@@ -191,10 +191,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             merged.insert(tag.key, tag.value);
         }
         if merged.len() > crate::state::MAX_TAGS {
-            // The refusal is this service's own fixed wording: it names the bound it
-            // enforces and the kind of resource, and carries nothing from the request —
-            // the caller's `resourceARN` is NOT echoed back, the same rule every other
-            // refusal here keeps (`crate::state::tag_quota_message`).
+            // The refusal carries AWS's own wording for this error class, which is wholly
+            // fixed text: it names no resource, no count and no limit, so nothing the
+            // caller sent is echoed back (`crate::state::TAG_QUOTA_MESSAGE`). The quota is
+            // cumulative per resource, which is why the bound is checked against the
+            // MERGED map rather than against the request's own list.
             return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: Some(crate::state::tag_quota_message()),

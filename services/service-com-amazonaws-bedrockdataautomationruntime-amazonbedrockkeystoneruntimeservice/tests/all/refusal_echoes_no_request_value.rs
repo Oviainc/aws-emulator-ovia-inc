@@ -43,14 +43,16 @@ const PROJECT_ARN: &str =
 
 /// The most tags one resource can carry: the modelled `TagList` bound
 /// (`@length(min: 0, max: 200)`, `smithy_query` shape `TagList`). Spelled out here rather
-/// than read from the crate, so the expected quota message below pins both the bound and
-/// the wording.
+/// than read from the crate, so the rows below pin the bound as well as the wording.
 const MAX_TAGS: usize = 200;
 
-/// The message the tag quota refusal must read as: the bound this service enforces and
-/// the kind of resource it is enforced on, with no request value in it.
+/// The message the tag quota refusal must read as: AWS's own fixed text for that error
+/// class, which names no resource, no count and no limit. Spelled out here rather than
+/// read from the crate, so a wrong constant in the implementation cannot make this pass.
 fn expected_tag_quota_message() -> String {
-    format!("Cannot have more than {MAX_TAGS} tags on a data automation invocation")
+    "The number of the provided tags is beyond the limit, or the number of total tags you \
+     are trying to attach to the specified resource exceeds the limit."
+        .to_string()
 }
 
 /// A router serving only this service over one shared engine.

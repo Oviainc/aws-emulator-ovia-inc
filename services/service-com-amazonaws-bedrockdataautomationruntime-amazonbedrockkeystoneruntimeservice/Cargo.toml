@@ -21,7 +21,7 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -31,6 +31,17 @@ tracing = { workspace = true }
 # transport is the emulator's own): a job's work begins by reading that asset, so whether
 # the object store holds it is what the job's terminal outcome is settled on.
 aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The EventBridge client a job's lifecycle event is published with, over the same
+# in-process callback: a submission carrying `eventBridgeEnabled` asks to be notified of
+# its job through the account's default event bus.
+aws-sdk-eventbridge = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# Reads the header of an input asset that is an image — its format, from the bytes' own
+# magic numbers, and its dimensions — which is what decides whether a job pointed at an
+# image can process it. Only the decoders for the image formats data automation reads.
+image = { version = "0.25", default-features = false, features = [
+    "png",
+    "jpeg",
+] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -51,6 +62,11 @@ tokio = { workspace = true, features = ["time"] }
 # the way the assembled emulator runs them — and stages the asset a submission points at
 # in its store, because a job that cannot read its asset is the failure path under test.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# EventBridge and SQS are mounted beside this service on one engine — the way the
+# assembled emulator runs them — so a job's published event travels the real bus to a real
+# SQS target, which is where the notification suite observes it.
+service-com-amazonaws-eventbridge-awsevents = { workspace = true }
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 
 [lints]
 workspace = true

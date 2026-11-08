@@ -21,10 +21,18 @@
 //! ([`resolve_input_asset`]), and the job's terminal outcome is settled on what that
 //! resolution established.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_bedrockdataautomation_amazonbedrockkeystonebuildtimeservice::state as build_time;
+
+/// Whether the bytes of an asset are an image this service can process, which is what a
+/// job pointed at an image settles its outcome on.
+pub mod input_image;
+
+/// The EventBridge events a job's lifecycle publishes for a submission that asked for
+/// them.
+pub mod job_events;
 
 use crate::ops::types::{
     AssetProcessingConfiguration, Blueprint, DataAutomationConfiguration, EncryptionConfiguration,
@@ -476,33 +484,80 @@ pub fn unknown_invocation_refusal<E>(
 /// What this service answers when a tag edit would take one invocation past [`MAX_TAGS`]
 /// — the message behind `ServiceQuotaExceededException` for `TagResource`.
 ///
-/// Worded on the same rule as [`INVOCATION_NOT_FOUND_MESSAGE`] and
-/// [`invocation_quota_message`]: the bound this service enforces, and the kind of
-/// resource it is enforced on, with NOTHING taken from the request — the caller's
-/// `resourceARN` is not interpolated, because this service does not echo a request value
-/// back in a refusal.
+/// AWS's own wording for this error class, which is ENTIRELY fixed text: it names no
+/// resource, no count and no limit, so there is no variable part to fill and nothing the
+/// caller sent can reach it. The quota is cumulative per resource, so one sentence covers
+/// both halves of it — a single request carrying too many tags, and a request whose tags
+/// would take the resource past the bound.
+pub const TAG_QUOTA_MESSAGE: &str = "The number of the provided tags is beyond the limit, \
+                                     or the number of total tags you are trying to attach \
+                                     to the specified resource exceeds the limit.";
+
+/// [`TAG_QUOTA_MESSAGE`], as the owned `String` the modelled error member holds.
 pub fn tag_quota_message() -> String {
-    format!("Cannot have more than {MAX_TAGS} tags on a data automation invocation")
+    TAG_QUOTA_MESSAGE.to_string()
+}
+
+/// The account field of an ARN that marks a resource AWS itself owns rather than one an
+/// account created — see [`SERVICE_OWNED_ACCOUNT`], which this is the authorization side
+/// of: an AWS-owned profile belongs to no account, so no caller is foreign to it.
+///
+/// What a caller IS authorized against is its own account: the modelled
+/// `DataAutomationProfileArn` pattern admits `(aws|[0-9]{12})` in that field, so an ARN
+/// naming any other twelve-digit account is well formed and has to be refused on
+/// authorization rather than on shape.
+///
+/// The sentence itself is the shared one every service of this workspace refuses such a
+/// request with (`service_common::iam_authorization`), so this service states only WHICH
+/// principal it names: the account this emulator serves, which is the account a caller's
+/// credentials speak for and the account every ARN it mints carries.
+pub fn access_denied_message() -> String {
+    ::service_common::iam_authorization::not_authorized_to_access_resource(
+        ::emulator_server::emulator_account_id(),
+    )
+}
+
+/// The refusal a submission's `dataAutomationProfileArn` earns when it names a profile of
+/// an account other than the caller's own, or `None` when the caller may use it.
+///
+/// A submission RUNS under the data-automation profile it names, so the caller has to be
+/// allowed to use that profile: a profile scoped to a foreign account never is, whatever
+/// the rest of the ARN says, and the refusal is decided from the ARN's account field
+/// alone — before anything is minted or persisted, so a denied submission leaves no
+/// record and no job behind. The two cases that are NOT foreign are the account this
+/// emulator serves, and AWS's own [`SERVICE_OWNED_ACCOUNT`] (a profile AWS publishes for
+/// every account to use). A value whose account field cannot be read is left to the
+/// framework's `@pattern` walk, which refuses it as a constraint violation.
+///
+/// The message is AWS's denial sentence ([`access_denied_message`]): it names the CALLER,
+/// never the foreign account the request carried, so a caller cannot learn from it
+/// whether a resource exists in an account that is not its own.
+pub fn cross_account_profile_refusal(data_automation_profile_arn: &str) -> Option<String> {
+    let account = ::service_common::arn::parse(data_automation_profile_arn)?.account;
+    let authorized =
+        account == SERVICE_OWNED_ACCOUNT || account == ::emulator_server::emulator_account_id();
+    (!authorized).then(access_denied_message)
 }
 
 /// What this service answers when it cannot admit one more invocation — the message
 /// behind `ServiceQuotaExceededException` for the two invoke operations.
 ///
-/// Carries only [`MAX_INVOCATIONS`], this service's own constant; see
-/// [`tag_quota_message`] for the rule both quota refusals keep.
+/// Carries only [`MAX_INVOCATIONS`], this service's own constant, and NOTHING taken from
+/// the request. NO RECORDING covers this refusal — the bound itself is the emulator's —
+/// so unlike [`TAG_QUOTA_MESSAGE`], whose wording is AWS's own for that error class, this
+/// sentence is the service's own and states the bound it enforces.
 pub fn invocation_quota_message() -> String {
     format!("Cannot have more than {MAX_INVOCATIONS} data automation invocations in progress")
 }
 
 /// The most invocation records this emulator retains at once.
 ///
-/// Every `InvokeDataAutomationAsync` call persists one record, and one `clientToken`
-/// entry beside it, on a request-reachable path, so without a ceiling the store would
-/// grow with traffic forever. The capacity is the emulator's own (AWS publishes no such
-/// quota), and it bounds BOTH maps: it is enforced by
+/// Every `InvokeDataAutomationAsync` call persists one record on a request-reachable
+/// path, so without a ceiling the store would grow with traffic forever. The capacity is
+/// the emulator's own (AWS publishes no such quota), and it is enforced by
 /// [`ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeserviceState::admit_invocation`],
-/// the one admission path, which evicts finished jobs (and their tokens) to make room
-/// and refuses the submission when it cannot.
+/// the one admission path, which evicts finished jobs to make room and refuses the
+/// submission when it cannot.
 pub const MAX_INVOCATIONS: usize = 1_000;
 
 /// What asking this emulator's own Amazon S3 about the asset a submission named
@@ -510,15 +565,20 @@ pub const MAX_INVOCATIONS: usize = 1_000;
 /// ([`Invocation::advance_to`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputAsset {
-    /// The job may take the asset on: the object store answered for it, or NOTHING could
-    /// be established about it — no object store on this emulator to ask, or an answer
-    /// that was not the store reporting an absent object — so no job is failed on an
-    /// assumption.
+    /// The job may take the asset on: the object store answered for it and what it holds
+    /// is processable, or NOTHING could be established about it — no object store on this
+    /// emulator to ask, or an answer that was not the store reporting an absent object —
+    /// so no job is failed on an assumption.
     Available,
     /// The object store ITSELF answered that the location the submission named holds no
     /// object, or that location addresses no object at all, so the job has nothing to
     /// read and the work it was accepted for cannot be carried out.
     Absent,
+    /// The object store served the asset, and what it holds is an IMAGE this service
+    /// cannot process: bytes that are not an image in a format it reads, or an image
+    /// outside the dimensions it processes ([`input_image::ImageVerdict`]). The job can
+    /// read its asset but not do the work it was accepted for.
+    InvalidImage,
 }
 
 /// Why a job pointed at an asset the object store holds none of failed — its
@@ -527,10 +587,20 @@ pub enum InputAsset {
 /// This service's own fixed string, on the same footing as
 /// [`MISSING_PROJECT_OR_BLUEPRINTS`]: it carries NOTHING from the request, and what a
 /// client branches on is the `ClientError` status and the two error members being there
-/// at all. NO RECORDING covers a failed data-automation job, so a later one showing how
-/// AWS words this failure settles the wording — and would change only this constant.
+/// at all. NO RECORDING covers a failed data-automation job whose asset was absent, so a
+/// later one showing how AWS words this failure settles the wording — and would change
+/// only this constant. The failure whose wording IS recorded has its own
+/// ([`input_image::INVALID_IMAGE_MESSAGE`]).
 pub const INPUT_ASSET_ABSENT_MESSAGE: &str =
     "The input asset could not be read from the Amazon S3 location the submission named.";
+
+/// The `errorType` of a job failed because its asset was not there.
+///
+/// NO RECORDING covers this failure class, so the type reported is the failure CLASS the
+/// status already names, which is all that can be said about it without inventing an AWS
+/// vocabulary. The class that IS recorded carries AWS's own type
+/// ([`input_image::INVALID_IMAGE_ERROR_TYPE`]).
+pub const INPUT_ASSET_ABSENT_ERROR_TYPE: &str = "ClientError";
 
 /// The Amazon S3 error codes in which S3 reports that an object a request names is NOT
 /// THERE: a bucket it does not hold (`NoSuchBucket`), a key that bucket does not hold
@@ -594,8 +664,13 @@ fn s3_object_address(uri: &str) -> Option<(&str, &str)> {
 ///
 /// The credentials are the emulator's own: they only sign this operation's in-process
 /// calls and are never put in a response or a log.
+///
+/// `callback` is the handle a handler reaches through
+/// [`smithy_server_runtime::OperationContext::callback`]; it is taken directly rather
+/// than through the request context so the job's own asset read can also be made once the
+/// call that submitted it has answered ([`job_events::settle_when_due`]).
 fn s3_client(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
     region: &str,
 ) -> ::aws_sdk_s3::Client {
     let region = arn_region(region);
@@ -607,8 +682,8 @@ fn s3_client(
         // bucket name is not a host this emulator resolves, so the request addresses its
         // bucket in the path.
         .force_path_style(true)
-        .credentials_provider(ctx.callback().aws_credentials_provider())
-        .http_client(ctx.callback().http_client())
+        .credentials_provider(callback.aws_credentials_provider())
+        .http_client(callback.http_client())
         // The transport is in-process: there is nothing to retry, time out or watch for a
         // stalled stream, and each of those would need a sleep implementation this client
         // is not given. The same goes for caching the identity: the credentials are handed
@@ -621,13 +696,21 @@ fn s3_client(
     ::aws_sdk_s3::Client::from_conf(config)
 }
 
+/// The most of one asset this service reads to establish what it holds.
+///
+/// The emulator's OWN ceiling, not an AWS quota: the classification only needs the
+/// asset's header ([`input_image::image_verdict`]), so an object this emulator would have
+/// to hold in memory beyond this is not read at all and nothing is established about it —
+/// which fails no job. It sits well above the formats whose header this reads.
+pub const MAX_CLASSIFIED_ASSET_BYTES: i64 = 8 * 1024 * 1024;
+
 /// Resolve the asset a submission named against this emulator's own Amazon S3 and report
 /// what that established.
 ///
 /// A submission points at an asset already in object storage, and the job's work starts
 /// by READING it, so the resolution happens when the job runs rather than when the
-/// submission is accepted: this is called by the reporting read that finds the terminal
-/// transition due ([`Invocation::terminal_transition_due`]), and its answer is what that
+/// submission is accepted: it is called by whatever settles the terminal transition the
+/// clock owes ([`Invocation::terminal_transition_due`]), and its answer is what that
 /// transition settles the outcome on. An asset created after the submission but before
 /// the job finishes is therefore there for the job, exactly as it would be in the real
 /// service.
@@ -639,12 +722,14 @@ fn s3_client(
 /// addresses no object at all ([`s3_object_address`]): it names no asset for any store to
 /// hold.
 ///
-/// The read is a `HeadObject`, "the same options as a GET operation on an object" without
-/// its body: what the job has to establish is that the asset it was pointed at IS there,
-/// and nothing in this service extracts anything from an asset, so no asset's bytes are
-/// ever fetched or held.
+/// TWO reads: a `HeadObject` establishes that the asset IS there and how large the store
+/// says it is, and then — only for an object inside [`MAX_CLASSIFIED_ASSET_BYTES`] — a
+/// `GetObject` reads it so the job can establish whether what it was pointed at is
+/// something it can process at all ([`input_image::image_verdict`]). Nothing here
+/// extracts anything FROM the asset: the bytes are used to read the asset's own header
+/// and are dropped with this call.
 pub async fn resolve_input_asset(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
+    callback: &::smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     s3_uri: &str,
 ) -> InputAsset {
@@ -653,15 +738,10 @@ pub async fn resolve_input_asset(
     let Some((bucket, key)) = s3_object_address(s3_uri) else {
         return InputAsset::Absent;
     };
-    match s3_client(ctx, region)
-        .head_object()
-        .bucket(bucket)
-        .key(key)
-        .send()
-        .await
-    {
-        // The asset is there. Only its METADATA was asked for, never its bytes.
-        Ok(_) => InputAsset::Available,
+    let client = s3_client(callback, region);
+    let declared = match client.head_object().bucket(bucket).key(key).send().await {
+        // The asset is there, and the store says how large it is.
+        Ok(answer) => answer.content_length().unwrap_or_default(),
         Err(error) => {
             if object_is_absent(&error) {
                 return InputAsset::Absent;
@@ -678,8 +758,45 @@ pub async fn resolve_input_asset(
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                 "the input asset could not be resolved against this emulator's Amazon S3"
             );
+            return InputAsset::Available;
+        }
+    };
+    // Past this emulator's read ceiling nothing is established about the asset, so the
+    // job is not failed on it.
+    if declared > MAX_CLASSIFIED_ASSET_BYTES {
+        return InputAsset::Available;
+    }
+    let read = match client.get_object().bucket(bucket).key(key).send().await {
+        Ok(read) => read,
+        Err(error) => {
+            // The asset was there a moment ago: whatever this answer is, it is not the
+            // store reporting that the asset cannot be processed, so it fails no job.
+            ::tracing::warn!(
+                bucket = ?bucket,
+                key = ?key,
+                code = ?error.code(),
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the input asset's bytes could not be read from this emulator's Amazon S3"
+            );
+            return InputAsset::Available;
+        }
+    };
+    let Ok(body) = read.body.collect().await else {
+        ::tracing::warn!(
+            bucket = ?bucket,
+            key = ?key,
+            "the input asset's bytes did not arrive from this emulator's Amazon S3"
+        );
+        return InputAsset::Available;
+    };
+    match input_image::image_verdict(&body.into_bytes()) {
+        // Either the asset is an image this service processes, or it is not an image at
+        // all — nothing an image rule can establish about a document, a video or an audio
+        // asset, so neither fails the job.
+        input_image::ImageVerdict::Processable | input_image::ImageVerdict::NotAnImage => {
             InputAsset::Available
         }
+        input_image::ImageVerdict::Invalid => InputAsset::InvalidImage,
     }
 }
 
@@ -775,6 +892,10 @@ pub struct Invocation {
     /// stable order.
     pub tags: BTreeMap<String, String>,
     /// The `clientToken` this job was submitted under, when the caller sent one.
+    ///
+    /// Retained as part of what the submission carried, and read by nothing: the token is
+    /// accepted for request validation and is NOT an application-level deduplication key
+    /// for this operation, so two submissions under one token are two independent jobs.
     pub client_token: Option<String>,
 }
 
@@ -824,12 +945,14 @@ impl Invocation {
     /// transition became DUE, not the instant it was observed, so the derived
     /// `jobDurationInSeconds` does not depend on when a caller happened to poll.
     ///
-    /// A job's work begins with READING the asset `inputConfiguration.s3Uri` names, so a
-    /// job pointed at an asset the object store holds none of cannot carry out the work it
-    /// was accepted for: it ends in the modelled failure status attributable to the
-    /// request (`ClientError`) carrying `errorType` and `errorMessage`, and never in
-    /// `Success`. A job whose asset IS there, or about which nothing could be established
-    /// ([`InputAsset`]), completes.
+    /// A job's work begins with READING the asset `inputConfiguration.s3Uri` names and
+    /// goes on to PROCESS what it read, so a job pointed at an asset the object store
+    /// holds none of, or at one it cannot process, cannot carry out the work it was
+    /// accepted for: it ends in the modelled failure status attributable to the request
+    /// (`ClientError`) carrying the `errorType` of that failure class and the fixed
+    /// `errorMessage` for it, and never in `Success`. A job whose asset IS there and
+    /// processable, or about which nothing could be established ([`InputAsset`]),
+    /// completes.
     ///
     /// What `Success` CLAIMS here: the invocation RECORD reached its terminal state, with
     /// the asset it was pointed at in place. It does not claim that result objects exist
@@ -847,15 +970,21 @@ impl Invocation {
         if self.status == AutomationJobStatus::InProgress {
             let completion_due = self.completion_due();
             if now >= completion_due {
+                // Each failure class carries its OWN `errorType` and its own fixed
+                // message, stated where that class is decided; nothing in either member
+                // is spelled from the request.
                 self.status = match asset {
                     InputAsset::Available => AutomationJobStatus::Success,
                     InputAsset::Absent => {
-                        // The failure CLASS is what the type reports: see
-                        // [`INPUT_ASSET_ABSENT_MESSAGE`] for why neither member is
-                        // spelled from anything else.
-                        self.error_type =
-                            Some(AutomationJobStatus::ClientError.as_wire().to_string());
+                        self.error_type = Some(INPUT_ASSET_ABSENT_ERROR_TYPE.to_string());
                         self.error_message = Some(INPUT_ASSET_ABSENT_MESSAGE.to_string());
+                        AutomationJobStatus::ClientError
+                    }
+                    InputAsset::InvalidImage => {
+                        self.error_type =
+                            Some(input_image::INVALID_IMAGE_ERROR_TYPE.to_string());
+                        self.error_message =
+                            Some(input_image::INVALID_IMAGE_MESSAGE.to_string());
                         AutomationJobStatus::ClientError
                     }
                 };
@@ -864,10 +993,23 @@ impl Invocation {
         }
     }
 
+    /// Whether this submission asked for its lifecycle to be published to EventBridge:
+    /// `notificationConfiguration.eventBridgeConfiguration.eventBridgeEnabled`.
+    ///
+    /// Both levels are `@required` inside the member that carries them, so a submission
+    /// that sent no `notificationConfiguration` asked for nothing.
+    pub fn event_bridge_enabled(&self) -> bool {
+        self.notification_configuration
+            .as_ref()
+            .is_some_and(|configuration| {
+                configuration.event_bridge_configuration.event_bridge_enabled
+            })
+    }
+
     /// When this job's terminal transition falls due: one `Created` span and one
     /// `InProgress` span after the submission was accepted
     /// ([`CREATED_FOR`] + [`IN_PROGRESS_FOR`]).
-    fn completion_due(&self) -> SystemTime {
+    pub fn completion_due(&self) -> SystemTime {
         self.job_submission_time + CREATED_FOR + IN_PROGRESS_FOR
     }
 
@@ -954,12 +1096,11 @@ impl Invocation {
 
 /// Per-service state for com-amazonaws-bedrockdataautomationruntime-amazonbedrockkeystoneruntimeservice. A handler reaches it through [`service_state`].
 ///
-/// BOTH maps are private, and the only way to add to either of them is
-/// [`Self::admit_invocation`], which admits one invocation and its `clientToken`
-/// TOGETHER and only after it has freed a slot. That is what bounds this store: no
-/// request-reachable path can insert into one map without the other, so
-/// `client_tokens` can never outgrow `invocations`, and `invocations` can never exceed
-/// [`MAX_INVOCATIONS`]. A handler reaches a record through
+/// Every field is private, and the only way to add an invocation is
+/// [`Self::admit_invocation`], which inserts one only after it has freed a slot. That is
+/// what bounds this store: `invocations` can never exceed [`MAX_INVOCATIONS`], and the
+/// queue of events waiting to be published is bounded in its own module
+/// ([`job_events::MAX_PENDING_EVENTS`]). A handler reaches a record through
 /// [`Self::resolve_invocation`] / [`Self::resolve_invocation_mut`] — which is also where
 /// an ARN naming no record earns its refusal — or through the bare
 /// [`Self::invocation`] / [`Self::invocation_mut`] lookups those are built on; none of
@@ -969,17 +1110,13 @@ pub struct ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimes
     /// Every invocation this emulator has minted, keyed by its `invocationArn`. Bounded
     /// at [`MAX_INVOCATIONS`] by [`Self::admit_invocation`].
     invocations: HashMap<String, Invocation>,
-    /// `clientToken` -> `invocationArn`, which is what makes
-    /// `InvokeDataAutomationAsync` (`@idempotent`) replay instead of minting a second
-    /// job for a token it has already seen.
-    ///
-    /// An entry is written ONLY by [`Self::admit_invocation`], together with the
-    /// invocation it points at, and is dropped with that invocation by
-    /// [`Self::forget_invocation`] — including when the invocation is evicted to free a
-    /// slot. So this map is a subset of `invocations`' keys by construction and inherits
-    /// its [`MAX_INVOCATIONS`] bound: a caller submitting a fresh token on every request
-    /// cannot make it grow past the cap.
-    client_tokens: HashMap<String, String>,
+    /// The lifecycle events of the jobs whose submission asked for them, waiting to be
+    /// published onto the account's default EventBridge bus ([`job_events`]).
+    pending_events: VecDeque<job_events::JobEvent>,
+    /// How many settles started by a submission are in flight, bounded at
+    /// [`job_events::MAX_SETTLES_IN_FLIGHT`] by [`Self::try_begin_settle`] — which is what
+    /// stops a stream of notified submissions from having unbounded work outstanding.
+    settles_in_flight: usize,
     /// How many invocations this store has ever minted an id for — the monotonic half of
     /// [`Self::mint_invocation_id`]. It counts mints, not retained records, so it keeps
     /// rising past an eviction and an id is never handed out twice.
@@ -1047,54 +1184,109 @@ impl ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeservice
         self.invocations.len()
     }
 
-    /// How many `clientToken` entries are retained; never more than
-    /// [`Self::invocation_count`].
-    pub fn client_token_count(&self) -> usize {
-        self.client_tokens.len()
-    }
-
-    /// The `invocationArn` an already-accepted `clientToken` must replay, if any.
+    /// Materialise the lifecycle transitions the clock owes the job `invocation_arn`
+    /// names at `now`, settling the terminal one on `asset`, and QUEUE the event a
+    /// transition this submission asked to be notified of earns.
     ///
-    /// The token ALONE identifies the submission: this model declares no
-    /// `IdempotentParameterMismatch`-style error for the operation, so a reused token is
-    /// answered with the job it already minted whatever else the request carries, rather
-    /// than with an error the model has no shape for.
-    ///
-    /// A token whose invocation is no longer retained is NOT replayed: handing back an
-    /// ARN no reader can resolve would turn an idempotent retry into a 404 from the very
-    /// next `GetDataAutomationStatus`. Such a token is dropped here, so the caller mints
-    /// a fresh job instead and the map does not keep dead entries.
-    pub fn replay_for_client_token(&mut self, client_token: &str) -> Option<String> {
-        let invocation_arn = self.client_tokens.get(client_token)?.clone();
-        if self.invocations.contains_key(&invocation_arn) {
-            return Some(invocation_arn);
+    /// The one path that advances a job: it is what keeps the record and the events
+    /// reporting it in step — a transition is queued by the very call that materialised
+    /// it, exactly once, because the materialisation happens here and nowhere else
+    /// ([`Invocation::advance_to`] is what it drives). `None` when this store retains no
+    /// such invocation.
+    pub fn settle_invocation(
+        &mut self,
+        invocation_arn: &str,
+        now: SystemTime,
+        asset: InputAsset,
+    ) -> Option<&Invocation> {
+        let invocation = self.invocations.get_mut(invocation_arn)?;
+        let before = invocation.status;
+        invocation.advance_to(now, asset);
+        let moved_to_terminal = invocation.is_terminal() && before != invocation.status;
+        let event = (moved_to_terminal && invocation.event_bridge_enabled())
+            .then(|| job_events::JobEvent::of(invocation));
+        if let Some(event) = event {
+            self.queue_job_event(event);
         }
-        self.client_tokens.remove(client_token);
-        None
+        self.invocations.get(invocation_arn)
     }
 
-    /// Admit one freshly minted invocation, with its `clientToken` (taken from the
-    /// record itself, so the two can never be written apart).
+    /// Queue one lifecycle event for publication, dropping the oldest when the queue is
+    /// full — see [`job_events::MAX_PENDING_EVENTS`] for why it is bounded.
+    pub fn queue_job_event(&mut self, event: job_events::JobEvent) {
+        while self.pending_events.len() >= job_events::MAX_PENDING_EVENTS {
+            self.pending_events.pop_front();
+            ::tracing::warn!(
+                "the queue of data automation job events waiting to be published to \
+                 EventBridge is full at {}; the oldest event was dropped",
+                job_events::MAX_PENDING_EVENTS
+            );
+        }
+        self.pending_events.push_back(event);
+    }
+
+    /// Take at most `limit` of the events not yet published, oldest first.
     ///
-    /// This is the ONLY way anything is added to this store. It first frees a slot,
+    /// Taking them out under the lock is what stops two concurrent calls from publishing
+    /// one event twice.
+    pub fn take_job_events(&mut self, limit: usize) -> Vec<job_events::JobEvent> {
+        let taking = limit.min(self.pending_events.len());
+        self.pending_events.drain(..taking).collect()
+    }
+
+    /// How many events are queued for publication — reporting only, for a reader that has
+    /// to tell "nothing moved" from "nothing was published".
+    pub fn pending_job_event_count(&self) -> usize {
+        self.pending_events.len()
+    }
+
+    /// Take one of the slots for a settle a submission starts on its job's behalf, or
+    /// `false` when [`job_events::MAX_SETTLES_IN_FLIGHT`] of them are already running.
+    ///
+    /// This is what bounds the work a stream of notified submissions can have in flight at
+    /// once: a submission that cannot take a slot starts nothing, and its job's outcome is
+    /// settled — and so published — by the next read that asks for it, exactly as a job
+    /// nobody asked to be notified about is.
+    pub fn try_begin_settle(&mut self) -> bool {
+        if self.settles_in_flight >= job_events::MAX_SETTLES_IN_FLIGHT {
+            return false;
+        }
+        self.settles_in_flight += 1;
+        true
+    }
+
+    /// Give back the slot [`Self::try_begin_settle`] took, however the settle ended.
+    pub fn finish_settle(&mut self) {
+        self.settles_in_flight = self.settles_in_flight.saturating_sub(1);
+    }
+
+    /// How many such settles are in flight; at most
+    /// [`job_events::MAX_SETTLES_IN_FLIGHT`].
+    pub fn settles_in_flight(&self) -> usize {
+        self.settles_in_flight
+    }
+
+    /// Admit one freshly minted invocation.
+    ///
+    /// This is the ONLY way an invocation is added to this store. It first frees a slot,
     /// bounding `invocations` at [`MAX_INVOCATIONS`]; `false` means every retained job
     /// is still running, so the caller must refuse the submission with the modelled
     /// quota error rather than drop work somebody is waiting on — and nothing at all is
-    /// inserted, so a refused submission grows neither map.
+    /// inserted, so a refused submission leaves no record behind.
+    ///
+    /// The record's `clientToken` is retained ON the record and indexed nowhere: this
+    /// operation accepts the token for request validation and does NOT deduplicate on
+    /// it, so a repeated token mints its own job and its own ARN exactly as a fresh one
+    /// does.
     pub fn admit_invocation(&mut self, invocation: Invocation, now: SystemTime) -> bool {
         if !self.reserve_invocation_slot(now) {
             return false;
         }
-        let invocation_arn = invocation.invocation_arn.clone();
-        if let Some(client_token) = invocation.client_token.clone() {
-            self.client_tokens
-                .insert(client_token, invocation_arn.clone());
-        }
-        self.invocations.insert(invocation_arn, invocation);
+        self.invocations
+            .insert(invocation.invocation_arn.clone(), invocation);
         debug_assert!(
-            self.client_tokens.len() <= self.invocations.len()
-                && self.invocations.len() <= MAX_INVOCATIONS,
-            "both maps stay bounded by MAX_INVOCATIONS"
+            self.invocations.len() <= MAX_INVOCATIONS,
+            "the invocation map stays bounded by MAX_INVOCATIONS"
         );
         true
     }
@@ -1106,7 +1298,7 @@ impl ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeservice
     /// ([`Invocation::is_terminal_at`]) — repeating until there is room. `false` means
     /// every retained job is still running. Nothing here MATERIALISES that transition:
     /// which terminal status a finished job carries rests on what its asset established,
-    /// which only the reporting read that asks the object store can settle, so this
+    /// which only a settle that asks the object store can decide, so this
     /// admission path reads the clock without writing an outcome it cannot ground.
     /// Private: admission goes through [`Self::admit_invocation`], so freeing a slot and
     /// filling it cannot come apart.
@@ -1131,13 +1323,12 @@ impl ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeservice
         true
     }
 
-    /// Drop one invocation and every `clientToken` entry that named it, so no token is
-    /// left pointing at a record that is gone — which is what keeps `client_tokens` a
-    /// subset of `invocations` across eviction.
+    /// Drop one invocation. A job nobody can resolve any more reports nothing, so the
+    /// events it had queued are left to the drain that was going to publish them: a
+    /// queued event carries the job's own id and is rendered from it
+    /// ([`job_events::JobEvent`]), not from the record it came off.
     pub fn forget_invocation(&mut self, invocation_arn: &str) {
         self.invocations.remove(invocation_arn);
-        self.client_tokens
-            .retain(|_, stored| stored != invocation_arn);
     }
 }
 

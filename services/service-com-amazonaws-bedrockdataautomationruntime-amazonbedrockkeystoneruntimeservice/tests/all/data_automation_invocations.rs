@@ -10,8 +10,9 @@
 //! request:
 //!
 //! * `InvokeDataAutomationAsync` mints and PERSISTS one invocation per accepted
-//!   submission and answers with that record's own ARN; `@idempotent` means a
-//!   `clientToken` the service already accepted replays the first ARN.
+//!   submission and answers with that record's own ARN; `clientToken` is accepted for
+//!   request validation and deduplicates nothing, so a repeated token mints a second,
+//!   independently tracked job.
 //! * `GetDataAutomationStatus` computes its answer from that record, and the status
 //!   progression is owed by the clock, so repeated reads never disagree.
 //! * The three tagging operations edit and report the stored tag map of the invocation
@@ -499,15 +500,17 @@ async fn each_submission_is_persisted_and_reported_back_from_state() {
 }
 
 #[tokio::test]
-async fn an_accepted_client_token_replays_the_one_invocation() {
+async fn a_repeated_client_token_mints_a_second_independent_job() {
     let router = service();
 
-    // `clientToken` is `@idempotencyToken` on an `@idempotent` operation, so the token
-    // identifies the submission. Rows differ in the token's shape, which the modelled
-    // pattern `^[a-zA-Z0-9](-*[a-zA-Z0-9]){1,256}$` allows.
+    // `clientToken` is `@idempotencyToken` on an `@idempotent` operation, which is a
+    // statement about the TOKEN rather than a dedup key this operation applies: the token
+    // is accepted for request validation and every accepted submission mints its own job.
+    // Rows differ in the token's shape, which the modelled pattern
+    // `^[a-zA-Z0-9](-*[a-zA-Z0-9]){1,256}$` allows.
     let tokens = ["tok-1", "a1", "Zz9", "many-dashes-in-here"];
 
-    let mut per_token: Vec<String> = Vec::new();
+    let mut minted: Vec<String> = Vec::new();
     for token in tokens {
         let body = json!({
             "clientToken": token,
@@ -516,57 +519,72 @@ async fn an_accepted_client_token_replays_the_one_invocation() {
             "dataAutomationProfileArn": PROFILE_ARN,
             "dataAutomationConfiguration": {"dataAutomationProjectArn": PROJECT_ARN},
         });
+        // The identical request twice, under the identical token: two jobs.
         let first = submit(&router, token, body.clone()).await;
-        let replay = submit(&router, token, body).await;
-        assert_eq!(
-            first, replay,
-            "case {token:?}: an identical resubmission must replay the same invocationArn"
+        let second = submit(&router, token, body).await;
+        assert_ne!(
+            first, second,
+            "case {token:?}: a repeated clientToken must mint a second invocation, got \
+             {first:?} twice"
         );
 
-        // A reused token names the job it already minted, so nothing the second request
-        // carries can create a second one.
-        let second_payload = json!({
-            "clientToken": token,
-            "inputConfiguration": {"s3Uri": "s3://in-bucket/assets/other.pdf"},
-            "outputConfiguration": {"s3Uri": "s3://out-bucket/second/"},
-            "dataAutomationProfileArn": PROFILE_ARN,
-            "dataAutomationConfiguration": {"dataAutomationProjectArn": PROJECT_ARN},
-        });
-        let third = submit(&router, token, second_payload).await;
-        assert_eq!(
-            first, third,
-            "case {token:?}: a reused token must not mint a second job"
-        );
-
-        let answer = call(
+        // And a third submission under the same token, carrying DIFFERENT parameters, is
+        // a third job — the token replays nothing, so each ARN resolves to the job that
+        // minted it and reports the prefix ITS submission named.
+        let third_prefix = "s3://out-bucket/second/";
+        let third = submit(
             &router,
-            "GetDataAutomationStatus",
-            json!({"invocationArn": first}),
+            token,
+            json!({
+                "clientToken": token,
+                "inputConfiguration": {"s3Uri": "s3://in-bucket/assets/other.pdf"},
+                "outputConfiguration": {"s3Uri": third_prefix},
+                "dataAutomationProfileArn": PROFILE_ARN,
+                "dataAutomationConfiguration": {"dataAutomationProjectArn": PROJECT_ARN},
+            }),
         )
         .await;
-        assert_eq!(
-            answer.body["outputConfiguration"]["s3Uri"].as_str(),
-            Some(crate::support::job_metadata_uri("s3://out-bucket/first/", &first).as_str()),
-            "case {token:?}: the stored job must stay the one the first call persisted, got {}",
-            answer.body
-        );
-        per_token.push(first);
+
+        for (arn, prefix) in [
+            (&first, "s3://out-bucket/first/"),
+            (&second, "s3://out-bucket/first/"),
+            (&third, third_prefix),
+        ] {
+            let answer = call(
+                &router,
+                "GetDataAutomationStatus",
+                json!({"invocationArn": arn}),
+            )
+            .await;
+            assert_eq!(
+                answer.status, 200,
+                "case {token:?}: every minted ARN must resolve, got {} / {}",
+                answer.status, answer.body
+            );
+            assert_eq!(
+                answer.body["outputConfiguration"]["s3Uri"].as_str(),
+                Some(crate::support::job_metadata_uri(prefix, arn).as_str()),
+                "case {token:?}: {arn:?} must report its own submission's output location, \
+                 got {}",
+                answer.body
+            );
+        }
+        minted.extend([first, second, third]);
     }
 
-    per_token.sort();
-    per_token.dedup();
-    assert_eq!(
-        per_token.len(),
-        tokens.len(),
-        "distinct tokens are distinct jobs, got {per_token:?}"
-    );
-
     // No token at all: the SDK would have filled one in, so two bare calls are two jobs.
-    let untokened_a = submit(&router, "no token (a)", minimal_submission("s3://out-bucket/a/")).await;
-    let untokened_b = submit(&router, "no token (b)", minimal_submission("s3://out-bucket/b/")).await;
-    assert_ne!(
-        untokened_a, untokened_b,
-        "a submission without a clientToken must mint a new job each time"
+    minted.push(submit(&router, "no token (a)", minimal_submission("s3://out-bucket/a/")).await);
+    minted.push(submit(&router, "no token (b)", minimal_submission("s3://out-bucket/b/")).await);
+
+    // Every submission above is its own job: no two of them share an ARN, whether they
+    // carried one token, another token, or none.
+    let submissions = minted.len();
+    minted.sort();
+    minted.dedup();
+    assert_eq!(
+        minted.len(),
+        submissions,
+        "each submission must mint its own invocationArn, got {minted:?}"
     );
 }
 
@@ -1046,18 +1064,10 @@ fn the_invocation_store_is_bounded_and_retires_finished_jobs_first() {
             "case {case:?}: expected admit_invocation to answer {want_room}"
         );
 
-        // Whatever the answer, NEITHER map may exceed the cap: the token map is admitted
-        // with its record and retired with it, so a stream of distinct tokens cannot
-        // allocate past the bound.
+        // Whatever the answer, the store may not exceed the cap.
         assert!(
             store.invocation_count() <= bda::state::MAX_INVOCATIONS,
             "case {case:?}: invocations must stay bounded, got {}",
-            store.invocation_count()
-        );
-        assert!(
-            store.client_token_count() <= store.invocation_count(),
-            "case {case:?}: client_tokens must never outgrow invocations, got {} vs {}",
-            store.client_token_count(),
             store.invocation_count()
         );
 
@@ -1078,14 +1088,6 @@ fn the_invocation_store_is_bounded_and_retires_finished_jobs_first() {
                 store.invocation(retired).is_none(),
                 "case {case:?}: {retired:?} was the longest-submitted finished record"
             );
-            // Its `clientToken` went with it: a token never outlives the job it minted,
-            // which is what keeps the token map from accumulating dead entries.
-            assert!(
-                store
-                    .replay_for_client_token(&format!("token{running:05}"))
-                    .is_none(),
-                "case {case:?}: the retired record's clientToken must not replay"
-            );
         } else {
             assert_eq!(
                 store.invocation_count(),
@@ -1096,62 +1098,51 @@ fn the_invocation_store_is_bounded_and_retires_finished_jobs_first() {
                 store.invocation(&newcomer_arn).is_none(),
                 "case {case:?}: a refused submission must insert nothing"
             );
-            assert!(
-                store
-                    .replay_for_client_token(&format!("token{:05}", bda::state::MAX_INVOCATIONS))
-                    .is_none(),
-                "case {case:?}: a refused submission must leave no clientToken behind"
-            );
         }
     }
 }
 
 #[test]
-fn a_stream_of_distinct_client_tokens_cannot_grow_the_store_past_its_bound() {
+fn a_stream_of_submissions_cannot_grow_the_store_past_its_bound() {
     use service_com_amazonaws_bedrockdataautomationruntime_amazonbedrockkeystoneruntimeservice::ComAmazonawsBedrockdataautomationruntimeAmazonbedrockkeystoneruntimeserviceState as Store;
 
-    // The adversarial pattern the bound exists for: every request carries a FRESH
-    // `clientToken`, so none of them replays and each one admits a new record. Both maps
-    // must stay at or below the cap however long the stream runs, and no token may
-    // survive the record it named.
+    // The adversarial pattern the bound exists for: a stream of submissions, each its own
+    // job — which is what every submission is, under a fresh `clientToken`, a repeated one
+    // or none at all. The store must stay at or below the cap however long the stream
+    // runs, and the records it retains must be the newest ones.
     let epoch = fixed_submission_time();
     let submissions = bda::state::MAX_INVOCATIONS + 250;
     let mut store = Store::default();
-    let mut tokens = Vec::new();
+    let mut arns = Vec::new();
 
     for i in 0..submissions {
         // Each record is submitted far enough in the past to have finished, so the
         // retirement policy always has a candidate; `now` keeps pace with the stream.
         let submitted = epoch + Duration::from_millis(i as u64);
         let now = submitted + CREATED_FOR + IN_PROGRESS_FOR;
-        let token = format!("stream-token-{i:06}");
         let arn = format!(
             "arn:aws:bedrock:us-west-2:000000000000:data-automation-invocation/stream{i:06}"
         );
         let mut invocation = Invocation::new(
-            arn,
+            arn.clone(),
             format!("stream{i:06}"),
             "s3://in-bucket/assets/doc.pdf".to_string(),
             "s3://out-bucket/results/".to_string(),
             PROFILE_ARN.to_string(),
             submitted,
         );
-        invocation.client_token = Some(token.clone());
+        // Every submission in the stream carries the SAME token, which deduplicates
+        // nothing: each one is admitted as its own record.
+        invocation.client_token = Some("one-token-for-the-whole-stream".to_string());
         assert!(
             store.admit_invocation(invocation, now),
             "submission {i}: a finished record was available to retire"
         );
-        tokens.push(token);
+        arns.push(arn);
 
         assert!(
             store.invocation_count() <= bda::state::MAX_INVOCATIONS,
             "submission {i}: invocations grew past the bound, got {}",
-            store.invocation_count()
-        );
-        assert!(
-            store.client_token_count() <= store.invocation_count(),
-            "submission {i}: client_tokens grew past invocations, got {} vs {}",
-            store.client_token_count(),
             store.invocation_count()
         );
     }
@@ -1162,23 +1153,18 @@ fn a_stream_of_distinct_client_tokens_cannot_grow_the_store_past_its_bound() {
         "the store must sit exactly at its bound after {submissions} submissions, got {}",
         store.invocation_count()
     );
-    // Every token that is still retained names a record that is still retained, so a
-    // replay can never hand back an ARN a reader cannot resolve.
-    let mut replayable = 0usize;
-    for token in &tokens {
-        if let Some(arn) = store.replay_for_client_token(token) {
-            replayable += 1;
-            assert!(
-                store.invocation(&arn).is_some(),
-                "token {token:?} replayed {arn:?}, which is no longer stored"
-            );
-        }
+    // The records retained are the newest `MAX_INVOCATIONS` of the stream: the longest
+    // submitted finished record is the one retirement takes.
+    let retained = submissions - bda::state::MAX_INVOCATIONS;
+    for (i, arn) in arns.iter().enumerate() {
+        let stored = store.invocation(arn).is_some();
+        assert_eq!(
+            stored,
+            i >= retained,
+            "submission {i}: expected retained={}, got {stored}",
+            i >= retained
+        );
     }
-    assert_eq!(
-        replayable,
-        bda::state::MAX_INVOCATIONS,
-        "exactly the retained records' tokens may replay, got {replayable}"
-    );
 }
 
 /// One submission shape under the cross-member rule, exercised through BOTH invoke

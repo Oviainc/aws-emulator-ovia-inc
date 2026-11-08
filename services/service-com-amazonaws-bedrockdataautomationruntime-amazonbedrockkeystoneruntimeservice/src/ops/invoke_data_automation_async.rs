@@ -3,27 +3,40 @@
 //! @op InvokeDataAutomationAsync
 //!
 //! Accepts a data-automation submission: it MINTS an invocation, persists it in
-//! [`crate::state`], and returns that record's own `invocationArn`. The operation is
-//! `@idempotent`, so a `clientToken` this service has already accepted replays the ARN
-//! of the job it minted then instead of minting a second one.
+//! [`crate::state`], and returns that record's own `invocationArn`. `clientToken` is
+//! `@idempotencyToken` on an `@idempotent` operation, which is a statement about the
+//! TOKEN and not a deduplication key this operation applies: the token is accepted for
+//! request validation, every accepted submission mints its own job, and a repeated token
+//! therefore answers with a second, independently tracked `invocationArn`.
 //!
 //! ## Authorization and referenced ARNs
 //!
-//! Caller-identity authorization is deliberately NOT emulated by this service. The
-//! emulator verifies every request signature centrally and holds no
-//! principal-to-resource policy, so the modelled `AccessDeniedException` is unreachable
-//! from this handler: a submission that succeeds here is evidence that the request was
-//! well formed and was persisted, NOT that AWS IAM would have allowed it.
+//! A submission RUNS under the `dataAutomationProfileArn` it names, so the caller has to
+//! be allowed to use that profile. The modelled pattern admits a FOREIGN twelve-digit
+//! account in that ARN's account field, so such a value is well formed and is refused on
+//! AUTHORIZATION: the account component is compared with the account this emulator serves
+//! (AWS's own `aws` account marks a profile every account may use) and a mismatch earns
+//! the modelled `AccessDeniedException` (HTTP 403) before anything is minted or persisted
+//! — see `crate::state::cross_account_profile_refusal`. Nothing else about the caller's
+//! identity is evaluated: the emulator verifies every request signature centrally and
+//! holds no principal-to-resource policy, so a submission that succeeds here is evidence
+//! that the request was well formed, was authorized against the profile's account and was
+//! persisted, NOT that AWS IAM would have allowed it.
 //!
 //! The resources a submission REFERENCES are a different matter. The data-automation
 //! project and the blueprints it names belong to the build-time service, which IS
 //! emulated in this workspace, and a job cannot start without reading them — so they are
 //! RESOLVED against that service's store (`crate::state::unresolved_reference_refusal`)
 //! and a reference that resolves to nothing is refused with the modelled
-//! `ValidationException`. The `dataAutomationProfileArn` is the one referenced ARN that
-//! stays recorded rather than resolved: no emulated service owns a data-automation
-//! profile, so there is no store to resolve it against, and the framework walk's
-//! `@pattern`/`@length` check is the whole check on it.
+//! `ValidationException`.
+//!
+//! ## Notification
+//!
+//! A submission carrying
+//! `notificationConfiguration.eventBridgeConfiguration.eventBridgeEnabled` asks to be
+//! NOTIFIED of its job rather than to poll for it, so this handler publishes the job's
+//! creation onto the account's default EventBridge bus and starts the settle that
+//! publishes its outcome (`crate::state::job_events`).
 //!
 //! ## Shape of an operation
 //!
@@ -175,6 +188,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // AUTHORIZATION FIRST, and from the ARN's account field alone: a submission RUNS
+        // under the data-automation profile it names, so a profile scoped to an account
+        // other than the caller's own is refused with this operation's own modelled
+        // `AccessDeniedException` (HTTP 403) before any rule about the request's CONTENT
+        // is reached and before anything is minted or persisted — a caller that may not
+        // use the profile must not be able to learn from the answer whether the rest of
+        // its request would have been accepted. The modelled `@pattern` admits a foreign
+        // twelve-digit account, so this is an authorization rule and not a shape one. See
+        // `crate::state::cross_account_profile_refusal`.
+        if let Some(message) =
+            crate::state::cross_account_profile_refusal(&input.data_automation_profile_arn)
+        {
+            return Err(InvokeDataAutomationAsyncErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         // A submission has to say WHAT to extract, in exactly one of two members: a
         // data-automation project or an inline `blueprints` list. The model marks both
         // optional and expresses no "exactly one of", so the rule is enforced here with
@@ -259,63 +292,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
 
-        // `@idempotent` + `@idempotencyToken`: the token identifies the submission, so a
-        // token this service has already accepted answers with the ARN it minted then —
-        // no second job, and no second ARN. A token whose job is no longer retained is
-        // not replayed (and is dropped), so a replay never names a record a reader
-        // cannot resolve.
-        if let Some(token) = input.client_token.as_deref() {
-            if let Some(invocation_arn) = store.replay_for_client_token(token) {
-                return Ok(InvokeDataAutomationAsyncOutput { invocation_arn });
+        // Everything that touches this service's store happens in ONE critical section,
+        // which ends before anything leaves this process: the publication and the settle
+        // below both call another emulated service, and this service's store is never
+        // held across such a call.
+        let (invocation_arn, notified, completion_due) = {
+            let mut store = state.lock();
+
+            // `@idempotent` + `@idempotencyToken` describe the TOKEN, not a dedup key
+            // this operation applies: the token is accepted for request validation and
+            // the submission always mints its own job, so a caller that retries under a
+            // stable token gets a second, independently tracked invocation rather than
+            // the first one's ARN. The token is retained on the record and consulted by
+            // nothing.
+            //
+            // The resource id is minted by the store from its own monotonic mint count
+            // and the submission instant, never derived from the request: two submissions
+            // of the identical payload, under one token or none, are two jobs with two
+            // ids.
+            let invocation_id = store.mint_invocation_id(now);
+            let invocation_arn = crate::state::invocation_arn(&region, &invocation_id);
+
+            let mut invocation = crate::state::Invocation::new(
+                invocation_arn.clone(),
+                invocation_id,
+                input.input_configuration.s3_uri.clone(),
+                input.output_configuration.s3_uri.clone(),
+                input.data_automation_profile_arn.clone(),
+                now,
+            );
+            // The whole submitted input configuration is retained, not just its `s3Uri`:
+            // the accepted job's processing scope is the scope the submission asked for.
+            invocation.asset_processing_configuration =
+                input.input_configuration.asset_processing_configuration;
+            if let Some(configuration) = input.data_automation_configuration {
+                invocation.data_automation_project_arn =
+                    Some(configuration.data_automation_project_arn);
+                invocation.stage = configuration.stage;
             }
-        }
+            invocation.blueprints = input.blueprints.unwrap_or_default();
+            invocation.encryption_configuration = input.encryption_configuration;
+            invocation.notification_configuration = input.notification_configuration;
+            invocation.client_token = input.client_token;
+            for tag in input.tags.unwrap_or_default() {
+                invocation.tags.insert(tag.key, tag.value);
+            }
 
-        // The resource id is minted by the store from its own monotonic mint count and
-        // the submission instant, never derived from the request: two submissions of the
-        // identical payload under different tokens are two jobs with two ids.
-        let invocation_id = store.mint_invocation_id(now);
-        let invocation_arn = crate::state::invocation_arn(&region, &invocation_id);
+            let notified = invocation.event_bridge_enabled();
+            let completion_due = invocation.completion_due();
+            let created_event = crate::state::job_events::JobEvent::created(&invocation);
 
-        let mut invocation = crate::state::Invocation::new(
-            invocation_arn.clone(),
-            invocation_id,
-            input.input_configuration.s3_uri.clone(),
-            input.output_configuration.s3_uri.clone(),
-            input.data_automation_profile_arn.clone(),
-            now,
-        );
-        // The whole submitted input configuration is retained, not just its `s3Uri`: the
-        // accepted job's processing scope is the scope the submission asked for.
-        invocation.asset_processing_configuration =
-            input.input_configuration.asset_processing_configuration;
-        if let Some(configuration) = input.data_automation_configuration {
-            invocation.data_automation_project_arn =
-                Some(configuration.data_automation_project_arn);
-            invocation.stage = configuration.stage;
-        }
-        invocation.blueprints = input.blueprints.unwrap_or_default();
-        invocation.encryption_configuration = input.encryption_configuration;
-        invocation.notification_configuration = input.notification_configuration;
-        invocation.client_token = input.client_token;
-        for tag in input.tags.unwrap_or_default() {
-            invocation.tags.insert(tag.key, tag.value);
-        }
+            // The store is bounded: this one admission path frees a slot first, so the
+            // invocation map cannot grow past `MAX_INVOCATIONS` on this
+            // request-reachable path. `false` means every retained job is still running,
+            // so the submission is refused rather than displacing work somebody is
+            // waiting on — and nothing was inserted.
+            if !store.admit_invocation(invocation, now) {
+                return Err(
+                    InvokeDataAutomationAsyncErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: Some(crate::state::invocation_quota_message()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // A submission that asked to be NOTIFIED of its job has that job's creation
+            // published below, and its outcome published by the settle this submission
+            // starts — so a client driven by the event, which never polls, observes both.
+            // A submission that asked for nothing queues nothing and starts nothing.
+            if notified {
+                store.queue_job_event(created_event);
+            }
+            (invocation_arn, notified, completion_due)
+        };
 
-        // The store is bounded, and the record and its `clientToken` are admitted
-        // TOGETHER by this one call: it frees a slot first, so neither the invocation
-        // map nor the token map can grow past `MAX_INVOCATIONS` on this
-        // request-reachable path. `false` means every retained job is still running, so
-        // the submission is refused rather than displacing work somebody is waiting on —
-        // and nothing was inserted.
-        if !store.admit_invocation(invocation, now) {
-            return Err(InvokeDataAutomationAsyncErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(crate::state::invocation_quota_message()),
-                },
-            )
-            .into());
+        if notified {
+            crate::state::job_events::publish_pending(ctx.callback(), &*self.engine).await;
+            crate::state::job_events::settle_when_due(
+                ::std::sync::Arc::clone(&self.engine),
+                ctx.callback().clone(),
+                invocation_arn.clone(),
+                region,
+                completion_due,
+            );
         }
 
         Ok(InvokeDataAutomationAsyncOutput { invocation_arn })

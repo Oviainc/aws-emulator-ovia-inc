@@ -211,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let asset = match pending_asset {
             Some(input_s3_uri) => {
                 crate::state::resolve_input_asset(
-                    ctx,
+                    ctx.callback(),
                     &crate::state::request_region(ctx.parts()),
                     &input_s3_uri,
                 )
@@ -222,29 +222,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => crate::state::InputAsset::Available,
         };
 
-        let mut store = state.lock();
-        let invocation = store.resolve_invocation_mut(
-            &input.invocation_arn,
-            GetDataAutomationStatusErrorModeled::ResourceNotFoundException,
-        )?;
+        // The answer is computed inside ONE critical section, which ends before anything
+        // leaves this process: publishing calls another emulated service, and this
+        // service's store is never held across such a call.
+        let answer = {
+            let mut store = state.lock();
+            // Materialising the transition the clock owes goes through the store's one
+            // settle path, which also queues the event a job whose submission asked to be
+            // notified earns for it — so a transition is reported exactly once, by
+            // whichever call materialised it. What an ARN naming nothing answers — shape,
+            // message and status — stays this service's one rule
+            // (`crate::state::unknown_invocation_refusal`).
+            let invocation = store
+                .settle_invocation(&input.invocation_arn, now, asset)
+                .ok_or_else(|| {
+                    crate::state::unknown_invocation_refusal(
+                        GetDataAutomationStatusErrorModeled::ResourceNotFoundException,
+                    )
+                })?;
 
-        invocation.advance_to(now, asset);
+            GetDataAutomationStatusOutput {
+                status: Some(invocation.status.as_wire().to_string()),
+                error_type: invocation.error_type.clone(),
+                error_message: invocation.error_message.clone(),
+                // The job's OWN metadata location under the submitted prefix, derived from
+                // the stored record (`crate::state::Invocation::output_metadata_s3_uri`):
+                // the prefix itself names no job, so it is not what a reader reports.
+                output_configuration: Some(OutputConfiguration {
+                    s3_uri: invocation.output_metadata_s3_uri(),
+                }),
+                job_submission_time: Some(crate::state::to_date_time(
+                    invocation.job_submission_time,
+                )),
+                job_completion_time: invocation
+                    .job_completion_time
+                    .map(crate::state::to_date_time),
+                job_duration_in_seconds: invocation.job_duration_in_seconds(),
+            }
+        };
+        // A read that materialised nothing finds an empty queue and publishes nothing.
+        crate::state::job_events::publish_pending(ctx.callback(), &*self.engine).await;
 
-        Ok(GetDataAutomationStatusOutput {
-            status: Some(invocation.status.as_wire().to_string()),
-            error_type: invocation.error_type.clone(),
-            error_message: invocation.error_message.clone(),
-            // The job's OWN metadata location under the submitted prefix, derived from the
-            // stored record (`crate::state::Invocation::output_metadata_s3_uri`): the
-            // prefix itself names no job, so it is not what a reader reports.
-            output_configuration: Some(OutputConfiguration {
-                s3_uri: invocation.output_metadata_s3_uri(),
-            }),
-            job_submission_time: Some(crate::state::to_date_time(invocation.job_submission_time)),
-            job_completion_time: invocation
-                .job_completion_time
-                .map(crate::state::to_date_time),
-            job_duration_in_seconds: invocation.job_duration_in_seconds(),
-        })
+        Ok(answer)
     }
 }

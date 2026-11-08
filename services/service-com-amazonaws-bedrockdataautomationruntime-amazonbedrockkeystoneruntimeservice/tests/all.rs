@@ -15,8 +15,14 @@
 mod asset_processing_configuration;
 #[path = "all/control_plane_reference_resolution.rs"]
 mod control_plane_reference_resolution;
+#[path = "all/cross_account_profile_authorization.rs"]
+mod cross_account_profile_authorization;
 #[path = "all/data_automation_invocations.rs"]
 mod data_automation_invocations;
+#[path = "all/input_image_classification.rs"]
+mod input_image_classification;
+#[path = "all/job_completion_events.rs"]
+mod job_completion_events;
 #[path = "all/job_output_location_and_outcome.rs"]
 mod job_output_location_and_outcome;
 #[path = "all/minted_arn_region_segment.rs"]
