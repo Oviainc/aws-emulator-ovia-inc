@@ -56,6 +56,13 @@ const NAME_ALREADY_EXISTS_MESSAGE: &str =
     "The name that you are using to create a field level encryption profile is associated with \
      another field level encryption profile in your account.";
 
+/// The sentence `FieldLevelEncryptionProfileAlreadyExists` carries when the CALLER REFERENCE a
+/// create submits is one another profile of the account already holds — spelled out here
+/// rather than taken from the crate, for the reason [`NAME_ALREADY_EXISTS_MESSAGE`] is.
+const CALLER_REFERENCE_ALREADY_EXISTS_MESSAGE: &str =
+    "The caller reference that you are using to create a field level encryption profile is \
+     associated with another field level encryption profile in your account.";
+
 // ---------------------------------------------------------------------------
 // Calling the profile surface
 // ---------------------------------------------------------------------------
@@ -797,10 +804,16 @@ async fn a_caller_reference_names_at_most_one_profile() {
             refused.raw
         );
         let message = refused.root().find_text("Message").unwrap_or_default();
+        assert_eq!(
+            message, CALLER_REFERENCE_ALREADY_EXISTS_MESSAGE,
+            "case {:?}: expected the service's fixed sentence for a taken caller reference, got \
+             {message:?}",
+            row.case
+        );
         assert!(
-            message.contains(&id),
-            "case {:?}: expected the refusal to name the profile holding the reference ({id}), \
-             got {message:?}",
+            !message.contains(&id),
+            "case {:?}: the sentence must not name the profile holding the reference ({id}), got \
+             {message:?}",
             row.case
         );
 

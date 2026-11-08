@@ -2203,17 +2203,20 @@ pub fn origin_access_identity_in_use() -> crate::ops::types::CloudFrontOriginAcc
     }
 }
 
-/// The sentence `CloudFrontOriginAccessIdentityAlreadyExists` carries, up to the identity
-/// the caller reference is already associated with, which is named at the end — the one
-/// piece of request-derived detail in it, and the one a caller cannot work out for
-/// itself. The same shape [`distribution_already_exists_message`] takes, for the same
-/// rule applied to the other resource.
-pub fn origin_access_identity_already_exists_message(existing_id: &str) -> String {
-    format!(
-        "The caller reference that you are using to create an origin access identity is \
-         associated with another identity. Already exists: {existing_id}"
-    )
-}
+/// The sentence `CloudFrontOriginAccessIdentityAlreadyExists` carries, on the wire.
+///
+/// The WIRE text — what the recorded service answers this code with, and what this emulator
+/// therefore serves. It differs from the prose the MODEL's documentation of the shape uses
+/// (which states the condition rather than a served sentence): this one states what the
+/// condition IS — the caller reference the request carried already names an identity.
+///
+/// The WHOLE sentence is fixed, as [`PUBLIC_KEY_ALREADY_EXISTS_MESSAGE`] is for the
+/// neighbouring resource: the conflict is over the reference the REQUEST submitted, so the
+/// caller already holds it, and the identifier of the identity that holds it is no part of
+/// the text.
+pub const ORIGIN_ACCESS_IDENTITY_ALREADY_EXISTS_MESSAGE: &str =
+    "The caller reference you are using to create the CloudFront origin access identity is \
+     associated with another identity.";
 
 /// The modelled `InvalidArgument` for a `ListStreamingDistributions` `Marker` that is no
 /// resume point this service ever handed out.
@@ -2994,17 +2997,22 @@ pub const FIELD_LEVEL_ENCRYPTION_PROFILE_IN_USE_MESSAGE: &str =
     "The field level encryption profile is currently associated with a field level encryption \
      config. Please disassociate the profile before deleting.";
 
-/// The sentence `FieldLevelEncryptionProfileAlreadyExists` carries — "The specified profile
-/// for field-level encryption already exists." — up to the profile the caller reference is
-/// already associated with, which it names at the end: the one piece of store-derived detail
-/// in it, and the one a caller cannot work out for itself. The same shape
-/// [`origin_access_identity_already_exists_message`] takes, for the same rule applied to the
-/// other resource.
-pub fn field_level_encryption_profile_already_exists_message(existing_id: &str) -> String {
-    format!(
-        "The specified profile for field-level encryption already exists: {existing_id}"
-    )
-}
+/// The sentence `FieldLevelEncryptionProfileAlreadyExists` carries when the CALLER REFERENCE
+/// a create submits is one another profile already holds, on the wire.
+///
+/// The WIRE text — what the recorded service answers this code with, and what this emulator
+/// therefore serves. It differs from the sentence the MODEL's documentation of the shape uses
+/// ("The specified profile for field-level encryption already exists."): that one documents
+/// the condition, this one states what the condition IS — the caller reference the request
+/// carried already names a profile of this account.
+///
+/// The WHOLE sentence is fixed, for the reason
+/// [`FIELD_LEVEL_ENCRYPTION_PROFILE_NAME_ALREADY_EXISTS_MESSAGE`] is: the conflict is over the
+/// reference the REQUEST submitted, so the caller already holds it, and the identifier of the
+/// profile that holds it is no part of the text.
+pub const FIELD_LEVEL_ENCRYPTION_PROFILE_ALREADY_EXISTS_MESSAGE: &str =
+    "The caller reference that you are using to create a field level encryption profile is \
+     associated with another field level encryption profile in your account.";
 
 /// The sentence `FieldLevelEncryptionProfileAlreadyExists` carries when it is the profile
 /// NAME that is already taken, on the wire.
@@ -3091,15 +3099,23 @@ pub const FIELD_LEVEL_ENCRYPTION_CONFIG_IN_USE_MESSAGE: &str =
     "The field level encryption config is currently associated with a cache behavior. Please \
      disassociate the config before deleting.";
 
-/// The sentence `FieldLevelEncryptionConfigAlreadyExists` carries — "The specified
-/// configuration for field-level encryption already exists." — up to the configuration the
-/// caller reference is already associated with, which it names at the end: the one piece of
-/// store-derived detail in it, and the one a caller cannot work out for itself. The same
-/// shape [`field_level_encryption_profile_already_exists_message`] takes, for the same rule
-/// applied to the other resource.
-pub fn field_level_encryption_config_already_exists_message(existing_id: &str) -> String {
-    format!("The specified configuration for field-level encryption already exists: {existing_id}")
-}
+/// The sentence `FieldLevelEncryptionConfigAlreadyExists` carries when the CALLER REFERENCE a
+/// create submits is one another configuration already holds, on the wire.
+///
+/// The WIRE text — what the recorded service answers this code with, and what this emulator
+/// therefore serves. It differs from the sentence the MODEL's documentation of the shape uses
+/// ("The specified configuration for field-level encryption already exists."): that one
+/// documents the condition, this one states what the condition IS — the caller reference the
+/// request carried already names a configuration of this account. The service words it
+/// "field level encryption config", as [`NO_SUCH_FIELD_LEVEL_ENCRYPTION_CONFIG_MESSAGE`] does.
+///
+/// The WHOLE sentence is fixed, as
+/// [`FIELD_LEVEL_ENCRYPTION_PROFILE_ALREADY_EXISTS_MESSAGE`] is for the neighbouring resource:
+/// the conflict is over the reference the REQUEST submitted, so the caller already holds it,
+/// and the identifier of the configuration that holds it is no part of the text.
+pub const FIELD_LEVEL_ENCRYPTION_CONFIG_ALREADY_EXISTS_MESSAGE: &str =
+    "The caller reference that you are using to create a field level encryption config is \
+     associated with another field level encryption config in your account.";
 
 /// The modelled `TooManyFieldLevelEncryptionConfigs` (HTTP 400) for a create that would take
 /// the store past [`MAX_FIELD_LEVEL_ENCRYPTION_CONFIGS`].

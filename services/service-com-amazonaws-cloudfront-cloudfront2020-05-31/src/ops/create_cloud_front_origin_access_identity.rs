@@ -204,12 +204,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     e_tag: Some(existing.etag.clone()),
                 });
             }
-            let message =
-                crate::state::origin_access_identity_already_exists_message(&existing.id);
+            // The conflict is over the reference the REQUEST carried, so the sentence is
+            // fixed service text and names no stored identifier.
             return Err(
                 CreateCloudFrontOriginAccessIdentityErrorModeled::CloudFrontOriginAccessIdentityAlreadyExists(
                     CloudFrontOriginAccessIdentityAlreadyExists {
-                        message: Some(message),
+                        message: Some(
+                            crate::state::ORIGIN_ACCESS_IDENTITY_ALREADY_EXISTS_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

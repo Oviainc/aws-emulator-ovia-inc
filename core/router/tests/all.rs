@@ -30,8 +30,6 @@ mod cloudformation_rollback_triggers_revert_the_operation;
 // service's span of the sorted list.
 #[path = "all/workspace_lockfile_covers_every_manifest.rs"]
 mod workspace_lockfile_covers_every_manifest;
-#[path = "all/cloudformation_asset_bucket_publishing_role.rs"]
-mod cloudformation_asset_bucket_publishing_role;
 // Declared here, in this same head region, for the reason the entry above records: the
 // appended tail and the sorted `c…` span (where every cloudformation suite lands) are both
 // regions concurrently landing suites add their line to.

@@ -232,19 +232,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A caller reference identifies ONE profile for its whole life: it is "a unique
         // number that ensures that the request can't be replayed", so a create under a
         // reference the store already holds is refused rather than storing a second profile
-        // under it. The sentence names the profile that holds the reference, which is the one
-        // piece of detail the caller cannot work out for itself. A repeat of the whole
-        // request reaches the NAME refusal above instead, since a profile's name travels with
-        // its reference.
-        if let Some(existing) =
-            store.field_level_encryption_profile_by_caller_reference(&config.caller_reference)
+        // under it. The conflict is over the reference the REQUEST carried, so the sentence is
+        // fixed service text and names no stored identifier. A repeat of the whole request
+        // reaches the NAME refusal above instead, since a profile's name travels with its
+        // reference.
+        if store
+            .field_level_encryption_profile_by_caller_reference(&config.caller_reference)
+            .is_some()
         {
-            let message =
-                crate::state::field_level_encryption_profile_already_exists_message(&existing.id);
             return Err(
                 CreateFieldLevelEncryptionProfileErrorModeled::FieldLevelEncryptionProfileAlreadyExists(
                     FieldLevelEncryptionProfileAlreadyExists {
-                        message: Some(message),
+                        message: Some(
+                            crate::state::FIELD_LEVEL_ENCRYPTION_PROFILE_ALREADY_EXISTS_MESSAGE
+                                .to_string(),
+                        ),
                     },
                 )
                 .into(),

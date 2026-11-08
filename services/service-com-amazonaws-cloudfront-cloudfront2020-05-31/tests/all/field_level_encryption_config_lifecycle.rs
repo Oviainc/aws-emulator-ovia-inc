@@ -1043,9 +1043,17 @@ async fn a_caller_reference_names_at_most_one_configuration() {
             refused.raw
         );
         let message = refused.root().find_text("Message").unwrap_or_default();
+        assert_eq!(
+            message,
+            "The caller reference that you are using to create a field level encryption config \
+             is associated with another field level encryption config in your account.",
+            "case {:?}: expected the service's fixed sentence for a taken caller reference, got \
+             {message:?}",
+            row.case
+        );
         assert!(
-            message.contains(&id),
-            "case {:?}: expected the refusal to name the configuration holding the reference \
+            !message.contains(&id),
+            "case {:?}: the sentence must not name the configuration holding the reference \
              ({id}), got {message:?}",
             row.case
         );

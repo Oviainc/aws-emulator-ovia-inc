@@ -29,6 +29,8 @@ mod cache_policy_lifecycle;
 mod cache_policy_list;
 #[path = "all/cache_policy_update.rs"]
 mod cache_policy_update;
+#[path = "all/caller_reference_conflict_wording.rs"]
+mod caller_reference_conflict_wording;
 #[path = "all/caller_reference_immutable.rs"]
 mod caller_reference_immutable;
 #[path = "all/connection_function_code.rs"]

@@ -278,12 +278,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     e_tag: Some(existing.etag.clone()),
                 });
             }
-            let message =
-                crate::state::field_level_encryption_config_already_exists_message(&existing.id);
+            // The conflict is over the reference the REQUEST carried, so the sentence is
+            // fixed service text and names no stored identifier.
             return Err(
                 CreateFieldLevelEncryptionConfigErrorModeled::FieldLevelEncryptionConfigAlreadyExists(
                     FieldLevelEncryptionConfigAlreadyExists {
-                        message: Some(message),
+                        message: Some(
+                            crate::state::FIELD_LEVEL_ENCRYPTION_CONFIG_ALREADY_EXISTS_MESSAGE
+                                .to_string(),
+                        ),
                     },
                 )
                 .into(),
