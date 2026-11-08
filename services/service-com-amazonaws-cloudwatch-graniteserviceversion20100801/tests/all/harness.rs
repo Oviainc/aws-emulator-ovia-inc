@@ -8,7 +8,8 @@
 //! production router does, through ONE definition of the request walk — including the
 //! MULTI-SERVICE emulator the alarm-action suites need, because an alarm's action is an SNS
 //! topic and a notification is asserted where a client sees it, on the topic's SQS
-//! subscription.
+//! subscription — or an EC2 INSTANCE action, whose effect is asserted where a client sees
+//! that: on the instance EC2 reports.
 
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -146,13 +147,18 @@ pub fn publish_managed_rule_template(
 
 /// The emulator the end-to-end alarm-action tests drive: CloudWatch, SNS and SQS on ONE
 /// engine, because an alarm's action is an SNS topic and the notification is asserted where a
-/// client sees it — on the queue subscribed to that topic.
+/// client sees it — on the queue subscribed to that topic. EC2 is mounted beside them for the
+/// same reason: an alarm's EC2 instance action is an operation on an instance, and what it did
+/// is asserted where a client sees that, on the instance EC2 reports.
 pub struct Emulator {
     /// The router every call below is dispatched through.
     pub router: MultiServiceRouter,
+    /// The engine every service above is mounted on, for a suite that has to seed another
+    /// service's store the way that service's own write would.
+    pub engine: Arc<engine::InMemoryEngine>,
 }
 
-/// One emulator with CloudWatch, SNS and SQS mounted on one engine.
+/// One emulator with CloudWatch, SNS, SQS and EC2 mounted on one engine.
 pub fn emulator() -> Emulator {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
@@ -170,7 +176,10 @@ pub fn emulator() -> Emulator {
     router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
         Arc::clone(&engine),
     ));
-    Emulator { router }
+    router.register_service(service_com_amazonaws_ec2_amazonec2::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
+    Emulator { router, engine }
 }
 
 /// The Region every end-to-end call below is signed for: the one every other call in this
@@ -266,14 +275,7 @@ pub async fn sns_call_in_region(
         body.push('&');
         body.push_str(name);
         body.push('=');
-        for byte in value.bytes() {
-            match byte {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    body.push(char::from(byte));
-                }
-                other => body.push_str(&format!("%{other:02X}")),
-            }
-        }
+        body.push_str(&form_value(value));
     }
     let request = http::Request::builder()
         .method("POST")
@@ -293,6 +295,89 @@ pub async fn sns_call_in_region(
     let status = response.status().as_u16();
     let text = String::from_utf8_lossy(response.body()).to_string();
     (status, text)
+}
+
+/// One form field's value, percent-encoded the way a client's own encoder writes it: every
+/// character outside the unreserved set escaped, so a value carrying `&`, `=` or a space
+/// cannot be read as another field. The ONE encoder of this harness's form bodies.
+fn form_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
+}
+
+/// The EC2 API version an `ec2Query` client sends in its form body.
+pub const EC2_API_VERSION: &str = "2016-11-15";
+
+/// One `ec2Query` form call against EC2 — the protocol that service serves — answering its
+/// HTTP status and the XML body. `params` are the indexed form fields EC2 flattens a list
+/// into (`InstanceId.1`).
+pub async fn ec2_call(
+    emulator: &Emulator,
+    action: &str,
+    params: &[(String, String)],
+) -> (u16, String) {
+    let mut body = format!("Action={action}&Version={EC2_API_VERSION}");
+    for (name, value) in params {
+        body.push('&');
+        body.push_str(name);
+        body.push('=');
+        body.push_str(&form_value(value));
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("/")
+        .header("host", format!("ec2.{REGION}.amazonaws.com"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDTESTTESTTEST/20260101/{REGION}/ec2/aws4_request, \
+                 SignedHeaders=host, Signature=0000"
+            ),
+        )
+        .body(bytes::Bytes::from(body))
+        .expect("the test request is well formed");
+    let response = emulator.router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let text = String::from_utf8_lossy(response.body()).to_string();
+    (status, text)
+}
+
+/// The same EC2 call, requiring a 200 and answering the XML body.
+pub async fn ec2(emulator: &Emulator, action: &str, params: &[(String, String)]) -> String {
+    let (status, text) = ec2_call(emulator, action, params).await;
+    assert_eq!(
+        status, 200,
+        "{action}: expected HTTP 200, got {status} / {text}"
+    );
+    text
+}
+
+/// The text of every `<tag>…</tag>` element of an awsQuery response, in document order.
+pub fn elements(body: &str, tag: &str) -> Vec<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let mut found: Vec<String> = Vec::new();
+    let mut rest = body;
+    while let Some(start) = rest.find(&open) {
+        rest = &rest[start + open.len()..];
+        match rest.find(&close) {
+            Some(end) => {
+                found.push(rest[..end].to_string());
+                rest = &rest[end + close.len()..];
+            }
+            None => break,
+        }
+    }
+    found
 }
 
 /// The text of the first `<tag>…</tag>` element of an awsQuery response.

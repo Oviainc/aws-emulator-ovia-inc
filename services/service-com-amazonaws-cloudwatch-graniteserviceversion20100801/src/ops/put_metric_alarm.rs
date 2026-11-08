@@ -269,66 +269,26 @@ use super::types::*;
 
 use std::collections::HashSet;
 
-/// The dimension that makes a metric a per-instance EC2 metric: an EC2 instance action can
-/// only ever execute against the instance the alarm's metric names, and `InstanceId` is the
-/// dimension that names it.
-const INSTANCE_ID_DIMENSION: &str = "InstanceId";
+// Which ARNs name an EC2 instance action, and which dimension makes a metric a per-instance
+// EC2 metric, come from the one definition this crate holds — the same one the EXECUTION of
+// such an action reads the instance off, so the precondition and the execution cannot drift.
+use crate::state::alarm_actions::ec2_instance_actions;
 
-/// The EC2 instance actions an alarm action list may carry, as this operation's own
-/// `AlarmActions` / `OKActions` / `InsufficientDataActions` documentation lists them:
-/// `arn:aws:automate:region:ec2:stop|terminate|reboot|recover` and the equivalent Simple
-/// Workflow forms `arn:aws:swf:region:account-id:action/actions/AWS_EC2.InstanceId.<Action>/1.0`.
-const EC2_INSTANCE_ACTIONS: [&str; 4] = ["stop", "terminate", "reboot", "recover"];
-
-/// The Simple Workflow EC2-instance-action resource prefix, from the same documentation.
-const SWF_EC2_ACTION_PREFIX: &str = "action/actions/AWS_EC2.InstanceId.";
-
-/// Whether `arn` names one of the EC2 instance actions in [`EC2_INSTANCE_ACTIONS`].
+/// Whether `arn` names one of the four EC2 instance actions.
 ///
 /// The partition and region segments are not matched: an EC2 instance action is one
 /// whatever partition or region it names, and an action in another region is still an EC2
 /// instance action (CloudWatch refuses it for the same reason). Any other ARN — an SNS
 /// topic, an Auto Scaling policy, an SSM OpsItem — carries no instance precondition.
 fn is_ec2_instance_action(arn: &str) -> bool {
-    // `arn:<partition>:<service>:<region>:<account>:<resource>`, resource last so a
-    // resource containing `:` stays whole.
-    let mut segments = arn.splitn(6, ':');
-    if segments.next() != Some("arn") {
-        return false;
-    }
-    let _partition = segments.next();
-    let service = segments.next().unwrap_or_default();
-    let _region = segments.next();
-    let account = segments.next().unwrap_or_default();
-    let resource = segments.next().unwrap_or_default();
-    match service {
-        "automate" => {
-            account == "ec2"
-                && EC2_INSTANCE_ACTIONS
-                    .iter()
-                    .any(|action| resource.eq_ignore_ascii_case(action))
-        }
-        "swf" => resource
-            .strip_prefix(SWF_EC2_ACTION_PREFIX)
-            .and_then(|rest| rest.strip_suffix("/1.0"))
-            .is_some_and(|action| {
-                EC2_INSTANCE_ACTIONS
-                    .iter()
-                    .any(|known| action.eq_ignore_ascii_case(known))
-            }),
-        _ => false,
-    }
+    ec2_instance_actions::of_action_arn(arn).is_some()
 }
 
 /// Whether a dimension list identifies one EC2 instance: it carries an `InstanceId`
 /// dimension with a value. A dimension is `Name`/`Value`, both required, so an empty value
 /// names no instance.
 fn dimensioned_by_instance_id(dimensions: Option<&Vec<Dimension>>) -> bool {
-    dimensions.is_some_and(|dimensions| {
-        dimensions
-            .iter()
-            .any(|dimension| dimension.name == INSTANCE_ID_DIMENSION && !dimension.value.is_empty())
-    })
+    ec2_instance_actions::instance_of_dimensions(dimensions.map(Vec::as_slice)).is_some()
 }
 
 /// Whether EVERY metric this alarm watches is dimensioned by `InstanceId`.

@@ -38,16 +38,23 @@
 //! was already due, and what is due NEXT is exactly what the client is no longer here to ask
 //! for.
 //!
-//! Only an SNS topic ARN is delivered to here. Every other action kind an alarm may carry (a
-//! Lambda function, an Auto Scaling policy, an SSM OpsItem, an EC2 instance action) needs its
-//! own invocation path, which is not implemented in this emulator: such an action is logged
-//! and NOTHING is invented for it — no history item claiming it ran.
+//! Two action kinds are executed from here, because each is an operation of another service
+//! this emulator serves: an SNS topic ARN, which receives the notification, and an EC2
+//! INSTANCE action ([`ec2_instance_actions`]), which is the EC2 operation it names performed
+//! on the instance the alarm watches. Every other action kind an alarm may carry (a Lambda
+//! function, an Auto Scaling policy, an SSM OpsItem) needs its own invocation path, which is
+//! not implemented in this emulator: such an action is logged and NOTHING is invented for it
+//! — no history item claiming it ran.
 
 use ::serde_json::{Map, Value};
 
 use crate::ops::types::{
     AlarmHistoryItem, CompositeAlarm, Dimension, MetricAlarm, MetricDataQuery,
 };
+
+/// The EC2 instance actions an alarm action list may carry, and the EC2 operation executing
+/// one performs.
+pub mod ec2_instance_actions;
 /// The ARN namespace of Amazon SNS, whose topics are the action kind this module delivers to.
 const SNS_ARN_NAMESPACE: &str = "sns";
 
@@ -108,6 +115,11 @@ pub struct AlarmNotification {
     pub new_state_value: String,
     /// The action ARNs configured for the state the alarm moved to.
     pub actions: Vec<String>,
+    /// The EC2 instance the alarm's own metric is dimensioned by: the instance an EC2
+    /// instance action among [`Self::actions`] executes against
+    /// ([`ec2_instance_actions::watched_instance_id`]). `None` for an alarm that monitors no
+    /// instance, which is every alarm that carries no such action.
+    pub instance_id: Option<String>,
     /// The SNS `Subject` of the notification, when the alarm's name leaves room for one
     /// inside [`MAX_SUBJECT_CHARS`].
     pub subject: Option<String>,
@@ -142,6 +154,7 @@ impl AlarmNotification {
             new_state_reason: alarm.state_reason.as_deref(),
             old_state_value,
             at_secs,
+            instance_id: ec2_instance_actions::watched_instance_id(alarm),
             detail: vec![("Trigger", metric_trigger_document(alarm))],
         }
         .build()
@@ -181,6 +194,9 @@ impl AlarmNotification {
             new_state_reason: alarm.state_reason.as_deref(),
             old_state_value,
             at_secs,
+            // A composite alarm watches other alarms rather than a metric, so it is
+            // dimensioned by nothing and monitors no instance of its own.
+            instance_id: None,
             detail: vec![
                 (
                     "AlarmRule",
@@ -214,6 +230,9 @@ struct Transition<'a> {
     new_state_reason: Option<&'a str>,
     old_state_value: Option<&'a str>,
     at_secs: f64,
+    /// The EC2 instance the alarm's metric names, for an EC2 instance action among its
+    /// action lists to execute against.
+    instance_id: Option<&'a str>,
     /// The members that say WHAT was evaluated: a metric alarm's `Trigger`, a composite
     /// alarm's `AlarmRule` and the children its rule read. A member whose value is null is
     /// left out of the document.
@@ -316,6 +335,7 @@ impl Transition<'_> {
             alarm_type: self.kind.to_string(),
             new_state_value: self.new_state_value.to_string(),
             actions,
+            instance_id: self.instance_id.map(str::to_string),
             subject,
             message: Value::Object(document).to_string(),
         })
@@ -393,12 +413,33 @@ async fn settle<Eng: Send + Sync + 'static>(
     let mut decided: Vec<Decided> = Vec::new();
     for notification in owed {
         for action in &notification.actions {
+            // An EC2 instance action is not a message to a target: it is an operation of EC2
+            // on the instance the alarm watches, so it is executed there and recorded with
+            // whatever EC2 answered.
+            if ec2_instance_actions::of_action_arn(action).is_some() {
+                let failure = ec2_instance_actions::execute(
+                    callback,
+                    action,
+                    notification.instance_id.as_deref(),
+                )
+                .await;
+                if let Some(failure) = failure.as_deref() {
+                    ::tracing::warn!(
+                        alarm = %notification.alarm_name,
+                        action = %action,
+                        error = %failure,
+                        "an alarm action could not be executed"
+                    );
+                }
+                record_action(&state, &notification, action, failure.as_deref(), now);
+                continue;
+            }
             let Some(region) = ::service_common::arn::region_of(action, SNS_ARN_NAMESPACE) else {
                 ::tracing::warn!(
                     alarm = %notification.alarm_name,
                     action = %action,
-                    "this alarm action is not an SNS topic in a Region this emulator can \
-                     reach; no action kind other than an SNS topic is executed here"
+                    "this alarm action is neither an EC2 instance action nor an SNS topic in \
+                     a Region this emulator can reach; no other action kind is executed here"
                 );
                 continue;
             };
@@ -687,13 +728,16 @@ fn next_due_or_release(
 /// this emulator's transport rather than anything about the action. A failure the target never
 /// answered at all (nothing dispatched, no response to parse) carries no such message, and for
 /// it the chain is the only account of the failure there is.
-fn action_failure<Response>(
-    error: &::aws_smithy_runtime_api::client::result::SdkError<
-        ::aws_sdk_sns::operation::publish::PublishError,
-        Response,
-    >,
+///
+/// One reader for every action kind executed from here, because what a client reads off a
+/// failed action is the invoked service's own sentence whichever service that was.
+fn action_failure<Error, Response>(
+    error: &::aws_smithy_runtime_api::client::result::SdkError<Error, Response>,
 ) -> String
 where
+    Error: ::aws_smithy_types::error::metadata::ProvideErrorMetadata
+        + ::std::error::Error
+        + 'static,
     Response: ::std::fmt::Debug,
 {
     error
@@ -742,15 +786,16 @@ fn action_history_item(
     // What was actually published, so a reader of the record can tell the notification THIS
     // alarm's transition produced from any other message the target received. An action that
     // FAILED handed nothing over, so it reports no published message at all: nothing received
-    // one.
+    // one. Neither does an EC2 instance action, which is an operation performed on an
+    // instance rather than a message handed to a target: nothing was published for it.
     //
     // `AlarmHistoryItem$HistoryData` is `@length 1..4095` and the document is JSON, so it can
     // never be truncated to fit: the published message is the one part of it whose size the
     // alarm's own configuration drives, so it is the part dropped when the whole document
     // would not fit. Each form is rendered at most once, because the document carries the
     // notification itself and is the largest thing this item holds.
-    let with_message = failure
-        .is_none()
+    let with_message = (failure.is_none()
+        && ec2_instance_actions::of_action_arn(action).is_none())
         .then(|| {
             let mut full = document.clone();
             full.insert(

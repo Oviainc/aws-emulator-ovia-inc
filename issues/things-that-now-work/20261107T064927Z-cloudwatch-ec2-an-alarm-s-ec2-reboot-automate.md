@@ -30,6 +30,25 @@ Expected: after SetAlarmState(ALARM) on an alarm whose AlarmActions = [`arn:aws:
 
 Actual: `[mismatch] cloudwatch__ec2.xsvc-cloudwatch-3-alarm-ec2-reboot-action-reboots-instance-and-disabled-twin-untouched — Error: Check timed out after 60.0s`. No reboot and no Action history entry is observed, so the check never reaches either assertion and the emulator yields no verdict for the enabled or the suppressed arm.
 
+## Resolution
+The alarm action executor now carries out EC2 instance actions. An alarm action ARN that names one
+— `arn:aws:automate:<region>:ec2:{stop|terminate|reboot|recover}` or the Simple Workflow form the
+same documentation lists — is, when an alarm whose actions are enabled transitions to the state
+whose action list carries it, that EC2 operation performed in the ARN's Region on the instance the
+alarm's own watched metric is dimensioned by, and the alarm's history gains one `Action` item
+carrying the outcome; an alarm with `ActionsEnabled=false` still executes nothing and records
+nothing. So the enabled arm's instance is really rebooted (a new guest boot appended to the console
+it has written, the instance keeping its id and its `running` state) and `DescribeAlarmHistory`
+reports the `Succeeded` action. See
+`services/service-com-amazonaws-cloudwatch-graniteserviceversion20100801/src/state/alarm_actions/ec2_instance_actions.rs`,
+covered by `tests/all/ec2_instance_action_execution.rs`.
+
+What the recorded check additionally waits for is a console line its launch's user data prints from
+inside the GUEST on every boot, which needs guest execution the emulator has no runtime for — the
+remaining half of
+`issues/things-that-now-work/20261107T160042Z-fis-aws-ec2-reboot-instances-experiment-never-converges.md`,
+whose own reboot check reads the same kind of marker.
+
 ## Steps to Reproduce
 1. Launch two identical EC2 instances in a dedicated VPC/subnet with user data (cloud-boothook) that prints the kernel boot id to the serial console on every boot.
 2. PutMetricAlarm twice, one per instance, on a metric dimensioned by InstanceId with AlarmActions=[`arn:aws:automate:<region>:ec2:reboot`] — one with ActionsEnabled=true, the twin with ActionsEnabled=false.

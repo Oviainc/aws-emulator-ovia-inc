@@ -37,6 +37,11 @@ service-common = { path = "../common" }
 # needed — the emulator supplies the transport, so the SDK's own HTTPS stack and runtime are
 # left out.
 aws-sdk-sns = { version = "1", default-features = false }
+# The AWS SDK for EC2, driven over the same in-process callback: an alarm's EC2 INSTANCE action
+# (`arn:aws:automate:region:ec2:stop|terminate|reboot|recover`) is that EC2 operation performed
+# on the instance the alarm watches (`state::alarm_actions::ec2_instance_actions`). Only the
+# generated client is needed — the emulator supplies the transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
 # GetMetricData's cursor carries a fixed-size digest of the request it was minted for, so a
 # token replayed against a different request is refused at constant token size.
 sha2 = { workspace = true }
@@ -75,6 +80,10 @@ service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 # SQS is mounted with them, because the subscriber of the alarm's topic is a queue and that
 # is where the delivered notification is read.
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# EC2 is mounted with them for the alarm-action suites that drive an EC2 INSTANCE action: the
+# action is an operation on an instance, so what it did is asserted on the instance EC2 itself
+# reports.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [lints]
 workspace = true

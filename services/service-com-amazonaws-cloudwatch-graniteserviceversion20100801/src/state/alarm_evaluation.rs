@@ -505,7 +505,7 @@ fn band_model_metrics(alarm: &MetricAlarm) -> Vec<super::metric_math::SeriesMetr
 /// metric. The query named by `ThresholdMetricId` is what the watched result is compared
 /// AGAINST rather than the result itself, so it is never the watched one however its own
 /// `ReturnData` reads.
-fn watched_query<'array>(
+pub(super) fn watched_query<'array>(
     queries: &'array [MetricDataQuery],
     threshold_metric_id: Option<&str>,
 ) -> Option<&'array MetricDataQuery> {
