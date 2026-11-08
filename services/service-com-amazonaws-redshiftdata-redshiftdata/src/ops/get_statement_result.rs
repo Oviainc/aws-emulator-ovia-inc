@@ -99,7 +99,8 @@
 use super::types::*;
 use crate::state::{
     decode_cursor, encode_cursor, BATCH_PARENT_RESULT_MESSAGE, CURSOR_ROWS, INVALID_TOKEN_MESSAGE,
-    NO_RESULT_MESSAGE, RESULT_PAGE_ROWS, UNKNOWN_QUERY_MESSAGE, UNKNOWN_QUERY_STATUS,
+    JSON_RESULT_READER_REQUIREMENT, NO_RESULT_MESSAGE, RESULT_PAGE_ROWS, UNKNOWN_QUERY_MESSAGE,
+    UNKNOWN_QUERY_STATUS,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -195,6 +196,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // than answered with a page no statement of the batch produced.
         if statement.is_batch {
             return Err(validation(BATCH_PARENT_RESULT_MESSAGE.to_string()));
+        }
+
+        // A statement's rows are read in the format it was SUBMITTED with, and
+        // this operation serves the JSON form: one whose result is read in the
+        // CSV form is refused with the requirement this operation's own
+        // documentation states, and read through the other reader, so the two
+        // never answer for the same statement.
+        if statement.result_format_is_csv() {
+            return Err(validation(JSON_RESULT_READER_REQUIREMENT.to_string()));
         }
 
         // Only a statement that ran to completion AND produced a result set has

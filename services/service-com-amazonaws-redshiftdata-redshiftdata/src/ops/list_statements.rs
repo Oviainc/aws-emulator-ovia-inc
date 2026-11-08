@@ -301,7 +301,7 @@ fn statement_data(statement: &Statement) -> StatementData {
         // with no parameters reports the member absent.
         query_parameters: (!statement.parameters.is_empty()).then(|| statement.parameters.clone()),
         is_batch_statement: Some(statement.is_batch),
-        result_format: Some(statement.result_format.clone()),
+        result_format: Some(statement.reported_result_format()),
         session_id: statement.session_id.clone(),
     }
 }

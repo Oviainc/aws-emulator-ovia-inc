@@ -51,8 +51,18 @@ hex = { workspace = true }
 # opened through `Database::open`, so the copy names no path and opens no file —
 # unlike `VACUUM INTO`, which the authorizer denies for exactly that reason.
 rusqlite = { version = "0.37", features = ["backup", "bundled", "column_decltype", "hooks", "limits"] }
+# `ops::get_statement_result_v2`: the CSV form of a statement's result is
+# WRITTEN by this CSV writer, so the separator, the quoting of a value carrying a
+# comma, a quote or a newline, and the line terminator are a CSV
+# implementation's rather than this service's own rendering.
+csv = "1.4"
 # Mints the `UUID`-shaped statement, query and session identifiers.
 uuid = { version = "1", features = ["v4"] }
+# `state::sql_parameters`: which named placeholders a submitted statement
+# references is read off the statement's own TOKENS, from this dialect-aware SQL
+# tokenizer, so a `:name` inside a string literal or a comment, a `::` cast and a
+# real placeholder are told apart by the SQL grammar rather than by a text scan.
+sqlparser = "0.59"
 # `state::warehouse`: the clients this service resolves a statement's compute
 # target through, over the in-process callback into this same emulator (no network
 # client feature is enabled: the transport is the emulator's own). A provisioned

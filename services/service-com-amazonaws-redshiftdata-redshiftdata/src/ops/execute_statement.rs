@@ -284,6 +284,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(validation("Sql must contain a SQL statement"));
         }
 
+        // Parameters are bound BY NAME, so the request only makes sense when
+        // the names it supplies are the names its statement references: the two
+        // are resolved against each other here, while the submit is still being
+        // answered, so a mismatch is reported to the caller that wrote it rather
+        // than discovered later as a statement that failed.
+        //
+        // Reading the statement's tokens is bounded but BLOCKING work on the
+        // caller's own text, so it runs on the blocking pool — where this
+        // operation runs the engine itself — and never on an async worker.
+        let parameters = input.parameters.clone().unwrap_or_default();
+        let resolved = {
+            let statements = vec![input.sql.clone()];
+            let parameters = parameters.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::state::sql_parameters::resolve(&statements, &parameters)
+            })
+            .await
+        };
+        match resolved {
+            Ok(Ok(())) => {}
+            Ok(Err(mismatch)) => return Err(validation(&mismatch.message())),
+            // The resolution itself failed to run, which says nothing about the
+            // request: a server fault, never an accepted submission.
+            Err(_joined) => return Err(unavailable()),
+        }
+
         // A statement runs on an ENDPOINT, so the target it selected is resolved
         // against the service that owns it before the statement is admitted: a
         // cluster or workgroup that does not exist in this Region has no
@@ -301,18 +327,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An idempotent replay answers with the statement the first call
         // submitted, read back out of state — it never submits a second one. A
         // token that names a BATCH submission is not a replay of one statement,
-        // so it is not answered as one.
+        // so it is not answered as one. The replayed statement's own text and
+        // parameters are re-recorded from THIS request, which is what the
+        // service reports for a token replayed with a different one.
         if let Some(token) = client_token.as_deref() {
             let mut store = state.lock();
             store.materialise_due_transitions();
-            let replayed = store.statement_id_for_client_token(token).map(str::to_string);
-            if let Some(output) = replayed
-                .as_deref()
-                .and_then(|id| store.statement(id))
-                .filter(|statement| !statement.is_batch)
-                .map(output_for)
-            {
-                return Ok(output);
+            let replayed = store
+                .statement_id_for_client_token(token)
+                .map(str::to_string)
+                .filter(|id| {
+                    store
+                        .statement(id)
+                        .is_some_and(|statement| !statement.is_batch)
+                });
+            if let Some(id) = replayed {
+                store.rewrite_submitted_sql(&id, std::slice::from_ref(&input.sql), &parameters);
+                if let Some(output) = store.statement(&id).map(output_for) {
+                    return Ok(output);
+                }
             }
         }
 
@@ -338,7 +371,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             db_user: connection.db_user,
             secret_arn: connection.secret_arn,
             statement_name: non_empty(input.statement_name.as_ref()),
-            parameters: input.parameters.clone().unwrap_or_default(),
+            parameters: parameters.clone(),
             with_event: input.with_event.unwrap_or(false),
             // "If no format is specified, the default is JSON."
             result_format: non_empty(input.result_format.as_ref())
@@ -422,7 +455,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let sql = input.sql.clone();
-        let parameters = input.parameters.clone().unwrap_or_default();
 
         // The execution is the statement's, not the request's: it runs to a
         // terminal status on its own, so two statements submitted at once are

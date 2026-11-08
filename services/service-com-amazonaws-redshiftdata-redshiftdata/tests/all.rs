@@ -44,6 +44,9 @@ mod state_roundtrip;
 #[path = "all/statement_lifecycle.rs"]
 mod statement_lifecycle;
 
+#[path = "all/statement_submission_surface.rs"]
+mod statement_submission_surface;
+
 #[path = "all/statement_wait.rs"]
 mod statement_wait;
 

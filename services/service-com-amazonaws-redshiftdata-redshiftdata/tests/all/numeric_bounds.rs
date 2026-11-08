@@ -25,7 +25,7 @@
 
 use serde_json::{json, Value};
 
-use super::emulator::{error_code, Emulator, QUICK_SQL};
+use super::emulator::{error_code, id_of, Emulator, QUICK_SQL};
 
 /// The `ClusterIdentifier`, `Database` and `DbUser` every row that needs a
 /// warehouse connects through. No Redshift control plane is mounted beside the
@@ -64,10 +64,11 @@ struct Bounded {
 /// Every one of them is modelled `integer`, which is why the far-past-the-bound
 /// values below are `i32`'s extremes.
 ///
-/// `GetStatementResultV2`, `ListSchemas` and `ListTables` are the three
-/// operations of this service that still answer `501`; their bound is checked
-/// before their handler is reached, so they carry `served: false` rather than
-/// being left out.
+/// `GetStatementResultV2` reads the CSV form of a result, so the statement it is
+/// driven with is one submitted in that format; `ListSchemas` and `ListTables`
+/// are the two operations of this service that still answer `501`, and their
+/// bound is checked before their handler is reached, so they carry
+/// `served: false` rather than being left out.
 const BOUNDED: [Bounded; 13] = [
     Bounded {
         operation: "ExecuteStatement",
@@ -123,7 +124,7 @@ const BOUNDED: [Bounded; 13] = [
         path: "waitTimeSeconds",
         min: 1,
         max: 30,
-        served: false,
+        served: true,
     },
     Bounded {
         operation: "ListStatements",
@@ -177,8 +178,9 @@ const BOUNDED: [Bounded; 13] = [
 
 /// The request `operation` is driven with, valid in every respect but the member
 /// under test, so the only thing a refusal can be about is that member's bound.
-/// `id` names a statement the service holds and has finished running.
-fn request_for(operation: &str, id: &str) -> Value {
+/// `id` names a statement the service holds and has finished running, and
+/// `csv_id` one of those whose result is read in the CSV form.
+fn request_for(operation: &str, id: &str, csv_id: &str) -> Value {
     match operation {
         "ExecuteStatement" => {
             let mut request = connection();
@@ -190,7 +192,8 @@ fn request_for(operation: &str, id: &str) -> Value {
             request["Sqls"] = json!([QUICK_SQL]);
             request
         }
-        "DescribeStatement" | "GetStatementResult" | "GetStatementResultV2" => json!({"Id": id}),
+        "DescribeStatement" | "GetStatementResult" => json!({"Id": id}),
+        "GetStatementResultV2" => json!({"Id": csv_id}),
         "ListStatements" | "ListSessions" => json!({}),
         "ListDatabases" => connection(),
         // `Database` is required on the three metadata readers.
@@ -206,6 +209,15 @@ fn constraint_message(response: &Value) -> String {
     response["message"].as_str().unwrap_or_default().to_string()
 }
 
+/// A finished statement whose result is read in the CSV form, so the reader of
+/// that form can be pointed at a statement it serves.
+async fn csv_statement(emulator: &Emulator) -> String {
+    let mut request = connection();
+    request["Sql"] = json!(QUICK_SQL);
+    request["ResultFormat"] = json!("CSV");
+    id_of(&emulator.execute_and_wait(&request).await)
+}
+
 /// RULE: a value outside a member's modelled `@range` is refused with the
 /// constraint envelope naming the member and the bound it broke.
 #[tokio::test]
@@ -214,6 +226,7 @@ async fn a_value_outside_a_modelled_range_is_refused_naming_the_bound_it_broke()
     // A statement the readers can be pointed at, so a refusal is about the
     // bound and never about an id the service holds no query for.
     let id = emulator.run(QUICK_SQL).await;
+    let csv_id = csv_statement(&emulator).await;
 
     for bounded in &BOUNDED {
         // One step past each published bound, and far past each of them: the
@@ -256,7 +269,7 @@ async fn a_value_outside_a_modelled_range_is_refused_naming_the_bound_it_broke()
 
         for (case, value, requirement) in &outside {
             let case = format!("{} {} {case}", bounded.operation, bounded.member);
-            let mut request = request_for(bounded.operation, &id);
+            let mut request = request_for(bounded.operation, &id, &csv_id);
             request[bounded.member] = json!(value);
             let (status, response) = emulator.call(bounded.operation, &request).await;
             assert_eq!(
@@ -289,11 +302,12 @@ async fn a_value_outside_a_modelled_range_is_refused_naming_the_bound_it_broke()
 async fn each_published_bound_is_admitted() {
     let emulator = Emulator::new();
     let id = emulator.run(QUICK_SQL).await;
+    let csv_id = csv_statement(&emulator).await;
 
     for bounded in &BOUNDED {
         for (edge, value) in [("the minimum", bounded.min), ("the maximum", bounded.max)] {
             let case = format!("{} {} at {edge}", bounded.operation, bounded.member);
-            let mut request = request_for(bounded.operation, &id);
+            let mut request = request_for(bounded.operation, &id, &csv_id);
             request[bounded.member] = json!(value);
             let (status, response) = emulator.call(bounded.operation, &request).await;
             let stated = constraint_message(&response);

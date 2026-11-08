@@ -308,6 +308,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "The parameters are available to all SQL statements in the batch. Each
+        // statement can reference any subset of the provided parameters. Each
+        // provided parameter must be referenced by at least one statement": the
+        // names the batch supplies and the names its statements reference are
+        // resolved against each other here, over the batch AS A WHOLE, so a
+        // parameter no statement reads and a placeholder nothing supplies are
+        // both reported to the caller that wrote them.
+        //
+        // Reading each statement's tokens is bounded but BLOCKING work on the
+        // caller's own text, so it runs on the blocking pool — where this
+        // operation runs the engine itself — and never on an async worker.
+        let parameters = input.parameters.clone().unwrap_or_default();
+        let resolved = {
+            let statements = input.sqls.clone();
+            let parameters = parameters.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::state::sql_parameters::resolve(&statements, &parameters)
+            })
+            .await
+        };
+        match resolved {
+            Ok(Ok(())) => {}
+            Ok(Err(mismatch)) => return Err(validation(&mismatch.message())),
+            // The resolution itself failed to run, which says nothing about the
+            // request: a server fault, never an accepted submission.
+            Err(_joined) => return Err(unavailable()),
+        }
+
         // Every statement of the batch runs on an ENDPOINT, so the target this
         // request selected is resolved against the service that owns it before
         // the batch is admitted — the same gate `ExecuteStatement` applies,
@@ -338,18 +366,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An idempotent replay answers with the batch the first call submitted,
         // read back out of state — it never submits a second one. A token that
         // names a statement submitted by `ExecuteStatement` is not a replay of
-        // a batch, so it is not answered as one.
+        // a batch, so it is not answered as one. The replayed batch's statements
+        // and parameters are re-recorded from THIS request, which is what the
+        // service reports for a token replayed with a different one.
         if let Some(token) = client_token.as_deref() {
             let mut store = state.lock();
             store.materialise_due_transitions();
-            let replayed = store.statement_id_for_client_token(token).map(str::to_string);
-            if let Some(output) = replayed
-                .as_deref()
-                .and_then(|id| store.statement(id))
-                .filter(|statement| statement.is_batch)
-                .map(output_for)
-            {
-                return Ok(output);
+            let replayed = store
+                .statement_id_for_client_token(token)
+                .map(str::to_string)
+                .filter(|id| store.statement(id).is_some_and(|statement| statement.is_batch));
+            if let Some(id) = replayed {
+                store.rewrite_submitted_sql(&id, &input.sqls, &parameters);
+                if let Some(output) = store.statement(&id).map(output_for) {
+                    return Ok(output);
+                }
             }
         }
 
@@ -378,14 +409,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The parameters are available to all SQL statements in the batch.
             // Each statement can reference any subset of the provided
             // parameters", so each statement is bound only the parameters the
-            // ENGINE reports it references. The batch-level rule that every
-            // provided parameter must be referenced by at least one statement is
-            // NOT enforced: the names a statement references are known only once
-            // the engine can prepare it, and a batch's later statements often
-            // cannot be prepared until its earlier ones have run (a SELECT from
-            // a table the first statement creates), so a parameter no statement
-            // reads is accepted and bound to nothing.
-            parameters: input.parameters.unwrap_or_default(),
+            // ENGINE reports it references. That every supplied parameter is
+            // referenced by at least one of them, and that every placeholder
+            // they reference is supplied, was resolved against the batch's own
+            // text before it was admitted.
+            parameters,
             with_event: input.with_event.unwrap_or(false),
             // "If no format is specified, the default is JSON."
             result_format: non_empty(input.result_format.as_ref())

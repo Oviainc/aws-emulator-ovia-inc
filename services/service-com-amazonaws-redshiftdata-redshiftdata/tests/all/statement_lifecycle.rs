@@ -898,8 +898,9 @@ async fn list_statements_pages_newest_first_without_gaps_or_repeats() {
         "ExecuteStatement submits a single statement: {newest}"
     );
     assert_eq!(
-        newest["ResultFormat"], "JSON",
-        "the default result format is JSON: {newest}"
+        newest["ResultFormat"], "json",
+        "the default result format is JSON, reported in the spelling the service \
+         answers with: {newest}"
     );
 }
 
@@ -2094,8 +2095,7 @@ async fn the_number_of_open_databases_is_bounded() {
 #[tokio::test]
 async fn the_operations_outside_this_slice_still_answer_not_implemented() {
     let emulator = Emulator::new();
-    let cases: [(&str, Value); 3] = [
-        ("GetStatementResultV2", json!({"Id": ABSENT_ID})),
+    let cases: [(&str, Value); 2] = [
         (
             "ListSchemas",
             json!({"ClusterIdentifier": "my-cluster", "Database": "dev"}),

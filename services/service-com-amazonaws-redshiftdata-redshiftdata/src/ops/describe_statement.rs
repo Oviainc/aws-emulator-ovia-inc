@@ -264,7 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .collect()
             }),
             workgroup_name: statement.target.workgroup_name(),
-            result_format: Some(statement.result_format.clone()),
+            result_format: Some(statement.reported_result_format()),
             session_id: statement.session_id.clone(),
             execution_mode: Some(statement.execution_mode().to_string()),
         })

@@ -73,6 +73,23 @@ rationale is recorded here so it is visible with the code rather than only in a 
   while waiting for a database a statement is running on and between copy steps, so it is
   always the copy's own deadline that ends it.
 
+### The two text formats this crate does not hand-render
+
+Two pure-Rust crates carry the two text formats a statement's text and its result
+would otherwise be scanned and written by hand:
+
+* `sqlparser` — which named placeholders (`:name`) a submitted statement references is
+  read off the statement's own TOKENS, so a `:name` inside a string literal or a
+  comment, a `::` cast and a real placeholder are told apart by the SQL grammar rather
+  than by a scan of the text. That is what lets a submit resolve its `Parameters`
+  against its SQL before the statement is admitted (`src/state/sql_parameters.rs`).
+* `csv` — `GetStatementResultV2` answers a statement's rows as CSV text, so the
+  separator, the quoting of a value carrying a comma, a quote or a newline, and the
+  CRLF record terminator are a CSV writer's rather than this crate's own rendering.
+
+Neither adds a native component: both are pure Rust, and this crate keeps
+`#![forbid(unsafe_code)]`.
+
 ## Layout
 
 ```

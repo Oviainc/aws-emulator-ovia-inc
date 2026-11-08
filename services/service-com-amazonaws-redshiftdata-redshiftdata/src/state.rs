@@ -52,6 +52,10 @@ use crate::ops::types::{ColumnMetadata, Field, SqlParameter};
 /// fact the services that OWN those resources answer, not this one.
 pub mod warehouse;
 
+/// Resolving a submission's named `Parameters` against the placeholders the SQL
+/// it submits really references.
+pub mod sql_parameters;
+
 /// Page size `ListStatements` uses when the request leaves `MaxResults` at its
 /// modelled default of 0 — the modelled maximum, so an unparameterised call
 /// returns as much as one page can hold.
@@ -77,6 +81,30 @@ pub const RESULT_PAGE_ROWS: usize = 1_000;
 /// result refuses it the same way.
 pub const NO_RESULT_MESSAGE: &str =
     "Query does not have result. Please check query status with DescribeStatement.";
+
+/// What a reader of a statement's result requires of the statement it is asked
+/// for, when the statement's result is not read in the format that reader
+/// serves.
+///
+/// A statement's rows are read in the format the statement was SUBMITTED with,
+/// and each format has its own reader: `GetStatementResult` serves the JSON form
+/// and `GetStatementResultV2` the CSV one, so the two are mutually exclusive for
+/// any one statement. Each refuses with the requirement the model DOCUMENTS for
+/// it, rather than with a sentence of this emulator's own: "The ExecuteStatement
+/// or BatchExecuteStatement operation that ran the SQL statement must have
+/// specified ResultFormat as JSON, or let the format default to JSON"
+/// (`smithy_query(query="doc",shape="GetStatementResult")`) and "… must have
+/// specified ResultFormat as CSV"
+/// (`smithy_query(query="doc",shape="GetStatementResultV2")`).
+pub const JSON_RESULT_READER_REQUIREMENT: &str =
+    "The ExecuteStatement or BatchExecuteStatement operation that ran the SQL statement must \
+     have specified ResultFormat as JSON, or let the format default to JSON.";
+
+/// The same requirement, as the CSV reader's own documentation states it. See
+/// [`JSON_RESULT_READER_REQUIREMENT`].
+pub const CSV_RESULT_READER_REQUIREMENT: &str =
+    "The ExecuteStatement or BatchExecuteStatement operation that ran the SQL statement must \
+     have specified ResultFormat as CSV.";
 
 /// The message the Data API answers a result read addressed to a BATCH's own
 /// `Id` with: a batch is not a query, and its results live on the `:<n>` ids of
@@ -662,8 +690,11 @@ pub struct Statement {
     result_size: i64,
     /// Whether the caller asked for an EventBridge event.
     pub with_event: bool,
-    /// `ResultFormat`, defaulted to JSON as the model documents.
-    pub result_format: String,
+    /// `ResultFormat` as the request SPELLED it: one of the modelled tokens,
+    /// defaulted to JSON as the model documents. Read through
+    /// [`Statement::reported_result_format`], which is the spelling the API
+    /// reports it in.
+    result_format: String,
     /// The `Parameters` the statement was submitted with.
     pub parameters: Vec<SqlParameter>,
     /// The session the statement ran in, when the caller used one.
@@ -796,6 +827,27 @@ impl Statement {
     /// it was submitted with.
     pub fn execution_mode(&self) -> &'static str {
         self.execution_mode.as_str()
+    }
+
+    /// `ResultFormat`: the format this statement's result is read in, in the
+    /// spelling the Data API REPORTS it in — the LOWER-CASE form of the token
+    /// the request supplied.
+    ///
+    /// The model fixes the spelling of the INPUT member only (`ResultFormatString`
+    /// is an enum of `JSON` and `CSV`, and it types `ExecuteStatementInput`'s
+    /// member as well as every member that reports a statement's format); the
+    /// service answers the lower-case form, which is what a client comparing the
+    /// member against the reader it should use reads. So the submitted token is
+    /// what is accepted and stored, and this is what every reporting member
+    /// carries.
+    pub fn reported_result_format(&self) -> String {
+        self.result_format.to_ascii_lowercase()
+    }
+
+    /// Whether this statement's result is read in the CSV form: the format the
+    /// request asked for, whatever case it spelled the token in.
+    pub fn result_format_is_csv(&self) -> bool {
+        self.result_format.eq_ignore_ascii_case("CSV")
     }
 
     /// `QueryString`: the text of one statement. A batch has no single query
@@ -2510,6 +2562,52 @@ impl ComAmazonawsRedshiftdataRedshiftdataState {
     /// The `Id` a previous `ExecuteStatement` with this `ClientToken` minted.
     pub fn statement_id_for_client_token(&self, token: &str) -> Option<&str> {
         self.client_tokens.get(token).map(String::as_str)
+    }
+
+    /// Re-record the SQL and the `Parameters` a submission carries onto the
+    /// statement an earlier submission with the same `ClientToken` already
+    /// minted.
+    ///
+    /// A replayed token RUNS nothing: the statement keeps the execution the
+    /// first submission gave it, so its status, timestamps, duration, counts and
+    /// result set all stay as that execution left them. What the record reports
+    /// as the statement's text and parameters is the LAST request submitted
+    /// under the token, which is what the service reports for a token replayed
+    /// with a different request — so a caller reading the record back sees the
+    /// request it last sent rather than one the service silently ignored.
+    ///
+    /// A replay mints no statement either, so a submission is re-recorded only
+    /// when it carries exactly the statements the record already holds — one for
+    /// a single statement, one per statement of a batch. A submission naming a
+    /// different number of them is not a re-submission of those statements, so
+    /// the record keeps the text and the parameters it has rather than reporting
+    /// some statements from one request and the rest from another.
+    pub fn rewrite_submitted_sql(
+        &mut self,
+        id: &str,
+        statements: &[String],
+        parameters: &[SqlParameter],
+    ) {
+        let Some(statement) = self.statements.get_mut(id) else {
+            return;
+        };
+        let recorded = if statement.is_batch {
+            statement.sub_statements.len()
+        } else {
+            1
+        };
+        if statements.len() != recorded {
+            return;
+        }
+        statement.parameters = parameters.to_vec();
+        if statement.is_batch {
+            for (sub_statement, sql) in statement.sub_statements.iter_mut().zip(statements) {
+                sub_statement.sql = sql.clone();
+                sub_statement.parameters = parameters.to_vec();
+            }
+        } else if let Some(sql) = statements.first() {
+            statement.sql = sql.clone();
+        }
     }
 
     /// Every retained statement, newest submission first — the order

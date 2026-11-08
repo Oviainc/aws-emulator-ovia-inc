@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetStatementResultV2
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetStatementResultV2`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetStatementResultV2::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Returns the rows the statement named by `Id` produced, in the CSV form the
+//! statement asked for: one record carrying the result's header line and its
+//! rows, paged with a `NextToken`. The CSV reader and the JSON one
+//! ([`crate::ops::get_statement_result`]) are mutually exclusive for any one
+//! statement — a statement's rows are read in the format it was SUBMITTED with
+//! — so this refuses a statement whose result is read in the JSON form. A
+//! reporting operation: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -102,6 +100,11 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state::{
+    decode_cursor, encode_cursor, BATCH_PARENT_RESULT_MESSAGE, CSV_RESULT_READER_REQUIREMENT,
+    CURSOR_ROWS, INVALID_TOKEN_MESSAGE, NO_RESULT_MESSAGE, RESULT_PAGE_ROWS,
+    UNKNOWN_QUERY_MESSAGE, UNKNOWN_QUERY_STATUS,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -174,18 +177,171 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetStatementResultV2` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetStatementResultV2ErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetStatementResultV2"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(unavailable(
+                "the Redshift Data API state store is unavailable",
+            ));
+        };
+
+        let mut store = state.lock();
+        store.materialise_due_transitions();
+        let Some(statement) = store.statement(&input.id) else {
+            return Err(no_such_query(&input.id));
+        };
+
+        // A batch is not a query: `BatchExecuteStatement` answers with one
+        // parent `Id` whose statements each carry their own `<id>:<n>`, and a
+        // result is read per statement — exactly as the JSON reader has it.
+        if statement.is_batch {
+            return Err(validation(BATCH_PARENT_RESULT_MESSAGE.to_string()));
+        }
+
+        // A statement's rows are read in the format it was SUBMITTED with, and
+        // this operation serves the CSV form: one whose result is read in the
+        // JSON form is refused with the requirement this operation's own
+        // documentation states, and read through the other reader, so the two
+        // never answer for the same statement.
+        if !statement.result_format_is_csv() {
+            return Err(validation(CSV_RESULT_READER_REQUIREMENT.to_string()));
+        }
+
+        // Only a statement that ran to completion AND produced a result set has
+        // rows to fetch: "no result set" and "an empty result set" are
+        // different answers, so a statement that produced none is refused as a
+        // missing result rather than served an empty page.
+        if !statement.has_fetchable_result() {
+            if !statement.status.is_terminal() {
+                return Err(validation(format!(
+                    "Query {} has not finished running; its status is {}",
+                    input.id,
+                    statement.status.as_str()
+                )));
+            }
+            return Err(GetStatementResultV2ErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: NO_RESULT_MESSAGE.to_string(),
+                    resource_id: input.id.clone(),
+                },
+            )
+            .into());
+        }
+
+        let (rows, column_metadata) = match statement.result() {
+            Some(result) => (result.rows.as_slice(), result.column_metadata.clone()),
+            None => (&[][..], Vec::new()),
+        };
+
+        // The cursor kind names the statement as well as the operation, so a
+        // token issued while paging one statement's rows is refused for any
+        // other statement rather than silently resolving to the same offset in
+        // a different result set.
+        let cursor_kind = format!("{CURSOR_ROWS}:{}", statement.id);
+        let offset = match input.next_token.as_deref() {
+            None => 0_usize,
+            Some(token) => {
+                let position = decode_cursor(&cursor_kind, token)
+                    .and_then(|position| usize::try_from(position).ok())
+                    .filter(|position| *position <= rows.len());
+                match position {
+                    Some(position) => position,
+                    None => return Err(validation(INVALID_TOKEN_MESSAGE.to_string())),
+                }
+            }
+        };
+
+        let end = offset.saturating_add(RESULT_PAGE_ROWS).min(rows.len());
+        let records = csv_records(&column_metadata, &rows[offset..end], offset == 0)
+            .map_err(|reason| unavailable(&format!("the result could not be rendered: {reason}")))?;
+        Ok(GetStatementResultV2Output {
+            records,
+            column_metadata: Some(column_metadata),
+            total_num_rows: i64::try_from(rows.len()).unwrap_or(i64::MAX),
+            result_format: Some(statement.reported_result_format()),
+            // A token only when rows remain, so a client stops paging when it
+            // has seen the whole result set.
+            next_token: (end < rows.len())
+                .then(|| encode_cursor(&cursor_kind, u64::try_from(end).unwrap_or(u64::MAX))),
+        })
     }
+}
+
+/// The page's rows as the CSV form of the result: one `CSVRecords` entry
+/// carrying the page as CSV text, the FIRST page led by the header line of the
+/// result's column names.
+///
+/// The text is written by the `csv` crate, so the separator, the quoting of a
+/// value carrying a comma, a quote or a newline, and the line terminator are a
+/// CSV writer's and not this service's own rendering. The terminator is the
+/// CRLF the CSV format itself specifies (RFC 4180 §2: "Each record is located
+/// on a separate line, delimited by a line break (CRLF)"), so a record's own
+/// embedded newline stays distinguishable from the end of a record.
+fn csv_records(
+    column_metadata: &[ColumnMetadata],
+    rows: &[Vec<Field>],
+    with_header: bool,
+) -> Result<Vec<QueryRecords>, String> {
+    let mut writer = csv::WriterBuilder::new()
+        .terminator(csv::Terminator::CRLF)
+        .from_writer(Vec::new());
+    if with_header {
+        let header: Vec<String> = column_metadata
+            .iter()
+            .map(|column| column.name.clone().unwrap_or_default())
+            .collect();
+        writer.write_record(&header).map_err(|e| e.to_string())?;
+    }
+    for row in rows {
+        let cells: Vec<String> = row.iter().map(csv_cell).collect();
+        writer.write_record(&cells).map_err(|e| e.to_string())?;
+    }
+    let rendered = writer
+        .into_inner()
+        .map_err(|error| error.error().to_string())?;
+    let rendered = String::from_utf8(rendered).map_err(|error| error.to_string())?;
+    Ok(vec![QueryRecords::CSVRecords(rendered)])
+}
+
+/// One value as its CSV cell: the text the value IS. A SQL NULL carries no
+/// text at all, which is the empty cell; binary carries its bytes as
+/// hexadecimal, the text form Amazon Redshift prints a `VARBYTE` value in.
+fn csv_cell(field: &Field) -> String {
+    match field {
+        Field::isNull(_) => String::new(),
+        Field::booleanValue(value) => value.to_string(),
+        Field::longValue(value) => value.to_string(),
+        Field::doubleValue(value) => value.to_string(),
+        Field::stringValue(value) => value.clone(),
+        Field::blobValue(value) => hex::encode(value),
+    }
+}
+
+/// Refuse the request as invalid, with the `ValidationException` this operation
+/// models.
+fn validation(message: String) -> GetStatementResultV2Error {
+    GetStatementResultV2ErrorModeled::ValidationException(ValidationException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// A fault of this emulator rather than of the request — a server error.
+fn unavailable(message: &str) -> GetStatementResultV2Error {
+    GetStatementResultV2ErrorModeled::InternalServerException(InternalServerException {
+        message: message.to_string(),
+    })
+    .into()
+}
+
+/// Refuse an `Id` this service holds no query for — the same refusal, in the
+/// same fixed words and at the same status, as every other reader of a statement
+/// gives (see `describe_statement::no_such_query`).
+fn no_such_query(id: &str) -> GetStatementResultV2Error {
+    crate::scaffolded::Scaffolded::modeled_with_status(
+        GetStatementResultV2ErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+            message: UNKNOWN_QUERY_MESSAGE.to_string(),
+            resource_id: id.to_string(),
+        }),
+        UNKNOWN_QUERY_STATUS,
+    )
 }
