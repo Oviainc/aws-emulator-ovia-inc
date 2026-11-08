@@ -41,6 +41,8 @@ mod admin_user_enabled_state;
 mod admin_user_global_sign_out;
 #[path = "all/admin_user_pool_lifecycle.rs"]
 mod admin_user_pool_lifecycle;
+#[path = "all/alias_attribute_ownership.rs"]
+mod alias_attribute_ownership;
 #[path = "all/app_client_and_pool_configuration.rs"]
 mod app_client_and_pool_configuration;
 #[path = "all/app_client_refusal_wording.rs"]

@@ -311,32 +311,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // of the pool: "If `ForceAliasCreation` is `false`, the API throws an
             // `AliasExistsException` error" for a value another user already holds, and
             // `true` "migrates the alias from the previous user to the newly created user"
-            // (`ConfirmSignUp.ForceAliasCreation` in this service's model).
-            let migrate_from = if pool.is_alias_attribute(&attribute)
-                && pool.alias_taken(&attribute, &destination, &username)
-            {
-                if !input.force_alias_creation {
+            // (`ConfirmSignUp.ForceAliasCreation` in this service's model). So the claim
+            // takes the value from EVERY other holder of it
+            // ([`crate::state::UserPool::alias_holder_keys`]), which is the same set the
+            // administrative attribute writes demote.
+            let migrate_from = if pool.is_alias_attribute(&attribute) {
+                let holders = pool.alias_holder_keys(&attribute, &destination, &username);
+                if !holders.is_empty() && !input.force_alias_creation {
                     return Err(alias_exists(&attribute));
                 }
-                pool.users
-                    .iter()
-                    .find(|(_, other)| {
-                        other.username != username
-                            && other.destination_of(&attribute).as_deref()
-                                == Some(destination.as_str())
-                            && other.alias_is_active(&attribute)
-                    })
-                    .map(|(key, _)| key.clone())
+                holders
             } else {
-                None
+                Vec::new()
             };
 
             let pool = guard.pool_mut(&user_pool_id).ok_or_else(internal_error)?;
-            // The migrated alias is no longer the previous holder's: its value stays, but
+            // The migrated alias is no longer the previous holders': each value stays, but
             // the flag that made it an alias no longer vouches for it.
-            if let Some(key) = migrate_from {
-                if let Some(flag) = crate::state::verified_flag(&attribute) {
-                    if let Some(previous) = pool.users.get_mut(&key) {
+            if let Some(flag) = crate::state::verified_flag(&attribute) {
+                for key in &migrate_from {
+                    if let Some(previous) = pool.users.get_mut(key) {
                         previous
                             .attributes
                             .insert(flag.to_string(), crate::state::FLAG_UNCONFIRMED.to_string());
