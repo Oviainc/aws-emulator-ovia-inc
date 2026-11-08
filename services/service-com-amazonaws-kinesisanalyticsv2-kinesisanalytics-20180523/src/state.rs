@@ -416,6 +416,7 @@ impl Application {
     ) -> Result<(), String> {
         let name = self.name.clone();
         let runtime_environment = self.runtime_environment.clone();
+        let application_mode = self.application_mode.clone();
         let cfg = self.configuration.get_or_insert_with(Default::default);
 
         if let Some(code) = update.application_code_configuration_update.as_ref() {
@@ -767,7 +768,7 @@ impl Application {
             }
         }
 
-        complete_with_service_defaults(cfg, &runtime_environment);
+        complete_with_service_defaults(cfg, &runtime_environment, &application_mode);
         Ok(())
     }
 
@@ -1156,12 +1157,13 @@ impl ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State {
         &mut self,
         cfg: Option<&ApplicationConfiguration>,
         runtime_environment: &str,
+        application_mode: &str,
     ) -> ApplicationConfigurationDescription {
         let mut description = match cfg {
             Some(cfg) => self.describe_supplied_configuration(cfg),
             None => ApplicationConfigurationDescription::default(),
         };
-        complete_with_service_defaults(&mut description, runtime_environment);
+        complete_with_service_defaults(&mut description, runtime_environment, application_mode);
         description
     }
 
@@ -1471,16 +1473,69 @@ impl ComAmazonawsKinesisanalyticsv2Kinesisanalytics20180523State {
 const CONFIGURATION_DEFAULT: &str = "DEFAULT";
 const CONFIGURATION_CUSTOM: &str = "CUSTOM";
 
-/// The checkpointing values a `DEFAULT` checkpoint configuration runs with, from the
+/// The checkpointing intervals a `DEFAULT` checkpoint configuration runs with, from the
 /// `CheckpointConfiguration$ConfigurationType` doc: "If this value is set to `DEFAULT`,
 /// the application will use the following values, even if they are set to other values
 /// using APIs or application code: CheckpointingEnabled true, CheckpointInterval 60000,
-/// MinPauseBetweenCheckpoints 5000".
-const DEFAULT_CHECKPOINTING_ENABLED: bool = true;
-/// See [`DEFAULT_CHECKPOINTING_ENABLED`]; milliseconds, as the member is documented.
+/// MinPauseBetweenCheckpoints 5000". Whether checkpointing itself is on is the one value
+/// of that table the application's KIND decides ([`ApplicationDefaults`]); milliseconds,
+/// as both members are documented.
 const DEFAULT_CHECKPOINT_INTERVAL: i64 = 60_000;
-/// See [`DEFAULT_CHECKPOINTING_ENABLED`]; milliseconds, as the member is documented.
+/// See [`DEFAULT_CHECKPOINT_INTERVAL`].
 const DEFAULT_MIN_PAUSE_BETWEEN_CHECKPOINTS: i64 = 5_000;
+
+/// The default values that are NOT the same for every application this service runs,
+/// because the two features they switch — checkpointing and snapshots — are features of a
+/// Managed Service for Apache Flink application: `CheckpointConfiguration$CheckpointingEnabled`
+/// "describes whether checkpointing is enabled for a Managed Service for Apache Flink
+/// application" and `ApplicationSnapshotConfiguration$SnapshotsEnabled` "describes whether
+/// snapshots are enabled for a Managed Service for Apache Flink application"
+/// (`smithy_query(query="doc",shape="CheckpointConfiguration",member="CheckpointingEnabled")`
+/// / `shape="ApplicationSnapshotConfiguration",member="SnapshotsEnabled"`). An application
+/// the service runs INTERACTIVELY is a Studio notebook rather than such an application
+/// (`CreateApplication$ApplicationMode`: "Use the STREAMING mode to create a Managed Service
+/// for Apache Flink application. To create a Managed Service for Apache Flink Studio
+/// notebook, use the INTERACTIVE mode"), so neither feature runs for it unless its own
+/// configuration switched it on, and its defaults are the off ones.
+#[derive(Debug, Clone, Copy)]
+struct ApplicationDefaults {
+    /// The `CheckpointingEnabled` of a checkpoint configuration the caller left to the
+    /// service.
+    checkpointing_enabled: bool,
+    /// The `SnapshotsEnabled` of an application created with no snapshot configuration.
+    snapshots_enabled: bool,
+}
+
+/// The defaults of a Managed Service for Apache Flink application — one that STREAMS:
+/// checkpointing runs, as the `DEFAULT` checkpoint-configuration table states, and
+/// snapshots are taken for it.
+const STREAMING_DEFAULTS: ApplicationDefaults = ApplicationDefaults {
+    checkpointing_enabled: true,
+    snapshots_enabled: true,
+};
+
+/// The defaults of an application the service runs INTERACTIVELY (a Studio notebook):
+/// neither of the two Managed Service for Apache Flink features above runs for it on its
+/// own. See [`ApplicationDefaults`].
+const INTERACTIVE_DEFAULTS: ApplicationDefaults = ApplicationDefaults {
+    checkpointing_enabled: false,
+    snapshots_enabled: false,
+};
+
+/// The defaults the service runs an application of this runtime and mode under.
+///
+/// What decides is the KIND of application rather than one spelled-out runtime value: the
+/// mode the application runs in, which for an application whose creator named none is the
+/// one its runtime implies ([`default_application_mode`]), so every Zeppelin runtime —
+/// present and future — is read as the notebook it is.
+fn defaults_for(runtime_environment: &str, application_mode: &str) -> ApplicationDefaults {
+    if application_mode == APPLICATION_MODE_INTERACTIVE || is_notebook_runtime(runtime_environment)
+    {
+        INTERACTIVE_DEFAULTS
+    } else {
+        STREAMING_DEFAULTS
+    }
+}
 
 /// The CloudWatch logging a `DEFAULT` monitoring configuration runs with: the service's
 /// own published defaults for the two members `CUSTOM` is required to set
@@ -1499,10 +1554,6 @@ const DEFAULT_PARALLELISM: i32 = 1;
 const DEFAULT_PARALLELISM_PER_KPU: i32 = 1;
 /// See [`DEFAULT_PARALLELISM`].
 const DEFAULT_AUTO_SCALING_ENABLED: bool = true;
-
-/// Snapshots are taken for an application whose creator said nothing about them: the
-/// service's default for `ApplicationSnapshotConfiguration$SnapshotsEnabled`.
-const DEFAULT_SNAPSHOTS_ENABLED: bool = true;
 
 /// The service does not roll an application back on its own unless its creator asked for
 /// it: the default for `ApplicationSystemRollbackConfiguration$RollbackEnabled`.
@@ -1524,10 +1575,17 @@ const DEFAULT_KEY_TYPE: &str = "AWS_OWNED_KEY";
 /// whatever else it carried, which is what `ConfigurationType` `DEFAULT` MEANS. Only a
 /// `CUSTOM` sub-configuration reports the caller's values, and the members it left unset
 /// still report the defaults the service applies to them.
+///
+/// WHICH defaults those are is the application's own: the two members that switch a
+/// Managed Service for Apache Flink feature on are defaulted per kind of application
+/// ([`defaults_for`]), so a Studio notebook is not described as running the streaming
+/// features it does not run.
 fn complete_with_service_defaults(
     description: &mut ApplicationConfigurationDescription,
     runtime_environment: &str,
+    application_mode: &str,
 ) {
+    let defaults = defaults_for(runtime_environment, application_mode);
     // Every runtime family this API still creates applications for runs on Apache Flink
     // (`FLINK-` directly, `ZEPPELIN-FLINK-` as a Studio notebook), so all of them run
     // under a Flink configuration. A SQL application does not: its processing is
@@ -1545,6 +1603,7 @@ fn complete_with_service_defaults(
             flink
                 .checkpoint_configuration_description
                 .get_or_insert_with(CheckpointConfigurationDescription::default),
+            defaults,
         );
         complete_monitoring_configuration(
             flink
@@ -1564,7 +1623,7 @@ fn complete_with_service_defaults(
     {
         description.application_snapshot_configuration_description =
             Some(ApplicationSnapshotConfigurationDescription {
-                snapshots_enabled: DEFAULT_SNAPSHOTS_ENABLED,
+                snapshots_enabled: defaults.snapshots_enabled,
             });
     }
     if description
@@ -1595,12 +1654,17 @@ fn is_custom(configuration_type: Option<&String>) -> bool {
     configuration_type.map(String::as_str) == Some(CONFIGURATION_CUSTOM)
 }
 
-/// See [`complete_with_service_defaults`].
-fn complete_checkpoint_configuration(description: &mut CheckpointConfigurationDescription) {
+/// See [`complete_with_service_defaults`]. Whether checkpointing runs for an application
+/// that left the decision to the service is the application's own default
+/// ([`ApplicationDefaults`]); the two intervals are the same for every application.
+fn complete_checkpoint_configuration(
+    description: &mut CheckpointConfigurationDescription,
+    defaults: ApplicationDefaults,
+) {
     if !is_custom(description.configuration_type.as_ref()) {
         *description = CheckpointConfigurationDescription {
             configuration_type: Some(CONFIGURATION_DEFAULT.to_string()),
-            checkpointing_enabled: Some(DEFAULT_CHECKPOINTING_ENABLED),
+            checkpointing_enabled: Some(defaults.checkpointing_enabled),
             checkpoint_interval: Some(DEFAULT_CHECKPOINT_INTERVAL),
             min_pause_between_checkpoints: Some(DEFAULT_MIN_PAUSE_BETWEEN_CHECKPOINTS),
         };
@@ -1608,7 +1672,7 @@ fn complete_checkpoint_configuration(description: &mut CheckpointConfigurationDe
     }
     description.checkpointing_enabled = description
         .checkpointing_enabled
-        .or(Some(DEFAULT_CHECKPOINTING_ENABLED));
+        .or(Some(defaults.checkpointing_enabled));
     description.checkpoint_interval = description
         .checkpoint_interval
         .or(Some(DEFAULT_CHECKPOINT_INTERVAL));

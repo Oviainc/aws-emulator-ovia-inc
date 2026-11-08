@@ -441,6 +441,17 @@ fn default_checkpoint() -> Value {
     })
 }
 
+/// The same `DEFAULT` checkpoint table for an application the service runs INTERACTIVELY
+/// (a Studio notebook): the intervals are the service's, and checkpointing itself is off,
+/// because what `CheckpointingEnabled` switches is a feature of a Managed Service for
+/// Apache Flink application
+/// (`smithy_query(query="doc",shape="CheckpointConfiguration",member="CheckpointingEnabled")`).
+fn interactive_default_checkpoint() -> Value {
+    let mut checkpoint = default_checkpoint();
+    checkpoint["CheckpointingEnabled"] = json!(false);
+    checkpoint
+}
+
 /// The CloudWatch logging a `DEFAULT` monitoring configuration runs under: the service's
 /// published defaults, each a member of its modelled enum (`MetricsLevel` / `LogLevel`).
 fn default_monitoring() -> Value {
@@ -598,7 +609,7 @@ async fn a_created_application_reports_the_configuration_it_runs_under() {
             runtime: "ZEPPELIN-FLINK-3_0",
             mode: Some("INTERACTIVE"),
             configuration: json!({"ApplicationSnapshotConfiguration": {"SnapshotsEnabled": false}}),
-            checkpoint: default_checkpoint(),
+            checkpoint: interactive_default_checkpoint(),
             monitoring: default_monitoring(),
             parallelism: default_parallelism(),
             snapshots_enabled: false,

@@ -283,12 +283,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Which mode the application runs in is a property of the application, so a
+        // create that named none still runs in the one its runtime implies — and the
+        // configuration it is described under is completed with that KIND of
+        // application's defaults, so the mode is resolved before the description is.
+        let application_mode = input.application_mode.clone().unwrap_or_else(|| {
+            crate::state::default_application_mode(&input.runtime_environment).to_string()
+        });
+
         // An application always RUNS under a full configuration, so the description is
         // materialised whether or not this request carried one: `describe_configuration`
         // completes whatever the creator supplied with the service's defaults.
         let configuration = Some(store.describe_configuration(
             input.application_configuration.as_ref(),
             &input.runtime_environment,
+            &application_mode,
         ));
         let cloud_watch_logging_options = input
             .cloud_watch_logging_options
@@ -301,11 +310,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: crate::state::application_arn(&region, &name),
             name: name.clone(),
             description: input.application_description,
-            // Which mode the application runs in is a property of the application, so a
-            // create that named none still stores the one its runtime implies.
-            application_mode: input.application_mode.unwrap_or_else(|| {
-                crate::state::default_application_mode(&input.runtime_environment).to_string()
-            }),
+            application_mode,
             runtime_environment: input.runtime_environment,
             service_execution_role: input.service_execution_role,
             // A newly created application is returned READY: it exists and is

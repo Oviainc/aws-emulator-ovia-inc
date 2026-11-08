@@ -27,6 +27,8 @@ mod harness;
 mod modeled_client_errors;
 #[path = "all/ops_name_bindings.rs"]
 mod ops_name_bindings;
+#[path = "all/runtime_configuration_defaults.rs"]
+mod runtime_configuration_defaults;
 #[path = "all/scratch.rs"]
 mod scratch;
 #[path = "all/snapshot_deletion.rs"]
