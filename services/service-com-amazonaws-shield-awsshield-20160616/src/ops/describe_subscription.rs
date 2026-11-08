@@ -157,7 +157,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(DescribeSubscriptionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some("The subscription does not exist.".to_string()),
+                    message: Some(crate::state::SUBSCRIPTION_NOT_FOUND_MESSAGE.to_string()),
                     resource_type: Some(crate::state::SUBSCRIPTION_RESOURCE_TYPE.to_string()),
                 },
             )

@@ -198,7 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if guard.subscription_state_at(now) != crate::state::SUBSCRIPTION_STATE_ACTIVE {
             return Err(CreateProtectionErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some("The subscription does not exist.".to_string()),
+                    message: Some(crate::state::SUBSCRIPTION_NOT_FOUND_MESSAGE.to_string()),
                     resource_type: Some(crate::state::SUBSCRIPTION_RESOURCE_TYPE.to_string()),
                 },
             )

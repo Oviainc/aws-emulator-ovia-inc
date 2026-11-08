@@ -21,5 +21,7 @@ mod shield_list_attacks;
 mod shield_protection_groups_tags_and_account;
 #[path = "all/shield_subscription_and_protections.rs"]
 mod shield_subscription_and_protections;
+#[path = "all/shield_unsubscribed_account.rs"]
+mod shield_unsubscribed_account;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
