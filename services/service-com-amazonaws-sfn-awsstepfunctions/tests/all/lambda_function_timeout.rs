@@ -114,7 +114,11 @@ fn definition(function_arn: &str, retry_on: Option<&str>) -> Value {
 }
 
 /// The types of a history, in the order the events happened.
-fn event_types(events: &[Value]) -> Vec<String> {
+///
+/// `pub(crate)`, not private: `tests/all.rs` is this binary's crate root, so a sibling
+/// suite that reads the events a Lambda task wrote reaches this rather than carrying a
+/// second copy of it.
+pub(crate) fn event_types(events: &[Value]) -> Vec<String> {
     events
         .iter()
         .filter_map(|event| event.get("type").and_then(Value::as_str))

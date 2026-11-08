@@ -189,6 +189,8 @@ mod task_target_authorization;
 mod terminal_runtime_errors;
 #[path = "all/test_state.rs"]
 mod test_state;
+#[path = "all/unhandled_handler_error_task_failure.rs"]
+mod unhandled_handler_error_task_failure;
 #[path = "all/unresolved_path_cause.rs"]
 mod unresolved_path_cause;
 #[path = "all/unserved_request_refusals.rs"]

@@ -196,12 +196,28 @@ impl Chain {
         source: &str,
         timeout_seconds: Option<u64>,
     ) -> String {
+        self.given_function_in(name, RUNTIME, MODULE, source, timeout_seconds)
+            .await
+    }
+
+    /// [`Self::given_function_of`] for a function of ANOTHER runtime: `runtime` is the
+    /// identifier the function declares, `module` the file the package carries the
+    /// handler's module in (the module [`HANDLER`] names, with the runtime's own
+    /// extension), and `source` that module's text.
+    pub(crate) async fn given_function_in(
+        &self,
+        name: &str,
+        runtime: &str,
+        module: &str,
+        source: &str,
+        timeout_seconds: Option<u64>,
+    ) -> String {
         let mut request = json!({
             "FunctionName": name,
             "Role": LAMBDA_ROLE_ARN,
-            "Runtime": RUNTIME,
+            "Runtime": runtime,
             "Handler": HANDLER,
-            "Code": { "ZipFile": package(source) },
+            "Code": { "ZipFile": package_of(module, source) },
         });
         if let Some(seconds) = timeout_seconds {
             request["Timeout"] = json!(seconds);
@@ -320,17 +336,27 @@ pub(crate) fn parsed(bytes: Bytes) -> Value {
     }
 }
 
+/// The file the python package carries its one module in, named after the module
+/// [`HANDLER`] names.
+const MODULE: &str = "index.py";
+
 /// `source` as a deployment package: one `.py` module named after the handler's own
 /// module, in a .zip archive, base64-encoded because `FunctionCode$ZipFile` is a blob
 /// and a `restJson1` request carries a blob base64-encoded in its JSON body.
 ///
 /// `pub(crate)` for the reason [`parsed`] is.
 pub(crate) fn package(source: &str) -> String {
+    package_of(MODULE, source)
+}
+
+/// [`package`] over the file ANOTHER runtime's handler module lives in (`index.js` for a
+/// node one), for a suite whose rows span more than one runtime.
+fn package_of(module: &str, source: &str) -> String {
     let mut archive = ::zip::ZipWriter::new(::std::io::Cursor::new(Vec::new()));
     let options: ::zip::write::SimpleFileOptions = ::zip::write::SimpleFileOptions::default()
         .compression_method(::zip::CompressionMethod::Deflated);
     archive
-        .start_file("index.py", options)
+        .start_file(module, options)
         .expect("the entry starts");
     ::std::io::Write::write_all(&mut archive, source.as_bytes()).expect("the entry is written");
     let bytes = archive.finish().expect("the archive finishes").into_inner();
