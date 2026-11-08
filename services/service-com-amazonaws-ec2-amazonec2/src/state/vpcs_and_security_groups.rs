@@ -1644,6 +1644,67 @@ impl ComAmazonawsEc2Amazonec2State {
         }
         removed
     }
+
+    /// Replace the rule stored under `rule_id` with the ONE rule `permission` describes, and
+    /// answer the rule as it now stands — or `None` when the store holds no such rule.
+    ///
+    /// A security group rule is a RESOURCE, so a modification keeps the resource and replaces
+    /// what it says: the id, the ARN, the group, its owner, the direction and the rule's tags
+    /// are facts of the stored rule and survive, while the protocol, the port range, the one
+    /// source or destination it names and its description are taken from `permission`. The
+    /// replacement is built by [`security_group_rule_grants`] — the SAME reading
+    /// [`Self::insert_security_group_rules`] stores a new rule through — so a modified rule and
+    /// a freshly authorized one with the same members are stored identically, and
+    /// `DescribeSecurityGroupRules` cannot tell which call wrote it.
+    ///
+    /// `permission` must describe exactly one grant: a modification acts on one rule, and a
+    /// permission naming several would describe several. One naming none replaces nothing and
+    /// answers `None`, so the stored rule is left as it was rather than emptied.
+    ///
+    /// BOUNDED: the record's caller-chosen bytes are recharged here — what the old record held
+    /// is given back and the new one is charged ([`security_group_rule_payload_bytes`]), so a
+    /// modification cannot grow the store's budget-counted bytes without the budget seeing it.
+    /// A caller whose replacement may be larger than the rule it replaces asks
+    /// [`Self::would_exceed_stored_bytes_after_refund`] first and refuses the whole request.
+    /// The group's aggregate `IpPermissions` are recomputed, so `DescribeSecurityGroups` can
+    /// never disagree with the rules that are stored.
+    pub fn replace_security_group_rule(
+        &mut self,
+        rule_id: &str,
+        permission: &IpPermission,
+    ) -> Option<SecurityGroupRule> {
+        let record = self.security_group_rules.get(rule_id)?;
+        let group_id = record.rule.group_id.clone().unwrap_or_default();
+        let is_egress = record.rule.is_egress.unwrap_or(false);
+        let tags = record.rule.tags.clone().unwrap_or_default();
+        let refund = record.payload_bytes;
+        let security_group_rule_id = record.rule.security_group_rule_id.clone();
+        let security_group_rule_arn = record.rule.security_group_rule_arn.clone();
+        let (grant, referenced_group_name) =
+            security_group_rule_grants(&group_id, is_egress, permission, &tags)
+                .into_iter()
+                .next()?;
+        let mut replaced = SecurityGroupRuleRecord {
+            rule: SecurityGroupRule {
+                security_group_rule_id,
+                security_group_rule_arn,
+                ..grant
+            },
+            referenced_group_name,
+            payload_bytes: 0,
+        };
+        // A modification is a REQUEST writing the rule, so what it leaves behind is
+        // caller-supplied data whatever the old record was charged — which is why the refund
+        // and the charge are separate: a service-written default rule a caller modifies was
+        // charged nothing and starts being charged here.
+        replaced.payload_bytes = security_group_rule_payload_bytes(&replaced);
+        self.release_stored_bytes(refund);
+        self.add_stored_bytes(replaced.payload_bytes);
+        let answer = replaced.rule.clone();
+        self.security_group_rules.insert(rule_id.to_string(), replaced);
+        self.resync_security_group_permissions(&group_id);
+        Some(answer)
+    }
 }
 
 /// EC2's error code for a `CreateDefaultVpc` in a Region whose account already holds a

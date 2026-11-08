@@ -1558,3 +1558,9 @@ mod modify_capacity_reservation;
 // behind. Declared at the tail of this file, which is where every new ec2 suite inserts its
 #[path = "all/verified_access_trust_provider_attachment.rs"]
 mod verified_access_trust_provider_attachment;
+// What `ModifySecurityGroupRules` replaces on one stored security group rule: the protocol,
+// the port range, the one source it names and its description, while the rule keeps its id,
+// ARN, group, owner, direction, tags and rule TYPE — read back through
+// `DescribeSecurityGroupRules` and the group's aggregated permissions. Declared beside
+#[path = "all/modify_security_group_rules.rs"]
+mod modify_security_group_rules;

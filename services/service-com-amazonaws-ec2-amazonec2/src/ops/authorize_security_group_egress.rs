@@ -248,16 +248,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored, however many of its other rules were fine.
         let mut prepared: Vec<IpPermission> = Vec::with_capacity(permissions.len());
         for (index, permission) in permissions.iter().enumerate() {
-            let position = index + 1;
-            let protocol = state::validated_ip_protocol(permission, position)?;
+            // The request path this permission arrived on, which every refusal below names:
+            // the shared readers word their messages about the member the caller sent rather
+            // than about an entry number of their own.
+            let member = format!("ipPermissions.{position}", position = index + 1);
+            let protocol = state::validated_ip_protocol(permission, &member)?;
             state::validate_ip_permission_port_range(
                 protocol,
-                position,
+                &member,
                 permission.from_port,
                 permission.to_port,
             )?;
             prepared.push(state::prepared_ip_permission(
-                &store, &vpc_id, permission, protocol, position, IS_EGRESS,
+                &store, &vpc_id, permission, protocol, &member, IS_EGRESS,
             )?);
         }
         // "The prefix list IDs" (`IpPermission$PrefixListIds`): a rule grants the ranges the

@@ -2082,28 +2082,30 @@ pub const PEERING_STATUSES: &[&str] =
     crate::ops::types::VPC_PEERING_CONNECTION_STATE_REASON_CODE_VALUES;
 
 /// The protocol `permission` names, refused when it names none or names one no rule may
-/// carry. `position` is the 1-based `ipPermissions` entry it came from, so a refusal names
-/// the entry the caller has to fix.
+/// carry. `member` is the REQUEST PATH the permission arrived on — `ipPermissions.<n>` for an
+/// authorize, `securityGroupRules.<n>.securityGroupRule` for a modify — so a refusal names
+/// the member of the caller's own request it has to fix rather than a member of another
+/// operation's.
 ///
 /// "The IP protocol name (`tcp`, `udp`, `icmp`, `icmpv6`) or number (see Protocol Numbers).
 /// Use `-1` to specify all protocols" (`IpPermission$IpProtocol`) — so a protocol is one of
 /// those four names, a number a single byte holds, or `-1`.
-pub fn validated_ip_protocol<E>(
-    permission: &IpPermission,
-    position: usize,
-) -> Result<&str, Scaffolded<E>> {
+pub fn validated_ip_protocol<'a, E>(
+    permission: &'a IpPermission,
+    member: &str,
+) -> Result<&'a str, Scaffolded<E>> {
     let protocol = permission
         .ip_protocol
         .as_deref()
         .filter(|protocol| !protocol.is_empty())
         .ok_or_else(|| {
             missing_parameter(format!(
-                "The request must contain the parameter ipPermissions.{position}.ipProtocol"
+                "The request must contain the parameter {member}.ipProtocol"
             ))
         })?;
     if !ip_protocol_is_known(protocol) {
         return Err(invalid_parameter_value(format!(
-            "Invalid IP protocol '{protocol}' for ipPermissions.{position}: use a protocol \
+            "Invalid IP protocol '{protocol}' for {member}: use a protocol \
              name ({IP_PROTOCOL_TCP}, {IP_PROTOCOL_UDP}, {IP_PROTOCOL_ICMP}, \
              {IP_PROTOCOL_ICMPV6}), a protocol number between 0 and {MAX_PROTOCOL_NUMBER}, \
              or {ALL_IP_PROTOCOLS} for all protocols"
@@ -2146,13 +2148,13 @@ pub fn ip_protocol_is_known(protocol: &str) -> bool {
 /// order.
 pub fn validate_ip_permission_port_range<E>(
     protocol: &str,
-    position: usize,
+    member: &str,
     from_port: Option<i32>,
     to_port: Option<i32>,
 ) -> Result<(), Scaffolded<E>> {
     if protocol_requires_port_range(protocol) && (from_port.is_none() || to_port.is_none()) {
         return Err(invalid_parameter_value(format!(
-            "ipPermissions.{position} must specify both fromPort and toPort for protocol \
+            "{member} must specify both fromPort and toPort for protocol \
              '{protocol}'"
         )));
     }
@@ -2162,7 +2164,7 @@ pub fn validate_ip_permission_port_range<E>(
         return match (from_port, to_port) {
             (None, None) => Ok(()),
             _ => Err(invalid_permission_malformed(format!(
-                "ipPermissions.{position} carries one end of a port range: fromPort and \
+                "{member} carries one end of a port range: fromPort and \
                  toPort are given together or not at all"
             ))),
         };
@@ -2172,17 +2174,17 @@ pub fn validate_ip_permission_port_range<E>(
     } else {
         MAX_PORT
     };
-    for (member, value) in [("fromPort", from_port), ("toPort", to_port)] {
+    for (port_member, value) in [("fromPort", from_port), ("toPort", to_port)] {
         if value != ALL_PORTS && !(0..=highest).contains(&value) {
             return Err(invalid_parameter_value(format!(
-                "Invalid value '{value}' for ipPermissions.{position}.{member}: it must be \
+                "Invalid value '{value}' for {member}.{port_member}: it must be \
                  between 0 and {highest}, or {ALL_PORTS} for all values"
             )));
         }
     }
     if from_port == ALL_PORTS && to_port != ALL_PORTS {
         return Err(invalid_permission_malformed(format!(
-            "ipPermissions.{position} starts at {ALL_PORTS} (all values), so toPort must be \
+            "{member} starts at {ALL_PORTS} (all values), so toPort must be \
              {ALL_PORTS} too"
         )));
     }
@@ -2195,7 +2197,7 @@ pub fn validate_ip_permission_port_range<E>(
         && !protocol_is_icmp(protocol)
     {
         return Err(invalid_permission_malformed(format!(
-            "ipPermissions.{position} ends at {to_port}, before it starts at {from_port}"
+            "{member} ends at {to_port}, before it starts at {from_port}"
         )));
     }
     Ok(())
@@ -2250,7 +2252,7 @@ pub fn prepared_ip_permission<E>(
     vpc_id: &str,
     permission: &IpPermission,
     protocol: &str,
-    position: usize,
+    member: &str,
     is_egress: bool,
 ) -> Result<IpPermission, Scaffolded<E>> {
     let mut ip_ranges: Vec<IpRange> = Vec::new();
@@ -2298,7 +2300,7 @@ pub fn prepared_ip_permission<E>(
                 prefix_list_id.starts_with(&format!("{PREFIX_LIST_ID_PREFIX}-"));
             if !names_a_prefix_list {
                 return Err(invalid_parameter_value(format!(
-                    "Invalid prefix list id '{prefix_list_id}' for ipPermissions.{position}"
+                    "Invalid prefix list id '{prefix_list_id}' for {member}"
                 )));
             }
             return Err(invalid_prefix_list_id_not_found(prefix_list_id));
@@ -2312,7 +2314,7 @@ pub fn prepared_ip_permission<E>(
     let mut user_id_group_pairs: Vec<UserIdGroupPair> = Vec::new();
     for pair in permission.user_id_group_pairs.iter().flatten() {
         validate_security_group_rule_description(pair.description.as_ref())?;
-        user_id_group_pairs.push(prepared_user_id_group_pair(store, vpc_id, pair, position)?);
+        user_id_group_pairs.push(prepared_user_id_group_pair(store, vpc_id, pair, member)?);
     }
 
     // "You must specify exactly one of the following sources" (an inbound rule) or
@@ -2325,7 +2327,7 @@ pub fn prepared_ip_permission<E>(
     {
         let grant = if is_egress { "destination" } else { "source" };
         return Err(missing_parameter(format!(
-            "The request must name a {grant} for ipPermissions.{position}: an IPv4 range \
+            "The request must name a {grant} for {member}: an IPv4 range \
              (ipRanges), an IPv6 range (ipv6Ranges), a prefix list (prefixListIds) or a \
              security group (groups)"
         )));
@@ -2356,7 +2358,7 @@ pub fn prepared_user_id_group_pair<E>(
     store: &ComAmazonawsEc2Amazonec2State,
     vpc_id: &str,
     pair: &UserIdGroupPair,
-    position: usize,
+    member: &str,
 ) -> Result<UserIdGroupPair, Scaffolded<E>> {
     let user_id = pair
         .user_id
@@ -2365,7 +2367,7 @@ pub fn prepared_user_id_group_pair<E>(
         .unwrap_or_else(|| ::engine::emulator_account_id().to_string());
     if !aws_account_id_is_well_formed(&user_id) {
         return Err(invalid_parameter_value(format!(
-            "Invalid account id '{user_id}' for ipPermissions.{position}"
+            "Invalid account id '{user_id}' for {member}"
         )));
     }
     // "The ID of the VPC for the referenced security group, if applicable"
@@ -2374,7 +2376,7 @@ pub fn prepared_user_id_group_pair<E>(
     // at all, so it is refused rather than stored on the rule. The prefix each kind is
     // asked about is the prefix ALONE — [`prefixed_id_is_well_formed`] reads the separator
     // itself — so a well-formed id of either kind is stored rather than refused.
-    for (member, prefix, value) in [
+    for (id_member, prefix, value) in [
         ("vpcId", "vpc", pair.vpc_id.as_deref()),
         (
             "vpcPeeringConnectionId",
@@ -2385,7 +2387,7 @@ pub fn prepared_user_id_group_pair<E>(
         if let Some(value) = value.filter(|value| !value.is_empty()) {
             if !prefixed_id_is_well_formed(prefix, value) {
                 return Err(invalid_parameter_value(format!(
-                    "Invalid id '{value}' for ipPermissions.{position}.{member}"
+                    "Invalid id '{value}' for {member}.{id_member}"
                 )));
             }
         }
@@ -2393,7 +2395,7 @@ pub fn prepared_user_id_group_pair<E>(
     if let Some(status) = pair.peering_status.as_deref().filter(|it| !it.is_empty()) {
         if !PEERING_STATUSES.contains(&status) {
             return Err(invalid_parameter_value(format!(
-                "Invalid value '{status}' for ipPermissions.{position}.peeringStatus: it must \
+                "Invalid value '{status}' for {member}.peeringStatus: it must \
                  be one of {known}",
                 known = PEERING_STATUSES.join(", "),
             )));
@@ -2465,7 +2467,7 @@ pub fn prepared_user_id_group_pair<E>(
             .ok_or_else(|| invalid_group_not_found(group_name))?,
         (None, None) => {
             return Err(invalid_permission_malformed(format!(
-                "ipPermissions.{position} names a security group with neither a groupId nor \
+                "{member} names a security group with neither a groupId nor \
                  a groupName"
             )))
         }

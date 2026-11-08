@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifySecurityGroupRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifySecurityGroupRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifySecurityGroupRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces what the security group rules a request names SAY, in place, out of
+//! [`crate::state`]: a rule is a resource of its own, so each one keeps its
+//! `SecurityGroupRuleId`, its ARN, its group, its owner, its direction and its tags, while
+//! the protocol, the port range, the one source or destination it names and its description
+//! are taken from the request. A modification may not change the rule's TYPE — which of the
+//! four sources it names — and the whole request is validated before anything is written, so
+//! a request that describes one modification it may not have writes none of them.
 //!
 //! ## Shape of an operation
 //!
@@ -67,6 +66,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use std::collections::HashSet;
+
+use crate::state::{SecurityGroupRuleKey, SecurityGroupRuleRecord, SecurityGroupRuleSource};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -135,18 +138,441 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifySecurityGroupRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifySecurityGroupRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifySecurityGroupRules"))
+        use crate::state;
+
+        // `ctx` carries the Region this request was signed for, which is what says which
+        // Region's published prefix lists a rule may reference; the store is reached through
+        // the engine held on `self`.
+        let region = state::request_region(ctx.parts());
+
+        // "Information about the security group properties to update"
+        // (`$SecurityGroupRules`) is caller-sized and the model bounds it nowhere, so it is
+        // capped HERE, before any work or allocation proportional to it — the same cap every
+        // other operation of this crate holds a caller-sized list to.
+        let updates = input.security_group_rules.as_slice();
+        if updates.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "The request describes {} rule modifications, above the maximum of {max}",
+                updates.len(),
+                max = state::MAX_RESOURCE_IDS,
+            )));
+        }
+        // The member is required, so a request that carries no entry for it has named no
+        // rule to modify at all.
+        if updates.is_empty() {
+            return Err(state::missing_parameter(
+                "The request must contain the parameter securityGroupRules",
+            ));
+        }
+
+        // "The ID of the security group" (`$GroupId`): a value that is not a security group
+        // id names no group of any account, which is a malformed parameter rather than a
+        // group that is missing.
+        if !state::security_group_id_is_well_formed(&input.group_id) {
+            return Err(state::invalid_group_id_malformed(&input.group_id));
+        }
+
+        let state_handle = state::require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+
+        // A group id this account holds no group for has no rules to modify.
+        let Some(group) = store.security_groups.get(&input.group_id) else {
+            return Err(state::invalid_group_not_found(&input.group_id));
+        };
+        let vpc_id = group.vpc_id.clone().unwrap_or_default();
+
+        // Every modification is read into the form its rule will be STORED in before anything
+        // is written — its protocol folded to the one spelling a protocol has, its CIDR
+        // canonicalised, the prefix list and the referenced group it names resolved — through
+        // the SAME readers an authorize reads a permission with, so a modified rule is held
+        // to exactly the rules a newly authorized one is.
+        let mut planned: Vec<Replacement> = Vec::with_capacity(updates.len());
+        let mut named: HashSet<&str> = HashSet::with_capacity(updates.len());
+        for (index, update) in updates.iter().enumerate() {
+            // The request path this modification arrived on, which every refusal below names.
+            let member = format!(
+                "securityGroupRules.{position}.securityGroupRule",
+                position = index + 1,
+            );
+            let rule_id = update.security_group_rule_id.as_str();
+            // "The ID of the security group rule" (`SecurityGroupRuleUpdate$SecurityGroupRuleId`):
+            // a value that is no rule id at all is malformed, and a well-formed one this group
+            // holds no rule for names nothing to modify — asked in that order, so "not an id
+            // of this kind" is never reported as "no such rule".
+            state::require_well_formed_id(
+                state::SECURITY_GROUP_RULE_ID_PREFIX,
+                rule_id,
+                state::INVALID_SECURITY_GROUP_RULE_ID_MALFORMED,
+            )?;
+            // A rule of ANOTHER group is not a rule of the group this request names, so from
+            // here it does not exist: the call modifies "the rules of a security group"
+            // (`ModifySecurityGroupRules`), the one its `GroupId` names.
+            let stored = store
+                .security_group_rules
+                .get(rule_id)
+                .filter(|record| record.rule.group_id.as_deref() == Some(input.group_id.as_str()))
+                .cloned()
+                .ok_or_else(|| state::invalid_security_group_rule_id_not_found(rule_id))?;
+            // One call cannot say two different things about one rule: the second entry for a
+            // rule would silently win over the first, so the request is refused instead.
+            if !named.insert(rule_id) {
+                return Err(state::invalid_parameter_value(format!(
+                    "The security group rule ID '{rule_id}' is named more than once; one \
+                     request modifies a rule once"
+                )));
+            }
+            // "Information about the security group rule"
+            // (`SecurityGroupRuleUpdate$SecurityGroupRule`): an entry that carries none says
+            // nothing to write onto the rule it named.
+            let Some(requested) = update.security_group_rule.as_ref() else {
+                return Err(state::missing_parameter(format!(
+                    "The request must contain the parameter {member}"
+                )));
+            };
+
+            // "You must specify exactly one of the following parameters, based on the rule
+            // type: CidrIpv4, CidrIpv6, PrefixListId, ReferencedGroupId"
+            // (`SecurityGroupRuleRequest`).
+            let sources = requested_sources(requested);
+            let source = match sources.as_slice() {
+                [] => {
+                    return Err(state::missing_parameter(format!(
+                        "The request must name exactly one of {member}.cidrIpv4, \
+                         {member}.cidrIpv6, {member}.prefixListId and \
+                         {member}.referencedGroupId"
+                    )));
+                }
+                [source] => source,
+                _ => {
+                    return Err(state::invalid_parameter_combination(format!(
+                        "{member} names {count} of cidrIpv4, cidrIpv6, prefixListId and \
+                         referencedGroupId; a security group rule names exactly one",
+                        count = sources.len(),
+                    )));
+                }
+            };
+
+            // "When you modify a rule, you cannot change the rule type. For example, if the
+            // rule uses an IPv4 address range, you must use CidrIpv4 to specify a new IPv4
+            // address range" (`SecurityGroupRuleRequest`). A stored rule that names no source
+            // at all has no type to keep, so nothing is held against it.
+            if let Some(held) = stored_source(&stored) {
+                if ::std::mem::discriminant(&held) != ::std::mem::discriminant(source) {
+                    return Err(state::invalid_parameter_value(format!(
+                        "Invalid value '{value}' for {member}.{given}: the security group rule \
+                         '{rule_id}' names {expected}, and a modification cannot change the \
+                         rule type",
+                        value = source_value(source),
+                        given = source_member(source),
+                        expected = source_member(&held),
+                    )));
+                }
+            }
+
+            // "Indicates whether the security group rule is an outbound rule"
+            // (`SecurityGroupRule$IsEgress`) is a fact of the stored rule, not of the
+            // request: a modification cannot turn an inbound rule outbound, and it is the
+            // side this rule's own bounds are weighed against.
+            let is_egress = stored.rule.is_egress.unwrap_or(false);
+            let requested_permission = permission_of_request(requested, source);
+            let protocol = state::validated_ip_protocol(&requested_permission, &member)?;
+            state::validate_ip_permission_port_range(
+                protocol,
+                &member,
+                requested.from_port,
+                requested.to_port,
+            )?;
+            let permission = state::prepared_ip_permission(
+                &store,
+                &vpc_id,
+                &requested_permission,
+                protocol,
+                &member,
+                is_egress,
+            )?;
+            // A rule granting a prefix list grants exactly the ranges that list holds, so an
+            // id naming no prefix list the account can see grants nothing — the one reading
+            // every path that resolves a rule's `PrefixListId` makes.
+            crate::ops::authorize_security_group_egress::referenced_prefix_lists::refuse_unknown_prefix_lists(
+                &store,
+                &region,
+                ::std::slice::from_ref(&permission),
+            )?;
+            planned.push(Replacement {
+                rule_id: rule_id.to_string(),
+                is_egress,
+                stored,
+                permission,
+            });
+        }
+
+        // A modification stores no FURTHER rule, so neither side's rule count grows — but the
+        // published quota is counted per address-family bucket of a side, and a rule granting
+        // a prefix list of the other family moves between those buckets, so every bucket is
+        // weighed before anything is written: the rules the side keeps, minus the ones these
+        // modifications take out of this bucket, plus what they would put back into it.
+        for is_egress in [false, true] {
+            let side: Vec<IpPermission> = planned
+                .iter()
+                .filter(|replacement| replacement.is_egress == is_egress)
+                .map(|replacement| replacement.permission.clone())
+                .collect();
+            if side.is_empty() {
+                continue;
+            }
+            let demand = store.security_group_rule_demand(&side);
+            for family in state::SECURITY_GROUP_RULE_FAMILIES {
+                let held =
+                    store.security_group_rule_family_count(&input.group_id, is_egress, family);
+                let leaving = planned
+                    .iter()
+                    .filter(|replacement| {
+                        replacement.is_egress == is_egress
+                            && store
+                                .security_group_rule_charges_family(&replacement.stored.rule, family)
+                    })
+                    .count();
+                if held
+                    .saturating_sub(leaving)
+                    .saturating_add(demand.in_bucket(family))
+                    > state::MAX_SECURITY_GROUP_RULES_PER_DIRECTION
+                {
+                    return Err(state::rules_per_security_group_limit_exceeded());
+                }
+            }
+        }
+
+        // "The specified rule already exists for that security group"
+        // (`InvalidPermission.Duplicate`): the rules the group would be LEFT with on each side
+        // have to be one rule each, so the rules it keeps and the rules these modifications
+        // would write are compared as one set — which also catches two modifications that
+        // would make one rule of two. Identity is [`state::SecurityGroupRuleAtom::identity`],
+        // the same comparison an authorize and a revoke match a rule by, paired with the
+        // direction, since the two sides of a group hold their rules apart.
+        let modified: HashSet<&str> = planned
+            .iter()
+            .map(|replacement| replacement.rule_id.as_str())
+            .collect();
+        let mut identities: HashSet<(bool, SecurityGroupRuleKey)> = store
+            .security_group_rules
+            .values()
+            .filter(|record| {
+                record.rule.group_id.as_deref() == Some(input.group_id.as_str())
+                    && !modified.contains(
+                        record
+                            .rule
+                            .security_group_rule_id
+                            .as_deref()
+                            .unwrap_or_default(),
+                    )
+            })
+            .filter_map(|record| {
+                let atom = state::SecurityGroupRuleAtom::of_stored_rule(record)?;
+                Some((record.rule.is_egress.unwrap_or(false), atom.identity()))
+            })
+            .collect();
+        for replacement in &planned {
+            for atom in state::security_group_rule_atoms(&replacement.permission) {
+                if !identities.insert((replacement.is_egress, atom.identity())) {
+                    return Err(state::invalid_permission_duplicate(&atom));
+                }
+            }
+        }
+
+        // A modification replaces caller-chosen text with caller-chosen text, so what the
+        // store's byte budget has to be asked is the NET change: charged with the same
+        // arithmetic the replaced records will be charged with, over every modification of the
+        // request at once, so a request that would pass the budget is refused with nothing
+        // written rather than part-way through.
+        let charge = planned.iter().fold(0usize, |charge, replacement| {
+            charge.saturating_add(state::security_group_rules_charge(
+                ::std::slice::from_ref(&replacement.permission),
+                replacement.stored.rule.tags.as_deref().unwrap_or_default(),
+            ))
+        });
+        let refund = planned.iter().fold(0usize, |refund, replacement| {
+            refund.saturating_add(replacement.stored.payload_bytes)
+        });
+        if store.would_exceed_stored_bytes_after_refund(charge, refund) {
+            return Err(crate::scaffolded::Scaffolded::tag_limit_exceeded(format!(
+                "This emulator holds {held} of at most {max} bytes of caller-supplied data, \
+                 so it cannot store {charge} more for these rules",
+                held = store.stored_bytes(),
+                max = state::MAX_STORED_BYTES,
+            )));
+        }
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you have
+        // the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been written yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // `replace_security_group_rule` keeps the rule's id, ARN, group, owner, direction and
+        // tags and rewrites what it says from the permission, recharges its bytes and
+        // recomputes the group's aggregate `IpPermissions` — so this handler never invents an
+        // id and `DescribeSecurityGroups` cannot disagree with the rules
+        // `DescribeSecurityGroupRules` reports. Every rule it names was resolved above, so it
+        // replaces each one; asserted rather than refused here, because a refusal at this
+        // point would answer an error with the earlier modifications already written.
+        for replacement in &planned {
+            let replaced =
+                store.replace_security_group_rule(&replacement.rule_id, &replacement.permission);
+            debug_assert!(
+                replaced.is_some(),
+                "every validated modification replaces the rule it named"
+            );
+        }
+
+        // "Returns true if the request succeeds; otherwise, returns an error" (`$Return`).
+        Ok(ModifySecurityGroupRulesOutput {
+            r#return: Some(true),
+        })
     }
+}
+
+/// One modification this request would make: the rule as the store holds it NOW, and the
+/// permission its replacement was read into.
+///
+/// Every modification of the request is read into one of these BEFORE any of them is written,
+/// because the bounds and the duplicate check below are questions about the whole request:
+/// what each side would be left holding cannot be answered one entry at a time.
+struct Replacement {
+    /// The `SecurityGroupRuleId` the request named, which the replacement keeps.
+    rule_id: String,
+    /// The side of the group the rule is on, which a modification does not change.
+    is_egress: bool,
+    /// The record as it stands, for the bytes it is charged and the rule type it keeps.
+    stored: SecurityGroupRuleRecord,
+    /// The one rule the request describes, in the form it will be stored in.
+    permission: IpPermission,
+}
+
+/// The sources `requested` names — "you must specify exactly one of the following
+/// parameters, based on the rule type: CidrIpv4, CidrIpv6, PrefixListId, ReferencedGroupId"
+/// (`SecurityGroupRuleRequest`), so anything other than one entry is a request the service
+/// refuses.
+///
+/// An empty string names no source: a form-encoded request that sends a member with no value
+/// has not named one, and reading it as one would store a rule granting nothing.
+fn requested_sources(requested: &SecurityGroupRuleRequest) -> Vec<SecurityGroupRuleSource> {
+    let named = |value: &Option<String>| {
+        value
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    let mut sources = Vec::new();
+    if let Some(cidr) = named(&requested.cidr_ipv4) {
+        sources.push(SecurityGroupRuleSource::Ipv4(cidr));
+    }
+    if let Some(cidr) = named(&requested.cidr_ipv6) {
+        sources.push(SecurityGroupRuleSource::Ipv6(cidr));
+    }
+    if let Some(prefix_list_id) = named(&requested.prefix_list_id) {
+        sources.push(SecurityGroupRuleSource::PrefixList(prefix_list_id));
+    }
+    if let Some(group_id) = named(&requested.referenced_group_id) {
+        sources.push(SecurityGroupRuleSource::ReferencedGroup(group_id));
+    }
+    sources
+}
+
+/// The source the stored rule `record` names, or `None` for a rule that names none.
+///
+/// Read through [`state::SecurityGroupRuleAtom::of_stored_rule`], the ONE translation from
+/// the stored form of a rule to the source it grants, so the rule type this operation holds a
+/// modification to is the same type every other operation reads off that rule.
+fn stored_source(record: &SecurityGroupRuleRecord) -> Option<SecurityGroupRuleSource> {
+    crate::state::SecurityGroupRuleAtom::of_stored_rule(record).map(|atom| atom.source)
+}
+
+/// The `SecurityGroupRuleRequest` member a source of this kind is named in, as a refusal
+/// about the rule type names it.
+fn source_member(source: &SecurityGroupRuleSource) -> &'static str {
+    match source {
+        SecurityGroupRuleSource::Ipv4(_) => "cidrIpv4",
+        SecurityGroupRuleSource::Ipv6(_) => "cidrIpv6",
+        SecurityGroupRuleSource::PrefixList(_) => "prefixListId",
+        SecurityGroupRuleSource::ReferencedGroup(_) => "referencedGroupId",
+    }
+}
+
+/// The value a source carries, as a refusal quotes the member the request sent.
+fn source_value(source: &SecurityGroupRuleSource) -> &str {
+    match source {
+        SecurityGroupRuleSource::Ipv4(value)
+        | SecurityGroupRuleSource::Ipv6(value)
+        | SecurityGroupRuleSource::PrefixList(value)
+        | SecurityGroupRuleSource::ReferencedGroup(value) => value,
+    }
+}
+
+/// The ONE rule `requested` describes, as the [`IpPermission`] the shared readers validate
+/// and canonicalise it through.
+///
+/// A `SecurityGroupRuleRequest` and an `IpPermission` describe the same thing at different
+/// grain: a permission names a protocol, a port range and ANY number of sources, each of
+/// which is one rule, while this shape names exactly one source — so one of these is one
+/// permission with one grant in it. Reading it into that form here is what lets this
+/// operation hold a modification to the protocol, port-range, CIDR, prefix-list, referenced-
+/// group and description rules an authorize holds a new rule to, through the same code, rather
+/// than a second reading that could come to disagree with it.
+///
+/// Every member is carried over as GIVEN: what is a valid protocol, port range, CIDR block,
+/// prefix list or referenced group is decided for this rule where it is decided for a rule an
+/// authorize describes.
+fn permission_of_request(
+    requested: &SecurityGroupRuleRequest,
+    source: &SecurityGroupRuleSource,
+) -> IpPermission {
+    // "The description of the security group rule" (`$Description`) belongs to the one grant
+    // the rule names, which is where a permission carries a rule's description.
+    let description = requested.description.clone();
+    let mut permission = IpPermission {
+        ip_protocol: requested.ip_protocol.clone(),
+        from_port: requested.from_port,
+        to_port: requested.to_port,
+        user_id_group_pairs: Some(Vec::new()),
+        ip_ranges: Some(Vec::new()),
+        ipv6_ranges: Some(Vec::new()),
+        prefix_list_ids: Some(Vec::new()),
+    };
+    match source {
+        SecurityGroupRuleSource::Ipv4(cidr) => {
+            permission.ip_ranges = Some(vec![IpRange {
+                cidr_ip: Some(cidr.clone()),
+                description,
+            }]);
+        }
+        SecurityGroupRuleSource::Ipv6(cidr) => {
+            permission.ipv6_ranges = Some(vec![Ipv6Range {
+                cidr_ipv6: Some(cidr.clone()),
+                description,
+            }]);
+        }
+        SecurityGroupRuleSource::PrefixList(prefix_list_id) => {
+            permission.prefix_list_ids = Some(vec![PrefixListId {
+                prefix_list_id: Some(prefix_list_id.clone()),
+                description,
+            }]);
+        }
+        SecurityGroupRuleSource::ReferencedGroup(group_id) => {
+            permission.user_id_group_pairs = Some(vec![UserIdGroupPair {
+                // "The ID of the security group that is referenced in the security group
+                // rule" (`$ReferencedGroupId`): a rule of this shape references a group by
+                // id alone, and the account that owns it is this one — the shared reader
+                // fills that in.
+                group_id: Some(group_id.clone()),
+                group_name: None,
+                user_id: None,
+                description,
+                vpc_id: None,
+                vpc_peering_connection_id: None,
+                peering_status: None,
+            }]);
+        }
+    }
+    permission
 }
