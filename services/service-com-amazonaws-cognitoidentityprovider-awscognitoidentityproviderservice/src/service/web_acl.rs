@@ -232,31 +232,10 @@ fn addressed_pool_arn(store: &PoolStore, submitted: &serde_json::Value) -> Optio
 /// SAME bytes: a body this emulator cannot read as bytes resolves no pool, so the
 /// inspection never runs against a substituted empty one.
 fn inspected_request(req: &RtRequest, body: Vec<u8>) -> waf_edge::InspectedRequest {
-    let headers: Vec<(String, String)> = req
-        .headers()
-        .iter()
-        .map(|(name, value)| (name.to_string(), value.to_string()))
-        .collect();
-    // The address the request came from. A request served in process crossed no socket
-    // from a remote peer, so there is no connection address; one that traversed a proxy
-    // still states where it came from, in its forwarded-for header.
-    let client_ip = headers
-        .iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case(waf_edge::FORWARDED_FOR_HEADER))
-        .and_then(|(_, value)| value.split(',').next())
-        .map(str::trim)
-        .filter(|address| address.parse::<std::net::IpAddr>().is_ok())
-        .unwrap_or(waf_edge::IN_PROCESS_CLIENT_IP)
-        .to_string();
     let (uri_path, query_string) = split_uri(req.uri());
-    waf_edge::InspectedRequest {
-        method: req.method().to_string(),
-        uri_path: uri_path.to_string(),
-        query_string: query_string.to_string(),
-        headers,
-        body,
-        client_ip,
-    }
+    // The one reading of an inbound request as WAF inspects it, which every protected
+    // resource's own service shares.
+    waf_edge::InspectedRequest::of_http(req, uri_path, query_string, body)
 }
 
 /// The path and the query string of `uri`, the two components

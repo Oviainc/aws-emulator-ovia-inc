@@ -42,12 +42,21 @@ ipnet = "2"
 # The rendering of an authenticated page marker's bytes as the opaque string a paginated
 # read hands back in `NextMarker` (`src/state/pagination.rs`).
 hex = { workspace = true }
+# The WAFv2 web ACL in front of a load balancer, and the evaluation of it: a web ACL is
+# associated with an Application Load Balancer through `AssociateWebACL`, so the records
+# and the semantics are that service's, and the data plane here asks it for the decision
+# rather than keeping a second reading of a rule tree (`service::web_acl`).
+service-com-amazonaws-wafv2-awswaf-20190729 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# `ByteMatchStatement$SearchString` is a blob, which travels base64-encoded in the
+# awsJson1_1 body `tests/all/web_acl_enforcement.rs` writes a web ACL's rules with — the
+# same coder the WAFv2 crate decodes it with.
+base64 = "0.22"
 # The Classic Elastic Load Balancing service, which owns the shared `elasticloadbalancing`
 # routing key both APIs are published on: `tests/all/shared_endpoint_routing.rs` drives
 # this model through that front door, the way an AWS SDK ELBv2 client reaches it.

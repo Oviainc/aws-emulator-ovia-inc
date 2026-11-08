@@ -516,15 +516,31 @@ impl DataPlaneRequest {
             .find(|(held, _)| held == name)
             .map(|(_, value)| value.as_str())
     }
+
+    /// Carry the headers a web ACL's `CustomRequestHandling` inserted onto the request the
+    /// rules are evaluated against and the targets would see.
+    ///
+    /// An inserted header REPLACES one the client sent under the same name: the prefix WAF
+    /// gives it is there so what is behind the edge can trust it came from WAF.
+    fn insert_headers(&mut self, inserted: Vec<(String, String)>) {
+        for (name, value) in inserted {
+            let name = name.to_ascii_lowercase();
+            self.headers.retain(|(held, _)| held != &name);
+            self.headers.push((name, value));
+        }
+    }
 }
 
-/// One answer this plane renders: the status, the content type and `Location` it carries,
-/// and the body.
+/// One answer this plane renders: the status, the content type, `Location` and any other
+/// headers it carries, and the body.
 #[derive(Debug, Default)]
 struct Served {
     status: u16,
     content_type: Option<String>,
     location: Option<String>,
+    /// Every other header the answer carries, which is what a web ACL's own custom
+    /// response configures; a listener's actions configure none.
+    headers: Vec<(String, String)>,
     body: Vec<u8>,
 }
 
@@ -537,6 +553,18 @@ impl Served {
             ..Self::default()
         }
     }
+
+    /// What the web ACL in front of the load balancer answered, which is served as it
+    /// leaves the edge: none of the listener's actions ran.
+    fn at_the_edge(answer: super::web_acl::EdgeAnswer) -> Self {
+        Self {
+            status: answer.status,
+            content_type: answer.content_type,
+            location: None,
+            headers: answer.headers,
+            body: answer.body,
+        }
+    }
 }
 
 /// Answer a request this plane claimed, out of the records the control plane holds.
@@ -546,37 +574,71 @@ impl Served {
 /// between the two (the load balancer was deleted by another request in between) is a load
 /// balancer no longer serving the name, which is [`PROVISIONING_STATUS`] rather than a
 /// panic.
+///
+/// The WEB ACL in front of the load balancer decides the request first ([`super::web_acl`]):
+/// a request it refuses is answered at the edge and none of the listener's actions runs,
+/// and one it allows is matched and answered carrying the headers it inserted. This
+/// service's own store is released before the web ACL is asked, so the two services'
+/// stores are never held at the same time.
 pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtResponse {
     let uri = parsed_uri(req.uri());
     let Some(resolved) = resolve(engine, &Addressed::of_request(req, &uri)) else {
         return rendered(&Served::status(PROVISIONING_STATUS));
     };
-    let request = DataPlaneRequest::of(req, &uri, &resolved.request_path);
+    let mut request = DataPlaneRequest::of(req, &uri, &resolved.request_path);
     let Some(state) = service_state(engine) else {
         return rendered(&Served::status(PROVISIONING_STATUS));
     };
-    let store = state.lock();
-    let Some(record) = store.load_balancers.get(&resolved.load_balancer_arn) else {
-        return rendered(&Served::status(PROVISIONING_STATUS));
-    };
     let now = SystemTime::now();
+    // What this service holds about the addressed load balancer and the listener the
+    // request reached, under a lock that is RELEASED before anything else is asked.
+    //
     // A load balancer the clock still owes its move out of `provisioning` is not serving
     // traffic on the name it published yet. Read, never written: this plane moves no
     // status.
-    if now < record.active_at {
-        return rendered(&Served::status(PROVISIONING_STATUS));
-    }
-    let Some(listener) = listener_addressed(&store, record, request.port) else {
-        return rendered(&Served::status(PROVISIONING_STATUS));
+    let (load_balancer_arn, listener_arn) = {
+        let store = state.lock();
+        let Some(record) = store.load_balancers.get(&resolved.load_balancer_arn) else {
+            return rendered(&Served::status(PROVISIONING_STATUS));
+        };
+        if now < record.active_at {
+            return rendered(&Served::status(PROVISIONING_STATUS));
+        }
+        let Some(listener) = listener_addressed(&store, record, request.port) else {
+            return rendered(&Served::status(PROVISIONING_STATUS));
+        };
+        (record.arn.clone(), listener.arn.clone())
     };
-    let served = answered(&store, listener, &request, now);
+
+    // The web ACL `AssociateWebACL` bound to this load balancer, which decides the request
+    // BEFORE the listener's own action — the load balancer's ARN is the one the binding was
+    // written under.
+    let served = match super::web_acl::decision(
+        engine,
+        &load_balancer_arn,
+        req,
+        &request.path,
+        &request.query,
+    ) {
+        super::web_acl::Decision::Refused(answer) => Served::at_the_edge(answer),
+        decided => {
+            if let super::web_acl::Decision::Allowed(inserted) = decided {
+                request.insert_headers(inserted);
+            }
+            let store = state.lock();
+            let Some(listener) = store.listeners.get(&listener_arn) else {
+                return rendered(&Served::status(PROVISIONING_STATUS));
+            };
+            answered(&store, listener, &request, now)
+        }
+    };
     // The record of one request this endpoint answered, as a load balancer's own access
     // log carries it: which load balancer and listener took it, what was asked, and what
     // was answered. Reported through the emulator's own logging facility, so a client can
     // see which plane claimed a request it believed went elsewhere.
     tracing::info!(
-        load_balancer = %record.arn,
-        listener = %listener.arn,
+        load_balancer = %load_balancer_arn,
+        listener = %listener_arn,
         method = %request.method,
         host = %request.host,
         path = %request.path,
@@ -929,6 +991,7 @@ fn fixed_response(action: &Action) -> Served {
                 .unwrap_or_else(|| DEFAULT_FIXED_RESPONSE_CONTENT_TYPE.to_string()),
         ),
         location: None,
+        headers: Vec::new(),
         body,
     }
 }
@@ -1001,6 +1064,7 @@ fn redirect(action: &Action, listener: &ListenerRecord, request: &DataPlaneReque
         status,
         content_type: None,
         location: Some(location),
+        headers: Vec::new(),
         body: Vec::new(),
     }
 }
@@ -1126,6 +1190,18 @@ fn rendered(served: &Served) -> RtResponse {
                 error = %refused,
                 "the redirect's location cannot be sent on the wire and is left off the \
                  response"
+            );
+        }
+    }
+    for (name, value) in &served.headers {
+        if let Err(refused) = response.headers_mut().try_insert(name.clone(), value.clone()) {
+            // A header a web ACL's custom response configures is a stored value, so one
+            // the wire cannot carry is left off the response rather than failing it.
+            tracing::warn!(
+                header = %name,
+                error = %refused,
+                "the header the web acl's custom response configures cannot be sent on the \
+                 wire and is left off the response"
             );
         }
     }

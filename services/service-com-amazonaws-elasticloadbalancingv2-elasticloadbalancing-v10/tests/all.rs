@@ -111,5 +111,7 @@ mod target_group_layer_7_health_check;
 mod target_validation_and_quotas;
 #[path = "all/trust_stores.rs"]
 mod trust_stores;
+#[path = "all/web_acl_enforcement.rs"]
+mod web_acl_enforcement;
 #[path = "all/wire.rs"]
 mod wire;

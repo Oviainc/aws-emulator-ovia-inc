@@ -48,22 +48,22 @@ const EMULATOR_HOST: &str = "127.0.0.1:9297";
 const DEFAULT_BODY: &str = "no-match";
 
 /// One answered request: the status line, the headers asserted on, and the body verbatim.
-struct Answered {
-    status: u16,
-    headers: HashMap<String, String>,
-    body: String,
+pub(crate) struct Answered {
+    pub(crate) status: u16,
+    pub(crate) headers: HashMap<String, String>,
+    pub(crate) body: String,
 }
 
 impl Answered {
     /// One response header, lower-cased as HTTP names compare.
-    fn header(&self, name: &str) -> Option<&str> {
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
         self.headers.get(name).map(String::as_str)
     }
 }
 
 /// Issue one data-plane request: no credential, no body, `headers` as the client sent
 /// them.
-async fn send(
+pub(crate) async fn send(
     router: &MultiServiceRouter,
     method: &str,
     host: &str,
@@ -101,7 +101,7 @@ async fn send(
 }
 
 /// Create a load balancer and answer its ARN, its name and the DNS name it published.
-async fn create_load_balancer(router: &MultiServiceRouter, name: &str) -> (String, String) {
+pub(crate) async fn create_load_balancer(router: &MultiServiceRouter, name: &str) -> (String, String) {
     let mut form = action("CreateLoadBalancer");
     form.push(p("Name", name));
     form.push(p("Subnets.member.1", "subnet-11111111"));
@@ -407,7 +407,7 @@ async fn deployment() -> Deployment {
 
 /// Place the instant the load balancer's move to `active` and every registration's move to
 /// `healthy` are owed at, so a case reads either side of it without sleeping.
-fn settle(engine: &Arc<engine::InMemoryEngine>, lb_arn: &str, at: SystemTime) {
+pub(crate) fn settle(engine: &Arc<engine::InMemoryEngine>, lb_arn: &str, at: SystemTime) {
     let state = engine.state::<ElbState>();
     let mut store = state.lock();
     if let Some(record) = store.load_balancers.get_mut(lb_arn) {

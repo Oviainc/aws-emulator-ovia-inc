@@ -63,7 +63,9 @@
 //! the one address this service told the caller to use. [`can_handle`](Service::can_handle)
 //! also claims a request addressed to a load balancer this service HOLDS, and
 //! [`override_routing_error`](Service::override_routing_error) answers it out of that load
-//! balancer's listener configuration; [`data_plane`] is what resolves and serves it.
+//! balancer's listener configuration; [`data_plane`] is what resolves and serves it. A
+//! request that plane serves is decided first by the WAFv2 web ACL `AssociateWebACL` put
+//! in front of the load balancer ([`web_acl`]), which is what refuses it at the edge.
 //!
 //! The fourth: this API answers every request it refuses before a handler ran under ONE
 //! error code, which the framework's two pre-dispatch layers do not agree on, so
@@ -85,6 +87,8 @@
 pub mod shared_endpoint;
 
 pub mod data_plane;
+
+pub mod web_acl;
 
 pub mod management_events;
 

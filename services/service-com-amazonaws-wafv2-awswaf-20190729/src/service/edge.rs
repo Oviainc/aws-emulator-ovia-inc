@@ -187,6 +187,50 @@ pub struct InspectedRequest {
 }
 
 impl InspectedRequest {
+    /// One inbound HTTP request as WAF inspects it — the ONE reading of it, shared by
+    /// every protected resource's own service, so no two of them can differ on what a
+    /// `FieldToMatch` names.
+    ///
+    /// `uri_path` and `query_string` are the caller's, not this function's: the path a
+    /// web ACL's criteria are written against is the path a client addressing AWS would
+    /// have sent, which the service that owns the resource resolves (the path within an
+    /// api's stage, within a load balancer's own endpoint), and the emulator's own
+    /// addressing prefix is how the request reached this process rather than part of it.
+    /// The query string is WITHOUT its leading `?`, as `FieldToMatch$QueryString` states
+    /// it, and `body` is the payload already read off the request, so a rule inspecting
+    /// `FieldToMatch$Body` and the caller's own reading of it see the SAME bytes.
+    pub fn of_http(
+        req: &::aws_smithy_runtime_api::http::Request,
+        uri_path: &str,
+        query_string: &str,
+        body: Vec<u8>,
+    ) -> Self {
+        let headers: Vec<(String, String)> = req
+            .headers()
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string()))
+            .collect();
+        // The address the request came from. A request served in process crossed no
+        // socket from a remote peer, so there is no connection address; one that
+        // traversed a proxy still states where it came from, in its forwarded-for header.
+        let client_ip = headers
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(FORWARDED_FOR_HEADER))
+            .and_then(|(_, value)| value.split(',').next())
+            .map(str::trim)
+            .filter(|address| address.parse::<IpAddr>().is_ok())
+            .unwrap_or(IN_PROCESS_CLIENT_IP)
+            .to_string();
+        Self {
+            method: req.method().to_string(),
+            uri_path: uri_path.to_string(),
+            query_string: query_string.to_string(),
+            headers,
+            body,
+            client_ip,
+        }
+    }
+
     /// The first value of the header `name` (compared case-insensitively, as HTTP
     /// header names are), or `None` when the request carries none.
     fn header(&self, name: &str) -> Option<&str> {
