@@ -1122,3 +1122,7 @@ mod cloudformation_ec2_instance_rollback;
 // changes appending the same entry is a redefinition — and, for one file reached under two
 // names, a duplicate module — either of which stops this target from compiling; the
 // duplicate tail lines are removed and the first declaration of each stands.
+// `cloudformation_asset_bucket_publishing_role`, `bedrock_agentcore_data_plane_parent_resources`
+// and `eks_control_plane_logs` — are each ALREADY declared above. Two concurrent changes
+// appended the same entry, which is a redefinition and stops this target from compiling; the
+// duplicate lines are removed here and the first declaration of each stands.

@@ -259,7 +259,9 @@ async fn a_batch_past_the_transport_ceiling_is_the_bare_413_and_not_the_batch_er
             let parsed: Value = serde_json::from_slice(&answer).unwrap_or(Value::Null);
             assert_eq!(
                 (status, parsed.get("__type").and_then(Value::as_str)),
-                (400, Some("BatchRequestTooLong")),
+                // The class named in full, as this `awsQueryCompatible` service names one:
+                // the shape id its own model declares for `BatchRequestTooLong`.
+                (400, Some("com.amazonaws.sqs#BatchRequestTooLong")),
                 "case {case:?}: expected the operation's own refusal, got {status} with {parsed}"
             );
         }

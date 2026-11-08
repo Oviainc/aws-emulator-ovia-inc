@@ -18,9 +18,15 @@
 //!   command's `input` IS the operation's input document, which is what an AWS JSON
 //!   protocol puts on the wire; the host builds, signs and dispatches the request
 //!   ([`super::aws_api`]) and the answer's document is what `send` resolves with.
-//! * A refusal is thrown as an error whose `name` is the service's own error code, with the
-//!   `$metadata` the answer carried — the shape a v3 client throws — so a handler that
-//!   catches one reads the emulated service's own answer.
+//! * A refusal is thrown as an instance of the error class the service's own model names for
+//!   it, with the `$metadata` the answer carried — the shape a v3 client throws — so a
+//!   handler that catches one by its class or by its name reads the emulated service's own
+//!   answer.
+//! * The names a package exports are the ones the SDK's own package for that service
+//!   exports: the client, a command class per operation and an error class per error shape,
+//!   read from the service's model ([`exports`]). They are exported as NAMES
+//!   because an ES module's `import { … } from` binds them when the module is linked, which
+//!   is before any of them is read.
 //! * A service whose protocol this seam does not bind, and an operation name that is not
 //!   one, are REFUSED: the call is reported as not made rather than answered with a
 //!   made-up success.
@@ -28,6 +34,13 @@
 //!   and the signature it carries are all host code's ([`super::aws_api`], [`super::node`]).
 
 use super::package::PackageModule;
+
+/// The names one of these packages exports, read from the service's own model.
+///
+/// It is a child of this module because the names are part of what a package IS; the file sits
+/// beside this one, which is what the path states.
+#[path = "node_sdk_exports.rs"]
+mod exports;
 
 /// The prefix of the package names this runtime answers for, which is the one namespace the
 /// AWS SDK for JavaScript v3 publishes its service clients under.
@@ -49,24 +62,102 @@ pub fn runtime_modules() -> Vec<PackageModule> {
 /// supplies none.
 ///
 /// `id` is the id of an entry of the runtime's own `node_modules`, so the name asked for is
-/// the package name a bare specifier resolved to.
+/// the package name a bare specifier resolved to — or, for a package of this runtime, one of
+/// its own subpaths.
 #[must_use]
 pub fn runtime_module_source(id: &str) -> Option<String> {
-    let package = id
+    let entry = id
         .strip_prefix(super::node::RUNTIME_ID_PREFIX)?
         .strip_prefix("node_modules/")?;
+    // A package's manifest is a subpath of the package: the SDK's packages export
+    // `./package.json`, which is how a handler reads the version of the client it is running
+    // against (`import pj from '@aws-sdk/client-sqs/package.json'`).
+    if let Some(package) = entry.strip_suffix(MANIFEST_SUBPATH) {
+        return supplies_package(package).then(|| manifest_source(package));
+    }
+    package_source(entry)
+}
+
+/// The subpath a package's own manifest is imported by.
+const MANIFEST_SUBPATH: &str = "/package.json";
+
+/// Whether this runtime supplies the package `package` names — the question the manifest arm
+/// above asks, which needs no module built for it.
+fn supplies_package(package: &str) -> bool {
+    package == DOCUMENT_CLIENT_PACKAGE
+        || package == DYNAMODB_UTIL_PACKAGE
+        || service_token(package).is_some()
+}
+
+/// The service token the client package `package` names, or `None` when it is not a client
+/// package of the SDK's own namespace.
+///
+/// A token is a service's SDK id, lower cased with its words hyphenated, so it carries ASCII
+/// letters, digits and hyphens and nothing else. Its length is bounded because it comes out of
+/// the guest's own specifier: a token longer than any service's SDK id names no package.
+fn service_token(package: &str) -> Option<&str> {
+    let token = package.strip_prefix(CLIENT_PACKAGE_PREFIX)?;
+    let named = !token.is_empty()
+        && token.len() <= MAX_SERVICE_TOKEN
+        && token.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
+    named.then_some(token)
+}
+
+/// The source of the package `package` names, or `None` when this runtime supplies no such
+/// package.
+fn package_source(package: &str) -> Option<String> {
     if package == DOCUMENT_CLIENT_PACKAGE {
         return Some(DOCUMENT_CLIENT_SOURCE.to_string());
     }
     if package == DYNAMODB_UTIL_PACKAGE {
         return Some(DYNAMODB_UTIL_SOURCE.to_string());
     }
-    let token = package.strip_prefix(CLIENT_PACKAGE_PREFIX)?;
-    if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-    {
-        return None;
-    }
-    Some(CLIENT_SOURCE.replace("__SERVICE_TOKEN__", token).replace("__CLIENT_NAME__", &client_name(token)))
+    Some(client_source(service_token(package)?))
+}
+
+/// The longest service token a package name may carry.
+///
+/// Every token the SDK publishes is far shorter than this; the bound is here because the token
+/// comes out of the guest's own specifier, so its length is the host's to decide and not the
+/// guest's.
+const MAX_SERVICE_TOKEN: usize = 64;
+
+/// The manifest of one package this runtime supplies.
+///
+/// A manifest states what the package IS: its name, and the generation of the SDK whose
+/// client, command and error classes it holds — the names the package exports. No release of
+/// the published package is claimed beyond that generation, because nothing else of one is
+/// here.
+fn manifest_source(package: &str) -> String {
+    ::serde_json::json!({ "name": package, "version": SDK_GENERATION })
+        .to_string()
+}
+
+/// The version the manifest of a package of this runtime states: the SDK GENERATION it
+/// implements, which for the `@aws-sdk/*` namespace is the AWS SDK for JavaScript v3 — the
+/// generation whose client, command and error classes these packages hold. It is not a
+/// published release of the package: no release of one is here to name.
+const SDK_GENERATION: &str = "3.0.0";
+
+/// One service client package, for the service `token` names: the client, the command class
+/// of every operation that service binds, and the error class of every error shape it
+/// declares — the names the SDK's own package for it exports, read from that service's model
+/// ([`exports`]).
+fn client_source(token: &str) -> String {
+    let exports = exports::client_exports(token);
+    let client = client_name(token);
+    let exception = format!("{}ServiceException", client.trim_end_matches("Client"));
+    CLIENT_SOURCE
+        .replace("__SERVICE_TOKEN__", token)
+        .replace("__CLIENT_NAME__", &client)
+        .replace("__SERVICE_EXCEPTION__", &exception)
+        .replace("__OPERATIONS__", &name_list(&exports.operations))
+        .replace("__ERRORS__", &name_list(&exports.errors))
+}
+
+/// `names` as the JavaScript array literal the module reads them from.
+fn name_list(names: &[String]) -> String {
+    ::serde_json::to_string(names).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// The class the `@aws-sdk/client-<token>` package exports its client under.
@@ -127,11 +218,12 @@ const DOCUMENT_CLIENT_PACKAGE: &str = "@aws-sdk/lib-dynamodb";
 /// The package the SDK publishes the DynamoDB value conversions under.
 const DYNAMODB_UTIL_PACKAGE: &str = "@aws-sdk/util-dynamodb";
 
-/// One service client package: the client, and a command class for every operation name
-/// asked of it.
+/// One service client package: the client, a command class for every operation, and an error
+/// class for every error shape.
 ///
 /// The service token is the package's own name — the one the SDK publishes that service's
-/// client under — and it is what the host resolves the destination from.
+/// client under — and it is what the host resolves the destination from. The operation and
+/// error names are that service's own model's ([`client_source`]).
 const CLIENT_SOURCE: &str = r##"
 'use strict';
 
@@ -153,8 +245,51 @@ function commandClass(name) {
     return Command;
 }
 
-// The error a v3 client throws for a service's refusal: the service's own error code as
-// the error's name, its message, and the metadata of the answer that carried them.
+// The exception the client throws, as a v3 client builds one: a real Error — so it carries
+// a stack — standing on the prototype of the class that names it, which is what makes
+// `error instanceof <Shape>` and `error.constructor.name` answer with the shape the service
+// refused with.
+function exception(Class, name, options) {
+    var held = options === undefined || options === null ? {} : options;
+    var error = new Error(held.message === undefined ? '' : held.message);
+    Object.setPrototypeOf(error, Class.prototype);
+    error.name = name;
+    error.$fault = held.$fault === undefined ? 'client' : held.$fault;
+    error.$metadata = held.$metadata === undefined ? {} : held.$metadata;
+    return error;
+}
+
+// The base every error class of this package extends, which is the class the SDK names a
+// refusal this package has no shape for.
+function ServiceException(options) {
+    return exception(ServiceException, '__SERVICE_EXCEPTION__', options);
+}
+ServiceException.prototype = Object.create(Error.prototype);
+ServiceException.prototype.constructor = ServiceException;
+Object.defineProperty(ServiceException, 'name', { value: '__SERVICE_EXCEPTION__' });
+
+var classes = Object.create(null);
+classes.__SERVICE_EXCEPTION__ = ServiceException;
+
+// The class of one error shape, held so that the class a handler imported by name and the
+// class a refusal is thrown as are the one class.
+function errorClass(name) {
+    var held = classes[name];
+    if (held !== undefined) {
+        return held;
+    }
+    var Thrown = function (options) {
+        return exception(Thrown, name, options);
+    };
+    Thrown.prototype = Object.create(ServiceException.prototype);
+    Thrown.prototype.constructor = Thrown;
+    Object.defineProperty(Thrown, 'name', { value: name });
+    classes[name] = Thrown;
+    return Thrown;
+}
+
+// The error a v3 client throws for a service's refusal: an instance of the class the error
+// shape names, its message, and the metadata of the answer that carried them.
 function serviceError(answered) {
     var document = {};
     try {
@@ -162,23 +297,29 @@ function serviceError(answered) {
     } catch (error) {
         document = {};
     }
-    var code = answered.errorType === null || answered.errorType === undefined
-        ? (document.__type === undefined ? 'ServiceException' : document.__type)
-        : answered.errorType;
+    // A v3 client reports the MODELED name — the error shape the answer's own document names
+    // in `__type` — and falls back to the error type of the response's header for an error
+    // the document names none for, which is what an unmodeled refusal is.
+    var code = document.__type === undefined || document.__type === null
+        ? (answered.errorType === null || answered.errorType === undefined
+            ? '__SERVICE_EXCEPTION__'
+            : answered.errorType)
+        : document.__type;
     // An error shape travels as `<shape>` or `<namespace>#<shape>`; the name a client
     // reports is the shape's own.
     var named = String(code).split('#').pop().split(':')[0];
     var message = document.message === undefined
         ? (document.Message === undefined ? '' : document.Message)
         : document.message;
-    var error = new Error(message);
-    error.name = named;
-    error.$metadata = {
-        httpStatusCode: answered.status,
-        requestId: answered.requestId === undefined ? undefined : answered.requestId
-    };
-    error.$fault = answered.status >= 500 ? 'server' : 'client';
-    return error;
+    var Thrown = errorClass(named);
+    return new Thrown({
+        message: message,
+        $metadata: {
+            httpStatusCode: answered.status,
+            requestId: answered.requestId === undefined ? undefined : answered.requestId
+        },
+        $fault: answered.status >= 500 ? 'server' : 'client'
+    });
 }
 
 // The input members a call carries BYTES in, by service: every protocol this SDK speaks
@@ -245,6 +386,8 @@ function Client(configuration) {
     };
 }
 
+Object.defineProperty(Client, 'name', { value: '__CLIENT_NAME__' });
+
 Client.prototype.send = function (command) {
     var self = this;
     return new Promise(function (resolve, reject) {
@@ -298,14 +441,30 @@ Client.prototype.send = function (command) {
 
 Client.prototype.destroy = function () { return undefined; };
 
-// The client's own exported name is the service's token in the form the SDK names it:
-// `S3Client` for `client-s3`, `DynamoDBClient` for `client-dynamodb`, which is the name a
-// handler destructures from this package. A name a handler asks for that this module does
-// not hold a value for is answered as the kind of member it names — a command class for a
-// `…Command`, the client for a `…Client` — and as nothing otherwise, so a typo is
-// `undefined` rather than a stand-in.
+// What this package exports, under the names the SDK's own package for this service exports
+// them by: the client — `S3Client` for `client-s3`, `DynamoDBClient` for `client-dynamodb` —
+// the command class of every operation the service binds, the error class of every error
+// shape it declares, and the base exception the others extend. They are OWN members so that
+// an `import { … } from` of this package, which binds its names when the module is linked,
+// finds them. A name a handler asks for that this module holds no value for is answered as
+// the kind of member it names — a command class for a `…Command`, the client for a `…Client`
+// — and as nothing otherwise, so a typo is `undefined` rather than a stand-in.
 var members = Object.create(null);
 members.__CLIENT_NAME__ = Client;
+members.__SERVICE_EXCEPTION__ = ServiceException;
+
+var OPERATIONS = __OPERATIONS__;
+var ERRORS = __ERRORS__;
+
+(function () {
+    var at = 0;
+    for (at = 0; at < OPERATIONS.length; at += 1) {
+        members[OPERATIONS[at] + 'Command'] = commandClass(OPERATIONS[at] + 'Command');
+    }
+    for (at = 0; at < ERRORS.length; at += 1) {
+        members[ERRORS[at]] = errorClass(ERRORS[at]);
+    }
+})();
 
 module.exports = new Proxy(members, {
     get: function (target, name) {
@@ -630,9 +789,20 @@ DynamoDBDocumentClient.prototype.destroy = function () {
     return this.client.destroy();
 };
 
+// What this package exports: the document client, and the command class of every action it
+// addresses — the actions `OPERATIONS` above maps, which are the ones the document client
+// has a command for. They are OWN members so that an `import { … } from` of this package
+// finds them.
 var members = Object.create(null);
 members.DynamoDBDocumentClient = DynamoDBDocumentClient;
 members.DynamoDBDocument = DynamoDBDocumentClient;
+
+(function () {
+    var actions = Object.keys(OPERATIONS);
+    for (var at = 0; at < actions.length; at += 1) {
+        members[actions[at] + 'Command'] = commandClass(actions[at] + 'Command');
+    }
+})();
 
 module.exports = new Proxy(members, {
     get: function (target, name) {
@@ -683,6 +853,24 @@ mod tests {    use super::*;
                 "case {id:?}: this runtime supplies no such module, so none must resolve"
             );
         }
+        // A token longer than any service's SDK id names no package of this runtime, so the
+        // length a specifier may carry is this runtime's and not the guest's.
+        let longest = format!(
+            "runtime:node_modules/@aws-sdk/client-{}",
+            "s".repeat(MAX_SERVICE_TOKEN)
+        );
+        let past = format!(
+            "runtime:node_modules/@aws-sdk/client-{}",
+            "s".repeat(MAX_SERVICE_TOKEN + 1)
+        );
+        assert!(
+            runtime_module_source(&longest).is_some(),
+            "case {longest:?}: a token of the longest length admitted still names a package"
+        );
+        assert!(
+            runtime_module_source(&past).is_none(),
+            "case {past:?}: a token past that length names no package of this runtime"
+        );
         // The two packages that are not a service client: the document client and the
         // value conversions it is built on.
         for id in [
@@ -722,6 +910,85 @@ mod tests {    use super::*;
                 source.contains(&format!("members.{exported} = Client;")),
                 "case {token:?}: expected the client exported as {exported}, got a module \
                  exporting another name"
+            );
+            let exception = format!("{}ServiceException", exported.trim_end_matches("Client"));
+            assert!(
+                source.contains(&format!("members.{exception} = ServiceException;")),
+                "case {token:?}: expected the base exception exported as {exception}, got a \
+                 module exporting another name"
+            );
+        }
+    }
+
+    /// A package's own MANIFEST is a subpath of it, which is how a handler reads the package
+    /// it is running against (`import pj from '@aws-sdk/client-sqs/package.json'`), and the
+    /// manifest names that package — one row per package this runtime supplies, plus the
+    /// manifest of a package it supplies none of.
+    #[test]
+    fn a_supplied_package_carries_its_own_manifest() {
+        for package in [
+            "@aws-sdk/client-sqs",
+            "@aws-sdk/client-s3",
+            "@aws-sdk/lib-dynamodb",
+            "@aws-sdk/util-dynamodb",
+        ] {
+            let id = format!("runtime:node_modules/{package}/package.json");
+            let source = runtime_module_source(&id)
+                .unwrap_or_else(|| panic!("case {package:?}: expected the manifest, got none"));
+            let read: ::serde_json::Value = ::serde_json::from_str(&source)
+                .unwrap_or_else(|_| panic!("case {package:?}: the manifest is not JSON"));
+            assert_eq!(
+                read.get("name").and_then(::serde_json::Value::as_str),
+                Some(package),
+                "case {package:?}: expected the manifest to name the package, got {source}"
+            );
+            assert!(
+                read.get("version")
+                    .and_then(::serde_json::Value::as_str)
+                    .is_some_and(|version| version.starts_with("3.")),
+                "case {package:?}: expected the manifest to state the SDK generation it \
+                 implements, got {source}"
+            );
+        }
+        for id in [
+            "runtime:node_modules/express/package.json",
+            "runtime:node_modules/@aws-sdk/lib-s3/package.json",
+            "runtime:node_modules/package.json",
+        ] {
+            assert!(
+                runtime_module_source(id).is_none(),
+                "case {id:?}: this runtime supplies no such package, so it holds no manifest \
+                 of one"
+            );
+        }
+    }
+
+    /// The names a client package exports are the service's own model's: the command class of
+    /// every operation it binds and the class of every error shape it declares, each an OWN
+    /// member of the package, which is what an ES module import of it binds by name.
+    #[test]
+    fn a_client_package_exports_its_services_commands_and_errors() {
+        // Each row: the package's token, a command the service's model binds, and an error
+        // class it declares.
+        let cases: &[(&str, &str, &str)] = &[
+            ("sqs", "GetQueueUrlCommand", "QueueDoesNotExist"),
+            ("sqs", "ReceiveMessageCommand", "OverLimit"),
+            ("dynamodb", "GetItemCommand", "ResourceNotFoundException"),
+            ("secretsmanager", "GetSecretValueCommand", "ResourceNotFoundException"),
+        ];
+        for (token, command, error) in cases {
+            let id = format!("runtime:node_modules/@aws-sdk/client-{token}");
+            let source = runtime_module_source(&id).expect("the client package's source");
+            let operation = command.trim_end_matches("Command");
+            assert!(
+                source.contains(&format!("\"{operation}\"")),
+                "case {token:?}: expected {command} among the commands the model's operations \
+                 give, got a module without it"
+            );
+            assert!(
+                source.contains(&format!("\"{error}\"")),
+                "case {token:?}: expected {error} among the classes the model's error shapes \
+                 give, got a module without it"
             );
         }
     }

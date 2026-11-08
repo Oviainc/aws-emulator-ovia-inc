@@ -275,6 +275,119 @@ fn boundary_refusal_code(resp: &aws_smithy_runtime_api::http::Response) -> Optio
         .copied()
 }
 
+/// The body member the JSON error renderers name the error shape in.
+const TYPE_MEMBER: &str = "__type";
+
+/// This service's own Smithy model, embedded from the file this crate is generated from.
+///
+/// The shape ids an error answer names its class under are read out of it, so the id a body
+/// carries is the id the model declares and cannot drift from it. The include is a
+/// COMPILE-TIME read of that file: a model that moves fails this crate's build.
+const MODEL: &str = include_str!("../smithy-model/com-amazonaws-sqs-amazonsqs.json");
+
+/// The fully qualified shape id this service's model declares for the error shape whose local
+/// name is `local`, or `None` when its model declares no error shape of that name.
+///
+/// The map is built once per process, out of the model's own shapes: every shape it marks
+/// with `@error`, under the local name the JSON renderer writes into `__type` and the
+/// qualified id the model gives it. A name the model declares no error shape for — the
+/// request-validation framework's own classes, which already name their own package, and the
+/// scaffold's synthetic signal — is not one of this service's classes and is answered as the
+/// layer that built it wrote it.
+fn modelled_error_id(local: &str) -> Option<&'static str> {
+    static IDS: std::sync::OnceLock<std::collections::BTreeMap<String, String>> =
+        std::sync::OnceLock::new();
+    IDS.get_or_init(|| {
+        let shapes = serde_json::from_str::<serde_json::Value>(MODEL)
+            .ok()
+            .and_then(|document| document.get("shapes").cloned());
+        let Some(serde_json::Value::Object(shapes)) = shapes else {
+            return std::collections::BTreeMap::new();
+        };
+        shapes
+            .iter()
+            .filter(|(_, shape)| {
+                shape.get("type").and_then(serde_json::Value::as_str) == Some("structure")
+                    && shape
+                        .get("traits")
+                        .and_then(serde_json::Value::as_object)
+                        .is_some_and(|traits| traits.contains_key("smithy.api#error"))
+            })
+            .filter_map(|(id, _)| {
+                let name = id.split('#').next_back()?;
+                (!name.is_empty()).then(|| (name.to_string(), id.clone()))
+            })
+            .collect()
+    })
+    .get(local)
+    .map(String::as_str)
+}
+
+/// `resp` with the error class its body names stated in FULL — the qualified shape id this
+/// service's model declares for it.
+///
+/// This is the other half of what `awsQueryCompatible` means for a service that migrated off
+/// the query protocol: the body names the error SHAPE, and it names it by its shape id
+/// (`com.amazonaws.sqs#QueueDoesNotExist`), which is what a modern client resolves its typed
+/// exception from. The framework's JSON renderer writes the local shape name alone, because
+/// that is all an error value carries, so the id is completed here — once, on the way out, so
+/// every layer's failure names its class alike.
+///
+/// Left alone: a success (it names no class), a body naming a class of no shape of this
+/// service's model, a body that already carries the qualified id, and every other member,
+/// header and the status.
+fn naming_the_class_in_full(
+    mut resp: aws_smithy_runtime_api::http::Response,
+) -> aws_smithy_runtime_api::http::Response {
+    // An error body is built in memory by its renderer, so its bytes are readable here; a
+    // streamed body is not an error body and is left alone.
+    let Some(rewritten) = resp
+        .body()
+        .bytes()
+        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+        .and_then(qualified_type_document)
+    else {
+        return resp;
+    };
+    // Only a renderer that advertised a length needs it corrected; the framework's error
+    // renderers set `content-type` alone and leave framing to the transport.
+    if resp.headers().get("content-length").is_some() {
+        let length = rewritten.len().to_string();
+        let _ = resp.headers_mut().try_insert("content-length", length);
+    }
+    *resp.body_mut() = aws_smithy_types::body::SdkBody::from(rewritten);
+    resp
+}
+
+/// `document` with its `__type` restated as the model's own shape id, or `None` when there is
+/// nothing to restate: a document naming no class, a class of no shape of this model, or one
+/// already named in full.
+fn qualified_type_document(mut document: serde_json::Value) -> Option<Vec<u8>> {
+    let object = document.as_object_mut()?;
+    let named = object.get(TYPE_MEMBER)?.as_str()?.trim().to_string();
+    let shape_id = modelled_error_id(named.split('#').next_back().unwrap_or(&named))?;
+    if named == shape_id {
+        return None;
+    }
+    object.insert(TYPE_MEMBER.to_string(), serde_json::Value::from(shape_id));
+    serde_json::to_vec(&document).ok()
+}
+
+/// `resp` as this `awsQueryCompatible` service answers it: the error class named in full in
+/// the body ([`naming_the_class_in_full`]), and its legacy query code reported in the header
+/// for a client that asked for one ([`reporting_the_query_error`]).
+///
+/// A success names no class and passes through untouched.
+fn completing_the_envelope(
+    req: &aws_smithy_runtime_api::http::Request,
+    resp: aws_smithy_runtime_api::http::Response,
+) -> aws_smithy_runtime_api::http::Response {
+    if resp.status().as_u16() < FIRST_FAILURE_STATUS {
+        return resp;
+    }
+    reporting_the_query_error(req, naming_the_class_in_full(resp))
+}
+
 /// `resp` with the legacy query error report added, for a request that asked for one.
 ///
 /// `awsQueryCompatible` names an error class TWICE: the body's `__type` names the error
@@ -317,7 +430,7 @@ fn reporting_the_query_error(
 
 /// Serves the modelled operation the generated routing table names for the request,
 /// exactly as that table would, and completes the error envelope this service owes on the
-/// way out ([`reporting_the_query_error`]).
+/// way out ([`completing_the_envelope`]).
 ///
 /// It stores no operation of its own and makes no routing decision: the operation run is
 /// the one the service's own table names for the request, so the framework still owns the
@@ -357,7 +470,7 @@ impl ErasedOperation for QueryCompatibleErrors {
                 // claimed the key.
                 None => svc.definition().routing_error_response(req),
             };
-            reporting_the_query_error(req, response)
+            completing_the_envelope(req, response)
         })
     }
 
@@ -500,5 +613,83 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{modelled_error_id, qualified_type_document, TYPE_MEMBER};
+
+    /// The class a body names is restated by the id this service's MODEL declares for it, and
+    /// nothing else is restated — one row per kind of name a layer of this service can write
+    /// into the discriminator.
+    #[test]
+    fn a_class_of_this_services_model_is_named_by_its_shape_id() {
+        // (case, the name a renderer wrote, the id the body then carries)
+        let rows: &[(&str, &str, Option<&str>)] = &[
+            (
+                "a modelled class the model binds a legacy code to",
+                "QueueDoesNotExist",
+                Some("com.amazonaws.sqs#QueueDoesNotExist"),
+            ),
+            (
+                "a modelled class whose legacy binding the model defaults",
+                "InvalidAttributeValue",
+                Some("com.amazonaws.sqs#InvalidAttributeValue"),
+            ),
+            (
+                "a modelled class of the batch operations",
+                "TooManyEntriesInBatchRequest",
+                Some("com.amazonaws.sqs#TooManyEntriesInBatchRequest"),
+            ),
+            (
+                "the same class already named in full",
+                "com.amazonaws.sqs#QueueDoesNotExist",
+                None,
+            ),
+            (
+                "the request-validation framework's own class",
+                "com.amazon.coral.service#InvalidParameterValueException",
+                None,
+            ),
+            ("the scaffold's own signal", "NotImplemented", None),
+            ("a name of no shape of this model", "ValidationException", None),
+        ];
+        for (case, written, expected) in rows {
+            let document = ::serde_json::json!({ TYPE_MEMBER: written, "message": "no" });
+            let rewritten = qualified_type_document(document).map(|bytes| {
+                ::serde_json::from_slice::<::serde_json::Value>(&bytes)
+                    .expect("the rewritten body is JSON")[TYPE_MEMBER]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string()
+            });
+            assert_eq!(
+                rewritten.as_deref(),
+                *expected,
+                "case {case:?}: expected the body to name {expected:?}, got {rewritten:?}"
+            );
+        }
+    }
+
+    /// The ids come from the model rather than from this file: a shape it does not mark as an
+    /// error is no class of an answer, whatever its name looks like.
+    #[test]
+    fn only_the_models_error_shapes_are_classes() {
+        for local in ["QueueDoesNotExist", "QueueNameExists", "InvalidMessageContents"] {
+            assert_eq!(
+                modelled_error_id(local),
+                Some(format!("com.amazonaws.sqs#{local}").as_str()),
+                "case {local:?}: expected the model's own id for the error shape"
+            );
+        }
+        for local in ["SendMessageRequest", "QueueAttributeName", "Message", ""] {
+            assert_eq!(
+                modelled_error_id(local),
+                None,
+                "case {local:?}: this names no error shape of the model, so no answer names a \
+                 class by it"
+            );
+        }
     }
 }

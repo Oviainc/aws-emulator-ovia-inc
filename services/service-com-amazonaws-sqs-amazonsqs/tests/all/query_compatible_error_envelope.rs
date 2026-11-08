@@ -23,11 +23,11 @@
 //! expected shape id and legacy code is the constant the service itself declares, never a
 //! string copied out of an answer.
 //!
-//! A MODELLED error's `__type` is its LOCAL shape name in these rows, which is what the
-//! answers this rule comes from already carry — the recorded divergence for those classes
-//! is the absent header alone — so the rows pin that discriminator rather than a namespaced
-//! form nothing has shown. Should a recording ever show `com.amazonaws.sqs#<ShapeName>` for
-//! one of them, that is a change to make here, not a regression of this suite.
+//! A MODELLED error's `__type` is its FULLY QUALIFIED shape id — `com.amazonaws.sqs#<Shape>`,
+//! the id the service's own model declares for the class — which is what a modern client
+//! resolves its typed exception from; a parameter refusal raised by the request-validation
+//! framework names that framework's own shape id instead, because the class belongs to that
+//! layer and not to this service's model.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_sqs_amazonsqs::scaffolded::{
@@ -49,6 +49,18 @@ use super::support::{
 /// the shape's own name, which is what makes them the rows that pin "the model's code wins".
 const NON_EXISTENT_QUEUE: &str = "AWS.SimpleQueueService.NonExistentQueue";
 const PURGE_IN_PROGRESS: &str = "AWS.SimpleQueueService.PurgeQueueInProgress";
+
+/// The namespace this service's model declares its shapes in
+/// (`smithy_query(query="service_info",
+/// model_path="services/service-com-amazonaws-sqs-amazonsqs/smithy-model/com-amazonaws-sqs-amazonsqs.json")`:
+/// service shape `com.amazonaws.sqs#AmazonSQS`), which is the package a body names one of its
+/// error classes under.
+const NAMESPACE: &str = "com.amazonaws.sqs";
+
+/// The shape id a body names the modelled class `local` under.
+fn modelled(local: &str) -> String {
+    format!("{NAMESPACE}#{local}")
+}
 
 /// One row: the case, the operation, the request, the status it owes, the error SHAPE its
 /// `__type` names and the LEGACY CODE its header reports.
@@ -138,7 +150,7 @@ async fn rows(router: &MultiServiceRouter) -> Vec<Row> {
                 "Attributes": {"VisibilityTimeout": "-1"},
             }),
             status: 400,
-            shape: "InvalidAttributeValue".to_string(),
+            shape: modelled("InvalidAttributeValue"),
             code: "InvalidAttributeValue".to_string(),
         },
         Row {
@@ -146,7 +158,7 @@ async fn rows(router: &MultiServiceRouter) -> Vec<Row> {
             operation: "SetQueueAttributes",
             request: json!({"QueueUrl": queue, "Attributes": {"DelaySeconds": "1000000"}}),
             status: 400,
-            shape: "InvalidAttributeValue".to_string(),
+            shape: modelled("InvalidAttributeValue"),
             code: "InvalidAttributeValue".to_string(),
         },
         Row {
@@ -154,7 +166,7 @@ async fn rows(router: &MultiServiceRouter) -> Vec<Row> {
             operation: "SendMessage",
             request: json!({"QueueUrl": queue, "MessageBody": "ring\u{7}ring"}),
             status: 400,
-            shape: "InvalidMessageContents".to_string(),
+            shape: modelled("InvalidMessageContents"),
             code: "InvalidMessageContents".to_string(),
         },
         // The BOUNDARY walk's refusal, worded by this service: rendered outside the
@@ -165,7 +177,7 @@ async fn rows(router: &MultiServiceRouter) -> Vec<Row> {
             operation: "GetQueueAttributes",
             request: json!({"QueueUrl": queue, "AttributeNames": ["NotAnAttribute"]}),
             status: 400,
-            shape: "InvalidAttributeName".to_string(),
+            shape: modelled("InvalidAttributeName"),
             code: "InvalidAttributeName".to_string(),
         },
         // A modelled class whose code the model STATES: the report carries that code, not
@@ -175,7 +187,7 @@ async fn rows(router: &MultiServiceRouter) -> Vec<Row> {
             operation: "GetQueueAttributes",
             request: json!({"QueueUrl": absent, "AttributeNames": ["All"]}),
             status: 400,
-            shape: "QueueDoesNotExist".to_string(),
+            shape: modelled("QueueDoesNotExist"),
             code: NON_EXISTENT_QUEUE.to_string(),
         },
         // A refusal that is a 4xx but not a 400: still the caller's fault.
@@ -184,7 +196,7 @@ async fn rows(router: &MultiServiceRouter) -> Vec<Row> {
             operation: "PurgeQueue",
             request: json!({"QueueUrl": purged}),
             status: 403,
-            shape: "PurgeQueueInProgress".to_string(),
+            shape: modelled("PurgeQueueInProgress"),
             code: PURGE_IN_PROGRESS.to_string(),
         },
     ]

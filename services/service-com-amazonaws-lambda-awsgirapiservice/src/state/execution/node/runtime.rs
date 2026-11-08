@@ -34,6 +34,8 @@
 //! * `resolveModule(base, name)` / `moduleSource(id)` — how an `import` is resolved and
 //!   loaded, which is the same resolution `require` performs: a file of this package, or a
 //!   core module this emulator supplies, and nothing else.
+//! * `moduleNotFound(name)` — the error a specifier that resolves to nothing fails with,
+//!   which the host raises from its own resolver.
 
 /// The JavaScript source of the runtime, evaluated once per invocation in a fresh engine.
 pub(super) const RUNTIME_SOURCE: &str = r##"
@@ -353,9 +355,13 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
     // The modules the RUNTIME itself supplies under its own `node_modules`, which a bare
     // specifier reaches once the package's and the layers' own directories are exhausted:
     // the AWS SDK a managed runtime ships.
+    //
+    // The lookup key is built by [`packagePath`] like every other one, so a specifier is
+    // normalised before anything is looked up and one carrying `..` names nothing of this
+    // mount: there is no second route to a key.
     function runtimeSupplied(request) {
-        var id = RUNTIME_PREFIX + 'node_modules/' + request;
-        return sourceOf(id) === null ? null : id;
+        var id = packagePath(RUNTIME_PREFIX + 'node_modules', request);
+        return id === null || sourceOf(id) === null ? null : id;
     }
 
     function moduleNotFound(request) {
@@ -463,7 +469,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
                 // A CORE module is compiled by the engine's own function constructor
                 // instead: the name a compilation unit is known by is the name a module of
                 // it is IMPORTED by, and a core module's import name is the one its own ES
-                // wrapper is declared under ([`coreWrapper`]), which must stay that
+                // wrapper is declared under ([`requiredWrapper`]), which must stay that
                 // wrapper's.
                 var compiled = core
                     ? new Function(
@@ -509,7 +515,7 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
             return null;
         }
         if (id.indexOf(CORE_PREFIX) === 0) {
-            return coreWrapper(id);
+            return requiredWrapper(id);
         }
         var source = sourceOf(id);
         if (source === null) {
@@ -517,6 +523,11 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         }
         if (endsWith(id, '.json')) {
             return 'export default ' + source + ';\n';
+        }
+        if (id.indexOf(RUNTIME_PREFIX) === 0) {
+            // A package the runtime itself supplies, which on a managed runtime is an ES
+            // module of the SDK: its members are its named exports.
+            return requiredWrapper(id);
         }
         if (esModuleFile(id)) {
             // Stated on the FIRST line, so every line of the module keeps the number it
@@ -561,18 +572,27 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         return /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(name) && name !== 'default';
     }
 
-    // A core module as an ES module: its own object as the default export, and one named
-    // export per member it carries, which is what an `import { member } from` needs.
-    function coreWrapper(id) {
+    // A module `require` answers with an object for, as an ES MODULE: its own object as the
+    // default export, and one named export per member it carries, which is what an `import
+    // { member } from` of it needs — the names are bound when the importing module is
+    // LINKED, before any of them is read, so they are stated here.
+    //
+    // This is how a CORE module is imported, and how a module the RUNTIME supplies is: the
+    // packages of the AWS SDK a managed node runtime ships, whose client, command and error
+    // classes a handler imports by name.
+    function requiredWrapper(id) {
         var exported = requireId(id);
         var lines = [
-            'const __core = globalThis.__lambdaRuntime.requireId(' + JSON.stringify(id) + ');',
-            'export default __core;'
+            'const __required = globalThis.__lambdaRuntime.requireId('
+                + JSON.stringify(id) + ');',
+            'export default __required;'
         ];
-        var keys = Object.keys(exported === null ? {} : exported);
+        var keys = Object.keys(exported === null || exported === undefined ? {} : exported);
         for (var index = 0; index < keys.length; index += 1) {
             if (isIdentifier(keys[index])) {
-                lines.push('export const ' + keys[index] + ' = __core.' + keys[index] + ';');
+                lines.push(
+                    'export const ' + keys[index] + ' = __required.' + keys[index] + ';'
+                );
             }
         }
         return lines.join('\n') + '\n';
@@ -1536,6 +1556,10 @@ pub(super) const RUNTIME_SOURCE: &str = r##"
         reportUnhandledRejection: reportUnhandledRejection,
         resolveModule: resolveModule,
         moduleSource: moduleSource,
+        // The error a specifier that resolves to nothing fails with, which is the one a
+        // `require` of it throws: the host raises it from its own resolver, so an `import`
+        // that resolves to nothing fails the way a `require` of the same specifier does.
+        moduleNotFound: moduleNotFound,
         requireId: requireId,
         // The three computations the `crypto` core module is served by, and the two reads
         // the `fs` one answers from the read-only mounts.

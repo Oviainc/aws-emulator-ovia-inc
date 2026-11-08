@@ -859,8 +859,24 @@ impl Resolver for RuntimeResolver {
     ) -> rquickjs::Result<String> {
         let resolved: Option<String> =
             runtime_call(ctx, "resolveModule", (base.to_string(), name.to_string()))
-                .map_err(|_| rquickjs::Error::new_resolving(base.to_string(), name.to_string()))?;
-        resolved.ok_or_else(|| rquickjs::Error::new_resolving(base.to_string(), name.to_string()))
+                .map_err(|_| module_not_found(ctx, name))?;
+        resolved.ok_or_else(|| module_not_found(ctx, name))
+    }
+}
+
+/// The failure a specifier that resolves to nothing is reported as: the error the node
+/// runtime raises for a module it cannot find, raised as the exception the resolution fails
+/// with.
+///
+/// It is the SAME error a `require` of that specifier throws — `MODULE_NOT_FOUND`, "Cannot
+/// find module '<specifier>'" — so a failed `import` is classified the way a failed `require`
+/// is, which is the class the node runtime reports for a module it could not import
+/// (`Runtime.ImportModuleError`) rather than as whatever the engine's own resolver failure
+/// looks like.
+fn module_not_found<'js>(ctx: &Ctx<'js>, name: &str) -> rquickjs::Error {
+    match runtime_call::<_, Value<'js>>(ctx, "moduleNotFound", (name.to_string(),)) {
+        Ok(error) => ctx.throw(error),
+        Err(_) => rquickjs::Error::new_resolving(String::new(), name.to_string()),
     }
 }
 
@@ -2188,6 +2204,162 @@ mod tests {
             }),
             "expected the zone to be refused as invalid, got {actual}"
         );
+    }
+
+    /// A run that resolves MANY distinct runtime-supplied specifiers answers inside its own
+    /// budget, and nothing a specifier names is held past it: the names a client package
+    /// exports are read from one cell per service this emulator can call
+    /// (`node_sdk_guest::exports`), so a handler naming tokens no service answers to grows
+    /// nothing outside the engine's own ceiling.
+    #[test]
+    fn a_run_that_names_many_runtime_specifiers_answers_inside_its_budget() {
+        let finished = ran(
+            "exports.handler = async () => {\n\
+             let bound = 0;\n\
+             for (let at = 0; at < 100; at += 1) {\n\
+                 const held = require('@aws-sdk/client-absentservice' + at);\n\
+                 bound += typeof held['AbsentService' + at + 'Client'] === 'function' ? 1 : 0;\n\
+             }\n\
+             return { bound };\n\
+             };",
+            "index.handler",
+            None,
+        );
+        let actual = returned(&finished, "a hundred distinct client packages");
+        assert_eq!(
+            actual,
+            ::serde_json::json!({ "bound": 100 }),
+            "expected every specifier to resolve inside the run's budget, got {actual}"
+        );
+    }
+
+    /// The AWS SDK packages this runtime BUNDLES are importable as ES modules by the names
+    /// they export, with nothing in the deployment package — one row per package, each
+    /// binding what that package exports and reading its own manifest subpath.
+    #[test]
+    fn an_es_module_imports_the_bundled_sdk_packages_by_name() {
+        let cases: &[(&str, &str, ::serde_json::Value)] = &[
+            (
+                "a service client, its commands and its error classes",
+                "import { SQSClient, GetQueueUrlCommand, QueueDoesNotExist, \
+                 SQSServiceException } from '@aws-sdk/client-sqs';\n\
+                 import manifest from '@aws-sdk/client-sqs/package.json' with { type: 'json' \
+                 };\n\
+                 export const handler = async () => ({\n\
+                 client: SQSClient.name,\n\
+                 command: new GetQueueUrlCommand({}).operation,\n\
+                 error: new QueueDoesNotExist({ message: 'gone' }).name,\n\
+                 modelled: new QueueDoesNotExist({}) instanceof SQSServiceException,\n\
+                 package: manifest.name,\n\
+                 });\n",
+                ::serde_json::json!({
+                    "client": "SQSClient",
+                    "command": "GetQueueUrl",
+                    "error": "QueueDoesNotExist",
+                    "modelled": true,
+                    "package": "@aws-sdk/client-sqs",
+                }),
+            ),
+            (
+                "another service's client package, with its own commands and error classes",
+                "import { S3Client, PutObjectCommand, NoSuchKey } from '@aws-sdk/client-s3';\n\
+                 export const handler = async () => ({\n\
+                 client: S3Client.name,\n\
+                 command: new PutObjectCommand({}).operation,\n\
+                 error: new NoSuchKey({}).name,\n\
+                 });\n",
+                ::serde_json::json!({
+                    "client": "S3Client",
+                    "command": "PutObject",
+                    "error": "NoSuchKey",
+                }),
+            ),
+            (
+                "a client package for a service this emulator makes no call to",
+                "import { KinesisClient } from '@aws-sdk/client-kinesis';\n\
+                 export const handler = async () => ({ client: KinesisClient.name });\n",
+                ::serde_json::json!({ "client": "KinesisClient" }),
+            ),
+            (
+                "the document client and its commands",
+                "import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';\n\
+                 export const handler = async () => ({\n\
+                 from: typeof DynamoDBDocumentClient.from,\n\
+                 command: new PutCommand({}).operation,\n\
+                 });\n",
+                ::serde_json::json!({ "from": "function", "command": "PutItem" }),
+            ),
+            (
+                "the value conversions",
+                "import { marshall, unmarshall } from '@aws-sdk/util-dynamodb';\n\
+                 export const handler = async () => ({\n\
+                 round: unmarshall(marshall({ n: 1, s: 'x' })),\n\
+                 });\n",
+                ::serde_json::json!({ "round": { "n": 1, "s": "x" } }),
+            ),
+        ];
+        for (case, source, expected) in cases {
+            let finished = ran_package(&[("index.mjs", source)], "index.handler", None);
+            let actual = returned(&finished, case);
+            assert_eq!(
+                &actual, expected,
+                "case {case:?}: expected {expected}, got {actual}"
+            );
+        }
+    }
+
+    /// A specifier this runtime cannot resolve fails the way the node runtime reports a
+    /// module it cannot find — the class of the INITIALIZATION phase, naming the specifier —
+    /// whether the handler's module reaches it with an `import` or with a `require`, which is
+    /// the one resolution.
+    #[test]
+    fn a_specifier_that_resolves_to_nothing_is_a_module_not_found() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "an ES module importing a scoped package no runtime supplies",
+                "import held from '@aws-sdk/lib-absent';\n\
+                 export const handler = async () => held;\n",
+                "@aws-sdk/lib-absent",
+            ),
+            (
+                "an ES module importing a bare package the package does not hold",
+                "import held from 'left-pad';\nexport const handler = async () => held;\n",
+                "left-pad",
+            ),
+            (
+                "an ES module importing a relative module the package does not hold",
+                "import held from './absent.mjs';\nexport const handler = async () => held;\n",
+                "./absent.mjs",
+            ),
+            (
+                "an ES module importing a core module this runtime does not supply",
+                "import held from 'node:absent';\nexport const handler = async () => held;\n",
+                "node:absent",
+            ),
+        ];
+        for (case, source, specifier) in cases {
+            let finished = ran_package(&[("index.mjs", source)], "index.handler", None);
+            match &finished.completion {
+                Completion::Raised {
+                    error_type,
+                    error_message,
+                    ..
+                } => {
+                    assert_eq!(
+                        error_type, "Runtime.ImportModuleError",
+                        "case {case:?}: expected the class of a module that would not import, \
+                         got {error_type} ({error_message})"
+                    );
+                    assert_eq!(
+                        error_message,
+                        &format!("Error: Cannot find module '{specifier}'"),
+                        "case {case:?}: expected the specifier to be named as the module that \
+                         was not found, got {error_message}"
+                    );
+                }
+                other => panic!("case {case:?}: expected a raised error, got {other:?}"),
+            }
+        }
     }
 
     /// The MAJOR version and the release a `Runtime` identifier names — one row per form

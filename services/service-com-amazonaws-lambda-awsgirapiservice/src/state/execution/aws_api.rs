@@ -324,6 +324,51 @@ pub const APIS: &[Api] = &[
     },
 ];
 
+/// The Smithy MODEL of each service a call may be made to, embedded from the crate that
+/// service's own emulator is generated from — the SAME file, so nothing read out of it can
+/// drift from the surface that service serves. The include is a COMPILE-TIME read: a model
+/// that moves fails this crate's build rather than changing what a call does.
+///
+/// Two things are read from these: the names the service's own SDK package exports, which an
+/// `import` of that package binds (`super::node_sdk_guest`'s `exports`, which holds the one
+/// table of which service each belongs to), and, for a `restJson1` service, where each member
+/// of a request belongs ([`super::rest_json`]).
+pub(super) const SQS_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-sqs-amazonsqs/smithy-model/\
+     com-amazonaws-sqs-amazonsqs.json"
+);
+pub(super) const EVENTBRIDGE_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-eventbridge-awsevents/smithy-model/\
+     com-amazonaws-eventbridge-awsevents.json"
+);
+pub(super) const DYNAMODB_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-dynamodb-dynamodb-20120810/smithy-model/\
+     com-amazonaws-dynamodb-dynamodb-20120810.json"
+);
+pub(super) const CLOUDWATCH_LOGS_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-cloudwatchlogs-logs-20140328/smithy-model/\
+     com-amazonaws-cloudwatchlogs-logs-20140328.json"
+);
+pub(super) const SECRETSMANAGER_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-secretsmanager-secretsmanager/smithy-model/\
+     com-amazonaws-secretsmanager-secretsmanager.json"
+);
+pub(super) const APIGATEWAY_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-apigateway-backplanecontrolservice/smithy-model/\
+     com-amazonaws-apigateway-backplanecontrolservice.json"
+);
+pub(super) const SESV2_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-sesv2-simpleemailservice-v2/smithy-model/\
+     com-amazonaws-sesv2-simpleemailservice-v2.json"
+);
+pub(super) const S3_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-s3-amazons3/smithy-model/com-amazonaws-s3-amazons3.json"
+);
+pub(super) const SFN_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-sfn-awsstepfunctions/smithy-model/\
+     com-amazonaws-sfn-awsstepfunctions.json"
+);
+
 /// Amazon API Gateway's own model, which a call to it is bound by.
 ///
 /// The model is the one the API Gateway emulator's own crate is generated from, embedded
@@ -333,10 +378,7 @@ pub const APIS: &[Api] = &[
 /// The include is a COMPILE-TIME read of that file: a model that moves fails this crate's
 /// build rather than changing what a call does.
 static APIGATEWAY: super::rest_json::RestApi = super::rest_json::RestApi {
-    model: include_str!(
-        "../../../../service-com-amazonaws-apigateway-backplanecontrolservice/smithy-model/\
-         com-amazonaws-apigateway-backplanecontrolservice.json"
-    ),
+    model: APIGATEWAY_MODEL,
     namespace: "com.amazonaws.apigateway",
     parsed: ::std::sync::OnceLock::new(),
 };
@@ -357,10 +399,7 @@ static OPENSEARCH: super::rest_json::RestApi = super::rest_json::RestApi {
 /// API Gateway model above is and for the same reason: the wire facts of its operations are
 /// that model's, so this seam states none of them.
 static SESV2: super::rest_json::RestApi = super::rest_json::RestApi {
-    model: include_str!(
-        "../../../../service-com-amazonaws-sesv2-simpleemailservice-v2/smithy-model/\
-         com-amazonaws-sesv2-simpleemailservice-v2.json"
-    ),
+    model: SESV2_MODEL,
     namespace: "com.amazonaws.sesv2",
     parsed: ::std::sync::OnceLock::new(),
 };
