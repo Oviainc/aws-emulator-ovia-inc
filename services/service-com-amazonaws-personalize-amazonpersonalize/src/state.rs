@@ -66,7 +66,11 @@ pub struct DatasetRecord {
     pub name: String,
     pub dataset_arn: String,
     pub dataset_group_arn: String,
-    /// The canonical spelling of the dataset type (see [`canonical_dataset_type`]).
+    /// The dataset's type, in the UPPER-CASE name Amazon Personalize identifies a type
+    /// by — the same spelling the dataset's own ARN carries as its last segment. The
+    /// create accepts the member case-insensitively
+    /// ([`canonical_dataset_type`]) and the casing it was written in is not part of the
+    /// dataset, so every read reports this one spelling.
     pub dataset_type: String,
     pub schema_arn: String,
     /// The tracking id Amazon Personalize provides for an ACTION INTERACTIONS dataset and
@@ -213,14 +217,26 @@ pub fn dataset_arn(region: &str, dataset_group_name: &str, dataset_type: &str) -
 // whichever operation raised it, so the text lives here instead of being composed at the
 // rejection site. Only the parts the service itself varies are arguments.
 
-/// What a lookup that resolves to nothing answers, for the ARN the caller asked about:
-/// the one variable part of the sentence.
-///
-/// The sentence names the ARN and NOT the kind of resource it addresses, so one wording
-/// serves every resource this service holds — a schema, a dataset group, a dataset — and
-/// every operation that resolves an ARN, whether it reads, deletes or references it.
-pub fn resource_not_found_message(arn: &str) -> String {
-    format!("Resource Arn {arn} does not exist.")
+/// The kind of resource a lookup failed to resolve. Personalize words its not-found
+/// refusal PER KIND, so the kind — not the operation — is what selects the sentence:
+/// every operation that resolves an ARN of one kind reads the same, whether it reads,
+/// deletes or merely references the resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MissingResource {
+    Schema,
+    DatasetGroup,
+    Dataset,
+}
+
+/// What a lookup that resolves to nothing answers for `arn`, in the wording Personalize
+/// uses for that kind of resource. The ARN the caller asked about is the sentence's one
+/// variable part.
+pub fn resource_not_found_message(resource: MissingResource, arn: &str) -> String {
+    match resource {
+        MissingResource::Schema => format!("Resource Arn {arn} does not exist."),
+        MissingResource::DatasetGroup => format!("The given dataset group does not exist: {arn}"),
+        MissingResource::Dataset => format!("The given dataset does not exist: {arn}"),
+    }
 }
 
 /// What a schema document that does not declare every field its dataset type requires
@@ -449,7 +465,9 @@ pub fn take_page<T>(
 // Shared value checks
 // ---------------------------------------------------------------------------
 
-/// The dataset types Personalize accepts, in the spelling it reports them back in.
+/// The dataset types Personalize accepts, in the spelling its documentation lists them
+/// in. It is the set membership that matters here: a stored dataset's type is held in the
+/// upper-case name the service identifies it by (see [`DatasetRecord::dataset_type`]).
 ///
 /// Source: the model's own documentation for `CreateDatasetRequest$datasetType` — "One of
 /// the following (case insensitive) values: Interactions, Items, Users, Actions,
@@ -465,11 +483,22 @@ pub const DATASET_TYPE_VALUES: &[&str] = &[
 
 /// The canonical spelling of `value`, matched case-insensitively, or `None` when it names
 /// no dataset type at all.
+///
+/// It is what a value IDENTIFIES, so it decides both what the type is stored and reported
+/// as (upper-cased, as the service names a type) and what the type's ARN segment is; the
+/// casing the request wrote is not kept.
 pub fn canonical_dataset_type(value: &str) -> Option<&'static str> {
     DATASET_TYPE_VALUES
         .iter()
         .find(|candidate| candidate.eq_ignore_ascii_case(value))
         .copied()
+}
+
+/// Whether a stored dataset is of the dataset type `value` names, compared the way
+/// `CreateDataset` accepts the member: case-insensitively, so two spellings of one type
+/// are one type however each was written.
+pub fn is_dataset_type(record: &DatasetRecord, value: &str) -> bool {
+    record.dataset_type.eq_ignore_ascii_case(value)
 }
 
 /// The fields a dataset schema of each dataset type must declare, in the order a refusal

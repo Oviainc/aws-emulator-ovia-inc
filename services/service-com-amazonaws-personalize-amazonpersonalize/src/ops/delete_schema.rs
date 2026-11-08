@@ -156,7 +156,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !state.schemas.contains_key(&input.schema_arn) {
             return Err(DeleteSchemaErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::resource_not_found_message(&input.schema_arn)),
+                    message: Some(crate::state::resource_not_found_message(
+                        crate::state::MissingResource::Schema,
+                        &input.schema_arn,
+                    )),
                 },
             )
             .into());

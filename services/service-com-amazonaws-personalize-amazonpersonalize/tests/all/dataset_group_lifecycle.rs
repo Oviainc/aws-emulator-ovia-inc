@@ -129,7 +129,7 @@ async fn assert_fails(
 /// A freshly created dataset group or dataset is NOT ready — the model documents the
 /// progression "CREATE PENDING > CREATE IN_PROGRESS > ACTIVE" — so every status seen on
 /// the way has to be one of the documented transient ones.
-async fn await_active(
+pub(crate) async fn await_active(
     emulator: &Emulator,
     operation: &str,
     arn_member: &str,
@@ -975,10 +975,13 @@ async fn a_dataset_of_every_documented_type_round_trips_through_its_group() {
             Some(format!("ds-{}", canonical.to_ascii_lowercase()).as_str()),
             "case {case:?}: expected the created name, got {dataset:?}"
         );
+        // `datasetType` is accepted case-insensitively and reported in the UPPER-CASE
+        // form of the type's name — the same spelling the ARN's trailing segment carries.
+        // The spellings themselves are covered row by row in `dataset_type_casing.rs`.
         assert_eq!(
             dataset["datasetType"].as_str(),
-            Some(*canonical),
-            "case {case:?}: expected the canonical dataset type, got {dataset:?}"
+            Some(canonical.to_ascii_uppercase().as_str()),
+            "case {case:?}: expected the upper-case dataset type, got {dataset:?}"
         );
         assert_eq!(
             dataset["datasetGroupArn"].as_str(),

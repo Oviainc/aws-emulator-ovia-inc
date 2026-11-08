@@ -142,12 +142,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // derived from the stored due instant, and nothing is written.
         let state = state.lock();
         let Some(record) = state.datasets.get(&input.dataset_arn) else {
-            // The not-found class carries this service's own wording, with the ARN the
-            // caller asked about as its one variable part
-            // ([`crate::state::resource_not_found_message`]).
+            // The not-found class carries the wording Personalize uses for the KIND of
+            // resource that was looked up, with the ARN the caller asked about as its one
+            // variable part ([`crate::state::resource_not_found_message`]).
             return Err(DescribeDatasetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::resource_not_found_message(&input.dataset_arn)),
+                    message: Some(crate::state::resource_not_found_message(
+                        crate::state::MissingResource::Dataset,
+                        &input.dataset_arn,
+                    )),
                 },
             )
             .into());

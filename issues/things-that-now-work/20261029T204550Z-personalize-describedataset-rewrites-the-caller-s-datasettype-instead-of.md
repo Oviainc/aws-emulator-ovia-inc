@@ -32,3 +32,18 @@ personalize-dataset-lifecycle-and-validation#task#5, DescribeDataset: status 200
 ## Steps to Reproduce
 1. Replay fixture personalize-dataset-lifecycle-and-validation: CreateSchema, CreateDatasetGroup, then CreateDataset with datasetType spelled in all caps (the Interactions type).
 2. At task#5 call DescribeDataset with the returned datasetArn -> $.dataset.datasetType comes back title-cased ('Interactions') instead of the all-caps string that was sent ('INTERACTIONS').
+
+## Resolution
+
+Fixed, but NOT by the rule stated above: the report's "echoes the request character for character"
+is a claim, and the recording disagrees with it. Echoing the request's own string was implemented
+first, and the recorded step still diverged on $.dataset.datasetType — so the recorded value is not
+a copy of what that request wrote. What the recording does report is the type's UPPER-CASE name,
+which is also the spelling the same reply's datasetArn carries as its last segment, so the rule
+implemented is: a dataset's type is stored and reported in the upper-case name Amazon Personalize
+identifies the type by, whatever casing the (case-insensitively accepted) create wrote. Case
+insensitive ACCEPTANCE is unchanged, and a group still holds at most one dataset per type however
+each create spelled it. Covered by tests/all/dataset_type_casing.rs (every documented type, one
+differing casing per row) and tests/all/dataset_type_echo.rs (one type recreated under four
+casings; the dataset's free-string `name` is still echoed verbatim).
+

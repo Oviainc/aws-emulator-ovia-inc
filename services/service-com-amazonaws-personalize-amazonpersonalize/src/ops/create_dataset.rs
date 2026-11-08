@@ -158,9 +158,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            active_at, canonical_dataset_type, creation_status, dataset_arn, mint_tracking_id,
-            DatasetRecord, DATASET_TYPE_VALUES, DATASET_TYPE_WITH_TRACKING_ID, MAX_DATASETS,
-            STATUS_ACTIVE,
+            active_at, canonical_dataset_type, creation_status, dataset_arn, is_dataset_type,
+            mint_tracking_id, DatasetRecord, DATASET_TYPE_VALUES, DATASET_TYPE_WITH_TRACKING_ID,
+            MAX_DATASETS, STATUS_ACTIVE,
         };
         use std::time::SystemTime;
 
@@ -174,8 +174,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `DatasetType` is a plain string shape, so the boundary validator only checks
         // its pattern. The permitted set is the model's own documented one, matched
-        // "case insensitive" as that documentation says, and stored in the canonical
-        // spelling the service reports back.
+        // "case insensitive" as that documentation says. The canonical spelling is what
+        // the value IDENTIFIES — the dataset's ARN segment, the type a group holds at
+        // most one of, and the one type that carries a tracking id — so the casing the
+        // request happened to write is not part of the dataset (see the state write).
         let Some(dataset_type) = canonical_dataset_type(&input.dataset_type) else {
             return Err(invalid_input(format!(
                 "Value '{}' at 'datasetType' failed to satisfy constraint: Member must be one of \
@@ -188,7 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
 
         let Some(group) = state.dataset_groups.get(&input.dataset_group_arn) else {
-            return Err(not_found(&input.dataset_group_arn));
+            return Err(not_found(
+                crate::state::MissingResource::DatasetGroup,
+                &input.dataset_group_arn,
+            ));
         };
         // "You must wait until the status of the dataset group is ACTIVE before adding a
         // dataset to the group": a group whose create is still pending is in use by that
@@ -209,7 +214,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = dataset_arn(&group.region, &group.name, dataset_type);
 
         if !state.schemas.contains_key(&input.schema_arn) {
-            return Err(not_found(&input.schema_arn));
+            return Err(not_found(
+                crate::state::MissingResource::Schema,
+                &input.schema_arn,
+            ));
         }
 
         // A dataset's identity inside its group is its TYPE — "a dataset group can
@@ -217,7 +225,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // looked up by (group, type) rather than by the minted ARN alone.
         if let Some(existing) = state.datasets.values().find(|record| {
             record.dataset_group_arn == input.dataset_group_arn
-                && record.dataset_type == dataset_type
+                && is_dataset_type(record, dataset_type)
         }) {
             return Err(CreateDatasetErrorModeled::ResourceAlreadyExistsException(
                 ResourceAlreadyExistsException {
@@ -297,7 +305,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 name: input.name.clone(),
                 dataset_arn: arn.clone(),
                 dataset_group_arn: input.dataset_group_arn.clone(),
-                dataset_type: dataset_type.to_string(),
+                // The type is identified by its UPPER-CASE name, the same spelling the
+                // ARN's trailing segment above carries, so that is the one every read
+                // reports whatever casing this request wrote.
+                dataset_type: dataset_type.to_ascii_uppercase(),
                 schema_arn: input.schema_arn.clone(),
                 tracking_id,
                 creation_date_time: now,
@@ -338,14 +349,15 @@ fn invalid_input(message: impl Into<String>) -> CreateDatasetError {
 }
 
 /// This operation's modelled `ResourceNotFoundException` for an ARN this service holds no
-/// resource for — a `datasetGroupArn` or a `schemaArn` alike.
+/// resource for — a `datasetGroupArn` or a `schemaArn`.
 ///
-/// Worded the way every lookup in this service words the class
+/// Worded the way every lookup in this service words the class for that KIND of resource
 /// (see [`crate::state::resource_not_found_message`]), so the reply reads the same here as
-/// it does from the operation that owns the resource.
-fn not_found(arn: &str) -> CreateDatasetError {
+/// it does from the operation that owns the resource, and the two lookups this create
+/// makes are told apart.
+fn not_found(resource: crate::state::MissingResource, arn: &str) -> CreateDatasetError {
     CreateDatasetErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(crate::state::resource_not_found_message(arn)),
+        message: Some(crate::state::resource_not_found_message(resource, arn)),
     })
     .into()
 }

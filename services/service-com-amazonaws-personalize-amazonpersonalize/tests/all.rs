@@ -15,6 +15,10 @@
 mod client_error_status;
 #[path = "all/dataset_group_lifecycle.rs"]
 mod dataset_group_lifecycle;
+#[path = "all/dataset_type_casing.rs"]
+mod dataset_type_casing;
+#[path = "all/dataset_type_echo.rs"]
+mod dataset_type_echo;
 #[path = "all/list_schemas.rs"]
 mod list_schemas;
 #[path = "all/refusal_wording.rs"]

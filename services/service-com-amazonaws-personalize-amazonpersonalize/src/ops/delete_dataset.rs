@@ -159,12 +159,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ResourceNotFoundException` and `ListDatasets` no longer reports it.
         let mut state = state.lock();
         let Some(deleted) = state.datasets.remove(&input.dataset_arn) else {
-            // The not-found class carries this service's own wording, with the ARN the
-            // caller asked about as its one variable part
-            // ([`crate::state::resource_not_found_message`]).
+            // The not-found class carries the wording Personalize uses for the KIND of
+            // resource that was looked up, with the ARN the caller asked about as its one
+            // variable part ([`crate::state::resource_not_found_message`]).
             return Err(DeleteDatasetErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::resource_not_found_message(&input.dataset_arn)),
+                    message: Some(crate::state::resource_not_found_message(
+                        crate::state::MissingResource::Dataset,
+                        &input.dataset_arn,
+                    )),
                 },
             )
             .into());

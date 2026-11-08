@@ -32,14 +32,25 @@ pub(crate) const SCHEMA_IN_USE_MESSAGE: &str =
 pub(crate) const DATASET_GROUP_IN_USE_MESSAGE: &str =
     "The provided dataset-group is being referenced by one or more datasets";
 
-/// What a lookup that resolves to nothing answers, whichever resource the ARN addresses.
-/// The ARN the caller asked about is the sentence's one variable part — the sentence names
-/// no resource KIND, so one wording serves schemas, dataset groups and datasets alike.
+/// What a lookup that resolves to nothing answers, in the wording Amazon Personalize uses
+/// for the KIND of resource that was looked up: a schema lookup names the ARN alone, while
+/// a dataset-group or a dataset lookup names the kind first and the ARN last. The ARN the
+/// caller asked about is each sentence's one variable part.
 ///
 /// Written out here rather than read from `crate::state` for the reason above: a test that
 /// asserted the handler's own helper would pass whatever that helper said.
-fn resource_not_found_message(arn: &str) -> String {
+fn schema_not_found_message(arn: &str) -> String {
     format!("Resource Arn {arn} does not exist.")
+}
+
+/// The same, for an ARN that addresses no dataset group.
+fn dataset_group_not_found_message(arn: &str) -> String {
+    format!("The given dataset group does not exist: {arn}")
+}
+
+/// The same, for an ARN that addresses no dataset.
+fn dataset_not_found_message(arn: &str) -> String {
+    format!("The given dataset does not exist: {arn}")
 }
 
 /// A row of the in-use table: the dataset types created against one schema in one group
@@ -210,7 +221,7 @@ async fn a_schema_lookup_that_resolves_to_nothing_names_the_arn_it_was_asked_abo
     ];
 
     for (index, (case, arn)) in absent.iter().enumerate() {
-        let expected = resource_not_found_message(arn);
+        let expected = schema_not_found_message(arn);
         for operation in ["DescribeSchema", "DeleteSchema"] {
             assert_refused(
                 &emulator,
@@ -277,20 +288,22 @@ async fn a_schema_lookup_that_resolves_to_nothing_names_the_arn_it_was_asked_abo
         (
             400,
             "ResourceNotFoundException",
-            &resource_not_found_message(&schema_arn),
+            &schema_not_found_message(&schema_arn),
         ),
         case,
     )
     .await;
 }
 
-/// One row of the not-found table: a well-formed ARN that addresses nothing, and every
-/// operation that has to resolve it.
+/// One row of the not-found table: a well-formed ARN that addresses nothing, every
+/// operation that has to resolve it, and the sentence its kind of resource is refused with.
 struct AbsentRow {
     case: &'static str,
     arn: String,
     /// `(operation, the input member naming the ARN)` for each operation that resolves it.
     lookups: &'static [(&'static str, &'static str)],
+    /// The wording this kind of resource's not-found refusal carries.
+    not_found: fn(&str) -> String,
 }
 
 /// The operations that resolve a `schemaArn`, and so can answer the not-found class for
@@ -315,30 +328,32 @@ const DATASET_LOOKUPS: &[(&str, &str)] = &[
 ];
 
 #[tokio::test]
-async fn a_lookup_that_resolves_to_nothing_reads_the_same_for_every_resource_kind() {
+async fn a_lookup_that_resolves_to_nothing_names_the_kind_of_resource_it_looked_for() {
     let emulator = Emulator::new();
 
     // The rows vary what the rule generalises over: the KIND of resource the ARN addresses
     // (schema, dataset group, dataset), the operation that resolves it (a read and a
     // delete for each), and the shape of the ARN itself (a plain name, every permitted
     // character class, a long name, a dataset's two-segment resource part, another region
-    // and account). The sentence names no kind, so every row expects the same text with
-    // its own ARN.
+    // and account). Each kind's rows expect that kind's sentence, with their own ARN.
     let rows: Vec<AbsentRow> = vec![
         AbsentRow {
             case: "a schema under a plain name",
             arn: format!("arn:aws:personalize:{REGION}:{ACCOUNT}:schema/absent-kind"),
             lookups: SCHEMA_LOOKUPS,
+            not_found: schema_not_found_message,
         },
         AbsentRow {
             case: "a dataset group under a plain name",
             arn: format!("arn:aws:personalize:{REGION}:{ACCOUNT}:dataset-group/absent-kind"),
             lookups: DATASET_GROUP_LOOKUPS,
+            not_found: dataset_group_not_found_message,
         },
         AbsentRow {
             case: "a dataset group with dashes, digits and underscores",
             arn: format!("arn:aws:personalize:{REGION}:{ACCOUNT}:dataset-group/Absent-9_dsg"),
             lookups: DATASET_GROUP_LOOKUPS,
+            not_found: dataset_group_not_found_message,
         },
         AbsentRow {
             case: "a dataset group under a long name",
@@ -347,11 +362,13 @@ async fn a_lookup_that_resolves_to_nothing_reads_the_same_for_every_resource_kin
                 "g".repeat(63)
             ),
             lookups: DATASET_GROUP_LOOKUPS,
+            not_found: dataset_group_not_found_message,
         },
         AbsentRow {
             case: "a dataset group in another region and account",
             arn: "arn:aws:personalize:eu-west-1:210987654321:dataset-group/elsewhere".to_string(),
             lookups: DATASET_GROUP_LOOKUPS,
+            not_found: dataset_group_not_found_message,
         },
         AbsentRow {
             case: "a dataset addressed by group and type",
@@ -359,16 +376,19 @@ async fn a_lookup_that_resolves_to_nothing_reads_the_same_for_every_resource_kin
                 "arn:aws:personalize:{REGION}:{ACCOUNT}:dataset/absent-kind/INTERACTIONS"
             ),
             lookups: DATASET_LOOKUPS,
+            not_found: dataset_not_found_message,
         },
         AbsentRow {
             case: "a dataset of another type in a group that exists",
             arn: format!("arn:aws:personalize:{REGION}:{ACCOUNT}:dataset/present-kind/ACTIONS"),
             lookups: DATASET_LOOKUPS,
+            not_found: dataset_not_found_message,
         },
         AbsentRow {
             case: "a dataset in another region and account",
             arn: "arn:aws:personalize:eu-west-1:210987654321:dataset/elsewhere/USERS".to_string(),
             lookups: DATASET_LOOKUPS,
+            not_found: dataset_not_found_message,
         },
     ];
 
@@ -380,7 +400,7 @@ async fn a_lookup_that_resolves_to_nothing_reads_the_same_for_every_resource_kin
         create_schema(&emulator, "present-kind", &avro_schema("Interactions"), setup).await;
 
     for row in &rows {
-        let expected = resource_not_found_message(&row.arn);
+        let expected = (row.not_found)(&row.arn);
         for (operation, member) in row.lookups {
             assert_refused(
                 &emulator,
@@ -395,22 +415,25 @@ async fn a_lookup_that_resolves_to_nothing_reads_the_same_for_every_resource_kin
     }
 
     // `CreateDataset` resolves two ARNs, and words whichever of them resolves to nothing
-    // the same way a read of that resource would.
-    for (case, group_arn, schema_arn, absent) in [
+    // the same way a read of that resource would — so the two lookups are told apart.
+    for (case, group_arn, schema_arn, expected) in [
         (
             "CreateDataset naming a group that does not exist",
             format!("arn:aws:personalize:{REGION}:{ACCOUNT}:dataset-group/absent-kind"),
             present_schema.clone(),
-            format!("arn:aws:personalize:{REGION}:{ACCOUNT}:dataset-group/absent-kind"),
+            dataset_group_not_found_message(&format!(
+                "arn:aws:personalize:{REGION}:{ACCOUNT}:dataset-group/absent-kind"
+            )),
         ),
         (
             "CreateDataset naming a schema that does not exist",
             present_group.clone(),
             format!("arn:aws:personalize:{REGION}:{ACCOUNT}:schema/absent-kind"),
-            format!("arn:aws:personalize:{REGION}:{ACCOUNT}:schema/absent-kind"),
+            schema_not_found_message(&format!(
+                "arn:aws:personalize:{REGION}:{ACCOUNT}:schema/absent-kind"
+            )),
         ),
     ] {
-        let expected = resource_not_found_message(&absent);
         let (status, body) = emulator
             .call(
                 "CreateDataset",
@@ -469,11 +492,19 @@ async fn a_lookup_that_resolves_to_nothing_reads_the_same_for_every_resource_kin
         case,
     )
     .await;
-    for (lookups, arn) in [
-        (DATASET_LOOKUPS, &dataset_arn),
-        (DATASET_GROUP_LOOKUPS, &present_group),
+    for (lookups, arn, not_found) in [
+        (
+            DATASET_LOOKUPS,
+            &dataset_arn,
+            dataset_not_found_message as fn(&str) -> String,
+        ),
+        (
+            DATASET_GROUP_LOOKUPS,
+            &present_group,
+            dataset_group_not_found_message as fn(&str) -> String,
+        ),
     ] {
-        let expected = resource_not_found_message(arn);
+        let expected = not_found(arn);
         for (operation, member) in lookups {
             assert_refused(
                 &emulator,
