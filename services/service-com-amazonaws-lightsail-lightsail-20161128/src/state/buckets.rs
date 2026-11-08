@@ -191,7 +191,7 @@ pub fn release_bucket_object_store<Eng: Send + Sync + 'static>(
 ) -> Option<bool> {
     let state = ::service_com_amazonaws_s3_amazons3::state::service_state(engine)?;
     let mut store = state.lock();
-    Some(store.remove_bucket(name))
+    Some(store.remove_bucket(name, ::std::time::SystemTime::now()))
 }
 
 /// Record the object versioning of the bucket named `name` in its object store:

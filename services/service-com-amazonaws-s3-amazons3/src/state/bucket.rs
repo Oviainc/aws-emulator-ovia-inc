@@ -1156,17 +1156,20 @@ impl Bucket {
         self.metadata_configuration = Some(configuration);
     }
 
-    /// Take the bucket's S3 Metadata configuration away, reporting whether it carried one.
+    /// Take the bucket's S3 Metadata configuration away, handing back the configuration it
+    /// carried — `None` for a bucket that carried none.
     ///
     /// What `DeleteBucketMetadataConfiguration` does to the BUCKET: it "deletes an S3
     /// Metadata configuration from a general purpose bucket" (that operation's own
     /// documentation), so the whole subresource goes and a read of it reports none again. The
     /// tables that configuration provisioned are NOT the bucket's: they are tables of the
-    /// managed table bucket's namespace, which the store holds and which this delete leaves
-    /// untouched ([`ComAmazonawsS3Amazons3State::delete_metadata_configuration`] is the one
-    /// way in).
-    pub fn clear_metadata_configuration(&mut self) -> bool {
-        self.metadata_configuration.take().is_some()
+    /// managed table bucket's namespace, which the STORE holds — which is why what goes is
+    /// handed back rather than dropped, and why
+    /// [`ComAmazonawsS3Amazons3State::delete_metadata_configuration`] is the one way in: it
+    /// takes the configuration off the bucket and settles what its tables leave in that
+    /// namespace in one step, so the two records cannot be written apart.
+    pub(super) fn take_metadata_configuration(&mut self) -> Option<BucketMetadataConfiguration> {
+        self.metadata_configuration.take()
     }
 
     /// Record `configuration_state` as the inventory table state of the bucket's S3 Metadata

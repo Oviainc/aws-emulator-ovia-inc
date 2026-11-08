@@ -3,18 +3,21 @@
 //! What the AWS-managed table bucket's namespace keeps, once a metadata configuration has
 //! provisioned a table in it.
 //!
-//! The rule under test: **a metadata table OUTLIVES the configuration that provisioned it.
-//! No S3 operation takes a table out of the AWS-managed table bucket's namespace — "delete
-//! the journal table, and then try again. To create a new S3 Metadata table, you must delete
-//! the S3 Metadata configuration for this bucket, and then create a new S3 Metadata
-//! configuration" ([`METADATA_JOURNAL_TABLE_EXISTS_MESSAGE`], the sentence the published V2
-//! provisioning failure carries) makes deleting the configuration the PRECONDITION for a new
-//! one and the leftover table a separate deletion the caller still owes — so once a name is in
-//! the namespace, every later create whose table would be created under it is ACCEPTED (HTTP
-//! 200, empty body: the collision is a provisioning outcome, not a refusal) and reports that
-//! table `FAILED` with the published `*AlreadyExists` code and sentence, with
-//! `JournalTableNotAvailable` for an inventory table whose own name is free but whose journal
-//! table failed.**
+//! The rule under test: **a metadata table that came into service OUTLIVES the configuration
+//! that provisioned it. No S3 operation takes such a table out of the AWS-managed table
+//! bucket's namespace — "delete the journal table, and then try again. To create a new S3
+//! Metadata table, you must delete the S3 Metadata configuration for this bucket, and then
+//! create a new S3 Metadata configuration" ([`METADATA_JOURNAL_TABLE_EXISTS_MESSAGE`], the
+//! sentence the published V2 provisioning failure carries) makes deleting the configuration the
+//! PRECONDITION for a new one and the leftover table a separate deletion the caller still owes
+//! — so once a table in service holds a name, every later create whose table would be created
+//! under it is ACCEPTED (HTTP 200, empty body: the collision is a provisioning outcome, not a
+//! refusal) and reports that table `FAILED` with the published `*AlreadyExists` code and
+//! sentence, with `JournalTableNotAvailable` for an inventory table whose own name is free but
+//! whose journal table failed. Every row here therefore waits for the first configuration's
+//! tables to reach `ACTIVE`; a configuration taken away before its tables ever came into
+//! service leaves no table behind and frees their names, which is the sibling rule
+//! [`super::bucket_metadata_unprovisioned_table_release`] spans.**
 //!
 //! That is what a caller sees whenever it recycles a metadata configuration: deleting the
 //! configuration and creating it again does not get the tables back, and a cleanup path that

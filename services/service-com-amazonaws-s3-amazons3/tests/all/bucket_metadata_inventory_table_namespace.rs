@@ -3,12 +3,12 @@
 //! The AWS-managed table bucket's namespace and the inventory table that
 //! `UpdateBucketMetadataInventoryTableConfiguration` provisions in it.
 //!
-//! The rule under test: **a metadata table OUTLIVES the configuration that provisioned it,
-//! whichever operation provisioned it, and no S3 operation on a general purpose bucket takes a
-//! name out of the AWS-managed table bucket's namespace — so a table provisioned under a name
-//! that namespace already holds is not created: the call is accepted and a reader reports that
-//! table `FAILED` with the published failure for the name being taken, its OWN name judged
-//! before the journal table it relies on.**
+//! The rule under test: **a metadata table that came into service OUTLIVES the configuration
+//! that provisioned it, whichever operation provisioned it, and no S3 operation on a general
+//! purpose bucket takes such a table out of the AWS-managed table bucket's namespace — so a
+//! table provisioned under a name that namespace already holds is not created: the call is
+//! accepted and a reader reports that table `FAILED` with the published failure for the name
+//! being taken, its OWN name judged before the journal table it relies on.**
 //!
 //! The update is in that rule because it really does provision a table:
 //! `s3tables:CreateTable` is among the permissions the operation requires, and none of the
@@ -16,8 +16,10 @@
 //! (`smithy_query(query="doc",shape="UpdateBucketMetadataInventoryTableConfiguration",
 //! model_path="services/service-com-amazonaws-s3-amazons3/smithy-model/com-amazonaws-s3-amazons3.json")`).
 //! So enabling the live inventory table takes its name in the managed namespace exactly as a
-//! create does, and disabling it or deleting the whole configuration gives that name back to
-//! nobody.
+//! create does, and once that table is in service, disabling it or deleting the whole
+//! configuration gives that name back to nobody — which is why every row here waits for the
+//! table to reach `ACTIVE` first. A table dropped before it ever came into service is the
+//! sibling rule [`super::bucket_metadata_unprovisioned_table_release`] spans.
 //!
 //! The codes and sentences are the published V2 provisioning failures
 //! (`smithy_query(query="doc",shape="com.amazonaws.s3#ErrorDetails",member="ErrorCode")`):

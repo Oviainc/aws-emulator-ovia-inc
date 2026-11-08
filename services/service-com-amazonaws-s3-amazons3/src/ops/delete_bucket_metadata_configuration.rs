@@ -197,21 +197,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // subresource delete in this crate: a bucket carrying no configuration is already in
         // the asked-for state, so the call still succeeds.
         //
-        // The TABLES the configuration provisioned stay where they are: they are tables of
-        // the AWS-managed table bucket's namespace, and the published provisioning failure
-        // for a name already in it asks the caller to "delete the journal table, and then try
-        // again. To create a new metadata table, you must delete the metadata configuration
-        // for this bucket, and then create a new metadata configuration"
-        // ([`crate::state::METADATA_JOURNAL_TABLE_EXISTS_MESSAGE`]) — so this delete is the
-        // precondition for a new configuration, not the deletion of the leftover table. A
-        // create of the same configuration afterwards is therefore accepted and its journal
-        // table reports that failure, exactly as a create colliding with any other table of
-        // the namespace does.
+        // The TABLES the configuration provisioned and that came into service stay where they
+        // are: they are tables of the AWS-managed table bucket's namespace, and the published
+        // provisioning failure for a name already in it asks the caller to "delete the journal
+        // table, and then try again. To create a new metadata table, you must delete the
+        // metadata configuration for this bucket, and then create a new metadata
+        // configuration" ([`crate::state::METADATA_JOURNAL_TABLE_EXISTS_MESSAGE`]) — so this
+        // delete is the precondition for a new configuration, not the deletion of the leftover
+        // table, and a create of the same configuration afterwards is accepted with its
+        // journal table reporting that failure. A table whose creation had NOT yet fallen due
+        // leaves no table behind for the caller to delete, so the name it was being created
+        // under is free again and the next create provisions afresh under it — the instant
+        // this call is made is what decides which of the two a table is in
+        // ([`crate::state::MetadataTable::creating_at`]).
         //
         // `false` is the bucket this emulator does not hold: the model declares no error for
         // this operation, so it is reported through the unmodelled channel with the code and
         // status every other bucket-subresource call in this crate answers it with.
-        if !store.delete_metadata_configuration(&input.bucket) {
+        if !store.delete_metadata_configuration(&input.bucket, ::std::time::SystemTime::now()) {
             return Err(crate::scaffolded::Scaffolded::unmodeled(
                 crate::state::NO_SUCH_BUCKET_CODE,
                 NO_SUCH_BUCKET_STATUS,

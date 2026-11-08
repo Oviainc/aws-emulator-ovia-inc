@@ -272,7 +272,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
-        store.remove_bucket(&input.bucket);
+        // The bucket's own life does not reach into the AWS-managed table bucket's namespace
+        // either: a metadata table of this bucket that came into service is deleted through
+        // the S3 Tables API that owns it, while one still being created leaves nothing behind
+        // and frees the name it was being created under — the same rule the configuration
+        // delete reads, at the instant of this call.
+        store.remove_bucket(&input.bucket, ::std::time::SystemTime::now());
         Ok(DeleteBucketOutput)
     }
 }

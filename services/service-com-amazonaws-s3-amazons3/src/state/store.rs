@@ -77,14 +77,16 @@ pub struct ComAmazonawsS3Amazons3State {
     /// a table name is taken or free for the store rather than for one bucket.
     ///
     /// Kept apart from the bucket's own configuration because its SCOPE is different, and
-    /// because a table OUTLIVES it: the name of a table is taken or free for the whole
-    /// namespace, so a create asks this set rather than the bucket whether the name it would
-    /// provision under is free — and provisions into [`METADATA_TABLE_STATUS_FAILED`] with
-    /// [`METADATA_JOURNAL_TABLE_EXISTS_CODE`] when a table already holds it. Deleting the
-    /// configuration that created a table does not delete the table (the published failure
-    /// above asks the caller to delete it through the table API that owns it), and neither
-    /// does deleting the general purpose bucket, so no operation of this service takes a name
-    /// out of this set; a ceiling is what bounds it
+    /// because a table that came into service OUTLIVES it: the name of a table is taken or
+    /// free for the whole namespace, so a create asks this set rather than the bucket whether
+    /// the name it would provision under is free — and provisions into
+    /// [`METADATA_TABLE_STATUS_FAILED`] with [`METADATA_JOURNAL_TABLE_EXISTS_CODE`] when a
+    /// table already holds it. Deleting the configuration that created a table in service does
+    /// not delete that table (the published failure above asks the caller to delete it through
+    /// the table API that owns it), and neither does deleting the general purpose bucket; what
+    /// a configuration going away DOES release is the name of a table whose creation had not
+    /// yet fallen due, which left no table behind for anyone to delete
+    /// ([`Self::release_unprovisioned_metadata_tables`]). A ceiling bounds the rest
     /// ([`MAX_METADATA_NAMESPACE_TABLES`]).
     pub(super) metadata_namespace_tables: BTreeSet<String>,
     /// The secret THIS store's page tokens are authenticated under — the continuation
@@ -183,7 +185,10 @@ impl ComAmazonawsS3Amazons3State {
     ///
     /// What a create of a metadata configuration asks before it provisions a table: a name
     /// already in the namespace is one S3 cannot create a second table under, which is the
-    /// `*AlreadyExists` provisioning failure the configuration then reports.
+    /// `*AlreadyExists` provisioning failure the configuration then reports. A name is in this
+    /// set while a table stands under it — one still being created as much as one in service —
+    /// and is out of it again once a configuration taken away carried off a table that had
+    /// never come into service ([`Self::release_unprovisioned_metadata_tables`]).
     pub fn metadata_namespace_holds(&self, table: &str) -> bool {
         self.metadata_namespace_tables.contains(table)
     }
@@ -191,7 +196,8 @@ impl ComAmazonawsS3Amazons3State {
     /// How many more tables the managed table bucket's namespace has room for
     /// ([`MAX_METADATA_NAMESPACE_TABLES`]).
     ///
-    /// Nothing releases a table — it outlives the configuration that created it
+    /// A table in service outlives the configuration that created it, and only the name of one
+    /// that never came into service is released with it
     /// ([`Self::delete_metadata_configuration`]) — so a caller creating configurations for
     /// bucket after bucket would grow the namespace without bound; what keeps it bounded is
     /// this ceiling, measured against the names a create would ADD before it records any of
@@ -205,9 +211,10 @@ impl ComAmazonawsS3Amazons3State {
     /// Record `table` as a table of the managed table bucket's namespace.
     ///
     /// Called for each table a create really provisions, so the namespace holds exactly the
-    /// tables this store has created, for as long as this store lives: no operation of this
-    /// service deletes a table from it. A name the namespace already holds is already
-    /// recorded, so recording it again changes nothing.
+    /// tables this store has created and not carried away before they came into service
+    /// ([`Self::release_unprovisioned_metadata_tables`]): no operation of this service deletes
+    /// a table that is really there. A name the namespace already holds is already recorded, so
+    /// recording it again changes nothing.
     ///
     /// The CEILING is the caller's: [`MAX_METADATA_NAMESPACE_TABLES`] is measured through
     /// [`Self::metadata_namespace_room`] against the names a create would add, before any of
@@ -222,26 +229,63 @@ impl ComAmazonawsS3Amazons3State {
     /// differently; a bucket carrying no configuration has nothing to delete and is already
     /// in the asked-for state, so it reports the same `true` a delete that removed one does.
     ///
-    /// The CONFIGURATION is what goes: the tables it provisioned stay in the managed table
-    /// bucket's namespace, because a metadata table is a table of an S3 Tables bucket and is
-    /// deleted through the table API that owns it — "a journal table already exists in the
-    /// Amazon Web Services managed table bucket's namespace. Delete the journal table, and
-    /// then try again. To create a new metadata table, you must delete the metadata
-    /// configuration for this bucket, and then create a new metadata configuration"
+    /// The CONFIGURATION is what goes, and with it the names of the tables that never came
+    /// into service. A table that DID is a table of an S3 Tables bucket and is deleted through
+    /// the table API that owns it — "a journal table already exists in the Amazon Web Services
+    /// managed table bucket's namespace. Delete the journal table, and then try again. To
+    /// create a new metadata table, you must delete the metadata configuration for this
+    /// bucket, and then create a new metadata configuration"
     /// ([`METADATA_JOURNAL_TABLE_EXISTS_MESSAGE`], the provisioning failure the published V2
     /// list carries) states both halves: the configuration delete is a PRECONDITION for a new
-    /// configuration, and the leftover table is the separate deletion a caller still owes. So
-    /// a create of the same configuration afterwards is accepted and its journal table
-    /// provisions into [`METADATA_TABLE_STATUS_FAILED`] carrying that code, exactly as a
-    /// create colliding with any other table of the namespace does. Nothing in this service's
-    /// API takes a table out of the namespace, which is why it is bounded by a ceiling
-    /// ([`MAX_METADATA_NAMESPACE_TABLES`]) rather than by what a delete releases.
-    pub fn delete_metadata_configuration(&mut self, bucket: &str) -> bool {
+    /// configuration, and the leftover table is the separate deletion a caller still owes. So a
+    /// create of the same configuration afterwards is accepted and its journal table provisions
+    /// into [`METADATA_TABLE_STATUS_FAILED`] carrying that code, exactly as a create colliding
+    /// with any other table of the namespace does — while a configuration whose tables were
+    /// still being created left no table for a caller to delete, so those names are free again
+    /// and the next create provisions afresh under them
+    /// ([`Self::release_unprovisioned_metadata_tables`]).
+    pub fn delete_metadata_configuration(&mut self, bucket: &str, now: SystemTime) -> bool {
         let Some(held) = self.buckets.get_mut(bucket) else {
             return false;
         };
-        held.clear_metadata_configuration();
+        let dropped = held.take_metadata_configuration();
+        if let Some(configuration) = dropped {
+            self.release_unprovisioned_metadata_tables(&configuration, now);
+        }
         true
+    }
+
+    /// Release from the managed table bucket's namespace the name of every table of
+    /// `configuration` that no table stands under at `now`.
+    ///
+    /// The one rule behind every way this service stops recording a configuration's tables —
+    /// the configuration deleted, the general purpose bucket carrying it deleted, one of its
+    /// optional tables disabled: a name belongs to the namespace for as long as a TABLE holds
+    /// it, and a table holds the name it was created under from the instant its creation falls
+    /// due ([`MetadataTable::creating_at`]). A table whose creation was still under way leaves
+    /// nothing in the namespace for the caller to delete, so its name is free again; a table in
+    /// service keeps its name until the S3 Tables API that owns it deletes it, and a table that
+    /// FAILED never held its name at all — the table that is really there does — so neither
+    /// releases anything here.
+    fn release_unprovisioned_metadata_tables(
+        &mut self,
+        configuration: &BucketMetadataConfiguration,
+        now: SystemTime,
+    ) {
+        for table in configuration.tables() {
+            if table.creating_at(now) {
+                self.metadata_namespace_tables.remove(&table.name);
+            }
+        }
+    }
+
+    /// Release the name of the single table `table` the same way, for a call that drops one
+    /// table of a configuration rather than the whole configuration — see
+    /// [`Self::release_unprovisioned_metadata_tables`], which owns the rule.
+    fn release_unprovisioned_metadata_table(&mut self, table: &MetadataTable, now: SystemTime) {
+        if table.creating_at(now) {
+            self.metadata_namespace_tables.remove(&table.name);
+        }
     }
 
     /// Record `configuration_state` as the inventory table state of the S3 Metadata
@@ -260,6 +304,11 @@ impl ComAmazonawsS3Amazons3State {
     /// ([`metadata_inventory_table_failure`], the one rule both paths read). Enabling the
     /// table that is already there is not a provisioning at all, so it leaves both the table
     /// and the namespace exactly as they are.
+    ///
+    /// DISABLING drops the table, which releases its name exactly when nothing stands under it
+    /// — a table whose creation had not yet fallen due left nothing behind for the caller to
+    /// delete ([`Self::release_unprovisioned_metadata_tables`], the rule the configuration
+    /// delete reads too).
     pub fn update_metadata_inventory_table(
         &mut self,
         bucket: &str,
@@ -297,6 +346,16 @@ impl ComAmazonawsS3Amazons3State {
         if takes_room && self.metadata_namespace_room() == 0 {
             return MetadataInventoryTableUpdate::NamespaceFull;
         }
+        // The table a DISABLE drops, read before the write that drops it, so its name can be
+        // released when no table stood under it.
+        let dropped = (configuration_state != METADATA_CONFIGURATION_STATE_ENABLED)
+            .then(|| {
+                configuration
+                    .inventory
+                    .as_ref()
+                    .and_then(|inventory| inventory.table.clone())
+            })
+            .flatten();
         let Some(held) = self.buckets.get_mut(bucket) else {
             // Unreachable: the lookup above ran against this same map, under this same guard.
             return MetadataInventoryTableUpdate::NoSuchBucket;
@@ -307,6 +366,9 @@ impl ComAmazonawsS3Amazons3State {
         }
         if takes_room {
             self.record_metadata_namespace_table(&table_name);
+        }
+        if let Some(table) = dropped {
+            self.release_unprovisioned_metadata_table(&table, now);
         }
         MetadataInventoryTableUpdate::Recorded
     }
@@ -1703,9 +1765,18 @@ impl ComAmazonawsS3Amazons3State {
             .map(|held| held.remove_version(key, version_id))
     }
 
-    /// Remove the bucket named `bucket_name`, releasing everything it still held.
+    /// Remove the bucket named `bucket_name`, releasing everything it still held — its
+    /// objects, and from the managed table bucket's namespace the names of its metadata
+    /// configuration's tables that never came into service
+    /// ([`Self::release_unprovisioned_metadata_tables`]).
     /// `false` when this emulator holds no such bucket.
-    pub fn remove_bucket(&mut self, bucket_name: &str) -> bool {
-        self.buckets.remove(bucket_name).is_some()
+    pub fn remove_bucket(&mut self, bucket_name: &str, now: SystemTime) -> bool {
+        let Some(mut held) = self.buckets.remove(bucket_name) else {
+            return false;
+        };
+        if let Some(configuration) = held.take_metadata_configuration() {
+            self.release_unprovisioned_metadata_tables(&configuration, now);
+        }
+        true
     }
 }

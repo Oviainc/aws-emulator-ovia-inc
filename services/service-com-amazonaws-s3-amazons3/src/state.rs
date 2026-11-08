@@ -4011,10 +4011,13 @@ pub const MAX_METADATA_TABLE_ROLE_CHARS: usize = 2048;
 /// The most metadata tables this emulator records in the managed table bucket's namespace
 /// ([`ComAmazonawsS3Amazons3State::metadata_namespace_holds`]).
 ///
-/// An emulator resource guard, NOT an AWS quota. The namespace is the one record here that
-/// nothing releases — a table OUTLIVES the configuration that created it, and nothing in
-/// this service's API deletes a table from an S3 Tables namespace — so without a ceiling a
-/// caller creating and deleting buckets could grow it for the life of the process. Three
+/// An emulator resource guard, NOT an AWS quota. A table that reached service OUTLIVES the
+/// configuration that created it, and nothing in this service's API deletes a table from an
+/// S3 Tables namespace — only the name of a table that never came into service is released
+/// with the configuration that asked for it
+/// ([`ComAmazonawsS3Amazons3State::release_unprovisioned_metadata_tables`]) — so without a
+/// ceiling a caller creating and deleting buckets could grow it for the life of the process.
+/// Three
 /// tables (journal, inventory, annotation) for as many general purpose buckets as this
 /// account may hold ([`MAX_BUCKETS_PER_ACCOUNT`]) is the most any sequence of creates can
 /// legitimately need; a create that would carry the namespace past it is refused with
@@ -4191,6 +4194,19 @@ impl MetadataTable {
             METADATA_TABLE_STATUS_ACTIVE
         }
     }
+
+    /// Whether this table's creation was still under way at `instant` — the one state in
+    /// which the configuration carrying it leaves NOTHING standing under its name.
+    ///
+    /// A table in service holds the name it was created under until that table is deleted
+    /// through the S3 Tables API that owns it, and a table that FAILED never held its name at
+    /// all — whatever table is really there does — so a table still being created is the only
+    /// one whose name is free again once the configuration it belongs to is taken away. See
+    /// [`ComAmazonawsS3Amazons3State::release_unprovisioned_metadata_tables`], which is what
+    /// reads it.
+    pub fn creating_at(&self, instant: SystemTime) -> bool {
+        self.status_at(instant) == METADATA_TABLE_STATUS_CREATING
+    }
 }
 
 /// One of the OPTIONAL tables of a metadata configuration — the inventory table or the
@@ -4285,6 +4301,28 @@ pub struct BucketMetadataConfiguration {
     pub inventory: Option<MetadataTableConfiguration>,
     /// The annotation table configuration, or `None` when the create named none.
     pub annotation: Option<MetadataTableConfiguration>,
+}
+
+impl BucketMetadataConfiguration {
+    /// Every table this configuration has: the journal table, which it always has, and the
+    /// optional inventory and annotation tables while their state has one behind it.
+    ///
+    /// The read seam for anything that acts on a configuration's tables as a SET — what
+    /// taking the configuration away releases from the managed table bucket's namespace — so
+    /// no caller re-derives which of the three containers carries a table of its own.
+    pub fn tables(&self) -> impl Iterator<Item = &MetadataTable> + '_ {
+        [
+            Some(&self.journal),
+            self.inventory
+                .as_ref()
+                .and_then(|inventory| inventory.table.as_ref()),
+            self.annotation
+                .as_ref()
+                .and_then(|annotation| annotation.table.as_ref()),
+        ]
+        .into_iter()
+        .flatten()
+    }
 }
 
 /// The name of one metadata table of the general purpose bucket `bucket`: its name, folded

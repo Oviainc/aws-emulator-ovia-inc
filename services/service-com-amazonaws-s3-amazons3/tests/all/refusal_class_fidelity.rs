@@ -558,10 +558,12 @@ async fn a_metadata_configuration_call_on_a_bucket_carrying_none_answers_the_not
             );
         }
 
-        // The bucket stays reusable: a fresh create is recorded, and what its journal table
-        // then reports follows the managed namespace — in service for a bucket whose table
-        // name was never taken, and the published already-exists failure for one whose
-        // deleted configuration left its table in the namespace.
+        // The bucket stays reusable: a fresh create is recorded, and its journal table reaches
+        // service. The configuration this row deleted was taken away while its journal table
+        // was still being created, so no table was left in the managed namespace holding that
+        // name and the fresh create provisions one afresh — the published already-exists
+        // failure is for a name a table that reached service still holds, which the namespace
+        // suites span.
         let again = create_metadata_configuration(&router, &name, &[], &configuration).await;
         assert_eq!(
             again.status,
@@ -587,14 +589,10 @@ async fn a_metadata_configuration_call_on_a_bucket_carrying_none_answers_the_not
             "case {how:?}: the journal table configuration must name its table, got {:?}",
             element_text(journal, "TableName")
         );
-        let expected_status = match deleted {
-            false => "ACTIVE",
-            true => "FAILED",
-        };
         assert_eq!(
             element_text(journal, "TableStatus").as_deref(),
-            Some(expected_status),
-            "case {how:?}: expected the journal table to report {expected_status}, got {:?}",
+            Some("ACTIVE"),
+            "case {how:?}: expected the journal table to report ACTIVE, got {:?}",
             element_text(journal, "TableStatus")
         );
     }

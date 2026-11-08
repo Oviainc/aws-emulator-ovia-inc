@@ -717,12 +717,18 @@ fn a_removal_reports_what_it_released_and_frees_the_byte_budget() {
         "the delete released the bytes the refused write needed"
     );
 
-    assert!(store.remove_bucket("one"), "bucket one exists");
+    assert!(
+        store.remove_bucket("one", SystemTime::now()),
+        "bucket one exists"
+    );
     assert!(
         store.bucket("one").is_none(),
         "a removed bucket is no longer held"
     );
-    assert!(!store.remove_bucket("one"), "bucket one is already gone");
+    assert!(
+        !store.remove_bucket("one", SystemTime::now()),
+        "bucket one is already gone"
+    );
     assert_eq!(
         store.remove_object("one", "kept"),
         None,

@@ -354,9 +354,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // provisioning failure rather than a refusal of the create — the configuration is
         // recorded and the table reports `FAILED` with those `ErrorDetails`. The namespace is
         // one per Region and a table name is derived from the general purpose bucket's name
-        // ([`crate::state::metadata_table_name`]), so that is the state a create is in when
-        // ANOTHER bucket whose name folds to the same table name already carries a
-        // configuration.
+        // ([`crate::state::metadata_table_name`]), so that is the state a create is in when a
+        // table that came into service is still there under that name: one ANOTHER bucket
+        // whose name folds to the same table name provisioned, or one this bucket's own
+        // earlier configuration did ([`crate::state::ComAmazonawsS3Amazons3State::delete_metadata_configuration`]
+        // releases only the names of tables that never came into service).
         //
         // `ContentMD5` is NOT verified, and `ChecksumAlgorithm` not acted on: by the time
         // this handler runs the payload is the deserialized container rather than the bytes
@@ -453,12 +455,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Every table this create really provisions joins the managed table bucket's
-        // namespace and stays in it for as long as this store lives — a table OUTLIVES the
-        // configuration that created it, which is what makes a create whose table name the
-        // namespace already holds report the failure above, whether that name was taken by
-        // another bucket's configuration or by this bucket's own earlier one. A table that
-        // FAILED to be created adds nothing: the name was already taken by the table that is
-        // there.
+        // namespace and stays in it for as long as a table stands under its name — a table
+        // that came into service OUTLIVES the configuration that created it, which is what
+        // makes a create whose table name such a table holds report the failure above, whether
+        // that name was taken by another bucket's configuration or by this bucket's own
+        // earlier one. A table that FAILED to be created adds nothing: the name was already
+        // taken by the table that is there.
         let created: Vec<String> = [
             (!journal_taken).then(|| journal_name.clone()),
             recorded
@@ -476,9 +478,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .into_iter()
         .flatten()
         .collect();
-        // The namespace is bounded ([`crate::state::MAX_METADATA_NAMESPACE_TABLES`]): nothing
-        // releases a name, so a caller creating configurations for bucket after bucket would
-        // grow the record without bound and the ceiling is what keeps it bounded. Only a name
+        // The namespace is bounded ([`crate::state::MAX_METADATA_NAMESPACE_TABLES`]): only a
+        // configuration carried away before its tables came into service releases their names,
+        // so a caller creating configurations for bucket after bucket would grow the record
+        // without bound and the ceiling is what keeps it bounded. Only a name
         // the namespace does NOT already hold takes room in it, so a create colliding with
         // tables that are already there is judged on what it would really add. A create that
         // would carry the namespace past the maximum is refused with NOTHING recorded — the
