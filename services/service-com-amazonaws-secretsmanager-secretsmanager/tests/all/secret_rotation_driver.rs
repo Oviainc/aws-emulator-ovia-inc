@@ -170,7 +170,7 @@ async fn lambda(router: &MultiServiceRouter, method: &str, uri: &str, body: &Val
 
 /// A .zip deployment package holding `source` as `lambda_function.py`, written in memory
 /// the way a caller uploads one.
-fn package(source: &str) -> Vec<u8> {
+pub(crate) fn package(source: &str) -> Vec<u8> {
     let mut buffer = std::io::Cursor::new(Vec::new());
     {
         let mut writer = zip::ZipWriter::new(&mut buffer);

@@ -113,6 +113,8 @@ mod multi_region_rotation_sharing;
 mod named_grant_identity;
 #[path = "all/no_allow_refusal_clause.rs"]
 mod no_allow_refusal_clause;
+#[path = "all/principal_attached_policy_authority.rs"]
+mod principal_attached_policy_authority;
 #[path = "all/public_key.rs"]
 mod public_key;
 #[path = "all/random_bytes.rs"]

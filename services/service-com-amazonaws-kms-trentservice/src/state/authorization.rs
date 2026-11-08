@@ -34,8 +34,10 @@
 //!   Resolving it materialises the session expiries the clock has already made due, a
 //!   write owed at that instant whether or not anybody called.
 //! * **the documents** — the key policy out of this service's own store, and the
-//!   principal's inline and attached policies out of IAM's own store, so this service
-//!   sees exactly what those handlers wrote.
+//!   principal's inline and attached policies out of IAM's own store, read through IAM's
+//!   OWN `principal_policies` accessor — where the collection rule lives — so this service
+//!   sees exactly what those handlers put in force, including the default version of an
+//!   attached policy whether AWS or this account owns it.
 //! * **the decision** — [`::service_common::iam_authorization`], the tree's ONE
 //!   evaluation of policy documents against `(action, resource, principal)`, so this
 //!   service and every other one handed the same document decide alike.
@@ -59,8 +61,11 @@
 //!   STS nor IAM holds a record for speaks for the account itself, which holds no
 //!   identity policies — the position AWS account root credentials are in.
 //! * **A principal holding an attachment this emulator cannot read.** An AWS-MANAGED
-//!   policy's document belongs to AWS, not to this account, so refusing on evidence this
-//!   emulator does not have would deny access AWS permits.
+//!   policy AWS publishes but this emulator's catalog does not carry has no document in
+//!   the store, so refusing on evidence this emulator does not have would deny access AWS
+//!   permits. A policy the store DOES resolve a document for — an account-owned one, or a
+//!   published AWS-managed one — is read like any other document and bounds the principal
+//!   as it is written.
 //! * **An AWS SERVICE acting for one of its own resources.** A cryptographic operation
 //!   another service performs as its OWN service principal — CloudFront opening the bytes
 //!   of an origin object for a fetch its origin access control signed — is made by no
@@ -93,7 +98,7 @@
 //! other key is left unpublished too, so a statement naming one stays undecided and the
 //! shared evaluator reads it fail-closed.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::time::SystemTime;
 
 use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam_store;
@@ -231,6 +236,29 @@ impl Caller {
     /// read (see the module docs).
     fn identity_is_unbounded(&self) -> bool {
         self.account_credential || self.unreadable_attachment
+    }
+
+    /// Read what the IAM identity `identity_arn` names may do, through the IAM service's
+    /// OWN accessor: the documents in force on it — its inline policies and the default
+    /// version of each managed policy attached to it, whether that policy belongs to this
+    /// account or to AWS — and whether it carries an attachment whose document the store
+    /// holds none for.
+    ///
+    /// The collection rule itself lives in IAM
+    /// ([`iam_store::ComAmazonawsIamAwsidentitymanagementv20100508State::principal_policies`]),
+    /// so this service sees exactly what `PutRolePolicy`/`AttachRolePolicy` put in force
+    /// and reads a principal's permissions as IAM's own authorizer reads them. Only a
+    /// policy the store resolves NO document for leaves part of the principal's authority
+    /// unknown, which is what [`Self::unreadable_attachment`] stands for.
+    fn read_policies_of(
+        &mut self,
+        store: &iam_store::ComAmazonawsIamAwsidentitymanagementv20100508State,
+        identity_arn: &str,
+    ) {
+        if let Some(policies) = store.principal_policies(identity_arn) {
+            self.documents = policies.documents;
+            self.unreadable_attachment = !policies.uncarried.is_empty();
+        }
     }
 }
 
@@ -735,49 +763,20 @@ pub fn caller<Eng: Send + Sync + 'static>(
         }
     }
     if let Some(role_name) = assumed_role_name(&caller.arn) {
-        let role_key = iam_store::name_key(role_name);
-        if let Some(held) = store.roles.get(&role_key) {
+        // An assumed-role session's permissions are the ROLE's, and the role is addressed
+        // by the ARN the account holds it under — which carries its PATH, where the session
+        // ARN does not.
+        if let Some(held) = store.roles.get(&iam_store::name_key(role_name)) {
             caller.principals.push(held.arn.clone());
+            let role_arn = held.arn.clone();
+            caller.read_policies_of(&store, &role_arn);
         }
-        caller
-            .documents
-            .extend(inline_documents(&store.role_inline_policies, &role_key));
-        for attached in store
-            .role_attached_policies
-            .get(&role_key)
-            .into_iter()
-            .flatten()
-        {
-            match store
-                .policy_by_arn(attached)
-                .and_then(default_version_document)
-            {
-                Some(document) => caller.documents.push(document),
-                // Only an AWS-MANAGED policy is a grant this emulator cannot read.
-                None if is_aws_managed_policy(attached) => {
-                    caller.unreadable_attachment = true;
-                }
-                None => {}
-            }
-        }
-    } else if let Some(user_name) = iam_user_name(&caller.arn) {
-        // A user's INLINE policies are what the IAM store holds for it; there is no
-        // attached-policy map to read for a user.
-        caller.documents.extend(inline_documents(
-            &store.user_inline_policies,
-            &iam_store::name_key(user_name),
-        ));
+    } else if iam_user_name(&caller.arn).is_some() {
+        // An IAM user's permissions are its own, under the ARN it was resolved by.
+        let user_arn = caller.arn.clone();
+        caller.read_policies_of(&store, &user_arn);
     }
     caller
-}
-
-/// Whether `arn` names an AWS-MANAGED policy: one whose account segment is IAM's `aws`,
-/// so it belongs to AWS rather than to this account and the IAM store holds no document
-/// for it. Read through IAM's own ARN parser, so this service and IAM agree on what an
-/// AWS-managed policy ARN is.
-fn is_aws_managed_policy(arn: &str) -> bool {
-    iam_store::parse_policy_arn(arn)
-        .is_some_and(|policy| policy.account == iam_store::AWS_MANAGED_POLICY_ACCOUNT)
 }
 
 /// The principal an IAM ROLE is, with the documents in force on it: the caller of a
@@ -809,12 +808,7 @@ pub fn role_caller<Eng: Send + Sync + 'static>(engine: &Eng, role_arn: &str) -> 
         return caller;
     };
     let store = iam_state.lock();
-    if let Some(policies) = store.principal_policies(role_arn) {
-        caller.documents = policies.documents;
-        // An attachment the collection resolved no document for is an entry of AWS's own
-        // catalog this emulator does not carry: a grant it cannot read.
-        caller.unreadable_attachment = !policies.uncarried.is_empty();
-    }
+    caller.read_policies_of(&store, role_arn);
     caller
 }
 
@@ -843,35 +837,3 @@ fn arn_resource<'a>(arn: &'a str, service: &str) -> Option<&'a str> {
     (parsed.vendor == service).then_some(parsed.resource)
 }
 
-/// The inline policy documents one entity holds, from the IAM store's
-/// `<entity> -> <policy name> -> policy` map.
-fn inline_documents(
-    policies: &BTreeMap<String, BTreeMap<String, iam_store::InlinePolicy>>,
-    entity_key: &str,
-) -> Vec<String> {
-    policies
-        .get(entity_key)
-        .map(|held| {
-            held.values()
-                .map(|policy| policy.policy_document.clone())
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// The document of a managed policy's DEFAULT version — the one in force on every entity
-/// it is attached to. `None` when the store holds no document for it.
-fn default_version_document(managed: &iam_store::ManagedPolicy) -> Option<String> {
-    let default = managed.policy.default_version_id.as_deref();
-    managed
-        .versions
-        .values()
-        .find(|version| default.is_some() && version.version_id.as_deref() == default)
-        .or_else(|| {
-            managed
-                .versions
-                .values()
-                .find(|version| version.is_default_version)
-        })
-        .and_then(|version| version.document.clone())
-}

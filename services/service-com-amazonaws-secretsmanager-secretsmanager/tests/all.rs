@@ -23,6 +23,8 @@ mod secret_batch_get;
 mod secret_client_request_token;
 #[path = "all/secret_cross_account_resource_policy.rs"]
 mod secret_cross_account_resource_policy;
+#[path = "all/secret_customer_key_caller_authority.rs"]
+mod secret_customer_key_caller_authority;
 #[path = "all/secret_delete_metadata_and_filters.rs"]
 mod secret_delete_metadata_and_filters;
 #[path = "all/secret_deletion_window.rs"]
@@ -61,6 +63,8 @@ mod secret_rotation;
 mod secret_rotation_cancel;
 #[path = "all/secret_rotation_driver.rs"]
 mod secret_rotation_driver;
+#[path = "all/secret_rotation_span.rs"]
+mod secret_rotation_span;
 #[path = "all/secret_service_owned_writes.rs"]
 mod secret_service_owned_writes;
 #[path = "all/secret_stop_replication_refusal.rs"]

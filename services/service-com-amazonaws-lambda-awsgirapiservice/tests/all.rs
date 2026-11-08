@@ -201,6 +201,10 @@ mod function_versions_by_capacity_provider;
 mod functions_by_code_signing_config;
 #[path = "all/handler_aws_sdk.rs"]
 mod handler_aws_sdk;
+#[path = "all/handler_customer_key_access.rs"]
+mod handler_customer_key_access;
+#[path = "all/handler_db_auth_token.rs"]
+mod handler_db_auth_token;
 #[path = "all/handler_db_auth_token.rs"]
 mod handler_db_auth_token;
 #[path = "all/handler_logging_facility.rs"]
@@ -357,6 +361,12 @@ mod invoke_caller_authorization;
 mod invoke_log_delivery;
 #[path = "all/invocation_logs.rs"]
 mod invocation_logs;
+#[path = "all/invocation_run_capacity.rs"]
+mod invocation_run_capacity;
+#[path = "all/layer_region_scope.rs"]
+mod layer_region_scope;
+#[path = "all/update_window_outlasts_its_call.rs"]
+mod update_window_outlasts_its_call;
 #[path = "all/handler_eventbridge_publication.rs"]
 mod handler_eventbridge_publication;
 #[path = "all/sqs_event_source_record_attributes.rs"]

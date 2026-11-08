@@ -79,14 +79,24 @@ const EVENT_STEP: &str = "Step";
 
 /// How long after the call that started it a rotation begins invoking the rotation function.
 ///
-/// A rotation is asynchronous — the call that starts it answers with the version the rotation
-/// has not created yet — so the state a caller sees straight after that call is the rotation
-/// IN FLIGHT: `AWSPENDING` staked on a version that does not exist, and a second
-/// `RotateSecret` refused for a rotation still in progress. The span is this emulator's own
-/// (AWS states none), inside the band this tree gives a transition it owes a caller, so a
-/// caller acting immediately still meets the transient state and one polling for the rotation
-/// to finish sees it finish.
-const ROTATION_START_DELAY: Duration = Duration::from_secs(2);
+/// `RotateSecret` "configures and STARTS the asynchronous process of rotating the secret"
+/// (this service's Smithy model), so the first step is the next thing that happens: the
+/// rotation is driven straight through its four steps, and what a client waits for is the
+/// FUNCTION's own work rather than a span this service adds ahead of it. That matters to a
+/// client that watches a rotation by one of its side effects — a backup copy an early step
+/// writes, a credential a later step changes — because every span added here is added
+/// between that side effect and the rotation being finished.
+///
+/// The span is therefore the smallest one that still leaves the rotation IN FLIGHT for a
+/// caller acting immediately: the call answers with `AWSPENDING` staked on a version that
+/// does not exist yet, and this keeps that state readable — and a second `RotateSecret`
+/// refused for a rotation still in progress — for a caller whose next request follows at
+/// once. The band this tree gives a transition it owes a caller is not this sub-span's to
+/// meet: it is the ROTATION that is the transition, and it stays in flight for the whole of
+/// its four invocations, which is where that band is spent. This is only the lead-in, so it
+/// is this emulator's own figure (AWS states none), orders of magnitude below one invocation
+/// of a rotation function.
+const ROTATION_START_DELAY: Duration = Duration::from_millis(250);
 
 /// How long one step of a rotation may hold the task that drives it.
 ///

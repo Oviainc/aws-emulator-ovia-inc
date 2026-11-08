@@ -62,6 +62,10 @@ base64 = "0.22"
 # assembled router mounts them, so the rotation function a rotation drives is a real
 # function running its own deployment package.
 service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# The bucket that rotation function writes its backup copies to, mounted beside this service
+# on one engine: the side effect a client watches a rotation by is asserted where a client
+# reads it, through Amazon S3's own API.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 # That deployment package is a .zip archive the suite writes in memory, the way a caller
 # uploads one.
 zip = { version = "9", default-features = false, features = ["deflate"] }
