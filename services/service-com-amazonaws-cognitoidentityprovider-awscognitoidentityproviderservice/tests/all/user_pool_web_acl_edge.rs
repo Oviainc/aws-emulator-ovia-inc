@@ -61,6 +61,12 @@ const PROBE_VALUE: &str = "refuse-this-request";
 const FORBIDDEN_EXCEPTION: &str = "ForbiddenException";
 const FORBIDDEN_STATUS: u16 = 403;
 
+/// The sentence that refusal carries, which is fixed text for this error class:
+/// `ForbiddenException$message` is "the message returned when WAF doesn't allow your
+/// request based on a web ACL that's associated with your user pool" and carries nothing
+/// from the request, from the web ACL or from the pool's state.
+const WAF_REFUSAL_MESSAGE: &str = "Request not allowed due to WAF block.";
+
 /// A password satisfying a default pool's password policy, and a second one the
 /// temporary-password sign-in uses.
 const GOOD_PASSWORD: &str = "Passw0rd!2024";
@@ -591,7 +597,7 @@ async fn a_web_acl_in_front_of_a_pool_decides_every_operation_it_governs() {
         );
         assert_eq!(
             blocked.message(),
-            "Request not allowed due to WAF rules.",
+            WAF_REFUSAL_MESSAGE,
             "case {:?}: expected the forbidden refusal's own sentence, got {:?}",
             row.case,
             blocked.message()
@@ -1163,4 +1169,158 @@ async fn nothing_the_web_acl_does_not_govern_is_decided_by_it() {
         after.status,
         after.body
     );
+}
+
+/// One request a web ACL did not allow: the operation that was called, the body that
+/// addresses the pool, how the web ACL was written, and whether the call carries the
+/// probe header the web ACL's rule hunts for.
+struct NotAllowed {
+    case: &'static str,
+    operation: &'static str,
+    body: Value,
+    default_action: Value,
+    rules: Value,
+    probe: bool,
+}
+
+/// The requests a web ACL refuses, spanning what the refusal's wording generalises over:
+/// which operation was called, which member of the request names the pool, whether a
+/// RULE or the `DefaultAction` decided, and which terminating action it applied.
+fn not_allowed_rows(pool: &Pool) -> Vec<NotAllowed> {
+    let sign_in = json!({
+        "ClientId": pool.client_id,
+        "AuthFlow": "USER_PASSWORD_AUTH",
+        "AuthParameters": { "USERNAME": pool.username, "PASSWORD": GOOD_PASSWORD },
+    });
+    // The terminating actions a rule may apply, from the model
+    // (`smithy_query(query="shape",shape="RuleAction")`): `Block`, `Captcha` and
+    // `Challenge` all end the evaluation, while `Count` lets the request through and so
+    // produces no refusal to word.
+    vec![
+        NotAllowed {
+            case: "a rule blocks the sign-in entry point, which names its pool by the app \
+                   client",
+            operation: "InitiateAuth",
+            body: sign_in.clone(),
+            default_action: json!({ "Allow": {} }),
+            rules: json!([rule("block-the-probe", 0, probe_header_match(), json!({ "Block": {} }))]),
+            probe: true,
+        },
+        NotAllowed {
+            case: "a rule blocks a self-service read, which names its pool by the access \
+                   token",
+            operation: "GetUser",
+            body: json!({ "AccessToken": pool.access_token }),
+            default_action: json!({ "Allow": {} }),
+            rules: json!([rule("block-the-probe", 0, probe_header_match(), json!({ "Block": {} }))]),
+            probe: true,
+        },
+        NotAllowed {
+            case: "a rule blocks a request part way through a challenge, which names its \
+                   pool by the session",
+            operation: "AssociateSoftwareToken",
+            body: json!({ "Session": pool.session }),
+            default_action: json!({ "Allow": {} }),
+            rules: json!([rule("block-the-probe", 0, probe_header_match(), json!({ "Block": {} }))]),
+            probe: true,
+        },
+        NotAllowed {
+            case: "no rule matches and the DefaultAction blocks",
+            operation: "InitiateAuth",
+            body: sign_in.clone(),
+            default_action: json!({ "Block": {} }),
+            rules: json!([]),
+            probe: false,
+        },
+        NotAllowed {
+            case: "a later rule blocks after an earlier one only counted the request",
+            operation: "InitiateAuth",
+            body: sign_in.clone(),
+            default_action: json!({ "Allow": {} }),
+            rules: json!([
+                rule("count-the-probe", 0, probe_header_match(), json!({ "Count": {} })),
+                rule(
+                    "block-every-post",
+                    1,
+                    byte_match(json!({ "Method": {} }), "POST", "EXACTLY"),
+                    json!({ "Block": {} }),
+                ),
+            ]),
+            probe: true,
+        },
+        NotAllowed {
+            case: "a rule runs a CAPTCHA check, which this endpoint's caller has no \
+                   browser to solve",
+            operation: "InitiateAuth",
+            body: sign_in.clone(),
+            default_action: json!({ "Allow": {} }),
+            rules: json!([rule(
+                "captcha-the-probe",
+                0,
+                probe_header_match(),
+                json!({ "Captcha": {} }),
+            )]),
+            probe: true,
+        },
+        NotAllowed {
+            case: "a rule runs a silent challenge, which this endpoint's caller has no \
+                   browser to run",
+            operation: "ForgotPassword",
+            body: json!({ "ClientId": pool.client_id, "Username": pool.username }),
+            default_action: json!({ "Allow": {} }),
+            rules: json!([rule(
+                "challenge-the-probe",
+                0,
+                probe_header_match(),
+                json!({ "Challenge": {} }),
+            )]),
+            probe: true,
+        },
+    ]
+}
+
+/// RULE: a request the web ACL in front of the pool did not allow is refused with HTTP
+/// 403 and `ForbiddenException`, whose message is the one sentence AWS words that error
+/// class with — fixed text that carries nothing from the request, from the web ACL or
+/// from the pool's state, so it does not vary with the operation called, with the rule
+/// that decided, or with the terminating action that rule applied.
+#[tokio::test]
+async fn every_request_a_web_acl_does_not_allow_is_worded_the_one_way() {
+    let edge = Edge::new();
+    let pool = Pool::build(&edge, "worded").await;
+
+    for (index, row) in not_allowed_rows(&pool).iter().enumerate() {
+        let web_acl = create_web_acl(
+            &edge,
+            &format!("worded-{index}"),
+            row.default_action.clone(),
+            row.rules.clone(),
+        )
+        .await;
+        associate(&edge, &web_acl.arn, &pool.arn).await;
+
+        let headers: &[(&str, &str)] = if row.probe {
+            &[(PROBE_HEADER, PROBE_VALUE)]
+        } else {
+            &[]
+        };
+        let refused = edge.cognito(row.operation, &row.body, headers).await;
+        assert_eq!(
+            refused.outcome(),
+            (FORBIDDEN_STATUS, FORBIDDEN_EXCEPTION.to_string()),
+            "case {:?} ({}): expected the web ACL's refusal, got {} with {}",
+            row.case,
+            row.operation,
+            refused.status,
+            refused.body
+        );
+        assert_eq!(
+            refused.message(),
+            WAF_REFUSAL_MESSAGE,
+            "case {:?} ({}): expected the one sentence this refusal is worded with, got {:?}",
+            row.case,
+            row.operation,
+            refused.message()
+        );
+    }
 }

@@ -60,8 +60,14 @@ pub const FORBIDDEN_EXCEPTION: &str = "ForbiddenException";
 /// words a bad parameter in.
 const FORBIDDEN_STATUS: u16 = 403;
 
-/// The sentence Amazon Cognito refuses a request its web ACL blocked with.
-const WAF_REFUSAL_MESSAGE: &str = "Request not allowed due to WAF rules.";
+/// The sentence Amazon Cognito refuses a request its web ACL did not allow with.
+///
+/// The WHOLE sentence is fixed text for this error class: `ForbiddenException$message`
+/// is "the message returned when WAF doesn't allow your request based on a web ACL
+/// that's associated with your user pool", and it carries nothing from the request, from
+/// the web ACL or from the pool's state — so every request a web ACL's decision refuses
+/// is worded the same, whichever operation was called and whichever rule decided it.
+const WAF_REFUSAL_MESSAGE: &str = "Request not allowed due to WAF block.";
 
 /// The media type an `awsJson1_1` body carries, which is what a response served at the
 /// edge with no `CustomResponseBody` content type of its own carries.
