@@ -21,8 +21,10 @@
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
 //! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
+//!   correctly. This service TAKES it, for one class of request: one whose body it
+//!   cannot read into the operation's modelled input, which the codec faults before
+//!   any handler runs (see [`request_layer`]). Everything else resolves through the
+//!   generated routing table.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -50,9 +52,15 @@
 
 use aws_smithy_schema_server::{Violation, ViolationKind};
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service,
+    http, ErasedOperation, Refusal, Refused, Service, ServerHttpProtocol,
 };
 use std::sync::Arc;
+
+/// How this service refuses a request body it cannot read into the operation's
+/// modelled input at all — a layer in FRONT of the generated walk, because the
+/// framework states that failure in its own codec's words under an error code
+/// this model does not declare.
+mod request_layer;
 
 /// The one client-input error this service models: `BadRequestException`,
 /// `errorKind` client, `httpError` 400, one `message` member
@@ -137,6 +145,22 @@ fn fixed_sentence(violation: &Violation) -> Option<&'static str> {
             "name" | "newName",
             ViolationKind::MinLength(TABLE_NAME_MIN) | ViolationKind::MaxLength(TABLE_NAME_MAX),
         ) => Some(crate::state::INVALID_TABLE_NAME_MESSAGE),
+        // The open table format a table is created in: the model targets this
+        // member at the `OpenTableFormat` enum and makes it `@required`, so a
+        // request either names a format the service has or names none — and
+        // both are the one failure this sentence states, since neither gives
+        // the create a format to work in.
+        (
+            "format",
+            ViolationKind::EnumValue(_) | ViolationKind::MissingRequiredMember,
+        ) => Some(crate::state::INVALID_OPEN_TABLE_FORMAT_MESSAGE),
+        // Anything the model rules out INSIDE the metadata document — a sort
+        // direction or null order outside its enumerated set, a value outside a
+        // declared bound — makes the document one this service will not create a
+        // table from, which is the class its metadata sentence states. The
+        // violation's first path segment is the input member that carried the
+        // value, so one arm covers every depth of the document.
+        ("metadata", _) => Some(crate::state::INVALID_METADATA_MESSAGE),
         _ => None,
     }
 }
@@ -174,6 +198,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// This service's wire protocol, built ONCE here because
     /// [`Service::override_protocol`] hands back a borrow of it.
     protocol: service_common::date_time_json::DateTimeRestJson,
+    /// Answers a request whose body this service cannot read into the
+    /// operation's modelled input (see [`request_layer`]). Held on the service
+    /// because [`Service::override_operation`] hands back a borrow of one of its
+    /// own operations.
+    unreadable_body: request_layer::UnreadableBody<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -184,6 +213,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(engine),
             protocol: service_common::date_time_json::DateTimeRestJson::new(),
+            unreadable_body: request_layer::UnreadableBody::new(),
         }
     }
 }
@@ -210,11 +240,28 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        // A body this service cannot read into the operation's modelled input is
+        // refused HERE, in front of the generated walk, because that failure
+        // happens in the codec: the value never becomes a value at all, so no
+        // handler runs and no modelled error is reached. The framework would
+        // state it in its codec's own words under an error code this model does
+        // not declare; this service states its own invalid-input sentence under
+        // the one client-input error it models. Everything else — a request whose
+        // body READS — resolves through the generated routing table, which is
+        // what `None` selects.
+        //
+        // WHICH operation the request names is resolved through the generated
+        // entry's own protocol, because that is the one holding the model's route
+        // table; the overridden protocol below carries none (a protocol's routes
+        // are read by `routing_key` alone) and is what READS the body, exactly as
+        // the generated walk reads it.
+        let routing = self.entry.protocol();
+        let codec: &dyn ServerHttpProtocol = &self.protocol;
+        if let Ok(key) = routing.routing_key(req) {
+            if request_layer::body_is_unreadable::<Eng>(key, codec, req) {
+                return Some(&self.unreadable_body);
+            }
+        }
         None
     }
 

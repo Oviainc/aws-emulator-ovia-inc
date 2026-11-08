@@ -137,14 +137,17 @@ fn not_found(message: &str) -> PutTableBucketReplicationError {
     .into()
 }
 
-/// How this service reports the state of the replication configuration a put
-/// has just put in force. The member is an untyped `String` the model
-/// documents as "the status of the replication configuration operation", and a
-/// configuration that was accepted is in force, which is the state this service
-/// words `enabled` — the same word its other configurations' statuses carry.
-/// No recorded response states this member's wording, so this is the service's
-/// own, derived from the state the put leaves and from nothing in the request.
-const CONFIGURATION_IN_FORCE: &str = "enabled";
+/// What this service reports as the outcome of a put that was accepted.
+///
+/// The model documents the required `status` member as "The status of the
+/// replication configuration OPERATION"
+/// (`smithy_query(query="doc", shape="PutTableBucketReplicationResponse",
+/// member="status")`), not the state of the configuration the put left behind:
+/// it describes the call. So it is a fixed literal for every accepted put —
+/// a put that is NOT accepted carries one of the modelled errors instead and no
+/// output at all — and it is independent of the rules the configuration holds,
+/// which `GetTableBucketReplication` is what reports.
+const OPERATION_SUCCEEDED: &str = "success";
 
 /// The `PutTableBucketReplication` operation.
 ///
@@ -279,7 +282,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(PutTableBucketReplicationOutput {
             version_token,
-            status: CONFIGURATION_IN_FORCE.to_string(),
+            status: OPERATION_SUCCEEDED.to_string(),
         })
     }
 }

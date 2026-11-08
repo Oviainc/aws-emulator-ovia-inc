@@ -19,10 +19,14 @@ mod constraint_refusals;
 mod fixed_error_sentences;
 #[path = "all/harness.rs"]
 mod harness;
+#[path = "all/invalid_input_refusals.rs"]
+mod invalid_input_refusals;
 #[path = "all/metrics_configuration_not_found_message.rs"]
 mod metrics_configuration_not_found_message;
 #[path = "all/namespace_and_table_lifecycle.rs"]
 mod namespace_and_table_lifecycle;
+#[path = "all/replication_put_outcome.rs"]
+mod replication_put_outcome;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/table_bucket_encryption.rs"]

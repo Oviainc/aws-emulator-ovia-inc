@@ -1240,6 +1240,30 @@ pub const RECORD_EXPIRATION_NOT_ALLOWED_MESSAGE: &str =
 /// service does.
 pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "The specified resourceArn is not valid.";
 
+/// How this service states a table format it will not accept — the members the
+/// model targets at the `OpenTableFormat` enum. FIXED text, as
+/// [`INVALID_TABLE_BUCKET_NAME_MESSAGE`]: it names the CLASS of the failure and
+/// neither echoes the value nor lists the formats this service does accept.
+pub const INVALID_OPEN_TABLE_FORMAT_MESSAGE: &str = "The specified open table format is not valid";
+
+/// How this service states table metadata it will not accept: a `metadata`
+/// document that does not describe a table this service can create — a column
+/// of a type no open table format has, a sort or partition field naming a
+/// column the schema does not declare, a transform no open table format
+/// applies. FIXED text — it names the CLASS of the failure and takes nothing
+/// from the request, as [`INVALID_TABLE_BUCKET_NAME_MESSAGE`] does for a name.
+pub const INVALID_METADATA_MESSAGE: &str = "The specified metadata is not valid";
+
+/// How this service states a request body it cannot read into the operation's
+/// modelled input at all — a member carrying a value of a JSON type the model
+/// does not declare for it, or a body that is not the operation's input. FIXED
+/// text: it points the caller at the reference that states the constraints
+/// rather than describing the one value that failed, so nothing of the request
+/// (and nothing of this emulator's codec) appears in it.
+pub const INVALID_INPUT_MESSAGE: &str = "Invalid input. Consult the S3 Tables and/or Iceberg REST \
+                                         Catalog API reference for constraints on request \
+                                         parameters.";
+
 /// Whether `name` satisfies the table-bucket naming rule the model's
 /// `@pattern` cannot express: a name begins and ends with a letter or a digit,
 /// so a hyphen may only appear between them.

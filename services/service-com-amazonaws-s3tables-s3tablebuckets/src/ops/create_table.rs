@@ -161,6 +161,339 @@ fn not_found(message: &str) -> CreateTableError {
     .into()
 }
 
+/// The primitive types a column of an Iceberg table may be declared with, as
+/// the Apache Iceberg table specification names them.
+///
+/// The model declares `SchemaField.type` (and `SchemaV2Field.type`) as free text
+/// rather than an enum (`smithy_query(query="shape", shape="SchemaField")`), so
+/// the type set is the service's own rule rather than a boundary constraint:
+/// this is where a column type no open table format has is refused.
+/// The parameterized primitives — `decimal(P, S)` and `fixed[L]` — carry a
+/// value in their spelling and are checked by [`parameterized_primitive`]
+/// instead of being listed.
+const ICEBERG_PRIMITIVE_TYPES: &[&str] = &[
+    "boolean",
+    "int",
+    "long",
+    "float",
+    "double",
+    "date",
+    "time",
+    "timestamp",
+    "timestamptz",
+    "timestamp_ns",
+    "timestamptz_ns",
+    "string",
+    "uuid",
+    "binary",
+];
+
+/// The nested type constructors an Iceberg column type may be spelled with: a
+/// struct, a list or a map, each parameterized by the types it holds. Their
+/// contents are not read apart here — the schema a create carries is written to
+/// the table's metadata file, which no operation of this service reads back — so
+/// a nested type is accepted on its constructor.
+const ICEBERG_NESTED_TYPES: &[&str] = &["struct", "list", "map"];
+
+/// The transforms a partition field or a sort field may name, as the Apache
+/// Iceberg table specification names them. `bucket[N]` and `truncate[W]` carry a
+/// width in their spelling and are checked by [`parameterized_transform`].
+const ICEBERG_TRANSFORMS: &[&str] = &["identity", "year", "month", "day", "hour", "void"];
+
+/// The order id Iceberg gives the unsorted sort order, which is the one order
+/// that names no field to sort by.
+const UNSORTED_ORDER_ID: i32 = 0;
+
+/// The widest `decimal` precision Iceberg admits, and the narrowest.
+const DECIMAL_PRECISION: std::ops::RangeInclusive<u32> = 1..=38;
+
+/// Whether `declared` is a parameterized Iceberg primitive: `decimal(P, S)`
+/// with a precision Iceberg admits and a scale that fits it, or `fixed[L]` with
+/// a positive length.
+fn parameterized_primitive(declared: &str) -> bool {
+    if let Some(parameters) = declared
+        .strip_prefix("decimal(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let mut parts = parameters.split(',').map(|part| part.trim().parse::<u32>());
+        return match (parts.next(), parts.next(), parts.next()) {
+            (Some(Ok(precision)), Some(Ok(scale)), None) => {
+                DECIMAL_PRECISION.contains(&precision) && scale <= precision
+            }
+            _ => false,
+        };
+    }
+    if let Some(length) = declared
+        .strip_prefix("fixed[")
+        .and_then(|rest| rest.strip_suffix(']'))
+    {
+        return length.trim().parse::<u32>().is_ok_and(|length| length > 0);
+    }
+    false
+}
+
+/// Whether `declared` is a type an Iceberg column may have.
+fn column_type_is_declarable(declared: &str) -> bool {
+    ICEBERG_PRIMITIVE_TYPES.contains(&declared)
+        || parameterized_primitive(declared)
+        || nested_type(declared)
+}
+
+/// Whether `declared` is a nested Iceberg type: one of the constructors, then
+/// the types it holds. The contents are not read apart (see
+/// [`ICEBERG_NESTED_TYPES`]), so the check is the constructor and the closing
+/// bracket.
+fn nested_type(declared: &str) -> bool {
+    declared.ends_with('>')
+        && declared
+            .split_once('<')
+            .is_some_and(|(constructor, _)| ICEBERG_NESTED_TYPES.contains(&constructor))
+}
+
+/// Whether `transform` is a parameterized Iceberg transform: `bucket[N]` or
+/// `truncate[W]`, each with a positive width.
+fn parameterized_transform(transform: &str) -> bool {
+    const PARAMETERIZED: &[&str] = &["bucket", "truncate"];
+    transform
+        .strip_suffix(']')
+        .and_then(|rest| rest.split_once('['))
+        .is_some_and(|(named, width)| {
+            PARAMETERIZED.contains(&named)
+                && width.trim().parse::<u32>().is_ok_and(|width| width > 0)
+        })
+}
+
+/// Whether `transform` is one an Iceberg table may partition or sort by.
+fn transform_is_applicable(transform: &str) -> bool {
+    ICEBERG_TRANSFORMS.contains(&transform) || parameterized_transform(transform)
+}
+
+/// Whether `names` are the column names of one schema: each one present, and no
+/// two the same. A partition spec's field names are the same rule.
+fn names_are_distinct<'a>(mut names: impl Iterator<Item = &'a str>) -> bool {
+    let mut seen: ::std::collections::BTreeSet<&str> = ::std::collections::BTreeSet::new();
+    names.all(|name| !name.is_empty() && seen.insert(name))
+}
+
+/// Whether `ids` are column ids of one schema: each positive, and no two the
+/// same.
+fn ids_are_distinct(mut ids: impl Iterator<Item = i32>) -> bool {
+    let mut seen: ::std::collections::BTreeSet<i32> = ::std::collections::BTreeSet::new();
+    ids.all(|id| id > 0 && seen.insert(id))
+}
+
+/// Whether `keys` name each of a partition spec's or a sort order's fields
+/// once: a column partitioned, or sorted on, twice the SAME way is one field
+/// stated twice. What "the same way" is belongs to the caller, which passes
+/// everything that distinguishes one of its fields from another — a sort field
+/// is distinguished by its direction and null order as well as by its column
+/// and transform.
+fn keys_are_distinct<'a>(
+    mut keys: impl Iterator<Item = (i32, &'a str, &'a str, &'a str)>,
+) -> bool {
+    let mut seen: ::std::collections::BTreeSet<(i32, &str, &str, &str)> =
+        ::std::collections::BTreeSet::new();
+    keys.all(|key| seen.insert(key))
+}
+
+/// The column ids a `schema` may be referred to by: the id each field states,
+/// and — for a schema whose fields leave the member out — the 1-based position
+/// of each field, which is the id Iceberg assigns when a request numbers none of
+/// them. Both are admitted because a document may number some columns and leave
+/// the rest to the service, and a reference to either is a reference the service
+/// can resolve.
+fn referable_column_ids(schema: &IcebergSchema) -> ::std::collections::BTreeSet<i32> {
+    schema
+        .fields
+        .iter()
+        .enumerate()
+        .flat_map(|(position, field)| {
+            [
+                field.id,
+                Some(i32::try_from(position + 1).unwrap_or(i32::MAX)),
+            ]
+        })
+        .flatten()
+        .collect()
+}
+
+/// Whether a `schema` describes columns a table can be created with: each
+/// column with a name of its own, a distinct id where it states one, and a type
+/// an Iceberg column may have.
+///
+/// Only the ids the request STATES are compared for distinctness: a column that
+/// states none is numbered by the service, so it cannot collide with anything.
+///
+/// A schema declaring NO column is a schema a table can be created with: the
+/// table is created with no columns and an engine adds them later, which is how
+/// the recorded service answers such a create.
+fn schema_is_creatable(schema: &IcebergSchema) -> bool {
+    names_are_distinct(schema.fields.iter().map(|field| field.name.as_str()))
+        && ids_are_distinct(schema.fields.iter().filter_map(|field| field.id))
+        && schema
+            .fields
+            .iter()
+            .all(|field| column_type_is_declarable(&field.r#type))
+}
+
+/// Whether a `type` document of a version 2 schema field is a type an Iceberg
+/// column may have: the text of a primitive, or a nested type stated as an
+/// object naming its constructor.
+fn document_type_is_declarable(declared: &::aws_smithy_types::Document) -> bool {
+    match declared {
+        ::aws_smithy_types::Document::String(text) => column_type_is_declarable(text),
+        ::aws_smithy_types::Document::Object(members) => members
+            .get("type")
+            .is_some_and(|named| match named {
+                ::aws_smithy_types::Document::String(text) => {
+                    ICEBERG_NESTED_TYPES.contains(&text.as_str())
+                        || column_type_is_declarable(text)
+                }
+                _ => false,
+            }),
+        _ => false,
+    }
+}
+
+/// Whether a version 2 `schema` describes columns a table can be created with.
+///
+/// The same rule as [`schema_is_creatable`], plus the one the version 2 shape
+/// adds: every identifier field it names is a column it declares
+/// (`smithy_query(query="shape", shape="IcebergSchemaV2")`).
+fn schema_v2_is_creatable(schema: &IcebergSchemaV2) -> bool {
+    // A SET of the ids, not a list: both the ids and the identifier fields that
+    // name them are lists the REQUEST sizes, so resolving one against the other
+    // by scanning would cost their product.
+    let ids: ::std::collections::BTreeSet<i32> =
+        schema.fields.iter().map(|field| field.id).collect();
+    names_are_distinct(schema.fields.iter().map(|field| field.name.as_str()))
+        && ids_are_distinct(schema.fields.iter().map(|field| field.id))
+        && schema
+            .fields
+            .iter()
+            .all(|field| document_type_is_declarable(&field.r#type))
+        && schema
+            .identifier_field_ids
+            .iter()
+            .flatten()
+            .all(|named| ids.contains(named))
+}
+
+/// Whether a `partition_spec` partitions the columns `column_ids` declares:
+/// every field naming a column of the schema, a transform an Iceberg table
+/// partitions by and a name of its own, and no column partitioned twice the
+/// same way. A spec with no field partitions nothing, which is the
+/// unpartitioned table every create that names no spec gets.
+fn partition_spec_is_creatable(
+    spec: &IcebergPartitionSpec,
+    column_ids: &::std::collections::BTreeSet<i32>,
+) -> bool {
+    spec.spec_id.is_none_or(|id| id >= 0)
+        && names_are_distinct(spec.fields.iter().map(|field| field.name.as_str()))
+        && keys_are_distinct(
+            spec.fields
+                .iter()
+                // A partition field is distinguished by its column and
+                // transform alone: it carries no direction or null order, so
+                // those halves of the key are the same for every one of them.
+                .map(|field| (field.source_id, field.transform.as_str(), "", "")),
+        )
+        && spec.fields.iter().all(|field| {
+            column_ids.contains(&field.source_id)
+                && transform_is_applicable(&field.transform)
+                && field.field_id.is_none_or(|id| id > 0)
+        })
+}
+
+/// Whether a `write_order` sorts the columns `column_ids` declares: every field
+/// naming a column of the schema and a transform an Iceberg table sorts by, no
+/// column sorted on twice the same way, and — for an order that names any field
+/// at all — an order id of its own, since Iceberg reserves order id zero for
+/// the unsorted order every table that is not sorted carries.
+fn sort_order_is_creatable(
+    write_order: &IcebergSortOrder,
+    column_ids: &::std::collections::BTreeSet<i32>,
+) -> bool {
+    if write_order.order_id < UNSORTED_ORDER_ID {
+        return false;
+    }
+    if write_order.fields.is_empty() {
+        return true;
+    }
+    write_order.order_id != UNSORTED_ORDER_ID
+        && keys_are_distinct(
+            write_order.fields.iter().map(|field| {
+                (
+                    field.source_id,
+                    field.transform.as_str(),
+                    field.direction.as_str(),
+                    field.null_order.as_str(),
+                )
+            }),
+        )
+        && write_order.fields.iter().all(|field| {
+            column_ids.contains(&field.source_id) && transform_is_applicable(&field.transform)
+        })
+}
+
+/// Whether `metadata` describes a table this service can create.
+///
+/// The document is the table's own metadata, so what makes it valid is whether
+/// it describes ONE table: one schema, columns with distinct names and ids and
+/// types an open table format has, and a partition spec and a sort order whose
+/// fields name columns that schema declares and transforms the format applies.
+/// A document that does not is refused before anything is written, so a table
+/// the service would never serve is never stored under the name the create
+/// asked for.
+fn metadata_describes_a_table(metadata: &TableMetadata) -> bool {
+    let TableMetadata::Iceberg(iceberg) = metadata;
+    // One table has one schema: a document stating both forms of it states two.
+    if iceberg.schema.is_some() && iceberg.schema_v2.is_some() {
+        return false;
+    }
+    if iceberg
+        .schema
+        .as_ref()
+        .is_some_and(|schema| !schema_is_creatable(schema))
+    {
+        return false;
+    }
+    if iceberg
+        .schema_v2
+        .as_ref()
+        .is_some_and(|schema| !schema_v2_is_creatable(schema))
+    {
+        return false;
+    }
+    // The columns a partition or sort field may name: those of the schema this
+    // document declares, as a SET — a field resolves against it in logarithmic
+    // time, so the work the whole document costs stays proportional to its own
+    // size rather than to the PRODUCT of two lists the request sizes. A document
+    // that declares no schema declares no column, so a field naming one cannot
+    // resolve.
+    let column_ids: ::std::collections::BTreeSet<i32> =
+        match (&iceberg.schema, &iceberg.schema_v2) {
+            (Some(schema), _) => referable_column_ids(schema),
+            (None, Some(schema)) => schema.fields.iter().map(|field| field.id).collect(),
+            (None, None) => ::std::collections::BTreeSet::new(),
+        };
+    if iceberg
+        .partition_spec
+        .as_ref()
+        .is_some_and(|spec| !partition_spec_is_creatable(spec, &column_ids))
+    {
+        return false;
+    }
+    if iceberg
+        .write_order
+        .as_ref()
+        .is_some_and(|order| !sort_order_is_creatable(order, &column_ids))
+    {
+        return false;
+    }
+    true
+}
+
 /// The `CreateTable` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -206,15 +539,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // `format` is a modeled enum, so a value outside it is refused at the
-        // boundary; reaching here with an unknown one would mean the model
-        // changed under us, and a table is never stored in a format this service
-        // cannot read back.
+        // boundary with this service's own sentence for that member; reaching
+        // here with an unknown one would mean the model changed under us, and a
+        // table is never stored in a format this service cannot read back.
         let format = OpenTableFormat::from_wire(&input.format).ok_or_else(|| {
-            bad_request(format!(
-                "The open table format {} is not supported.",
-                input.format
-            ))
+            bad_request(crate::state::INVALID_OPEN_TABLE_FORMAT_MESSAGE.to_string())
         })?;
+
+        // The metadata is the table's OWN description, and it is read before
+        // anything is looked up or written: a document that does not describe a
+        // table this service can create is the client request error the model's
+        // `BadRequestException` (HTTP 400) names, and it reserves no name — so
+        // the same request repeated is refused the same way rather than
+        // colliding with a table the first attempt should never have created.
+        if input
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| !metadata_describes_a_table(metadata))
+        {
+            return Err(bad_request(
+                crate::state::INVALID_METADATA_MESSAGE.to_string(),
+            ));
+        }
 
         // The table-level overrides of what the bucket configures, stored as the
         // caller asked for them.

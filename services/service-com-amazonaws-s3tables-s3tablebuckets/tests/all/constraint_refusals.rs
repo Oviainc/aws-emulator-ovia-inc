@@ -326,14 +326,20 @@ async fn a_refusal_this_service_states_no_sentence_for_still_carries_its_own_err
     // A member class with no fixed sentence of its own keeps the clause that
     // names the member and the requirement it broke — but the error type is
     // still this service's, because the type the framework would otherwise name
-    // is a shape this model does not declare.
+    // is a shape this model does not declare. (A table FORMAT outside its enum
+    // is not one of these: this service states its own sentence for that class,
+    // which `invalid_input_refusals.rs` pins.)
     let cases = [
         (
-            "a table format outside the modelled enum",
+            "a storage class outside the modelled enum",
             "PUT",
             format!("/tables/{}/resident", encode(&arn)),
-            Some(json!({ "name": "resident", "format": "PARQUET" })),
-            "format",
+            Some(json!({
+                "name": "resident",
+                "format": "ICEBERG",
+                "storageClassConfiguration": { "storageClass": "ULTRA" },
+            })),
+            "storageClass",
         ),
         (
             "a create missing the required table bucket name",
