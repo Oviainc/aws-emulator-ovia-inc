@@ -122,6 +122,10 @@ aws-credential-types = { workspace = true }
 # default is needed. Pinned EXACTLY: the parse shapes the module reads a refused
 # construct off are this version's.
 jsonata-rs = { version = "=0.3.4", default-features = false }
+# `injected_api_faults`: the per-call draw that decides whether a call falls in the share a
+# fault-injection action affects, taken from the maintained generator rather than from a
+# counter kept across calls.
+rand = "0.9"
 # The arena `jsonata-rs` allocates its parsed expression and its values into: one per
 # evaluation, dropped with it. Pinned EXACTLY for the same reason — the memory ceiling of
 # an evaluation is enforced through this crate's allocation limit.

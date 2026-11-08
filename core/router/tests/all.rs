@@ -23,6 +23,11 @@ mod cloudformation_fifo_resource_generated_names;
 #[path = "all/cloudformation_provisions_secrets_manager_secrets.rs"]
 mod cloudformation_provisions_secrets_manager_secrets;
 // Declared here, in this same head region, for the reason the entry above records: what a
+// RUNNING fault-injection experiment makes of the targeted role's calls to the service whose
+// API it names, which spans four services.
+#[path = "all/fis_injected_api_fault.rs"]
+mod fis_injected_api_fault;
+// Declared here, in this same head region, for the reason the entry above records: what a
 // deployed `AWS_IAM` method makes of the credential its request presents, on a router that
 // verifies request signatures.
 #[path = "all/apigateway_iam_authenticated_invoke.rs"]

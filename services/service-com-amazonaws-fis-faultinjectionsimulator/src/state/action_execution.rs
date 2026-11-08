@@ -76,6 +76,11 @@ pub const ACTION_ID_FIS_WAIT: &str = "aws:fis:wait";
 /// `ListTargetResourceTypes` publishes it: "An Amazon EC2 instance."
 pub const RESOURCE_TYPE_EC2_INSTANCE: &str = "aws:ec2:instance";
 
+/// The target resource type whose resources the API-fault actions act on, as that same
+/// listing publishes it: "An IAM role." — the principal whose calls a fault affects
+/// ([`super::api_fault_injection`]).
+pub const RESOURCE_TYPE_IAM_ROLE: &str = "aws:iam:role";
+
 /// The ARN vendor an EC2 resource ARN names, and the resource type an instance's ARN
 /// carries (`arn:aws:ec2:<region>:<account>:instance/<id>`) — read through the shared ARN
 /// reader rather than by cutting the string up here.
@@ -299,25 +304,59 @@ pub fn action_effect(
 /// The ids of the EC2 instances `action`'s targets resolved to, at most
 /// [`MAX_ACTION_EFFECT_RESOURCES`] of them, in the order the resolution reports them.
 ///
-/// Only an entry of the EC2 instance resource type contributes, and only through the ARN its
-/// `targetInformation` carries: a resolved entry of another type is another service's
-/// resource, and a value that is not an EC2 instance ARN names no instance at all. The ARN
-/// is read by [`::service_common::arn`], the shared reader, rather than by cutting the
-/// string up here.
+/// WHICH resolved entries the action is about is [`action_target_arns`]'s rule, shared with
+/// every other action that acts on what its targets resolved to; what this adds is the one
+/// reading of an ARN as an INSTANCE id: a value that is not an EC2 instance ARN names no
+/// instance at all, and the ARN is read by [`::service_common::arn`], the shared reader,
+/// rather than by cutting the string up here.
 fn action_instance_ids(
     action: &ExperimentTemplateAction,
     targets: &HashMap<String, ExperimentTarget>,
     resolved: &[ResolvedTarget],
 ) -> Vec<String> {
-    let named: BTreeMap<&str, &str> = action
-        .targets
-        .iter()
+    let arns = action_target_arns(
+        action.targets.as_ref(),
+        targets,
+        resolved,
+        RESOURCE_TYPE_EC2_INSTANCE,
+    );
+    arns.iter()
+        .filter(|arn| ::service_common::arn::is_resource_arn_of(arn, EC2_ARN_VENDOR))
+        .filter_map(|arn| {
+            ::service_common::arn::resource_id_of_type(arn, EC2_INSTANCE_ARN_RESOURCE)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// The ARNs of the `resource_type` resources an action's own targets resolved to, at most
+/// [`MAX_ACTION_EFFECT_RESOURCES`] of them, in the order the resolution reports them.
+///
+/// `action_targets` is the action's `targets` map — the target NAME it refers to under each
+/// of its own keys — which is the only part of an action this reading needs, so it serves an
+/// action held as a template's and one held as an experiment's alike.
+///
+/// The ONE reading of "which resources is this action about" in this service, so the
+/// instances a reboot acts on ([`action_instance_ids`]) and the roles an API fault affects
+/// ([`super::api_fault_injection`]) are selected by the same rule: an entry contributes only
+/// when the action named its target, the entry is of the resource type the action acts on,
+/// and the entry carries the ARN its `targetInformation` reports — so an action acts on
+/// exactly what `ListExperimentResolvedTargets` told the client it would act on.
+pub fn action_target_arns(
+    action_targets: Option<&HashMap<String, String>>,
+    targets: &HashMap<String, ExperimentTarget>,
+    resolved: &[ResolvedTarget],
+    resource_type: &str,
+) -> Vec<String> {
+    let named: BTreeMap<&str, &str> = action_targets
+        .into_iter()
         .flatten()
         .map(|(key, name)| (key.as_str(), name.as_str()))
         .collect();
-    let mut ids: Vec<String> = Vec::new();
+    let mut arns: Vec<String> = Vec::new();
     for entry in resolved {
-        if ids.len() >= MAX_ACTION_EFFECT_RESOURCES {
+        if arns.len() >= MAX_ACTION_EFFECT_RESOURCES {
             break;
         }
         let Some(target_name) = entry.target_name.as_deref() else {
@@ -327,31 +366,25 @@ fn action_instance_ids(
             continue;
         }
         // The resource type the entry carries is the TARGET's, so a target of another type
-        // under an instance action's key contributes nothing.
-        let resource_type = entry
+        // under this action's key contributes nothing.
+        let entry_type = entry
             .resource_type
             .as_deref()
             .or_else(|| targets.get(target_name)?.resource_type.as_deref());
-        if resource_type != Some(RESOURCE_TYPE_EC2_INSTANCE) {
+        if entry_type != Some(resource_type) {
             continue;
         }
         let Some(arn) = entry
             .target_information
             .as_ref()
             .and_then(|information| information.get(TARGET_INFORMATION_ARN_KEY))
+            .filter(|arn| !arn.is_empty())
         else {
             continue;
         };
-        if !::service_common::arn::is_resource_arn_of(arn, EC2_ARN_VENDOR) {
-            continue;
-        }
-        let instance_id = ::service_common::arn::resource_id_of_type(arn, EC2_INSTANCE_ARN_RESOURCE)
-            .filter(|id| !id.is_empty());
-        if let Some(instance_id) = instance_id {
-            ids.push(instance_id.to_string());
-        }
+        arns.push(arn.clone());
     }
-    ids
+    arns
 }
 
 impl ExperimentRecord {
@@ -495,7 +528,7 @@ pub fn carry_out_action_effects<Eng: Send + Sync + 'static>(
 }
 
 /// Carry out every action effect the clock has made due at `now`, for every experiment this
-/// store holds.
+/// store holds, and publish what its running actions INJECT into another service's API.
 ///
 /// The one call a reporting operation makes for this: it settles the experiments (the settle
 /// is what reaches an action and makes its effect due), takes the effects off the records
@@ -506,6 +539,10 @@ pub fn carry_out_action_effects<Eng: Send + Sync + 'static>(
 /// the run reached was carried out at that instant whether or not anybody polled, which is
 /// exactly why a client that starts an experiment and then waits for it finds the fault
 /// injected.
+///
+/// The API faults go the same way, as the whole live set of each experiment's leases
+/// ([`super::api_fault_injection`]): an action that is running has its fault published where
+/// the affected service reads it, and one the run has left behind has it withdrawn.
 pub fn materialise_action_effects<Eng: Send + Sync + 'static>(engine: &Eng, now: SystemTime) {
     let Some(state) = super::service_state(engine) else {
         return;
@@ -514,10 +551,16 @@ pub fn materialise_action_effects<Eng: Send + Sync + 'static>(engine: &Eng, now:
     // CloudWatch store before this store's guard is taken, exactly as every other operation
     // that settles reads them ([`super::stop_conditions`]).
     let breaches = super::stop_conditions::AlarmBreaches::read(engine);
-    let effects = {
+    let (effects, injections) = {
         let mut store = state.lock();
         store.settle_experiments(now, &breaches);
-        store.take_pending_action_effects()
+        (
+            store.take_pending_action_effects(),
+            store.live_api_fault_leases(),
+        )
     };
     carry_out_action_effects(engine, &effects, now);
+    for (experiment_id, leases) in injections {
+        super::api_fault_injection::publish_api_faults(engine, &experiment_id, leases, now);
+    }
 }

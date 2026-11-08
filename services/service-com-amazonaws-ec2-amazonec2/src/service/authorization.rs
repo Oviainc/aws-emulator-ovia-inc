@@ -192,6 +192,22 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     Ok(())
 }
 
+/// Every spelling of the principal this request speaks for: the session ARN
+/// `sts:GetCallerIdentity` reports, and the ARN of the IAM role behind an assumed-role
+/// session.
+///
+/// The SAME resolution the authorization gate decides on ([`caller`]), so the principal a
+/// refusal blames and the principal a fault injected against a role affects
+/// ([`super::injected_faults`]) are one answer and not two: a request signed with a session
+/// of a role is the role's request for both questions. Empty for a credential that speaks
+/// for nobody.
+pub fn request_principals<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+) -> Vec<String> {
+    caller(engine, ctx).principals
+}
+
 /// The principal a request speaks for, and everything the decision is made from.
 #[derive(Debug, Clone)]
 struct Caller {

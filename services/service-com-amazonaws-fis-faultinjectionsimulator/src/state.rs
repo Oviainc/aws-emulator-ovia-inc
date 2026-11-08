@@ -165,6 +165,9 @@ use crate::ops::types::{
 pub mod action_execution;
 pub mod action_permissions;
 pub mod action_progress;
+/// The API faults a RUNNING experiment imposes on another service's API, published where
+/// that service reads them ([`api_fault_injection`]).
+pub mod api_fault_injection;
 pub mod experiment_logs;
 pub mod stop_conditions;
 mod catalog;
@@ -172,6 +175,7 @@ mod experiment_reports;
 mod template_validation;
 pub use action_execution::*;
 pub use action_progress::*;
+pub use api_fault_injection::*;
 pub use template_validation::*;
 pub use experiment_reports::*;
 pub use catalog::*;

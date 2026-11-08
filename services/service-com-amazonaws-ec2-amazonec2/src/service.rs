@@ -73,6 +73,12 @@ use std::sync::Arc;
 /// operation's input.
 pub mod authorization;
 
+/// The fault a RUNNING fault-injection experiment imposes on this service's API: the
+/// decision [`FinishedEnvelope::run`] takes beside the authorization gate, because it is a
+/// fact of the request's CREDENTIAL and of the instant it arrived rather than of any one
+/// operation's input.
+pub mod injected_faults;
+
 /// The `com-amazonaws-ec2-amazonec2` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -737,6 +743,16 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for FinishedEnvelope<Eng> {
                 stamp_envelope(&mut response);
                 return response;
             }
+            // The fault-injection gate, for the same reason: whether a running experiment
+            // has made this caller's calls to this operation fail is a fact of the
+            // CREDENTIAL the request presented and of the instant it arrived, not of the
+            // input the operation reads ([`injected_faults::injected_fault`]). It is asked
+            // after the gate above, so a call the caller may not make at all is refused as
+            // such and an injected fault fails a call it could otherwise have made.
+            if let Some(mut response) = injected_fault_response(&*self.engine, svc, req, ctx) {
+                stamp_envelope(&mut response);
+                return response;
+            }
             let mut response = match modeled_operation(svc, req) {
                 Some(operation) => operation.run(svc, req, ctx).await,
                 // `override_operation` claims a request only for a routing key the table
@@ -823,6 +839,37 @@ fn authorization_refusal<Eng: Send + Sync + 'static>(
             code: crate::state::UNAUTHORIZED_OPERATION.to_string(),
             message: refusal.message(),
         }),
+    ))
+}
+
+/// The failure a RUNNING fault-injection experiment imposes on this request, or `None` when
+/// no such experiment is injecting one into this caller's calls to this operation
+/// ([`injected_faults::injected_fault`]).
+///
+/// The status, the code and the message are the FAULT's, stated by the action that injects it
+/// and carried through unchanged — the whole point of the injection being that a client's
+/// retry path sees that failure. The envelope is this service's own, written through the
+/// framework's ec2Query error body so an injected failure is shaped exactly like every other
+/// error of this service, and closed by [`stamp_envelope`] with the same media type and
+/// `<RequestID>`.
+///
+/// The operation asked about is the operation's own name, taken from the request's routing key
+/// and only when the routing table SERVES that key: so a request naming no operation of this
+/// service reaches the routing failure rather than a fault aimed at a name nothing serves.
+fn injected_fault_response<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    svc: &dyn Service,
+    req: &RtRequest,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+) -> Option<RtResponse> {
+    let operation = svc.definition().protocol().routing_key(req).ok()?;
+    svc.definition().routing_table().get(operation)?;
+    let fault = injected_faults::injected_fault(engine, ctx, operation)?;
+    let body = ::aws_smithy_schema_server::query_error_body(true, &fault.code, &fault.message);
+    let status = ::aws_smithy_runtime_api::http::StatusCode::try_from(fault.status).ok()?;
+    Some(RtResponse::new(
+        status,
+        ::aws_smithy_types::body::SdkBody::from(body),
     ))
 }
 

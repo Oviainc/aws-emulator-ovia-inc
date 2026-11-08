@@ -357,6 +357,11 @@ pub mod iam_authorization;
 /// `@pattern` cannot decide, since Smithy's `@pattern` is a find and that pattern's
 /// alternation is anchored on one side only.
 pub mod iam_entity_path;
+/// The faults a RUNNING fault-injection experiment imposes on another service's API — who
+/// they affect, which operations of which service, what share of the calls and for how long
+/// — held once in the shared engine, so the service that runs the experiment and the service
+/// whose API it affects read ONE set of them.
+pub mod injected_api_faults;
 /// The ONE reading of a data-plane connection whose ENCRYPTION is negotiated IN BAND: the
 /// first byte that tells a TLS record from a request in the clear, and the replay of that
 /// byte to whoever reads the stream next — for every service that serves one announced
