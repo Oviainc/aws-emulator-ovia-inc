@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! End-to-end HTTP tests for `ListComponents`.
+//! End-to-end HTTP tests for `ListComponents` and `ListComponentBuildVersions`.
 //!
 //! Every case drives the real wire path — the production `MultiServiceRouter`,
 //! restJson1 serialization, the modelled-constraint walk and the handlers — so what is
@@ -18,6 +18,11 @@
 //! versions a version holds, how many versions a name holds, the Region, which member a
 //! filter names, how many values it carries, whether the version it names is exact or
 //! carries wildcard nodes, and the page size the request asks for.
+//!
+//! `ListComponentBuildVersions` is the listing BELOW that one: it reports one entry per
+//! stored BUILD version of the component version its ARN names — of every component the
+//! account owns in the calling Region when it names none — so the two listings are tested
+//! against the same stored components and differ only in what one entry stands for.
 
 use std::sync::Arc;
 
@@ -789,6 +794,256 @@ async fn a_listing_pages_through_what_it_selected_under_a_token_of_its_own() {
         } else {
             list_components(&router, &body).await
         };
+        assert_refused(case, status, &refused, 400, "InvalidPaginationTokenException");
+    }
+}
+
+/// `ListComponentBuildVersions` with `body`, in `region`.
+async fn list_build_versions_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    body: &Value,
+) -> (u16, Value) {
+    call_in(
+        router,
+        region,
+        "POST",
+        "/ListComponentBuildVersions",
+        Some(body),
+    )
+    .await
+}
+
+/// `ListComponentBuildVersions` with `body`, in [`REGION`].
+async fn list_build_versions(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+    list_build_versions_in(router, REGION, body).await
+}
+
+/// The ARNs one build-version listing page reports, in the order it reported them.
+fn summary_arns(case: &str, body: &Value) -> Vec<String> {
+    body.get("componentSummaryList")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("case {case:?}: expected a componentSummaryList in {body}"))
+        .iter()
+        .map(|entry| {
+            entry
+                .get("arn")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| panic!("case {case:?}: expected an arn in {entry}"))
+                .to_string()
+        })
+        .collect()
+}
+
+/// RULE: a build-version listing reports one entry per stored BUILD version of the
+/// component version its ARN names — of every component of the calling Region when it
+/// names none — and nothing of another Region.
+#[tokio::test]
+async fn a_build_version_listing_reports_one_entry_per_stored_build_version() {
+    let router = emulator();
+    stored_components(&router).await;
+
+    let every_build = vec![
+        build_version_arn(REGION, "alpha-component", "1.0.0", 1),
+        build_version_arn(REGION, "alpha-component", "1.0.0", 2),
+        build_version_arn(REGION, "alpha-component", "1.1.0", 1),
+        build_version_arn(REGION, "alpha-component", "2.0.0", 1),
+        build_version_arn(REGION, "beta-component", "1.0.0", 1),
+    ];
+
+    // The rows differ along how many build versions the named version holds, whether the
+    // request names a version at all, and which Region's endpoint served it.
+    let cases: Vec<(&str, &str, Value, Vec<String>)> = vec![
+        (
+            "a version holding two build versions",
+            REGION,
+            json!({"componentVersionArn": listed_arn(REGION, "alpha-component", "1.0.0")}),
+            vec![
+                build_version_arn(REGION, "alpha-component", "1.0.0", 1),
+                build_version_arn(REGION, "alpha-component", "1.0.0", 2),
+            ],
+        ),
+        (
+            "a version holding one build version",
+            REGION,
+            json!({"componentVersionArn": listed_arn(REGION, "alpha-component", "1.1.0")}),
+            vec![build_version_arn(REGION, "alpha-component", "1.1.0", 1)],
+        ),
+        (
+            "a version of the other name",
+            REGION,
+            json!({"componentVersionArn": listed_arn(REGION, "beta-component", "1.0.0")}),
+            vec![build_version_arn(REGION, "beta-component", "1.0.0", 1)],
+        ),
+        (
+            "a version nothing was stored under",
+            REGION,
+            json!({"componentVersionArn": listed_arn(REGION, "alpha-component", "9.9.9")}),
+            Vec::new(),
+        ),
+        (
+            "a name nothing was stored under",
+            REGION,
+            json!({"componentVersionArn": listed_arn(REGION, "absent-component", "1.0.0")}),
+            Vec::new(),
+        ),
+        (
+            "no ARN at all, which asks about every component this account owns",
+            REGION,
+            json!({}),
+            every_build.clone(),
+        ),
+        (
+            "a version of this Region, through the other Region's endpoint",
+            OTHER_REGION,
+            json!({"componentVersionArn": listed_arn(REGION, "alpha-component", "1.0.0")}),
+            Vec::new(),
+        ),
+        (
+            "no ARN at all, through the other Region's endpoint",
+            OTHER_REGION,
+            json!({}),
+            vec![build_version_arn(OTHER_REGION, "gamma-component", "1.0.0", 1)],
+        ),
+    ];
+
+    for (case, region, body, want) in cases {
+        let (status, listed) = list_build_versions_in(&router, region, &body).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200, got {status} with {listed}"
+        );
+        let arns = summary_arns(case, &listed);
+        assert_eq!(arns, want, "case {case:?}: expected {want:?}, got {arns:?}");
+    }
+
+    // One entry, member for member: a summary of the stored build version it stands for.
+    let case = "the second build version of alpha-component 1.0.0";
+    let (_, listed) = list_build_versions(
+        &router,
+        &json!({"componentVersionArn": listed_arn(REGION, "alpha-component", "1.0.0")}),
+    )
+    .await;
+    let entry = listed
+        .get("componentSummaryList")
+        .and_then(Value::as_array)
+        .and_then(|entries| entries.get(1))
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a second entry in {listed}"));
+    for (name, expected) in [
+        ("name", json!("alpha-component")),
+        ("version", json!("1.0.0")),
+        ("platform", json!("Linux")),
+        ("type", json!("BUILD")),
+        ("owner", json!(ACCOUNT)),
+        ("description", json!("the second build")),
+        ("state", json!({"status": "ACTIVE"})),
+        ("obfuscate", json!(false)),
+    ] {
+        assert_member(case, &entry, name, &expected);
+    }
+    assert_instant(case, &entry, "dateCreated");
+}
+
+/// RULE: a build-version listing pages through what it selected under a token issued for
+/// that listing and that query, and nothing else.
+#[tokio::test]
+async fn a_build_version_listing_pages_under_a_token_of_its_own() {
+    let router = emulator();
+    stored_components(&router).await;
+
+    let every_build = vec![
+        build_version_arn(REGION, "alpha-component", "1.0.0", 1),
+        build_version_arn(REGION, "alpha-component", "1.0.0", 2),
+        build_version_arn(REGION, "alpha-component", "1.1.0", 1),
+        build_version_arn(REGION, "alpha-component", "2.0.0", 1),
+        build_version_arn(REGION, "beta-component", "1.0.0", 1),
+    ];
+
+    // The walks differ along the page size, including one larger than the listing itself.
+    for page_size in [1_usize, 2, 4, 25] {
+        let case = format!("{page_size} entries per page");
+        let mut walked: Vec<String> = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut body = Map::new();
+            body.insert("maxResults".to_string(), json!(page_size));
+            if let Some(token) = &token {
+                body.insert("nextToken".to_string(), json!(token));
+            }
+            let (status, page) = list_build_versions(&router, &Value::Object(body)).await;
+            assert_eq!(
+                status, 200,
+                "case {case:?}: expected HTTP 200, got {status} with {page}"
+            );
+            let arns = summary_arns(&case, &page);
+            assert!(
+                arns.len() <= page_size,
+                "case {case:?}: expected at most {page_size} entries, got {arns:?}"
+            );
+            walked.extend(arns);
+            token = page
+                .get("nextToken")
+                .and_then(Value::as_str)
+                .map(str::to_string);
+            let expects_token = walked.len() < every_build.len();
+            assert_eq!(
+                token.is_some(),
+                expects_token,
+                "case {case:?}: expected a nextToken={expects_token} after {} entries, got {page}",
+                walked.len()
+            );
+            if token.is_none() {
+                break;
+            }
+        }
+        assert_eq!(
+            walked, every_build,
+            "case {case:?}: expected {every_build:?}, got {walked:?}"
+        );
+    }
+
+    // A token this service did not issue for THIS listing and query is refused.
+    let (_, first_page) = list_build_versions(&router, &json!({"maxResults": 1})).await;
+    let issued = first_page
+        .get("nextToken")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let (_, components_page) = list_components(&router, &json!({"maxResults": 1})).await;
+    let from_components = components_page
+        .get("nextToken")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let tokens: Vec<(&str, &str, Value)> = vec![
+        (
+            "a fabricated token",
+            REGION,
+            json!({"nextToken": "not-a-token", "maxResults": 1}),
+        ),
+        (
+            "a token issued for the unfiltered listing, spent on one naming a version",
+            REGION,
+            json!({
+                "nextToken": issued.clone(),
+                "maxResults": 1,
+                "componentVersionArn": listed_arn(REGION, "alpha-component", "1.0.0"),
+            }),
+        ),
+        (
+            "a token issued in one Region, spent in another",
+            OTHER_REGION,
+            json!({"nextToken": issued, "maxResults": 1}),
+        ),
+        (
+            "a token issued by the component listing, spent on the build-version listing",
+            REGION,
+            json!({"nextToken": from_components, "maxResults": 1}),
+        ),
+    ];
+    for (case, region, body) in tokens {
+        let (status, refused) = list_build_versions_in(&router, region, &body).await;
         assert_refused(case, status, &refused, 400, "InvalidPaginationTokenException");
     }
 }

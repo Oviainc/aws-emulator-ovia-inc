@@ -1079,8 +1079,13 @@ async fn a_create_refuses_what_it_cannot_resolve() {
                 &answer,
                 400,
                 "ResourceAlreadyExistsException",
-                "An image pipeline named refusal taken already exists in this Amazon Web Services \
-                 Region.",
+                // The refusal names the LABEL AWS gives this kind — a `Pipeline`, not the
+                // `ImagePipeline` its ARN spells — and the ARN of the pipeline that already
+                // carries the normalized name.
+                &format!(
+                    "The following resource 'Pipeline' already exists: \
+                     'arn:aws:imagebuilder:{REGION}:{ACCOUNT}:image-pipeline/refusal-taken'."
+                ),
             );
         }
     }

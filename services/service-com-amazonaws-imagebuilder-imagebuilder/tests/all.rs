@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/arn_parameter_refusals.rs"]
 mod arn_parameter_refusals;
+#[path = "all/component_document_sources.rs"]
+mod component_document_sources;
 #[path = "all/component_image_recipe.rs"]
 mod component_image_recipe;
 #[path = "all/component_listing.rs"]

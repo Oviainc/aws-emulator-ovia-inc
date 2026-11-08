@@ -351,7 +351,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreateInfrastructureConfigurationErrorModeled::ResourceAlreadyExistsException(
                     ResourceAlreadyExistsException {
                         message: Some(
-                            crate::state::infrastructure_configuration_exists_message(&input.name),
+                            crate::state::infrastructure_configuration_exists_message(),
                         ),
                     },
                 )

@@ -22,7 +22,8 @@
 //! * the response carries the wildcard version ARNs the created recipe is reached by
 //!   ([`crate::state::latest_version_references`]);
 //! * the ARN is derived from a NORMALIZED form of the name plus the version, so a second
-//!   create of one name+version pair is `ResourceAlreadyExistsException`;
+//!   create of one name+version pair is `ResourceAlreadyExistsException`, naming the
+//!   recipe that already carries that ARN;
 //! * `clientToken` is an idempotency token: a retry carrying it answers with the
 //!   ORIGINAL response, and the same token carrying different creation parameters is
 //!   `IdempotentParameterMismatchException`;
@@ -357,10 +358,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateImageRecipeErrorModeled::ResourceAlreadyExistsException(
                     ResourceAlreadyExistsException {
-                        message: Some(crate::state::image_recipe_exists_message(
-                            &input.name,
-                            &input.semantic_version,
-                        )),
+                        message: Some(crate::state::resource_already_exists_message(&arn)),
                     },
                 )
                 .into(),

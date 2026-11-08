@@ -77,9 +77,12 @@
 //! resource's own ARN
 //! ([`ComAmazonawsImagebuilderImagebuilderState::resource_policies`]): every policy pair
 //! in this model names its resource by that ARN and carries nothing but the document, a
-//! write REPLACES the document the matching read then reports verbatim, and a resource no
+//! write REPLACES the document the matching read then reports, and a resource no
 //! policy was ever applied to has no entry at all — which a read reports as
-//! [`UNSET_RESOURCE_POLICY`] rather than as a missing resource.
+//! [`UNSET_RESOURCE_POLICY`] rather than as a missing resource. What is stored is this
+//! store's own rendering of the submitted document
+//! ([`ComAmazonawsImagebuilderImagebuilderState::put_resource_policy`]), so a read reports
+//! the policy as this service holds it.
 //!
 //! `clientToken` is an idempotency token: a repeat of a request that already
 //! succeeded answers with the ORIGINAL response, and the same token carrying
@@ -91,10 +94,15 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
+/// Where a component document named by `uri` is read from: the object the emulator's own
+/// Amazon S3 holds at that address.
+mod component_document_object;
+pub use component_document_object::*;
+
 use crate::ops::types::{
     AdditionalInstanceConfiguration, AmiDistributionConfiguration, Component,
     ComponentConfiguration, ComponentParameterDetail,
-    ComponentState, ComponentVersion, CreateComponentInput,
+    ComponentState, ComponentSummary, ComponentVersion, CreateComponentInput,
     CreateDistributionConfigurationInput, CreateImageInput,
     CreateImagePipelineInput, CreateImageRecipeInput,
     CreateInfrastructureConfigurationInput, Distribution, DistributionConfiguration, Filter,
@@ -185,6 +193,9 @@ pub const LIST_IMAGE_BUILD_VERSIONS_OPERATION: &str = "ListImageBuildVersions";
 /// See [`LIST_IMAGE_RECIPES_OPERATION`].
 pub const LIST_COMPONENTS_OPERATION: &str = "ListComponents";
 
+/// See [`LIST_IMAGE_RECIPES_OPERATION`].
+pub const LIST_COMPONENT_BUILD_VERSIONS_OPERATION: &str = "ListComponentBuildVersions";
+
 /// How many nodes of a semantic version a caller assigns.
 ///
 /// From `semanticVersion`'s own documentation, which `CreateComponent` and
@@ -221,10 +232,6 @@ pub const COMPONENT_TYPE_TEST: &str = "TEST";
 /// member: "Image Builder encrypts all component data at rest, so this value is always
 /// true. This field is retained for backward compatibility."
 pub const COMPONENT_DATA_ENCRYPTED: bool = true;
-
-/// The scheme a component document URI must carry, from `CreateComponent`'s `uri`: "This
-/// must be an S3 URL (s3://bucket/key)".
-pub const COMPONENT_URI_SCHEME: &str = "s3://";
 
 /// The platform of a parent image whose reference names Windows, from the modelled
 /// `Platform` enum (`Windows | Linux | macOS`).
@@ -642,9 +649,11 @@ pub struct ComponentRecord {
     /// The account that owns it — "The value is your account ID for components that you
     /// own" (the modelled `owner` member).
     pub owner: String,
-    /// The inline document the create carried, when it carried one.
+    /// The document this component carries: the inline `data` the create carried, or the
+    /// one-time snapshot fetched from the `uri` it named instead.
     pub data: Option<String>,
-    /// The document URI the create carried instead, when it carried one.
+    /// The document URI the create carried instead of an inline document, when it carried
+    /// one. The document itself was fetched from it at create time and lives in `data`.
     pub uri: Option<String>,
     pub kms_key_id: Option<String>,
     /// The parameters the document declared, derived from it at create time.
@@ -745,6 +754,34 @@ impl ComponentRecord {
             // See [`Self::view`]: a component a caller created here carries no Marketplace
             // product codes.
             product_codes: None,
+        }
+    }
+
+    /// This record as the modelled `ComponentSummary` a build-version listing reports: "A
+    /// high-level summary of a component", one per BUILD version, so the ARN it carries is
+    /// the build version's own.
+    #[must_use]
+    pub fn build_summary(&self) -> ComponentSummary {
+        ComponentSummary {
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            version: Some(self.version.clone()),
+            platform: Some(self.platform.clone()),
+            supported_os_versions: self.supported_os_versions.clone(),
+            state: Some(ComponentState {
+                status: Some(COMPONENT_STATUS_ACTIVE.to_string()),
+                reason: None,
+            }),
+            r#type: Some(self.component_type.clone()),
+            owner: Some(self.owner.clone()),
+            description: self.description.clone(),
+            change_description: self.change_description.clone(),
+            date_created: Some(self.date_created.clone()),
+            tags: Some(reported_tags(self.tags.as_ref())),
+            // See [`Self::view`]: a component a caller created here is neither third-party
+            // nor hidden from view.
+            publisher: None,
+            obfuscate: false,
         }
     }
 
@@ -1753,10 +1790,21 @@ impl ComAmazonawsImagebuilderImagebuilderState {
     /// Apply `policy` to the resource `arn` names, replacing whatever policy it carried.
     ///
     /// A policy write is a REPLACEMENT, not a merge: the document stored here is the
-    /// document the matching read reports back, verbatim.
+    /// document the matching read reports back. What is stored is this store's own
+    /// RENDERING of the submitted document rather than the submitted bytes — the
+    /// whitespace between its JSON tokens dropped, and a principal value given as a
+    /// one-element array of one string written as that string
+    /// (`service_common::iam_policy_rendering`), which is the form a read of this service
+    /// reports. Every other element keeps the form the caller wrote, an `Action` list
+    /// included.
     pub fn put_resource_policy(&mut self, arn: &str, policy: &str) {
-        self.resource_policies
-            .insert(arn.to_string(), policy.to_string());
+        self.resource_policies.insert(
+            arn.to_string(),
+            ::service_common::iam_policy_rendering::rendered_collapsing(
+                policy,
+                &::service_common::iam_policy_rendering::PRINCIPAL_ELEMENTS,
+            ),
+        );
     }
 
     /// Whether the store is already holding as many image recipes as this emulator will
@@ -2335,6 +2383,10 @@ const PARAMETER_TYPE_KEY: &str = "type";
 const PARAMETER_DEFAULT_KEY: &str = "default";
 const PARAMETER_DESCRIPTION_KEY: &str = "description";
 
+/// The requirement clause a document declaring no phases is refused with: fixed text for
+/// this class, naming the key the document left out.
+const MISSING_PHASES_REQUIREMENT: &str = "Missing phases.";
+
 /// What a component document declares: everything a stored component derives from it.
 #[derive(Debug, Clone)]
 pub struct ComponentDocument {
@@ -2346,9 +2398,10 @@ pub struct ComponentDocument {
     pub parameters: Option<Vec<ComponentParameterDetail>>,
 }
 
-/// What `data` declares, or why it is not a component document.
+/// What a submitted component document declares, or why it is not a component document.
 ///
-/// The `Err` is the wording the refusal carries: this service's own statement of what a
+/// The `Err` is the REQUIREMENT CLAUSE the refusal states ([`component_document_message`]):
+/// this service's own statement of what a
 /// component document has to be, never the parser's diagnostic text, so the message one
 /// malformed document earns does not depend on which reader read it. The document is
 /// bounded before it is parsed: the modelled `data` member is `len 1..16000`, which the
@@ -2382,6 +2435,12 @@ pub fn parse_component_document(data: &str) -> Result<ComponentDocument, String>
         .and_then(::yaml_rust2::Yaml::as_vec)
         .map(Vec::as_slice)
         .unwrap_or_default();
+    // A component document is the work Image Builder runs, and the phases are that work:
+    // a document that declares none describes nothing to build, test or validate, so it is
+    // not a document this service can accept. The clause is fixed text for this class.
+    if phases.is_empty() {
+        return Err(MISSING_PHASES_REQUIREMENT.to_string());
+    }
     let only_test_phase = phases.len() == 1
         && phases.iter().all(|phase| {
             phase
@@ -2674,6 +2733,16 @@ pub fn component_query_fingerprint(
         text(Some(owner.unwrap_or(OWNERSHIP_SELF))),
         filter_list(filters)
     )
+}
+
+/// A deterministic rendering of which build versions one `ListComponentBuildVersions`
+/// request asked for, so a token issued for one query is refused for another.
+///
+/// `maxResults` is deliberately NOT part of it, for the reason
+/// [`image_recipe_query_fingerprint`] states.
+#[must_use]
+pub fn component_build_version_query_fingerprint(component_version_arn: Option<&str>) -> String {
+    format!("componentVersionArn={};", text(component_version_arn))
 }
 
 /// A deterministic rendering of which build versions one `ListImageBuildVersions`
@@ -3538,23 +3607,49 @@ pub fn reserved_resource_tag_key_message(key: &str) -> String {
     format!("The resourceTags key {key} is reserved and can't be assigned.")
 }
 
-/// Why a create whose name is already taken in this Region is refused.
+/// Why a create of a resource this Region already holds is refused.
+///
+/// Names the resource LABEL AWS gives the kind the create would have minted and the ARN of
+/// the resource that already carries it, read from this service's own store — the identity a
+/// caller needs in order to take the already-exists path, and nothing else about that
+/// resource. The label is the kind the ARN itself names ([`already_exists_label`]), so one
+/// wording serves every create whose recorded refusal states the ARN.
 #[must_use]
-pub fn infrastructure_configuration_exists_message(name: &str) -> String {
-    format!(
-        "An infrastructure configuration named {name} already exists in this Amazon Web Services \
-         Region."
-    )
+pub fn resource_already_exists_message(arn: &str) -> String {
+    let resource_label = already_exists_label(arn);
+    format!("The following resource '{resource_label}' already exists: '{arn}'.")
 }
 
-/// Why a create whose distribution-configuration name is already taken in this Region is
-/// refused.
+/// The resource LABEL an already-exists refusal names a resource kind by.
+///
+/// Mostly the kind the ARN itself names, in the upper camel case this model's shape names use
+/// ([`arn_resource_type`]). One kind is labelled differently from its ARN: an
+/// `image-pipeline` is labelled `Pipeline`, which is what a recorded refusal of
+/// `CreateImagePipeline` carries.
 #[must_use]
-pub fn distribution_configuration_exists_message(name: &str) -> String {
-    format!(
-        "A distribution configuration named {name} already exists in this Amazon Web Services \
-         Region."
-    )
+fn already_exists_label(arn: &str) -> String {
+    match ::service_common::arn::resource_type(arn) {
+        Some(IMAGE_PIPELINE_RESOURCE_TYPE) => IMAGE_PIPELINE_RESOURCE_LABEL.to_string(),
+        _ => arn_resource_type(arn),
+    }
+}
+
+/// The resource type an image-pipeline ARN carries, as the resource field spells it
+/// ([`IMAGE_PIPELINE_ARN_PREFIX`] without its separator).
+const IMAGE_PIPELINE_RESOURCE_TYPE: &str = "image-pipeline";
+
+/// The label a refusal gives that kind, which is not the kind its ARN names.
+const IMAGE_PIPELINE_RESOURCE_LABEL: &str = "Pipeline";
+
+/// Why a create whose infrastructure-configuration name is already taken in this Region is
+/// refused.
+///
+/// The one create of this service whose recorded already-exists refusal states no ARN and
+/// names no resource: the whole sentence is fixed text, so nothing of the request or of the
+/// existing configuration appears in it.
+#[must_use]
+pub fn infrastructure_configuration_exists_message() -> String {
+    "The resource already exists.".to_string()
 }
 
 /// Why a create whose distributions name one Region twice is refused.
@@ -3670,38 +3765,73 @@ pub fn component_data_or_uri_message() -> String {
 }
 
 /// The member a component document rides in inline, as the API spells it.
-const COMPONENT_DATA_MEMBER: &str = "data";
+pub const COMPONENT_DATA_MEMBER: &str = "data";
 
 /// The member a component document's location rides in, as the API spells it.
-const COMPONENT_URI_MEMBER: &str = "uri";
+pub const COMPONENT_URI_MEMBER: &str = "uri";
 
 /// Why a `CreateComponent` naming a URI that is not an S3 URL is refused.
 ///
-/// From the `uri` member's own documentation: "This must be an S3 URL (s3://bucket/key)".
+/// From the `uri` member's own documentation: "This must be an S3 URL (s3://bucket/key)" —
+/// a requirement on that member's VALUE, so it is stated as this service states every
+/// parameter whose value it refuses.
 #[must_use]
-pub fn component_uri_message(uri: &str) -> String {
-    format!("The uri {uri} is not valid. A component document uri must be an S3 URL (s3://bucket/key).")
+pub fn component_uri_message() -> String {
+    ::service_common::validation_message::parameter_value_mismatch(
+        COMPONENT_URI_MEMBER,
+        "uri must be an S3 URL (s3://bucket/key)",
+    )
 }
 
-/// Why a `CreateComponent` repeating the latest build version's content is refused.
+/// Why a `CreateComponent` naming a URI the object store serves no object at is refused.
 ///
-/// The rule is `CreateComponent`'s `name` member: a repeat of a name+version pair "creates
-/// a new build version for it. If the content is also identical to the latest build
-/// version, the request fails because the component already exists." `CreateComponent` is
-/// the one create in this model that declares no `ResourceAlreadyExistsException` — its
-/// sibling `CreateImageRecipe` does — so the already-exists condition of a component is
-/// reported under the resource-state error it DOES declare,
-/// `ResourceInUseException` (HTTP 400), with the message naming the build version that
-/// already holds this content.
+/// Image Builder fetches the document itself at create time, so a `uri` naming no object is
+/// a value of that member this service cannot accept, stated in the same sentence as every
+/// other refused parameter with the clause this class carries.
 #[must_use]
-pub fn component_already_exists_message(arn: &str) -> String {
-    format!("The component {arn} already exists with identical content.")
+pub fn component_uri_not_found_message() -> String {
+    ::service_common::validation_message::parameter_value_mismatch(
+        COMPONENT_URI_MEMBER,
+        COMPONENT_URI_NOT_FOUND_REQUIREMENT,
+    )
 }
 
-/// Why a delete of a component a stored recipe still includes is refused.
+/// The requirement clause a `uri` the object store serves no object at is refused with.
+const COMPONENT_URI_NOT_FOUND_REQUIREMENT: &str = "Not Found";
+
+/// Why a `CreateComponent` whose document this service could not read at all is answered
+/// with a server-side failure.
+///
+/// Nothing was established about the object the `uri` named — no object store answered the
+/// read — so this is not a claim about the value the request carried, and the message is the
+/// one the modelled `ServiceException` states for its own class: "An internal server error
+/// occurred while Image Builder processed the request. Retrying the request may succeed."
 #[must_use]
-pub fn component_in_use_message(arn: &str, recipe_arn: &str) -> String {
-    format!("The component {arn} can't be deleted because the image recipe {recipe_arn} includes it.")
+pub fn component_document_unreadable_message() -> String {
+    "An internal server error occurred while Image Builder processed the request. Retrying \
+     the request may succeed."
+        .to_string()
+}
+
+/// Why a `CreateComponent` whose document this service cannot accept is refused.
+///
+/// `member` is the member the document ARRIVED in — `data` for an inline document, `uri` for
+/// one fetched from the object store — and `why` is the clause [`parse_component_document`]
+/// states for it: the document is the VALUE that member carried, so a document this service
+/// cannot accept is refused as that parameter's value.
+#[must_use]
+pub fn component_document_message(member: &str, why: &str) -> String {
+    ::service_common::validation_message::parameter_value_mismatch(member, why)
+}
+
+/// Why a delete of a resource another stored resource still references is refused.
+///
+/// Names the ARN the request asked to delete and the fact that something else depends on
+/// it, and nothing about the resources that do: what the caller has to act on is that the
+/// delete cannot proceed while a reference stands.
+#[must_use]
+pub fn resource_dependency_message(arn: &str) -> String {
+    format!("Resource dependency error: The resource ARN '{arn}' has other resources depended on it.")
 }
 
 /// Why a create whose components do not agree on one platform is refused.
@@ -3741,23 +3871,6 @@ pub fn duplicate_recipe_component_message(name: &str) -> String {
     )
 }
 
-/// Why a create whose name and version are already taken in this Region is refused.
-#[must_use]
-pub fn image_recipe_exists_message(name: &str, semantic_version: &str) -> String {
-    format!(
-        "An image recipe named {name} at version {semantic_version} already exists in this Amazon \
-         Web Services Region."
-    )
-}
-
-/// Why a create whose pipeline name is already taken in this Region is refused.
-///
-/// The rule is `CreateImagePipeline`'s `name` member: "Pipeline names must be unique to
-/// your account in each Amazon Web Services Region."
-#[must_use]
-pub fn image_pipeline_exists_message(name: &str) -> String {
-    format!("An image pipeline named {name} already exists in this Amazon Web Services Region.")
-}
 
 /// Why a create naming neither recipe, or both, is refused.
 ///
@@ -4012,7 +4125,10 @@ mod tests {
                 "name: bt\nphases:\n  - name: build\n    steps: []\n  - name: test\n    steps: []\n",
                 COMPONENT_TYPE_BUILD,
             ),
-            ("name: none\nschemaVersion: 1.0\n", COMPONENT_TYPE_BUILD),
+            (
+                "name: tb\nphases:\n  - name: test\n    steps: []\n  - name: build\n    steps: []\n",
+                COMPONENT_TYPE_BUILD,
+            ),
         ];
         for (data, expected) in cases {
             let document = parse_component_document(data)
@@ -4103,6 +4219,82 @@ mod tests {
             actual.is_ok(),
             "case a big flat document: expected it to be read, got {actual:?}"
         );
+    }
+
+    /// RULE: a document that declares no phases describes no work, and is refused with the
+    /// clause this class carries whatever else the document holds.
+    #[test]
+    fn a_document_declaring_no_phases_is_refused_as_missing_phases() {
+        // The rows differ along HOW the phases are missing: the key absent, present with an
+        // empty list, present with no value at all, and present carrying something that is
+        // not a list of phases.
+        let cases: &[(&str, &str)] = &[
+            ("no phases key at all", "name: x\nschemaVersion: 1.0\n"),
+            ("nothing but the name", "name: x\n"),
+            ("an empty phases list", "name: x\nphases: []\n"),
+            ("a phases key with no value", "name: x\nphases:\n"),
+            ("phases carrying a scalar", "name: x\nphases: build\n"),
+            (
+                "phases carrying a mapping rather than a list",
+                "name: x\nphases:\n  build:\n    steps: []\n",
+            ),
+        ];
+        for (case, data) in cases {
+            let actual = parse_component_document(data);
+            assert_eq!(
+                actual.as_ref().err().map(String::as_str),
+                Some(MISSING_PHASES_REQUIREMENT),
+                "case {case:?}: expected the missing-phases clause, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: an already-exists refusal names the label AWS gives the kind the ARN identifies,
+    /// which is the kind its own resource field spells except where a recorded refusal shows
+    /// otherwise.
+    #[test]
+    fn an_already_exists_refusal_labels_the_kind_its_arn_names() {
+        // (case, the existing resource's ARN, the label the message carries)
+        let rows: &[(&str, &str, &str)] = &[
+            (
+                "a component build version",
+                "arn:aws:imagebuilder:us-west-2:000000000000:component/demo/1.0.0/1",
+                "Component",
+            ),
+            (
+                "an image recipe",
+                "arn:aws:imagebuilder:us-west-2:000000000000:image-recipe/demo/1.0.0",
+                "ImageRecipe",
+            ),
+            (
+                "a distribution configuration",
+                "arn:aws:imagebuilder:us-west-2:000000000000:distribution-configuration/demo",
+                "DistributionConfiguration",
+            ),
+            (
+                "an infrastructure configuration",
+                "arn:aws:imagebuilder:us-west-2:000000000000:infrastructure-configuration/demo",
+                "InfrastructureConfiguration",
+            ),
+            (
+                "a container recipe",
+                "arn:aws:imagebuilder:us-west-2:000000000000:container-recipe/demo/1.0.0",
+                "ContainerRecipe",
+            ),
+            (
+                "an image pipeline, which AWS labels by the shorter word",
+                "arn:aws:imagebuilder:us-west-2:000000000000:image-pipeline/demo",
+                "Pipeline",
+            ),
+        ];
+        for (case, arn, label) in rows {
+            let actual = resource_already_exists_message(arn);
+            let expected = format!("The following resource '{label}' already exists: '{arn}'.");
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
     }
 
     #[test]

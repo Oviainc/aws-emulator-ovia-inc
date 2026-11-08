@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListComponentBuildVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListComponentBuildVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListComponentBuildVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the component build versions this service's state holds under the component
+//! version the request names, so what a `CreateComponent` stored is what this listing
+//! enumerates.
+//!
+//! The rules it follows, each from the modelled documentation quoted beside it:
+//!
+//! * "The component version ARN whose build versions you want to list. The ARN must
+//!   specify an exact version, without a build number suffix. If you don't specify an ARN,
+//!   Image Builder returns build versions for the components that your account owns" — so a
+//!   version ARN selects the build versions stored under it, and a request naming none asks
+//!   about every build version of the calling Region;
+//! * one entry per BUILD version, each the modelled summary of that stored record
+//!   ([`crate::state::ComponentRecord::build_summary`]);
+//! * "Deprecated build versions aren't included in the results": every component this store
+//!   holds reports `ACTIVE` — a record here has never changed state — so that exclusion
+//!   leaves out none of them;
+//! * a page carries at most `maxResults` entries and answers a `nextToken` only while an
+//!   entry it did not carry remains; a token is issued FOR this listing and this query, so
+//!   one issued elsewhere is `InvalidPaginationTokenException`.
 //!
 //! ## Shape of an operation
 //!
@@ -174,18 +185,97 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListComponentBuildVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListComponentBuildVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListComponentBuildVersions"))
+        // The ARN's pattern, the `maxResults` 1..25 range and the token's length have all
+        // been refused past by the centralized walk before this body runs.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListComponentBuildVersionsErrorModeled::ServiceException(ServiceException {
+                message: Some(crate::state::store_unavailable_message()),
+            })
+        })?;
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // Which listing this page belongs to: the component version it was asked about, so
+        // a token issued for one listing is refused for another.
+        let mut cursor = crate::state::PageCursor {
+            operation: crate::state::LIST_COMPONENT_BUILD_VERSIONS_OPERATION.to_string(),
+            region: region.clone(),
+            query: crate::state::component_build_version_query_fingerprint(
+                input.component_version_arn.as_deref(),
+            ),
+            after: String::new(),
+        };
+        let after = match input.next_token.as_deref() {
+            None => String::new(),
+            Some(token) => match crate::state::decode_page_token(token, &cursor) {
+                Some(after) => after,
+                None => {
+                    return Err(
+                        ListComponentBuildVersionsErrorModeled::InvalidPaginationTokenException(
+                            InvalidPaginationTokenException {
+                                message: Some(crate::state::invalid_pagination_token_message()),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+        };
+
+        // A page carries at most `maxResults` entries, and at most the modelled maximum
+        // when the request names none.
+        let page_size = input
+            .max_results
+            .and_then(|requested| usize::try_from(requested).ok())
+            .unwrap_or(crate::state::MAX_COMPONENTS_PER_PAGE)
+            .clamp(1, crate::state::MAX_COMPONENTS_PER_PAGE);
+
+        // "The ARN must specify an exact version, without a build number suffix": the build
+        // versions a version ARN reaches are the ones stored under it, which is what its
+        // own ARN prefixes.
+        let under = input
+            .component_version_arn
+            .as_deref()
+            .map(|version_arn| format!("{version_arn}/"));
+
+        // A pure read: the guard is taken, this page is copied out as modelled summaries,
+        // and nothing is written. The store is keyed by the build version ARN, so the
+        // listing has one order and a token's position in it is stable.
+        let store = state.lock();
+        let mut matching = store
+            .components
+            .iter()
+            .filter(|(arn, _)| arn.as_str() > after.as_str())
+            .filter(|(arn, _)| {
+                under
+                    .as_deref()
+                    .is_none_or(|prefix| arn.as_str().starts_with(prefix))
+            })
+            .map(|(_, record)| record)
+            .filter(|record| record.region == region);
+
+        let page: Vec<ComponentSummary> = matching
+            .by_ref()
+            .take(page_size)
+            .map(crate::state::ComponentRecord::build_summary)
+            .collect();
+        // A `nextToken` is answered only when a build version this page did not carry
+        // remains.
+        let remaining = matching.next().is_some();
+        let next_token = page
+            .last()
+            .filter(|_| remaining)
+            .and_then(|last| last.arn.clone())
+            .map(|last| {
+                cursor.after = last;
+                crate::state::encode_page_token(&cursor)
+            });
+        drop(store);
+
+        Ok(ListComponentBuildVersionsOutput {
+            request_id: Some(crate::state::new_request_id()),
+            component_summary_list: Some(page),
+            next_token,
+        })
     }
 }

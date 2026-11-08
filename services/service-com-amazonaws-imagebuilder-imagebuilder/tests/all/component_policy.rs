@@ -9,8 +9,11 @@
 //! as the modelled `@httpQuery` puts it.
 //!
 //! The rule under test: a resource policy is attached to the resource its ARN names, so a
-//! policy read reports the document the last successful write applied to that resource,
-//! verbatim, and the unset-policy document `{}` when no write has applied one. An ARN the
+//! policy read reports the document the last successful write applied to that resource, in
+//! this service's own RENDERING of it — the whitespace between the document's JSON tokens
+//! dropped and a principal value given as a one-element array of one string reported as that
+//! string, every other element as the caller wrote it — and the unset-policy document `{}`
+//! when no write has applied one. An ARN the
 //! calling Region holds no such resource under is reported as a missing required resource,
 //! and a policy document that is not parseable JSON is refused as an invalid parameter
 //! value, leaving the stored policy as it was.
@@ -255,32 +258,54 @@ fn malformed_policy_message() -> String {
         .to_string()
 }
 
-/// One policy document a write applies and a read must report back verbatim.
+/// One policy document a write applies and the rendering a read must report back.
 #[derive(Debug)]
 struct PolicyRow {
     /// What makes this document different from the others.
     case: &'static str,
     /// The document itself.
     document: String,
+    /// What a read of the resource it was applied to reports: this service's rendering of
+    /// it. Equal to `document` for a document already in that form.
+    reported: String,
 }
 
 /// The documents a write stores, spanning the form, size, nesting, whitespace and
-/// character set the rule generalises over. The documents are JSON; nothing else about
-/// them is constrained by the model, whose `policy` member is text of length 1..30000.
+/// character set the rule generalises over, each beside the rendering a read reports for
+/// it. The documents are JSON; nothing else about them is constrained by the model, whose
+/// `policy` member is text of length 1..30000.
+///
+/// The rows differ along what the rendering rule generalises over: whether the document
+/// carries whitespace between its tokens, WHICH element carries a one-element array (a
+/// principal value, which collapses; an `Action`/`Resource` list, which does not), how many
+/// elements that array holds, and how many statements the policy has.
 fn policy_rows() -> Vec<PolicyRow> {
     let long_value = "a".repeat(MAX_POLICY_LENGTH / 2);
     vec![
         PolicyRow {
             case: "the unset-policy document written explicitly",
             document: UNSET_POLICY.to_string(),
+            reported: UNSET_POLICY.to_string(),
         },
         PolicyRow {
-            case: "a one-statement share policy",
+            case: "a one-statement share policy whose principal is a one-element list",
             document: json!({
                 "Version": "2012-10-17",
                 "Statement": [{
                     "Effect": "Allow",
                     "Principal": { "AWS": ["111111111111"] },
+                    "Action": ["imagebuilder:GetComponent"],
+                    "Resource": "*",
+                }],
+            })
+            .to_string(),
+            // The principal collapses to the scalar it names; the one-element `Action`
+            // list is reported as the caller wrote it.
+            reported: json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": { "AWS": "111111111111" },
                     "Action": ["imagebuilder:GetComponent"],
                     "Resource": "*",
                 }],
@@ -308,19 +333,75 @@ fn policy_rows() -> Vec<PolicyRow> {
                 ],
             })
             .to_string(),
+            // A principal list of two collapses nothing, and neither does a condition
+            // value: this document is already in the rendered form.
+            reported: json!({
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Effect": "Allow",
+                        "Principal": { "AWS": ["111111111111", "222222222222"] },
+                        "Action": ["imagebuilder:GetComponent", "imagebuilder:ListComponents"],
+                        "Resource": "*",
+                        "Condition": { "StringEquals": { "aws:PrincipalOrgID": ["o-abc123"] } },
+                    },
+                    {
+                        "Effect": "Deny",
+                        "Principal": "*",
+                        "Action": "imagebuilder:DeleteComponent",
+                        "Resource": "*",
+                    },
+                ],
+            })
+            .to_string(),
         },
         PolicyRow {
             case: "a document carrying newlines and indentation",
             document: "{\n  \"Version\": \"2012-10-17\",\n  \"Statement\": []\n}".to_string(),
+            // The whitespace between the tokens is gone; a one-statement `Statement` array
+            // and an empty one keep their brackets.
+            reported: "{\"Version\":\"2012-10-17\",\"Statement\":[]}".to_string(),
         },
         PolicyRow {
             case: "a document whose values carry non-ASCII text",
             document: json!({ "Version": "2012-10-17", "Sid": "accès-partagé-\u{1f512}" })
                 .to_string(),
+            reported: json!({ "Version": "2012-10-17", "Sid": "accès-partagé-\u{1f512}" })
+                .to_string(),
         },
         PolicyRow {
             case: "a document half the modelled maximum length",
             document: json!({ "Version": "2012-10-17", "Sid": long_value }).to_string(),
+            reported: json!({ "Version": "2012-10-17", "Sid": long_value }).to_string(),
+        },
+        PolicyRow {
+            case: "a principal map whose every value is a one-element list",
+            document: json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": {
+                        "AWS": ["arn:aws:iam::111111111111:root"],
+                        "Service": ["imagebuilder.amazonaws.com"],
+                    },
+                    "Action": "imagebuilder:GetComponent",
+                    "Resource": "*",
+                }],
+            })
+            .to_string(),
+            reported: json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": {
+                        "AWS": "arn:aws:iam::111111111111:root",
+                        "Service": "imagebuilder.amazonaws.com",
+                    },
+                    "Action": "imagebuilder:GetComponent",
+                    "Resource": "*",
+                }],
+            })
+            .to_string(),
         },
     ]
 }
@@ -377,8 +458,9 @@ async fn the_policy_a_write_applies_is_the_document_the_read_reports() {
 
         let reported = reported_policy(&router, row.case, &arn).await;
         assert_eq!(
-            reported, row.document,
-            "case {:?}: expected the stored document back verbatim, got {reported:?}",
+            reported, row.reported,
+            "case {:?}: expected this service's rendering of the stored document, got \
+             {reported:?}",
             row.case
         );
 
@@ -386,8 +468,20 @@ async fn the_policy_a_write_applies_is_the_document_the_read_reports() {
         // document.
         let again = reported_policy(&router, row.case, &arn).await;
         assert_eq!(
-            again, row.document,
+            again, row.reported,
             "case {:?}: expected a second read to report the same document, got {again:?}",
+            row.case
+        );
+
+        // The rendering is a fixed point: a caller that puts back what it read stores the
+        // same document again.
+        let (status, body) = put_policy(&router, &arn, &row.reported).await;
+        assert_ok(row.case, status, body);
+        let round_tripped = reported_policy(&router, row.case, &arn).await;
+        assert_eq!(
+            round_tripped, row.reported,
+            "case {:?}: expected the rendering to survive being put back, got \
+             {round_tripped:?}",
             row.case
         );
     }
@@ -412,11 +506,11 @@ async fn a_write_replaces_the_document_the_component_carried() {
 
         let after = reported_policy(&router, row.case, &arn).await;
         assert_eq!(
-            after, row.document,
+            after, row.reported,
             "case {:?}: expected the newly written document, got {after:?}",
             row.case
         );
-        previous = row.document;
+        previous = row.reported;
     }
 }
 

@@ -318,7 +318,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateImagePipelineErrorModeled::ResourceAlreadyExistsException(
                     ResourceAlreadyExistsException {
-                        message: Some(crate::state::image_pipeline_exists_message(&input.name)),
+                        message: Some(crate::state::resource_already_exists_message(&arn)),
                     },
                 )
                 .into(),

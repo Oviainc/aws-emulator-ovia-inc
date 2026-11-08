@@ -536,10 +536,11 @@ async fn the_arn_carries_a_normalized_name_and_that_name_is_taken_once() {
         );
         let (status, answer) = create(&router, &body).await;
         assert_refused(name, status, &answer, 400, "ResourceAlreadyExistsException");
-        let expected = format!(
-            "A distribution configuration named {name} already exists in this Amazon Web \
-             Services Region."
-        );
+        // The already-exists refusal names the kind of resource the create would have
+        // minted and the ARN of the one that already carries it — the ARN derived from the
+        // FIRST name, which this name normalizes to.
+        let expected =
+            format!("The following resource 'DistributionConfiguration' already exists: '{expected_arn}'.");
         let actual = error_message(name, &answer);
         assert_eq!(
             actual, expected,

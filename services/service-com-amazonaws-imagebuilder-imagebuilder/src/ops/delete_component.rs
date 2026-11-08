@@ -212,15 +212,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        if let Some(recipe_arn) = store
+        if store
             .recipe_depending_on_component(&input.component_build_version_arn)
-            .map(|recipe| recipe.arn.clone())
+            .is_some()
         {
             return Err(DeleteComponentErrorModeled::ResourceDependencyException(
                 ResourceDependencyException {
-                    message: Some(crate::state::component_in_use_message(
+                    message: Some(crate::state::resource_dependency_message(
                         &input.component_build_version_arn,
-                        &recipe_arn,
                     )),
                 },
             )

@@ -35,6 +35,10 @@ yaml-rust2 = { version = "0.10", default-features = false }
 sha2 = { workspace = true }
 # The same token's payload travels as hex, rather than through a hand-rolled encoding.
 hex = { workspace = true }
+# The Amazon S3 client `CreateComponent` fetches a `uri`-named component document through,
+# over the in-process callback into this same emulator (no network client feature: the
+# transport is the emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -44,6 +48,9 @@ emulator-core-build-support = { workspace = true }
 # ARN the tagging operations take rides in the URI path the way a signed request puts it
 # there, rather than through a hand-rolled escape in the tests.
 percent-encoding = "2.3"
+# The Amazon S3 service, mounted beside imagebuilder on one engine so a component document
+# staged with `PutObject` is the one a `uri`-named create resolves.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

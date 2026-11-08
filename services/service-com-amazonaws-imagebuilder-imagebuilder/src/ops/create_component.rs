@@ -14,17 +14,21 @@
 //!   version past that bound is `InvalidVersionNumberException`;
 //! * the component TYPE is read from the document, never submitted: "If the document
 //!   contains a single phase named test, the component type is TEST. Otherwise, the
-//!   component type is BUILD". A component named by `uri` carries no document this
-//!   emulator can read — the document lives in Amazon S3, which nothing here fetches —
-//!   so its type is the one the rule's "Otherwise" gives, its `parameters` are absent,
-//!   and `GetComponent` reports no `data` for it: what the request carried, and nothing
-//!   invented for a document nobody read. The `uri` itself is still checked for the form
-//!   the member documents, and the round-trip test covers that row;
+//!   component type is BUILD". A component named by `uri` carries its document in Amazon
+//!   S3, which this operation FETCHES at create time
+//!   ([`crate::state::document_at`]) — so a `uri` the object store serves nothing at is
+//!   refused and nothing is minted, and a document that was served is read exactly like an
+//!   inline one and stored as the component's own, a one-time snapshot a later overwrite of
+//!   the object cannot change;
+//! * a document this service cannot accept — one declaring no phases among them — is an
+//!   invalid value of the member that carried it, refused as this service refuses every
+//!   parameter whose value it cannot accept;
 //! * the ARN is derived from a NORMALIZED form of the name plus the version and the
 //!   build number, and a repeat of one name+version pair "creates a new build version
 //!   for it. If the content is also identical to the latest build version, the request
-//!   fails because the component already exists" — reported as `ResourceInUseException`,
-//!   the one resource-state error this operation declares;
+//!   fails because the component already exists" — reported as
+//!   `ResourceAlreadyExistsException`, the create-collision error, naming the build version
+//!   that already holds this content;
 //! * `clientToken` is an idempotency token: a retry carrying it answers with the
 //!   ORIGINAL response, and the same token carrying different creation parameters is
 //!   `IdempotentParameterMismatchException`;
@@ -168,6 +172,8 @@
 //!   Verify the request and try again.
 //! * `InvalidVersionNumberException` (HTTP 400) — Your version number is out of bounds or
 //!   does not follow the required syntax.
+//! * `ResourceAlreadyExistsException` (HTTP 400) — widened in through `extra_errors` (see
+//!   below): "The resource that you are trying to create already exists."
 //! * `ResourceInUseException` (HTTP 400) — The resource that you are trying to operate on is
 //!   currently in use. Review the message details and retry later.
 //! * `ServiceException` (HTTP 500) — An internal server error occurred while Image Builder
@@ -193,14 +199,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
 //
-// `InvalidParameterValueException` is widened in through `extra_errors`: the SERVICE models
-// that shape (a client error, `@httpError` 400, "The value that you provided for the
-// specified parameter is invalid.") and other operations declare it, while this operation's
-// own error list does not — and it is the class Image Builder refuses a parameter of this
-// request with, including the one requirement that holds over `data` and `uri` TOGETHER.
+// `InvalidParameterValueException` and `ResourceAlreadyExistsException` are widened in
+// through `extra_errors`: the SERVICE models both shapes (each a client error, `@httpError`
+// 400 — "The value that you provided for the specified parameter is invalid." and "The
+// resource that you are trying to create already exists.") and other operations declare
+// them, while this operation's own error list does not. The first is the class Image Builder
+// refuses a parameter of this request with, including the one requirement that holds over
+// `data` and `uri` TOGETHER; the second is the class a create whose resource already exists
+// is refused with, which is a different claim from the resource-state error
+// `ResourceInUseException` names ("the resource that you are trying to operate on is
+// currently in use"), the one clients treat as retryable.
 #[smithy_macros::operation_error(
     "com.amazonaws.imagebuilder#CreateComponent",
-    extra_errors = ["InvalidParameterValueException"]
+    extra_errors = ["InvalidParameterValueException", "ResourceAlreadyExistsException"]
 )]
 #[derive(Debug)]
 pub enum CreateComponentErrorModeled {
@@ -213,6 +224,7 @@ pub enum CreateComponentErrorModeled {
     InvalidParameterValueException(InvalidParameterValueException),
     InvalidRequestException(InvalidRequestException),
     InvalidVersionNumberException(InvalidVersionNumberException),
+    ResourceAlreadyExistsException(ResourceAlreadyExistsException),
     ResourceInUseException(ResourceInUseException),
     ServiceException(ServiceException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
@@ -317,38 +329,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        // What the stored component derives from the document. A `uri` points at a
-        // document in Amazon S3 that this emulator does not read, so the URI is checked
-        // for the form the member documents and the component carries the type a
-        // document that is not a lone `test` phase has.
-        let document = match document_source {
-            DocumentSource::Inline(data) => {
-                // The refusal text is this service's own statement of what a component
-                // document has to be, so it is returned as the message rather than
-                // re-worded here.
-                crate::state::parse_component_document(data).map_err(|why| {
-                    CreateComponentErrorModeled::InvalidRequestException(InvalidRequestException {
-                        message: Some(why),
-                    })
-                })?
-            }
+        let fingerprint = crate::state::component_request_fingerprint(&input);
+
+        // "If you retry a request with the same client token, Image Builder returns the
+        // original response without running the operation again" — down to its `requestId`.
+        // Answered BEFORE the document is read: a retry carrying a token that already
+        // succeeded runs nothing, so it cannot be refused for an object that has since been
+        // removed. The same token carrying different creation parameters is the modelled
+        // mismatch instead. The check is repeated under the lock that writes, which is what
+        // settles a token two requests carry at once.
+        if let Some(answered) = answered_before(
+            &state.lock(),
+            &region,
+            &input.client_token,
+            &fingerprint,
+        ) {
+            return answered;
+        }
+
+        // What the stored component derives from the document. A `uri` names a document in
+        // Amazon S3, which this service fetches at create time: the bytes it was served are
+        // the component's own document from then on, read exactly like an inline one.
+        let (document_member, document_text) = match document_source {
+            DocumentSource::Inline(data) => (crate::state::COMPONENT_DATA_MEMBER, data.to_string()),
             DocumentSource::Uri(uri) => {
-                if !is_s3_url(uri) {
-                    return Err(CreateComponentErrorModeled::InvalidRequestException(
-                        InvalidRequestException {
-                            message: Some(crate::state::component_uri_message(uri)),
-                        },
-                    )
-                    .into());
-                }
-                crate::state::ComponentDocument {
-                    component_type: crate::state::COMPONENT_TYPE_BUILD.to_string(),
-                    parameters: None,
+                match crate::state::document_at(ctx, uri).await {
+                    crate::state::DocumentObject::Read(document) => {
+                        (crate::state::COMPONENT_URI_MEMBER, document)
+                    }
+                    // "This must be an S3 URL (s3://bucket/key)": a value that is not one
+                    // addresses no object, so it is refused for the form the member
+                    // requires.
+                    crate::state::DocumentObject::NotAnS3Url => {
+                        return Err(
+                            CreateComponentErrorModeled::InvalidParameterValueException(
+                                InvalidParameterValueException {
+                                    message: Some(crate::state::component_uri_message()),
+                                },
+                            )
+                            .into(),
+                        )
+                    }
+                    // The object store answered that it serves nothing at that address: a
+                    // fact about the value `uri` carried, so the create is refused as that
+                    // parameter's value and nothing is minted.
+                    crate::state::DocumentObject::NotServed => {
+                        return Err(
+                            CreateComponentErrorModeled::InvalidParameterValueException(
+                                InvalidParameterValueException {
+                                    message: Some(crate::state::component_uri_not_found_message()),
+                                },
+                            )
+                            .into(),
+                        )
+                    }
+                    crate::state::DocumentObject::Rejected(why) => {
+                        return Err(
+                            CreateComponentErrorModeled::InvalidParameterValueException(
+                                InvalidParameterValueException {
+                                    message: Some(crate::state::component_document_message(
+                                        crate::state::COMPONENT_URI_MEMBER,
+                                        &why,
+                                    )),
+                                },
+                            )
+                            .into(),
+                        )
+                    }
+                    // Nothing answered the read, so nothing about the object is established:
+                    // this is this emulator failing to reach its own object store, not a
+                    // claim about the caller's `uri`.
+                    crate::state::DocumentObject::Unestablished => {
+                        return Err(CreateComponentErrorModeled::ServiceException(
+                            ServiceException {
+                                message: Some(
+                                    crate::state::component_document_unreadable_message(),
+                                ),
+                            },
+                        )
+                        .into())
+                    }
                 }
             }
         };
 
-        let fingerprint = crate::state::component_request_fingerprint(&input);
+        // The document itself, read the same way whichever member carried it. A document
+        // this service cannot accept is an invalid value of THAT member.
+        let document = crate::state::parse_component_document(&document_text).map_err(|why| {
+            CreateComponentErrorModeled::InvalidParameterValueException(
+                InvalidParameterValueException {
+                    message: Some(crate::state::component_document_message(
+                        document_member,
+                        &why,
+                    )),
+                },
+            )
+        })?;
+
+        // What the component WOULD HOLD, which is what "identical content" compares: the
+        // resolved document rather than the member that named it, so a repeat naming a `uri`
+        // whose object was overwritten is new content, and an inline create of the very bytes
+        // a `uri` create fetched is the same content.
+        let content = content_fingerprint(&input, &document_text);
         let normalized = crate::state::normalized_name(&input.name);
 
         // The idempotency check, the content check, the build numbering and the insert
@@ -356,56 +438,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and each gets its own build number.
         let mut store = state.lock();
 
-        // "If you retry a request with the same client token, Image Builder returns the
-        // original response without running the operation again" — down to its
-        // `requestId`. The same token carrying different creation parameters is the
-        // modelled mismatch instead.
-        if let Some(receipt) = store.create_receipt(
-            crate::state::CREATE_COMPONENT_OPERATION,
-            &region,
-            &input.client_token,
-        ) {
-            if receipt.fingerprint != fingerprint {
-                return Err(
-                    CreateComponentErrorModeled::IdempotentParameterMismatchException(
-                        IdempotentParameterMismatchException {
-                            message: Some(crate::state::idempotent_parameter_mismatch_message()),
-                        },
-                    )
-                    .into(),
-                );
-            }
-            return Ok(CreateComponentOutput {
-                request_id: Some(receipt.request_id.clone()),
-                client_token: Some(receipt.client_token.clone()),
-                component_build_version_arn: Some(receipt.arn.clone()),
-                // The ORIGINAL response, down to the wildcard references the resource
-                // that request created is reached by.
-                latest_version_references: crate::state::latest_version_references(
-                    &receipt.arn,
-                    crate::state::COMPONENT_ARN_PREFIX,
-                ),
-            });
+        // The token again, now under the lock that writes: a token this request did not see
+        // above because another request was carrying it at the same time is settled here.
+        if let Some(answered) = answered_before(&store, &region, &input.client_token, &fingerprint)
+        {
+            return answered;
         }
 
         // A repeat of one name+version pair creates the NEXT build version — unless its
         // content is identical to the latest build version, in which case "the request
-        // fails because the component already exists". What a request says about the
-        // component is exactly the rendering the idempotency check compares, so the two
-        // agree on what "identical" means. This operation declares no
-        // `ResourceAlreadyExistsException` — its sibling `CreateImageRecipe` does — so the
-        // already-exists condition is reported under the resource-state error it does
-        // declare.
+        // fails because the component already exists". The comparison runs over the
+        // CONTENT — the creation members plus the resolved document — so what "identical"
+        // means does not depend on which member named the document. A create whose resource
+        // already exists is refused as the create-collision it is, naming the build version
+        // that holds that content — the identity a caller needs in order to take the
+        // already-exists path.
         if let Some(latest) =
             store.latest_component_build(&region, &normalized, &input.semantic_version)
         {
-            if stored_component_fingerprint(latest) == fingerprint {
-                return Err(CreateComponentErrorModeled::ResourceInUseException(
-                    ResourceInUseException {
-                        message: Some(crate::state::component_already_exists_message(&latest.arn)),
-                    },
-                )
-                .into());
+            if stored_content_fingerprint(latest) == content {
+                return Err(
+                    CreateComponentErrorModeled::ResourceAlreadyExistsException(
+                        ResourceAlreadyExistsException {
+                            message: Some(crate::state::resource_already_exists_message(
+                                &latest.arn,
+                            )),
+                        },
+                    )
+                    .into(),
+                );
             }
         }
 
@@ -461,7 +522,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 platform: input.platform,
                 supported_os_versions: input.supported_os_versions,
                 owner: ::engine::EMULATOR_ACCOUNT_ID.to_string(),
-                data: input.data,
+                // The document this component carries, whichever member named it: the
+                // inline text, or the snapshot the fetch above read from the object store.
+                data: Some(document_text),
                 uri: input.uri,
                 kms_key_id: input.kms_key_id,
                 parameters: document.parameters,
@@ -495,20 +558,61 @@ enum DocumentSource<'request> {
     Uri(&'request str),
 }
 
-/// Whether `uri` is an S3 URL of the form the `uri` member documents
-/// (`s3://bucket/key`): the scheme, a bucket and a non-empty key.
-fn is_s3_url(uri: &str) -> bool {
-    let Some(path) = uri.strip_prefix(crate::state::COMPONENT_URI_SCHEME) else {
-        return false;
-    };
-    path.split_once('/')
-        .is_some_and(|(bucket, key)| !bucket.is_empty() && !key.is_empty())
+/// What this request has ALREADY been answered, when its `clientToken` names a create that
+/// succeeded: the original response, or the mismatch a token carrying different creation
+/// parameters earns. `None` when the token names nothing yet, which is the request's to run.
+///
+/// "If you retry a request with the same client token, Image Builder returns the original
+/// response without running the operation again" — so this is answered before anything is
+/// read or written, and again under the lock that writes.
+fn answered_before(
+    store: &crate::state::ComAmazonawsImagebuilderImagebuilderState,
+    region: &str,
+    client_token: &str,
+    fingerprint: &str,
+) -> Option<Result<CreateComponentOutput, CreateComponentError>> {
+    let receipt =
+        store.create_receipt(crate::state::CREATE_COMPONENT_OPERATION, region, client_token)?;
+    if receipt.fingerprint != fingerprint {
+        return Some(Err(
+            CreateComponentErrorModeled::IdempotentParameterMismatchException(
+                IdempotentParameterMismatchException {
+                    message: Some(crate::state::idempotent_parameter_mismatch_message()),
+                },
+            )
+            .into(),
+        ));
+    }
+    Some(Ok(CreateComponentOutput {
+        request_id: Some(receipt.request_id.clone()),
+        client_token: Some(receipt.client_token.clone()),
+        component_build_version_arn: Some(receipt.arn.clone()),
+        // The ORIGINAL response, down to the wildcard references the resource that request
+        // created is reached by.
+        latest_version_references: crate::state::latest_version_references(
+            &receipt.arn,
+            crate::state::COMPONENT_ARN_PREFIX,
+        ),
+    }))
 }
 
-/// The stored component rendered the way a request that would create it renders, so "the
-/// content is also identical to the latest build version" is one comparison rather than a
-/// second rule.
-fn stored_component_fingerprint(record: &crate::state::ComponentRecord) -> String {
+/// What a create would STORE, rendered the way the stored record renders: the creation
+/// members the request carried, with `document` \u2014 the resolved document, whichever member
+/// named it \u2014 standing in for both `data` and `uri`.
+///
+/// This is what "the content is also identical to the latest build version" compares, which
+/// is a different question from whether two REQUESTS are the same (the idempotency token's
+/// own comparison, over [`crate::state::component_request_fingerprint`] of the request).
+fn content_fingerprint(input: &CreateComponentInput, document: &str) -> String {
+    let mut content = input.clone();
+    content.data = Some(document.to_string());
+    content.uri = None;
+    crate::state::component_request_fingerprint(&content)
+}
+
+/// The stored component rendered as [`content_fingerprint`] renders a request, so the two
+/// are one comparison rather than a second rule.
+fn stored_content_fingerprint(record: &crate::state::ComponentRecord) -> String {
     crate::state::component_request_fingerprint(&CreateComponentInput {
         name: record.name.clone(),
         semantic_version: record.version.clone(),
@@ -516,12 +620,13 @@ fn stored_component_fingerprint(record: &crate::state::ComponentRecord) -> Strin
         change_description: record.change_description.clone(),
         platform: record.platform.clone(),
         supported_os_versions: record.supported_os_versions.clone(),
+        // The document this component holds, whichever member named it.
         data: record.data.clone(),
-        uri: record.uri.clone(),
+        uri: None,
         kms_key_id: record.kms_key_id.clone(),
         tags: record.tags.clone().map(|tags| tags.into_iter().collect()),
-        // Neither is part of the rendering: the token is the key it is compared under,
-        // and `dryRun` describes the call rather than the component.
+        // Neither is part of the rendering: the token is the key a receipt is compared
+        // under, and `dryRun` describes the call rather than the component.
         client_token: String::new(),
         dry_run: false,
     })

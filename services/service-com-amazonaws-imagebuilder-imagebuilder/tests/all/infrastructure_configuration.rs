@@ -457,6 +457,17 @@ async fn the_arn_carries_a_normalized_name_and_that_name_is_taken_once() {
                 400,
                 "ResourceAlreadyExistsException",
             );
+            // The already-exists refusal of THIS create names no resource: the whole
+            // sentence is fixed text, so neither the submitted name nor the stored ARN
+            // appears in it.
+            let message = body
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            assert_eq!(
+                message, "The resource already exists.",
+                "case {other:?}: expected the fixed already-exists sentence, got {message:?}"
+            );
         }
     }
 }

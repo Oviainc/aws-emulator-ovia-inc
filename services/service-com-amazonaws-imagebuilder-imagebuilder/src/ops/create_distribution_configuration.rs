@@ -279,8 +279,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateDistributionConfigurationErrorModeled::ResourceAlreadyExistsException(
                     ResourceAlreadyExistsException {
-                        message: Some(crate::state::distribution_configuration_exists_message(
-                            &input.name,
+                        message: Some(crate::state::resource_already_exists_message(
+                            &arn,
                         )),
                     },
                 )

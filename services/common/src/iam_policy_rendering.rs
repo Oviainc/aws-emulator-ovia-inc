@@ -13,6 +13,11 @@
 //!    one-element array holding one string, so a one-action statement is reported with a
 //!    scalar `Action`.
 //!
+//! WHICH elements a given policy store collapses that way is the STORE's own: a service
+//! whose reads are observed to collapse the principal lists alone and to leave an `Action`
+//! list as the caller wrote it names the elements it collapses
+//! ([`rendered_collapsing`], [`PRINCIPAL_ELEMENTS`]) instead of taking the whole set.
+//!
 //! Everything else is the caller's own data and survives untouched: member order, statement
 //! count, the `Statement` array itself (a one-statement policy keeps its one-element array,
 //! which is why `Statement` is not one of the elements above), the type and spelling of
@@ -53,6 +58,13 @@ pub const STRING_OR_ARRAY_ELEMENTS: [&str; 8] = [
     "CanonicalUser",
 ];
 
+/// The principal lists alone: the elements a `Principal`/`NotPrincipal` map keys its values
+/// by, which are the subset of [`STRING_OR_ARRAY_ELEMENTS`] that sits inside a principal.
+///
+/// For a store whose reads collapse a one-element principal list and report every other
+/// element as the caller wrote it ([`rendered_collapsing`]).
+pub const PRINCIPAL_ELEMENTS: [&str; 4] = ["AWS", "Service", "Federated", "CanonicalUser"];
+
 /// `document` as a service renders the policy it was handed: the whitespace between its
 /// JSON tokens dropped, and every [`STRING_OR_ARRAY_ELEMENTS`] element written as the
 /// string it names when the caller submitted a one-element array of one string.
@@ -61,13 +73,25 @@ pub const STRING_OR_ARRAY_ELEMENTS: [&str; 8] = [
 /// caller that puts back the document it read sees the same bytes again.
 #[must_use]
 pub fn rendered(document: &str) -> String {
-    collapsed(&minified(document))
+    rendered_collapsing(document, &STRING_OR_ARRAY_ELEMENTS)
 }
 
-/// Every one-element array of one string an element of [`STRING_OR_ARRAY_ELEMENTS`] carries
-/// in `document`, written as that string. `document` carries no whitespace between its
+/// [`rendered`] collapsing only the elements `elements` names: the whitespace between the
+/// document's JSON tokens dropped, and a one-element array of one string written as that
+/// string for those elements alone.
+///
+/// For a store that collapses a narrower set than the policy language's whole string-or-array
+/// set — [`PRINCIPAL_ELEMENTS`] for one whose reads keep an `Action` list as it arrived.
+/// Rendering what was rendered changes nothing, for any set.
+#[must_use]
+pub fn rendered_collapsing(document: &str, elements: &[&str]) -> String {
+    collapsed(&minified(document), elements)
+}
+
+/// Every one-element array of one string an element of `elements` carries in `document`,
+/// written as that string. `document` carries no whitespace between its
 /// tokens (it is [`minified`]'s output), so what is left to walk is the tokens themselves.
-fn collapsed(document: &str) -> String {
+fn collapsed(document: &str, elements: &[&str]) -> String {
     let bytes = document.as_bytes();
     let mut out = String::with_capacity(bytes.len());
     // The element whose value starts at the current position: set by a string token that a
@@ -86,7 +110,7 @@ fn collapsed(document: &str) -> String {
                     (closed && bytes.get(end) == Some(&b':')).then(|| &document[at + 1..end - 1]);
                 at = end;
             }
-            b'[' if element.is_some_and(|name| STRING_OR_ARRAY_ELEMENTS.contains(&name)) => {
+            b'[' if element.is_some_and(|name| elements.contains(&name)) => {
                 // `["value"]` is rendered as `"value"`. Anything else — an empty array,
                 // several elements, or one that is not a string — is copied as it is.
                 let single = (bytes.get(at + 1) == Some(&b'"'))
@@ -236,6 +260,52 @@ mod tests {
             // The rendering is a fixed point: a caller that puts back what it read stores
             // the same document again.
             let again = rendered(&actual);
+            assert_eq!(
+                again, actual,
+                "case {case:?}: the rendered form must be a fixed point, got {again:?}"
+            );
+        }
+    }
+
+    /// RULE: a store names the elements it collapses, and an element outside that set keeps
+    /// the form the caller submitted.
+    #[test]
+    fn only_the_named_elements_collapse() {
+        // (case, the elements the store collapses, the submitted document, the rendering)
+        let rows: [(&str, &[&str], &str, &str); 4] = [
+            (
+                "the principal lists alone: Action keeps its list",
+                &PRINCIPAL_ELEMENTS,
+                r#"{"Statement": [{"Effect": "Allow", "Principal": {"AWS": ["arn:aws:iam::000000000000:root"]}, "Action": ["svc:A"], "Resource": ["*"]}]}"#,
+                r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:root"},"Action":["svc:A"],"Resource":["*"]}]}"#,
+            ),
+            (
+                "the whole string-or-array set: Action collapses too",
+                &STRING_OR_ARRAY_ELEMENTS,
+                r#"{"Statement": [{"Effect": "Allow", "Principal": {"AWS": ["arn:aws:iam::000000000000:root"]}, "Action": ["svc:A"], "Resource": ["*"]}]}"#,
+                r#"{"Statement":[{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:root"},"Action":"svc:A","Resource":"*"}]}"#,
+            ),
+            (
+                "no element at all: the whitespace rule alone",
+                &[],
+                r#"{"Action": ["svc:A"]}"#,
+                r#"{"Action":["svc:A"]}"#,
+            ),
+            (
+                "a principal list of two, which no set collapses",
+                &PRINCIPAL_ELEMENTS,
+                r#"{"Principal": {"AWS": ["a", "b"]}}"#,
+                r#"{"Principal":{"AWS":["a","b"]}}"#,
+            ),
+        ];
+
+        for (case, elements, submitted, reported) in rows {
+            let actual = rendered_collapsing(submitted, elements);
+            assert_eq!(
+                actual, reported,
+                "case {case:?}: expected {reported:?}, got {actual:?}"
+            );
+            let again = rendered_collapsing(&actual, elements);
             assert_eq!(
                 again, actual,
                 "case {case:?}: the rendered form must be a fixed point, got {again:?}"

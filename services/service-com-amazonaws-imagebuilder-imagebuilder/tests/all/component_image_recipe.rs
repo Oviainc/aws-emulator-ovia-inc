@@ -38,8 +38,9 @@ const ACCOUNT: &str = "000000000000";
 
 /// Members a create carries that the stored COMPONENT does not report back under the
 /// same name: `clientToken` and `dryRun` describe the call, `semanticVersion` is
-/// reported as `version`, and `uri` names where a document this emulator does not read
-/// lives.
+/// reported as `version`, and `uri` names WHERE the document was fetched from — the
+/// document itself is reported as the component's own `data`
+/// (`crate::component_document_sources`).
 const NOT_COMPONENT_MEMBERS: &[&str] = &["clientToken", "dryRun", "semanticVersion", "uri"];
 
 /// Members a create carries that the stored RECIPE does not report back under the same
@@ -393,19 +394,6 @@ fn component_rows() -> Vec<ComponentRow> {
             extra: || json!({"platform": "macOS"}),
             component_type: "BUILD",
         },
-        ComponentRow {
-            case: "a document named by uri instead of inline",
-            name: "uri-component",
-            normalized: "uri-component",
-            version: "3.2.1",
-            extra: || {
-                json!({
-                    "data": Value::Null,
-                    "uri": "s3://no-such-bucket/components/prep.yaml",
-                })
-            },
-            component_type: "BUILD",
-        },
     ]
 }
 
@@ -414,13 +402,7 @@ async fn a_created_component_is_reported_back_member_for_member() {
     let router = emulator();
 
     for (n, row) in component_rows().into_iter().enumerate() {
-        let mut body = component_body(row.name, row.version, &format!("ctok-{n:04}"), (row.extra)());
-        // A row that names a `uri` carries no inline document at all.
-        if let Value::Object(map) = &mut body {
-            if map.get("data") == Some(&Value::Null) {
-                map.remove("data");
-            }
-        }
+        let body = component_body(row.name, row.version, &format!("ctok-{n:04}"), (row.extra)());
 
         let (status, created) = create_component(&router, &body).await;
         assert_eq!(
@@ -475,16 +457,6 @@ async fn a_created_component_is_reported_back_member_for_member() {
             );
         }
         assert_instant(row.case, &component, "dateCreated");
-
-        // A component named by uri carries no document, so none is reported.
-        if body.get("uri").is_some() {
-            assert_eq!(
-                component.get("data"),
-                None,
-                "case {:?}: expected no data for a component named by uri, got {component}",
-                row.case
-            );
-        }
     }
 }
 
@@ -592,9 +564,8 @@ async fn a_repeated_name_and_version_gets_the_next_build_version() {
     }
 
     // "If the content is also identical to the latest build version, the request fails
-    // because the component already exists." This operation declares no
-    // ResourceAlreadyExistsException, so the condition is reported under the one
-    // resource-state error it does declare.
+    // because the component already exists." A create whose resource already exists is
+    // refused as the create-collision it is, naming the build version that holds it.
     let repeat = component_body(
         "Versioned Component",
         "1.4.0",
@@ -607,7 +578,16 @@ async fn a_repeated_name_and_version_gets_the_next_build_version() {
         status,
         &refused,
         400,
-        "ResourceInUseException",
+        "ResourceAlreadyExistsException",
+    );
+    let message = text("identical content", &refused, "message");
+    let expected = format!(
+        "The following resource 'Component' already exists: '{}'.",
+        component_arn(REGION, "versioned-component", "1.4.0", 3)
+    );
+    assert_eq!(
+        message, expected,
+        "case \"identical content\": expected {expected:?}, got {message:?}"
     );
 
     // A version ARN, with or without trailing wildcards, resolves to the latest build.
@@ -824,7 +804,7 @@ async fn a_create_this_service_cannot_serve_is_refused_the_documented_way() {
                 "uri": "https://example.com/component.yaml",
             }),
             400,
-            "InvalidRequestException",
+            "InvalidParameterValueException",
         ),
         (
             "a component document that is not YAML",
@@ -835,7 +815,7 @@ async fn a_create_this_service_cannot_serve_is_refused_the_documented_way() {
                 json!({"data": "phases: [\n"}),
             ),
             400,
-            "InvalidRequestException",
+            "InvalidParameterValueException",
         ),
         (
             "a component document built to drive the YAML reader's recursion",
@@ -846,7 +826,18 @@ async fn a_create_this_service_cannot_serve_is_refused_the_documented_way() {
                 json!({"data": format!("phases: {}", "[".repeat(8_000))}),
             ),
             400,
-            "InvalidRequestException",
+            "InvalidParameterValueException",
+        ),
+        (
+            "a component document declaring no phases",
+            component_body(
+                "no-phases-document",
+                "1.0.0",
+                "rtok-0009",
+                json!({"data": "name: x\nschemaVersion: 1.0\n"}),
+            ),
+            400,
+            "InvalidParameterValueException",
         ),
         (
             "a component dry run",
