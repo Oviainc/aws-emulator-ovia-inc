@@ -97,6 +97,8 @@ mod pagination_token_region_scope;
 mod pagination_token_spelling;
 #[path = "all/platform_domain_authority.rs"]
 mod platform_domain_authority;
+#[path = "all/policy_revision_refusal_wording.rs"]
+mod policy_revision_refusal_wording;
 #[path = "all/put_rum_events_unresolvable_id.rs"]
 mod put_rum_events_unresolvable_id;
 #[path = "all/query_bound_required_members.rs"]

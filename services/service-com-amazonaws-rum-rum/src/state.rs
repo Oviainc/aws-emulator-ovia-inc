@@ -27,9 +27,10 @@ use crate::ops::types::{
     AccessDeniedException, AppMonitor, AppMonitorConfiguration, AppMonitorDetails,
     AppMonitorSummary, ConflictException, CustomEvents, CwLog, DataStorage,
     DeobfuscationConfiguration, InternalServerException, InvalidPolicyRevisionIdException,
-    JavaScriptSourceMaps, MetricDefinition, MetricDefinitionRequest, MetricDestinationSummary,
-    PolicyNotFoundException, ResourceNotFoundException, ServiceQuotaExceededException,
-    ValidationException, METRIC_DESTINATION_VALUES,
+    JavaScriptSourceMaps, MalformedPolicyDocumentException, MetricDefinition,
+    MetricDefinitionRequest, MetricDestinationSummary, PolicyNotFoundException,
+    ResourceNotFoundException, ServiceQuotaExceededException, ValidationException,
+    METRIC_DESTINATION_VALUES,
 };
 
 /// Who a request speaks for, and whether IAM lets it do what it asks: the authorization
@@ -1277,17 +1278,19 @@ impl AppMonitorRecord {
     /// Until an id has been assigned a request may still name one, and is then
     /// conditional on it being the current one — including when there is no policy at
     /// all, where no id can be current.
+    ///
+    /// Both ways the condition can fail are the SAME refusal of the same operation, so
+    /// both carry that operation's own fixed wording
+    /// ([`put_policy_revision_mismatch`]).
     pub fn policy_revision_refusal_on_current(
         &self,
         provided: Option<&str>,
     ) -> Option<InvalidPolicyRevisionIdException> {
-        match provided {
-            Some(provided) => (self.policy_revision_id().as_deref() != Some(provided))
-                .then(|| policy_revision_mismatch(provided)),
-            None => self
-                .policy_revision_assigned()
-                .then(policy_revision_not_provided),
-        }
+        let satisfied = match provided {
+            Some(provided) => self.policy_revision_id().as_deref() == Some(provided),
+            None => !self.policy_revision_assigned(),
+        };
+        (!satisfied).then(put_policy_revision_mismatch)
     }
 
     /// Why the `PolicyRevisionId` a request PROVIDES stops it acting on this monitor's
@@ -1300,13 +1303,17 @@ impl AppMonitorRecord {
     /// …". The refusal is conditioned on the id the request PROVIDES, so a request that
     /// provides none asks for no atomicity and is unconditional, whatever the policy's
     /// history.
+    ///
+    /// The refusal carries the delete's OWN wording
+    /// ([`delete_policy_revision_mismatch`]), which the service words differently from the
+    /// put's.
     pub fn policy_revision_refusal_on_provided(
         &self,
         provided: Option<&str>,
     ) -> Option<InvalidPolicyRevisionIdException> {
         let provided = provided?;
         (self.policy_revision_id().as_deref() != Some(provided))
-            .then(|| policy_revision_mismatch(provided))
+            .then(delete_policy_revision_mismatch)
     }
 
     /// Append events to this monitor's buffer, dropping the oldest once the buffer is at
@@ -3271,6 +3278,10 @@ pub fn canonical_policy_document(document: &str) -> String {
 /// element has the type and the value set that language gives it. Semantics beyond the
 /// grammar (whether an action exists, whether a principal resolves) are NOT checked:
 /// they are not what "formatted correctly" means.
+///
+/// The reason is what DECIDES the refusal; it is not what the refusal reports. RUM answers
+/// this error class with the code alone ([`malformed_policy_document`]), so the sentences
+/// below state the grammar for a reader of this crate rather than for a caller.
 pub fn policy_document_refusal(document: &str) -> Option<String> {
     let parsed = match ::serde_json::from_str::<::serde_json::Value>(document) {
         Ok(parsed) => parsed,
@@ -3440,7 +3451,18 @@ fn is_policy_condition_value(value: &::serde_json::Value) -> bool {
     }
 }
 
-/// The wording RUM answers `PolicyNotFoundException` with.
+/// `MalformedPolicyDocumentException` as RUM answers it: the error CLASS alone.
+///
+/// Recorded behaviour: the body carries no `message` member at all — the model declares
+/// one, but the service sends none for this class, so a caller that submitted a document
+/// the policy grammar refuses learns the class and nothing more. Which rule of the grammar
+/// the document broke ([`policy_document_refusal`]) therefore stays inside the service, and
+/// no diagnostic of this crate's JSON parser reaches the wire.
+pub fn malformed_policy_document() -> MalformedPolicyDocumentException {
+    MalformedPolicyDocumentException {}
+}
+
+/// The message RUM answers `PolicyNotFoundException` with.
 ///
 /// Recorded behaviour: the message is this CONSTANT, carrying no part of the request —
 /// the monitor the caller asked about is already the one it addressed, so the error says
@@ -3456,42 +3478,41 @@ pub fn policy_not_found() -> PolicyNotFoundException {
     }
 }
 
-/// `InvalidPolicyRevisionIdException` for a conditional request whose `PolicyRevisionId`
-/// is not the stored policy's current one.
+/// The message `PutResourcePolicy` answers `InvalidPolicyRevisionIdException` with, for
+/// EVERY request of that operation its optimistic-lock check refuses.
 ///
-/// From the model: "The policy revision ID that you provided doeesn't match the latest
-/// policy revision ID." The message names the id the REQUEST carried; the current one is
-/// deliberately not disclosed, since a caller that holds a stale id has to re-read the
-/// policy to learn the new one.
-pub fn policy_revision_mismatch(provided: &str) -> InvalidPolicyRevisionIdException {
+/// Recorded behaviour: the message is this CONSTANT — wholly fixed text, carrying no part
+/// of the request, so neither the id the request named nor the one the policy currently
+/// holds appears in it. A caller that holds the wrong revision id has to re-read the
+/// policy to learn the current one, and nothing in the refusal tells it more than that its
+/// write did not apply.
+pub const PUT_POLICY_REVISION_MISMATCH_MESSAGE: &str =
+    "If policyRevisionID is provided, then it must match the existing revision.";
+
+/// The message `DeleteResourcePolicy` answers `InvalidPolicyRevisionIdException` with.
+///
+/// Recorded behaviour: this CONSTANT, with no trailing period and no part of the request
+/// in it — and deliberately NOT the sentence `PutResourcePolicy` answers with
+/// ([`PUT_POLICY_REVISION_MISMATCH_MESSAGE`]), so a caller reconciling puts and deletes
+/// can tell which of the two optimistic-lock checks refused it.
+pub const DELETE_POLICY_REVISION_MISMATCH_MESSAGE: &str =
+    "PolicyRevisionID must match the existing revision";
+
+/// `InvalidPolicyRevisionIdException` as `PutResourcePolicy` words it: its own fixed
+/// sentence ([`PUT_POLICY_REVISION_MISMATCH_MESSAGE`]).
+pub fn put_policy_revision_mismatch() -> InvalidPolicyRevisionIdException {
     InvalidPolicyRevisionIdException {
-        message: format!(
-            "The policy revision ID {provided} does not match the latest policy revision ID."
-        ),
+        message: PUT_POLICY_REVISION_MISMATCH_MESSAGE.to_string(),
     }
 }
 
-/// `InvalidPolicyRevisionIdException` for a request that had to provide the stored
-/// policy's current `PolicyRevisionId` and provided none at all.
-///
-/// The same error class as [`policy_revision_mismatch`] — the request did not provide the
-/// correct current revision id — so it is the error's own documented sentence ("The policy
-/// revision ID that you provided … match the latest policy revision ID") with no id to
-/// name, because the request carried none. The model's sentence contracts the verb; the
-/// wording here keeps the "does not match" voice of the recorded sibling message above, so
-/// two refusals of one class do not read differently. No recording of this case is
-/// available, so the exact service wording for a request that carries no id is not
-/// verified against one.
-pub fn policy_revision_not_provided() -> InvalidPolicyRevisionIdException {
+/// `InvalidPolicyRevisionIdException` as `DeleteResourcePolicy` words it: its own fixed
+/// sentence ([`DELETE_POLICY_REVISION_MISMATCH_MESSAGE`]).
+pub fn delete_policy_revision_mismatch() -> InvalidPolicyRevisionIdException {
     InvalidPolicyRevisionIdException {
-        message: POLICY_REVISION_NOT_PROVIDED_MESSAGE.to_string(),
+        message: DELETE_POLICY_REVISION_MISMATCH_MESSAGE.to_string(),
     }
 }
-
-/// The wording of [`policy_revision_not_provided`], which a caller of the conditional
-/// put sees when it omits `PolicyRevisionId` after one has been assigned.
-pub const POLICY_REVISION_NOT_PROVIDED_MESSAGE: &str =
-    "The policy revision ID that you provided does not match the latest policy revision ID.";
 
 /// `ConflictException` for a create whose `Name` a stored app monitor already holds.
 ///

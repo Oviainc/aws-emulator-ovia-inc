@@ -201,10 +201,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
-        if let Some(message) = crate::state::policy_document_refusal(&input.policy_document) {
+        if crate::state::policy_document_refusal(&input.policy_document).is_some() {
+            // The refusal reports the error CLASS and nothing else: recorded behaviour
+            // carries no `message` member on this one, so which rule of the policy grammar
+            // the document broke decides the refusal without being reported
+            // (`crate::state::malformed_policy_document`).
             return Err(
                 PutResourcePolicyErrorModeled::MalformedPolicyDocumentException(
-                    MalformedPolicyDocumentException { message },
+                    crate::state::malformed_policy_document(),
                 )
                 .into(),
             );
@@ -258,7 +262,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names one is conditional on it being the policy's current one, and once a
         // revision id has been assigned a request that names none is refused too, rather
         // than overwriting the policy unconditionally. The check happens before anything
-        // is written, so a refused put leaves the stored policy exactly as it was.
+        // is written, so a refused put leaves the stored policy exactly as it was. The
+        // refusal carries THIS operation's own fixed wording
+        // (`crate::state::PUT_POLICY_REVISION_MISMATCH_MESSAGE`), which the service words
+        // differently from the delete's refusal of the same error class.
         if let Some(mismatch) = store.app_monitor(&region, &input.name).and_then(|record| {
             record.policy_revision_refusal_on_current(input.policy_revision_id.as_deref())
         }) {

@@ -63,16 +63,19 @@ const POLICY_REVISION_ID_BOUNDS: (usize, usize) = (1, 255);
 /// optimistic-concurrency round trip orderable.
 const FIRST_POLICY_REVISION_ID: &str = "1";
 
-/// The message RUM answers `InvalidPolicyRevisionIdException` with when the request
-/// provided no `PolicyRevisionId` at all and one had been assigned.
-/// Source: the error's own documented sentence
-/// (`smithy_query(query="shape", shape="InvalidPolicyRevisionIdException")` — "The policy
-/// revision ID that you provided … match the latest policy revision ID"), carrying no id
-/// because the request named none, in the same "does not match" voice as the refusal of a
-/// stale id. No recording of this case is available, so the assertion pins the wording the
-/// service answers with rather than one taken from a recorded run.
-const POLICY_REVISION_NOT_PROVIDED_MESSAGE: &str =
-    "The policy revision ID that you provided does not match the latest policy revision ID.";
+/// The message `PutResourcePolicy` answers `InvalidPolicyRevisionIdException` with, for
+/// every request of that operation its optimistic-lock check refuses — including one that
+/// provided no `PolicyRevisionId` at all after one had been assigned.
+/// Source: recorded RUM behaviour — wholly fixed text, carrying no part of the request.
+/// The wording of each operation's refusal is pinned over a table of inputs in
+/// `policy_revision_refusal_wording.rs`.
+const PUT_POLICY_REVISION_MISMATCH_MESSAGE: &str =
+    "If policyRevisionID is provided, then it must match the existing revision.";
+
+/// The message `DeleteResourcePolicy` answers the same error class with: recorded RUM
+/// behaviour again, worded differently from the put's and with no trailing period.
+const DELETE_POLICY_REVISION_MISMATCH_MESSAGE: &str =
+    "PolicyRevisionID must match the existing revision";
 
 /// A syntactically valid `PolicyRevisionId` that no revision of any policy here carries.
 const FOREIGN_POLICY_REVISION_ID: &str = "00000000-0000-4000-8000-000000000000";
@@ -234,6 +237,30 @@ fn assert_refused(reply: &Reply, case: &str, status: u16, code: &str) {
     assert_eq!(
         actual, code,
         "case {case:?}: expected error code {code}, got {actual:?}"
+    );
+}
+
+/// Assert a refusal reports the error CLASS alone: the body carries `__type` and no other
+/// member, so a caller gets the code with no message beside it.
+///
+/// Source: recorded RUM behaviour for `MalformedPolicyDocumentException` — the body has no
+/// `message` member at all, although the model declares one.
+fn assert_reports_the_class_alone(reply: &Reply, case: &str) {
+    let document = reply.json(case);
+    let members: Vec<String> = document
+        .as_object()
+        .map(|body| {
+            body.keys()
+                .filter(|key| *key != "__type")
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default();
+    assert!(
+        members.is_empty(),
+        "case {case:?}: expected a body carrying the error class alone, got the \
+         member(s) {members:?} in {:?}",
+        String::from_utf8_lossy(&reply.body)
     );
 }
 
@@ -736,6 +763,7 @@ async fn malformed_documents_are_refused_and_store_nothing() {
 
         let put = put_policy(&router, &name, &document, None).await;
         assert_refused(&put, case, 400, "MalformedPolicyDocumentException");
+        assert_reports_the_class_alone(&put, case);
 
         // Nothing was stored: the monitor still carries no policy at all.
         let get = get_policy(&router, &name).await;
@@ -744,6 +772,7 @@ async fn malformed_documents_are_refused_and_store_nothing() {
         // And a refused put never replaces a policy that is already there.
         let onto_holder = put_policy(&router, holder, &document, None).await;
         assert_refused(&onto_holder, case, 400, "MalformedPolicyDocumentException");
+        assert_reports_the_class_alone(&onto_holder, case);
         let held = get_policy(&router, holder).await;
         assert_stored_document(case, &good, &held.member(case, "PolicyDocument"));
         assert_eq!(
@@ -1431,14 +1460,12 @@ async fn a_put_is_refused_unless_it_provides_the_assigned_revision() {
             );
         } else {
             assert_refused(&follow_up, case, 400, "InvalidPolicyRevisionIdException");
-            if named == Named::Nothing {
-                let message = follow_up.member(case, "message");
-                assert_eq!(
-                    message, POLICY_REVISION_NOT_PROVIDED_MESSAGE,
-                    "case {case:?}: expected the message \
-                     {POLICY_REVISION_NOT_PROVIDED_MESSAGE:?}, got {message:?}"
-                );
-            }
+            let message = follow_up.member(case, "message");
+            assert_eq!(
+                message, PUT_POLICY_REVISION_MISMATCH_MESSAGE,
+                "case {case:?}: expected the message \
+                 {PUT_POLICY_REVISION_MISMATCH_MESSAGE:?}, got {message:?}"
+            );
             // Nothing was written: the policy and the revision in force are untouched.
             assert_stored_document(case, &held, &read.member(case, "PolicyDocument"));
             assert_eq!(
@@ -1483,6 +1510,12 @@ async fn a_delete_stays_conditional_only_on_the_revision_it_provides() {
         let deleted = delete_policy(&router, &name, named.value(&in_force, &stale).as_deref()).await;
         if !accepted {
             assert_refused(&deleted, case, 400, "InvalidPolicyRevisionIdException");
+            let message = deleted.member(case, "message");
+            assert_eq!(
+                message, DELETE_POLICY_REVISION_MISMATCH_MESSAGE,
+                "case {case:?}: expected the message \
+                 {DELETE_POLICY_REVISION_MISMATCH_MESSAGE:?}, got {message:?}"
+            );
             assert_stored_document(
                 case,
                 &document,

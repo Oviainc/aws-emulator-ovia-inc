@@ -26,11 +26,16 @@ pub struct PutResourcePolicyOutput {
     pub policy_revision_id: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.rum#MalformedPolicyDocumentException")]
+/// The body of this error class as RUM sends it: recorded behaviour answers it with the
+/// code alone, so `message` — which the model declares — is declared unsupported and stays
+/// off the wire, exactly as `ResourceNotFoundException`'s `resourceName` does. Constructed
+/// through `crate::state::malformed_policy_document`.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.rum#MalformedPolicyDocumentException",
+    unsupported = ["message"]
+)]
 #[derive(Debug, Clone, Default)]
-pub struct MalformedPolicyDocumentException {
-    pub message: String,
-}
+pub struct MalformedPolicyDocumentException {}
 
 #[smithy_macros::smithy(shape = "com.amazonaws.rum#PolicySizeLimitExceededException")]
 #[derive(Debug, Clone, Default)]
