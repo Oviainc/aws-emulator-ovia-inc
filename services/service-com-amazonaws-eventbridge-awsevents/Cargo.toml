@@ -64,6 +64,11 @@ aws-sdk-kinesis = { version = "1", default-features = false }
 # A CodePipeline pipeline target is delivered to with `StartPipelineExecution`,
 # over the same in-process callback.
 aws-sdk-codepipeline = { version = "1", default-features = false }
+# A CloudWatch Logs log-group target is delivered to by WRITING into the group
+# over the same in-process callback (`CreateLogStream` then `PutLogEvents`), and
+# the resource policies in force over that group — which decide the write — are
+# read through `DescribeResourcePolicies`.
+aws-sdk-cloudwatchlogs = { version = "1", default-features = false }
 # `FailedInvocations`, the metric EventBridge counts an undeliverable event on,
 # is appended to the CloudWatch store in the SAME shared engine (the `AWS/Events`
 # namespace). CloudWatch refuses a `PutMetricData` into a reserved `AWS/`
@@ -116,6 +121,10 @@ service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
 service-com-amazonaws-kms-trentservice = { workspace = true }
+# A rule target that is a CloudWatch Logs log group is asserted where a client
+# reads one: the log events that service's own `FilterLogEvents` reports, and the
+# resource policy on the group that decides whether the write happens at all.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # A publication a RUNNING Lambda handler makes is judged against the policies in
 # force on the function's execution role, so the authorization suite that spans
 # that path mounts Lambda and the token service beside EventBridge on one engine:

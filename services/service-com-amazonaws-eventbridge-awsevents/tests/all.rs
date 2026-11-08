@@ -95,6 +95,8 @@ mod kinesis_target_delivery;
 mod kinesis_target_shard_affinity;
 #[path = "all/kinesis_target_stream_consumption.rs"]
 mod kinesis_target_stream_consumption;
+#[path = "all/log_group_target_delivery.rs"]
+mod log_group_target_delivery;
 #[path = "all/missing_resource_wording.rs"]
 mod missing_resource_wording;
 #[path = "all/or_relationship_branches.rs"]

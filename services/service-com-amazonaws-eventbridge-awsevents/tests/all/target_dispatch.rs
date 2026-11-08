@@ -105,6 +105,14 @@ pub(crate) fn emulator() -> Emulator {
     router.register_service(
         service_com_amazonaws_kms_trentservice::EmulatedService::new(Arc::clone(&engine)),
     );
+    // CloudWatch Logs: a rule target that is a log group is delivered to by writing a
+    // log event into that group, and the write is read back through that service's own
+    // `FilterLogEvents` — the resource policies that decide the write live there too.
+    router.register_service(
+        service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
+    );
     Emulator { router, engine }
 }
 

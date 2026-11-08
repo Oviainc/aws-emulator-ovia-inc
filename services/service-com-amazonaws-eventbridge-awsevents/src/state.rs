@@ -3252,16 +3252,33 @@ pub fn target_policy_admits(
     attempt: &DeliveryAttempt<'_>,
     rule_arn: &str,
 ) -> bool {
+    policy.is_some_and(|document| {
+        target_policy_decision(document, attempt, rule_arn)
+            == ::service_common::iam_authorization::Decision::Allowed
+    })
+}
+
+/// What the TARGET's document `policy` states about the invocation `attempt`
+/// describes, in IAM's own three answers.
+///
+/// The decision [`target_policy_admits`] reads, answered rather than collapsed to
+/// a grant for the target over which SEVERAL documents are in force — a log
+/// group's own resource policy and the account's are both over a write into that
+/// group ([`log_group_target::documents_admit`]) — because IAM's order spans the
+/// whole set: an explicit `Deny` in ANY document refuses the invocation whatever
+/// another grants, which one document's verdict cannot say.
+pub fn target_policy_decision(
+    policy: &str,
+    attempt: &DeliveryAttempt<'_>,
+    rule_arn: &str,
+) -> ::service_common::iam_authorization::Decision {
     let (action, resource) = (attempt.action, attempt.resource);
     let principals = [SERVICE_PRINCIPAL.to_string()];
     let context = target_invocation_condition_context(rule_arn);
     let request = ::service_common::iam_authorization::Request::new(action, resource, &principals)
         .with_context(&context)
         .with_published_keys(&TARGET_INVOCATION_CONDITION_KEYS);
-    policy.is_some_and(|document| {
-        ::service_common::iam_authorization::resource_decision(document, &request)
-            == ::service_common::iam_authorization::Decision::Allowed
-    })
+    ::service_common::iam_authorization::resource_decision(policy, &request)
 }
 
 /// The condition EventBridge reports for a delivery whose target was not there
@@ -4935,6 +4952,16 @@ pub mod event_pattern;
 /// connection holds and the parameters the connection and the target each
 /// contribute to the request.
 pub mod invocation;
+
+/// The LOG RECORD a delivery to a CloudWatch Logs log-group target writes: the
+/// group the target's ARN names, the stream the write opens, and the
+/// `{timestamp, message}` pair the delivered text is written as.
+///
+/// A log-group target is delivered to by WRITING into the group rather than by
+/// invoking an API of it, so what the delivered text becomes is a reading of
+/// that text and belongs beside the other readings of a delivery
+/// ([`input_transform`]) rather than in the handler that makes the write.
+pub mod log_group_target;
 
 /// The SCHEDULE a rule fires on: when a rule carrying a `ScheduleExpression` is
 /// due, and what firing one hands its targets.
