@@ -544,7 +544,8 @@ pub fn merge_base_files(
 ///
 /// A fast-forward merge moves a reference rather than merging content, so what
 /// decides it is which of the two tips the merge base IS, and nothing about the
-/// paths either side changed.
+/// paths either side changed. Only [`FastForward::Advances`] is a merge this
+/// strategy can make: see [`FastForward::advances`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FastForward {
     /// The destination tip is the merge base, so the destination's history is a
@@ -552,13 +553,29 @@ pub enum FastForward {
     /// The same condition [`MergeEvaluation::is_fast_forward`] reports.
     Advances,
     /// The source tip is the merge base, so its history is already part of the
-    /// destination's: there is nothing left to advance, and the destination tip
-    /// stands as the merged commit.
+    /// destination's and the destination holds commits the source does not: the
+    /// reference would have to move BACKWARDS onto an ancestor to take the
+    /// source tip, which is not an advance, so this strategy cannot make the
+    /// merge.
     AlreadyMerged,
     /// Neither tip is the other's ancestor: each history holds commits the other
     /// does not, so honouring both needs a merge commit, which no reference move
     /// can make.
     Diverged,
+}
+
+impl FastForward {
+    /// Can this merge be made by advancing the destination reference, which is
+    /// the only merge a fast-forward strategy performs?
+    ///
+    /// True only where the destination tip IS the merge base — the same reading
+    /// of the relation [`MergeEvaluation::is_fast_forward`] reports, so what
+    /// `GetMergeOptions` offers as a strategy and what a fast-forward merge
+    /// performs cannot disagree. Two tips that are the same commit advance by
+    /// nothing and are still an advance.
+    pub fn advances(self) -> bool {
+        matches!(self, FastForward::Advances)
+    }
 }
 
 /// How the two tips are related by ancestry in this repository, resolving the
@@ -974,12 +991,41 @@ pub enum ResolutionProblem {
     PathNotInResult(String),
 }
 
-/// Does this `conflictResolution` ask for anything at all?
+/// Is this request asking for a conflict resolution its strategy cannot honour?
 ///
 /// A resolution is "a list of inputs to use when resolving conflicts during a
-/// merge" only under `AUTOMERGE`, so an operation asks this BEFORE checking the
-/// entries themselves: a list that cannot be honoured at all is why the request
-/// fails, whatever one of its entries says.
+/// merge" only under `AUTOMERGE`: under any other strategy the version each
+/// conflicting path takes is already decided, so a list supplied with one cannot
+/// be honoured and the request is refused rather than silently ignored. The
+/// combination is what fails, so it is judged BEFORE the entries themselves and
+/// whatever one of them says — an entry of a list the merge will not read is
+/// never examined.
+pub fn resolution_cannot_be_honoured(
+    strategy: &str,
+    resolution: Option<&ConflictResolution>,
+) -> bool {
+    resolution_supplied(resolution) && strategy != CONFLICT_RESOLUTION_AUTOMERGE
+}
+
+/// `InvalidConflictResolutionException`'s message for a `conflictResolution` the
+/// request's strategy cannot honour: the sentence CodeCommit answers that
+/// combination with, naming the strategy the merge is being evaluated with — the
+/// one the request asked for, or `NONE` where it asked for none.
+///
+/// The one place this crate words that combination, so every operation that
+/// takes a `conflictResolution` states it identically, and the one the
+/// pre-dispatch layer
+/// ([`crate::service::conflict_resolution`]) states it with for a request whose
+/// entries the model's own constraints would otherwise refuse first.
+pub fn invalid_conflict_resolution_message(strategy: &str) -> String {
+    format!(
+        "Conflict resolution parameter cannot be used together with {strategy} conflict \
+         resolution strategy"
+    )
+}
+
+/// Does this `conflictResolution` ask for anything at all? An absent block, and
+/// one whose three lists are all absent or empty, ask for nothing.
 pub fn resolution_supplied(resolution: Option<&ConflictResolution>) -> bool {
     resolution.is_some_and(|resolution| {
         [

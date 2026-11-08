@@ -5,18 +5,18 @@
 //! Implemented: advances ONE stored reference — the `targetBranch`, or the branch the
 //! destination specifier itself names — from the destination tip to the source tip,
 //! which is all a fast-forward is. No commit is written, so the merge is admitted
-//! exactly where the two tips are related by ancestry, which is where one of them IS
-//! their merge base: where the destination tip is the base, its history is a prefix of
-//! the source's and the reference advances to the source; where the SOURCE tip is the
-//! base, its history is already part of the destination's, so there is nothing to
-//! advance and the destination tip stands as the merge. Where neither tip is the
-//! other's ancestor, each history holds commits the other does not and honouring both
-//! needs a merge commit, which this strategy cannot make: the call is refused with the
+//! exactly where the destination tip IS the merge base of the two: there its history
+//! is a prefix of the source's and the reference advances to the source (two tips
+//! that are the same commit advance by nothing and are still admitted). Where the
+//! destination tip is NOT the base, it holds commits the source does not — the source
+//! already merged, or the two histories diverged — so the merge needs a commit that
+//! honours both sides, which this strategy cannot make: the call is refused with the
 //! modelled `ManualMergeRequiredException` and nothing is written.
 //!
 //! The ancestry question is [`crate::state::merge::fast_forward`], built on the merge
 //! base every merge question in this service shares with `GetMergeOptions`, so the two
-//! cannot disagree about what the base is. It is charged to one per-request budget and
+//! cannot disagree about what the base is or about whether a fast-forward is one of
+//! the strategies this pair of tips admits. It is charged to one per-request budget and
 //! runs off the async worker, exactly as that operation's evaluation is, because it
 //! holds the store guard it walks the history through for its whole span.
 //!
@@ -269,7 +269,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let source_commit_id = source.commit_id.clone();
         let source_tree_id = source.tree_id.clone();
         let destination_commit_id = destination.commit_id.clone();
-        let destination_tree_id = destination.tree_id.clone();
 
         // The reference this merge is applied to: "the branch where the merge is
         // applied" when the caller names one, and otherwise the branch the
@@ -381,36 +380,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
-        // Which of the two tips the merge leaves in the target branch, and whether
-        // the reference has to move to get there.
-        let (merged_commit_id, merged_tree_id) = match relation {
-            // The destination's history is a prefix of the source's: the reference
-            // advances, and the source tip is what the target branch then holds.
-            crate::state::merge::FastForward::Advances => {
-                (source_commit_id.clone(), source_tree_id)
-            }
-            // The source is already part of the destination's history, so there is
-            // nothing to advance and the destination tip stands as the merge.
-            crate::state::merge::FastForward::AlreadyMerged => {
-                (destination_commit_id.clone(), destination_tree_id)
-            }
-            crate::state::merge::FastForward::Diverged => {
-                // Each history holds commits the other does not, so honouring both
-                // sides needs a merge commit, which no reference move can make —
-                // which is exactly what the modelled refusal says, in the one
-                // sentence the service answers that code with for every merge path.
-                return Err(
-                    MergeBranchesByFastForwardErrorModeled::ManualMergeRequiredException(
-                        ManualMergeRequiredException {
-                            message: Some(
-                                crate::state::MANUAL_MERGE_REQUIRED_MESSAGE.to_string(),
-                            ),
-                        },
-                    )
-                    .into(),
-                );
-            }
-        };
+        // A fast-forward is admitted only where the destination reference can
+        // ADVANCE to the source tip. Any other relation leaves the destination
+        // holding commits the source does not — the source already merged, or the
+        // two histories diverged — so taking the source tip would move the
+        // reference off them rather than advance it, and honouring both sides
+        // needs a merge commit this strategy cannot make. That is what the
+        // modelled refusal says, in the one sentence the service answers that code
+        // with for every merge path, and nothing is written.
+        if !relation.advances() {
+            return Err(
+                MergeBranchesByFastForwardErrorModeled::ManualMergeRequiredException(
+                    ManualMergeRequiredException {
+                        message: Some(crate::state::MANUAL_MERGE_REQUIRED_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        // The merge the target branch is left at: the source tip, whose history
+        // now contains the destination's.
+        let (merged_commit_id, merged_tree_id) = (source_commit_id.clone(), source_tree_id);
 
         // Advance the reference. A target already at the merged commit has nothing
         // left to do — the source is already merged, the same request repeated, or a

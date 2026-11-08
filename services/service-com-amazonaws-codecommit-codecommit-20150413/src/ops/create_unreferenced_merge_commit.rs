@@ -494,16 +494,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // rather than silently ignored. Checked BEFORE the entries themselves,
         // because a list that cannot be honoured at all is the primary reason the
         // request fails, whatever one of its entries says.
-        let resolution_supplied = merge::resolution_supplied(input.conflict_resolution.as_ref());
-        if resolution_supplied && strategy != merge::CONFLICT_RESOLUTION_AUTOMERGE {
+        if merge::resolution_cannot_be_honoured(strategy, input.conflict_resolution.as_ref()) {
             return Err(
                 CreateUnreferencedMergeCommitErrorModeled::InvalidConflictResolutionException(
                     InvalidConflictResolutionException {
-                        message: Some(format!(
-                            "a conflict resolution list is used only with the \
-                             {} conflict resolution strategy",
-                            merge::CONFLICT_RESOLUTION_AUTOMERGE
-                        )),
+                        message: Some(merge::invalid_conflict_resolution_message(strategy)),
                     },
                 )
                 .into(),

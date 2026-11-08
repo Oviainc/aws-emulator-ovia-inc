@@ -4,6 +4,13 @@
 //! Implemented: persists a pull request between two branches of one stored
 //! repository in `crate::state` and answers with the stored pull request.
 //!
+//! The two sides have to be a comparison: a request whose references name ONE
+//! branch, and one whose two branches hold the SAME tip, are both refused with
+//! the modelled `SourceAndDestinationAreSameException` — the two conditions its
+//! sentence states — and a reference the repository does not hold with
+//! `ReferenceDoesNotExistException`, naming the specifier that resolved to
+//! nothing.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -226,6 +233,38 @@ fn checked_reference(raw: &str) -> Result<&str, CreatePullRequestError> {
             .into()
         }
     })
+}
+
+/// `SourceAndDestinationAreSameException` as this operation models it, worded in
+/// the one place this crate words that code.
+///
+/// Raised for BOTH conditions its sentence states: the two references naming one
+/// branch, and two differently named branches whose tips are the same commit —
+/// neither is a comparison a pull request can be opened over.
+fn source_and_destination_are_same() -> CreatePullRequestError {
+    CreatePullRequestErrorModeled::SourceAndDestinationAreSameException(
+        SourceAndDestinationAreSameException {
+            message: Some(crate::state::SOURCE_AND_DESTINATION_ARE_SAME_MESSAGE.to_string()),
+        },
+    )
+    .into()
+}
+
+/// `ReferenceDoesNotExistException`'s message for a reference the repository does
+/// not hold: the sentence CodeCommit answers for a specifier it could not resolve
+/// to a commit — the specifier as the request spelled it, then the two reasons it
+/// may name nothing: it does not exist, or what it names was never pushed.
+///
+/// A pull request is opened between two references the caller NAMES, so the
+/// refusal names the one that resolved to nothing. Where the request named none —
+/// the destination left to a repository that has no default branch — there is no
+/// specifier to state, and the refusal keeps the shape's own documented sentence
+/// ([`crate::state::REFERENCE_DOES_NOT_EXIST_MESSAGE`]).
+fn reference_does_not_exist_message(specifier: &str) -> String {
+    format!(
+        "AWS CodeCommit could not find the commit specifier {specifier}. Either the specifier \
+         does not exist, or the commit has not yet been pushed to the remote repository."
+    )
 }
 
 /// The pull request this call created (or, on a repeated idempotency token, the
@@ -479,15 +518,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     )
                 })?;
 
-            let reference_does_not_exist = || {
+            // A reference that resolves to no stored branch, named in the
+            // refusal where the request named it: `None` is the destination a
+            // request left to a repository that has no default branch, which
+            // names no specifier at all.
+            let reference_does_not_exist = |specifier: Option<&str>| {
                 CreatePullRequestErrorModeled::ReferenceDoesNotExistException(
                     ReferenceDoesNotExistException {
-                        message: Some(
-                            crate::state::REFERENCE_DOES_NOT_EXIST_MESSAGE.to_string(),
-                        ),
+                        message: Some(match specifier {
+                            Some(specifier) => reference_does_not_exist_message(specifier),
+                            None => crate::state::REFERENCE_DOES_NOT_EXIST_MESSAGE.to_string(),
+                        }),
                     },
                 )
             };
+            // The specifiers the request itself named, which the refusals below
+            // state rather than the branch names they resolve to.
+            let source_specifier = target.source_reference.trim();
+            let destination_specifier = target
+                .destination_reference
+                .as_deref()
+                .map(str::trim)
+                .filter(|reference| !reference.is_empty());
             // "The branch of the repository where the pull request changes are
             // merged": the request's own destination, or the repository's
             // default branch when it names none.
@@ -496,22 +548,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 None => repository
                     .default_branch
                     .clone()
-                    .ok_or_else(reference_does_not_exist)?,
+                    .ok_or_else(|| reference_does_not_exist(None))?,
             };
             // The two sides of the comparison must differ. The refusal is worded
             // in the one place this crate words this code, covering both the
             // same-name and the identical-tip condition.
             if source_branch == destination_branch {
-                return Err(
-                    CreatePullRequestErrorModeled::SourceAndDestinationAreSameException(
-                        SourceAndDestinationAreSameException {
-                            message: Some(
-                                crate::state::SOURCE_AND_DESTINATION_ARE_SAME_MESSAGE.to_string(),
-                            ),
-                        },
-                    )
-                    .into(),
-                );
+                return Err(source_and_destination_are_same());
             }
             // Both branches have to be references this repository holds: a pull
             // request is between stored tips, never between a name the
@@ -519,15 +562,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let source_commit = repository
                 .branches
                 .get(&source_branch)
-                .ok_or_else(reference_does_not_exist)?
+                .ok_or_else(|| reference_does_not_exist(Some(source_specifier)))?
                 .commit_id
                 .clone();
             let destination_commit = repository
                 .branches
                 .get(&destination_branch)
-                .ok_or_else(reference_does_not_exist)?
+                .ok_or_else(|| reference_does_not_exist(destination_specifier))?
                 .commit_id
                 .clone();
+            // Two differently named branches whose tips are the SAME commit are
+            // the same comparison as one branch against itself: there is nothing
+            // to merge from one into the other, which is the second condition
+            // this code is raised for and the second half of its sentence.
+            if source_commit == destination_commit {
+                return Err(source_and_destination_are_same());
+            }
 
             let source_reference = crate::state::qualified_reference(&source_branch);
             let destination_reference = crate::state::qualified_reference(&destination_branch);

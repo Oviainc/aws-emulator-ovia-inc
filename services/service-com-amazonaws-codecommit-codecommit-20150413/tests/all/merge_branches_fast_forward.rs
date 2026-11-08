@@ -4,12 +4,15 @@
 //! the router that serves the real emulator.
 //!
 //! The rule under test: a fast-forward merge leaves one stored reference — the
-//! `targetBranch`, or the branch the destination specifier names — at the DESCENDANT of
-//! the two tips and writes no commit: it advances the reference to the source where the
-//! destination tip is an ancestor of it, and leaves the destination tip standing where
-//! the source is already part of the destination's history; where neither tip is the
-//! other's ancestor the call is refused with `ManualMergeRequiredException` and the
-//! repository is left exactly as it was.
+//! `targetBranch`, or the branch the destination specifier names — at the SOURCE tip
+//! and writes no commit, and it is admitted exactly where the destination tip IS the
+//! merge base of the two: there the destination's history is a prefix of the source's
+//! and the reference advances (two tips that are the same commit advance by nothing).
+//! Where the destination tip is not the base — the source already part of the
+//! destination's history, or two histories neither of which contains the other — the
+//! call is refused with `ManualMergeRequiredException` and the repository is left
+//! exactly as it was, which is the same answer `GetMergeOptions` gives by offering no
+//! fast-forward for that pair.
 //!
 //! The tables below span the class that rule covers — how far each side moved, which
 //! side is ahead, every commit-specifier form for either side, an explicit target branch
@@ -177,9 +180,9 @@ fn request(source: &str, destination: &str, target: Option<&str>) -> Value {
 struct Case<'a> {
     label: &'a str,
     /// How many commits the destination branch takes past the base commit. Nothing
-    /// past it leaves the destination an ancestor of the source, so the reference
-    /// advances; commits past it with NO source commit leave the source already
-    /// part of the destination's history, where there is nothing to advance.
+    /// past it leaves the destination AT the base, which is what makes the merge a
+    /// fast-forward; a destination that moved is a refusal row instead
+    /// ([`a_destination_that_is_not_the_merge_base_is_refused_and_changes_nothing`]).
     destination_commits: usize,
     /// How many commits the source branch takes past the base commit.
     source_commits: usize,
@@ -296,48 +299,14 @@ async fn a_fast_forward_leaves_the_target_branch_at_the_descendant_tip() {
             target: None,
             destination_follows_the_branch: true,
         },
-        Case {
-            label: "the source is already merged: the destination moved, the source did not",
-            destination_commits: 1,
-            source_commits: 0,
-            source: branch_source,
-            destination: branch_destination,
-            target: None,
-            destination_follows_the_branch: true,
-        },
-        Case {
-            label: "already merged three commits back, named by reference",
-            destination_commits: 3,
-            source_commits: 0,
-            source: reference_source,
-            destination: reference_destination,
-            target: Some(DESTINATION),
-            destination_follows_the_branch: true,
-        },
-        Case {
-            label: "already merged, the source named by commit id",
-            destination_commits: 2,
-            source_commits: 0,
-            source: commit_source,
-            destination: head_destination,
-            target: None,
-            destination_follows_the_branch: true,
-        },
     ];
 
     for case in cases {
         let label = case.label;
         let history = History::build(case.destination_commits, case.source_commits).await;
-        // One side at most moves in this table, so the two tips are always related
-        // by ancestry and the merge the commit the target branch is left at is the
-        // DESCENDANT of the two: the source where the reference advances, the
-        // destination where the source is already in its history.
-        let advances = history.destination_commit == history.base_commit;
-        let (merged, other) = if advances {
-            (&history.source_commit, &history.destination_commit)
-        } else {
-            (&history.destination_commit, &history.source_commit)
-        };
+        // Every row here leaves the destination AT the merge base, so the merge is
+        // the SOURCE tip and the destination is the side that did not move.
+        let (merged, other) = (&history.source_commit, &history.destination_commit);
         let body = request(
             &(case.source)(&history),
             &(case.destination)(&history),
@@ -376,27 +345,24 @@ async fn a_fast_forward_leaves_the_target_branch_at_the_descendant_tip() {
             "case {label:?}: the source branch must not move, got {source_branch:?}"
         );
 
-        // Where the reference advanced, what the source wrote is readable on the
-        // destination branch now, which is what advancing it means for a later
-        // reader.
-        if advances {
-            if let Some((path, content)) = &history.last_source_file {
-                let read = ok(
-                    &history.router,
-                    "GetFile",
-                    &json!({
-                        "repositoryName": REPOSITORY,
-                        "filePath": path,
-                        "commitSpecifier": DESTINATION,
-                    }),
-                )
-                .await;
-                assert_eq!(
-                    from_base64(&string_at(&read, "/fileContent")),
-                    *content,
-                    "case {label:?}: {path} must be readable on {DESTINATION} after the merge"
-                );
-            }
+        // What the source wrote is readable on the destination branch now, which is
+        // what advancing the reference means for a later reader.
+        if let Some((path, content)) = &history.last_source_file {
+            let read = ok(
+                &history.router,
+                "GetFile",
+                &json!({
+                    "repositoryName": REPOSITORY,
+                    "filePath": path,
+                    "commitSpecifier": DESTINATION,
+                }),
+            )
+            .await;
+            assert_eq!(
+                from_base64(&string_at(&read, "/fileContent")),
+                *content,
+                "case {label:?}: {path} must be readable on {DESTINATION} after the merge"
+            );
         }
 
         // Merging again has nothing left to advance. Where the destination follows
@@ -427,13 +393,18 @@ async fn a_fast_forward_leaves_the_target_branch_at_the_descendant_tip() {
 }
 
 #[tokio::test]
-async fn two_diverged_tips_are_refused_and_change_nothing() {
-    // Rows differ along how far each side diverged: both sides hold commits the
-    // other does not, which is the only shape a fast-forward cannot serve.
+async fn a_destination_that_is_not_the_merge_base_is_refused_and_changes_nothing() {
+    // Rows differ along how the destination came to hold commits the source does
+    // not: both sides moved (neither history contains the other), and only the
+    // destination moved, by one commit and by several (the source already part of
+    // the destination's history). Either way the destination tip is not the merge
+    // base, so the reference cannot advance and the merge is not a fast-forward.
     let cases: Vec<(&str, usize, usize)> = vec![
         ("one commit on each side", 1, 1),
         ("two on the destination, three on the source", 2, 3),
         ("three on the destination, one on the source", 3, 1),
+        ("the source already merged: one commit on the destination", 1, 0),
+        ("the source already merged three commits back", 3, 0),
     ];
 
     for (label, destination_commits, source_commits) in cases {

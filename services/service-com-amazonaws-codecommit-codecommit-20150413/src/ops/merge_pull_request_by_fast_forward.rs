@@ -7,16 +7,18 @@
 //! A fast-forward is nothing but an advance of the destination reference, so the
 //! only question it asks is how the two tips are related by ancestry
 //! ([`crate::state::merge::fast_forward`], the one reading of that relation this
-//! crate has, shared with `MergeBranchesByFastForward` and `GetMergeOptions`): where
-//! the destination tip is the merge base, the destination branch is left at the
-//! SOURCE tip and that tip is the merge; where the source tip is already part of the
-//! destination's history there is nothing to advance, so the destination tip stands
-//! as the merge and no reference moves. Nothing about which paths either side
-//! changed enters into it, which is why this operation models no conflict members.
+//! crate has, shared with `MergeBranchesByFastForward` and `GetMergeOptions`): the
+//! merge is admitted exactly where the destination tip IS the merge base of the two,
+//! and the destination branch is then left at the SOURCE tip, which is the merge
+//! (two references holding the same tip advance by nothing and are still admitted).
+//! Nothing about which paths either side changed enters into it, which is why this
+//! operation models no conflict members.
 //!
-//! Two tips neither of which is the other's ancestor cannot be joined by moving a
-//! reference, so the merge is refused with the modelled
-//! `ManualMergeRequiredException` and nothing is written; so are a pull request that
+//! A destination tip that is NOT the merge base holds commits the source does not —
+//! the source already merged, or the two histories diverged — and no move of the
+//! destination reference can honour both sides, so the merge is refused with the
+//! modelled `ManualMergeRequiredException` and nothing is written; so are a pull
+//! request that
 //! was closed without ever being merged, one whose approval rules still state
 //! conditions its approvals do not meet
 //! ([`crate::state::PullRequestRecord::approval_rules_satisfied`]), and one whose
@@ -489,24 +491,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ))
             }
         })?;
-        // Which commit the destination branch holds once the merge is made, and the
-        // merge base it was made against — for a fast-forward the base IS one of
-        // the two tips, which is what makes the merge a reference move.
-        let (merge_commit_id, base_commit_id) = match relation {
-            // The destination's history is a prefix of the source's: the reference
-            // advances, and the source tip is the merge.
-            crate::state::merge::FastForward::Advances => {
-                (source_tip.clone(), destination_tip.clone())
-            }
-            // The source is already part of the destination's history, so there is
-            // nothing to advance and the destination tip stands as the merge.
-            crate::state::merge::FastForward::AlreadyMerged => {
-                (destination_tip.clone(), source_tip.clone())
-            }
-            // Each history holds commits the other does not, so honouring both
-            // sides needs a merge commit, which no reference move can make.
-            crate::state::merge::FastForward::Diverged => return Err(manual_merge_required()),
-        };
+        // A fast-forward is admitted only where the destination reference can
+        // ADVANCE to the source tip. Any other relation leaves the destination
+        // holding commits the source does not — the source already merged, or the
+        // two histories diverged — so no move of the destination reference
+        // honours both sides and the merge needs a commit this strategy cannot
+        // make.
+        if !relation.advances() {
+            return Err(manual_merge_required());
+        }
+        // The merge the destination reference is left at, and the base it was made
+        // against — for a fast-forward the base IS the destination tip, which is
+        // what makes the merge a reference move.
+        let (merge_commit_id, base_commit_id) = (source_tip.clone(), destination_tip.clone());
 
         // A fast-forward writes no commit and no object: the merge IS one of the
         // two tips, so all there is to write is the reference. A destination

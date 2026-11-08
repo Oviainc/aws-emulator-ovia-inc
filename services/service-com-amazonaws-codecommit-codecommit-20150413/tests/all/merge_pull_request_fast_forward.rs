@@ -6,11 +6,12 @@
 //! The rule under test is the fast-forward merge itself: it merges a pull request by
 //! MOVING its destination reference rather than by writing a commit, so the only
 //! thing that decides it is how the current tips of its two references are related
-//! by ancestry. Where the destination tip is an ancestor of the source tip the
-//! destination branch is left at the SOURCE tip; where the source tip is already in
-//! the destination's history nothing moves and the destination tip stands as the
-//! merge; and where neither tip is the other's ancestor the merge is refused with
-//! HTTP 400 `ManualMergeRequiredException` and nothing is written. A merge that goes
+//! by ancestry. The merge is made exactly where the destination tip IS the merge
+//! base of the two — there the destination branch is left at the SOURCE tip — and
+//! every other relation (the source already in the destination's history, two
+//! histories neither of which contains the other) is refused with HTTP 400
+//! `ManualMergeRequiredException`, nothing being written, because a reference that
+//! cannot advance cannot honour both sides. A merge that goes
 //! through closes the pull request and records what was merged, who merged it, the
 //! commit the destination branch then holds and the `FAST_FORWARD_MERGE` strategy.
 //!
@@ -81,23 +82,12 @@ const STATEMENT_TYPE: &str = "Approvers";
 /// (`smithy_query(query="shape",shape="ApprovalState")`).
 const APPROVE: &str = "APPROVE";
 
-/// Which of the two tips the fast-forward leaves on the destination branch — the
-/// expectation of a row that merges, derived from the ancestry the row builds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Lands {
-    /// The destination reference advances to the source tip.
-    SourceTip,
-    /// The source is already in the destination's history, so the destination tip
-    /// stands as the merge and no reference moves.
-    DestinationTip,
-}
-
 /// What the merge must answer for one row of the merge table.
 #[derive(Debug, Clone)]
 enum Expected {
-    /// The merge goes through: which tip the destination branch is left at, and the
-    /// tree readable there afterwards.
-    Merged(Lands, Vec<(&'static str, &'static str, &'static str)>),
+    /// The merge goes through, which can only leave the destination branch at the
+    /// SOURCE tip: the tree readable there afterwards.
+    Merged(Vec<(&'static str, &'static str, &'static str)>),
     /// The modelled error code the request is refused with.
     Refused(&'static str),
 }
@@ -161,13 +151,10 @@ fn rows() -> Vec<Row> {
             vec![("README.md", "# base\n")],
             vec![],
             vec![vec![Change::Put("src/only.txt", "source\n")]],
-            Expected::Merged(
-                Lands::SourceTip,
-                vec![
-                    ("README.md", "# base\n", NORMAL),
-                    ("src/only.txt", "source\n", NORMAL),
-                ],
-            ),
+            Expected::Merged(vec![
+                ("README.md", "# base\n", NORMAL),
+                ("src/only.txt", "source\n", NORMAL),
+            ]),
         ),
         // Several commits ahead rather than one: the advance is over the whole run
         // of them, so the tree is the last commit's.
@@ -180,14 +167,11 @@ fn rows() -> Vec<Row> {
                 vec![Change::Put("deep/a/b/c.txt", "nested\n")],
                 vec![Change::PutMode("run.sh", "#!/bin/sh\n", EXECUTABLE)],
             ],
-            Expected::Merged(
-                Lands::SourceTip,
-                vec![
-                    ("a.txt", "two\n", NORMAL),
-                    ("deep/a/b/c.txt", "nested\n", NORMAL),
-                    ("run.sh", "#!/bin/sh\n", EXECUTABLE),
-                ],
-            ),
+            Expected::Merged(vec![
+                ("a.txt", "two\n", NORMAL),
+                ("deep/a/b/c.txt", "nested\n", NORMAL),
+                ("run.sh", "#!/bin/sh\n", EXECUTABLE),
+            ]),
         ),
         // A run of commits that DELETES what the base held: a fast-forward carries
         // whatever the source's history did, deletions included.
@@ -199,10 +183,10 @@ fn rows() -> Vec<Row> {
                 vec![Change::Put("b/d.txt", "another\n")],
                 vec![Change::Delete("b/c.txt")],
             ],
-            Expected::Merged(
-                Lands::SourceTip,
-                vec![("a.txt", "one\n", NORMAL), ("b/d.txt", "another\n", NORMAL)],
-            ),
+            Expected::Merged(vec![
+                ("a.txt", "one\n", NORMAL),
+                ("b/d.txt", "another\n", NORMAL),
+            ]),
         ),
         // The same advance with `sourceCommitId` naming the tip the branch holds:
         // the merge proceeds exactly as it does without it.
@@ -211,13 +195,10 @@ fn rows() -> Vec<Row> {
             vec![("README.md", "# base\n")],
             vec![],
             vec![vec![Change::Put("src/only.txt", "source\n")]],
-            Expected::Merged(
-                Lands::SourceTip,
-                vec![
-                    ("README.md", "# base\n", NORMAL),
-                    ("src/only.txt", "source\n", NORMAL),
-                ],
-            ),
+            Expected::Merged(vec![
+                ("README.md", "# base\n", NORMAL),
+                ("src/only.txt", "source\n", NORMAL),
+            ]),
         )
         .pinning(Pin::SourceTip),
         // "Pass this value if you want an exception thrown if the current commit ID
@@ -231,27 +212,21 @@ fn rows() -> Vec<Row> {
             Expected::Refused("TipOfSourceReferenceIsDifferentException"),
         )
         .pinning(Pin::Base),
-        // Neither side moved: the two references hold the SAME tip, so the advance
-        // has nothing to do and that tip is the merge.
-        Row::new(
-            "neither-side-moved",
-            vec![("a.txt", "one\n")],
-            vec![],
-            vec![],
-            Expected::Merged(Lands::SourceTip, vec![("a.txt", "one\n", NORMAL)]),
-        ),
         // Only the destination moved: the source tip is already in the
-        // destination's history, so there is nothing to advance and the
-        // destination's own tree stands.
+        // destination's history, so the destination tip is NOT the merge base and
+        // the reference cannot advance \u2014 the merge is refused rather than reported
+        // as the destination's own tip, exactly as `GetMergeOptions` offers no
+        // fast-forward for this pair.
+        //
+        // (Neither side moving is not a row: two references holding the same tip
+        // are two sides with nothing between them, so no pull request can be
+        // opened over them at all \u2014 see `pull_request_creation`.)
         Row::new(
             "only-the-destination-moved",
             vec![("a.txt", "one\n")],
             vec![vec![Change::Put("d.txt", "destination\n")]],
             vec![],
-            Expected::Merged(
-                Lands::DestinationTip,
-                vec![("a.txt", "one\n", NORMAL), ("d.txt", "destination\n", NORMAL)],
-            ),
+            Expected::Refused("ManualMergeRequiredException"),
         ),
         // Both sides moved, on paths that do not even overlap: neither tip is the
         // other's ancestor, so no reference move can join them however mergeable
@@ -491,14 +466,12 @@ async fn a_fast_forward_merge_moves_the_destination_reference_and_closes_the_pul
                     "case {case:?}: a refused merge leaves the target unmerged, got {target}"
                 );
             }
-            Expected::Merged(lands, entries) => {
+            Expected::Merged(entries) => {
                 // Which commit the rule says the destination branch is left at, and
-                // which commit is then the merge base: for a fast-forward the base
-                // IS the other tip, because one history contains the other.
-                let (expected_commit, expected_base) = match lands {
-                    Lands::SourceTip => (&built.source_tip, &built.destination_tip),
-                    Lands::DestinationTip => (&built.destination_tip, &built.source_tip),
-                };
+                // which commit is then the merge base: a fast-forward is made only
+                // where the destination tip is the base, so the merge is the SOURCE
+                // tip and the base is the destination's own.
+                let (expected_commit, expected_base) = (&built.source_tip, &built.destination_tip);
                 // The parents the landing commit had BEFORE the merge: a
                 // fast-forward writes no commit, so they are unchanged by it.
                 let parents_before =

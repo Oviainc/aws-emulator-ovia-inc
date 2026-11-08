@@ -45,6 +45,7 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+pub mod conflict_resolution;
 pub mod git_http;
 pub mod git_pack;
 
@@ -99,6 +100,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// operation. It reaches this service's store through this handle, exactly as
     /// a handler reaches it through its own `self.engine`.
     engine: Arc<Eng>,
+    /// The refusal [`Service::override_operation`] hands back for a merge request
+    /// whose `conflictResolution` its strategy cannot honour
+    /// ([`conflict_resolution`]). Held on the service because that seam hands the
+    /// router a BORROW of an operation; it carries no state of its own.
+    unhonourable_conflict_resolution: conflict_resolution::UnhonourableConflictResolution<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -109,6 +115,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             engine,
+            unhonourable_conflict_resolution:
+                conflict_resolution::UnhonourableConflictResolution::new(),
         }
     }
 }
@@ -664,11 +672,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        // A merge whose `conflictResolution` its strategy cannot honour is
+        // refused for that COMBINATION, before any entry of the list is looked
+        // at — which the handler cannot do for an entry the MODEL refuses,
+        // because the framework validates the request against the model before
+        // any handler runs. The one seam that runs earlier is this one, so the
+        // refusal is answered from here; [`conflict_resolution`] carries the whole
+        // argument, decides it from the framework's own deserializer and
+        // constraint walk, and answers `None` for every request the model accepts
+        // (whose handler then refuses the combination itself, in the same words).
+        let protocol = self.entry.protocol();
+        if let Ok(key) = protocol.routing_key(req) {
+            if conflict_resolution::refusal_for::<Eng>(key, protocol, req).is_some() {
+                return Some(&self.unhonourable_conflict_resolution);
+            }
+        }
+        // Everything else resolves through the generated routing table.
         None
     }
 

@@ -133,6 +133,8 @@ mod merge_pull_request_repeat;
 mod merge_pull_request_squash;
 #[path = "all/merge_pull_request_three_way.rs"]
 mod merge_pull_request_three_way;
+#[path = "all/merge_strategy_and_resolution_rules.rs"]
+mod merge_strategy_and_resolution_rules;
 #[path = "all/object_store_bounds.rs"]
 mod object_store_bounds;
 #[path = "all/path_depth_bound.rs"]
