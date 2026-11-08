@@ -1029,12 +1029,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // so the denial is the whole account of why the update did not happen, and it is
             // what a client reading the stack has to act on.
             let reason = denial.reason();
-            stack.fail_transition(failed_at, status::UPDATE_FAILED, reason.clone());
             // "Preserve the state of previously provisioned resources when an operation
             // fails": the request's own `DisableRollback` where it carries one, else the
             // value in force on the stack — the same reading the deploying path gives that
-            // member, so a denied update and a failed one answer it alike.
-            if !disables_rollback(&input).unwrap_or(stack.disable_rollback) {
+            // member, so a denied update and a failed one answer it alike. It decides
+            // whether the stack RESTS in `UPDATE_FAILED`, and so whether an event of its
+            // own reports that status
+            // ([`crate::state::StoredStack::fail_transition_superseded`]).
+            if disables_rollback(&input).unwrap_or(stack.disable_rollback) {
+                stack.fail_transition(failed_at, status::UPDATE_FAILED, reason);
+            } else {
+                stack.fail_transition_superseded(failed_at, status::UPDATE_FAILED, reason.clone());
                 stack.begin_update_rollback(failed_at, reason);
             }
             return Ok(UpdateStackOutput {
@@ -1349,13 +1354,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // resources' events, or CloudFormation's own diagnostic where it refused the
                 // deployment before asking anybody.
                 let failed_at = ::std::time::SystemTime::now();
-                stack.fail_transition(failed_at, status::UPDATE_FAILED, failure.clone());
                 // ...and the failed update is rolled back, unless its caller asked for the
                 // failed state to be kept (`DisableRollback`), which says what it wants left
                 // behind: that stack stays at UPDATE_FAILED with the plan still held, since
                 // `RollbackStack` is the call that clears it up and the plan is the only
-                // record of what the failed update changed in the owning services.
-                stack.begin_owed_update_rollback(failed_at, failure);
+                // record of what the failed update changed in the owning services. Only that
+                // stack rests in the failed status, and only it carries a stack-level event
+                // for it ([`crate::state::StoredStack::fail_transition_superseded`]).
+                if stack.disable_rollback {
+                    stack.fail_transition(failed_at, status::UPDATE_FAILED, failure);
+                } else {
+                    stack.fail_transition_superseded(
+                        failed_at,
+                        status::UPDATE_FAILED,
+                        failure.clone(),
+                    );
+                    stack.begin_owed_update_rollback(failed_at, failure);
+                }
             }
         }
 

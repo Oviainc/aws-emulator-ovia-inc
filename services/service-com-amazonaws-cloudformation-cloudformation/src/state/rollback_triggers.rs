@@ -213,10 +213,16 @@ impl super::StoredStack {
             return None;
         }
         let reason = trigger_failure_summary(fired.iter().map(String::as_str));
-        self.fail_transition(now, super::failed_status_of(&self.status), reason.clone());
+        let failed_status = super::failed_status_of(&self.status);
+        // Only a stack LEFT in the failed status rests in it, and only that one carries a
+        // stack-level event for it: where the rollback begins at this very instant, its own
+        // event is what reports the failure
+        // ([`super::StoredStack::fail_transition_superseded`]).
         if self.disable_rollback {
+            self.fail_transition(now, failed_status, reason.clone());
             return None;
         }
+        self.fail_transition_superseded(now, failed_status, reason.clone());
         if updating {
             self.begin_owed_update_rollback(now, reason);
             return Some(Owes::Revert);

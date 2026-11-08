@@ -1955,7 +1955,16 @@ impl StoredStack {
             stabilising::Awaited::Gone => failed_action::DELETE,
         };
         let summary = resource_failure_summary(action, [logical_id]);
-        self.fail_transition(now, failed_status, summary.clone());
+        // Whether the stack RESTS in the failed status decides whether an event of its own
+        // reports that status: a rollback this failure owes begins at this very instant and
+        // carries the failure on its own event
+        // ([`Self::fail_transition_superseded`]).
+        let rolls_back = !self.disable_rollback && (updating || creating);
+        if rolls_back {
+            self.fail_transition_superseded(now, failed_status, summary.clone());
+        } else {
+            self.fail_transition(now, failed_status, summary.clone());
+        }
         if self.disable_rollback {
             return None;
         }
@@ -2049,7 +2058,14 @@ impl StoredStack {
         let failed_status = failed_status_of(&self.status);
         let updating = self.status == status::UPDATE_IN_PROGRESS;
         self.wait_conditions.clear();
-        self.fail_transition(now, failed_status, reason.clone());
+        // The UPDATE whose rollback is opened right below never rests in the failed status,
+        // so no event of the stack's reports it ([`Self::fail_transition_superseded`]);
+        // every other barrier timeout leaves the stack in the failed status it reports.
+        if updating && !self.disable_rollback {
+            self.fail_transition_superseded(now, failed_status, reason.clone());
+        } else {
+            self.fail_transition(now, failed_status, reason.clone());
+        }
         if updating {
             self.begin_owed_update_rollback(now, reason);
         }
@@ -2677,14 +2693,35 @@ impl StoredStack {
     ) {
         self.record_resource_statuses(transitions, at);
     }
+}
 
-    /// Record that the operation in flight could not be carried out: the stack takes the
-    /// failed status with the reason, the clock is owed nothing more, and the event log
-    /// carries the failure.
+/// Whether a stack-level EVENT reports the failed status a failed transition records.
+///
+/// CloudFormation's event stream is what the stack DID: a failure the stack rests in is an
+/// event of its own, while a failure whose rollback begins at the same instant is reported
+/// by that rollback's event instead — the stack moved straight from the operation's
+/// `*_IN_PROGRESS` into `ROLLBACK_IN_PROGRESS` / `UPDATE_ROLLBACK_IN_PROGRESS` and never
+/// rested in the failed status for an event to report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureReport {
+    /// The stack rests in the failed status: the event log carries it.
+    Rested,
+    /// A rollback or a removal supersedes it at the same instant: no event of its own.
+    Superseded,
+}
+
+impl StoredStack {
+    /// Record that the operation in flight could not be carried out, and that the stack
+    /// RESTS in the failed status: it takes that status with the reason, the clock is owed
+    /// nothing more, and the event log carries the failure.
     ///
     /// This is how CloudFormation reports a stack whose resources an owning service
-    /// refused to create or delete (`CREATE_FAILED` / `DELETE_FAILED`) — the operation
+    /// refused to create or delete and that is left in the failed state
+    /// (`CREATE_FAILED` / `DELETE_FAILED`) — the operation
     /// does not stay pending and no terminal status it never reached is reported.
+    ///
+    /// [`Self::fail_transition_superseded`] is the other report: the same failure, for a
+    /// stack that moves into its rollback at this very instant.
     ///
     /// The operation CONCLUDED at `now`, which for a failure an owning service answered is
     /// sooner than the span the walk over the resources was laid out across: the walk is
@@ -2692,6 +2729,40 @@ impl StoredStack {
     /// recorded in the order it did it, at its own instants, ahead of the failure that ends
     /// it ([`timeline::Timeline::compress_into`]).
     pub fn fail_transition(&mut self, now: SystemTime, failed_status: &str, reason: String) {
+        self.record_failure(now, failed_status, reason, FailureReport::Rested);
+    }
+
+    /// Record a failure of the operation in flight that the stack does NOT rest in, because
+    /// the removal that failure owes begins at the same instant — a create CloudFormation
+    /// rolls back, a create it takes the stack away for, or an update it reverts.
+    ///
+    /// Everything [`Self::fail_transition`] records is recorded: the stack takes the failed
+    /// status with the reason and the attempt is concluded as failed at `now`, which is what
+    /// the removal that follows is then opened over. What is NOT recorded is a stack-level
+    /// EVENT for that status: the stack moved straight from the operation's
+    /// `*_IN_PROGRESS` into the rollback — whose own event carries the failure and the
+    /// clause saying the rollback was asked for ([`Self::begin_rollback`]) — so no event
+    /// reports a status the stack never rested in. The resources' own failure events are
+    /// untouched: WHICH resource failed, and why, is reported on that resource, and a
+    /// failed status the stack does rest in (`DisableRollback`, `OnFailure=DO_NOTHING`)
+    /// still gets its event from [`Self::fail_transition`].
+    pub fn fail_transition_superseded(
+        &mut self,
+        now: SystemTime,
+        failed_status: &str,
+        reason: String,
+    ) {
+        self.record_failure(now, failed_status, reason, FailureReport::Superseded);
+    }
+
+    /// The one writer of a failed transition, for both of the reports above.
+    fn record_failure(
+        &mut self,
+        now: SystemTime,
+        failed_status: &str,
+        reason: String,
+        report: FailureReport,
+    ) {
         self.flush_resource_timeline(now);
         let pending = self.pending.take();
         // An operation that failed waits for nothing: whatever it was waiting at, it is
@@ -2703,6 +2774,9 @@ impl StoredStack {
         let operation_id = pending.as_ref().and_then(|p| p.operation_id.clone());
         // The attempt FAILED at this instant, whatever its failure then owes.
         self.conclude_operation(operation_id.as_deref(), failed_status, now);
+        if report == FailureReport::Superseded {
+            return;
+        }
         self.record_event(
             now,
             failed_status,

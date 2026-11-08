@@ -224,7 +224,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetId<Eng> {
         // that trust accepts.
         if let Some(refusal) = pool.refuse_logins(&registered, &logins) {
             return Err(GetIdErrorModeled::NotAuthorizedException(NotAuthorizedException {
-                message: Some(refusal.message().to_string()),
+                message: Some(refusal.message(&pool.identity_pool_id).into_owned()),
             })
             .into());
         }

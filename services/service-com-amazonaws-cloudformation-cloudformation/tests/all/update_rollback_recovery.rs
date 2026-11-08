@@ -823,10 +823,18 @@ async fn an_update_whose_wait_runs_out_is_rolled_back_in_the_services_that_own_i
              {events:?}",
             case.case
         );
-        assert!(
-            events.contains(&(case.stack.to_string(), status::UPDATE_FAILED.to_string())),
-            "case {:?}: expected the update's own failure event, got {events:?}",
-            case.case
+        // ...and the failure is an event of the STACK only where the stack RESTS in
+        // `UPDATE_FAILED`: a stack rolled straight back goes from `UPDATE_IN_PROGRESS` into
+        // `UPDATE_ROLLBACK_IN_PROGRESS`, whose own event carries the failure, while a caller
+        // that asked for the failed state to be kept gets that status and its event.
+        let rested_in_the_failure =
+            events.contains(&(case.stack.to_string(), status::UPDATE_FAILED.to_string()));
+        assert_eq!(
+            rested_in_the_failure, case.disable_rollback,
+            "case {:?}: expected the stack's own {} event exactly where the failed state is \
+             kept, got {events:?}",
+            case.case,
+            status::UPDATE_FAILED
         );
     }
 }

@@ -260,12 +260,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // The update is over at this instant: it did not go through, so whatever it was
             // waiting at it will not proceed, and the attempt is recorded as one that failed
-            // with the cancellation as its reason.
-            stack.fail_transition(
-                now,
-                status::UPDATE_FAILED,
-                UPDATE_CANCELLED_BY_USER.to_string(),
-            );
+            // with the cancellation as its reason. A stack that goes straight into its
+            // rollback never rests in that failed status, so only the one left in it (a
+            // caller that asked for the failed state to be kept) carries a stack-level event
+            // for it ([`crate::state::StoredStack::fail_transition_superseded`]).
+            if stack.disable_rollback {
+                stack.fail_transition(
+                    now,
+                    status::UPDATE_FAILED,
+                    UPDATE_CANCELLED_BY_USER.to_string(),
+                );
+            } else {
+                stack.fail_transition_superseded(
+                    now,
+                    status::UPDATE_FAILED,
+                    UPDATE_CANCELLED_BY_USER.to_string(),
+                );
+            }
             // ..."the stack rolls back the update and reverts to the previous stack
             // configuration": the revision the update replaced goes back onto the stack, the
             // deployment that update staged is abandoned, and what it had already changed in

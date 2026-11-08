@@ -543,11 +543,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stack.schedule_resource_events(&denial.transitions());
                 let failed_at = ::std::time::SystemTime::now();
                 let reason = denial.reason();
-                stack.fail_transition(failed_at, status::UPDATE_FAILED, reason.clone());
                 // The flag in force on THIS execution: the request's, the change set's
                 // `OnStackFailure` where it chose one, else the stack's — the same reading
-                // the deploying path below gives that member.
-                if !disable_rollback.unwrap_or(stack.disable_rollback) {
+                // the deploying path below gives that member. It decides whether the stack
+                // RESTS in `UPDATE_FAILED`, and so whether an event of its own reports that
+                // status ([`crate::state::StoredStack::fail_transition_superseded`]).
+                if disable_rollback.unwrap_or(stack.disable_rollback) {
+                    stack.fail_transition(failed_at, status::UPDATE_FAILED, reason);
+                } else {
+                    stack.fail_transition_superseded(
+                        failed_at,
+                        status::UPDATE_FAILED,
+                        reason.clone(),
+                    );
                     stack.begin_update_rollback(failed_at, reason);
                 }
                 // The execution was attempted and the plan was not carried out, so the
@@ -877,7 +885,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                                 status::UPDATE_FAILED
                             };
                             let failed_at = ::std::time::SystemTime::now();
-                            stack.fail_transition(failed_at, failed, failure.clone());
+                            // The stack rests in the failed status only where nothing
+                            // follows it: a rollback (or the removal `DELETE` asks for)
+                            // begins at this very instant and its own event is what reports
+                            // the failure
+                            // ([`crate::state::StoredStack::fail_transition_superseded`]).
+                            if stack.disable_rollback {
+                                stack.fail_transition(failed_at, failed, failure.clone());
+                            } else {
+                                stack.fail_transition_superseded(
+                                    failed_at,
+                                    failed,
+                                    failure.clone(),
+                                );
+                            }
                             if creating {
                                 if stack.disable_rollback {
                                     None

@@ -401,6 +401,8 @@ mod stop_stack_set_operation;
 mod stored_stack_policy_validation;
 #[path = "all/substitution_resource_attributes.rs"]
 mod substitution_resource_attributes;
+#[path = "all/superseded_failure_events.rs"]
+mod superseded_failure_events;
 #[path = "all/tags_only_stack_updates.rs"]
 mod tags_only_stack_updates;
 #[path = "all/template_by_reference.rs"]

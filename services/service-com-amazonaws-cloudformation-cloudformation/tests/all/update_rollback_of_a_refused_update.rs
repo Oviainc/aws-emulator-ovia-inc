@@ -432,12 +432,21 @@ async fn a_refused_update_is_rolled_back_however_far_it_got() {
              {reported:?}",
             case.case
         );
-        assert!(
-            reported.iter().any(|(logical_id, reported_status, _)| {
-                logical_id == case.stack && reported_status == status::UPDATE_FAILED
-            }),
-            "case {:?}: expected the update's own failure event, got {reported:?}",
-            case.case
+        // ...and the update's own failure is an event of the STACK only where the stack
+        // RESTS in `UPDATE_FAILED`: a caller that asked for the failed state to be kept gets
+        // that status and the event reporting it, while a stack rolled straight back goes
+        // from `UPDATE_IN_PROGRESS` into `UPDATE_ROLLBACK_IN_PROGRESS`, whose own event
+        // carries the failure. Either way the resource that failed has its own event, which
+        // is what the reason above was read from.
+        let rested_in_the_failure = reported.iter().any(|(logical_id, reported_status, _)| {
+            logical_id == case.stack && reported_status == status::UPDATE_FAILED
+        });
+        assert_eq!(
+            rested_in_the_failure, case.disable_rollback,
+            "case {:?}: expected the stack's own {} event exactly where the failed state is \
+             kept, got {reported:?}",
+            case.case,
+            status::UPDATE_FAILED
         );
     }
 }

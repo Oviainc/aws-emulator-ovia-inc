@@ -398,7 +398,6 @@ async fn an_update_whose_gate_is_never_satisfied_settles_on_a_rolled_back_status
         }
         let events = stack_events(case.case, &router, case.stack).await;
         for owed in [
-            status::UPDATE_FAILED,
             status::UPDATE_ROLLBACK_IN_PROGRESS,
             status::UPDATE_ROLLBACK_COMPLETE,
         ] {
@@ -408,6 +407,16 @@ async fn an_update_whose_gate_is_never_satisfied_settles_on_a_rolled_back_status
                 case.case
             );
         }
+        // The failure the rollback was owed for is reported on the resource that failed and
+        // on the rollback's own event: a stack rolled straight back never rests in
+        // `UPDATE_FAILED`, so no event of its own reports that status.
+        assert!(
+            !events.contains(&(case.stack.to_string(), status::UPDATE_FAILED.to_string())),
+            "case {:?}: expected no stack-level {} event for an update that rolled straight \
+             back, got {events:?}",
+            case.case,
+            status::UPDATE_FAILED
+        );
 
         // The rolled-back stack is not wedged: a further valid update is accepted and its own
         // waiter terminates on the completed status.

@@ -301,14 +301,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         } else {
                             status::CREATE_FAILED
                         };
-                        stack.fail_transition(now, failed_status, reason.clone());
                         // A failed operation is rolled back unless the request that started
                         // it asked for the failed state to be kept ("DO_NOTHING: Do nothing
                         // if stack creation fails", which `DisableRollback` also spells): a
                         // failed CREATE's rollback removes what the create had already made,
                         // and a failed UPDATE's puts the previous stack configuration back
                         // in the services that own the resources it changed
-                        // ([`crate::state::settle_due_rollbacks`], driven below).
+                        // ([`crate::state::settle_due_rollbacks`], driven below). The stack
+                        // rests in the failed status only where none of that follows, which
+                        // is the one case a stack-level event reports it
+                        // ([`crate::state::StoredStack::fail_transition_superseded`]).
+                        if stack.disable_rollback {
+                            stack.fail_transition(now, failed_status, reason.clone());
+                        } else {
+                            stack.fail_transition_superseded(now, failed_status, reason.clone());
+                        }
                         if updating {
                             stack.begin_owed_update_rollback(now, reason);
                             (stack.stack_id.clone(), None)

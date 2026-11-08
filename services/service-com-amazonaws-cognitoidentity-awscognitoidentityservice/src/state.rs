@@ -15,6 +15,7 @@ pub mod authorization;
 
 use crate::ops::types::{CognitoIdentityProvider, MappingRule, RoleMapping};
 use emulator_server::CredentialStore;
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
@@ -154,7 +155,15 @@ impl IdentityPool {
                 .or_default()
                 .accept(resolvable, client_ids);
         }
-        PoolLoginTrust { issuers }
+        PoolLoginTrust {
+            issuers,
+            // WHY the trust holds no entry for an issuer is part of what a refusal says, so
+            // the pool's whole provider configuration travels with the trust: a pool that
+            // names no identity provider AT ALL is in a different state from one whose
+            // providers simply do not include the issuer presented
+            // ([`Self::configures_no_identity_provider`]).
+            configures_no_provider: self.configures_no_identity_provider(),
+        }
     }
 
     /// Whether a `Logins` entry made in the name of `provider_name` carries an OpenID
@@ -243,6 +252,41 @@ impl IdentityPool {
                 .iter()
                 .flatten()
                 .any(|arn| arn == provider_name)
+    }
+
+    /// Whether this pool's stored configuration names NO identity provider at all: none of
+    /// the four federated-provider members a `Logins` entry can be keyed by
+    /// ([`Self::names_federated_provider`]) and no developer provider of its own either.
+    ///
+    /// A pool in that state federates NOBODY — there is no issuer whose users it asked for,
+    /// so no login presented to it could have been one of a provider it is configured with.
+    /// That is a different thing from a login whose provider is not among the ones the pool
+    /// does name ([`LoginProviderRefusal::UnsupportedProvider`]), and AWS words it
+    /// differently ([`no_identity_providers_message`]): what the caller has to act on is the
+    /// POOL's configuration rather than the token it presented.
+    pub fn configures_no_identity_provider(&self) -> bool {
+        let no_public_providers = self
+            .supported_login_providers
+            .as_ref()
+            .is_none_or(BTreeMap::is_empty);
+        let no_user_pools = self
+            .cognito_identity_providers
+            .as_ref()
+            .is_none_or(Vec::is_empty);
+        let no_oidc_providers = self
+            .open_id_connect_provider_arns
+            .as_ref()
+            .is_none_or(Vec::is_empty);
+        let no_saml_providers = self.saml_provider_arns.as_ref().is_none_or(Vec::is_empty);
+        let no_developer_provider = self
+            .developer_provider_name
+            .as_deref()
+            .is_none_or(str::is_empty);
+        no_public_providers
+            && no_user_pools
+            && no_oidc_providers
+            && no_saml_providers
+            && no_developer_provider
     }
 
     /// Whether `logins` carries at least one entry made in the name of a PUBLIC provider —
@@ -490,6 +534,10 @@ impl TrustedAudiences {
 #[derive(Debug, Default, Clone)]
 pub struct PoolLoginTrust {
     issuers: BTreeMap<String, TrustedAudiences>,
+    /// Whether the pool names no identity provider of any kind
+    /// ([`IdentityPool::configures_no_identity_provider`]) — which is what an issuer the
+    /// trust holds no entry for is refused on, where it is refused at all.
+    configures_no_provider: bool,
 }
 
 impl PoolLoginTrust {
@@ -523,8 +571,19 @@ impl PoolLoginTrust {
     fn refuse_login(&self, provider_name: &str, token: &str) -> Option<LoginProviderRefusal> {
         let issuer = login_provider_issuer(provider_name);
         let Some(trusted) = self.issuers.get(issuer) else {
-            return names_cognito_user_pool(issuer)
-                .then_some(LoginProviderRefusal::UnsupportedProvider);
+            if !names_cognito_user_pool(issuer) {
+                return None;
+            }
+            // The pool holds no trust for this issuer, and WHY decides the wording: a pool
+            // configured with no identity provider at all federates nobody, so what the
+            // caller has to act on is that pool's configuration, while a pool whose
+            // configured providers simply do not include the issuer is refused on the token
+            // it presented.
+            return Some(if self.configures_no_provider {
+                LoginProviderRefusal::NoIdentityProviders
+            } else {
+                LoginProviderRefusal::UnsupportedProvider
+            });
         };
         if trusted.any {
             return None;
@@ -553,18 +612,28 @@ pub enum LoginProviderRefusal {
     IssuerMismatch,
     /// The pool states no trust for the token's issuer.
     UnsupportedProvider,
+    /// The pool states no trust for ANY issuer: it names no identity provider at all.
+    NoIdentityProviders,
     /// It states one, and the token names an audience that trust does not accept.
     IncorrectAudience,
 }
 
 impl LoginProviderRefusal {
-    /// The message the refusal carries.
-    pub fn message(self) -> &'static str {
+    /// The message the refusal carries, for a login presented to the pool
+    /// `identity_pool_id` names.
+    ///
+    /// Only the refusal that is about the POOL's own configuration states that pool
+    /// ([`no_identity_providers_message`]); every other one is about the TOKEN, and is the
+    /// fixed sentence its own constant records.
+    pub fn message(self, identity_pool_id: &str) -> Cow<'static, str> {
         match self {
-            Self::NotAnIdentityToken => INVALID_OPEN_ID_CONNECT_TOKEN_MESSAGE,
-            Self::IssuerMismatch => MISMATCHED_TOKEN_ISSUER_MESSAGE,
-            Self::UnsupportedProvider => UNSUPPORTED_LOGIN_PROVIDER_MESSAGE,
-            Self::IncorrectAudience => INCORRECT_TOKEN_AUDIENCE_MESSAGE,
+            Self::NotAnIdentityToken => Cow::Borrowed(INVALID_OPEN_ID_CONNECT_TOKEN_MESSAGE),
+            Self::IssuerMismatch => Cow::Borrowed(MISMATCHED_TOKEN_ISSUER_MESSAGE),
+            Self::UnsupportedProvider => Cow::Borrowed(UNSUPPORTED_LOGIN_PROVIDER_MESSAGE),
+            Self::NoIdentityProviders => {
+                Cow::Owned(no_identity_providers_message(identity_pool_id))
+            }
+            Self::IncorrectAudience => Cow::Borrowed(INCORRECT_TOKEN_AUDIENCE_MESSAGE),
         }
     }
 }
@@ -855,6 +924,19 @@ const COGNITO_USER_POOL_PROVIDER_SUFFIX: &str = ".amazonaws.com";
 /// to act on.
 pub const UNSUPPORTED_LOGIN_PROVIDER_MESSAGE: &str =
     "Token is not from a supported provider of this identity pool.";
+
+/// How AWS words the refusal of a login presented to an identity pool that is configured
+/// with no identity provider at all ([`IdentityPool::configures_no_identity_provider`]).
+///
+/// Its one variable part is the pool the call addressed, which the caller itself named (the
+/// `IdentityPoolId` of the request, or the pool the `IdentityId` it presented belongs to) —
+/// so unlike [`UNSUPPORTED_LOGIN_PROVIDER_MESSAGE`], which withholds the pool's provider
+/// configuration from an unauthenticated caller, this one discloses nothing the caller did
+/// not already have: WHICH pool is unconfigured is the one thing it has to act on, and a
+/// pool with no providers has no configuration to report.
+pub fn no_identity_providers_message(identity_pool_id: &str) -> String {
+    format!("Identity pool - {identity_pool_id} does not have identity providers configured.")
+}
 
 /// The message a `NotAuthorizedException` carries for a `Logins` entry whose token names an
 /// audience the pool's trust for that token's issuer does not accept — a client id that is

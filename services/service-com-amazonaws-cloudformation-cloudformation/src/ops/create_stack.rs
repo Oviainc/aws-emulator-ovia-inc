@@ -984,7 +984,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // dynamic reference it could not resolve), which no resource's event
                     // could carry because no resource was ever asked for.
                     let failed_at = ::std::time::SystemTime::now();
-                    stack.fail_transition(failed_at, status::CREATE_FAILED, failure.clone());
                     // "ROLLBACK — Roll back the stack creation. This is the default": the
                     // failed create does not stop there. What the caller asked for decides
                     // which of the three documented `OnFailure` behaviours it gets —
@@ -992,9 +991,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // state and everything the create had already made, DELETE takes the
                     // stack itself away, and ROLLBACK removes what the create made and
                     // leaves the stack reporting that it was rolled back.
+                    //
+                    // That same answer decides how the failure is REPORTED: only the stack
+                    // that is left in `CREATE_FAILED` rests in it, so only that one carries
+                    // a stack-level event for it; where the removal begins at this very
+                    // instant, the failure is reported by the rollback's own event
+                    // ([`crate::state::StoredStack::fail_transition_superseded`]).
                     if stack.disable_rollback {
+                        stack.fail_transition(failed_at, status::CREATE_FAILED, failure);
                         None
                     } else {
+                        stack.fail_transition_superseded(
+                            failed_at,
+                            status::CREATE_FAILED,
+                            failure.clone(),
+                        );
                         let deletes_the_stack =
                             input.on_failure.as_deref() == Some(ON_FAILURE_DELETE);
                         if deletes_the_stack {

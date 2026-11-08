@@ -499,7 +499,15 @@ impl super::StoredStack {
         } else {
             Vec::new()
         };
-        self.fail_transition(now, failed_status, reason.clone());
+        // Whether the stack RESTS in the failed status decides whether an event of its own
+        // reports it: a create this failure rolls back, and an update it reverts, move into
+        // that rollback at this very instant and the rollback's own event carries the
+        // failure ([`super::StoredStack::fail_transition_superseded`]).
+        if !self.disable_rollback && (updating || creating) {
+            self.fail_transition_superseded(now, failed_status, reason.clone());
+        } else {
+            self.fail_transition(now, failed_status, reason.clone());
+        }
         if self.disable_rollback {
             return None;
         }

@@ -379,9 +379,19 @@ async fn a_refused_deployments_events_keep_the_order_of_the_walk_that_was_cut_sh
     );
 
     let events = events_of(&router, stack).await;
-    // The operation's own bracket: nothing the walk recorded falls outside it.
+    // The operation's own bracket: nothing the walk recorded falls outside it. A failed
+    // create that CloudFormation rolls back never rests in `CREATE_FAILED` — the stack goes
+    // from the operation's `CREATE_IN_PROGRESS` straight into `ROLLBACK_IN_PROGRESS`, whose
+    // event carries the failure — so the rollback's own event is where the operation ends.
     let stack_opened = scheduled(CASE, &events, stack, "CREATE_IN_PROGRESS");
-    let stack_failed = finished(CASE, &events, stack, "CREATE_FAILED");
+    let stack_failed = finished(CASE, &events, stack, "ROLLBACK_IN_PROGRESS");
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.logical_id == stack && event.status == "CREATE_FAILED"),
+        "case {CASE:?}: a rolled-back create rests in no CREATE_FAILED status, so no event of \
+         the stack's may report it, got {events:?}"
+    );
     for logical_id in ["Vpc", "SubnetA", "SubnetB", "SubnetGroup"] {
         let opened = scheduled(CASE, &events, logical_id, "CREATE_IN_PROGRESS");
         assert!(

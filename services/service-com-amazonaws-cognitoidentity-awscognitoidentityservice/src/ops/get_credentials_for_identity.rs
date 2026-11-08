@@ -309,7 +309,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> GetCredentialsFor
                 if let Some(refusal) = pool.refuse_logins(&registered, &logins) {
                     return Err(GetCredentialsForIdentityErrorModeled::NotAuthorizedException(
                         NotAuthorizedException {
-                            message: Some(refusal.message().to_string()),
+                            message: Some(refusal.message(&identity_pool_id).into_owned()),
                         },
                     )
                     .into());

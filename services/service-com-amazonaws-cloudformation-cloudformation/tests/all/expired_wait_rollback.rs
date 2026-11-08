@@ -318,12 +318,14 @@ async fn an_update_whose_wait_runs_out_rolls_back_and_leaves_untouched_resources
         "case {case:?}: expected the update whose wait ran out to roll back, got {settled:?}"
     );
 
-    // The stack's own events end with the failure and the two transitions of its rollback,
-    // and the resources the update did not touch are acted on NOWHERE in THIS operation's
-    // events: a resource the template re-declares unchanged is not created again, which
-    // holds for the handle (a type no service here provisions) exactly as it does for the
-    // parameter. `DescribeStackEvents` reports newest first, so the operation's own events
-    // are the ones up to and including the `UPDATE_IN_PROGRESS` that opened it.
+    // The stack's own events end with the two transitions of its rollback, and the resources
+    // the update did not touch are acted on NOWHERE in THIS operation's events: a resource
+    // the template re-declares unchanged is not created again, which holds for the handle (a
+    // type no service here provisions) exactly as it does for the parameter. The failure
+    // itself is reported on the resource that failed and on the ROLLBACK's own event — a
+    // stack rolled straight back never rests in `UPDATE_FAILED`, so no event of its own
+    // reports that status. `DescribeStackEvents` reports newest first, so the operation's own
+    // events are the ones up to and including the `UPDATE_IN_PROGRESS` that opened it.
     let whole_log = stack_events(case, &router, stack).await;
     let opened = whole_log
         .iter()
@@ -333,7 +335,6 @@ async fn an_update_whose_wait_runs_out_rolls_back_and_leaves_untouched_resources
         .unwrap_or_else(|| panic!("case {case:?}: no UPDATE_IN_PROGRESS event, got {whole_log:?}"));
     let events = whole_log[..=opened].to_vec();
     for expected in [
-        status::UPDATE_FAILED,
         status::UPDATE_ROLLBACK_IN_PROGRESS,
         status::UPDATE_ROLLBACK_COMPLETE,
     ] {
@@ -343,6 +344,13 @@ async fn an_update_whose_wait_runs_out_rolls_back_and_leaves_untouched_resources
             "case {case:?}: expected the stack's own {expected:?} event, got {events:?}"
         );
     }
+    let rested_in_the_failure = (stack.to_string(), status::UPDATE_FAILED.to_string());
+    assert!(
+        !events.contains(&rested_in_the_failure),
+        "case {case:?}: expected no stack-level {:?} event for an update that rolled \
+         straight back, got {events:?}",
+        status::UPDATE_FAILED
+    );
     for untouched in ["Kept", "Handle"] {
         for forbidden in [
             resource_status::CREATE_IN_PROGRESS,
