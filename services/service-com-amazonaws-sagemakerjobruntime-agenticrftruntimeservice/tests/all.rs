@@ -46,6 +46,9 @@ mod rejected_value_echo;
 #[path = "all/request_content_type_is_read_once.rs"]
 mod request_content_type_is_read_once;
 
+#[path = "all/retained_bytes_ceiling.rs"]
+mod retained_bytes_ceiling;
+
 #[path = "all/reward_resolution_precedes_its_own_checks.rs"]
 mod reward_resolution_precedes_its_own_checks;
 

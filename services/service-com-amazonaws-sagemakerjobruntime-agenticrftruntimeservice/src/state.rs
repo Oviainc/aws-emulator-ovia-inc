@@ -337,9 +337,17 @@ impl ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
     ///
     /// `respond` is handed the turn's index and answers the response body and
     /// its `Content-Type`; it runs BEFORE the turn is recorded, so what the
-    /// caller is served and what the trajectory holds are the same bytes. The
-    /// answer is the [`ServedTurn`] — the response alone, never a copy of the
-    /// caller's own payload, which is retained exactly once.
+    /// caller is served and what the trajectory holds are the same bytes, and
+    /// before the store-wide byte ceiling is checked, so the check can measure
+    /// the whole turn it admits. It renders a body and writes nothing, so a turn
+    /// refused after it ran leaves the store exactly as it was. The answer is
+    /// the [`ServedTurn`] — the response alone, never a copy of the caller's own
+    /// payload, which is retained exactly once.
+    ///
+    /// `respond` runs while the store this method writes is LOCKED (the guard
+    /// [`serve_sampling_turn`] takes), so it renders its bytes from what it was
+    /// handed and must neither reach this store again ([`service_state`]) nor
+    /// block.
     ///
     /// Refused — with nothing written — when the trajectory is already sealed
     /// ("no further turns will be appended to the trajectory") or when an
@@ -376,7 +384,7 @@ impl ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
         }
         // The caller's payload is retained for the life of the process, so its
         // SIZE is bounded before anything is written: one body that is too big
-        // to capture, and a body that would pass the store-wide retained total,
+        // to capture, and a turn that would pass the store-wide retained total,
         // are both refused here.
         let request_bytes = request.request_body.len();
         if request_bytes > MAX_TURN_BODY_BYTES {
@@ -384,21 +392,34 @@ impl ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
                 bytes: request_bytes,
             });
         }
-        if self.retained_body_bytes.saturating_add(request_bytes) > MAX_RETAINED_BODY_BYTES {
-            return Err(AppendRefusal::RetainedBytesQuota);
-        }
-        let retained_before = self.retained_body_bytes;
-        let trajectory = self.trajectories.entry(key).or_insert_with(|| {
-            Trajectory::new(request.job_arn, request.trajectory_id, request.at)
-        });
-        let index = trajectory.turns.len();
+        // The position the turn would take is what `respond` is handed, and it is
+        // known before anything is written — the turns the trajectory already holds —
+        // so the response half is rendered, and MEASURED, before the turn is admitted.
+        let index = self
+            .trajectories
+            .get(&key)
+            .map_or(0, |trajectory| trajectory.turns.len());
         let (response_body, response_content_type) = respond(index);
+        // A captured turn retains BOTH halves, and both are what the counter below is
+        // advanced by, so both are what the ceiling is measured against: a turn whose
+        // request half alone would fit is still refused when the pair would pass the
+        // ceiling, and nothing is written for it.
+        let turn_bytes = request_bytes.saturating_add(response_body.len());
+        let retained_before = self.retained_body_bytes;
+        if retained_before.saturating_add(turn_bytes) > MAX_RETAINED_BODY_BYTES {
+            return Err(AppendRefusal::RetainedBytesQuota {
+                bytes: turn_bytes,
+                retained: retained_before,
+            });
+        }
         let served = ServedTurn {
             body: response_body.clone(),
             content_type: response_content_type.clone(),
             index,
         };
-        let response_bytes = response_body.len();
+        let trajectory = self.trajectories.entry(key).or_insert_with(|| {
+            Trajectory::new(request.job_arn, request.trajectory_id, request.at)
+        });
         trajectory.turns.push(Turn {
             request_body: request.request_body.to_vec(),
             request_content_type: request.request_content_type(),
@@ -409,9 +430,7 @@ impl ComAmazonawsSagemakerjobruntimeAgenticrftruntimeserviceState {
             at: request.at,
         });
         trajectory.updated_at = request.at;
-        self.retained_body_bytes = retained_before
-            .saturating_add(request_bytes)
-            .saturating_add(response_bytes);
+        self.retained_body_bytes = retained_before.saturating_add(turn_bytes);
         Ok(served)
     }
 }
@@ -497,7 +516,13 @@ pub enum AppendRefusal {
     TrajectoryQuota,
     /// Capturing the turn would pass [`MAX_RETAINED_BODY_BYTES`], the store-wide
     /// ceiling on retained payload.
-    RetainedBytesQuota,
+    RetainedBytesQuota {
+        /// How many bytes capturing the turn would retain, summed over both of its
+        /// halves — the quantity the ceiling is measured against.
+        bytes: usize,
+        /// How many bytes the store already retains for the turns it holds.
+        retained: usize,
+    },
 }
 
 impl AppendRefusal {
@@ -532,10 +557,11 @@ impl AppendRefusal {
                 "This emulator already holds the maximum of {MAX_TRAJECTORIES} trajectories, so \
                  trajectory {trajectory_id} cannot be created."
             ),
-            Self::RetainedBytesQuota => format!(
-                "This emulator already retains the maximum of {MAX_RETAINED_BODY_BYTES} bytes of \
-                 captured payload, so no further turn can be appended to trajectory \
-                 {trajectory_id}."
+            Self::RetainedBytesQuota { bytes, retained } => format!(
+                "Capturing a turn of {bytes} byte(s) would take this emulator past the maximum of \
+                 {MAX_RETAINED_BODY_BYTES} bytes of captured payload it retains, of which \
+                 {retained} byte(s) are already retained, so no further turn can be appended to \
+                 trajectory {trajectory_id}."
             ),
         }
     }
@@ -550,7 +576,7 @@ impl AppendRefusal {
     pub const fn is_quota(self) -> bool {
         matches!(
             self,
-            Self::TurnQuota | Self::TrajectoryQuota | Self::RetainedBytesQuota
+            Self::TurnQuota | Self::TrajectoryQuota | Self::RetainedBytesQuota { .. }
         )
     }
 }
