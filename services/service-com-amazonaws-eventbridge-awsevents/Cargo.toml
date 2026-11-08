@@ -116,6 +116,15 @@ service-com-amazonaws-sfn-awsstepfunctions = { workspace = true }
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
 service-com-amazonaws-kms-trentservice = { workspace = true }
+# A publication a RUNNING Lambda handler makes is judged against the policies in
+# force on the function's execution role, so the authorization suite that spans
+# that path mounts Lambda and the token service beside EventBridge on one engine:
+# Lambda runs the handler, the token service mints the role session its SDK call is
+# signed as, and this service decides the publication.
+service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# The deployment package that suite uploads is a .zip archive it writes in memory.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [lints]
 workspace = true

@@ -241,6 +241,11 @@ form_urlencoded = "1"
 # bucket policy and the role policies that decide such a read are written with S3's and
 # IAM's own operations.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The bus a publication made with an invocation's own credential is decided by, mounted
+# beside lambda on ONE engine: the event is asserted where a client sees it — off the queue
+# the matching rule targets — and the role policies that decide the publication are written
+# with IAM's own operations.
+service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 
 [lints]
 workspace = true

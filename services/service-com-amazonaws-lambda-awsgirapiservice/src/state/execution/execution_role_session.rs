@@ -18,10 +18,12 @@
 //!   the account's roles live, so the session speaks for the very record `iam:CreateRole`
 //!   wrote.
 //! * The session is minted by the TOKEN SERVICE's own mint
-//!   ([`sts_store::mint_session`]), so `sts:GetCallerIdentity` under the credential reports
-//!   the session, every service that authorizes a request resolves it the same way, and the
-//!   credential is one the emulator's own request verifier accepts. Nothing here constructs
-//!   an access key id or a secret.
+//!   ([`sts_store::mint_role_session`]), so `sts:GetCallerIdentity` under the credential
+//!   reports the session, every service that authorizes a request resolves it the same way
+//!   — the mint records the session wherever a temporary credential's principal is read
+//!   from, so the call is judged on the policies in force on the role whichever service
+//!   serves it — and the credential is one the emulator's own request verifier accepts.
+//!   Nothing here constructs an access key id or a secret.
 //! * Its identity is the assumed-role session AWS reports for a function's calls:
 //!   `arn:<partition>:sts::<account>:assumed-role/<role name>/<function name>` — the session
 //!   is named for the FUNCTION it was opened for, which is how a refusal says which
@@ -80,8 +82,9 @@ const REFRESH_MARGIN: Duration = Duration::from_secs(900);
 ///
 /// Engine-scoped rather than a field of this service's own store, so minting one takes the
 /// token service's lock and this small one and never this service's state guard. LOCK
-/// ORDER: this store first, then the token service's registry and the credential store —
-/// the order [`execution_role_identity`] takes them in, and the only order anything may.
+/// ORDER: this store first, then the token service's registry and the credential store, and
+/// last the IAM store the mint records the session in — the order [`execution_role_identity`]
+/// takes them in, and the only order anything may.
 #[derive(Debug, Default)]
 pub struct ExecutionRoleSessions {
     /// One held session per `(role ARN, function name)` — a structured key, so no spelling
@@ -245,11 +248,14 @@ fn mint<Eng: Send + Sync + 'static>(
         ),
     };
     let duration_seconds = SESSION_SECONDS.min(role.max_session_duration);
-    let mut registry = registry.lock();
-    let minted = sts_store::mint_session(
+    // Minted through the token service's shared role-session mint, which also records the
+    // session where a service resolves a temporary credential's principal: a call this
+    // function's handler makes is then judged on the policies in force on the execution
+    // role, whichever service serves it.
+    let minted = sts_store::mint_role_session(
         engine,
         store,
-        &mut registry,
+        &registry,
         now,
         sts_store::NewSession {
             role_arn: Some(role.arn.clone()),

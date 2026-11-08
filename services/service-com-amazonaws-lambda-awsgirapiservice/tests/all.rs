@@ -209,6 +209,9 @@ mod handler_object_store_sdk;
 mod handler_dynamodb_resource;
 #[path = "all/handler_email_sdk.rs"]
 mod handler_email_sdk;
+#[path = "all/handler_eventbridge_publication.rs"]
+mod handler_eventbridge_publication;
+
 #[path = "all/handler_object_storage_sdk.rs"]
 mod handler_object_storage_sdk;
 #[path = "all/handler_rest_api_sdk.rs"]

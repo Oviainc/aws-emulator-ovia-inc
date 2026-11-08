@@ -2212,6 +2212,35 @@ pub fn mint_session<Eng: Send + Sync + 'static>(
     })
 }
 
+/// Mint a session of a ROLE for a service other than this one, and record it everywhere a
+/// request signed with it is resolved from.
+///
+/// A credential that is a session of a role is judged on the policies in force on THAT role
+/// — "the temporary security credentials … have the permissions of the role"
+/// (`AssumeRole`) — whichever operation vended it, so the record a service resolves a
+/// temporary credential's principal through ([`publish_role_session`]) belongs to every
+/// mint, not only to this service's own operations. Those operations publish it themselves
+/// because each holds the registry lock across its own later checks; everything else mints
+/// through here, so a session minted outside this service speaks for its role exactly as an
+/// assumed one does.
+///
+/// The registry lock is taken for the mint alone and GIVEN UP before the record is
+/// published, so no caller holds the IAM lock and the session lock at once.
+pub fn mint_role_session<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    store: &CredentialStore,
+    registry: &::engine::ServiceState<StsState>,
+    now: SystemTime,
+    request: NewSession,
+) -> Result<MintedSession, MintError> {
+    let minted = {
+        let mut held = registry.lock();
+        mint_session(engine, store, &mut held, now, request)?
+    };
+    publish_role_session(iam_state(engine).as_ref(), &minted, now);
+    Ok(minted)
+}
+
 /// The account's SESSION directory in the shared engine: the audit view of the sessions
 /// this emulator minted, keyed by the access key id each was minted under.
 ///

@@ -79,6 +79,8 @@ mod global_endpoint_deletion;
 mod global_endpoint_identity;
 #[path = "all/glue_workflow_target_delivery.rs"]
 mod glue_workflow_target_delivery;
+#[path = "all/handler_execution_role_publication.rs"]
+mod handler_execution_role_publication;
 #[path = "all/implicit_default_bus.rs"]
 mod implicit_default_bus;
 #[path = "all/input_transformation.rs"]

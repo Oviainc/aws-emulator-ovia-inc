@@ -2998,7 +2998,9 @@ pub struct VendedSession {
 /// Mint the role session a vend hands back: an assumed-role session of `role`, recorded in
 /// the STS session registry in the same engine ([`sts_state`]) by STS's own mint, so
 /// `sts:GetCallerIdentity` under the credential reports the assumed-role ARN and anything
-/// correlating the session back to its role matches.
+/// correlating the session back to its role matches. That same mint records the session
+/// where a service resolves a temporary credential's principal, so a call the vended
+/// credential signs is judged on the policies in force on the role it is a session of.
 ///
 /// The session lasts `validity`, capped by the role's own `MaxSessionDuration` — a session
 /// is never minted for longer than the role admits.
@@ -3034,11 +3036,10 @@ pub fn mint_vended_role_session<Eng: Send + Sync + 'static>(
         account: role.account.clone(),
         arn: assumed_role_arn.clone(),
     };
-    let mut registry = registry.lock();
-    let minted = sts::mint_session(
+    let minted = sts::mint_role_session(
         engine,
         store,
-        &mut registry,
+        &registry,
         now,
         sts::NewSession {
             role_arn: Some(role.arn.clone()),
