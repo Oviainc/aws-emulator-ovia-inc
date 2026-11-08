@@ -258,6 +258,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // it no transition: the status it reports is already the settled
             // one.
             settled_at: None,
+            settled_status: None,
+            settled_status_message: None,
+            // Nothing has changed the list yet, so the step it reports is the
+            // one this call reached.
+            change: crate::state::FirewallChange::Created,
         };
 
         let domain_list = record.to_domain_list(now);

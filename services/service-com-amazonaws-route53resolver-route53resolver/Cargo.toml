@@ -31,6 +31,10 @@ service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # The account's own AWS Outposts inventory: `CreateOutpostResolver` resolves its
 # `OutpostArn` against the Outposts that service holds.
 service-com-amazonaws-outposts-outpostsolafservice = { workspace = true }
+# The account's own Amazon S3 inventory: the domain file `ImportFirewallDomains`
+# reads is an object of that store, read through its own accessors
+# (`state::domain_imports`).
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

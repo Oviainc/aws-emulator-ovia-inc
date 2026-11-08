@@ -9,17 +9,19 @@
 //! a handler called directly.
 //!
 //! What these cases pin is the rule the operation implements: a domain list
-//! holds a SET of domains, membership decided on the case-folded name, and one
-//! update applies exactly one set operation to it — `ADD` the union, `REMOVE`
-//! the difference, `REPLACE` the requested set itself — which every later read
-//! of the list reports.
+//! holds a SET of domains, each stored as the DNS-canonical, fully qualified
+//! name — rooted with one trailing dot, whatever spelling the request wrote —
+//! membership decided on the case-folded canonical name, and one update applies
+//! exactly one set operation to it — `ADD` the union, `REMOVE` the difference,
+//! `REPLACE` the requested set itself — which every later read of the list
+//! reports.
 
 use std::collections::HashSet;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_route53resolver_route53resolver::state::{
-    MAX_DOMAINS_PER_UPDATE, PROVISIONING_DELAY,
+    firewall_domain_canonical, MAX_DOMAINS_PER_UPDATE, PROVISIONING_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -155,6 +157,18 @@ fn as_set(domains: &[String]) -> Vec<String> {
     sorted
 }
 
+/// `domains` in the spelling a domain list reads them back in: the fully
+/// qualified name, rooted with one trailing dot — the canonicalization the
+/// write path applies, through the service's own one
+/// ([`firewall_domain_canonical`]), so what a case asserts is the stored form of
+/// the domains it wrote and not a second copy of the rule.
+fn rooted(domains: &[String]) -> Vec<String> {
+    domains
+        .iter()
+        .map(|domain| firewall_domain_canonical(domain))
+        .collect()
+}
+
 /// Assert the list's domains are exactly `expected`, read back through the
 /// reader and counted through `GetFirewallDomainList`.
 async fn assert_domains(
@@ -170,11 +184,12 @@ async fn assert_domains(
         walked.len(),
         "case {case:?}: a domain list holds each domain once, got {walked:?}"
     );
+    let expected = rooted(expected);
     assert_eq!(
         as_set(&walked),
-        as_set(expected),
+        as_set(&expected),
         "case {case:?}: expected the domains {:?}, got {walked:?}",
-        as_set(expected)
+        as_set(&expected)
     );
     let read = read_list(router, id).await;
     assert_eq!(
@@ -424,7 +439,7 @@ async fn paging_walks_every_domain_exactly_once() {
         .collect();
     update(&router, &id, "ADD", &seeded).await;
 
-    let expected = as_set(&seeded);
+    let expected = as_set(&rooted(&seeded));
     // Page sizes spanning the modelled `ListDomainMaxResults` range (1..5000):
     // both published bounds, sizes that do and do not divide the collection,
     // exactly the collection size, and MaxResults omitted altogether.

@@ -22,7 +22,8 @@ use std::time::{Duration, Instant};
 use serde_json::{json, Value};
 use service_com_amazonaws_route53resolver_route53resolver::ops::types::FIREWALL_RULE_GROUP_STATUS_VALUES;
 use service_com_amazonaws_route53resolver_route53resolver::state::{
-    service_state, FIREWALL_RULE_GROUP_STATUS_COMPLETE, PROVISIONING_DELAY,
+    service_state, FIREWALL_RULE_GROUP_STATUS_COMPLETE, FIREWALL_RULE_GROUP_STATUS_DELETING,
+    PROVISIONING_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -40,9 +41,11 @@ use super::harness::{
 const STATE_TRANSITION_CONFLICT: &str = "The requested state transition isn't valid.";
 
 /// The sentence DNS Firewall states in `FirewallRuleGroup$StatusMessage` for a
-/// group that reached its created, settled lifecycle step: fixed text for the
+/// group that reached its created, settled lifecycle step, and the one it
+/// states once a delete has been accepted for the group: fixed text for the
 /// step, with no part of the request in it.
 const CREATED_RULE_GROUP_MESSAGE: &str = "Created Firewall Rule Group";
+const DELETING_RULE_GROUP_MESSAGE: &str = "Deleting the Firewall Rule Group";
 
 /// The `FirewallRuleGroup` of a create/get/delete response.
 fn rule_group(body: &Value) -> &Value {
@@ -210,24 +213,24 @@ async fn a_deleted_rule_group_is_removed_from_state() {
         );
         let status = string_member(&deleted, "Status");
         assert_eq!(
-            status, FIREWALL_RULE_GROUP_STATUS_COMPLETE,
-            "case {case:?}: the delete is carried out inside the call, so the group reports the step it last reached, got {deleted}"
+            status, FIREWALL_RULE_GROUP_STATUS_DELETING,
+            "case {case:?}: the delete has been accepted, so the group it answers with is on its way out, got {deleted}"
         );
         assert!(
             FIREWALL_RULE_GROUP_STATUS_VALUES.contains(&status.as_str()),
             "case {case:?}: Status must be a modelled FirewallRuleGroupStatus, got {status:?}"
         );
         // The status message goes with the step the status names, so the delete
-        // states the same step the reads before it stated.
+        // states the delete step rather than the one the reads before it stated.
         let message = string_member(&deleted, "StatusMessage");
         assert_eq!(
-            message, CREATED_RULE_GROUP_MESSAGE,
+            message, DELETING_RULE_GROUP_MESSAGE,
             "case {case:?}: the delete must state the step the group stands in, got {deleted}"
         );
         assert_eq!(
-            deleted.get("StatusMessage"),
-            before.get("StatusMessage"),
-            "case {case:?}: StatusMessage must come from the stored group, got {deleted}"
+            string_member(&before, "StatusMessage"),
+            CREATED_RULE_GROUP_MESSAGE,
+            "case {case:?}: the reads before the delete state the step the group stood in, got {before}"
         );
         assert!(
             message.len() <= 255,
@@ -469,12 +472,12 @@ async fn a_rule_group_whose_change_has_not_settled_cannot_be_deleted_yet() {
         let deleted = delete(&router, &id).await;
         assert_eq!(
             string_member(&deleted, "Status"),
-            FIREWALL_RULE_GROUP_STATUS_COMPLETE,
+            FIREWALL_RULE_GROUP_STATUS_DELETING,
             "case {case:?}: once the change has settled the delete is served, got {deleted}"
         );
         assert_eq!(
             string_member(&deleted, "StatusMessage"),
-            CREATED_RULE_GROUP_MESSAGE,
+            DELETING_RULE_GROUP_MESSAGE,
             "case {case:?}: the served delete states the step the group stands in, got {deleted}"
         );
         expect_error(

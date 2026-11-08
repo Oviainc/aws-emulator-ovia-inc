@@ -699,6 +699,12 @@ pub fn locate_firewall_rule<'a>(
         // Among rules of one group that match the same source, the `Qtype` the
         // request names is what tells them apart — a rule that evaluates every
         // query type stores none, so a request that names none names that rule.
+        // Where SEVERAL rules answer to the query type the request named, the
+        // first of them in the group's order is the one addressed: a request has
+        // no other member to name a rule by, so refusing would leave such rules
+        // impossible to update or delete at all, while a teardown that deletes
+        // them one at a time reaches each of them in turn. Where NONE answers to
+        // it, the request has not said which rule it means.
         several => {
             let mut evaluating_the_qtype = several.iter().copied().filter(|index| {
                 group
@@ -707,9 +713,9 @@ pub fn locate_firewall_rule<'a>(
                     .and_then(|record| record.rule.qtype.as_deref())
                     == named.qtype
             });
-            match (evaluating_the_qtype.next(), evaluating_the_qtype.next()) {
-                (Some(only), None) => Ok((only, (match_source_member, match_source_id))),
-                _ => Err(FirewallRuleLookupFault::Validation(ValidationException {
+            match evaluating_the_qtype.next() {
+                Some(first) => Ok((first, (match_source_member, match_source_id))),
+                None => Err(FirewallRuleLookupFault::Validation(ValidationException {
                     message: Some(format!(
                         "More than one rule of firewall rule group {} matches \
                          {match_source_id}; name the Qtype of the rule to {}",
@@ -978,9 +984,10 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
             ));
         };
         group.rules.push(record);
-        // The group's own `ModificationTime` moves with the rules it holds: a
-        // group a rule was just added to has changed.
+        // The group's own `ModificationTime` and the step it reports move with
+        // the rules it holds: a group a rule was just added to has changed.
         group.modification_time = now_rfc3339();
+        group.change = FirewallChange::Changed;
 
         Ok(reported)
     }
@@ -1201,9 +1208,10 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         rule.modification_time = Some(timestamp.clone());
 
         let reported = record.to_rule(now);
-        // The group's own `ModificationTime` moves with the rules it holds: a
-        // group whose rule just changed has changed.
+        // The group's own `ModificationTime` and the step it reports move with
+        // the rules it holds: a group whose rule just changed has changed.
         group.modification_time = timestamp;
+        group.change = FirewallChange::Changed;
 
         Ok(reported)
     }
@@ -1239,9 +1247,10 @@ impl ComAmazonawsRoute53resolverRoute53resolverState {
         };
         let (index, _) = locate_firewall_rule(group, &named)?;
         let record = group.rules.remove(index);
-        // The group's own `ModificationTime` moves with the rules it holds: a
-        // group a rule was just removed from has changed.
+        // The group's own `ModificationTime` and the step it reports move with
+        // the rules it holds: a group a rule was just removed from has changed.
         group.modification_time = now_rfc3339();
+        group.change = FirewallChange::Changed;
 
         // The rule is reported as the group held it at the moment it was
         // deleted, lifecycle state included, so a caller reads back exactly the

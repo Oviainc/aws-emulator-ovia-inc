@@ -261,16 +261,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
-        // The requested domains, in the order they arrived and without a
-        // repeat: a domain list holds a domain once however many times one
-        // request names it. Both capacities are the length of the request's
-        // already-materialised list, which the limit above bounds.
+        // The requested domains, CANONICALIZED (a fully qualified name, rooted
+        // with one trailing dot — `crate::state::firewall_domain_canonical`),
+        // in the order they arrived and without a repeat: a domain list holds a
+        // domain once however many times one request names it, and in the one
+        // spelling every reader of the list projects. Both capacities are the
+        // length of the request's already-materialised list, which the limit
+        // above bounds.
         let mut requested: Vec<String> = Vec::with_capacity(input.domains.len());
         let mut requested_keys: ::std::collections::HashSet<String> =
             ::std::collections::HashSet::with_capacity(input.domains.len());
         for domain in &input.domains {
             if requested_keys.insert(crate::state::firewall_domain_key(domain)) {
-                requested.push(domain.clone());
+                requested.push(crate::state::firewall_domain_canonical(domain));
             }
         }
 
@@ -327,6 +330,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The step the list stands in as this update is ACCEPTED, which is what
+        // the response states: the recorded acknowledgement of an update names
+        // the step the list was in when the request arrived — the creation step
+        // for the first write of a list, the finished-change step for the next
+        // one — and the step this change reaches is what a later read of the
+        // list reports. So the two differ by design, and the write itself is
+        // the thing the caller observes through the reader.
+        let accepted_status = record.status_at(now).to_string();
+        let accepted_status_message = record.status_message_at(now);
+
         record.domains = updated;
         record.modification_time = timestamp;
         // The whole set operation is applied to the stored domains inside this
@@ -336,15 +349,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // not.
         record.status = crate::state::FIREWALL_DOMAIN_LIST_STATUS_COMPLETE.to_string();
         record.settled_at = None;
+        record.settled_status = None;
+        record.settled_status_message = None;
+        // The list has been written, so the step every later read reports is
+        // the one this change reached and no longer the one its create did.
+        record.change = crate::state::FirewallChange::Changed;
 
         Ok(UpdateFirewallDomainsOutput {
             id: Some(record.id.clone()),
             name: Some(record.name.clone()),
-            // "Status of the UpdateFirewallDomains request", which is this
-            // list's status as of now, and the sentence that lifecycle step
-            // leaves on the list beside it.
-            status: Some(record.status_at(now).to_string()),
-            status_message: record.status_message_at(now),
+            // "Status of the UpdateFirewallDomains request": the step the list
+            // stood in as the request was accepted, and the sentence that
+            // lifecycle step leaves on the list beside it.
+            status: Some(accepted_status),
+            status_message: accepted_status_message,
         })
     }
 }

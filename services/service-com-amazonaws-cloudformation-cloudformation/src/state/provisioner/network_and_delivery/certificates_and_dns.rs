@@ -1052,7 +1052,13 @@ pub(crate) const FIREWALL_RULE_GROUP_ATTRIBUTES: &[(&str, &str)] = &[
 /// Delete the rule group a stack created, by the id its create minted. A group Route 53
 /// Resolver no longer holds is already in the state the delete asks for.
 ///
-/// A group a VPC is still filtered by cannot be deleted, so a stack that declares both
+/// The rules the create made in the group go FIRST: a group that still holds a rule still
+/// filters DNS traffic, so Route 53 Resolver refuses to delete it (`ConflictException`) until
+/// its rules are gone — the same order a client tearing a group down by hand follows. The
+/// rules are read back off the group rather than off the declaration, so a rule an update
+/// added is removed too.
+///
+/// A group a VPC is still filtered by cannot be deleted either, so a stack that declares both
 /// removes the association FIRST, because [`super::provisioning::delete`] deletes a stack's
 /// resources in the reverse of the order they were created in and the association depends on
 /// the group.
@@ -1061,12 +1067,107 @@ pub(crate) async fn delete_firewall_rule_group(
     region: &str,
     physical_resource_id: &str,
 ) -> Result<(), Refusal> {
+    delete_firewall_rule_group_rules(ctx, region, physical_resource_id).await?;
     let request = serde_json::json!({ "FirewallRuleGroupId": physical_resource_id });
     match call_route53resolver(ctx, region, "DeleteFirewallRuleGroup", &request).await {
         Ok(_) => Ok(()),
         Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => Ok(()),
         Err(refusal) => Err(refusal),
     }
+}
+
+/// Delete every rule the rule group `physical_resource_id` holds, each by the match source
+/// `DeleteFirewallRule` names one by: the group, the domain list or threat-protection id the
+/// rule matches on, and the query type that tells apart two rules of the group matching the
+/// same source.
+///
+/// The rules are walked page by page, as `ListFirewallRules` reports them; a group the service
+/// no longer holds has no rules to delete, and a rule that is already gone leaves nothing to
+/// do.
+async fn delete_firewall_rule_group_rules(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let mut next_token: Option<String> = None;
+    loop {
+        let mut listing = Map::new();
+        listing.insert(
+            "FirewallRuleGroupId".to_string(),
+            Value::String(physical_resource_id.to_string()),
+        );
+        // The maximum `ListFirewallRules` admits, so the walk makes as few calls as the
+        // model allows.
+        listing.insert("MaxResults".to_string(), Value::from(100));
+        if let Some(token) = &next_token {
+            listing.insert("NextToken".to_string(), Value::String(token.clone()));
+        }
+        let listed = match call_route53resolver(
+            ctx,
+            region,
+            "ListFirewallRules",
+            &Value::Object(listing),
+        )
+        .await
+        {
+            Ok(listed) => listed,
+            Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => return Ok(()),
+            Err(refusal) => return Err(refusal),
+        };
+        for rule in rules_in_delete_order(
+            listed
+                .get("FirewallRules")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default(),
+        ) {
+            let mut request = Map::new();
+            request.insert(
+                "FirewallRuleGroupId".to_string(),
+                Value::String(physical_resource_id.to_string()),
+            );
+            for member in FIREWALL_RULE_MATCH_SOURCE {
+                if let Some(value) = rule.get(*member) {
+                    request.insert((*member).to_string(), value.clone());
+                }
+            }
+            match call_route53resolver(ctx, region, "DeleteFirewallRule", &Value::Object(request))
+                .await
+            {
+                Ok(_) => {}
+                Err(refusal) if refusal.code == RESOURCE_NOT_FOUND => {}
+                Err(refusal) => return Err(refusal),
+            }
+        }
+        next_token = listed
+            .get("NextToken")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if next_token.is_none() {
+            return Ok(());
+        }
+    }
+}
+
+/// The members of a reported `FirewallRule` that name WHICH rule of a group a delete is
+/// about: the source it matches on, and the query type that scopes it.
+const FIREWALL_RULE_MATCH_SOURCE: &[&str] = &[
+    "FirewallDomainListId",
+    "FirewallThreatProtectionId",
+    "Qtype",
+];
+
+/// `rules` in the order their deletes are issued: the rules that name a `Qtype` FIRST.
+///
+/// A delete names a rule by the source it matches, and the `Qtype` is what tells apart two
+/// rules of one group matching the SAME source — so a delete that names no `Qtype` is only
+/// unambiguous while one rule of that source is left. Taking the `Qtype`-bearing rules out
+/// first leaves exactly that, whatever order the group reports its rules in.
+fn rules_in_delete_order(rules: Vec<Value>) -> Vec<Value> {
+    let (scoped, unscoped): (Vec<Value>, Vec<Value>) = rules
+        .into_iter()
+        .partition(|rule| rule.get("Qtype").is_some());
+    scoped.into_iter().chain(unscoped).collect()
 }
 
 /// The rule group's configuration as Route 53 Resolver reports it, for drift detection.

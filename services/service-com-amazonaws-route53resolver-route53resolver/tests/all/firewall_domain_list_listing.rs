@@ -31,6 +31,7 @@ const PUBLISHED_LISTS: &[&str] = &[
     "AWSManagedDomainsMalwareDomainList",
     "AWSManagedDomainsBotnetCommandandControl",
     "AWSManagedDomainsAggregateThreatList",
+    "AWSManagedDomainsAmazonGuardDutyThreatList",
 ];
 
 /// The `ManagedOwnerName` every published list reports, from the model doc cited
@@ -156,9 +157,15 @@ async fn the_published_lists_are_visible_without_any_create() {
             "case {case:?}: ManagedListType must be one of {DOMAIN_LIST_TYPES:?}, got {managed_type:?}"
         );
         assert_eq!(
-            item.get("CreatorRequestId"),
-            None,
-            "case {case:?}: no request of this account created a published list, got {item}"
+            string_member(item, "CreatorRequestId"),
+            case,
+            "case {case:?}: a published list is identified by the name DNS Firewall publishes it \
+             under, got {item}"
+        );
+        // Every published list says what the intelligence inside it is about.
+        assert!(
+            !string_member(item, "Category").is_empty(),
+            "case {case:?}: a published list must report its Category, got {item}"
         );
 
         // The id the listing reported resolves to the same list through the
@@ -172,7 +179,15 @@ async fn the_published_lists_are_visible_without_any_create() {
         let read = fetched
             .get("FirewallDomainList")
             .expect("the read carries a FirewallDomainList");
-        for member in ["Id", "Arn", "Name", "ManagedOwnerName", "ManagedListType"] {
+        for member in [
+            "Id",
+            "Arn",
+            "Name",
+            "ManagedOwnerName",
+            "ManagedListType",
+            "Category",
+            "CreatorRequestId",
+        ] {
             assert_eq!(
                 read.get(member),
                 item.get(member),

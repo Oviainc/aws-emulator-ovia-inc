@@ -29,6 +29,8 @@ mod firewall_association_error_bodies;
 mod firewall_config_listing;
 #[path = "all/firewall_configs.rs"]
 mod firewall_configs;
+#[path = "all/firewall_domain_imports.rs"]
+mod firewall_domain_imports;
 #[path = "all/firewall_domain_list_deletion.rs"]
 mod firewall_domain_list_deletion;
 #[path = "all/firewall_domain_list_listing.rs"]
@@ -125,6 +127,8 @@ mod resolver_rules;
 mod resource_not_found_identifier;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/scratch_probe.rs"]
+mod scratch_probe;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/tag_acceptance.rs"]

@@ -679,6 +679,25 @@ async fn a_stack_provisions_the_dns_firewall_resources_its_template_declares() {
             "case {case:?}: expected HTTP 200 from DeleteStack, got {status} with body {body}"
         );
         tokio::time::sleep(PAST_PROVISIONING_SPANS).await;
+        // The stack's own delete has to have gone through: a resource the owning service
+        // refused to delete would leave the stack in DELETE_FAILED with that refusal, and
+        // the reads below would then be asserting the refusal rather than the removal.
+        let (_, deleted_stack) = cloudformation(
+            &router,
+            region,
+            "DescribeStackEvents",
+            &[("StackName", &stack_name)],
+        )
+        .await;
+        assert!(
+            !elements(&deleted_stack, "ResourceStatus")
+                .iter()
+                .any(|status| status == "DELETE_FAILED"),
+            "case {case:?}: expected every resource of the stack to be deleted, got the events \
+             {:?} with the reasons {:?}",
+            elements(&deleted_stack, "ResourceStatus"),
+            elements(&deleted_stack, "ResourceStatusReason")
+        );
         for (operation, member, id) in [
             Some((
                 "GetFirewallDomainList",

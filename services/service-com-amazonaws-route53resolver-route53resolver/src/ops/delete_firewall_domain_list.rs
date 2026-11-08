@@ -170,14 +170,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // so the delete is refused with the sentence the model states for that
         // class (`crate::state::state_transition_conflict`, shared with the
         // rule-group delete) and the record is left exactly as it is. Once the
-        // clock has made the settled status due, the same call is served. The
-        // status is read out as an owned value, so the record is no longer
-        // borrowed when it is taken out of the store below.
+        // clock has made the settled status due, the same call is served — and
+        // a list that settled in the step a FAILED import leaves it in has no
+        // transition in flight either, so its delete is served too
+        // (`crate::state::firewall_domain_list_status_is_settled`). The status
+        // is read out as an owned value, so the record is no longer borrowed
+        // when it is taken out of the store below.
         let in_flight = store
             .firewall_domain_lists
             .get(&input.firewall_domain_list_id)
             .map(|record| record.status_at(now).to_string())
-            .filter(|status| status != crate::state::FIREWALL_DOMAIN_LIST_STATUS_COMPLETE);
+            .filter(|status| !crate::state::firewall_domain_list_status_is_settled(status));
         if in_flight.is_some() {
             return Err(DeleteFirewallDomainListErrorModeled::ConflictException(
                 crate::state::state_transition_conflict(),
@@ -217,6 +220,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reached as the call is served, so the clock owes nothing on it.
         record.status = crate::state::FIREWALL_DOMAIN_LIST_STATUS_DELETING.to_string();
         record.settled_at = None;
+        record.settled_status = None;
+        record.settled_status_message = None;
         record.modification_time = crate::state::now_rfc3339();
 
         Ok(DeleteFirewallDomainListOutput {

@@ -16617,6 +16617,7 @@ dependencies = [
  "serde_json",
  "service-com-amazonaws-ec2-amazonec2",
  "service-com-amazonaws-outposts-outpostsolafservice",
+ "service-com-amazonaws-s3-amazons3",
  "sha2 0.10.9",
  "tokio",
  "tracing",

@@ -263,6 +263,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Sharing is configured afterwards, by attaching a resource policy,
             // so a group that was just created carries none.
             firewall_rule_group_policy: None,
+            // No rule write has touched the group yet, so the step it reports
+            // is the one this call reached.
+            change: crate::state::FirewallChange::Created,
         };
 
         let rule_group = record.to_rule_group(now);

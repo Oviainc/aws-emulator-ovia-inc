@@ -45,11 +45,13 @@ use crate::ops::types::{
 // resource family's records, refusals and the store methods that write them,
 // and the root re-exports them all so every handler reaches them from
 // `crate::state`.
+mod domain_imports;
 mod firewall_rules;
 mod query_log;
 mod resolver_rules;
 mod tags;
 mod vpc_configs;
+pub use domain_imports::*;
 pub use firewall_rules::*;
 pub use query_log::*;
 pub use resolver_rules::*;
@@ -480,6 +482,15 @@ pub const RSLVR_CODE_FIREWALL_RULE_NOT_FOUND: &str = "RSLVR-02004";
 /// [`firewall_rule_block_option_not_for_action`].
 pub const RSLVR_CODE_FIREWALL_RULE_BLOCK_OPTION_NOT_FOR_ACTION: &str = "RSLVR-02010";
 
+/// The Route 53 Resolver service error code reported when a DNS Firewall rule
+/// group cannot be deleted because it still has a rule in it.
+///
+/// Carried for the same reason as [`RSLVR_CODE_ASSOCIATION_PRIORITY_IN_USE`]:
+/// `ConflictException` states every state transition the service refuses, so
+/// the HTTP status and the shape name alone do not say which one. See
+/// [`firewall_rule_group_has_rule`].
+pub const RSLVR_CODE_FIREWALL_RULE_GROUP_HAS_RULE: &str = "RSLVR-02103";
+
 /// `ResourceNotFoundException$ResourceType`, "the type of resource that doesn't
 /// exist": the modelled shape name of a Resolver endpoint.
 pub const RESOURCE_TYPE_RESOLVER_ENDPOINT: &str = "ResolverEndpoint";
@@ -558,6 +569,33 @@ pub const FIREWALL_DOMAIN_LIST_STATUS_COMPLETE: &str = "COMPLETE";
 /// is no longer in the settled status it held until that call.
 pub const FIREWALL_DOMAIN_LIST_STATUS_DELETING: &str = "DELETING";
 
+/// The `FirewallDomainListStatus` a domain list reports while an import of a
+/// domain file into it is still under way, the model's `IMPORTING`:
+/// `ImportFirewallDomains` answers with "the status of the import request",
+/// which is in flight until the clock makes the outcome due.
+pub const FIREWALL_DOMAIN_LIST_STATUS_IMPORTING: &str = "IMPORTING";
+
+/// The `FirewallDomainListStatus` a domain list terminates in when an import
+/// into it did not go through, the model's `COMPLETE_IMPORT_FAILED`.
+///
+/// It is a SETTLED status, like [`FIREWALL_DOMAIN_LIST_STATUS_COMPLETE`]: the
+/// import is over, so the list is not in a transition any more and the next
+/// call that writes or deletes it is served
+/// ([`firewall_domain_list_status_is_settled`]).
+pub const FIREWALL_DOMAIN_LIST_STATUS_COMPLETE_IMPORT_FAILED: &str = "COMPLETE_IMPORT_FAILED";
+
+/// Whether `status` is a step a domain list has REACHED rather than one it is
+/// moving through: the two the model declares for a list nothing is doing
+/// anything to (`COMPLETE`, `COMPLETE_IMPORT_FAILED`). Every other value
+/// (`IMPORTING`, `UPDATING`, `DELETING`) describes a change in flight, which is
+/// what the operations that move a list refuse it in.
+pub fn firewall_domain_list_status_is_settled(status: &str) -> bool {
+    matches!(
+        status,
+        FIREWALL_DOMAIN_LIST_STATUS_COMPLETE | FIREWALL_DOMAIN_LIST_STATUS_COMPLETE_IMPORT_FAILED
+    )
+}
+
 /// The `StatusMessage` a domain list reports while it holds
 /// [`FIREWALL_DOMAIN_LIST_STATUS_COMPLETE`].
 ///
@@ -576,21 +614,72 @@ pub const FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_COMPLETE: &str = "Created Firewall
 pub const FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_DELETING: &str =
     "Deleting the Firewall Domain List";
 
-/// The `StatusMessage` the lifecycle step `status` leaves on a domain list, or
-/// `None` for a step DNS Firewall states nothing for.
+/// The `StatusMessage` a domain list reports once a change a caller made to it
+/// has landed: a write of its domains, through `UpdateFirewallDomains` or an
+/// import that went through.
 ///
-/// It is DERIVED from the status rather than held beside it, so no projection of
-/// a list can report one step's status with another step's message.
-pub fn firewall_domain_list_status_message(status: &str) -> Option<String> {
+/// What `StatusMessage` states is the step the list LAST reached, so a list
+/// someone has written reports the step that write reached and not the one its
+/// create did ([`FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_COMPLETE`]). Like every
+/// other step's sentence it is fixed text with no part of the request in it.
+pub const FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_CHANGED: &str = "Finished domain list update";
+
+/// What last happened to a DNS Firewall resource, which is what the resource's
+/// `StatusMessage` states once it stands settled again.
+///
+/// A domain list and a rule group both report it, so the two slices decide
+/// their message the same way: a resource nothing has changed since it was
+/// created states its creation step, and one a caller has written states that
+/// the change finished ([`firewall_domain_list_status_message`],
+/// [`firewall_rule_group_status_message`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FirewallChange {
+    /// Nothing has changed the resource since the call that created it.
+    #[default]
+    Created,
+    /// A caller has changed it — the domains of a list, the rules of a group.
+    Changed,
+}
+
+/// The `StatusMessage` the lifecycle step `status` leaves on a domain list that
+/// last underwent `change`, or `None` for a step DNS Firewall states nothing
+/// for.
+///
+/// It is DERIVED from the status and that change rather than held beside them,
+/// so no projection of a list can report one step's status with another step's
+/// message. `IMPORTING` is a step the list is moving THROUGH, and what the
+/// service states on it is not recorded anywhere this crate can read, so — as
+/// for an association that is coming up — no sentence is invented for it.
+pub fn firewall_domain_list_status_message(status: &str, change: FirewallChange) -> Option<String> {
     match status {
-        FIREWALL_DOMAIN_LIST_STATUS_COMPLETE => {
-            Some(FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_COMPLETE.to_string())
-        }
+        FIREWALL_DOMAIN_LIST_STATUS_COMPLETE => Some(
+            match change {
+                FirewallChange::Created => FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_COMPLETE,
+                FirewallChange::Changed => FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_CHANGED,
+            }
+            .to_string(),
+        ),
         FIREWALL_DOMAIN_LIST_STATUS_DELETING => {
             Some(FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_DELETING.to_string())
         }
         _ => None,
     }
+}
+
+/// The `StatusMessage` a domain list reports once an import into it failed
+/// because the domain file could not be read from the URL the request named.
+///
+/// It is the sentence DNS Firewall states for that outcome: fixed text whose
+/// only variable part is the Region the request was signed for, which is the
+/// Region the file has to be in ("The file must be in an S3 bucket that's in
+/// the same Region as your DNS Firewall" —
+/// `ImportFirewallDomains$DomainFileUrl`'s own documentation). It fits
+/// `StatusMessage` (length 0..255).
+pub fn firewall_domain_list_import_download_failed(region: &str) -> String {
+    format!(
+        "Failed to download the file from provided url, please try with a smaller file or copy \
+         the file into a {region} S3 bucket."
+    )
 }
 
 /// The most domains one `UpdateFirewallDomains` request may carry.
@@ -649,14 +738,44 @@ pub const FIREWALL_RULE_GROUP_STATUS_COMPLETE: &str = "COMPLETE";
 /// the request in it.
 pub const FIREWALL_RULE_GROUP_STATUS_MESSAGE_COMPLETE: &str = "Created Firewall Rule Group";
 
-/// The `StatusMessage` the lifecycle step `status` leaves on a rule group, or
-/// `None` for a step DNS Firewall states nothing for — the rule-group twin of
-/// [`firewall_domain_list_status_message`], and derived from the status for the
-/// same reason.
-pub fn firewall_rule_group_status_message(status: &str) -> Option<String> {
+/// The `StatusMessage` a rule group reports once a change a caller made to it
+/// has landed: a rule added to it, changed in it or removed from it.
+///
+/// The rule-group twin of [`FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_CHANGED`], and
+/// stated for the same reason: what `StatusMessage` carries is the step the
+/// group LAST reached, so a group whose rules someone has written reports that
+/// change rather than its creation.
+pub const FIREWALL_RULE_GROUP_STATUS_MESSAGE_CHANGED: &str = "Finished rule group update";
+
+/// The `FirewallRuleGroupStatus` a rule group reports once a delete has been
+/// accepted for it, the model's `DELETING`: `DeleteFirewallRuleGroup` answers
+/// with the rule group it just deleted, which is on its way out and so is no
+/// longer in the settled status it held until that call — the rule-group twin of
+/// [`FIREWALL_DOMAIN_LIST_STATUS_DELETING`].
+pub const FIREWALL_RULE_GROUP_STATUS_DELETING: &str = "DELETING";
+
+/// The `StatusMessage` a rule group reports once it holds
+/// [`FIREWALL_RULE_GROUP_STATUS_DELETING`] — the delete step's own sentence,
+/// stated for the resource it is about exactly as the domain list's
+/// ([`FIREWALL_DOMAIN_LIST_STATUS_MESSAGE_DELETING`]) is, and likewise carrying
+/// nothing from the request.
+pub const FIREWALL_RULE_GROUP_STATUS_MESSAGE_DELETING: &str = "Deleting the Firewall Rule Group";
+
+/// The `StatusMessage` the lifecycle step `status` leaves on a rule group that
+/// last underwent `change`, or `None` for a step DNS Firewall states nothing
+/// for — the rule-group twin of [`firewall_domain_list_status_message`], and
+/// derived from the status and that change for the same reason.
+pub fn firewall_rule_group_status_message(status: &str, change: FirewallChange) -> Option<String> {
     match status {
-        FIREWALL_RULE_GROUP_STATUS_COMPLETE => {
-            Some(FIREWALL_RULE_GROUP_STATUS_MESSAGE_COMPLETE.to_string())
+        FIREWALL_RULE_GROUP_STATUS_COMPLETE => Some(
+            match change {
+                FirewallChange::Created => FIREWALL_RULE_GROUP_STATUS_MESSAGE_COMPLETE,
+                FirewallChange::Changed => FIREWALL_RULE_GROUP_STATUS_MESSAGE_CHANGED,
+            }
+            .to_string(),
+        ),
+        FIREWALL_RULE_GROUP_STATUS_DELETING => {
+            Some(FIREWALL_RULE_GROUP_STATUS_MESSAGE_DELETING.to_string())
         }
         _ => None,
     }
@@ -2210,15 +2329,59 @@ pub fn firewall_rule_priority_in_use(firewall_rule_group_id: &str) -> Validation
     }
 }
 
-/// The key a firewall domain list decides membership on: the domain name, case
-/// folded.
+/// The `ConflictException` `DeleteFirewallRuleGroup` is refused with while the
+/// group it names still has a rule in it.
 ///
-/// DNS names are case-insensitive (RFC 4343 §1), so `Example.com` and
-/// `example.com` name ONE domain: adding the second to a list that already
-/// holds the first adds nothing, and removing either removes the entry. Only
-/// the comparison is folded — a stored domain keeps the text the request wrote.
+/// A rule group that still holds rules still filters DNS traffic, so deleting
+/// it is not a state transition the service makes: the rules go first, which is
+/// the teardown order `DeleteFirewallRule`/`DeleteFirewallRuleGroup` are meant
+/// to be called in, and the model's `ConflictException` ("the requested state
+/// transition isn't valid") is the answer for a transition it will not make.
+/// The refusal is the RSLVR-coded sentence the service states for that fault
+/// ([`RSLVR_CODE_FIREWALL_RULE_GROUP_HAS_RULE`]): it names the rule group from
+/// the request and tells the caller to delete the rule first. The second
+/// sentence carries the extra space the service writes between the two, as
+/// [`association_priority_in_use`]'s does.
+pub fn firewall_rule_group_has_rule(firewall_rule_group_id: &str) -> ConflictException {
+    ConflictException {
+        message: Some(rslvr_message_sentences(
+            RSLVR_CODE_FIREWALL_RULE_GROUP_HAS_RULE,
+            &[
+                &format!(
+                    "The DNS Firewall rule group has an associated rule: \
+                     \"{firewall_rule_group_id}\""
+                ),
+                " Delete the rule and try again later",
+            ],
+        )),
+    }
+}
+
+/// The canonical spelling of a domain name written to a firewall domain list:
+/// the fully qualified name, rooted with exactly one trailing dot.
+///
+/// It is the ONE canonicalization this service already applies to the domain
+/// name a Resolver rule selects on ([`canonical_domain_name`]) — a domain name
+/// is written relative to the root, and the root is written as a trailing dot
+/// (RFC 1035 §3.1) — read here under the name the firewall slice uses it by:
+/// the fully qualified form is what a domain list HOLDS, so every reader of the
+/// list projects the rooted name whatever spelling the request wrote it in.
+/// Rooting is IDEMPOTENT, which is what makes the two spellings of one domain
+/// one entry rather than two ([`firewall_domain_key`]).
+pub fn firewall_domain_canonical(domain: &str) -> String {
+    canonical_domain_name(domain)
+}
+
+/// The key a firewall domain list decides membership on: the canonical name
+/// ([`firewall_domain_canonical`]), case folded.
+///
+/// DNS names are case-insensitive (RFC 4343 §1) and a name means the same
+/// domain whether or not the request rooted it, so `Example.com` and
+/// `example.com.` name ONE domain: adding the second to a list that already
+/// holds the first adds nothing, and removing either — however it was spelled —
+/// removes the entry.
 pub fn firewall_domain_key(domain: &str) -> String {
-    domain.to_ascii_lowercase()
+    firewall_domain_canonical(domain).to_ascii_lowercase()
 }
 
 /// Whether `domain` satisfies the requirements
@@ -2279,6 +2442,10 @@ pub struct ManagedFirewallDomainList {
     /// The `ManagedListType` this list reports: "the type of the managed domain
     /// list, for example `THREAT`".
     pub managed_list_type: &'static str,
+    /// The `Category` this list reports: "the category of the domain list" —
+    /// what the threat intelligence inside it is about, which is published with
+    /// the list and is the same for every account that reads it.
+    pub category: &'static str,
 }
 
 /// The domain lists DNS Firewall publishes to every account, in the order
@@ -2286,24 +2453,31 @@ pub struct ManagedFirewallDomainList {
 ///
 /// The names are the ones AWS publishes for DNS Firewall's managed domain
 /// lists, the first of which the model itself names in
-/// `FirewallDomainList$ManagedOwnerName`'s doc. All three are threat lists, so
-/// each reports [`DOMAIN_LIST_TYPE_THREAT`]; `CONTENT`
-/// ([`DOMAIN_LIST_TYPE_CONTENT`]) is the other value the model's enum carries,
-/// which no published list of this service uses. The GuardDuty threat list is
-/// deliberately absent: it appears only for an account with GuardDuty enabled,
-/// and this emulator holds no GuardDuty state to decide that from.
+/// `FirewallDomainList$ManagedOwnerName`'s doc, each with the category AWS
+/// publishes beside it. All four are threat lists, so each reports
+/// [`DOMAIN_LIST_TYPE_THREAT`]; `CONTENT` ([`DOMAIN_LIST_TYPE_CONTENT`]) is the
+/// other value the model's enum carries, which no published list of this
+/// service uses.
 pub const MANAGED_FIREWALL_DOMAIN_LISTS: &[ManagedFirewallDomainList] = &[
     ManagedFirewallDomainList {
         name: "AWSManagedDomainsMalwareDomainList",
         managed_list_type: DOMAIN_LIST_TYPE_THREAT,
+        category: "Malware",
     },
     ManagedFirewallDomainList {
         name: "AWSManagedDomainsBotnetCommandandControl",
         managed_list_type: DOMAIN_LIST_TYPE_THREAT,
+        category: "Botnet/Command and Control",
     },
     ManagedFirewallDomainList {
         name: "AWSManagedDomainsAggregateThreatList",
         managed_list_type: DOMAIN_LIST_TYPE_THREAT,
+        category: "Aggregate Threat List",
+    },
+    ManagedFirewallDomainList {
+        name: "AWSManagedDomainsAmazonGuardDutyThreatList",
+        managed_list_type: DOMAIN_LIST_TYPE_THREAT,
+        category: "Amazon GuardDuty Threat List",
     },
 ];
 
@@ -2337,15 +2511,15 @@ impl ManagedFirewallDomainList {
             id: Some(self.id()),
             arn: Some(self.arn(region)),
             name: Some(self.name.to_string()),
-            // `CreatorRequestId` is "a unique string defined by YOU to identify
-            // the request": no request of this account created a published list,
-            // so there is none to report. `Category` is "the category of the
-            // domain list", for which neither the model nor the published list
-            // states a value, so no value is invented for it.
-            creator_request_id: None,
+            // `CreatorRequestId` is "a unique string defined by you to identify
+            // the request": the request that created a published list is the
+            // service's own, and what DNS Firewall identifies it by is the
+            // list's published name, which is what every account is served for
+            // it.
+            creator_request_id: Some(self.name.to_string()),
             managed_owner_name: Some(MANAGED_FIREWALL_DOMAIN_LIST_OWNER.to_string()),
             managed_list_type: Some(self.managed_list_type.to_string()),
-            category: None,
+            category: Some(self.category.to_string()),
         }
     }
 
@@ -2365,9 +2539,6 @@ impl ManagedFirewallDomainList {
             // count this store holds for the list — none — exactly as a stored
             // record's count is derived from its own domains
             // ([`FirewallDomainListRecord::domain_count`]) rather than claimed.
-            // `CreationTime`/`ModificationTime` are unknown — no call of this
-            // account created or last changed the list — so neither is
-            // invented.
             domain_count: Some(0),
             status: Some(FIREWALL_DOMAIN_LIST_STATUS_COMPLETE.to_string()),
             // The published list stands in the same settled step a list of this
@@ -2375,12 +2546,19 @@ impl ManagedFirewallDomainList {
             // ([`firewall_domain_list_status_message`]).
             status_message: firewall_domain_list_status_message(
                 FIREWALL_DOMAIN_LIST_STATUS_COMPLETE,
+                // Nothing this account did changed a published list, so the
+                // step it stands in is the one it was published in.
+                FirewallChange::Created,
             ),
             managed_owner_name: Some(MANAGED_FIREWALL_DOMAIN_LIST_OWNER.to_string()),
-            creator_request_id: None,
+            // The published list is identified by its own name, exactly as
+            // [`Self::to_metadata`] reports it; `CreationTime`/`ModificationTime`
+            // are unknown — no call of this account created or last changed the
+            // list — so neither is invented.
+            creator_request_id: Some(self.name.to_string()),
             creation_time: None,
             modification_time: None,
-            category: None,
+            category: Some(self.category.to_string()),
             managed_list_type: Some(self.managed_list_type.to_string()),
         }
     }
@@ -2449,9 +2627,26 @@ pub struct FirewallDomainListRecord {
     pub creation_time: String,
     pub modification_time: String,
     /// The instant at which the move from the transient [`Self::status`] to
-    /// `COMPLETE` is owed, or `None` for a list with no transition in flight
-    /// (one nobody has changed since it was created empty).
+    /// [`Self::settled_status`] is owed, or `None` for a list with no
+    /// transition in flight (one nobody has changed since it was created
+    /// empty).
     pub settled_at: Option<Instant>,
+    /// The `FirewallDomainListStatus` the clock owes this list, reported from
+    /// [`Self::settled_at`] onwards, or `None` when that step is the settled
+    /// [`FIREWALL_DOMAIN_LIST_STATUS_COMPLETE`] every change but a failed
+    /// import ends in.
+    pub settled_status: Option<String>,
+    /// The `StatusMessage` the settled step states, for the one step whose
+    /// sentence is not derived from the status alone because it carries the
+    /// Region of the request that started it
+    /// ([`firewall_domain_list_import_download_failed`]); `None` leaves the
+    /// message derived from the status, as every other step's is.
+    pub settled_status_message: Option<String>,
+    /// What last changed this list, which is the step its `StatusMessage`
+    /// states once it stands settled again ([`Self::status_message_at`]): a
+    /// list nobody has written since the create states its creation, and one
+    /// whose domains a caller wrote states that the change finished.
+    pub change: FirewallChange,
 }
 
 impl FirewallDomainListRecord {
@@ -2462,22 +2657,34 @@ impl FirewallDomainListRecord {
     }
 
     /// This list's `FirewallDomainListStatus` as of `now`: the status it holds
-    /// until the transition the clock owes falls due,
-    /// [`FIREWALL_DOMAIN_LIST_STATUS_COMPLETE`] after it — the same shape as
+    /// until the transition the clock owes falls due, [`Self::settled_status`]
+    /// — [`FIREWALL_DOMAIN_LIST_STATUS_COMPLETE`] unless the change in flight
+    /// owes another step — after it. The same shape as
     /// [`FirewallRuleGroupRecord::status_at`], so a list the clock owes nothing
     /// reports the step it stands in.
     pub fn status_at(&self, now: Instant) -> &str {
         match self.settled_at {
             Some(due) if now < due => &self.status,
-            Some(_) => FIREWALL_DOMAIN_LIST_STATUS_COMPLETE,
+            Some(_) => self
+                .settled_status
+                .as_deref()
+                .unwrap_or(FIREWALL_DOMAIN_LIST_STATUS_COMPLETE),
             None => &self.status,
         }
     }
 
     /// This list's `StatusMessage` as of `now`: the sentence the lifecycle step
-    /// it reports then ([`Self::status_at`]) leaves on it.
+    /// it reports then ([`Self::status_at`]) leaves on it — the one the step
+    /// that settled it stated, where that sentence carries more than the status
+    /// ([`Self::settled_status_message`]).
     pub fn status_message_at(&self, now: Instant) -> Option<String> {
-        firewall_domain_list_status_message(self.status_at(now))
+        let settled = self.settled_at.is_some_and(|due| now >= due);
+        if settled {
+            if let Some(message) = &self.settled_status_message {
+                return Some(message.clone());
+            }
+        }
+        firewall_domain_list_status_message(self.status_at(now), self.change)
     }
 
     /// Project the record onto the modelled `FirewallDomainList`.
@@ -2578,6 +2785,12 @@ pub struct FirewallRuleGroupRecord {
     /// resolves through the same record every other rule-group operation reads,
     /// and a group the store no longer holds has no policy to report.
     pub firewall_rule_group_policy: Option<String>,
+    /// What last changed this group, which is the step its `StatusMessage`
+    /// states once it stands settled again ([`Self::status_message_at`]) — the
+    /// rule-group twin of [`FirewallDomainListRecord::change`]: a group no rule
+    /// write has touched since the create states its creation, and one whose
+    /// rules a caller wrote states that the change finished.
+    pub change: FirewallChange,
 }
 
 impl FirewallRuleGroupRecord {
@@ -2602,7 +2815,7 @@ impl FirewallRuleGroupRecord {
     /// step it reports then ([`Self::status_at`]) leaves on it — the
     /// rule-group twin of [`FirewallDomainListRecord::status_message_at`].
     pub fn status_message_at(&self, now: Instant) -> Option<String> {
-        firewall_rule_group_status_message(self.status_at(now))
+        firewall_rule_group_status_message(self.status_at(now), self.change)
     }
 
     /// Project the record onto the modelled `FirewallRuleGroup`.

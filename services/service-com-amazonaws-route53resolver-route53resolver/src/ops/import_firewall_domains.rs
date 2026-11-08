@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ImportFirewallDomains
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ImportFirewallDomains`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ImportFirewallDomains::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Imports the domains listed in a file into a DNS Firewall domain list of this
+//! account: `REPLACE` makes the list exactly match the list in the file. The
+//! file is an object of the account's own Amazon S3 inventory, read through
+//! that service's own store ([`crate::state::firewall_domain_file_at`]); a URL
+//! addressing no file DNS Firewall can download starts an import that
+//! terminates in `COMPLETE_IMPORT_FAILED`, stating why, with the list's domains
+//! untouched.
 //!
 //! ## Shape of an operation
 //!
@@ -176,18 +175,140 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ImportFirewallDomains` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ImportFirewallDomainsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ImportFirewallDomains"))
+        // The engine is reachable from `&self` (constructor-injected); `ctx`
+        // carries the Region the request was signed for, which is the Region the
+        // domain file has to be in and the one the download failure names.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                ImportFirewallDomainsErrorModeled::InternalServiceErrorException(
+                    InternalServiceErrorException {
+                        message: Some("the Route 53 Resolver store is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // "This must be set to REPLACE, which updates the domain list to
+        // exactly match the list in the file": the one value the modelled
+        // `FirewallDomainImportOperation` enum declares. An unmodelled value is
+        // refused rather than silently treated as it.
+        let operation = input.operation.as_str();
+        if !crate::ops::types::FIREWALL_DOMAIN_IMPORT_OPERATION_VALUES.contains(&operation) {
+            return Err(ImportFirewallDomainsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "Operation must be one of {:?}",
+                        crate::ops::types::FIREWALL_DOMAIN_IMPORT_OPERATION_VALUES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let region = crate::state::request_region(&ctx.parts().headers);
+
+        // The file is read out of the account's own object store BEFORE this
+        // service's store is locked, so no guard of one store is held while the
+        // other is taken (see `crate::state::firewall_domain_file_at`).
+        let file = crate::state::firewall_domain_file_at(&*self.engine, &input.domain_file_url);
+        if let crate::state::FirewallDomainFile::NotDomains(line) = &file {
+            return Err(ImportFirewallDomainsErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(format!(
+                        "The file at the provided url carries {line:?}, which is not a domain \
+                         specification: a domain may start with an asterisk and otherwise \
+                         carries only letters, digits, hyphens and underscores in dot-separated \
+                         labels"
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let now = ::std::time::Instant::now();
+        let timestamp = crate::state::now_rfc3339();
+        let mut store = state.lock();
+
+        let Some(record) = store
+            .firewall_domain_lists
+            .get_mut(&input.firewall_domain_list_id)
+        else {
+            // A list DNS Firewall publishes itself belongs to the service, not
+            // to the account reading it: nothing this account does changes it,
+            // so it is not visible as a writable resource at all and an import
+            // naming one is answered exactly as an import naming a list that
+            // does not exist (see
+            // `crate::state::firewall_domain_list_not_found`).
+            return Err(
+                ImportFirewallDomainsErrorModeled::ResourceNotFoundException(
+                    crate::state::firewall_domain_list_not_found(&input.firewall_domain_list_id),
+                )
+                .into(),
+            );
+        };
+
+        // `ConflictException` is "the requested state transition isn't valid.
+        // For example ... you can't import domains into a domain list that is
+        // in the process of being deleted": a list with a change still in
+        // flight takes no import, and the record is left exactly as it is.
+        if !crate::state::firewall_domain_list_status_is_settled(record.status_at(now)) {
+            return Err(ImportFirewallDomainsErrorModeled::ConflictException(
+                crate::state::state_transition_conflict(),
+            )
+            .into());
+        }
+
+        // "The number of domain names that are specified in the domain list" is
+        // bounded by what this store holds per list, so a file past the bound is
+        // a file this import cannot take: nothing is written and the import ends
+        // in the same failure a file it could not download ends in.
+        let imported = match &file {
+            crate::state::FirewallDomainFile::Domains(domains)
+                if domains.len() <= crate::state::MAX_DOMAINS_PER_LIST =>
+            {
+                Some(domains.clone())
+            }
+            _ => None,
+        };
+
+        match imported {
+            // The file was downloaded and read: `REPLACE` makes the list
+            // "exactly match the list in the file", and the import is in flight
+            // until the clock makes its outcome due.
+            Some(domains) => {
+                record.domains = domains;
+                record.settled_status =
+                    Some(crate::state::FIREWALL_DOMAIN_LIST_STATUS_COMPLETE.to_string());
+                record.settled_status_message = None;
+                // The import writes the list's domains, so once it has landed
+                // the list reports that change and no longer its creation.
+                record.change = crate::state::FirewallChange::Changed;
+            }
+            // The file could not be downloaded, so nothing is imported: the
+            // list keeps the domains it held and the import terminates in the
+            // step a failed import leaves it in, stating why.
+            None => {
+                record.settled_status = Some(
+                    crate::state::FIREWALL_DOMAIN_LIST_STATUS_COMPLETE_IMPORT_FAILED.to_string(),
+                );
+                record.settled_status_message = Some(
+                    crate::state::firewall_domain_list_import_download_failed(&region),
+                );
+            }
+        }
+        record.status = crate::state::FIREWALL_DOMAIN_LIST_STATUS_IMPORTING.to_string();
+        record.settled_at = Some(now + crate::state::PROVISIONING_DELAY);
+        record.modification_time = timestamp;
+
+        Ok(ImportFirewallDomainsOutput {
+            id: Some(record.id.clone()),
+            name: Some(record.name.clone()),
+            // "Status of the import request", which is this list's status as of
+            // now — the import is under way — and the sentence that lifecycle
+            // step leaves on the list beside it.
+            status: Some(record.status_at(now).to_string()),
+            status_message: record.status_message_at(now),
+        })
     }
 }

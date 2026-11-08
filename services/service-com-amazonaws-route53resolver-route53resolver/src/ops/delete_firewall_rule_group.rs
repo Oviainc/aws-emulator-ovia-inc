@@ -4,7 +4,8 @@
 //! SCAFFOLD REPLACED: implemented. The delete completes the DNS Firewall
 //! rule-group slice (`CreateFirewallRuleGroup`, `GetFirewallRuleGroup`): it
 //! computes its response from the record in [`crate::state`] and removes that
-//! record. This is the ONLY file to touch for this operation.
+//! record — once the group holds no rule, which is the one state it can be
+//! deleted from. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -188,6 +189,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A group that still holds a rule still filters DNS traffic, so the
+        // delete is refused with the sentence the service states for that fault
+        // (`crate::state::firewall_rule_group_has_rule`) and the group is left
+        // in place: the rules go first, which is the order the rule delete and
+        // this one are meant to be called in. A group whose rules have all been
+        // deleted holds none, so the very same call is then served — and the
+        // `RuleCount` the answer reports is derived from those rules, so the
+        // precondition and the count cannot disagree.
+        let holds_rules = store
+            .firewall_rule_groups
+            .get(&input.firewall_rule_group_id)
+            .is_some_and(|record| !record.rules.is_empty());
+        if holds_rules {
+            return Err(DeleteFirewallRuleGroupErrorModeled::ConflictException(
+                crate::state::firewall_rule_group_has_rule(&input.firewall_rule_group_id),
+            )
+            .into());
+        }
+
         // Nothing is stored under that id — including a second delete of the
         // same group, which the first one already removed.
         let Some(record) = store
@@ -210,10 +230,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove(&record.creator_request_id);
 
         // The answer is the group this call took out, as it stood — with the
-        // rules it held counted, and in the lifecycle step it last reached,
-        // whose own sentence the projection reports beside it: the delete is
-        // carried out inside this call, so there is no step still in flight for
-        // the group to report.
+        // rules it held counted — and it is on its way out, so it reports the
+        // deleting step rather than the settled one it held until this call,
+        // with that step's own sentence beside it: the same way the domain-list
+        // delete reports the list it just took out. The step is reached as the
+        // call is served, so the clock owes nothing on it.
+        let mut record = record;
+        record.status = crate::state::FIREWALL_RULE_GROUP_STATUS_DELETING.to_string();
+        record.settled_at = None;
+        record.modification_time = crate::state::now_rfc3339();
+
         Ok(DeleteFirewallRuleGroupOutput {
             firewall_rule_group: Some(record.to_rule_group(now)),
         })

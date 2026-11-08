@@ -14,9 +14,11 @@
 //! What these cases pin is the rule the slice implements: a domain list and a
 //! rule group each stand in a lifecycle step, and every projection of one
 //! reports that step BOTH as its `Status` and as the sentence the step states in
-//! `StatusMessage`; a change the service applies inside the call it was asked
-//! for leaves the resource in its settled step, so no response reports a step
-//! that is still in flight for work that is already done.
+//! `StatusMessage` — the step it LAST reached, so a resource a caller has
+//! written states the step that change reached and not the one its create did;
+//! a change the service applies inside the call it was asked for leaves the
+//! resource in its settled step, so no response reports a step that is still in
+//! flight for work that is already done.
 
 use serde_json::{json, Value};
 use service_com_amazonaws_route53resolver_route53resolver::ops::types::{
@@ -28,15 +30,23 @@ use smithy_server_runtime::MultiServiceRouter;
 use super::harness::{emulator, expect_error, ok, string_member};
 
 /// The sentence DNS Firewall states for a domain list that stands in its
-/// created, settled step, and the one it states once a delete has been accepted
-/// for the list. Both are fixed text for the step, with no part of the request
-/// in them.
+/// created, settled step, the one it states once a write of its domains has
+/// landed, and the one it states once a delete has been accepted for the list.
+/// All three are fixed text for the step, with no part of the request in them.
 const DOMAIN_LIST_CREATED_MESSAGE: &str = "Created Firewall Domain List";
+const DOMAIN_LIST_CHANGED_MESSAGE: &str = "Finished domain list update";
 const DOMAIN_LIST_DELETING_MESSAGE: &str = "Deleting the Firewall Domain List";
 
 /// The sentence DNS Firewall states for a rule group that stands in its
-/// created, settled step.
+/// created, settled step, and the one it states once a write of its rules has
+/// landed.
 const RULE_GROUP_CREATED_MESSAGE: &str = "Created Firewall Rule Group";
+const RULE_GROUP_CHANGED_MESSAGE: &str = "Finished rule group update";
+
+/// The sentence DNS Firewall states for a rule group a delete has been
+/// accepted for — the group's own delete-step sentence, as
+/// [`DOMAIN_LIST_DELETING_MESSAGE`] is the list's.
+const RULE_GROUP_DELETING_MESSAGE: &str = "Deleting the Firewall Rule Group";
 
 /// The settled `FirewallDomainListStatus`/`FirewallRuleGroupStatus` both
 /// families report once nothing is in flight, out of the model's enums
@@ -202,6 +212,15 @@ async fn every_domain_list_projection_states_the_step_the_list_stands_in() {
                 .map(|slot| format!("host-{slot}.example.com"))
                 .chain(std::iter::once(format!("{operation}.example.com")))
                 .collect();
+            // The acknowledgement states the step the list stood in as the
+            // update was accepted: the step the change reaches is what the read
+            // after it reports. So the first update answers the creation step
+            // and every later one the finished-change step.
+            let accepted = if index == 0 {
+                DOMAIN_LIST_CREATED_MESSAGE
+            } else {
+                DOMAIN_LIST_CHANGED_MESSAGE
+            };
             let answered = ok(
                 &router,
                 "UpdateFirewallDomains",
@@ -212,19 +231,20 @@ async fn every_domain_list_projection_states_the_step_the_list_stands_in() {
                 }),
             )
             .await;
-            // The whole set operation is applied inside the call, so the list
-            // is settled by the time it answers — and the read agrees.
             assert_step(
                 &answered,
                 SETTLED,
-                DOMAIN_LIST_CREATED_MESSAGE,
+                accepted,
                 FIREWALL_DOMAIN_LIST_STATUS_VALUES,
                 &format!("{case}: {operation}"),
             );
+            // The whole set operation is applied inside the call, so the list
+            // is settled by the time it answers — in the step that write
+            // reached, which every later read reports.
             assert_step(
                 &read_list(&router, &id).await,
                 SETTLED,
-                DOMAIN_LIST_CREATED_MESSAGE,
+                DOMAIN_LIST_CHANGED_MESSAGE,
                 FIREWALL_DOMAIN_LIST_STATUS_VALUES,
                 &format!("{case}: the read after {operation}"),
             );
@@ -260,8 +280,8 @@ async fn every_domain_list_projection_states_the_step_the_list_stands_in() {
 
 /// Every projection of a rule group — the create, the read and the delete —
 /// reports the step the group stands in as both `Status` and `StatusMessage`.
-/// The delete carries the removal out inside the call, so the group it answers
-/// with stands in the step it last reached.
+/// The delete has been accepted when it answers, so the group it answers with
+/// stands in its deleting step.
 #[tokio::test]
 async fn every_rule_group_projection_states_the_step_the_group_stands_in() {
     let router = emulator();
@@ -304,8 +324,8 @@ async fn every_rule_group_projection_states_the_step_the_group_stands_in() {
         );
         assert_step(
             &deleted,
-            SETTLED,
-            RULE_GROUP_CREATED_MESSAGE,
+            DELETING,
+            RULE_GROUP_DELETING_MESSAGE,
             FIREWALL_RULE_GROUP_STATUS_VALUES,
             &format!("{case}: the delete"),
         );
@@ -317,6 +337,91 @@ async fn every_rule_group_projection_states_the_step_the_group_stands_in() {
             "ResourceNotFoundException",
         )
         .await;
+    }
+}
+
+/// A rule group whose rules a caller has written states the step that change
+/// reached and no longer the one its create did — the domain list's rule
+/// ([`every_domain_list_projection_states_the_step_the_list_stands_in`]) over
+/// the other resource that carries rules.
+///
+/// The rows are every write that changes what a group holds: a rule added to
+/// it, that rule changed in it, and the rule removed from it again.
+#[tokio::test]
+async fn a_rule_group_states_the_step_its_last_rule_write_reached() {
+    let router = emulator();
+    let list = string_member(
+        &domain_list(
+            &ok(
+                &router,
+                "CreateFirewallDomainList",
+                json!({ "CreatorRequestId": "req-rule-source", "Name": "rule-source" }),
+            )
+            .await,
+        ),
+        "Id",
+    );
+    let group = string_member(
+        &rule_group(
+            &ok(
+                &router,
+                "CreateFirewallRuleGroup",
+                json!({ "CreatorRequestId": "req-written-group", "Name": "written-group" }),
+            )
+            .await,
+        ),
+        "Id",
+    );
+
+    let writes = vec![
+        (
+            "a rule added to the group",
+            "CreateFirewallRule",
+            json!({
+                "CreatorRequestId": "req-written-rule",
+                "FirewallRuleGroupId": group.clone(),
+                "FirewallDomainListId": list.clone(),
+                "Name": "written-rule",
+                "Priority": 100,
+                "Action": "ALERT",
+            }),
+        ),
+        (
+            "that rule changed in the group",
+            "UpdateFirewallRule",
+            json!({
+                "FirewallRuleGroupId": group.clone(),
+                "FirewallDomainListId": list.clone(),
+                "Priority": 200,
+            }),
+        ),
+        (
+            "the rule removed from the group again",
+            "DeleteFirewallRule",
+            json!({
+                "FirewallRuleGroupId": group.clone(),
+                "FirewallDomainListId": list.clone(),
+            }),
+        ),
+    ];
+
+    for (case, operation, request) in writes {
+        ok(&router, operation, request).await;
+        let read = rule_group(
+            &ok(
+                &router,
+                "GetFirewallRuleGroup",
+                json!({ "FirewallRuleGroupId": group.clone() }),
+            )
+            .await,
+        );
+        assert_step(
+            &read,
+            SETTLED,
+            RULE_GROUP_CHANGED_MESSAGE,
+            FIREWALL_RULE_GROUP_STATUS_VALUES,
+            case,
+        );
     }
 }
 
@@ -402,8 +507,8 @@ async fn the_sentence_belongs_to_the_step_and_not_to_one_request() {
             string_member(&group, "StatusMessage"),
         ));
 
-        // A list read back after a write to it still stands in the settled
-        // step, so its sentence has not moved.
+        // A list read back after a write to it still stands in a settled step,
+        // and states the step that write reached.
         ok(
             &router,
             "UpdateFirewallDomains",
@@ -423,6 +528,8 @@ async fn the_sentence_belongs_to_the_step_and_not_to_one_request() {
     for (case, message) in &seen {
         let expected = if case.contains("group") {
             RULE_GROUP_CREATED_MESSAGE
+        } else if case.contains("after a write") {
+            DOMAIN_LIST_CHANGED_MESSAGE
         } else {
             DOMAIN_LIST_CREATED_MESSAGE
         };
