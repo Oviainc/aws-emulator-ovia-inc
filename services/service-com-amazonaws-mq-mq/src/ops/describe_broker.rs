@@ -300,7 +300,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .values()
                     .map(|user| UserSummary {
                         username: user.username.clone(),
-                        pending_change: None,
+                        // "The type of change pending for the broker user" — a
+                        // user the broker still owes a change is reported with
+                        // that change until the reboot applies it.
+                        pending_change: user.pending_change.clone(),
                     })
                     .collect()
             }),

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteUser
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteUser`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteUser::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: marks the user named by `Username` on the broker named by `BrokerId` as
+//! pending deletion and persists that on the broker's record, where `DescribeUser` and
+//! `DescribeBroker` read it back as this user's pending change. The response has no
+//! members. A `BrokerId` with no broker behind it, or a `Username` the broker does not
+//! hold, is `NotFoundException` (404).
+//!
+//! A user change does not take effect on the broker until the broker is rebooted — which
+//! is why the modelled answer carries `UserPendingChanges` at all — so the deleted user
+//! keeps being reported, with its change pending, until the reboot applies it.
+//!
+//! Deleting the broker's LAST user — or its only administrative one — is accepted: the
+//! "at least one user" precondition is `CreateBroker`'s (see
+//! [`crate::state::MIN_USERS_PER_BROKER`]), not a rule this operation enforces.
 //!
 //! ## Shape of an operation
 //!
@@ -68,6 +73,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -140,18 +146,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteUser` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteUserErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteUser"))
+        let _ = ctx;
+        let Some(state) = state::service_state(&*self.engine) else {
+            return Err(DeleteUserErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    message: Some("the service state store is unavailable".to_string()),
+                    ..Default::default()
+                },
+            )
+            .into());
+        };
+
+        let mut store = state.lock();
+        let Some(broker) = store.brokers.get_mut(&input.broker_id) else {
+            return Err(DeleteUserErrorModeled::NotFoundException(NotFoundException {
+                error_attribute: Some("broker-id".to_string()),
+                message: Some(state::broker_not_found_message(&input.broker_id)),
+                resource_share_errors: None,
+            })
+            .into());
+        };
+
+        // A username outside its documented constraint can name no stored user, so
+        // the lookup below already answers it as the missing resource it is — the
+        // same answer `DescribeUser` gives for any username the broker does not
+        // hold. Nothing else about the request is checked: `Username` and `BrokerId`
+        // are this operation's only members.
+        let Some(user) = broker.users.get_mut(&input.username) else {
+            return Err(DeleteUserErrorModeled::NotFoundException(NotFoundException {
+                error_attribute: Some(state::USERNAME_ATTRIBUTE.to_string()),
+                message: Some(state::user_not_found_message(
+                    &input.broker_id,
+                    &input.username,
+                )),
+                resource_share_errors: None,
+            })
+            .into());
+        };
+
+        // The broker applies the change when it reboots, so what this call persists
+        // is the pending change, not the removal. Asking again for a deletion that
+        // is already pending leaves the one pending change as it is.
+        user.pending_change = Some(state::CHANGE_TYPE_DELETE.to_string());
+
+        Ok(DeleteUserOutput {})
     }
 }

@@ -174,10 +174,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let Some(user) = broker.users.get(&input.username) else {
             return Err(DescribeUserErrorModeled::NotFoundException(NotFoundException {
-                error_attribute: Some("username".to_string()),
-                message: Some(format!(
-                    "broker {:?} has no user named {:?}",
-                    input.broker_id, input.username
+                error_attribute: Some(state::USERNAME_ATTRIBUTE.to_string()),
+                message: Some(state::user_not_found_message(
+                    &input.broker_id,
+                    &input.username,
                 )),
                 resource_share_errors: None,
             })
@@ -190,7 +190,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             console_access: Some(user.console_access),
             groups: state::optional_list(&user.groups),
             replication_user: Some(user.replication_user),
-            pending: None,
+            // "The status of the changes pending for the ActiveMQ user" — present
+            // only while the broker still owes this user a change, and carrying
+            // only `PendingChange`, the one member a pending DELETE has a value
+            // for: nothing about the user is being changed, the user is going.
+            pending: user
+                .pending_change
+                .as_deref()
+                .map(|change| UserPendingChanges {
+                    pending_change: change.to_string(),
+                    console_access: None,
+                    groups: None,
+                }),
         })
     }
 }

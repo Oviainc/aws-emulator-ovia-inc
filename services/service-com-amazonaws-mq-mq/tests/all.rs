@@ -29,3 +29,5 @@ mod configuration_wire_form;
 mod resource_tags;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/user_deletion.rs"]
+mod user_deletion;

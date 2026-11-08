@@ -206,7 +206,18 @@ pub struct BrokerUser {
     pub console_access: bool,
     pub groups: Vec<String>,
     pub replication_user: bool,
+    /// The change this user is waiting for the broker to apply, as
+    /// `UserPendingChanges$PendingChange` reports it ("Required. The type of
+    /// change pending for the ActiveMQ user"), or `None` when nothing is
+    /// pending. A user change does not take effect on the broker until the
+    /// broker is rebooted, so the user keeps serving and keeps being reported
+    /// while its change is pending; the reboot is what applies it.
+    pub pending_change: Option<String>,
 }
+
+/// The `ChangeType` of a user the broker is to drop once the change is applied.
+/// From `ChangeType`'s modelled values (`CREATE`, `UPDATE`, `DELETE`).
+pub const CHANGE_TYPE_DELETE: &str = "DELETE";
 
 /// The broker logging `CreateBroker` was asked for. `Logs$general` is a plain
 /// flag, and `Logs$audit` is kept optional because the member "does not apply to
@@ -877,6 +888,25 @@ pub fn broker_not_found_message(broker_id: &str) -> String {
     format!(
         "Cannot find broker ID [{broker_id}]. Verify that your broker exists or check \
          broker permissions."
+    )
+}
+
+/// The input member a refusal names when the `Username` of the request resolved
+/// to no user of the broker it was asked of, for
+/// `NotFoundException$errorAttribute` ("The attribute which caused the error").
+pub const USERNAME_ATTRIBUTE: &str = "username";
+
+/// The sentence this service answers a `Username` that resolves to no user of
+/// the broker the request named with, on every operation that resolves one. No
+/// recorded response covers this refusal, so it is worded the way this service
+/// words the resource-not-found it does have recorded
+/// ([`broker_not_found_message`]), naming the user asked for and the broker it
+/// was asked of — both read from the request. Shared so the handlers that look a
+/// user up state the one failure identically.
+pub fn user_not_found_message(broker_id: &str, username: &str) -> String {
+    format!(
+        "Cannot find user [{username}] of broker ID [{broker_id}]. Verify that your user \
+         exists or check broker permissions."
     )
 }
 

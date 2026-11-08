@@ -217,6 +217,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 console_access: input.console_access.unwrap_or(false),
                 groups: input.groups.clone().unwrap_or_default(),
                 replication_user: input.replication_user.unwrap_or(false),
+                pending_change: None,
             },
         );
 
