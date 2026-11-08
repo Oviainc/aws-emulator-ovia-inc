@@ -15,6 +15,8 @@
 mod call_preconditions;
 #[path = "all/json_record_values.rs"]
 mod json_record_values;
+#[path = "all/malformed_transaction_ids.rs"]
+mod malformed_transaction_ids;
 #[path = "all/mysql_upsert.rs"]
 mod mysql_upsert;
 #[path = "all/probe.rs"]

@@ -147,6 +147,21 @@ pub(crate) fn parameter(name: &str, value: Value) -> Value {
     json!({"name": name, "value": value})
 }
 
+/// An id of the same CLASS as one this service issued, that no transaction was ever opened
+/// under.
+///
+/// A transaction id carries the resource it belongs to, so an id a cluster could have
+/// issued cannot be written by hand without an id it DID issue to take that binding from:
+/// changing one digit of the issued id's head leaves the binding intact and names a
+/// transaction nothing opened.
+pub(crate) fn a_sibling_id(issued: &str) -> String {
+    let (first, rest) = issued
+        .split_at_checked(1)
+        .unwrap_or_else(|| panic!("an issued transaction id is not empty: {issued:?}"));
+    let other = if first == "0" { "1" } else { "0" };
+    format!("{other}{rest}")
+}
+
 /// RULE: the five implemented operations compute their answers from one persisted
 /// SQL database per (cluster, database name), and a transaction's writes reach
 /// that database only when it commits.
@@ -887,12 +902,12 @@ async fn the_modelled_failures_are_what_a_client_sees() {
         );
     }
 
-    // The ids that belong to ANOTHER resource: ids of this service's own form whose
-    // resource binding is not this cluster's. The rows span that class: an id a second
-    // cluster of this emulator really issued, one a third cluster in another Region
-    // issued, and one of the same form whose binding belongs to no cluster at all. (A
-    // value that is not one of this service's ids names no transaction anywhere, and is
-    // the transaction store's own 404 — `refusal_classes` pins that sentence.)
+    // The ids that could NOT have been issued for this cluster: ids of this service's own
+    // form whose resource binding is not this cluster's. The rows span that class: an id a
+    // second cluster of this emulator really issued, one a third cluster in another Region
+    // issued, and one of the same form whose binding belongs to no cluster at all. (A value
+    // that is not of that form at all is the same class of refusal, which
+    // `malformed_transaction_ids` pins over its own table.)
     const ANOTHER_CLUSTER_ARN: &str = "arn:aws:rds:us-east-1:000000000000:cluster:other";
     const FAR_CLUSTER_ARN: &str = "arn:aws:rds:us-west-2:000000000000:cluster:far";
     let another_clusters = api.begin_transaction_on(ANOTHER_CLUSTER_ARN).await;

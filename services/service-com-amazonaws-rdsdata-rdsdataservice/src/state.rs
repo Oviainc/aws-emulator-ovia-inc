@@ -444,8 +444,10 @@ pub const TERMINAL_TRANSACTION_MEMORY: Duration = TRANSACTION_MAX_LIFETIME;
 pub const MAX_TERMINAL_TRANSACTIONS: usize = 64;
 
 /// What the service tells a caller whose `transactionId` names no transaction that is
-/// RUNNING: one it never issued, one the clock rolled back, and one a previous call ended
-/// — a commit, a rollback, or a statement of its own that failed.
+/// RUNNING: an id this resource could have issued and did not, one the clock rolled back,
+/// and one a previous call ended — a commit, a rollback, or a statement of its own that
+/// failed. An id that could NOT have been issued for the resource the call names is a
+/// fault of the call's own shape instead, refused before any transaction is looked up.
 ///
 /// Entirely fixed text: it carries no value from the request and none from state, so a
 /// refusal says nothing about which ids this service has issued.
@@ -1545,10 +1547,10 @@ pub fn mint_transaction_id(resource_arn: &str) -> String {
 /// Whether `transaction_id` is an id [`mint_transaction_id`] could have minted AT ALL: the
 /// form a transaction id of this service has, whichever resource issued it.
 ///
-/// A value of ANOTHER form names no transaction this service ever issued, anywhere, and is
-/// answered by the transaction store as the id it has no running transaction for; this is
-/// what separates that case from an id that IS one of this service's and belongs to another
-/// resource ([`transaction_id_names_resource`]).
+/// A value of ANOTHER form could not have been issued by this service for any resource, so
+/// it is refused on the call's own shape, before any transaction is looked up
+/// (`preconditions`), together with an id of this form that belongs to another resource
+/// ([`transaction_id_names_resource`]).
 #[must_use]
 pub fn is_minted_transaction_id(transaction_id: &str) -> bool {
     transaction_id.len() == UUID_HEX_DIGITS + RESOURCE_TAG_DIGITS

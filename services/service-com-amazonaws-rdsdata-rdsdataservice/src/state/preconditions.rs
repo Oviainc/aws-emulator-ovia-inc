@@ -26,6 +26,9 @@
 //! 5. **the login** — those credentials have to be the cluster's: the database refuses a
 //!    user it does not have, and the Data API passes that refusal through.
 //! 6. **the database** — a statement runs against a database the cluster HAS.
+//! 7. **the transaction** — a `transactionId` that cannot be an id of the cluster the call
+//!    named is refused as a validation fault, ahead of the transaction store the
+//!    operation would otherwise look it up in.
 //!
 //! ## Nothing is assumed from silence
 //!
@@ -139,8 +142,9 @@ fn postgresql_catalog_error(database: &str) -> String {
     )
 }
 
-/// What the service tells a caller whose `transactionId` belongs to ANOTHER resource than
-/// the one the call named — an id some other cluster's `BeginTransaction` issued.
+/// What the service tells a caller whose `transactionId` cannot be an id of the resource
+/// the call named — a value that is not of the form a transaction id has at all, and one
+/// of that form that some other cluster's `BeginTransaction` issued.
 ///
 /// Entirely fixed text, and a VALIDATION fault rather than a lookup miss: the id is not
 /// this resource's to resolve, so nothing is looked up and nothing is changed. The
@@ -176,28 +180,33 @@ pub async fn admit<Eng: Send + Sync + 'static>(
     if let (Some(cluster), Some(database)) = (&cluster, call.database) {
         cluster.require_database(database, &held)?;
     }
-    require_the_resources_own_transaction(call)?;
+    require_a_transaction_id_of_the_resource(call)?;
     Ok(())
 }
 
-/// Refuse a `transactionId` that is one of THIS SERVICE's ids but belongs to another
-/// resource.
+/// Refuse a `transactionId` that cannot be a transaction id of the resource the call
+/// names: a value that is not of the form a transaction id of this service has at all, and
+/// one of that form whose resource is another cluster.
 ///
-/// A transaction belongs to the DB cluster whose `BeginTransaction` opened it, and the id
-/// this service mints CARRIES that cluster ([`super::mint_transaction_id`]). An id of that
-/// form naming another cluster therefore cannot be resolved here at all — the transaction
-/// it names may well still be running on the cluster that issued it — so the call is an
-/// invalid argument and nothing of it is carried out. A value that is NOT one of this
-/// service's ids ([`super::is_minted_transaction_id`]) names no transaction anywhere, which
-/// is the transaction store's own answer (`super::TRANSACTION_NOT_RUNNING_MESSAGE`) and not
-/// this one.
-fn require_the_resources_own_transaction(call: &Call<'_>) -> Result<(), Refusal> {
+/// A transaction id is opaque and the only ids there are are the ones a `BeginTransaction`
+/// minted, carrying the cluster the transaction belongs to
+/// ([`super::mint_transaction_id`]). So a value of ANOTHER form, and one bound to another
+/// cluster, are the same thing to this resource: a value it could never have issued, which
+/// names no transaction here to look up — the call is an invalid argument, decided from the
+/// request's own members, and nothing of it is carried out.
+/// Only an id this resource COULD have issued reaches the transaction store, where an id no
+/// transaction is running under is the store's own answer
+/// (`super::TRANSACTION_NOT_RUNNING_MESSAGE`). That is what lets a caller tell a corrupted
+/// or truncated id from a transaction a previous call ended.
+///
+/// This is the LAST leg of the chain: the identity, the cluster and the secret a call names
+/// are resolved first, so a caller who may not call at all, or who addressed a cluster with
+/// no Data API endpoint, learns that rather than anything about the id it quoted.
+fn require_a_transaction_id_of_the_resource(call: &Call<'_>) -> Result<(), Refusal> {
     let Some(transaction_id) = call.transaction_id else {
         return Ok(());
     };
-    if super::is_minted_transaction_id(transaction_id)
-        && !super::transaction_id_names_resource(transaction_id, call.resource_arn)
-    {
+    if !super::transaction_id_names_resource(transaction_id, call.resource_arn) {
         return Err(Refusal::Validation(
             INVALID_TRANSACTION_ID_MESSAGE.to_string(),
         ));

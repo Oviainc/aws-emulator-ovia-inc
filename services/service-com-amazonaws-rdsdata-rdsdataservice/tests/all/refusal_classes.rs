@@ -13,10 +13,11 @@
 //! * a `parameters` list that cannot be bound is a VALIDATION fault, one message per
 //!   distinct fault, and the statement does not run
 //!   ([`a_binding_fault_is_a_validation_fault_with_its_own_message`]);
-//! * a `transactionId` that names no RUNNING transaction is HTTP 404
-//!   `TransactionNotFoundException` with the terminated-transaction sentence, on every
-//!   operation that takes one, and a transaction a previous call ENDED is remembered as
-//!   ended ([`a_transaction_that_is_not_running_is_refused_with_the_same_sentence`]);
+//! * a `transactionId` the resource could have issued and no transaction is RUNNING under
+//!   is HTTP 404 `TransactionNotFoundException` with the terminated-transaction sentence,
+//!   on every operation that takes one, and a transaction a previous call ENDED is
+//!   remembered as ended
+//!   ([`a_transaction_that_is_not_running_is_refused_with_the_same_sentence`]);
 //! * a statement whose RESULT the API cannot represent still RAN: the refusal arrives
 //!   after the write, and the row it inserted stays
 //!   ([`a_refused_result_keeps_the_write_the_statement_made`]);
@@ -31,7 +32,7 @@
 
 use serde_json::{json, Value};
 
-use crate::sql_data_api::{error_code, list, number, parameter, DataApi};
+use crate::sql_data_api::{a_sibling_id, error_code, list, number, parameter, DataApi};
 
 /// The sentence every refusal of a `transactionId` that names no running transaction
 /// carries, as this service states it once
@@ -362,12 +363,15 @@ async fn a_binding_fault_is_a_validation_fault_with_its_own_message() {
     );
 }
 
-/// RULE: a `transactionId` that names no RUNNING transaction is refused with HTTP 404
+/// RULE: a `transactionId` the resource the call names COULD have issued and no transaction
+/// of that resource is RUNNING under is refused with HTTP 404
 /// `TransactionNotFoundException` and the fixed sentence AWS words that class with — on
 /// every operation that takes one, and however the transaction stopped running: a commit
-/// ended it, a rollback ended it, a statement of its own that failed ended it, or the
-/// service never issued the id at all. Refusing the call changes nothing: the committed
-/// row stays readable and the rolled-back write stays absent.
+/// ended it, a rollback ended it, a statement of its own that failed ended it, or no
+/// transaction was ever opened under that id. Refusing the call changes nothing: the
+/// committed row stays readable and the rolled-back write stays absent.
+/// (A value that could NOT be an id of that resource is a fault of the call's own shape
+/// instead — `sql_data_api` pins that class.)
 #[tokio::test]
 async fn a_transaction_that_is_not_running_is_refused_with_the_same_sentence() {
     let api = DataApi::new();
@@ -420,12 +424,17 @@ async fn a_transaction_that_is_not_running_is_refused_with_the_same_sentence() {
         "case the rollback of an aborted transaction: got {answered}"
     );
 
+    // An id this cluster COULD have issued and never did: the resource binding a minted id
+    // carries is this cluster's, and the rest of it names no transaction that was ever
+    // opened.
+    let never_issued = a_sibling_id(&committed);
+
     // Every id that is not running, on every operation that takes one.
     let ids = [
         ("a committed transaction", committed.as_str()),
         ("a rolled-back transaction", rolled_back.as_str()),
         ("a transaction its own statement aborted and a rollback ended", terminated.as_str()),
-        ("an id this service never issued", "0123456789abcdef0123456789abcdef"),
+        ("an id this cluster could have issued and never did", never_issued.as_str()),
     ];
     for (case, transaction_id) in ids {
         let calls = vec![
