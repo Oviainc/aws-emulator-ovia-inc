@@ -195,7 +195,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The listing itself holds this store's lock; the publication below does
+        // not, so no lock is held across an await. Each change names the Region its
+        // own job belongs to, so this handler reads none from `ctx`.
+        let output = self.listed_jobs(input)?;
+        crate::state::publish_job_state_changes(ctx, &*self.engine).await;
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ListBackupJobs<Eng> {
+    /// Report the page `input` asks for, materialising the transitions the clock
+    /// already owed the jobs it reports and queueing the events those transitions
+    /// owe (`crate::state::events`).
+    ///
+    /// Separate from `handle` so this store's lock lives for exactly this call: the
+    /// publication `handle` makes afterwards awaits, and a guard must not be held
+    /// across an await.
+    fn listed_jobs(
+        &self,
+        input: ListBackupJobsInput,
+    ) -> Result<ListBackupJobsOutput, ListBackupJobsError> {
         let now = ::std::time::SystemTime::now();
         // A page size outside the model's `@range` is this service's own
         // `InvalidParameterValueException`, answered before anything is read so
@@ -384,6 +404,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message_category: None,
             })
             .collect();
+        // Every job this report settled is a transition the account's event bus is
+        // owed: the borrow of the store the page was projected from is released
+        // first, then the changes are queued (`crate::state::events`).
+        drop(matching);
+        store.record_job_state_changes();
 
         Ok(ListBackupJobsOutput {
             backup_jobs: Some(backup_jobs),

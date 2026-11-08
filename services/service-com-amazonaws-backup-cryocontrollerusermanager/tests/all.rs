@@ -29,6 +29,8 @@ mod error_bodies;
 mod framework;
 #[path = "all/framework_update.rs"]
 mod framework_update;
+#[path = "all/job_state_change_events.rs"]
+mod job_state_change_events;
 #[path = "all/legal_hold.rs"]
 mod legal_hold;
 #[path = "all/legal_hold_cancel_state_refusal.rs"]

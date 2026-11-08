@@ -212,13 +212,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `BackupVaultName`, `ResourceArn` and `IamRoleArn` are `@required`, so an
         // absent one is refused before this handler runs; `crate::service` words
         // that refusal as `MissingParameterValueException`.
+        let region = crate::state::request_region(ctx);
+        // Starting the job holds this store's lock; the publication below does not,
+        // so no lock is held across an await.
+        let output = self.started_job(input, &region)?;
+        crate::state::publish_job_state_changes(ctx, &*self.engine).await;
+        // The transition this job is owed falls due on the clock, not on the next
+        // call: the pump publishes it when it does, so a client watching the bus
+        // needs to make no further call (`crate::state::events`).
+        crate::state::drive_job_clock(ctx, &self.engine);
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartBackupJob<Eng> {
+    /// Store the job `input` asks for, the recovery point it writes and the state
+    /// its later moves are published against (`crate::state::events`).
+    ///
+    /// Separate from `handle` so this store's lock lives for exactly this call: the
+    /// publication `handle` makes afterwards awaits, and a guard must not be held
+    /// across an await. `region` is the Region of the call, which every ARN this
+    /// mints carries.
+    fn started_job(
+        &self,
+        input: StartBackupJobInput,
+        region: &str,
+    ) -> Result<StartBackupJobOutput, StartBackupJobError> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartBackupJobErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
                 message: Some("the backup vault store is unavailable".to_string()),
                 ..Default::default()
             })
         })?;
-        let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
         // This member asks the job to ALSO copy the backup it takes into a
@@ -358,7 +383,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let job_id = store.next_id(now);
         let point_id = store.next_id(now);
-        let point_arn = crate::state::recovery_point_arn(&region, &point_id);
+        let point_arn = crate::state::recovery_point_arn(region, &point_id);
         let resource_type = crate::state::resource_type_of(&input.resource_arn);
         // Checked arithmetic here too, for consistency with `start_by` below: a
         // clock that cannot express the due instant settles the job at once
@@ -468,6 +493,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         store.backup_jobs.insert(job_id, job);
+        // The state this call stored is what this call's own response reports, so
+        // recording it announces nothing: it is the state the job's LATER moves are
+        // published against (`crate::state::events`).
+        store.record_job_state_changes();
         Ok(output)
     }
 }

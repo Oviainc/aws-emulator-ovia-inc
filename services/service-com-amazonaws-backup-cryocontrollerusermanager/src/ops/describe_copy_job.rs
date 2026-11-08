@@ -139,7 +139,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The region of the call is not read here: each change names the Region its
+        // own job belongs to (`crate::state::events`).
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeCopyJobErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
                 message: Some("the backup vault store is unavailable".to_string()),
@@ -147,24 +148,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let mut store = state.lock();
-        // Materialise only what the clock already owed, and only for the job
-        // asked about: a copy job whose settle instant has passed completed
-        // then, whether or not anybody looked.
-        store.settle_copy_job(&input.copy_job_id, ::std::time::SystemTime::now());
+        // The store's lock is held for exactly this block, so it is released before
+        // the publication below awaits.
+        let output = {
+            let mut store = state.lock();
+            // Materialise only what the clock already owed, and only for the job
+            // asked about: a copy job whose settle instant has passed completed
+            // then, whether or not anybody looked.
+            store.settle_copy_job(&input.copy_job_id, ::std::time::SystemTime::now());
 
-        let Some(job) = store.copy_jobs.get(&input.copy_job_id) else {
-            // The sentence belongs to the CONDITION, not to this operation, so
-            // it comes from the service's one error vocabulary; it names no
-            // part of the request, because AWS's does not.
-            return Err(DescribeCopyJobErrorModeled::ResourceNotFoundException(
-                crate::state::copy_job_not_found(),
-            )
-            .into());
+            let Some(job) = store.copy_jobs.get(&input.copy_job_id) else {
+                // The sentence belongs to the CONDITION, not to this operation, so
+                // it comes from the service's one error vocabulary; it names no
+                // part of the request, because AWS's does not.
+                return Err(DescribeCopyJobErrorModeled::ResourceNotFoundException(
+                    crate::state::copy_job_not_found(),
+                )
+                .into());
+            };
+            let output = DescribeCopyJobOutput {
+                copy_job: Some(store.copy_job_view(job)),
+            };
+            // A transition the clock owed is a transition the account's event bus is
+            // owed too: this read materialised it, so this read is what queues it
+            // (`crate::state::events`).
+            store.record_job_state_changes();
+            output
         };
-
-        Ok(DescribeCopyJobOutput {
-            copy_job: Some(store.copy_job_view(job)),
-        })
+        crate::state::publish_job_state_changes(ctx, &*self.engine).await;
+        Ok(output)
     }
 }

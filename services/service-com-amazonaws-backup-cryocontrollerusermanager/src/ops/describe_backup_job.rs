@@ -238,7 +238,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // The read itself holds this store's lock; the publication below does not,
+        // so no lock is held across an await. Each change names the Region its own
+        // job belongs to, so this handler reads none from `ctx`.
+        let output = self.described_job(&input)?;
+        crate::state::publish_job_state_changes(ctx, &*self.engine).await;
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> DescribeBackupJob<Eng> {
+    /// Report the job `input` names, materialising the transition the clock already
+    /// owed it and queueing the event that transition owes
+    /// (`crate::state::events`).
+    ///
+    /// Separate from `handle` so this store's lock lives for exactly this call: the
+    /// publication `handle` makes afterwards awaits, and a guard must not be held
+    /// across an await.
+    fn described_job(
+        &self,
+        input: &DescribeBackupJobInput,
+    ) -> Result<DescribeBackupJobOutput, DescribeBackupJobError> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DescribeBackupJobErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
                 message: Some("the backup vault store is unavailable".to_string()),
@@ -264,7 +284,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let vault_type = store.vault_type_of(&job.backup_vault_name);
 
-        Ok(DescribeBackupJobOutput {
+        let output = DescribeBackupJobOutput {
             account_id: Some(::engine::emulator_account_id().to_string()),
             backup_job_id: Some(job.job_id.clone()),
             backup_vault_name: Some(job.backup_vault_name.clone()),
@@ -302,6 +322,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             child_jobs_in_state: None,
             resource_name: None,
             message_category: None,
-        })
+        };
+        // A transition the clock owed is a transition the account's event bus is
+        // owed too: this read materialised it, so this read is what queues it
+        // (`crate::state::events`).
+        store.record_job_state_changes();
+        Ok(output)
     }
 }

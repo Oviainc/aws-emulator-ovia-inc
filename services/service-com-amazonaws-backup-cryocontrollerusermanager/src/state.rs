@@ -24,6 +24,11 @@
 //!   [`LegalHoldRecord::listed`] and whose stored selection decides, through
 //!   [`LegalHoldRecord::holds`], which recovery points the hold is on.
 //!
+//! A job's state is also ANNOUNCED, not only stored: the `events` module holds the one diff
+//! that turns every state a stored job moves into after its start call into an event on the
+//! account's default EventBridge bus, so a client watching a backup or a copy through a
+//! rule sees the same transitions a reader of the job does.
+//!
 //! `recovery_points_by_vault` is the ONLY per-vault list: both
 //! `ListRecoveryPointsByBackupVault`'s page and `DescribeBackupVault`'s
 //! `NumberOfRecoveryPoints` are derived from it, so the two can never disagree.
@@ -51,6 +56,12 @@ pub mod schedule;
 
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// The EventBridge events a job's state changes publish, and the path that publishes
+/// them. Re-exported here so a handler reaches them through `crate::state` like every
+/// other part of this service's state.
+mod events;
+pub use events::*;
 
 use crate::ops::types::{
     AdvancedBackupSetting, AlreadyExistsException, BackupPlan, BackupPlanInput, BackupRule,
@@ -2429,6 +2440,13 @@ pub struct ComAmazonawsBackupCryocontrollerusermanagerState {
     /// use, so every default-key vault in a region reports the same key on
     /// every read. Bounded by [`MAX_DEFAULT_ENCRYPTION_KEYS`].
     pub default_encryption_keys: BTreeMap<String, String>,
+    /// What has already been published about each stored job, and the state changes
+    /// waiting to be published — see [`JobEventLog`]. Bounded by
+    /// [`MAX_PENDING_EVENTS`] and pruned to the jobs the store still holds.
+    pub job_events: JobEventLog,
+    /// The single clock pump that publishes a transition when it falls due, with no
+    /// further call from anybody — see [`drive_job_clock`].
+    pub job_clock: JobClock,
     /// Monotonic counter behind [`Self::next_id`]; never reused within a run.
     id_seq: u64,
 }
@@ -3066,6 +3084,21 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
         job.completion_date = Some(job.settles_at);
         let destination_vault = job.destination_backup_vault_name.clone();
         self.settle_recovery_points_in(&destination_vault, now);
+    }
+
+    /// The same for every stored copy job, for a caller that materialises what the
+    /// clock owes the store as a whole rather than one job's own read — the clock
+    /// pump ([`drive_job_clock`]) is the one that does.
+    pub fn settle_copy_jobs(&mut self, now: SystemTime) {
+        let copy_job_ids: Vec<String> = self
+            .copy_jobs
+            .iter()
+            .filter(|(_, job)| job.state == COPY_JOB_STATE_CREATED)
+            .map(|(copy_job_id, _)| copy_job_id.clone())
+            .collect();
+        for copy_job_id in copy_job_ids {
+            self.settle_copy_job(&copy_job_id, now);
+        }
     }
 
     /// The members a copy-job read reports, computed ONCE from the stored job

@@ -186,8 +186,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `BackupVaultName` pattern, so a name this service could not have
         // stored is refused there too. Every ARN this handler mints carries the
         // region of the vault the resource belongs to, which is read off the
-        // destination ARN rather than from `ctx`.
-        let _ = ctx;
+        // destination ARN rather than from `ctx`. The Region a copy job's state
+        // changes are announced in is the Region of the vault it reads FROM, which
+        // the stored job carries, so this handler reads none from `ctx`.
+        // Starting the copy holds this store's lock; the publication below does
+        // not, so no lock is held across an await.
+        let output = self.started_copy_job(input)?;
+        crate::state::publish_job_state_changes(ctx, &*self.engine).await;
+        // The transition this copy job is owed falls due on the clock, not on the
+        // next call: the pump publishes it when it does, so a client watching the
+        // bus needs to make no further call (`crate::state::events`).
+        crate::state::drive_job_clock(ctx, &self.engine);
+        Ok(output)
+    }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartCopyJob<Eng> {
+    /// Store the copy job `input` asks for, the recovery point the copy writes into
+    /// the destination vault and the state the job's later moves are published
+    /// against (`crate::state::events`).
+    ///
+    /// Separate from `handle` so this store's lock lives for exactly this call: the
+    /// publication `handle` makes afterwards awaits, and a guard must not be held
+    /// across an await.
+    fn started_copy_job(
+        &self,
+        input: StartCopyJobInput,
+    ) -> Result<StartCopyJobOutput, StartCopyJobError> {
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartCopyJobErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
                 message: Some("the backup vault store is unavailable".to_string()),
@@ -429,6 +454,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         store.copy_jobs.insert(copy_job_id, job);
+        // The state this call stored is what this call's own response reports, so
+        // recording it announces nothing: it is the state the job's LATER moves are
+        // published against (`crate::state::events`).
+        store.record_job_state_changes();
         Ok(output)
     }
 }

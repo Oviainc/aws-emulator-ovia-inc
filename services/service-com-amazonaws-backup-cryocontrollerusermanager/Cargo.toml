@@ -16,7 +16,7 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -31,9 +31,19 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # Resolves the IANA time zone a backup rule names, so its schedule is read in
 # that zone rather than only in UTC.
 chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
-# `iam_role`: the shared reading of a caller-supplied IAM role ARN and of what
-# this account's IAM answers about it, for the role a backup selection's jobs
-# would run as; `iam_client` under it is the in-process hop that asks IAM.
+# The AWS SDK for EventBridge, driven over the in-process callback
+# (`OperationContext::callback`): AWS Backup publishes a `Backup Job State Change`
+# or `Copy Job State Change` event onto the account's default event bus as a job
+# moves (`state::publish_job_state_changes`). Only the generated client is needed —
+# the emulator supplies the transport, so the SDK's own HTTPS stack and runtime are
+# left out.
+aws-sdk-eventbridge = { version = "1", default-features = false }
+# `eventbridge_client`: the tree's ONE construction of that in-process EventBridge
+# client, so this service configures the publication hop exactly as every other
+# publisher does. `iam_role`: the shared reading of a caller-supplied IAM role ARN
+# and of what this account's IAM answers about it, for the role a backup
+# selection's jobs would run as; `iam_client` under it is the in-process hop that
+# asks IAM.
 service-common = { path = "../common" }
 
 [build-dependencies]
@@ -41,6 +51,12 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# EventBridge and SQS are mounted beside Backup on one engine in the integration
+# tests, because a job transition publishes a state-change event onto the default
+# event bus and a rule on that bus delivers it to an SQS queue target: without them
+# mounted there is nothing for the publication to reach.
+service-com-amazonaws-eventbridge-awsevents = { workspace = true }
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # The role-resolution suite mounts IAM beside this service on one engine and
 # creates the roles it resolves through IAM's own wire, so the records read are
 # the ones `CreateRole` wrote.
