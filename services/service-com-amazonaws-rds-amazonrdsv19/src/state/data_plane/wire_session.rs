@@ -219,6 +219,7 @@ impl SessionContext {
         };
         let record = store.instance_by_resource_id(&region, &resource_id)?;
         let wire = super::engine_wire(&record.engine)?;
+        let endpoint = store.engine_endpoint(&(record.region.clone(), record.identifier.clone()));
         Some(facts_of(
             RecordFacts {
                 kind: EndpointKind::DbInstance,
@@ -231,9 +232,11 @@ impl SessionContext {
                 master_username: record.master_username.clone(),
                 password: record.master_user_password.clone(),
                 requires_secure_transport: store.requires_secure_transport(record),
-                served_host: store
-                    .engine_endpoint(&(record.region.clone(), record.identifier.clone()))
-                    .map(|endpoint| endpoint.endpoint.host.clone()),
+                served_host: endpoint.map(|endpoint| endpoint.endpoint.host.clone()),
+                served_port: endpoint
+                    .and_then(|endpoint| u16::try_from(endpoint.endpoint.port).ok()),
+                region: record.region.clone(),
+                iam_database_authentication_enabled: record.iam_database_authentication_enabled,
                 runtime: engine_runtime_of(&store, record),
             },
             &self.database,
@@ -267,6 +270,52 @@ impl SessionContext {
             }
         }
     }
+
+    /// Whether this login could be an IAM-authenticated one, read BEFORE the credential it
+    /// presents: the resource's own setting, and the database the user would be resolved
+    /// against.
+    ///
+    /// Nothing is asked of the engine here, and the database a client NAMED is resolved
+    /// against the databases the resource has before it can reach one: a name the resource
+    /// does not have resolves to none, so a login about to be refused opens nothing and
+    /// creates nothing. The engine is read once, later, and only for a login whose token
+    /// claims already hold ([`IamLogin::admits`]).
+    #[must_use]
+    pub fn iam_login(
+        &self,
+        facts: &InstanceFacts,
+        user: &str,
+        database: Option<&str>,
+    ) -> IamLogin {
+        let could_be = facts.iam_database_authentication_enabled
+            && facts.wire == EngineWire::Postgres
+            && facts
+                .master_username
+                .as_ref()
+                .is_none_or(|master| master != user);
+        IamLogin {
+            enabled: could_be,
+            database: could_be.then(|| resolved_database(facts, database)).flatten(),
+            engine: Arc::clone(&self.database),
+        }
+    }
+}
+
+/// The database a login lands in: the one it named, where the resource has it, and the
+/// database a login that names none gets.
+///
+/// `None` for a name the resource does not have, which is what
+/// [`LoginRefusal::UnknownDatabase`] answers — and the same resolution [`admit`] makes, so a
+/// login cannot be decided against one database and opened on another.
+fn resolved_database(facts: &InstanceFacts, named: Option<&str>) -> Option<String> {
+    match named {
+        None | Some("") => Some(facts.default_database.clone()),
+        Some(named) => facts
+            .databases
+            .iter()
+            .find(|known| known.as_str() == named)
+            .cloned(),
+    }
 }
 
 /// What ONE record says about the endpoint a session is being opened on: the facts that
@@ -293,6 +342,14 @@ pub(super) struct RecordFacts {
     /// The host the resource's own listener is bound to, for a resource the store holds one
     /// for.
     pub served_host: Option<String>,
+    /// The port that listener published, for the same resource: the port an authentication
+    /// token has to have been generated for.
+    pub served_port: Option<u16>,
+    /// The Region the resource lives in, which such a token has to be signed in.
+    pub region: String,
+    /// Whether the resource has IAM database authentication turned on
+    /// (`IAMDatabaseAuthenticationEnabled`).
+    pub iam_database_authentication_enabled: bool,
     pub runtime: EngineRuntime,
 }
 
@@ -357,6 +414,9 @@ pub(super) fn facts_of(record: RecordFacts, database: &Arc<InstanceDatabase>) ->
         endpoint_host: record
             .served_host
             .unwrap_or_else(|| "localhost".to_string()),
+        endpoint_port: record.served_port.unwrap_or_default(),
+        region: record.region,
+        iam_database_authentication_enabled: record.iam_database_authentication_enabled,
         runtime: record.runtime,
     }
 }
@@ -486,6 +546,15 @@ pub struct InstanceFacts {
     pub requires_secure_transport: bool,
     /// The host the instance's listener is bound to, which is the host a refusal names.
     pub endpoint_host: String,
+    /// The port that listener published, which is the port an authentication token has to
+    /// have been generated for.
+    pub endpoint_port: u16,
+    /// The Region the instance lives in, which such a token has to be signed in.
+    pub region: String,
+    /// Whether the instance has IAM database authentication turned on
+    /// (`IAMDatabaseAuthenticationEnabled`), which is the control-plane half of admitting a
+    /// login that presents an authentication token.
+    pub iam_database_authentication_enabled: bool,
     /// What the instance's engine is running with: its parameters, its start time, its
     /// role.
     pub runtime: EngineRuntime,
@@ -601,12 +670,19 @@ pub fn precheck(facts: &InstanceFacts, encrypted: bool) -> Result<(), LoginRefus
 /// is not running answers nothing else, a session that may not be in the clear is refused
 /// before any credential is read, and the password is checked before the database is
 /// resolved (so a wrong password cannot be used to discover which databases exist).
+///
+/// Two credentials authenticate a login. The MASTER USER's password, which the instance was
+/// created with, and — for an instance with IAM database authentication turned on — the
+/// AUTHENTICATION TOKEN a database user enabled for it presents in place of a password,
+/// which is what `iam` carries ([`IamLogin`]); a wire that serves no such login passes
+/// `None`.
 pub fn admit(
     facts: &InstanceFacts,
     user: &str,
     database: Option<&str>,
     encrypted: bool,
     proof: &PasswordProof<'_>,
+    iam: Option<&IamLogin>,
 ) -> Result<String, LoginRefusal> {
     if !facts.is_available() {
         return Err(LoginRefusal::NotRunning {
@@ -616,7 +692,7 @@ pub fn admit(
     if facts.requires_secure_transport && !encrypted {
         return Err(LoginRefusal::PlaintextRefused);
     }
-    let authenticated = facts
+    let as_master = facts
         .master_username
         .as_ref()
         .is_some_and(|master| master == user)
@@ -631,7 +707,13 @@ pub fn admit(
             // login against, so nothing can authenticate as its master user.
             (_, PasswordProof::None) | (None, _) => false,
         };
-    if !authenticated {
+    // A database user enabled for IAM database authentication authenticates with the token
+    // it presents instead, which is read against this endpoint and this user.
+    let as_iam_user = match (iam, proof) {
+        (Some(iam), PasswordProof::Cleartext(token)) => iam.admits(facts, user, token),
+        _ => false,
+    };
+    if !as_master && !as_iam_user {
         return Err(LoginRefusal::AuthenticationFailed {
             user: user.to_string(),
             password_given: proof.password_given(),
@@ -648,6 +730,87 @@ pub fn admit(
                 })
             }
         }
+    }
+}
+
+/// The IAM-authenticated half of a login: whether this database user authenticates with an
+/// authentication token rather than with a password.
+///
+/// Both halves of IAM database authentication have to hold, which is why this carries both:
+/// the resource must have it turned on (`EnableIAMDatabaseAuthentication`), and the database
+/// user must be one enabled for it inside the engine — on PostgreSQL, a member of `rds_iam`
+/// ([`super::pg_grants::user_authenticates_with_a_token`]).
+///
+/// The decision WRITES NOTHING, and is taken in an order that keeps it that way: the
+/// token's own claims are read first ([`super::iam_auth_token`] reads text and the clock and
+/// nothing else), and only a login whose claims already hold is looked up in the engine's
+/// role catalog — a read of the database the login named, RESOLVED against the databases the
+/// resource has ([`SessionContext::iam_login`]), so no name a client chose reaches the
+/// engine and a login that is about to be refused leaves nothing behind for a later session
+/// to find.
+#[derive(Clone)]
+pub struct IamLogin {
+    /// Whether the resource serves IAM database authentication and this login could be one
+    /// at all: the PostgreSQL wire, and a user other than the master.
+    enabled: bool,
+    /// The database whose role catalog the user is resolved against: the one the login
+    /// named, resolved against the databases the resource has. `None` for a login naming a
+    /// database the resource does not have, which is refused for that.
+    database: Option<String>,
+    /// The databases behind this endpoint, for that one read.
+    engine: Arc<InstanceDatabase>,
+}
+
+/// Prints the decision's inputs; the engine handle has no formatted form of its own.
+impl std::fmt::Debug for IamLogin {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("IamLogin")
+            .field("enabled", &self.enabled)
+            .field("database", &self.database)
+            .finish_non_exhaustive()
+    }
+}
+
+impl IamLogin {
+    /// Whether `token` authenticates `user` on this endpoint, as of now.
+    ///
+    /// `false` unless every half holds, so neither a token on a resource that does not serve
+    /// IAM authentication, nor a token for another endpoint, user or moment, nor a user
+    /// nothing enabled admits anybody.
+    #[must_use]
+    pub fn admits(&self, facts: &InstanceFacts, user: &str, token: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        let Some(database) = &self.database else {
+            return false;
+        };
+        let target = super::iam_auth_token::TokenTarget {
+            host: &facts.endpoint_host,
+            port: facts.endpoint_port,
+            region: &facts.region,
+            user,
+        };
+        // The token's own claims come FIRST: reading them touches nothing, so a login
+        // presenting anything other than a token for this endpoint, this user and this
+        // moment is refused without the engine being asked anything at all.
+        if let Err(refusal) =
+            super::iam_auth_token::admits(token, &target, ::std::time::SystemTime::now())
+        {
+            // The credential itself is never logged: what a reader needs is the resource
+            // and which claim of the token did not hold.
+            ::tracing::debug!(
+                db_instance_identifier = %facts.identifier,
+                ?refusal,
+                "an engine session presented an authentication token this endpoint does \
+                 not admit"
+            );
+            return false;
+        }
+        // Only then the engine, and only as a READ: whether this database user is one
+        // enabled for token authentication.
+        super::pg_grants::user_authenticates_with_a_token(&self.engine, database, user)
     }
 }
 
@@ -979,6 +1142,11 @@ pub fn run_statement(
     // handing to the engine, and which it answers in PostgreSQL's words.
     if facts.wire == EngineWire::Postgres {
         if let Some(answer) = super::pg_server::role_statement(database, facts, &words, &tokens)? {
+            return Ok(answer);
+        }
+        // `GRANT` and `REVOKE` change WHICH ROLE MAY DO WHAT, which is likewise the
+        // server's own catalog rather than a row in one of the instance's tables.
+        if let Some(answer) = super::pg_grants::grant_statement(database, facts, &words, &tokens)? {
             return Ok(answer);
         }
     }

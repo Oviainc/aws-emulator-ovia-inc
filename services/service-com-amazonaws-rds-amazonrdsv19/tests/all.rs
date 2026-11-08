@@ -127,6 +127,8 @@ mod docdb_query_surface;
 mod engine_default_cluster_parameters;
 #[path = "all/engine_default_parameters.rs"]
 mod engine_default_parameters;
+#[path = "all/engine_role_grants.rs"]
+mod engine_role_grants;
 #[path = "all/engine_server_surface.rs"]
 mod engine_server_surface;
 #[path = "all/engine_statement_classes.rs"]
@@ -175,6 +177,8 @@ mod managed_master_secret_key_bound;
 mod managed_master_user_password;
 #[path = "all/managed_master_user_secret.rs"]
 mod managed_master_user_secret;
+#[path = "all/managed_secret_service_ownership.rs"]
+mod managed_secret_service_ownership;
 #[path = "all/management_event_recording.rs"]
 mod management_event_recording;
 #[path = "all/modification_and_final_snapshot_refusal_sentences.rs"]

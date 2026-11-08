@@ -395,6 +395,10 @@ from botocore.response import StreamingBody
 
 _host = __import__("_lambda_host")
 
+# The client that carries `generate_db_auth_token`: the SDK adds it to the RDS client
+# rather than to every client, because the token is a database login's, not an API call's.
+_DB_AUTH_TOKEN_SERVICES = ("rds",)
+
 # The input members a call carries BYTES in, by service. Every protocol this SDK speaks
 # carries a blob as base64 text, so the bytes a handler passes in one of these are encoded
 # before the call is made; a `str` is encoded as UTF-8 first, which is what a client does
@@ -523,6 +527,14 @@ class Client:
     def __getattr__(self, name):
         if name.startswith("_"):
             raise AttributeError(name)
+        # `generate_db_auth_token` is not an operation: the SDK adds it to the RDS client
+        # alone, and on every other client the attribute does not exist at all.
+        if name == "generate_db_auth_token":
+            if self._service_name not in _DB_AUTH_TOKEN_SERVICES:
+                raise AttributeError(
+                    "'%s' object has no attribute '%s'" % (self._service_name, name)
+                )
+            return self._db_auth_token
         operation_name = _operation_name(name)
 
         def method(**parameters):
@@ -533,6 +545,26 @@ class Client:
 
     def can_paginate(self, operation_name):
         return False
+
+    def _db_auth_token(self, DBHostname, Port, DBUsername, Region=None):
+        """The authentication token a database login presents in place of a password.
+
+        Not an API call: the SDK builds the token in the client, by presigning a request
+        to connect as one database user on one endpoint. It is minted by the runtime,
+        which holds the credential it is signed with.
+        """
+        answered = json.loads(
+            _host.db_auth_token(
+                str(DBHostname),
+                int(Port),
+                str(DBUsername),
+                Region or self._region_name,
+            )
+        )
+        refused = answered.get("refused")
+        if refused is not None:
+            raise SdkCallNotMade(detail=answered.get("detail") or "")
+        return answered.get("token") or ""
 
     def get_paginator(self, operation_name):
         raise SdkCallNotMade(

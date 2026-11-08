@@ -1032,12 +1032,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // guard is NOT held here — see the decision scope above.
         let (master_user_secret, master_user_password) = if manage_master_user_password {
             let minted = crate::state::mint_master_user_secret(
+                &*self.engine,
                 ctx,
                 &region,
                 &crate::state::MasterSecretRequest {
                     name: &crate::state::cluster_master_user_secret_name(&resource_id),
                     username: master_username.as_deref(),
                     engine: &input.engine,
+                    owner: crate::state::ManagedSecretOwner::db_cluster(
+                        &crate::state::db_cluster_arn(&region, &input.db_cluster_identifier),
+                    ),
                     kms_key_id: input.master_user_secret_kms_key_id.as_deref(),
                 },
             )

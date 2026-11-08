@@ -264,6 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             match subject {
                 Some((instance_engine, dbi_resource_id)) => Some(
                     crate::state::mint_master_user_secret(
+                        &*self.engine,
                         ctx,
                         &region,
                         &crate::state::MasterSecretRequest {
@@ -273,6 +274,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             ),
                             username: Some(&input.master_username),
                             engine: &instance_engine,
+                            // A tenant database's master user is a user of the DB INSTANCE
+                            // that holds it, so the instance is the resource the secret
+                            // belongs to.
+                            owner: crate::state::ManagedSecretOwner::db_instance(
+                                &crate::state::db_instance_arn(&region, &identifier),
+                            ),
                             kms_key_id: input.master_user_secret_kms_key_id.as_deref(),
                         },
                     )

@@ -98,6 +98,13 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 # `thrift` (this release line reads the format's metadata with its own code, so the advisory
 # against `thrift` before 0.23 does not reach this build).
 parquet = { version = "60", default-features = false, features = ["flate2-rust_backend"] }
+# The AUTHENTICATION TOKEN an IAM-authenticated engine login presents as its password
+# (`src/state/data_plane/iam_auth_token.rs`) is a presigned request: `form_urlencoded` reads
+# its query fields, and `chrono` reads the basic ISO 8601 instant SigV4 signs it at, so
+# neither a query string nor a calendar is parsed by hand. Both are already in this
+# workspace's lock file.
+form_urlencoded = "1"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

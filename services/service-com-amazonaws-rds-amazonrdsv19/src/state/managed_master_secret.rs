@@ -109,24 +109,72 @@ impl ManagedMasterSecret {
     }
 }
 
+/// The prefix every secret RDS MANAGES is named under: the service's own id and the
+/// character AWS reserves for a secret an AWS service owns.
+///
+/// A secret in this form is not a caller's to create — the mark is not one of the
+/// characters a secret name may carry ("ASCII letters, numbers, and the following
+/// characters: /_+=.@-", `CreateSecretRequest$Name`), so a caller's `CreateSecret` cannot
+/// name one at all — which is what makes the name itself say the secret is RDS's. It is
+/// accepted from the service whose own principal is making the create
+/// ([`::service_com_amazonaws_secretsmanager_secretsmanager::state::service_owned`]).
+pub const MANAGED_SECRET_NAME_PREFIX: &str = "rds!";
+
 /// The name of the secret RDS manages for a DB CLUSTER's master user password.
 ///
 /// It carries the cluster's immutable `DbClusterResourceId` rather than its identifier,
 /// which can be renamed, so the secret of a cluster is still the secret of that cluster
-/// afterwards. The prefix says which service owns the secret and which kind of resource
-/// it belongs to; the character AWS reserves for a service-owned secret name is not one
-/// of the characters Secrets Manager accepts in a name
-/// (`::service_com_amazonaws_secretsmanager_secretsmanager`'s `CreateSecret` enforces
-/// "ASCII letters, numbers, and the following characters: /_+=.@-"), so the prefix is
-/// spelled with a hyphen.
+/// afterwards, under the reserved prefix every RDS-managed secret carries
+/// ([`MANAGED_SECRET_NAME_PREFIX`]) and then the kind of resource it belongs to.
 pub fn cluster_master_user_secret_name(resource_id: &str) -> String {
-    format!("rds-cluster-{resource_id}")
+    format!("{MANAGED_SECRET_NAME_PREFIX}cluster-{resource_id}")
 }
 
 /// The name of the secret RDS manages for a DB INSTANCE's master user password, carrying
 /// the instance's immutable `DbiResourceId`; see [`cluster_master_user_secret_name`].
 pub fn instance_master_user_secret_name(resource_id: &str) -> String {
-    format!("rds-db-{resource_id}")
+    format!("{MANAGED_SECRET_NAME_PREFIX}db-{resource_id}")
+}
+
+/// The tag AWS applies to the secret RDS manages for a DB INSTANCE's master user
+/// password: a fixed key whose value is that instance's `DBInstanceArn`, which is how a
+/// client answers "which database do these credentials belong to?" from the secret alone,
+/// and what a tag-scoped policy written for such a secret matches on.
+pub const PRIMARY_DB_INSTANCE_ARN_TAG: &str = "aws:rds:primaryDBInstanceArn";
+
+/// The same tag for the secret of a DB CLUSTER's master user password, whose value is the
+/// cluster's `DBClusterArn`.
+pub const PRIMARY_DB_CLUSTER_ARN_TAG: &str = "aws:rds:primaryDBClusterArn";
+
+/// The resource a managed secret belongs to, as the secret itself reports it: the
+/// AWS-applied tag naming that resource's ARN.
+#[derive(Debug, Clone, Copy)]
+pub struct ManagedSecretOwner<'a> {
+    /// The tag key for the kind of resource that owns the secret.
+    pub tag_key: &'static str,
+    /// That resource's ARN, which is the tag's value.
+    pub arn: &'a str,
+}
+
+impl<'a> ManagedSecretOwner<'a> {
+    /// The secret of the DB INSTANCE `arn` names — also the owner of the secret of a
+    /// TENANT DATABASE of that instance, whose master user is a user of that instance.
+    #[must_use]
+    pub fn db_instance(arn: &'a str) -> Self {
+        Self {
+            tag_key: PRIMARY_DB_INSTANCE_ARN_TAG,
+            arn,
+        }
+    }
+
+    /// The secret of the DB CLUSTER `arn` names.
+    #[must_use]
+    pub fn db_cluster(arn: &'a str) -> Self {
+        Self {
+            tag_key: PRIMARY_DB_CLUSTER_ARN_TAG,
+            arn,
+        }
+    }
 }
 
 /// What a request that turns management on asks for: the secret to create, the master
@@ -140,6 +188,9 @@ pub struct MasterSecretRequest<'a> {
     pub username: Option<&'a str>,
     /// The resource's engine, which publishes how long the password may be.
     pub engine: &'a str,
+    /// The resource whose master user password this secret holds, which the secret reports
+    /// through the AWS-applied tag naming its ARN.
+    pub owner: ManagedSecretOwner<'a>,
     /// `MasterUserSecretKmsKeyId`: "The Amazon Web Services KMS key identifier to encrypt
     /// a secret that is automatically generated and managed in Amazon Web Services
     /// Secrets Manager … If you don't specify MasterUserSecretKmsKeyId, then the
@@ -173,19 +224,37 @@ impl std::fmt::Debug for MintedMasterSecret {
 /// of this EMULATOR to do what RDS does — Secrets Manager not mounted beside this
 /// service, or a store that would not take the secret — never anything the request
 /// carried: the values it carries are checked by the handler before this is called.
-pub async fn mint_master_user_secret(
+pub async fn mint_master_user_secret<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     asked: &MasterSecretRequest<'_>,
 ) -> Result<MintedMasterSecret, String> {
     let secrets = secrets_manager_client(ctx, region).ok_or_else(unaskable_region)?;
     let password = generated_password(&secrets, asked.engine).await?;
+    // The secret is one RDS OWNS, so the create is made as RDS's OWN service principal
+    // acting for the resource the secret belongs to ([`ServicePrincipalCall`]): that is
+    // what lets it be named under the reserved prefix no caller can mint, be reported with
+    // `OwningService`, and carry the AWS-applied tag naming its resource. A call that
+    // cannot be made that way cannot create that secret AT ALL — the reserved name and the
+    // AWS-applied tag are refused for anyone else — so it is reported as this emulator
+    // failing to create the secret rather than quietly creating an ordinary one of the
+    // account under a name a caller could mint.
+    let acting = ServicePrincipalCall::begin(engine, ctx, asked.owner.arn)
+        .ok_or_else(|| unactable_principal(asked.owner.arn))?;
+    let secrets = acting.secrets_manager_client(ctx, region)?;
     let created = secrets
         .create_secret()
         .name(asked.name)
         .client_request_token(fresh_version_token())
         .secret_string(credentials_document(asked.username, &password))
         .set_kms_key_id(asked.kms_key_id.map(str::to_string))
+        .tags(
+            ::aws_sdk_secretsmanager::types::Tag::builder()
+                .key(asked.owner.tag_key)
+                .value(asked.owner.arn)
+                .build(),
+        )
         .send()
         .await
         .map_err(|error| {
@@ -418,9 +487,30 @@ const SECRETS_MANAGER_DEFAULT_KEY_ALIAS: &str = "alias/aws/secretsmanager";
 /// Region this emulator can ask a peer service in ([`secrets_manager_client`]): a failure of
 /// this emulator to reach the service that owns the secret, like the others here.
 fn unaskable_region() -> String {
+    unaskable_region_message()
+}
+
+/// The same sentence, for the sibling module that builds a client of its own
+/// ([`super::ServicePrincipalCall::secrets_manager_client`]).
+pub(super) fn unaskable_region_message() -> String {
     "the master user secret could not be reached in Amazon Web Services Secrets Manager: the \
      request's signing scope names no Amazon Web Services Region"
         .to_string()
+}
+
+/// The sentence reported when this emulator could not make the create AS the RDS service
+/// principal acting for `owner` ([`ServicePrincipalCall::begin`]).
+///
+/// Such a secret is RDS's own — its name and its tags are not a caller's to write — so a
+/// call that cannot be made as that principal creates nothing: this is a failure of the
+/// emulator to do what RDS does, like the other failures here, never anything the request
+/// carried.
+fn unactable_principal(owner: &str) -> String {
+    format!(
+        "the master user secret could not be created in Amazon Web Services Secrets Manager: \
+         this emulator could not make the call as the Amazon RDS service principal acting for \
+         {owner}, which is the identity that owns the secret"
+    )
 }
 
 /// A Secrets Manager client over the IN-PROCESS callback into this same emulator: the

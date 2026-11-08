@@ -854,6 +854,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusal has been answered, exactly as `CreateDBInstance` mints one.
         if input.manage_master_user_password == Some(true) {
             let minted = crate::state::mint_master_user_secret(
+                &*self.engine,
                 ctx,
                 &region,
                 &crate::state::MasterSecretRequest {
@@ -862,6 +863,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                     username: record.master_username.as_deref(),
                     engine: &record.engine,
+                    owner: crate::state::ManagedSecretOwner::db_instance(
+                        &crate::state::db_instance_arn(&region, &record.identifier),
+                    ),
                     kms_key_id: input.master_user_secret_kms_key_id.as_deref(),
                 },
             )

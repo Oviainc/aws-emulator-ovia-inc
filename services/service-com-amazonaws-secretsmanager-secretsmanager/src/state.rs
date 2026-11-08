@@ -54,6 +54,11 @@ pub mod rotation;
 pub mod replication;
 pub use replication::*;
 
+/// The secrets ANOTHER Amazon Web Services service creates and manages for one of its own
+/// resources: the reserved name they carry, the owning service they report, and how a
+/// request of that service is told apart from a caller's.
+pub mod service_owned;
+
 /// The staging label on the current value of a secret.
 pub const STAGE_CURRENT: &str = "AWSCURRENT";
 

@@ -501,6 +501,40 @@ impl AwsAccess {
             Err(_elapsed) => Err(Refusal::TimedOut),
         }
     }
+    /// Mint the AUTHENTICATION TOKEN a handler presents to a database endpoint that serves
+    /// IAM database authentication, for `user` on `host`:`port`.
+    ///
+    /// Not a call: the SDKs build this token in the client
+    /// ([`super::db_auth_token`]), so nothing is dispatched and no service answers. It is
+    /// here beside [`call`](Self::call) because the credential it is signed with is the one
+    /// this seam holds, and because the guest reaches both the same way.
+    ///
+    /// `region` is the Region the SDK client the guest built names, honoured when it is a
+    /// Region name at all and otherwise replaced by the invocation's own — the same reading
+    /// [`call`](Self::call) gives it, for the same reason: the value reaches the token's
+    /// credential scope.
+    pub fn db_auth_token(
+        &self,
+        host: &str,
+        port: u16,
+        user: &str,
+        region: &str,
+    ) -> Result<String, Refusal> {
+        let region = if well_formed_region(region) {
+            region
+        } else {
+            &self.region
+        };
+        self.runtime
+            .block_on(super::db_auth_token::db_auth_token(
+                &self.callback,
+                host,
+                port,
+                user,
+                region,
+            ))
+            .map_err(Refusal::NotMade)
+    }
 
     /// One call, built the way the called service's own protocol binds it.
     async fn dispatched(

@@ -698,6 +698,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             (Some(true), None) => {
                 let minted = crate::state::mint_master_user_secret(
+                    &*self.engine,
                     ctx,
                     &region,
                     &crate::state::MasterSecretRequest {
@@ -706,6 +707,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         ),
                         username: accepted.master_username.as_deref(),
                         engine: &accepted.engine,
+                        owner: crate::state::ManagedSecretOwner::db_instance(
+                            &crate::state::db_instance_arn(&region, &identifier),
+                        ),
                         kms_key_id: input.master_user_secret_kms_key_id.as_deref(),
                     },
                 )

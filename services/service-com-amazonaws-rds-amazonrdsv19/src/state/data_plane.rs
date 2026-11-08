@@ -31,6 +31,10 @@
 //! * [`server_statements`] — the statements the server answers out of the instance's own
 //!   catalog: installing an extension, creating a database, opening and ending a
 //!   transaction;
+//! * [`pg_grants`] — the role memberships and object privileges a PostgreSQL client grants
+//!   and revokes, and the catalogs they live in;
+//! * [`iam_auth_token`] — the authentication token an IAM-authenticated login presents in
+//!   place of a password;
 //! * [`pg_wire`] and [`mysql_wire`] — the server half of each protocol.
 //!
 //! The endpoint is the RESOURCE: dropping the stored [`DbEngineEndpoint`] closes the port
@@ -47,8 +51,10 @@ use super::{ComAmazonawsRdsAmazonrdsv19State, DbInstanceRecord, RegionalKey};
 
 pub mod cluster_endpoint;
 pub mod dialect;
+pub mod iam_auth_token;
 pub mod mysql_wire;
 pub mod pg_copy;
+pub mod pg_grants;
 pub mod pg_server;
 pub mod pg_sessions;
 pub mod pg_wire;

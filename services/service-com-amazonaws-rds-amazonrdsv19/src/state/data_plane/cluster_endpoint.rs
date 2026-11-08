@@ -151,6 +151,8 @@ pub(super) fn cluster_facts(
 ) -> Option<InstanceFacts> {
     let record = store.cluster_by_resource_id(region, resource_id)?;
     let wire = cluster_engine_wire(&record.engine)?;
+    let endpoint =
+        store.cluster_engine_endpoint(&(record.region.clone(), record.identifier.clone()));
     Some(facts_of(
         RecordFacts {
             kind: EndpointKind::DbCluster,
@@ -163,9 +165,10 @@ pub(super) fn cluster_facts(
             master_username: record.master_username.clone(),
             password: record.master_user_password.clone(),
             requires_secure_transport: store.cluster_requires_secure_transport(record),
-            served_host: store
-                .cluster_engine_endpoint(&(record.region.clone(), record.identifier.clone()))
-                .map(|endpoint| endpoint.endpoint.host.clone()),
+            served_host: endpoint.map(|endpoint| endpoint.endpoint.host.clone()),
+            served_port: endpoint.and_then(|endpoint| u16::try_from(endpoint.endpoint.port).ok()),
+            region: record.region.clone(),
+            iam_database_authentication_enabled: record.iam_database_authentication_enabled,
             runtime: cluster_runtime_of(store, record),
         },
         database,

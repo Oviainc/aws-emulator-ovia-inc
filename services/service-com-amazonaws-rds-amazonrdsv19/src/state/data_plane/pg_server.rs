@@ -27,30 +27,34 @@ use crate::state::{ClusterParameterSpec, ParameterSetting};
 ///
 /// A statement that names one has that catalog rebuilt from state before it runs
 /// ([`refresh_catalogs`]); a statement that names none pays nothing.
-pub const CATALOGS: [&str; 5] = [
+pub const CATALOGS: [&str; 8] = [
     "pg_settings",
     "pg_database",
     "pg_roles",
     "pg_user",
     "pg_stat_activity",
+    "pg_auth_members",
+    "pg_namespace",
+    "pg_class",
 ];
 
 /// The catalog tables' definitions, with the columns PostgreSQL publishes for each and the
 /// types a client decodes them under.
 ///
 /// Source: the "System Views" and "System Catalogs" chapters of the PostgreSQL
-/// documentation — `pg_settings`, `pg_database`, `pg_roles` and `pg_stat_activity` — reduced
+/// documentation — `pg_settings`, `pg_database`, `pg_roles`, `pg_stat_activity`,
+/// `pg_auth_members`, `pg_namespace` and `pg_class` — reduced
 /// to the columns this server has state behind. A column it has no state for is left out of
 /// the view rather than filled with a value nothing stands behind.
-const CATALOG_SCHEMA: [&str; 5] = [
+const CATALOG_SCHEMA: [&str; 8] = [
     "CREATE TABLE IF NOT EXISTS pg_settings (\
        name text PRIMARY KEY, setting text, unit text, category text, short_desc text, \
        context text, vartype text, source text, min_val text, max_val text, enumvals text, \
        boot_val text, reset_val text, pending_restart boolean)",
     "CREATE TABLE IF NOT EXISTS pg_database (\
-       oid integer PRIMARY KEY, datname text, datdba text, encoding integer, \
+       oid integer PRIMARY KEY, datname text UNIQUE, datdba text, encoding integer, \
        datcollate text, datctype text, datistemplate boolean, datallowconn boolean, \
-       datconnlimit integer)",
+       datconnlimit integer, datacl text)",
     "CREATE TABLE IF NOT EXISTS pg_roles (\
        oid integer PRIMARY KEY, rolname text UNIQUE, rolsuper boolean, rolinherit boolean, \
        rolcreaterole boolean, rolcreatedb boolean, rolcanlogin boolean, \
@@ -67,6 +71,18 @@ const CATALOG_SCHEMA: [&str; 5] = [
        rolcreatedb AS usecreatedb, rolsuper AS usesuper, rolreplication AS userepl, \
        rolbypassrls AS usebypassrls, '********' AS passwd, rolvaliduntil AS valuntil \
        FROM pg_roles WHERE rolcanlogin",
+    // `pg_auth_members` is the role MEMBERSHIPS (`GRANT <role> TO <role>`), keyed by the
+    // object identifiers of the two roles in `pg_roles`, as PostgreSQL keys them.
+    "CREATE TABLE IF NOT EXISTS pg_auth_members (\
+       oid integer PRIMARY KEY, roleid integer, member integer, grantor integer, \
+       admin_option boolean, UNIQUE (roleid, member))",
+    // The schema the objects of a database live in, and its access control list.
+    "CREATE TABLE IF NOT EXISTS pg_namespace (\
+       oid integer PRIMARY KEY, nspname text UNIQUE, nspowner integer, nspacl text)",
+    // The relations a database holds, with the privileges granted on each.
+    "CREATE TABLE IF NOT EXISTS pg_class (\
+       oid integer PRIMARY KEY, relname text UNIQUE, relnamespace integer, \
+       relowner integer, relkind text, relacl text)",
 ];
 
 /// The encoding every database on an RDS for PostgreSQL instance is created with, as
@@ -317,6 +333,14 @@ pub fn refresh_catalogs(
             // it; it carries no state of its own.
             "pg_user" => refresh_roles(database, facts)?,
             "pg_stat_activity" => refresh_activity(database, facts)?,
+            // The role memberships and the object catalogs are state of their own: a
+            // membership a `GRANT` recorded and a privilege it wrote belong to the instance
+            // from then on, so what a refresh does is SEED the rows the instance comes with
+            // (the one schema its objects live in, the relations the engine holds) and leave
+            // every granted row alone.
+            "pg_auth_members" => refresh_roles(database, facts)?,
+            "pg_namespace" => refresh_namespaces(database, facts)?,
+            "pg_class" => refresh_relations(database, facts)?,
             _ => {}
         }
     }
@@ -412,6 +436,27 @@ fn refresh_databases(
     database: &InstanceDatabase,
     facts: &SessionFacts,
 ) -> Result<(), EngineError> {
+    // The privileges granted on a database are state of their own, so they survive the
+    // rebuild of the rest of its row.
+    let held = database.execute(
+        &facts.database,
+        "SELECT datname, datacl FROM pg_database",
+        &[],
+    )?;
+    let granted: Vec<(String, Option<String>)> = held
+        .rows
+        .iter()
+        .filter_map(|row| match row.first() {
+            Some(super::sql_engine::Cell::Text(name)) => Some((
+                name.clone(),
+                match row.get(1) {
+                    Some(super::sql_engine::Cell::Text(acl)) => Some(acl.clone()),
+                    _ => None,
+                },
+            )),
+            _ => None,
+        })
+        .collect();
     database.execute(&facts.database, "DELETE FROM pg_database", &[])?;
     let owner = facts.runtime.master_username.clone();
     let rows: Vec<Vec<Option<String>>> = facts
@@ -429,10 +474,134 @@ fn refresh_databases(
                 Some("0".to_string()),
                 Some("1".to_string()),
                 Some(NO_CONNECTION_LIMIT.to_string()),
+                granted
+                    .iter()
+                    .find(|(held, _)| held == name)
+                    .and_then(|(_, acl)| acl.clone()),
             ]
         })
         .collect();
-    insert_rows(database, facts, "pg_database", 9, &rows)
+    insert_rows(database, facts, "pg_database", 10, &rows)
+}
+
+/// The schemas a database on this server holds: the one a client's own objects live in and
+/// the one the system catalogs live in, which PostgreSQL creates with every database.
+///
+/// This server serves unqualified names, so these two are the whole namespace of a
+/// database; a schema a statement names that is not one of them is a schema the database
+/// does not have.
+const SCHEMAS: [&str; 2] = ["pg_catalog", "public"];
+
+/// The first object identifier the schemas take, above the range the roles occupy.
+const FIRST_NAMESPACE_OID: i64 = FIRST_USER_OID + 100;
+
+/// The first object identifier a relation takes, above the schemas'.
+const FIRST_RELATION_OID: i64 = FIRST_USER_OID + 200;
+
+/// The object identifier of the role a database's objects belong to: the master user, who
+/// owns the instance's databases.
+fn owner_oid(facts: &SessionFacts) -> Option<String> {
+    facts
+        .runtime
+        .master_username
+        .as_ref()
+        .map(|_| (FIRST_USER_OID + RDS_ROLES.len() as i64).to_string())
+}
+
+/// Seed `pg_namespace` with the schemas every database has ([`SCHEMAS`]).
+///
+/// Seeded rather than replaced: the access control list a `GRANT` wrote on a schema belongs
+/// to the instance from then on, so an existing row is left exactly as it is.
+fn refresh_namespaces(
+    database: &InstanceDatabase,
+    facts: &SessionFacts,
+) -> Result<(), EngineError> {
+    for (offset, name) in SCHEMAS.iter().enumerate() {
+        database.execute(
+            &facts.database,
+            "INSERT OR IGNORE INTO pg_namespace (oid, nspname, nspowner, nspacl) \
+             VALUES (?, ?, ?, NULL)",
+            &[
+                Some((FIRST_NAMESPACE_OID + offset as i64).to_string()),
+                Some((*name).to_string()),
+                owner_oid(facts),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Bring `pg_class` up to date with the relations the session's database actually holds:
+/// one row per table and view the engine has, in the schema its name puts it in.
+///
+/// The privileges granted on a relation are state of their own, so a relation that is still
+/// there keeps its row — and with it its access control list — while one that has been
+/// dropped loses its row, exactly as PostgreSQL drops the catalog row with the object.
+fn refresh_relations(
+    database: &InstanceDatabase,
+    facts: &SessionFacts,
+) -> Result<(), EngineError> {
+    let present = database.execute(
+        &facts.database,
+        "SELECT name, type FROM sqlite_master WHERE type IN ('table', 'view') ORDER BY name",
+        &[],
+    )?;
+    let relations: Vec<(String, &'static str)> = present
+        .rows
+        .iter()
+        .filter_map(|row| match (row.first(), row.get(1)) {
+            (
+                Some(super::sql_engine::Cell::Text(name)),
+                Some(super::sql_engine::Cell::Text(kind)),
+            ) => Some((
+                name.clone(),
+                // `pg_class.relkind`: `r` for an ordinary table, `v` for a view.
+                if kind == "view" { "v" } else { "r" },
+            )),
+            _ => None,
+        })
+        .collect();
+    for (name, kind) in &relations {
+        // A catalog the server keeps is a relation of the schema the catalogs live in;
+        // everything else is a relation of the schema a client's objects live in.
+        let namespace = if name.starts_with("pg_") || name.starts_with("sqlite_") {
+            FIRST_NAMESPACE_OID
+        } else {
+            FIRST_NAMESPACE_OID + 1
+        };
+        database.execute(
+            &facts.database,
+            "INSERT OR IGNORE INTO pg_class \
+               (oid, relname, relnamespace, relowner, relkind, relacl) \
+             VALUES ((SELECT IFNULL(MAX(oid), ?) + 1 FROM pg_class), ?, ?, ?, ?, NULL)",
+            &[
+                Some(FIRST_RELATION_OID.to_string()),
+                Some(name.clone()),
+                Some(namespace.to_string()),
+                owner_oid(facts),
+                Some((*kind).to_string()),
+            ],
+        )?;
+    }
+    // The rows of relations the database no longer holds. A database holding NO relation at
+    // all is the empty case: `NOT IN ()` is not SQL, so what that asks for is said plainly.
+    let held: Vec<Option<String>> = relations
+        .iter()
+        .map(|(name, _)| Some(name.clone()))
+        .collect();
+    if held.is_empty() {
+        database.execute(&facts.database, "DELETE FROM pg_class", &[])?;
+        return Ok(());
+    }
+    let placeholders = std::iter::repeat_n("?", held.len())
+        .collect::<Vec<_>>()
+        .join(", ");
+    database.execute(
+        &facts.database,
+        &format!("DELETE FROM pg_class WHERE relname NOT IN ({placeholders})"),
+        &held,
+    )?;
+    Ok(())
 }
 
 /// Seed `pg_roles` with the roles the instance was created with: the master user and the

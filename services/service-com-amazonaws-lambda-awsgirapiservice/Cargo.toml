@@ -182,6 +182,14 @@ aws-smithy-eventstream = "0.60"
 # or a query parameter's value is percent-encoded on the way into one
 # (`state::execution::rest_json`).
 percent-encoding = "2.3"
+# `generate_db_auth_token` is not an API call: the SDKs build the authentication token a
+# database login presents by SigV4-PRESIGNING a request in the client
+# (`state::execution::db_auth_token`). `aws-sigv4` is the SDK's own signer, in that
+# presigned form, and `aws-credential-types` is the credential type it signs with, so the
+# token is the one that signer computes rather than a format written out here. Both are
+# already in this workspace's lock file.
+aws-sigv4 = { version = "1", default-features = false, features = ["http1", "sign-http"] }
+aws-credential-types = "1"
 # The platform's own values for the names a complete POSIX module carries as plain data —
 # the `open` flags the standard library reads off `os` while being imported
 # (`state::execution::host_posix`) — taken from the C headers rather than written out here.
@@ -225,6 +233,9 @@ service-com-amazonaws-sesv2-simpleemailservice-v2 = { workspace = true }
 service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810 = { workspace = true }
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# The token-minting tests read the query fields of a minted authentication token the way a
+# client reads them, with the same query-string reader the SDK's own signer uses.
+form_urlencoded = "1"
 # The bucket a handler's own S3 call reads and writes, mounted beside lambda on ONE engine
 # in the SDK tests: an object a handler reads is asserted where a client reads it, and the
 # bucket policy and the role policies that decide such a read are written with S3's and

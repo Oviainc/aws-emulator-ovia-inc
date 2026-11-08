@@ -195,6 +195,11 @@ async fn serve_session(
             nonce: &nonce,
             response: &login.auth_response,
         },
+        // IAM database authentication on a MySQL instance is an AUTHENTICATION PLUGIN on
+        // the account (`IDENTIFIED WITH AWSAuthenticationPlugin`), which this wire's
+        // handshake does not negotiate and this endpoint's MySQL half keeps no account
+        // table for: no login here presents an authentication token, so none is read.
+        None,
     ) {
         Ok(database) => database,
         Err(refusal) => {

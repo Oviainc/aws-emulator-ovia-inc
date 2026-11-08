@@ -637,9 +637,9 @@ fn clamp_recursion(vm: &VirtualMachine, limit: usize) -> PyResult<()> {
     Ok(())
 }
 
-/// The module the four host functions live on: the invocation log, the bounded sleep, the
-/// step hook and the one AWS SDK call. Nothing else of the host is reachable from guest
-/// code.
+/// The module the five host functions live on: the invocation log, the bounded sleep, the
+/// step hook, the one AWS SDK call and the authentication token the SDK mints in the client.
+/// Nothing else of the host is reachable from guest code.
 fn host_module(
     vm: &VirtualMachine,
     capture: &Arc<Mutex<Capture>>,
@@ -719,6 +719,50 @@ fn host_module(
             }
             let answered = access.call(&service, &operation, &region, &body, remaining);
             Ok(vm.ctx.new_str(call_answer(&answered)).into())
+        },
+    );
+    // The AUTHENTICATION TOKEN an SDK mints in the CLIENT for a database login
+    // ([`super::db_auth_token`]). It is not a call — nothing is dispatched and no service
+    // answers — but it is signed with the credential this seam holds, which is why the host
+    // mints it and the guest only states which endpoint and which database user it is for.
+    // It counts against the same per-run budget as a call, so no run can mint tokens
+    // without end.
+    let token_access = aws.cloned();
+    let token_bounds = Arc::clone(bounds);
+    let minted = Arc::clone(&made);
+    set_function(
+        vm,
+        &module,
+        "db_auth_token",
+        move |args: FuncArgs, vm: &VirtualMachine| {
+            let (host, port, user, region): (String, u16, String, String) = args.bind(vm)?;
+            if let Some(stop) = token_bounds.stopped() {
+                return Err(vm.new_runtime_error(stop.reason().to_owned()));
+            }
+            if minted.fetch_add(1, Ordering::Relaxed) >= MAX_CALLS_PER_RUN as u64 {
+                return Err(vm.new_runtime_error(format!(
+                    "one invocation may make at most {MAX_CALLS_PER_RUN} AWS SDK calls"
+                )));
+            }
+            let Some(access) = token_access.as_ref() else {
+                return Ok(vm
+                    .ctx
+                    .new_str(refusal_answer(
+                        "not_made",
+                        "this invocation was given no AWS SDK seam, so no authentication \
+                         token was minted",
+                    ))
+                    .into());
+            };
+            let answer = match access.db_auth_token(&host, port, &user, &region) {
+                Ok(token) => ::serde_json::json!({ "token": token }).to_string(),
+                Err(Refusal::NotMade(detail)) => refusal_answer("not_made", &detail),
+                Err(_other) => refusal_answer(
+                    "not_made",
+                    "the authentication token could not be minted",
+                ),
+            };
+            Ok(vm.ctx.new_str(answer).into())
         },
     );
     // The ONE request a handler SENDS ITSELF, for a service whose data plane is reached

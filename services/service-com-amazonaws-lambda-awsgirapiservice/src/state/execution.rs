@@ -84,6 +84,10 @@ mod aws_s3;
 /// Binding one of those calls to HTTP for a service whose protocol is `restJson1`.
 pub mod rest_json;
 
+/// The AUTHENTICATION TOKEN the SDK mints in the CLIENT for a handler connecting to a
+/// database with IAM database authentication, which is not an API call at all.
+pub mod db_auth_token;
+
 /// The credential a running handler's own calls are made with: a session of the function's
 /// execution role.
 pub mod execution_role_session;

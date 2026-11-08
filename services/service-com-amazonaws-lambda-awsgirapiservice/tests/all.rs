@@ -201,6 +201,8 @@ mod function_versions_by_capacity_provider;
 mod functions_by_code_signing_config;
 #[path = "all/handler_aws_sdk.rs"]
 mod handler_aws_sdk;
+#[path = "all/handler_db_auth_token.rs"]
+mod handler_db_auth_token;
 #[path = "all/handler_object_store_sdk.rs"]
 mod handler_object_store_sdk;
 #[path = "all/handler_email_sdk.rs"]
@@ -223,6 +225,8 @@ mod invocation_log_delivery;
 mod invocation_log_group_search;
 #[path = "all/invocation_refusal_diagnostics.rs"]
 mod invocation_refusal_diagnostics;
+#[path = "all/invocation_run_capacity.rs"]
+mod invocation_run_capacity;
 #[path = "all/invoke_addressed_function.rs"]
 mod invoke_addressed_function;
 #[path = "all/invoke_function_error_document.rs"]
@@ -339,5 +343,3 @@ mod invoke_caller_authorization;
 mod invoke_log_delivery;
 #[path = "all/invocation_logs.rs"]
 mod invocation_logs;
-#[path = "all/invocation_run_capacity.rs"]
-mod invocation_run_capacity;

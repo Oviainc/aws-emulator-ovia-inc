@@ -242,6 +242,9 @@ mod clusters;
 // record a resource stores for it, and the minting a request that turns
 // `ManageMasterUserPassword` on depends on.
 mod managed_master_secret;
+// The identity a call RDS makes of its OWN presents to the service serving it: the one
+// place this crate acts as its own service principal rather than as the caller.
+mod service_principal_call;
 // WHO OWNS that secret: it goes with the resource it was minted for, and a resource that
 // merely inherits another's master credential owns none.
 mod master_user_credentials;
@@ -261,6 +264,7 @@ pub use published_values::*;
 pub use clusters::*;
 pub use instances::*;
 pub use managed_master_secret::*;
+pub use service_principal_call::*;
 pub use master_user_credentials::*;
 pub use data_plane::{
     capture_instance_storage, cluster_endpoint::cluster_engine_wire, engine_wire,

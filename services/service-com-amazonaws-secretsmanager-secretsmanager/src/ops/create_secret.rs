@@ -265,6 +265,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Whether this create is one ANOTHER Amazon Web Services service is making as its
+        // own service principal for a secret it will MANAGE, and which service that is
+        // ([`crate::state::service_owned`]). It decides the two things such a create may
+        // carry and a caller's may not — the reserved name and the AWS-applied tags — and
+        // nothing else about how the secret is created.
+        let owner = crate::state::service_owned::requesting_owner(&*self.engine, ctx);
         // "A list of tags to attach to the secret. Each tag is a key and value
         // pair": a tag's key is its identity, and the `aws:` prefix is reserved
         // for AWS's own tags — the same rules `TagResource` applies.
@@ -291,10 +297,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The tags the OWNING service applies to a secret it manages live in exactly that
+        // namespace, under its own service id, so a create of that service's own may write
+        // them — and nothing else may.
         if let Some(reserved) = tags
             .iter()
             .filter_map(|tag| tag.key.as_deref())
-            .find(|key| key.starts_with(crate::state::RESERVED_TAG_PREFIX))
+            .find(|key| {
+                key.starts_with(crate::state::RESERVED_TAG_PREFIX)
+                    && owner.as_ref().is_none_or(|owner| !owner.may_tag(key))
+            })
         {
             return Err(CreateSecretErrorModeled::InvalidParameterException(
                 InvalidParameterException {
@@ -342,7 +354,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // characters: /_+=.@-". The model declares no pattern for `NameType`,
         // so the documented charset is enforced here — and it is what keeps the
         // name a safe literal inside the ARN this operation allocates.
-        if !crate::state::is_valid_secret_name(&input.name) {
+        // A name in the reserved `<service>!…` form is one only that service's own create
+        // may carry; for every other caller it is a name outside the documented charset,
+        // and is refused as one.
+        let named_well = match &owner {
+            Some(owner) => owner.may_name(&input.name),
+            None => crate::state::is_valid_secret_name(&input.name),
+        };
+        if !named_well {
             return Err(CreateSecretErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     message: Some(format!(
@@ -572,6 +591,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         secret.description = input.description.clone().filter(|text| !text.is_empty());
         secret.kms_key_id = input.kms_key_id.clone();
         secret.secret_type = input.r#type.clone();
+        // "The ID of the service that created this secret": the service whose own
+        // principal made this create, for a secret that service manages.
+        secret.owning_service = owner.as_ref().map(|owner| owner.service_id.clone());
         secret.tags = tags.iter().map(crate::state::StoredTag::from_modeled).collect();
 
         if let Some(sealed) = sealed {

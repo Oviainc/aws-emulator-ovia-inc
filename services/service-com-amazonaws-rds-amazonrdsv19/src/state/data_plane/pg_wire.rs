@@ -217,12 +217,20 @@ async fn serve_session(
             .await
         }
     };
+    // Which credentials admit this login: the master user's password, and — on a resource
+    // with IAM database authentication turned on — an authentication token presented by a
+    // database user enabled for it. What this resolves is the resource's own setting and
+    // the database the user would be resolved against, both read from the facts above; the
+    // engine is read only inside the decision, and only for a login whose token claims
+    // already hold.
+    let iam = context.iam_login(&facts, &user, database.as_deref());
     let database = match wire_session::admit(
         &facts,
         &user,
         database.as_deref(),
         tls.is_some(),
         &PasswordProof::Cleartext(&password),
+        Some(&iam),
     ) {
         Ok(database) => database,
         Err(refusal) => {
