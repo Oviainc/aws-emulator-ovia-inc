@@ -182,10 +182,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let connector = store
             .cloud_connector_in_mut(&region, &input.identifier)
             .ok_or_else(|| {
-                // A mutation states the reason from the identifier the request carried,
-                // through the one formatter every mutating path of this service shares.
+                // The one sentence this resource's 404s carry, read and mutation alike:
+                // the recorded 404 of this very update, for a connector a delete had just
+                // removed, is worded exactly as the recorded 404 of a read of it. The
+                // identifier the request carried is reported on `ResourceId`.
                 UpdateCloudConnectorErrorModeled::ResourceNotFoundException(
-                    crate::state::cloud_connector_not_found_on_mutation(&input.identifier),
+                    crate::state::cloud_connector_not_found(&input.identifier),
                 )
             })?;
 

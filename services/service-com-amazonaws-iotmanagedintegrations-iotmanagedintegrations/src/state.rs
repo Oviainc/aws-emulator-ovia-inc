@@ -136,11 +136,11 @@ pub const MAX_CLOUD_CONNECTORS: usize = 1_000;
 /// and the kind an idempotency token is scoped to ([`IdempotencyKey`]).
 pub const CLOUD_CONNECTOR_RESOURCE_TYPE: &str = "CloudConnector";
 
-/// The cloud-connector resource as its own reasons name it: the resource in SENTENCE case,
-/// because both the sentence a read of an absent connector states
-/// ([`subject_not_found_message`]) and the one a mutation states
-/// ([`cannot_be_found_message`]) are sentences ABOUT the resource — exactly as its sibling
-/// of the C2C surface words its own ([`CONNECTOR_DESTINATION_RESOURCE_SUBJECT`]).
+/// The cloud-connector resource as its own reason names it: the resource in SENTENCE case,
+/// because the one sentence this resource's absence is stated with
+/// ([`cloud_connector_not_found`], which words it through [`subject_not_found_message`]) is
+/// a sentence ABOUT the resource — as the sentences its sibling of the C2C surface words
+/// are ([`CONNECTOR_DESTINATION_RESOURCE_SUBJECT`]).
 pub const CLOUD_CONNECTOR_RESOURCE_SUBJECT: &str = "Cloud connector";
 
 /// One stored connector destination: the record `CreateConnectorDestination` inserts —
@@ -2252,30 +2252,25 @@ pub fn bare_resource_not_found() -> ResourceNotFoundException {
     }
 }
 
-/// The modelled `ResourceNotFoundException` a READ answers for a cloud connector the
-/// store does not hold under the identifier a request named: the sentence this resource's
-/// backend words its absence with ([`subject_not_found_message`]) plus the `ResourceId` and
-/// `ResourceType` members the recorded body carries.
-pub fn cloud_connector_not_found_on_read(identifier: &str) -> ResourceNotFoundException {
+/// The modelled `ResourceNotFoundException` EVERY operation of this service answers for a
+/// cloud connector the store does not hold under the identifier a request named: the
+/// sentence this resource's backend words its absence with ([`subject_not_found_message`])
+/// plus the `ResourceId` and `ResourceType` members the recorded body carries.
+///
+/// ONE reason, read and mutation alike, because that is what this resource's recorded 404s
+/// carry: within the recorded cloud-connector lifecycle
+/// (`iot-managed-integrations.cloud-connector-lifecycle`, and the cloud-connector error
+/// paths beside it), a `GetCloudConnector` for an identifier the account holds no connector
+/// under and an `UpdateCloudConnector` for one a delete had just removed both answer
+/// `Cloud connector not found.` — the identical `Message`, the subject being this resource's
+/// own ([`CLOUD_CONNECTOR_RESOURCE_SUBJECT`]) and no request value interpolated. So the
+/// sentence belongs to the cloud connector rather than to the path that resolved it, and a
+/// resource whose recorded paths DO word their own differently keeps its own pair of reasons
+/// ([`connector_destination_not_found_on_read`] beside
+/// [`connector_destination_not_found_on_mutation`]).
+pub fn cloud_connector_not_found(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(subject_not_found_message(CLOUD_CONNECTOR_RESOURCE_SUBJECT)),
-        ..resource_not_found(CLOUD_CONNECTOR_RESOURCE_TYPE, identifier)
-    }
-}
-
-/// The modelled `ResourceNotFoundException` a MUTATION answers for a cloud connector the
-/// store does not hold under the `Identifier` a request named: the mutating path's reason
-/// ([`cannot_be_found_message`]) plus the `ResourceId` and `ResourceType` members every 404
-/// of this service reports the same way.
-///
-/// A 404 of this service is worded by the PATH that resolved the resource, not by the
-/// operation: a read of this same identifier states which KIND of resource is missing
-/// ([`cloud_connector_not_found_on_read`]), where a mutation states a sentence about the
-/// resource itself, as the recorded mutating 404 of the other half of the C2C surface does
-/// ([`connector_destination_not_found_on_mutation`]).
-pub fn cloud_connector_not_found_on_mutation(identifier: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: Some(cannot_be_found_message(CLOUD_CONNECTOR_RESOURCE_SUBJECT)),
         ..resource_not_found(CLOUD_CONNECTOR_RESOURCE_TYPE, identifier)
     }
 }
@@ -2558,7 +2553,8 @@ pub fn account_association_not_found_on_read(identifier: &str) -> ResourceNotFou
 /// `CreateDestination` for a name the region already holds one under is recorded as
 /// `Destination already exists`, naming no identifier — so every create that refuses a
 /// duplicate of a NAME-addressed resource states it through here, the way
-/// [`cannot_be_found_message`] serves every mutation's 404.
+/// [`cannot_be_found_message`] serves the mutating paths whose recorded 404s word their
+/// absence that way.
 pub fn already_exists_message(resource_subject: &str) -> String {
     format!("{resource_subject} already exists")
 }

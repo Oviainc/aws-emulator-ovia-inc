@@ -463,12 +463,12 @@ async fn an_update_of_a_connector_this_region_does_not_hold_is_not_found() {
              got {:?}",
             refused.string("ResourceType")
         );
-        // A mutation states a sentence about the resource and names no identifier, so the
-        // reason is the same for every row.
+        // The reason is the ONE sentence this resource's 404s carry, read and mutation
+        // alike, and it names no identifier, so it is the same for every row.
         assert_eq!(
             refused.string("Message"),
-            Some(format!("{CLOUD_CONNECTOR_RESOURCE_SUBJECT} cannot be found.").as_str()),
-            "case {identifier:?}: expected the mutating path's reason, got {:?}",
+            Some(format!("{CLOUD_CONNECTOR_RESOURCE_SUBJECT} not found.").as_str()),
+            "case {identifier:?}: expected this resource's absent-connector reason, got {:?}",
             refused.string("Message")
         );
         assert!(

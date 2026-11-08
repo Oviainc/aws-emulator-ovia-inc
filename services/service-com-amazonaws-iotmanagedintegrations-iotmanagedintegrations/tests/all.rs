@@ -17,6 +17,8 @@ mod absent_and_default_response_values;
 mod account_association_lifecycle;
 #[path = "all/bare_not_found_bodies.rs"]
 mod bare_not_found_bodies;
+#[path = "all/cloud_connector_delete.rs"]
+mod cloud_connector_delete;
 #[path = "all/cloud_connector_lifecycle.rs"]
 mod cloud_connector_lifecycle;
 #[path = "all/cloud_connector_update.rs"]
