@@ -26,7 +26,8 @@ fn formatted(body: &Value) -> Value {
 /// result set report the same value as the same JSON type: the union models
 /// `booleanValue` as a boolean and `blobValue` as a blob — which this protocol
 /// carries base64-encoded — so a boolean column is a JSON `true`/`false` and a
-/// binary column is its base64 text, a number is a JSON number, text and a date
+/// binary column is its base64 text, an EXACT number is a JSON string (neither form
+/// turns one into a float), an inexact one is a JSON number, text and a date
 /// or time are JSON strings, a NULL is `null`, and an array column is a JSON
 /// array whose elements take the form their element type names.
 ///
@@ -112,7 +113,7 @@ async fn the_json_record_format_renders_a_value_as_its_field_member_does() {
             "NUMERIC(10,2)",
             "2.5",
             json!([]),
-            json!(2.5),
+            json!("2.50"),
             json!({"stringValue": "2.50"}),
         ),
         (
@@ -180,14 +181,14 @@ async fn the_json_record_format_renders_a_value_as_its_field_member_does() {
             json!({"arrayValue": {"doubleValues": [0.5, 1.25]}}),
         ),
         (
-            // The one class where the two forms differ: JSON has a number, and
-            // `records` follows `decimalReturnType`, whose documented default
-            // returns an exact number as text.
+            // An exact number is text in BOTH forms: neither turns it into a float,
+            // so the digits and the scale a client reads are the ones the column
+            // holds.
             "an array of exact numbers",
             "NUMERIC[]",
             "'{2.50,3}'::numeric[]",
             json!([]),
-            json!([2.5, 3.0]),
+            json!(["2.50", "3"]),
             json!({"arrayValue": {"stringValues": ["2.50", "3"]}}),
         ),
         (

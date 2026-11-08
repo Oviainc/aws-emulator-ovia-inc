@@ -27,7 +27,9 @@ tracing = { workspace = true }
 # on the build host) rather than linking whatever the host happens to ship, so the
 # engine version is pinned by Cargo.lock and reproducible.
 # `backup` copies a database for a transaction's snapshot, `column_decltype`
-# supplies the declared type of each result column for `columnMetadata`, `hooks`
+# supplies the declared type of each result column for `columnMetadata`, `functions`
+# defines the ONE function this data plane adds (the reader of a binary value's
+# documented input format), `hooks`
 # installs BOTH the progress handler that bounds a statement and the default-deny
 # authorizer that confines it, and `limits` sets the engine's size, depth and
 # ATTACH limits. Every escape this re-opens is closed in `Database::open` (see the
@@ -35,9 +37,10 @@ tracing = { workspace = true }
 # foreign virtual tables and the file-touching SQL functions are refused by the
 # authorizer, extension loading is off, defensive mode is on, and memory, value
 # size, statement size, expression depth and query complexity are all capped.
-rusqlite = { version = "0.37", features = ["bundled", "backup", "column_decltype", "hooks", "limits"] }
-# The PostgreSQL parser in front of that engine: a Data API statement is Aurora
-# PostgreSQL, so it is parsed with this crate's PostgreSQL dialect and rendered
+rusqlite = { version = "0.37", features = ["bundled", "backup", "column_decltype", "functions", "hooks", "limits"] }
+# The PostgreSQL and MySQL parsers in front of that engine: a Data API statement is
+# written in the dialect of the engine the caller addresses, so it is parsed with this
+# crate's PostgreSQL dialect and, failing that, its MySQL one, and rendered
 # back out in the form the engine's own grammar accepts. `visitor` is what walks
 # the parsed statement to rewrite it; no SQL text is inspected by hand.
 sqlparser = { version = "0.59", features = ["visitor"] }
@@ -45,9 +48,15 @@ sqlparser = { version = "0.59", features = ["visitor"] }
 uuid = { version = "1", features = ["v4"] }
 # The calendar and clock behind the DATE/TIME/TIMESTAMP `typeHint`s: a hinted
 # string is accepted only if this crate parses it as the date or time the model's
-# documented format names, so no date arithmetic or format parsing is written
+# documented format names, and a time of day is RENDERED back out by it at the
+# precision that format carries, so no date arithmetic or format parsing is written
 # here. Same version the rest of the tree pins.
-time = { version = "0.3.55", default-features = false, features = ["parsing", "macros", "std"] }
+time = { version = "0.3.55", default-features = false, features = ["formatting", "parsing", "macros", "std"] }
+# Hexadecimal: the INPUT FORMAT PostgreSQL documents for a binary value is a `\x`
+# prefix and two hex digits per byte, so the digits are decoded by this crate's codec
+# rather than by a loop written here — and this crate's suites write a byte string as
+# hex text for the same reason.
+hex = { workspace = true }
 # `iam_authorization` / `iam_role`: the tree's ONE evaluation of IAM policy documents
 # against (action, resource), and the readings of a principal ARN, used by the
 # authorization leg of the request precondition chain (`src/state/authorization.rs`).
@@ -82,10 +91,6 @@ sha2 = { workspace = true }
 service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
 service-com-amazonaws-kms-trentservice = { workspace = true }
 service-com-amazonaws-rds-amazonrdsv19 = { workspace = true }
-# Hexadecimal, for writing a byte string as text in this crate's suites: the
-# bytes a binary column holds are written in hex and the base64 the response
-# carries them as is decoded back to them.
-hex = { workspace = true }
 
 [lints]
 workspace = true

@@ -254,41 +254,53 @@ fn commit(
     let aborted = transaction.is_aborted();
     let database = crate::state::database_key(transaction.database.as_ref());
     cluster.database_mut(&database)?;
+    // READ COMMITTED, at the commit itself: the writes this transaction is about to
+    // install go ON TOP of everything committed on that database since it last ran, so
+    // a commit another writer made while this transaction was open is not replaced by
+    // this one. An ABORTED transaction installs nothing, so there is nothing to put on
+    // top of anything.
+    if !aborted {
+        cluster.read_what_is_committed(
+            &input.transaction_id,
+            &mut crate::state::RequestBudget::new(),
+        )?;
+    }
     // Ending the transaction hands back the database it was writing into and leaves its
     // id with the cluster, now terminal — so a SECOND commit of the same id is answered
     // for a transaction a previous call ended rather than as an id this service never
     // issued.
     let pending = cluster.end_transaction(&input.transaction_id)?;
     if aborted {
-        // A statement of this transaction already failed, and "if the transaction block
-        // is aborted, COMMIT performs a ROLLBACK and reports ROLLBACK" (PostgreSQL's own
-        // `COMMIT`): the writes are discarded, and what the caller is told is the
-        // rollback that really happened rather than a commit that did not. The sequence
-        // values the transaction took out are still not handed out again, for the reason
-        // `RollbackTransaction` gives.
+        // A statement of this transaction already failed, and a commit of a transaction
+        // block that has failed performs a ROLLBACK: the writes are DISCARDED, which is
+        // why the database it was writing into is dropped here instead of installed. The
+        // STATUS the call reports is still the one a commit reports — ending a
+        // transaction through `CommitTransaction` is what the caller asked for, and the
+        // service answers for the call it served rather than for the operation the
+        // database performed underneath it. The sequence values the transaction took out
+        // are still not handed out again, for the reason `RollbackTransaction` gives.
         let marks = pending.sequence_marks();
         drop(pending);
         if let Some(committed) = cluster.databases.get_mut(&database) {
             committed.advance_sequences(&marks);
         }
         return Ok(CommitTransactionOutput {
-            transaction_status: Some(crate::state::ROLLBACK_COMPLETE_STATUS.to_string()),
+            transaction_status: Some(crate::state::TRANSACTION_COMMITTED_STATUS.to_string()),
         });
     }
     // Applying the transaction's writes: the database it wrote into becomes the
     // cluster's committed database for that name, which is what makes those writes
     // visible to a later non-transactional statement.
     //
-    // ISOLATION, stated here because it is observable: installing the whole
-    // database gives ONE database database-granularity last-writer-wins, so a
-    // write committed outside this transaction after it opened is replaced by this
-    // commit rather than merged with it. A real engine would serialise the two.
-    // The emulator keeps the simpler rule deliberately — the transaction's own
-    // statements are all the engine's own behaviour, and a caller that needs two
-    // writers on one database serialises them itself — and
-    // `two_writers_on_one_database_are_last_writer_wins` in
-    // `tests/all/sql_data_api.rs` pins it, so the semantics are asserted and not
-    // merely commented.
+    // ISOLATION, stated here because it is observable: the database being installed was
+    // rebuilt from what is committed NOW with this transaction's own writes replayed
+    // onto it (see `read_what_is_committed` above), so a commit ADDS this transaction's
+    // writes to the committed database rather than replacing it, and two writers on one
+    // database both keep their rows. What a replay does not reproduce is stated at
+    // `Transaction::rebase_onto`, and
+    // `two_transactions_on_one_database_both_keep_their_writes` in
+    // `tests/all/read_committed_transactions.rs` pins the semantics rather than leaving
+    // them to this comment.
     cluster.databases.insert(database, pending);
     Ok(CommitTransactionOutput {
         transaction_status: Some(crate::state::TRANSACTION_COMMITTED_STATUS.to_string()),

@@ -169,8 +169,8 @@ async fn an_error_the_database_raised_is_the_database_error_class() {
 
         // The in-transaction path: the same class, and the statement that failed ABORTS
         // the transaction it ran in — the database ignores every further command of it,
-        // and a commit of it discards what it wrote and reports the rollback it
-        // performed instead.
+        // and a commit of it discards what it wrote while still reporting the status a
+        // commit reports.
         let transaction = api.begin_transaction(None).await;
         let (status, inside) = api
             .execute(json!({"sql": sql, "transactionId": transaction.clone()}))
@@ -212,8 +212,8 @@ async fn an_error_the_database_raised_is_the_database_error_class() {
         );
         assert_eq!(
             committed["transactionStatus"],
-            json!("Rollback complete"),
-            "case {case}: a commit of an aborted transaction performs a rollback and says so, \
+            json!("Transaction Committed"),
+            "case {case}: a commit reports the status of the commit it was asked for, \
              got {committed}"
         );
     }
@@ -368,10 +368,12 @@ async fn a_binding_fault_is_a_validation_fault_with_its_own_message() {
 /// `TransactionNotFoundException` and the fixed sentence AWS words that class with — on
 /// every operation that takes one, and however the transaction stopped running: a commit
 /// ended it, a rollback ended it, a statement of its own that failed ended it, or no
-/// transaction was ever opened under that id. Refusing the call changes nothing: the
-/// committed row stays readable and the rolled-back write stays absent.
-/// (A value that could NOT be an id of that resource is a fault of the call's own shape
-/// instead — `sql_data_api` pins that class.)
+/// transaction was ever opened under that id. An id of this service's own form that
+/// belongs to ANOTHER resource is refused APART from those, as the invalid argument it
+/// is. Refusing the call changes nothing either way: the committed row stays readable
+/// and the rolled-back write stays absent.
+/// (A value that could NOT be an id of this service at all is a fault of the call's own
+/// shape instead — `sql_data_api` pins that class.)
 #[tokio::test]
 async fn a_transaction_that_is_not_running_is_refused_with_the_same_sentence() {
     let api = DataApi::new();
@@ -478,6 +480,42 @@ async fn a_transaction_that_is_not_running_is_refused_with_the_same_sentence() {
                  {body}"
             );
         }
+    }
+
+    // And an id of THIS SERVICE's own form that belongs to ANOTHER resource: refused
+    // APART from the ids above, on the resource the id itself carries, because the
+    // transaction it names may well still be running on the cluster that issued it.
+    let foreign = api
+        .begin_transaction_on("arn:aws:rds:us-east-1:000000000000:cluster:other")
+        .await;
+    let calls = vec![
+        (
+            "ExecuteStatement",
+            api.execute(json!({
+                "sql": "INSERT INTO ledger (id, note) VALUES (9, 'late')",
+                "transactionId": foreign.clone(),
+            }))
+            .await,
+        ),
+        (
+            "BatchExecuteStatement",
+            api.batch(json!({
+                "sql": "INSERT INTO ledger (id, note) VALUES (9, 'late')",
+                "parameterSets": [[]],
+                "transactionId": foreign.clone(),
+            }))
+            .await,
+        ),
+        ("CommitTransaction", api.commit(&foreign).await),
+        ("RollbackTransaction", api.rollback(&foreign).await),
+    ];
+    for (operation, (status, body)) in calls {
+        assert_eq!(
+            (status, error_code(&body), body["message"].clone()),
+            (400, "ValidationException", json!("Invalid transaction ID")),
+            "case an id of another resource on {operation}: expected the invalid-argument \
+             refusal, got {status} {body}"
+        );
     }
 
     // None of those refusals changed the data: the committed row is there, and neither

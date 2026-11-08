@@ -15,6 +15,10 @@
 mod call_preconditions;
 #[path = "all/ended_transaction_sentence.rs"]
 mod ended_transaction_sentence;
+#[path = "all/engine_dialects.rs"]
+mod engine_dialects;
+#[path = "all/exact_numeric_results.rs"]
+mod exact_numeric_results;
 #[path = "all/json_record_values.rs"]
 mod json_record_values;
 #[path = "all/malformed_transaction_ids.rs"]
@@ -23,6 +27,8 @@ mod malformed_transaction_ids;
 mod mysql_upsert;
 #[path = "all/probe.rs"]
 mod probe;
+#[path = "all/read_committed_transactions.rs"]
+mod read_committed_transactions;
 #[path = "all/refusal_classes.rs"]
 mod refusal_classes;
 #[path = "all/sql_data_api.rs"]
@@ -33,3 +39,5 @@ mod state_roundtrip;
 mod statement_names;
 #[path = "all/transaction_id_classes.rs"]
 mod transaction_id_classes;
+#[path = "all/typed_values.rs"]
+mod typed_values;

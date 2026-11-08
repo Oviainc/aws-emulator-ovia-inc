@@ -508,7 +508,14 @@ async fn the_field_member_follows_the_column_type_and_result_set_options() {
         api.run(json!({"sql": format!("CREATE TABLE probe ({})", case.column)}))
             .await;
         api.run(json!({
-            "sql": "INSERT INTO probe (value) VALUES (:value)",
+            // A value written as TEXT reaches a column of another type through a CAST
+            // the statement writes (a `typeHint` is the other way of saying it); what
+            // the case is about is the column's own type and the options, so every
+            // case binds the same way.
+            "sql": format!(
+                "INSERT INTO probe (value) VALUES (CAST(:value AS {}))",
+                case.column.strip_prefix("value ").unwrap_or(case.column)
+            ),
             "parameters": [parameter("value", case.bound.clone())],
         }))
         .await;
@@ -546,9 +553,12 @@ async fn the_field_member_follows_the_column_type_and_result_set_options() {
 /// inserted, updated or deleted — 0 for DDL and for a statement that only reads —
 /// and `BatchExecuteStatement` runs the statement once per parameter set, so N
 /// sets of an INSERT leave N rows a later SELECT returns.
+///
+/// A call carrying NO parameter sets runs the statement once, which is the batch
+/// rule's own row in `tests/all/engine_dialects.rs`.
 #[tokio::test]
 async fn row_counts_are_what_the_engine_changed() {
-    for rows in [0_usize, 1, 2, 5, 13] {
+    for rows in [1_usize, 2, 5, 13] {
         let api = DataApi::new();
         api.run(json!({"sql": "CREATE TABLE items (id INT, label VARCHAR(8))"}))
             .await;
@@ -1766,13 +1776,15 @@ async fn a_pattern_comparison_is_bounded_and_leaves_the_data_plane_usable() {
 
 /// RULE: EVERY call answers, with a modelled response, inside the budget one
 /// request has — whatever else the data plane is doing. A statement that cannot
-/// finish is aborted at its own deadline, and a call that has to WAIT for a data
-/// plane another call is holding is answered at the outer one, so no request is
+/// finish is aborted at its own deadline, a call that has to WAIT for a data
+/// plane another call is holding is answered at the outer one, and a statement whose
+/// own TEXT is what grows costs work linear in that text, so no request is
 /// ever left open.
 ///
 /// The rows differ along how many calls contend for the data plane at once: one
 /// that only has to outrun its own deadline, and several that have to wait for
-/// the ones in front of them as well.
+/// the ones in front of them as well — and then along what one call's own statement
+/// asks for.
 #[tokio::test]
 async fn every_call_answers_inside_the_request_budget() {
     // Counting an endless recursion returns no row until it finishes, so nothing
@@ -1815,13 +1827,44 @@ async fn every_call_answers_inside_the_request_budget() {
             started.elapsed()
         );
     }
+
+    // And a statement whose TEXT is what grows — as many placeholder tokens as the
+    // level bound admits — is answered inside one request's budget too: what the data
+    // plane does per placeholder costs one pass over the statement, not one per
+    // placeholder. A statement past that bound is refused, as the suite that pins the
+    // bound asserts.
+    let api = DataApi::new();
+    let placeholders = (0..400)
+        .map(|index| format!(":p{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let parameters = (0..400)
+        .map(|index| parameter(&format!("p{index}"), json!({"stringValue": "a"})))
+        .collect::<Vec<_>>();
+    let started = std::time::Instant::now();
+    let (status, answered) = api
+        .execute(json!({
+            "sql": format!("SELECT {placeholders}"),
+            "parameters": parameters,
+        }))
+        .await;
+    assert_eq!(
+        status, 200,
+        "case four hundred placeholders: expected the statement to run, got {status} {answered}"
+    );
+    assert!(
+        started.elapsed() < REQUEST_BUDGET,
+        "case four hundred placeholders: expected an answer within {REQUEST_BUDGET:?}, took {:?}",
+        started.elapsed()
+    );
 }
 
-/// RULE: a `typeHint` on a `stringValue` names the type that string is sent as,
-/// so the request is checked against that type's accepted format — the documented
-/// form is accepted and stored, anything else is refused with HTTP 400 — and a
-/// hint on any other `Field` member, where the member already names the type, is
-/// ignored.
+/// RULE: a `typeHint` on a `stringValue` names the type that string is SENT AS, so the
+/// string has to be a value of that type — the documented form is accepted and stored,
+/// and anything else is refused as a value the service CANNOT PARSE as that type,
+/// naming the hint and the string, in the class a failure to read the caller's data is
+/// — and a hint on any other `Field` member, where the member already names the type,
+/// is ignored.
 ///
 /// The formats come from the model: `DATE` is `YYYY-MM-DD`, `TIME` is
 /// `HH:MM:SS[.FFF]`, `TIMESTAMP` is `YYYY-MM-DD HH:MM:SS[.FFF]`, and `DECIMAL`,
@@ -1834,22 +1877,51 @@ async fn a_type_hint_decides_what_a_string_parameter_may_be() {
     api.run(json!({"sql": "CREATE TABLE hinted (hint VARCHAR(16), value TEXT)"}))
         .await;
 
-    // One row per hint the model declares: a value of the documented form, and
-    // one that is the right shape for some OTHER hint, so a hint that was ignored
-    // would let it through.
+    // One row per hint the model declares: a value of the documented form, one that is
+    // the right shape for some OTHER hint (so a hint that was ignored would let it
+    // through), and the sentence the refusal of that string carries — the hint and the
+    // string for a value the service cannot read as that type, and the PARSER's own
+    // complaint for a document, which is what a document type's input error says.
     let cases = [
-        ("DATE", "2024-02-29", "2024-02-30"),
-        ("TIME", "23:59:59.500", "24:00:00"),
-        ("TIMESTAMP", "2024-01-31 00:00:00", "2024-01-31T00:00:00"),
-        ("DECIMAL", "-12345678901234567890.25", "12.5e3"),
-        ("JSON", r#"{"a":[1,2,null]}"#, "{a:1}"),
+        (
+            "DATE",
+            "2024-02-29",
+            "2024-02-30",
+            "Cannot parse DATE parameter: \"2024-02-30\"".to_string(),
+        ),
+        (
+            "TIME",
+            "23:59:59.500",
+            "24:00:00",
+            "Cannot parse TIME parameter: \"24:00:00\"".to_string(),
+        ),
+        (
+            "TIMESTAMP",
+            "2024-01-31 00:00:00",
+            "2024-01-31T00:00:00",
+            "Cannot parse TIMESTAMP parameter: \"2024-01-31T00:00:00\"".to_string(),
+        ),
+        (
+            "DECIMAL",
+            "-12345678901234567890.25",
+            "12.5e3",
+            "Cannot parse DECIMAL parameter: \"12.5e3\"".to_string(),
+        ),
+        (
+            "JSON",
+            r#"{"a":[1,2,null]}"#,
+            "{a:1}",
+            "invalid input syntax for type json: key must be a string at line 1 column 2"
+                .to_string(),
+        ),
         (
             "UUID",
             "4bcd3f0e-7a25-4f8c-9c3a-1b2c3d4e5f60",
             "4bcd3f0e-7a25-4f8c-9c3a",
+            "Cannot parse UUID parameter: \"4bcd3f0e-7a25-4f8c-9c3a\"".to_string(),
         ),
     ];
-    for (hint, accepted, refused) in cases {
+    for (hint, accepted, refused, expected_message) in cases {
         let inserted = api
             .run(json!({
                 "sql": "INSERT INTO hinted (hint, value) VALUES (:hint, :value)",
@@ -1892,15 +1964,15 @@ async fn a_type_hint_decides_what_a_string_parameter_may_be() {
         );
         assert_eq!(
             error_code(&body),
-            "ValidationException",
-            "case {hint} refusing {refused:?}: got {body}"
+            "DatabaseErrorException",
+            "case {hint} refusing {refused:?}: the value was SENT as that type, so\
+             failing to read it is the data plane's error, got {body}"
         );
-        assert!(
-            body["message"]
-                .as_str()
-                .is_some_and(|message| message.contains("value") && message.contains(hint)),
-            "case {hint} refusing {refused:?}: the message must name the parameter and \
-             the hint, got {body}"
+        assert_eq!(
+            body["message"],
+            json!(expected_message),
+            "case {hint} refusing {refused:?}: expected the sentence that names the \
+             failure to read it, got {body}"
         );
     }
 
@@ -1953,22 +2025,28 @@ async fn a_type_hint_decides_what_a_string_parameter_may_be() {
         "case an unmodelled hint: expected HTTP 400, got {status} {body}"
     );
 
-    // And a hint on a member that is not `stringValue` is ignored: the member
-    // already names the type, so the value goes in unchanged.
-    let inserted = api
-        .run(json!({
-            "sql": "INSERT INTO hinted (hint, value) VALUES (:hint, :value)",
-            "parameters": [
-                parameter("hint", json!({"stringValue": "long with a DATE hint"})),
-                json!({"name": "value", "value": {"longValue": 7}, "typeHint": "DATE"}),
-            ],
-        }))
-        .await;
-    assert_eq!(
-        number(&inserted, "numberOfRecordsUpdated"),
-        1,
-        "case a hint on longValue: expected 1 row inserted, got {inserted}"
-    );
+    // And a hint on a member that is not `stringValue` is ignored: the member already
+    // names the type, so the value goes in unchanged — for a value of a type, and for a
+    // NULL, which has no type to be sent as.
+    for (case, value) in [
+        ("a hint on longValue", json!({"longValue": 7})),
+        ("a hint on a NULL", json!({"isNull": true})),
+    ] {
+        let inserted = api
+            .run(json!({
+                "sql": "INSERT INTO hinted (hint, value) VALUES (:hint, :value)",
+                "parameters": [
+                    parameter("hint", json!({"stringValue": case})),
+                    json!({"name": "value", "value": value, "typeHint": "DATE"}),
+                ],
+            }))
+            .await;
+        assert_eq!(
+            number(&inserted, "numberOfRecordsUpdated"),
+            1,
+            "case {case}: expected 1 row inserted, got {inserted}"
+        );
+    }
 }
 
 /// RULE: `columnMetadata` is returned for a result set ONLY when
@@ -2023,63 +2101,10 @@ async fn column_metadata_is_returned_only_when_the_caller_asks_for_it() {
     }
 }
 
-/// RULE: a commit installs the database the transaction has been writing, so ONE
-/// database gets database-granularity last-writer-wins: of two writers on the
-/// same database, whichever finishes LAST decides what is stored — and a
-/// transaction that rolls back decides nothing, so the other writer's rows stay.
-///
-/// This is the isolation this emulator gives (stated in `src/state.rs`'s module
-/// docs and at the commit itself), weaker than the serialisation a real engine
-/// would impose, and it is asserted here rather than only commented. The rows
-/// differ along WHICH writer finishes last.
-#[tokio::test]
-async fn two_writers_on_one_database_are_last_writer_wins() {
-    for (case, commits) in [("the transaction commits", true), ("it rolls back", false)] {
-        let api = DataApi::new();
-        api.run(json!({"sql": "CREATE TABLE notes (who VARCHAR(16))"}))
-            .await;
-
-        let transaction = api.begin_transaction(None).await;
-        api.run(json!({
-            "sql": "INSERT INTO notes (who) VALUES (:who)",
-            "transactionId": transaction,
-            "parameters": [parameter("who", json!({"stringValue": "transaction"}))],
-        }))
-        .await;
-
-        // A second writer commits to the same database while the transaction is
-        // still open, so it finishes FIRST.
-        api.run(json!({
-            "sql": "INSERT INTO notes (who) VALUES (:who)",
-            "parameters": [parameter("who", json!({"stringValue": "outsider"}))],
-        }))
-        .await;
-
-        let (status, body) = if commits {
-            api.commit(&transaction).await
-        } else {
-            api.rollback(&transaction).await
-        };
-        assert_eq!(status, 200, "case {case}: finishing failed with {body}");
-
-        let after = api.run(json!({"sql": "SELECT who FROM notes"})).await;
-        let expected = if commits {
-            // The transaction finished last, so its database is what is stored.
-            json!([[{"stringValue": "transaction"}]])
-        } else {
-            // It discarded its database, so the other writer's row is all there is.
-            json!([[{"stringValue": "outsider"}]])
-        };
-        assert_eq!(
-            after["records"], expected,
-            "case {case}: expected {expected}, got {after}"
-        );
-    }
-}
-
 /// RULE: a transaction reads the committed rows it started from plus its own
-/// writes, and nobody else sees those writes until it commits — the isolation the
-/// snapshot gives, checked from both sides of the same statement sequence.
+/// writes, and nobody else sees those writes until it commits — checked from both
+/// sides of the same statement sequence. What a transaction reads once ANOTHER
+/// writer has committed is the rule `tests/all/read_committed_transactions.rs` pins.
 #[tokio::test]
 async fn a_transaction_sees_its_own_writes_and_no_one_else_sees_them() {
     let api = DataApi::new();
@@ -2089,7 +2114,9 @@ async fn a_transaction_sees_its_own_writes_and_no_one_else_sees_them() {
         "sql": "INSERT INTO ledger (id, amount) VALUES (:id, :amount)",
         "parameters": [
             parameter("id", json!({"longValue": 1})),
-            parameter("amount", json!({"stringValue": "10.00"})),
+            // An exact number is sent as one: the hint names the type the string is
+            // sent as, which is what the column takes.
+            json!({"name": "amount", "value": {"stringValue": "10.00"}, "typeHint": "DECIMAL"}),
         ],
     }))
     .await;
@@ -2111,7 +2138,7 @@ async fn a_transaction_sees_its_own_writes_and_no_one_else_sees_them() {
         "transactionId": transaction,
         "parameters": [
             parameter("id", json!({"longValue": 2})),
-            parameter("amount", json!({"stringValue": "-2.50"})),
+            json!({"name": "amount", "value": {"stringValue": "-2.50"}, "typeHint": "DECIMAL"}),
         ],
     }))
     .await;

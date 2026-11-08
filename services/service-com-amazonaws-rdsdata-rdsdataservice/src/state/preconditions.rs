@@ -128,18 +128,13 @@ const NO_USER_NAME: &str = "";
 /// access-denied diagnostic names the client address, which is this.
 const DATA_API_CLIENT_ADDRESS: &str = "127.0.0.1";
 
-/// The SQLSTATE of an invalid catalog name — a database that does not exist — from
-/// PostgreSQL's "Error Codes" appendix (class 3D).
-const SQLSTATE_INVALID_CATALOG_NAME: &str = "3D000";
-
 /// How the Data API words a database that is not there: PostgreSQL's own sentence for the
 /// condition, in the frame every error the database raises reaches the caller in — the
-/// message, then the SQLSTATE a client classifies it by.
+/// message, then the SQLSTATE a client classifies it by. Worded once, beside the other
+/// diagnostics of the database this API answers for, so a `database` member nothing holds
+/// and a statement about a database the cluster does not have say the same thing.
 fn postgresql_catalog_error(database: &str) -> String {
-    format!(
-        "ERROR: database \"{database}\" does not exist; SQLState: \
-         {SQLSTATE_INVALID_CATALOG_NAME}"
-    )
+    super::postgres::database_does_not_exist(database)
 }
 
 /// What the service tells a caller whose `transactionId` cannot be an id of the resource

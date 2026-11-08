@@ -21,15 +21,18 @@
 //!
 //! ## Transactions
 //!
-//! `BeginTransaction` snapshots the committed database into a private one
-//! ([`Database::snapshot`]); statements carrying that `transactionId` run against
-//! the snapshot, so their writes are invisible to a non-transactional reader.
-//! `CommitTransaction` installs the snapshot as the committed database and
-//! `RollbackTransaction` drops it. That gives a transaction snapshot isolation
-//! with database-granularity last-writer-wins at commit: two transactions open on
-//! ONE database at the same time do not see a conflict, where a real engine would
-//! serialise them. Everything inside one transaction, and every non-transactional
-//! statement, is the engine's own behaviour.
+//! `BeginTransaction` takes a private copy of the committed database
+//! ([`Database::snapshot`]) for the transaction to write into; statements carrying that
+//! `transactionId` run against that copy, so their writes are invisible to every other
+//! reader until they are committed. A transaction READS AT READ COMMITTED: the copy is
+//! rebuilt from the committed database, with the transaction's own writes replayed onto
+//! it ([`Transaction::rebase_onto`]), whenever another writer has committed since the
+//! transaction last ran — so a statement of it sees every row committed before it ran,
+//! alongside its own uncommitted rows. `CommitTransaction` installs that rebuilt copy as
+//! the committed database and `RollbackTransaction` drops it, so a commit adds the
+//! transaction's writes to what is committed rather than replacing it. What the replay
+//! does not reproduce is in [`Transaction::rebase_onto`]; everything inside one
+//! transaction, and every non-transactional statement, is the engine's own behaviour.
 //!
 //! ## Confining the engine
 //!
@@ -249,6 +252,17 @@ pub const MAX_CLUSTERS: usize = 16;
 pub const MAX_DATABASES_PER_CLUSTER: usize = 16;
 pub const MAX_OPEN_TRANSACTIONS: usize = 32;
 
+/// How many statements ONE open transaction may have changed its database with.
+///
+/// A transaction keeps the statements that CHANGED its database until it ends, because
+/// that is what is replayed when the committed database moves under it and what a
+/// commit installs on top of that database ([`Transaction::rebase_onto`]). So the list
+/// is a store one caller can grow by running statements, and it is capped like every
+/// other store here — above the statements a whole [`MAX_PARAMETER_SETS`] batch leaves,
+/// so a batch at ITS cap fits in a transaction, and a statement past this one is
+/// refused rather than running and then being forgotten.
+pub const MAX_TRANSACTION_WRITES: usize = 2 * MAX_PARAMETER_SETS;
+
 /// The widest fixed-point scale a value is ever formatted at. A value the engine
 /// holds is a 64-bit float, which carries ~17 significant decimal digits, so a
 /// declared scale beyond this adds no information — and a declaration like
@@ -284,6 +298,10 @@ const SCHEMA_INTROSPECTION_PRAGMAS: &[&str] = &["table_info", "table_xinfo"];
 /// (<https://sqlite.org/lang_mathfunc.html>) and the JSON functions
 /// (<https://sqlite.org/json1.html>) — every one of which computes over the
 /// values in this database, or over the clock, and nothing else.
+///
+/// The ONE function beside them is this data plane's own reader of a binary value's
+/// input format (`postgres::binary_input_reader`), which [`Database::open`] defines
+/// and the authorizer admits by that same name.
 ///
 /// DELIBERATELY ABSENT, so they are denied by the default arm: `load_extension`
 /// (the engine's own code loader), the `sqlite3` shell's file functions
@@ -455,12 +473,13 @@ pub const TRANSACTION_NOT_RUNNING_MESSAGE: &str =
     "INVALID_ARGUMENT: Transaction error: one previous call resulted in a termination of \
      your transaction";
 
-/// The `transactionStatus` a commit that installed a transaction's writes reports.
+/// The `transactionStatus` a commit reports — the one it installed a transaction's
+/// writes with, and the one a COMMIT of a transaction that a statement of its own had
+/// already failed in reports too, because what the call reports is the operation the
+/// CALLER asked for (see `CommitTransaction`, which discards those writes).
 pub const TRANSACTION_COMMITTED_STATUS: &str = "Transaction Committed";
 
-/// The `transactionStatus` a rollback reports — and what a COMMIT of a transaction one of
-/// its own statements had already failed in reports, because that commit performs a
-/// rollback (see `CommitTransaction`).
+/// The `transactionStatus` a rollback reports.
 pub const ROLLBACK_COMPLETE_STATUS: &str = "Rollback complete";
 
 /// Run one request's unit of engine work.
@@ -674,6 +693,120 @@ impl Cluster {
             transaction.abort();
         }
     }
+
+    /// Run one statement inside the transaction `transaction_id` names, against the
+    /// database that transaction READS: everything committed on its database now, plus
+    /// its own writes ([`Transaction::rebase_onto`]).
+    pub fn run_in_transaction(
+        &mut self,
+        transaction_id: &str,
+        budget: &mut RequestBudget,
+        sql: &str,
+        parameters: &[SqlParameter],
+    ) -> Result<StatementOutcome, SqlError> {
+        self.read_what_is_committed(transaction_id, budget)?;
+        let transaction = self.open_transaction_mut(transaction_id)?;
+        transaction.touch();
+        transaction.require_room_for(1)?;
+        let outcome = transaction
+            .open_database()?
+            .run_within(budget, sql, parameters)?;
+        transaction.record(sql, parameters, &outcome);
+        Ok(outcome)
+    }
+
+    /// Run one statement once per parameter set inside the transaction
+    /// `transaction_id` names, as ONE unit of work, against the same database its
+    /// single statements run against.
+    pub fn run_batch_in_transaction(
+        &mut self,
+        transaction_id: &str,
+        budget: &mut RequestBudget,
+        sql: &str,
+        parameter_sets: &[Vec<SqlParameter>],
+    ) -> Result<Vec<StatementOutcome>, SqlError> {
+        self.read_what_is_committed(transaction_id, budget)?;
+        let transaction = self.open_transaction_mut(transaction_id)?;
+        transaction.touch();
+        transaction.require_room_for(parameter_sets.len())?;
+        let outcomes = transaction
+            .open_database()?
+            .run_batch_within(budget, sql, parameter_sets)?;
+        for (parameters, outcome) in parameter_sets.iter().zip(&outcomes) {
+            transaction.record(sql, parameters, outcome);
+        }
+        Ok(outcomes)
+    }
+
+    /// Put the transaction `transaction_id` names back on top of what is COMMITTED on
+    /// its database now, where the committed database has moved since it last ran.
+    ///
+    /// This is what gives a transaction READ COMMITTED visibility: its next statement —
+    /// and the commit that installs its writes — read every row another transaction
+    /// committed in the meantime. Nothing to do for a transaction that has ended, one a
+    /// statement of its own already failed in (its writes can no longer reach the
+    /// committed database), one whose database the store no longer holds, and one whose
+    /// copy is already built from what is committed.
+    pub fn read_what_is_committed(
+        &mut self,
+        transaction_id: &str,
+        budget: &mut RequestBudget,
+    ) -> Result<(), SqlError> {
+        let Some(open) = self
+            .transactions
+            .get(transaction_id)
+            .filter(|transaction| !transaction.is_terminal() && !transaction.is_aborted())
+        else {
+            return Ok(());
+        };
+        let name = database_key(open.database.as_ref());
+        // Disjoint fields of this cluster: the committed database is read while the
+        // transaction that rebases onto it is written.
+        let Some(committed) = self.databases.get(&name) else {
+            return Ok(());
+        };
+        let Some(transaction) = self.transactions.get_mut(transaction_id) else {
+            return Ok(());
+        };
+        if transaction.reads_version(committed.version()) {
+            return Ok(());
+        }
+        transaction.rebase_onto(committed, budget)
+    }
+
+    /// Apply a statement about THIS CLUSTER'S DATABASES and report what the engine
+    /// reports for it: a statement that defines or drops a database changes no rows and
+    /// returns no result set.
+    ///
+    /// Each database of a cluster is its own engine here, so no engine behind one of
+    /// them can create or drop another; and such a statement is DDL, which the engines
+    /// behind this API apply outside any transaction block, so it is applied to the
+    /// cluster at once whether or not the call quoted a `transactionId`.
+    pub fn apply_namespace(
+        &mut self,
+        statement: &postgres::NamespaceStatement,
+    ) -> Result<StatementOutcome, SqlError> {
+        match statement {
+            postgres::NamespaceStatement::Create {
+                name,
+                if_not_exists,
+            } => {
+                if self.databases.contains_key(name) {
+                    if *if_not_exists {
+                        return Ok(StatementOutcome::nothing());
+                    }
+                    return Err(SqlError::Engine(postgres::database_already_exists(name)));
+                }
+                self.database_mut(name)?.declare();
+            }
+            postgres::NamespaceStatement::Drop { name, if_exists } => {
+                if self.databases.remove(name).is_none() && !*if_exists {
+                    return Err(SqlError::Engine(postgres::database_does_not_exist(name)));
+                }
+            }
+        }
+        Ok(StatementOutcome::nothing())
+    }
 }
 
 /// The name a request's optional `database` member selects. `""` stands for the
@@ -736,19 +869,116 @@ fn query_column(conn: &Connection, query: &str, argument: &str) -> Vec<String> {
     rows.filter_map(Result::ok).collect()
 }
 
+/// The type the schema declares for a column named `column`, when it settles ONE: the
+/// type an aggregate over that column is exact or inexact by.
+///
+/// Read from the engine's own schema, and answered only where every table that
+/// declares such a column declares it the same way — a name two tables type
+/// differently settles nothing, exactly as [`Database::declared_column`] treats one.
+fn declared_column_type(conn: &Connection, column: &str) -> Option<String> {
+    let declared = query_column(
+        conn,
+        "SELECT DISTINCT info.type FROM sqlite_master AS m JOIN pragma_table_info(m.name) AS info \
+         WHERE m.type = 'table' AND info.name = ?1 COLLATE NOCASE AND info.type <> ''",
+        column,
+    );
+    match declared.as_slice() {
+        [only] => Some(only.clone()),
+        _ => None,
+    }
+}
+
+/// The type ONE table's declaration gives one of its columns, read from the engine's
+/// own schema. `None` where the engine holds no such column, whose type nothing here
+/// decides.
+fn declared_type_in(conn: &Connection, table: &str, column: &str) -> Option<String> {
+    let Ok(mut statement) = conn.prepare(
+        "SELECT info.type FROM sqlite_master AS m JOIN pragma_table_info(m.name) AS info \
+         WHERE m.type = 'table' AND m.name = ?1 COLLATE NOCASE \
+           AND info.name = ?2 COLLATE NOCASE AND info.type <> ''",
+    ) else {
+        return None;
+    };
+    statement
+        .query_row(rusqlite::params![table, column], |row| {
+            row.get::<_, String>(0)
+        })
+        .ok()
+}
+
+/// The bytes a binary value's TEXT spells, in the input format PostgreSQL documents
+/// for `bytea`: its "hex format" — a leading `\x`, then two hexadecimal digits per
+/// byte.
+///
+/// Text in no such format is the bytes of the text itself, which is what the engine's
+/// own cast to its binary type gives, and a number is the bytes of its digits, for the
+/// same reason. Decoded by the `hex` crate, so the codec is one implementation and not
+/// a loop written here.
+fn binary_input(value: ValueRef<'_>) -> SqlValue {
+    let text = match value {
+        ValueRef::Null => return SqlValue::Null,
+        ValueRef::Blob(bytes) => return SqlValue::Blob(bytes.to_vec()),
+        ValueRef::Text(bytes) => bytes.to_vec(),
+        ValueRef::Integer(number) => number.to_string().into_bytes(),
+        ValueRef::Real(number) => number.to_string().into_bytes(),
+    };
+    let decoded = text
+        .strip_prefix(BYTEA_HEX_PREFIX)
+        .and_then(|digits| hex::decode(digits).ok());
+    SqlValue::Blob(decoded.unwrap_or(text))
+}
+
+/// What PostgreSQL's hex input format for a binary value opens with.
+const BYTEA_HEX_PREFIX: &[u8] = br"\x";
+
 /// One SQL database, run by SQLite in this process.
 #[derive(Debug)]
 pub struct Database {
     conn: Connection,
-    /// The name the declaration gave each sequence-carrying column of this
-    /// database, keyed by (table, column), both lower-cased.
+    /// What the declaration gave each sequence-carrying column of this database,
+    /// keyed by (table, column), both lower-cased.
     ///
-    /// A `serial` column is declared to the engine as the integer key it is, so
-    /// the engine assigns its values; what the engine then reports for it is
-    /// `INTEGER`, and this is what remembers that the DECLARATION said `serial`,
-    /// which is the type `columnMetadata` reports. Replaced wholesale when a
-    /// table is created and dropped with the table.
-    sequence_columns: HashMap<(String, String), String>,
+    /// A `serial` or `AUTO_INCREMENT` column is declared to the engine as the integer
+    /// key it is, so the engine assigns its values; what the engine then reports for
+    /// it is `INTEGER`, and this is what remembers what the DECLARATION said, which
+    /// decides the type `columnMetadata` reports and whether the assigned value is one
+    /// `generatedFields` carries. Replaced wholesale when a table is created and
+    /// dropped with the table.
+    sequence_columns: HashMap<(String, String), DeclaredSequence>,
+    /// The version this database's CONTENT is at: a ticket from [`next_version`],
+    /// taken afresh every time a statement changes it.
+    ///
+    /// What a transaction compares to tell whether the committed database it reads has
+    /// MOVED since it last ran — which is what READ COMMITTED needs and a counter of
+    /// this database's own would not give, because a commit replaces one `Database`
+    /// with another.
+    version: u64,
+    /// Whether a `CREATE DATABASE` brought this database into being, as opposed to a
+    /// statement that merely named it: one a caller created EXISTS even while it holds
+    /// nothing, so it is not swept away as a database naming alone created
+    /// ([`Self::is_empty`]).
+    declared: bool,
+}
+
+/// What a table's declaration said about a column whose values the ENGINE assigns.
+#[derive(Debug, Clone)]
+struct DeclaredSequence {
+    /// The catalog name of the declared type (`serial`, `int4`).
+    type_name: String,
+    /// Whether the value the engine assigns is one `generatedFields` reports.
+    reports_generated_key: bool,
+}
+
+/// A ticket from the ONE counter every change to a database here takes its version
+/// from.
+///
+/// Process-wide rather than per database, because a commit INSTALLS a transaction's own
+/// copy as the committed database: a version read from a counter the database object
+/// keeps would start again with it, and another transaction comparing versions would
+/// not see that the database it reads had moved.
+fn next_version() -> u64 {
+    static CHANGES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    CHANGES.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Database {
@@ -763,14 +993,22 @@ impl Database {
     /// A database the engine cannot be asked (a connection that has failed) is
     /// reported as NOT empty, so a sweep never discards state it could not read.
     pub fn is_empty(&self) -> bool {
-        self.conn
-            .query_row(
-                "SELECT (SELECT count(*) FROM sqlite_master) \
+        !self.declared
+            && self
+                .conn
+                .query_row(
+                    "SELECT (SELECT count(*) FROM sqlite_master) \
                       + (SELECT count(*) FROM sqlite_temp_master)",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .is_ok_and(|objects| objects == 0)
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .is_ok_and(|objects| objects == 0)
+    }
+
+    /// Record that a `CREATE DATABASE` created this database, so it is a database the
+    /// cluster HAS until a statement drops it.
+    pub fn declare(&mut self) {
+        self.declared = true;
     }
 
     /// An empty database, CONFINED before it can run anything: see the module
@@ -852,12 +1090,31 @@ impl Database {
                 .map_err(SqlError::unavailable)?;
         }
 
+        // The reader of the INPUT FORMAT a binary value is written in, defined on this
+        // connection because the format is the DATABASE's and not the engine's: a
+        // `bytea` value written as text (PostgreSQL's documented hex format, `\x` and
+        // two hexadecimal digits per byte) holds the BYTES that text spells, where the
+        // engine's own cast to its binary type would store the text's own bytes. Every
+        // cast to a binary type is rendered as a call of this (see
+        // `postgres::binary_input_reader`), so the format is decoded whatever the value
+        // turns out to be: a literal, or a value a parameter binds.
+        conn.create_scalar_function(
+            postgres::binary_input_reader(),
+            1,
+            rusqlite::functions::FunctionFlags::SQLITE_UTF8
+                | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+            |context| Ok(binary_input(context.get_raw(0))),
+        )
+        .map_err(SqlError::unavailable)?;
+
         // Default deny on every SQL action, installed LAST so the settings above
         // (which are themselves pragmas) are not refused by it.
         conn.authorizer(Some(confine_to_data_plane));
         Ok(Self {
             conn,
             sequence_columns: HashMap::new(),
+            version: next_version(),
+            declared: false,
         })
     }
 
@@ -874,9 +1131,18 @@ impl Database {
                 .run_to_completion(1024, Duration::ZERO, None)
                 .map_err(SqlError::from_engine)?;
         }
-        // The copy carries the same schema, so it carries the same declarations.
+        // The copy carries the same schema, so it carries the same declarations —
+        // and the same CONTENT, so it is at the same version as the database it was
+        // taken from.
         copy.sequence_columns = self.sequence_columns.clone();
+        copy.version = self.version;
         Ok(copy)
+    }
+
+    /// The version this database's content is at: what a transaction compares to tell
+    /// whether the committed database it reads has moved since it last ran.
+    pub fn version(&self) -> u64 {
+        self.version
     }
 
     /// The high-water mark the engine keeps for each table whose key it assigns:
@@ -982,6 +1248,11 @@ impl Database {
         drop(watchdog);
         self.conn
             .progress_handler(PROGRESS_HANDLER_OPS, None::<fn() -> bool>);
+        // A statement that CHANGED this database takes it to a new version, which is
+        // what tells a transaction reading this database that it has moved.
+        if outcome.as_ref().is_ok_and(StatementOutcome::changed_it) {
+            self.version = next_version();
+        }
         // An error the DATABASE raised reaches the caller in the words of the database
         // this API answers for, with its SQLSTATE — never in the words of whichever
         // engine ran the statement.
@@ -1078,17 +1349,31 @@ impl Database {
         // conflicting key named and only the table's own declaration holds it (see
         // `postgres::plan_upsert`).
         let plan = {
-            let keys = |table: &str| conflict_key_columns(&self.conn, table);
-            postgres::plan(sql, &keys)?
+            let catalog = postgres::Catalog {
+                key_columns: &|table: &str| conflict_key_columns(&self.conn, table),
+                column_type: &|column: &str| declared_column_type(&self.conn, column),
+            };
+            postgres::plan(sql, &catalog)?
         };
         let mut statement = self.conn.prepare(&plan.sql).map_err(SqlError::from_engine)?;
         let mut columns = self.describe(&statement, &plan);
+        // The values this statement assigns have to be values the columns it assigns
+        // them to TAKE, and the values it CASTS have to be values the types it casts
+        // them to read: the database decides both before it stores anything.
+        self.require_assignable_values(&plan, parameters)?;
+        self.require_readable_values(&plan, parameters)?;
         bind_named_parameters(&mut statement, parameters)?;
 
         let mut rows = Vec::new();
         if statement.column_count() > 0 {
             let mut cursor = statement.raw_query();
             while let Some(row) = cursor.next().map_err(SqlError::from_engine)? {
+                // The ROW's own container is charged BEFORE it is filled, as each of
+                // its values is charged before it is copied: a result set of cheap
+                // values is then bounded by what it really occupies, containers
+                // included, so a statement cannot grow this process by returning
+                // millions of empty rows.
+                budget.charge(row_bytes(columns.len()))?;
                 let mut record = Vec::with_capacity(columns.len());
                 for index in 0..columns.len() {
                     // The REQUEST's remaining bytes are charged for the value the
@@ -1139,7 +1424,10 @@ impl Database {
         for column in &plan.sequence_columns {
             self.sequence_columns.insert(
                 (column.table.clone(), column.column.clone()),
-                column.type_name.clone(),
+                DeclaredSequence {
+                    type_name: column.type_name.clone(),
+                    reports_generated_key: column.reports_generated_key,
+                },
             );
         }
         // The RESULT is shaped once the statement has been APPLIED, so a statement whose
@@ -1150,10 +1438,131 @@ impl Database {
         // — the row would be missing against this emulator and present against AWS.
         require_returnable(&columns)?;
         Ok(StatementOutcome {
+            generated_fields: self.generated_fields(&plan, changed),
             columns,
             rows,
             records_updated: changed,
         })
+    }
+
+    /// `generatedFields` for the row an insert stored: the key the ENGINE assigned to
+    /// it, read from the engine itself.
+    ///
+    /// Reported for a table whose declaration carries an identity key the engine
+    /// assigns and the API reports — MySQL's `AUTO_INCREMENT` key — and EMPTY for every
+    /// other statement and every other table, because
+    /// `ExecuteStatementResponse.generatedFields`'s own documentation says "The
+    /// generatedFields data isn't supported by Aurora PostgreSQL. To get the values of
+    /// generated fields, use the RETURNING clause": a `serial` column's assigned value
+    /// is read through RETURNING and not from this list.
+    ///
+    /// The value is the key of the LAST row the statement stored, which for an insert
+    /// of one row is the key it generated for that row.
+    fn generated_fields(&self, plan: &Plan, changed: i64) -> Vec<Field> {
+        if changed == 0 {
+            return Vec::new();
+        }
+        let Some(table) = plan.inserted_table.as_deref() else {
+            return Vec::new();
+        };
+        if !self.reports_generated_key(table) {
+            return Vec::new();
+        }
+        vec![Field::longValue(self.conn.last_insert_rowid())]
+    }
+
+    /// Whether a table declares an identity key whose assigned value `generatedFields`
+    /// reports.
+    fn reports_generated_key(&self, table: &str) -> bool {
+        let table = table.to_ascii_lowercase();
+        self.sequence_columns
+            .iter()
+            .any(|((declared_in, _), sequence)| {
+                *declared_in == table && sequence.reports_generated_key
+            })
+    }
+
+    /// Refuse a value the column the statement ASSIGNS it to does not take.
+    ///
+    /// A parameter reaches the database as a value of the type its `Field` member
+    /// names, and a `stringValue` carrying no `typeHint` is a value written as TEXT:
+    /// PostgreSQL has no implicit cast from a character type to another type, so such a
+    /// value can be assigned to a character column and to no other — and the database
+    /// says so rather than storing it. Which is what `SqlParameter$typeHint` is for:
+    /// the model documents each hint as what "the corresponding String parameter value
+    /// is sent as", so a hinted value is sent as a value of THAT type and is not text
+    /// at all. A cast the statement writes is the other way of saying it, and is not an
+    /// assignment of the parameter (see [`postgres::Plan::assigned_values`]).
+    ///
+    /// Only where the statement and the schema BOTH settle the question: a placeholder
+    /// the statement assigns directly, to a column of a table this database holds, of a
+    /// type the catalog names and that does not take a value written as text.
+    fn require_assignable_values(
+        &self,
+        plan: &Plan,
+        parameters: &[SqlParameter],
+    ) -> Result<(), SqlError> {
+        let Some(table) = plan.assigned_table.as_deref() else {
+            return Ok(());
+        };
+        for assigned in &plan.assigned_values {
+            let sent_as_text = parameters.iter().any(|parameter| {
+                parameter.name.as_deref() == Some(assigned.placeholder.as_str())
+                    && parameter.type_hint.is_none()
+                    && matches!(parameter.value.as_ref(), Some(Field::stringValue(_)))
+            });
+            if !sent_as_text {
+                continue;
+            }
+            let Some(declared) = declared_type_in(&self.conn, table, &assigned.column) else {
+                continue;
+            };
+            let pg = postgres::pg_type(&declared);
+            if !pg.takes_text {
+                return Err(SqlError::Engine(postgres::wrong_type_for_column(
+                    &assigned.column,
+                    &pg,
+                    postgres::CHARACTER_VALUE_TYPE,
+                    assigned.position,
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse a value the type the statement CASTS it to does not read.
+    ///
+    /// A cast is how a statement says which type a value written as text is, and the
+    /// type then reads that text as one of its own values or refuses it — "invalid
+    /// input syntax for type <type>" — rather than reading as much of it as it can and
+    /// storing a value the caller never wrote. The same rule the statement's own
+    /// literals are held to (`postgres::reads_text`), applied to the values the
+    /// request carries, which the statement's text does not hold.
+    fn require_readable_values(
+        &self,
+        plan: &Plan,
+        parameters: &[SqlParameter],
+    ) -> Result<(), SqlError> {
+        for (placeholder, pg) in &plan.cast_values {
+            let sent = parameters.iter().find_map(|parameter| {
+                match (parameter.name.as_deref(), parameter.value.as_ref()) {
+                    (Some(name), Some(Field::stringValue(text))) if name == placeholder => {
+                        Some(text)
+                    }
+                    _ => None,
+                }
+            });
+            let Some(text) = sent else {
+                continue;
+            };
+            if !postgres::reads_text(pg, text) {
+                return Err(SqlError::Engine(postgres::invalid_input_syntax(
+                    pg.worded_name(),
+                    text,
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// The declared shape of each column of a prepared statement's result set:
@@ -1166,6 +1575,12 @@ impl Database {
     /// gives a computed column (a cast, a literal). A column neither names is
     /// left for [`name_undeclared_types`] to name from the storage class its
     /// values arrive in.
+    ///
+    /// WHICH column of which table a result column comes from is the ENGINE's own
+    /// answer (`table_name`/`origin_name`), not a search of the schema for the label:
+    /// an ALIAS renames a result column without detaching it from the column it reads,
+    /// so the table, the declaration and the sequence are all looked up under the name
+    /// the table gave it.
     fn describe(&self, statement: &rusqlite::Statement<'_>, plan: &Plan) -> Vec<ColumnInfo> {
         let count = statement.column_count();
         statement
@@ -1178,22 +1593,32 @@ impl Database {
                 // stored in a table, so its absence means this result column is
                 // computed (an expression, an aggregate) and no table declares it.
                 let declared_type = column.decl_type().map(str::to_string);
-                let origin = declared_type
-                    .as_deref()
-                    .and_then(|declared_type| self.declared_column(&label, declared_type));
-                let (table_name, declared) = match origin {
-                    Some((table, declared)) => (table, Some(declared)),
-                    None => (None, None),
+                // WHICH column of which table this result column reads: an ALIAS
+                // renames a result column without detaching it from the column it
+                // reads, so the table, the declaration and the sequence are looked up
+                // under the name the TABLE gave it. A wildcard expands to the columns
+                // of the one table the statement reads, under their own names.
+                let (reads_from, stored_as) = match plan.result_origin(index, count) {
+                    Some(origin) => (origin.table.clone(), origin.column.clone()),
+                    None => (plan.sole_table.clone(), label.clone()),
                 };
+                // Only a column a TABLE declares has a declaration to report: the
+                // engine names a declared type for exactly those, and the schema is
+                // asked for that column of that table.
+                let declared = declared_type.as_ref().and(reads_from.as_deref()).and_then(
+                    |table| self.declared_column(table, &stored_as),
+                );
+                let table_name = declared.as_ref().and(reads_from);
                 let (pg, named_type) = match declared_type.as_deref() {
                     Some(declared_type) => {
                         // A column the engine reports as an integer may be one
                         // this database declared with a sequence, which is the
                         // type the catalog holds for it.
-                        let mut pg = match self.declared_sequence(table_name.as_deref(), &label) {
-                            Some(sequence) => postgres::pg_type(&sequence),
-                            None => postgres::pg_type(declared_type),
-                        };
+                        let mut pg =
+                            match self.declared_sequence(table_name.as_deref(), &stored_as) {
+                                Some(sequence) => postgres::pg_type(&sequence),
+                                None => postgres::pg_type(declared_type),
+                            };
                         // A refusal the STATEMENT's own text determines stands even where
                         // the table names the column's type: it is about the VALUE this
                         // statement puts in that column, not about the declaration.
@@ -1236,64 +1661,38 @@ impl Database {
     /// The type a sequence-carrying column was declared with, when the column a
     /// result set reports is one.
     ///
-    /// Keyed by the table the column is stored in, so it answers only for the
-    /// column that was declared: a result column whose table the schema cannot
-    /// name unambiguously is reported with the type the ENGINE holds for it
-    /// rather than a declaration that might belong to another table's column.
-    fn declared_sequence(&self, table: Option<&str>, label: &str) -> Option<String> {
+    /// Keyed by the table the column is stored in and the name that table gave it, so
+    /// it answers for the column that was DECLARED however the result set labels it.
+    fn declared_sequence(&self, table: Option<&str>, stored_as: &str) -> Option<String> {
         let table = table?.to_ascii_lowercase();
         self.sequence_columns
-            .get(&(table, label.to_ascii_lowercase()))
-            .cloned()
+            .get(&(table, stored_as.to_ascii_lowercase()))
+            .map(|sequence| sequence.type_name.clone())
     }
 
-    /// How this database's schema declares a column named `label` of type
-    /// `declared_type`, and the table that declares it.
-    ///
-    /// Read from the engine's own schema (`sqlite_master` joined with
-    /// `pragma_table_info`). SQLite's C API reports a result column's declared type
-    /// but not which table it came from, so the schema is searched for the
-    /// declaration: the table name is reported only when exactly one table declares
-    /// such a column, and the declaration itself only when every table that
-    /// declares it agrees — otherwise the answer is `None`, and the caller reports
-    /// the column as one a NULL is not forbidden in rather than making a guess.
-    fn declared_column(
-        &self,
-        label: &str,
-        declared_type: &str,
-    ) -> Option<(Option<String>, DeclaredColumn)> {
+    /// How one table's schema declares the column it stores as `stored_as`, read from
+    /// the engine's own schema (`pragma_table_info`). `None` for a table or a column
+    /// the engine holds no declaration for, whose nullability nothing here decides.
+    fn declared_column(&self, table: &str, stored_as: &str) -> Option<DeclaredColumn> {
         let mut statement = self
             .conn
             .prepare(
-                "SELECT m.name, info.type, info.\"notnull\", info.pk \
+                "SELECT info.type, info.\"notnull\", info.pk \
                  FROM sqlite_master AS m JOIN pragma_table_info(m.name) AS info \
                  WHERE m.type = 'table' \
-                   AND info.name = ?1 COLLATE NOCASE \
-                   AND info.type = ?2 COLLATE NOCASE",
+                   AND m.name = ?1 COLLATE NOCASE \
+                   AND info.name = ?2 COLLATE NOCASE",
             )
             .ok()?;
-        let found = statement
-            .query_map(rusqlite::params![label, declared_type], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    DeclaredColumn {
-                        type_name: row.get::<_, String>(1)?,
-                        not_null: row.get::<_, i64>(2)? != 0,
-                        primary_key: row.get::<_, i64>(3)? != 0,
-                    },
-                ))
+        statement
+            .query_row(rusqlite::params![table, stored_as], |row| {
+                Ok(DeclaredColumn {
+                    type_name: row.get::<_, String>(0)?,
+                    not_null: row.get::<_, i64>(1)? != 0,
+                    primary_key: row.get::<_, i64>(2)? != 0,
+                })
             })
-            .ok()?
-            .collect::<Result<Vec<_>, _>>()
-            .ok()?;
-        let (table, first) = found.first()?.clone();
-        let agreed = found.iter().all(|(_, candidate)| {
-            candidate.not_null == first.not_null && candidate.primary_key == first.primary_key
-        });
-        if !agreed {
-            return None;
-        }
-        Some(((found.len() == 1).then_some(table), first))
+            .ok()
     }
 }
 
@@ -1383,6 +1782,15 @@ impl Drop for Watchdog {
 ///
 /// Its copy of the database goes when it ends, so what is remembered is the id and when it
 /// ended.
+///
+/// ## What it reads
+///
+/// A transaction reads at READ COMMITTED: everything committed on its database AT THE
+/// MOMENT ITS STATEMENT RUNS, alongside its own writes. The copy it runs against is
+/// therefore rebuilt whenever the committed database has MOVED under it — a fresh copy
+/// of what is committed now, with the transaction's own writes replayed onto it
+/// ([`Self::rebase_onto`]) — which is why those writes are kept as the statements they
+/// are and not only as the rows they left behind.
 #[derive(Debug)]
 pub struct Transaction {
     /// The opaque id returned to the caller and used to find this transaction.
@@ -1395,16 +1803,30 @@ pub struct Transaction {
     /// When a call last used this transaction's id, which is what the idle timeout
     /// is measured from.
     pub last_used_at: SystemTime,
-    /// The transaction's own copy of the database, taken when it was opened: written by
-    /// its statements, installed on commit, dropped on rollback — and `None` once the
+    /// The transaction's own copy of the database: everything committed as of
+    /// [`Self::based_on`] plus [`Self::writes`], written by its statements, installed on
+    /// commit, dropped on rollback — and `None` once the
     /// transaction has ENDED, because an ended transaction has no database to write into.
     /// An ABORTED transaction still holds it: the copy is what a rollback discards.
     pending: Option<Database>,
+    /// Every statement of this transaction that CHANGED its database, in the order it
+    /// ran, with the values it bound: what is replayed onto the committed database when
+    /// that database moves, and what a commit therefore installs on top of it.
+    writes: Vec<RecordedWrite>,
+    /// The version of the committed database the copy above was built from.
+    based_on: u64,
     /// Set when a statement of this transaction failed, which is what the database
     /// ignores every further command of it for. A commit or a rollback still ends it.
     aborted: bool,
     /// When the transaction ended, and `None` while it is open or aborted.
     terminated_at: Option<SystemTime>,
+}
+
+/// One statement a transaction ran that changed its database, with the values it bound.
+#[derive(Debug, Clone)]
+struct RecordedWrite {
+    sql: String,
+    parameters: Vec<SqlParameter>,
 }
 
 impl Transaction {
@@ -1426,7 +1848,9 @@ impl Transaction {
                 "this emulator holds at most {MAX_OPEN_TRANSACTIONS} open transactions per cluster"
             )));
         }
-        let pending = cluster.database_mut(&database_key(database))?.snapshot()?;
+        let committed = cluster.database_mut(&database_key(database))?;
+        let based_on = committed.version();
+        let pending = committed.snapshot()?;
         let id = mint_transaction_id(resource_arn);
         let now = SystemTime::now();
         cluster.transactions.insert(
@@ -1440,6 +1864,8 @@ impl Transaction {
                 created_at: now,
                 last_used_at: now,
                 pending: Some(pending),
+                writes: Vec::new(),
+                based_on,
                 aborted: false,
                 terminated_at: None,
             },
@@ -1474,6 +1900,67 @@ impl Transaction {
             return Err(SqlError::Engine(postgres::transaction_aborted()));
         }
         self.pending.as_mut().ok_or(SqlError::TransactionNotFound)
+    }
+
+    /// Whether this transaction's copy was built from the committed database as it is
+    /// at `version`, so its next statement already reads everything committed.
+    fn reads_version(&self, version: u64) -> bool {
+        self.based_on == version
+    }
+
+    /// Rebuild the copy this transaction runs against from the COMMITTED database as it
+    /// is now, with this transaction's own writes replayed onto it.
+    ///
+    /// What READ COMMITTED means here: a statement of this transaction reads every row
+    /// another transaction committed before it ran, alongside the rows this transaction
+    /// has written itself and nobody else can see yet. The rows another writer committed
+    /// come from the fresh copy and this transaction's own from the replay, so both are
+    /// there.
+    ///
+    /// What the replay does NOT reproduce: a statement that read the database as it was
+    /// (`UPDATE t SET n = n + 1`, `INSERT … SELECT`) is applied again to the newer rows,
+    /// and one that read a clock or a random value gets another reading. A replayed
+    /// statement the newer rows REFUSE (a key another transaction has since committed)
+    /// fails as that statement's own failure, which terminates this transaction the way
+    /// any failed statement in it does.
+    fn rebase_onto(
+        &mut self,
+        committed: &Database,
+        budget: &mut RequestBudget,
+    ) -> Result<(), SqlError> {
+        let mut rebuilt = committed.snapshot()?;
+        for write in &self.writes {
+            rebuilt.run_within(budget, &write.sql, &write.parameters)?;
+        }
+        self.pending = Some(rebuilt);
+        self.based_on = committed.version();
+        Ok(())
+    }
+
+    /// Remember a statement of this transaction that CHANGED its database, so a later
+    /// rebase puts it back.
+    fn record(&mut self, sql: &str, parameters: &[SqlParameter], outcome: &StatementOutcome) {
+        if !outcome.changed_it() {
+            return;
+        }
+        self.writes.push(RecordedWrite {
+            sql: sql.to_string(),
+            parameters: parameters.to_vec(),
+        });
+    }
+
+    /// Refuse a transaction that is already holding [`MAX_TRANSACTION_WRITES`]
+    /// statements one more, BEFORE it runs: the statements a transaction has written are
+    /// kept until it ends (that is what a rebase replays and a commit installs), so their
+    /// number is a store one caller can grow and is capped like every other store here.
+    fn require_room_for(&self, statements: usize) -> Result<(), SqlError> {
+        if self.writes.len() + statements > MAX_TRANSACTION_WRITES {
+            return Err(SqlError::Capacity(format!(
+                "this emulator holds at most {MAX_TRANSACTION_WRITES} statements per open \
+                 transaction"
+            )));
+        }
+        Ok(())
     }
 
     /// End this transaction and hand back the database it was writing into, so the caller
@@ -1583,12 +2070,33 @@ pub struct StatementOutcome {
     /// Rows the statement inserted, updated or deleted — 0 for DDL and for a
     /// statement that only reads.
     pub records_updated: i64,
+    /// The values the engine GENERATED for the row this statement stored, as
+    /// `generatedFields` reports them (see [`Database::generated_fields`]).
+    pub generated_fields: Vec<Field>,
 }
 
 impl StatementOutcome {
+    /// What a statement that produced nothing at all did: no result set, no row
+    /// changed and no value generated — what a DDL statement answers with.
+    pub fn nothing() -> Self {
+        Self {
+            columns: Vec::new(),
+            rows: Vec::new(),
+            records_updated: 0,
+            generated_fields: Vec::new(),
+        }
+    }
+
     /// Whether the statement produced a result set (as opposed to changing rows).
     pub fn has_result_set(&self) -> bool {
         !self.columns.is_empty()
+    }
+
+    /// Whether the statement CHANGED the database it ran against: it changed rows, or
+    /// it produced no result set at all, which is what a statement that defines or
+    /// drops something does.
+    pub fn changed_it(&self) -> bool {
+        self.records_updated > 0 || !self.has_result_set()
     }
 
     /// The result set as `records`: one list of [`Field`]s per row.
@@ -1656,18 +2164,6 @@ impl StatementOutcome {
         }
         formatted.push(']');
         Ok(formatted)
-    }
-
-    /// `generatedFields` for a statement that changed rows.
-    ///
-    /// ALWAYS EMPTY: `ExecuteStatementResponse.generatedFields`'s own
-    /// documentation says "The generatedFields data isn't supported by Aurora
-    /// PostgreSQL. To get the values of generated fields, use the RETURNING
-    /// clause", and this data plane is Aurora PostgreSQL. A client that read a
-    /// generated key out of this list here would find it empty against the real
-    /// service, so the list it gets here is the list the real service returns.
-    pub fn generated_fields(&self) -> Vec<Field> {
-        Vec::new()
     }
 }
 
@@ -1815,12 +2311,18 @@ pub struct ReturnTypes {
 
 impl ReturnTypes {
     /// Read the two options off a request's `resultSetOptions`.
+    ///
+    /// Each member's values are an enum the model declares (`LongReturnType` is `LONG |
+    /// STRING`, `DecimalReturnType` is `STRING | DOUBLE_OR_LONG`), and a value outside
+    /// it never reaches here: the request walk refuses it against the model before this
+    /// operation runs (`tests/all/typed_values.rs` pins that refusal). So what is left
+    /// to read is which of the declared values the caller asked for.
     pub fn from_options(options: Option<&ResultSetOptions>) -> Self {
         let long_as_string = options
-            .and_then(|o| o.long_return_type.as_deref())
+            .and_then(|options| options.long_return_type.as_deref())
             .is_some_and(|value| value.eq_ignore_ascii_case("STRING"));
         let decimal_as_number = options
-            .and_then(|o| o.decimal_return_type.as_deref())
+            .and_then(|options| options.decimal_return_type.as_deref())
             .is_some_and(|value| value.eq_ignore_ascii_case("DOUBLE_OR_LONG"));
         Self {
             long_as_string,
@@ -1978,6 +2480,7 @@ fn confine_to_data_plane(context: AuthContext<'_>) -> Authorization {
             if PERMITTED_FUNCTIONS
                 .iter()
                 .any(|allowed| function_name.eq_ignore_ascii_case(allowed))
+                || function_name.eq_ignore_ascii_case(postgres::binary_input_reader())
             {
                 Authorization::Allow
             } else {
@@ -2180,21 +2683,45 @@ fn sql_value_for(parameter: &SqlParameter) -> Result<SqlValue, SqlError> {
 /// parameter and the accepted form, rather than silently stored under a type it
 /// is not.
 ///
+/// And the hint is what the value is SENT AS, which is not always the string the
+/// request spelled it with: a value of the hint's own type has one form, and the
+/// request's spelling of it is only one of the spellings that name it. So what reaches
+/// the column is that type's own value —
+///
+/// * a JSON document, whose members a document type holds in ITS order and not in the
+///   order a request happened to write them ([`json_document`]);
+/// * a time of day at the precision the hint's documented format carries, which is
+///   thousandths of a second ([`time_of_day`]);
+///
+/// — and the other four, whose documented format admits exactly one spelling of each
+/// value, as they were written.
+///
 /// Every one of the six is then bound as TEXT, because that is how this engine
 /// represents each of these types — it has no DATE, TIME, TIMESTAMP, DECIMAL,
 /// JSON or UUID storage class of its own — and what a later read returns is
 /// decided by the COLUMN's declared type, not by the hint (see [`field_for`]).
 fn hinted_text(name: &str, hint: &str, value: &str) -> Result<SqlValue, SqlError> {
-    let (accepted, form) = match hint.to_ascii_uppercase().as_str() {
-        "DATE" => (is_date(value), "YYYY-MM-DD"),
-        "TIME" => (is_time(value), "HH:MM:SS[.FFF]"),
-        "TIMESTAMP" => (is_timestamp(value), "YYYY-MM-DD HH:MM:SS[.FFF]"),
-        "DECIMAL" => (is_decimal(value), "a decimal number"),
-        "JSON" => (
-            serde_json::from_str::<serde_json::Value>(value).is_ok(),
-            "a JSON document",
-        ),
-        "UUID" => (uuid::Uuid::parse_str(value).is_ok(), "a UUID"),
+    let cannot_parse = |hint: &str| Err(cannot_parse_parameter(hint, value));
+    let sent: Result<String, String> = match hint.to_ascii_uppercase().as_str() {
+        "DATE" => is_date(value)
+            .then(|| value.to_string())
+            .map_or_else(|| cannot_parse("DATE"), Ok),
+        "TIME" => time_of_day(value).map_or_else(|| cannot_parse("TIME"), Ok),
+        "TIMESTAMP" => is_timestamp(value)
+            .then(|| value.to_string())
+            .map_or_else(|| cannot_parse("TIMESTAMP"), Ok),
+        "DECIMAL" => is_decimal(value)
+            .then(|| value.to_string())
+            .map_or_else(|| cannot_parse("DECIMAL"), Ok),
+        // A document is read by a PARSER, which says what is wrong with a string that
+        // is not one — the detail the type's own input error carries.
+        "JSON" => serde_json::from_str::<serde_json::Value>(value)
+            .map(|parsed| as_stored_document(&parsed).to_string())
+            .map_err(|error| invalid_json_input(&error)),
+        "UUID" => uuid::Uuid::parse_str(value)
+            .is_ok()
+            .then(|| value.to_string())
+            .map_or_else(|| cannot_parse("UUID"), Ok),
         // The model declares `TypeHint` as an enum of exactly those six, so a
         // seventh value is a request this service cannot act on rather than a
         // hint it may drop.
@@ -2205,12 +2732,76 @@ fn hinted_text(name: &str, hint: &str, value: &str) -> Result<SqlValue, SqlError
             )))
         }
     };
-    if accepted {
-        Ok(SqlValue::Text(value.to_string()))
-    } else {
-        Err(SqlError::Parameter(format!(
-            "parameter {name} carries typeHint {hint}, whose accepted format is {form}"
-        )))
+    sent.map(SqlValue::Text).map_err(SqlError::Engine)
+}
+
+/// What the service tells a caller whose hinted string it cannot read as a value of the
+/// type the hint named: the hint as the model declares it, and the string the request
+/// sent.
+///
+/// A failure to READ the value the request sent, so it is reported as the data plane's
+/// own error and not as a fault of the call's shape: the request named a type the model
+/// has and sent a string the model carries.
+fn cannot_parse_parameter(hint: &str, value: &str) -> String {
+    format!("Cannot parse {hint} parameter: \"{value}\"")
+}
+
+/// And what it tells a caller whose JSON parameter is not a document: the type the
+/// string was sent as, and what the PARSER said was wrong with it, which is the detail
+/// a document type's own input error carries.
+fn invalid_json_input(error: &serde_json::Error) -> String {
+    format!("invalid input syntax for type json: {error}")
+}
+
+/// The time of day a `TIME` parameter names, in the form the hint's documented format
+/// gives it: `HH:MM:SS`, and with the fraction at the THOUSANDTHS the format's `.FFF`
+/// carries for a value that has one, so `.5` and `.500` are the one value they both
+/// name. `None` for a string that is no time of day at all.
+///
+/// Parsed and rendered by the `time` crate, so no clock arithmetic is written here.
+fn time_of_day(value: &str) -> Option<String> {
+    if time::Time::parse(value, TIME_FORMAT).is_ok() {
+        return Some(value.to_string());
+    }
+    time::Time::parse(value, TIME_WITH_SUBSECOND_FORMAT)
+        .ok()?
+        .format(TIME_WITH_MILLISECONDS_FORMAT)
+        .ok()
+}
+
+/// The document a `JSON` parameter carries, in the form a document type holds it:
+/// every object's members IN NAME ORDER, and none of the whitespace a request wrote
+/// between them. `None` for a string that is not a JSON document.
+///
+/// A document type stores a DOCUMENT and not the text of one, so one document has one
+/// form however a request wrote it, and what a later read returns is that form — which
+/// is why a round trip through such a column answers the request's own members in the
+/// type's order rather than the request's.
+fn json_document(value: &str) -> Option<String> {
+    let parsed: serde_json::Value = serde_json::from_str(value).ok()?;
+    Some(as_stored_document(&parsed).to_string())
+}
+
+/// The same document with every object's members in the order of their names.
+///
+/// Bounded by the parse that produced the document, whose own nesting limit is what
+/// bounds this walk.
+fn as_stored_document(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(members) => {
+            let mut ordered: Vec<(&String, &serde_json::Value)> = members.iter().collect();
+            ordered.sort_by_key(|(name, _)| *name);
+            serde_json::Value::Object(
+                ordered
+                    .into_iter()
+                    .map(|(name, member)| (name.clone(), as_stored_document(member)))
+                    .collect(),
+            )
+        }
+        serde_json::Value::Array(elements) => {
+            serde_json::Value::Array(elements.iter().map(as_stored_document).collect())
+        }
+        settled => settled.clone(),
     }
 }
 
@@ -2219,14 +2810,6 @@ fn hinted_text(name: &str, hint: &str, value: &str) -> Result<SqlValue, SqlError
 /// common one). No date arithmetic is written here.
 fn is_date(value: &str) -> bool {
     time::Date::parse(value, DATE_FORMAT).is_ok()
-}
-
-/// `HH:MM:SS`, with the optional fractional second the model writes as `.FFF`,
-/// parsed by the `time` crate. Two descriptions rather than one, because it is
-/// the FRACTION the model marks optional.
-fn is_time(value: &str) -> bool {
-    time::Time::parse(value, TIME_FORMAT).is_ok()
-        || time::Time::parse(value, TIME_WITH_SUBSECOND_FORMAT).is_ok()
 }
 
 /// `YYYY-MM-DD HH:MM:SS[.FFF]`: the date and the time in one value, checked as a
@@ -2244,6 +2827,10 @@ const TIME_FORMAT: &[time::format_description::FormatItem<'static>] =
     time::macros::format_description!("[hour]:[minute]:[second]");
 const TIME_WITH_SUBSECOND_FORMAT: &[time::format_description::FormatItem<'static>] =
     time::macros::format_description!("[hour]:[minute]:[second].[subsecond digits:1+]");
+/// And the form a time of day is SENT in: the same format with the three fractional
+/// digits its `.FFF` names.
+const TIME_WITH_MILLISECONDS_FORMAT: &[time::format_description::FormatItem<'static>] =
+    time::macros::format_description!("[hour]:[minute]:[second].[subsecond digits:3]");
 const TIMESTAMP_FORMAT: &[time::format_description::FormatItem<'static>] =
     time::macros::format_description!("[year]-[month]-[day] [hour]:[minute]:[second]");
 const TIMESTAMP_WITH_SUBSECOND_FORMAT: &[time::format_description::FormatItem<'static>] =
@@ -2285,6 +2872,15 @@ pub fn field_for(
 ) -> Result<Field, SqlError> {
     Ok(match value {
         SqlValue::Null => Field::isNull(true),
+        // A non-finite number is no value of any of the union's members: `isNull` would
+        // tell the caller the value is missing and a number member cannot carry it, so
+        // the result is the one this call cannot return, in the modelled refusal's own
+        // words.
+        SqlValue::Real(number) if !number.is_finite() => {
+            return Err(SqlError::UnsupportedResult(
+                postgres::NON_FINITE_FLOAT.to_string(),
+            ))
+        }
         SqlValue::Integer(number) => {
             if column.is_boolean() {
                 Field::booleanValue(*number != 0)
@@ -2300,15 +2896,7 @@ pub fn field_for(
                         Field::doubleValue(*number as f64)
                     }
                 } else {
-                    // Built from the integer itself, not through a float, so a value
-                    // beyond a float's 53 significant bits keeps every digit. A type
-                    // that declared no scale carries each value's own, so the value
-                    // keeps the digits it has instead of being padded to a scale
-                    // nobody declared.
-                    match column.pg.declared_scale {
-                        Some(scale) => Field::stringValue(decimal_text_of_integer(*number, scale)),
-                        None => Field::stringValue(number.to_string()),
-                    }
+                    Field::stringValue(exact_integer_text(*number, column))
                 }
             } else if column.pg.class == TypeClass::Float {
                 // A float column holding a whole number is still a float.
@@ -2329,10 +2917,7 @@ pub fn field_for(
                         _ => Field::doubleValue(*number),
                     }
                 } else {
-                    match column.pg.declared_scale {
-                        Some(scale) => Field::stringValue(decimal_text(*number, scale)),
-                        None => Field::stringValue(number.to_string()),
-                    }
+                    Field::stringValue(exact_text(*number, column))
                 }
             } else {
                 Field::doubleValue(*number)
@@ -2340,6 +2925,14 @@ pub fn field_for(
         }
         SqlValue::Text(text) if column.pg.class == TypeClass::Array => {
             Field::arrayValue(array_value(text, &column.pg)?)
+        }
+        // A document column holds the DOCUMENT a value names, so what comes back is
+        // that document written out and not the text that named it.
+        SqlValue::Text(text) if column.pg.document => Field::stringValue(document_text(text)),
+        // And a date-and-time column holds an INSTANT, so what comes back is that
+        // instant in the form the database displays it.
+        SqlValue::Text(text) if column.pg.class == TypeClass::Temporal => {
+            Field::stringValue(temporal_text(text, &column.pg))
         }
         SqlValue::Text(text) => Field::stringValue(text.clone()),
         SqlValue::Blob(bytes) => Field::blobValue(bytes.clone()),
@@ -2537,6 +3130,29 @@ fn decimal_text(number: f64, scale: i32) -> String {
     format!("{number:.places$}")
 }
 
+/// An exact number the engine holds as an INTEGER, as the text an exact number is
+/// reported as.
+///
+/// Built from the integer itself, never through a float, so a value beyond a float's
+/// 53 significant bits keeps every digit. A type that declared no scale carries each
+/// value's own, so the value keeps the digits it has instead of being padded to a
+/// scale nobody declared.
+fn exact_integer_text(number: i64, column: &ColumnInfo) -> String {
+    match column.pg.declared_scale {
+        Some(scale) => decimal_text_of_integer(number, scale),
+        None => number.to_string(),
+    }
+}
+
+/// An exact number the engine holds as a REAL, as that same text: at the scale the
+/// column's declaration gave, and otherwise with the digits the value has.
+fn exact_text(number: f64, column: &ColumnInfo) -> String {
+    match column.pg.declared_scale {
+        Some(scale) => decimal_text(number, scale),
+        None => number.to_string(),
+    }
+}
+
 /// An integer held in a fixed-point column as text, at the column's declared
 /// scale. The integer is exact, so its digits are kept and the scale only decides
 /// how many zeros follow the point.
@@ -2590,24 +3206,37 @@ fn holds_an_array(elements: &[serde_json::Value]) -> bool {
 /// of the same JSON type, as it would in `records`. The `Field` union models
 /// `booleanValue` as a boolean and `blobValue` as a blob — which this protocol
 /// carries base64-encoded — so a boolean column is one of the JSON literals
-/// `true`/`false` and a binary column is its base64 text; a number is a JSON
-/// number, text and a date or time are JSON strings, a NULL is `null`, and an
-/// array column is a JSON array whose elements take the form their ELEMENT type
-/// names (see [`json_element`]).
+/// `true`/`false` and a binary column is its base64 text; an EXACT number is a JSON
+/// string, as `records` reports it, because neither form turns an exact number into a
+/// float; an inexact one is a JSON number, text and a date or time are JSON strings, a
+/// NULL is `null`, and an array column is a JSON array whose elements take the form
+/// their ELEMENT type names (see [`json_element`]).
 fn json_for(value: &SqlValue, column: &ColumnInfo) -> Result<serde_json::Value, SqlError> {
     Ok(match value {
         SqlValue::Null => serde_json::Value::Null,
+        // JSON has no form for a non-finite number, and neither has the `Field` union:
+        // such a value is the result this call cannot return, stated the way the
+        // modelled refusal states it, rather than reported as NULL, which would tell
+        // the caller the value is missing.
+        SqlValue::Real(number) if !number.is_finite() => {
+            return Err(SqlError::UnsupportedResult(
+                postgres::NON_FINITE_FLOAT.to_string(),
+            ))
+        }
         SqlValue::Integer(number) => {
             if column.is_boolean() {
                 serde_json::Value::Bool(*number != 0)
+            } else if column.is_decimal() {
+                serde_json::Value::String(exact_integer_text(*number, column))
             } else {
                 serde_json::Value::from(*number)
             }
         }
-        // JSON has no form for a non-finite number, and neither has the `Field` union:
-        // such a value is the result this call cannot return, stated the way the
-        // modelled refusal states it, rather than reported as NULL, which would tell the
-        // caller the value is missing.
+        // An exact number keeps its digits and its scale, which is what the text form
+        // is for.
+        SqlValue::Real(number) if column.is_decimal() => {
+            serde_json::Value::String(exact_text(*number, column))
+        }
         SqlValue::Real(number) => serde_json::Number::from_f64(*number)
             .map(serde_json::Value::Number)
             .ok_or_else(|| {
@@ -2629,6 +3258,12 @@ fn json_for(value: &SqlValue, column: &ColumnInfo) -> Result<serde_json::Value, 
                     .ok_or_else(|| unsupported_type(&column.pg))?,
             )
         }
+        SqlValue::Text(text) if column.pg.document => {
+            serde_json::Value::String(document_text(text))
+        }
+        SqlValue::Text(text) if column.pg.class == TypeClass::Temporal => {
+            serde_json::Value::String(temporal_text(text, &column.pg))
+        }
         SqlValue::Text(text) => serde_json::Value::String(text.clone()),
         // A blob is what the `Field` union's `blobValue` carries, and this
         // protocol carries a blob as its base64 text — so that is the text a
@@ -2644,10 +3279,9 @@ fn json_for(value: &SqlValue, column: &ColumnInfo) -> Result<serde_json::Value, 
 /// One element of an array column inside a `formatRecordsAs=JSON` result set: the
 /// JSON form the array's ELEMENT type names, read off the element the engine
 /// holds — the same element-type mapping [`array_value`] uses to choose the
-/// `ArrayValue` list an element comes back in, with the two differences JSON
-/// itself makes: an exact number is a JSON number (as a scalar one is above,
-/// where `records` follows `decimalReturnType` and writes it as text), and a NULL
-/// element has a JSON form where the union's lists have no room for one.
+/// `ArrayValue` list an element comes back in, with the one difference JSON
+/// itself makes: a NULL element has a JSON form where the union's lists have no room
+/// for one.
 ///
 /// `None` for an element whose type has no form of its own: an array of arrays,
 /// or an array of a type the `Field` union cannot carry.
@@ -2661,16 +3295,131 @@ fn json_element(element: &serde_json::Value, element_type: &PgType) -> Option<se
     match element_type.class {
         TypeClass::Boolean => boolean_element(element).map(serde_json::Value::Bool),
         TypeClass::Integer => integer_element(element).map(serde_json::Value::from),
-        // Both number classes are JSON numbers, as a scalar number of either is
-        // above; a value JSON cannot represent is refused rather than reported as
-        // something else.
-        TypeClass::Float | TypeClass::Decimal => float_element(element)
+        // An inexact number is a JSON number, as a scalar one is above; a value JSON
+        // cannot represent is refused rather than reported as something else.
+        TypeClass::Float => float_element(element)
             .and_then(serde_json::Number::from_f64)
             .map(serde_json::Value::Number),
-        TypeClass::Text | TypeClass::Temporal => {
+        // And an exact one is the text of its own digits, which is what both forms
+        // report an exact number as.
+        TypeClass::Decimal | TypeClass::Text | TypeClass::Temporal => {
             text_element(element).map(serde_json::Value::String)
         }
         TypeClass::Binary | TypeClass::Array | TypeClass::Other => None,
+    }
+}
+
+/// The document a document column holds, written out: the form [`json_document`]
+/// gives it, and the text as it is for a value that is no document at all — which the
+/// engine has no form of its own for either.
+fn document_text(text: &str) -> String {
+    json_document(text).unwrap_or_else(|| text.to_string())
+}
+
+/// The instant a date-and-time column holds, in the form the DATABASE displays that
+/// type in: `YYYY-MM-DD` for a date, `HH:MM:SS` for a time of day, the two separated
+/// by a SPACE for a timestamp — and with no zone designator, which is the zone a Data
+/// API caller does not get back.
+///
+/// A value of such a type can be WRITTEN in more forms than one (ISO 8601's `T`
+/// separator and its `Z`, an offset, a space), and what the column holds is the instant
+/// they all name rather than the spelling one caller chose; a zone the value carries is
+/// read as that zone and displayed in UTC, which is the session's. The FRACTION of a
+/// second is kept as the value carries it, because that is the precision the value was
+/// given at.
+///
+/// Parsed by the `time` crate, so no calendar or clock arithmetic is written here; text
+/// that is no date or time at all is returned as it is, which is what the engine holds.
+fn temporal_text(text: &str, pg: &PgType) -> String {
+    match pg.name.as_str() {
+        "date" => time::Date::parse(text, DATE_FORMAT)
+            .ok()
+            .and_then(|date| date.format(DATE_FORMAT).ok()),
+        "time" | "timetz" => time_text(text),
+        _ => timestamp_text(text),
+    }
+    .unwrap_or_else(|| text.to_string())
+}
+
+/// A time of day in the form the database displays it, read in either of the forms it
+/// is written in — with a fraction of a second and without.
+fn time_text(text: &str) -> Option<String> {
+    let clock = time::Time::parse(text, TIME_FORMAT)
+        .or_else(|_| time::Time::parse(text, TIME_WITH_SUBSECOND_FORMAT))
+        .ok()?;
+    let displayed = clock.format(TIME_FORMAT).ok()?;
+    Some(format!("{displayed}{}", written_fraction(text)))
+}
+
+/// A timestamp in the form the database displays it, read in any of the forms it is
+/// WRITTEN in: with the date and the time separated by a space or by ISO 8601's `T`,
+/// with or without a zone (`Z` or an offset), and with or without a fraction of a
+/// second.
+fn timestamp_text(text: &str) -> Option<String> {
+    let displayed = timestamp_instant(text)?.format(TIMESTAMP_FORMAT).ok()?;
+    Some(format!("{displayed}{}", written_fraction(text)))
+}
+
+/// The instant a timestamp's text names, with a zone it carries read as that zone and
+/// answered in the session's, which is UTC.
+fn timestamp_instant(text: &str) -> Option<time::PrimitiveDateTime> {
+    for description in TIMESTAMP_INPUT_FORMATS {
+        if let Ok(parsed) = time::PrimitiveDateTime::parse(text, description) {
+            return Some(parsed);
+        }
+    }
+    let zoned = ZONED_TIMESTAMP_INPUT_FORMATS
+        .iter()
+        .find_map(|description| time::OffsetDateTime::parse(text, description).ok())
+        .or_else(|| {
+            time::OffsetDateTime::parse(text, &time::format_description::well_known::Rfc3339).ok()
+        })?;
+    let utc = zoned.to_offset(time::UtcOffset::UTC);
+    Some(time::PrimitiveDateTime::new(utc.date(), utc.time()))
+}
+
+/// The forms a timestamp carrying NO zone is written in: the separator is a space or
+/// ISO 8601's `T`, and the fraction of a second is optional.
+const TIMESTAMP_INPUT_FORMATS: &[&[time::format_description::FormatItem<'static>]] = &[
+    TIMESTAMP_FORMAT,
+    TIMESTAMP_WITH_SUBSECOND_FORMAT,
+    time::macros::format_description!("[year]-[month]-[day]T[hour]:[minute]:[second]"),
+    time::macros::format_description!(
+        "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:1+]"
+    ),
+];
+
+/// And the forms one carrying a zone as an OFFSET is written in, which is how
+/// PostgreSQL itself displays such a value (`+00`, `+02:00`). ISO 8601's `T` form,
+/// including its `Z`, is read by the `time` crate's own well-known description.
+const ZONED_TIMESTAMP_INPUT_FORMATS: &[&[time::format_description::FormatItem<'static>]] = &[
+    time::macros::format_description!(
+        "[year]-[month]-[day] [hour]:[minute]:[second][offset_hour sign:mandatory]"
+    ),
+    time::macros::format_description!(
+        "[year]-[month]-[day] [hour]:[minute]:[second][offset_hour sign:mandatory]:[offset_minute]"
+    ),
+    time::macros::format_description!(
+        "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:1+]\
+         [offset_hour sign:mandatory]"
+    ),
+    time::macros::format_description!(
+        "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:1+]\
+         [offset_hour sign:mandatory]:[offset_minute]"
+    ),
+];
+
+/// The fraction of a second a date-and-time value's text carries, with its point, and
+/// empty for a value written without one.
+fn written_fraction(text: &str) -> String {
+    let Some((_, rest)) = text.split_once('.') else {
+        return String::new();
+    };
+    let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+    if digits.is_empty() {
+        String::new()
+    } else {
+        format!(".{digits}")
     }
 }
 
@@ -2695,6 +3444,14 @@ fn value_bytes(value: &ValueRef<'_>) -> usize {
         ValueRef::Text(bytes) | ValueRef::Blob(bytes) => bytes.len(),
     };
     payload + std::mem::size_of::<SqlValue>()
+}
+
+/// And what one ROW costs beside its values: the container the response keeps it in,
+/// and this row's own place in the list of them. Charged per row, so the ROW COUNT a
+/// statement can return is bounded by the same cap as the bytes in them — a result set
+/// of empty values cannot grow this process by its length.
+fn row_bytes(columns: usize) -> usize {
+    std::mem::size_of::<Vec<SqlValue>>() * 2 + columns * std::mem::size_of::<SqlValue>()
 }
 
 /// Give a result column whose type nothing has named — a computed column the

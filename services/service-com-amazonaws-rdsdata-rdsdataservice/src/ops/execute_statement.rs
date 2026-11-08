@@ -21,6 +21,13 @@
 //!   names the database it was opened for (`BeginTransaction` stored it), and its
 //!   statements run against that one.
 //!
+//! ## Statements about the cluster's databases
+//!
+//! `CREATE DATABASE` and `DROP DATABASE` act on the cluster's DATABASES rather than on
+//! the rows of one of them, so the cluster applies them
+//! (`crate::state::Cluster::apply_namespace`) and the database a later call names in
+//! `database` is one of them.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -317,6 +324,11 @@ fn execute(
     // prepared AND before the state lock is taken, so a request-shaped fault costs no
     // other caller anything: the statement never runs, and nothing waits on this one.
     crate::state::require_bindable_parameters(&parameters)?;
+    // How the result set is returned: both members' values are enums the model
+    // declares, and a value outside either never reaches here — the request walk
+    // refuses it against the model first.
+    let returns = crate::state::ReturnTypes::from_options(input.result_set_options.as_ref());
+    let as_json = format_as_json(input.format_records_as.as_deref());
     let mut state = store.lock();
     let cluster = state.cluster_mut(&input.resource_arn)?;
     cluster.expire_timed_out_transactions();
@@ -327,46 +339,63 @@ fn execute(
     let mut budget = crate::state::RequestBudget::new();
 
     // With a `transactionId` the statement runs inside that transaction, against
-    // its own copy of the database, so its writes stay invisible to every other
-    // reader until it commits. Without one it runs against the committed database
-    // and auto-commits — what the model's doc says an untransacted call does.
-    let outcome = match input.transaction_id.as_deref() {
-        Some(transaction_id) => {
-            let transaction = cluster.open_transaction_mut(transaction_id)?;
-            transaction.touch();
-            let ran = transaction
-                .open_database()?
-                .run_within(&mut budget, &input.sql, &parameters);
-            // "A transaction is terminated when a statement in it fails"
-            // (`BeginTransaction`'s own documentation), so a statement the ENGINE
-            // refused aborts the transaction it was part of: the database ignores every
-            // further command of it, and whatever it had written can no longer be
-            // committed — a commit of it discards those writes exactly as a rollback
-            // does.
-            if ran
-                .as_ref()
-                .err()
-                .is_some_and(crate::state::SqlError::terminates_a_transaction)
-            {
-                cluster.abort_transaction(transaction_id);
+    // the database that transaction READS: everything committed on it, plus the
+    // transaction's own writes, which stay invisible to every other reader until it
+    // commits. Without one it runs against the committed database and auto-commits —
+    // what the model's doc says an untransacted call does. A statement about the
+    // cluster's DATABASES is neither: the cluster applies it. A statement the reader
+    // cannot read at all is not one of those, so it goes to the statement path below,
+    // which refuses it in the same words AND ends the transaction it ran in.
+    let namespace = crate::state::postgres::namespace_statement(&input.sql).unwrap_or_default();
+    let outcome = match namespace {
+        Some(statement) => {
+            // A call quoting a `transactionId` is served only while that transaction is
+            // RUNNING, whatever its statement does — so the id is resolved here too;
+            // the statement itself still goes to the cluster, because the engines
+            // behind this API apply a statement about their databases outside any
+            // transaction block.
+            if let Some(transaction_id) = input.transaction_id.as_deref() {
+                cluster.open_transaction_mut(transaction_id)?.touch();
             }
-            ran?
+            cluster.apply_namespace(&statement)?
         }
-        None => cluster
-            .database_mut(&crate::state::database_key(input.database.as_ref()))?
-            .run_within(&mut budget, &input.sql, &parameters)?,
+        None => match input.transaction_id.as_deref() {
+            Some(transaction_id) => {
+                let ran = cluster.run_in_transaction(
+                    transaction_id,
+                    &mut budget,
+                    &input.sql,
+                    &parameters,
+                );
+                // "A transaction is terminated when a statement in it fails"
+                // (`BeginTransaction`'s own documentation), so a statement the ENGINE
+                // refused aborts the transaction it was part of: the database ignores
+                // every further command of it, and whatever it had written can no longer
+                // be committed — a commit of it discards those writes exactly as a
+                // rollback does.
+                if ran
+                    .as_ref()
+                    .err()
+                    .is_some_and(crate::state::SqlError::terminates_a_transaction)
+                {
+                    cluster.abort_transaction(transaction_id);
+                }
+                ran?
+            }
+            None => cluster
+                .database_mut(&crate::state::database_key(input.database.as_ref()))?
+                .run_within(&mut budget, &input.sql, &parameters)?,
+        },
     };
 
     let mut output = ExecuteStatementOutput::default();
     if outcome.has_result_set() {
         // `formattedRecords` "is only present when the formatRecordsAs parameter
         // is set to JSON", and `records` / `columnMetadata` are blank then.
-        if format_as_json(input.format_records_as.as_deref()) {
+        if as_json {
             output.formatted_records = Some(outcome.formatted_records(&mut budget)?);
         } else {
-            output.records = Some(outcome.records(crate::state::ReturnTypes::from_options(
-                input.result_set_options.as_ref(),
-            ))?);
+            output.records = Some(outcome.records(returns)?);
             if input.include_result_metadata {
                 output.column_metadata = Some(outcome.column_metadata());
             }
@@ -378,7 +407,7 @@ fn execute(
         // default instead — "a SELECT does not set it" is stated here, by not
         // setting it, rather than left to the serializer omitting a zero.
         output.number_of_records_updated = outcome.records_updated;
-        output.generated_fields = Some(outcome.generated_fields());
+        output.generated_fields = Some(outcome.generated_fields.clone());
     }
     // An access record for the data plane: who was addressed and what the engine
     // did. The statement text and the secret are NOT recorded — both carry caller
@@ -395,7 +424,9 @@ fn execute(
 }
 
 /// `formatRecordsAs=JSON`. The model's `RecordsFormatType` is `NONE | JSON`, and
-/// `NONE` — the documented default — returns the result set in `records`.
+/// `NONE` — the documented default — returns the result set in `records`; a value the
+/// enum does not declare never reaches here, because the request walk refuses it
+/// against the model first.
 fn format_as_json(format: Option<&str>) -> bool {
     format.is_some_and(|format| format.eq_ignore_ascii_case("JSON"))
 }

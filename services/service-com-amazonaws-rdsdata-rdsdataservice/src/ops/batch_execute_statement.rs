@@ -300,11 +300,20 @@ fn execute_batch(
     for parameters in &parameter_sets {
         crate::state::require_bindable_parameters(parameters)?;
     }
+    // `parameterSets` is OPTIONAL, and a call that omits it (or sends an empty list)
+    // still runs the statement: it binds nothing, so there is one execution of it and
+    // the response carries that one `UpdateResult`. A set per execution is what the
+    // response's own list is one of.
+    let runs = if parameter_sets.is_empty() {
+        vec![Vec::new()]
+    } else {
+        parameter_sets
+    };
     let mut state = store.lock();
     let cluster = state.cluster_mut(&input.resource_arn)?;
     cluster.expire_timed_out_transactions();
 
-    // Exactly one `UpdateResult` per parameter set, in the order the sets arrived:
+    // Exactly one `UpdateResult` per execution, in the order the sets arrived:
     // the statement is run once per set against the same database, so N sets of an
     // INSERT leave N rows behind — and a set that FAILS refuses the whole batch,
     // leaving none of them behind. ONE budget covers the whole batch — one deadline
@@ -313,37 +322,51 @@ fn execute_batch(
     // statement gets.
     let mut budget = crate::state::RequestBudget::new();
 
-    // A `transactionId` runs the batch inside that transaction, against its own
-    // copy of the database; without one the batch runs against the committed
-    // database and auto-commits.
-    let outcomes = match input.transaction_id.as_deref() {
-        Some(transaction_id) => {
-            let transaction = cluster.open_transaction_mut(transaction_id)?;
-            transaction.touch();
-            let ran = transaction.open_database()?.run_batch_within(
-                &mut budget,
-                &input.sql,
-                &parameter_sets,
-            );
-            // A statement of the batch that the engine refused aborts the transaction it
-            // ran in, exactly as a single statement does.
-            if ran
-                .as_ref()
-                .err()
-                .is_some_and(crate::state::SqlError::terminates_a_transaction)
-            {
-                cluster.abort_transaction(transaction_id);
+    // A `transactionId` runs the batch inside that transaction, against the database
+    // that transaction reads; without one the batch runs against the committed
+    // database and auto-commits. A statement about the cluster's DATABASES is applied
+    // by the cluster, once per execution like every other statement of a batch; one the
+    // reader cannot read at all goes to the statement path, which refuses it in the same
+    // words and ends the transaction it ran in.
+    let namespace = crate::state::postgres::namespace_statement(&input.sql).unwrap_or_default();
+    let outcomes = match namespace {
+        Some(statement) => {
+            // A call quoting a `transactionId` is served only while that transaction is
+            // RUNNING, whatever its statement does; the statement itself still goes to
+            // the cluster, which applies it outside any transaction block.
+            if let Some(transaction_id) = input.transaction_id.as_deref() {
+                cluster.open_transaction_mut(transaction_id)?.touch();
             }
-            ran?
+            let mut outcomes = Vec::with_capacity(runs.len());
+            for _ in &runs {
+                outcomes.push(cluster.apply_namespace(&statement)?);
+            }
+            outcomes
         }
-        None => cluster
-            .database_mut(&crate::state::database_key(input.database.as_ref()))?
-            .run_batch_within(&mut budget, &input.sql, &parameter_sets)?,
+        None => match input.transaction_id.as_deref() {
+            Some(transaction_id) => {
+                let ran =
+                    cluster.run_batch_in_transaction(transaction_id, &mut budget, &input.sql, &runs);
+                // A statement of the batch that the engine refused aborts the transaction it
+                // ran in, exactly as a single statement does.
+                if ran
+                    .as_ref()
+                    .err()
+                    .is_some_and(crate::state::SqlError::terminates_a_transaction)
+                {
+                    cluster.abort_transaction(transaction_id);
+                }
+                ran?
+            }
+            None => cluster
+                .database_mut(&crate::state::database_key(input.database.as_ref()))?
+                .run_batch_within(&mut budget, &input.sql, &runs)?,
+        },
     };
     let update_results = outcomes
         .iter()
         .map(|outcome| UpdateResult {
-            generated_fields: Some(outcome.generated_fields()),
+            generated_fields: Some(outcome.generated_fields.clone()),
         })
         .collect::<Vec<_>>();
     // An access record for the data plane: who was addressed and how much the

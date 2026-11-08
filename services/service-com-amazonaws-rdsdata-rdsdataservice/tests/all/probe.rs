@@ -238,7 +238,9 @@ async fn column_metadata_reports_the_postgresql_catalog() {
             type_name: "time",
             jdbc_type: 92,
             precision: 15,
-            scale: 0,
+            // Every date-and-time type that carries a TIME resolves to one
+            // microsecond, which is the scale it reports.
+            scale: 6,
             signed: false,
             case_sensitive: false,
         },
@@ -249,18 +251,23 @@ async fn column_metadata_reports_the_postgresql_catalog() {
             type_name: "timestamp",
             jdbc_type: 93,
             precision: 29,
-            scale: 0,
+            scale: 6,
             signed: false,
             case_sensitive: false,
         },
         Case {
             declared: "TIMESTAMP WITH TIME ZONE",
             bound: json!({"stringValue": "2024-02-29 23:59:59+00"}),
-            expected: json!({"stringValue": "2024-02-29 23:59:59+00"}),
+            // A zone-aware timestamp is displayed in the session's zone and with no
+            // zone designator, which is the zone a Data API caller does not get back.
+            expected: json!({"stringValue": "2024-02-29 23:59:59"}),
             type_name: "timestamptz",
-            jdbc_type: 93,
+            // `java.sql.Types` has no constant for a timestamp carrying a time zone,
+            // so the catalog reports the code for a type it does not name, and the
+            // microsecond resolution PostgreSQL documents for the type as its scale.
+            jdbc_type: 1111,
             precision: 35,
-            scale: 0,
+            scale: 6,
             signed: false,
             case_sensitive: false,
         },
@@ -341,7 +348,14 @@ async fn column_metadata_reports_the_postgresql_catalog() {
         }))
         .await;
         api.run(json!({
-            "sql": "INSERT INTO probe (value) VALUES (:value)",
+            // A value written as TEXT reaches a column of another type through a CAST
+            // the statement writes (a `typeHint` is the other way of saying it), so
+            // every case binds through one and what the case is about stays the
+            // column's own declared type.
+            "sql": format!(
+                "INSERT INTO probe (value) VALUES (CAST(:value AS {}))",
+                case.declared
+            ),
             "parameters": [parameter("value", case.bound.clone())],
         }))
         .await;
@@ -988,7 +1002,9 @@ async fn the_array_reader_refuses_what_is_not_an_array() {
     ];
     for (case, stored, expected) in cases {
         api.run(json!({
-            "sql": "INSERT INTO stored (label, tags) VALUES (:label, :tags)",
+            // The array column takes the text through the cast the statement writes:
+            // a character value reaches a column of another type that way.
+            "sql": "INSERT INTO stored (label, tags) VALUES (:label, CAST(:tags AS text[]))",
             "parameters": [
                 parameter("label", json!({"stringValue": case})),
                 parameter("tags", json!({"stringValue": stored})),
@@ -1028,14 +1044,16 @@ async fn the_array_reader_refuses_what_is_not_an_array() {
 /// RULE: a statement is bounded by how many levels it asks the data plane to
 /// chain, as well as by how deeply it nests: a combined query and an operator
 /// chain are parsed iteratively, so their depth grows with the request text,
-/// while the tree they build is walked and dropped by recursion. A statement past
-/// either bound is refused with HTTP 400, and the data plane serves the next
-/// request.
+/// while the tree they build is walked and dropped by recursion. The bound is therefore
+/// decided on the statement's TOKENS, before it is parsed at all; a statement past
+/// either bound is refused with HTTP 400 on every operation that takes one, and the
+/// data plane serves the next request.
 ///
 /// The rows differ along WHICH chain the statement grows — the queries it
 /// combines, the conditions it ands, the values it concatenates — each one far
 /// past what a client writes, and each paired with a statement of the same shape
-/// that is inside the bound and runs.
+/// that is inside the bound and runs; the last row fills the largest `sql` the model
+/// carries (65,536 bytes), which is the most tree one call could ask for.
 #[tokio::test]
 async fn a_statement_is_bounded_by_the_levels_it_chains() {
     let api = DataApi::new();
@@ -1066,6 +1084,12 @@ async fn a_statement_is_bounded_by_the_levels_it_chains() {
             format!("SELECT 'a'{} AS cast_over", "::text".repeat(8)),
             format!("SELECT 'a'{} AS cast_over", "::text".repeat(2_000)),
         ),
+        (
+            // 4 bytes per level, so this fills the model's own `sql` ceiling.
+            "numbers added to the largest sql the model carries",
+            format!("SELECT 1{} AS total", " + 1".repeat(8)),
+            format!("SELECT 1{} AS total", " + 1".repeat(16_000)),
+        ),
     ] {
         let (status, body) = api.execute(json!({"sql": inside})).await;
         assert_eq!(
@@ -1073,12 +1097,22 @@ async fn a_statement_is_bounded_by_the_levels_it_chains() {
             "case {case} inside the bound: got {status} {body}"
         );
 
-        let (status, body) = api.execute(json!({"sql": past})).await;
+        // On both operations that take a statement: the bound is the statement's, not
+        // one operation's.
+        let (status, body) = api.execute(json!({"sql": past.clone()})).await;
         assert_eq!(status, 400, "case {case} past the bound: got {status} {body}");
         assert_eq!(
             error_code(&body),
             "ValidationException",
             "case {case} past the bound: got {body}"
+        );
+        let (status, body) = api
+            .batch(json!({"sql": past, "parameterSets": [[]]}))
+            .await;
+        assert_eq!(
+            (status, error_code(&body)),
+            (400, "ValidationException"),
+            "case {case} past the bound as a batch: got {status} {body}"
         );
 
         // The data plane is still there, which is the point of the bound.
