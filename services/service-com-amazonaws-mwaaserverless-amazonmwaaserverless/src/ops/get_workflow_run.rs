@@ -237,7 +237,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The ONE write a read may make: the transitions the clock already owed.
         run.settle(now);
 
-        Ok(GetWorkflowRunOutput {
+        // The output those transitions produced, exported below once this store's guard
+        // is released (`crate::state::run_logs`).
+        let exported = run.take_pending_log_lines();
+
+        let reported = GetWorkflowRunOutput {
             workflow_arn: Some(run.workflow_arn.clone()),
             workflow_version: Some(run.workflow_version.clone()),
             run_id: Some(run.run_id.clone()),
@@ -270,7 +274,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
                 run_state: Some(run.status.clone()),
             }),
-        })
+        };
+
+        // Delivered with NO store of this service held, so the two services' stores are
+        // never locked at once.
+        drop(store);
+        crate::state::run_logs::publish(&*self.engine, &region, exported);
+        Ok(reported)
     }
 }
 

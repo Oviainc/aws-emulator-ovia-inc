@@ -258,6 +258,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // removal — and its deadline — exactly where it was.
         let already_deleting = workflow.is_deleting();
 
+        let mut exported = Vec::new();
         if !already_deleting {
             let workflow = store.workflow_in_mut(&region, &arn).ok_or_else(|| {
                 DeleteWorkflowErrorModeled::InternalServerException(InternalServerException {
@@ -302,7 +303,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     workflow.modified_at = now;
                 }
             }
+            // What the executions this cleanup stopped produced on their way out,
+            // exported below once this store's guard is released
+            // (`crate::state::run_logs`).
+            exported = workflow.take_pending_log_lines();
         }
+
+        // Delivered with NO store of this service held, so the two services' stores are
+        // never locked at once.
+        drop(store);
+        crate::state::run_logs::publish(&*self.engine, &region, exported);
 
         Ok(DeleteWorkflowOutput {
             workflow_arn: arn,

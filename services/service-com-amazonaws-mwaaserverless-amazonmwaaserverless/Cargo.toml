@@ -34,6 +34,15 @@ aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", 
 # implementation the other services that read caller-supplied YAML use; YAML 1.2 is a
 # superset of JSON, so one reader covers both spellings of a definition.
 yaml-rust2 = { version = "0.10", default-features = false }
+# The CloudWatch Logs store a run's execution output is exported to (`state::run_logs`):
+# a workflow's `LoggingConfiguration` names the log group its runs' logs are stored in, so
+# the group, its streams and their events have to exist in the very store CloudWatch Logs'
+# own `DescribeLogStreams` / `GetLogEvents` read.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
+# `cloudwatch_logs` — the tree's one reading of what a caller-supplied CloudWatch Logs log
+# group NAME may be, which is what `LoggingConfiguration.LogGroupName` has to satisfy to
+# name a group this service can export a run's output to.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

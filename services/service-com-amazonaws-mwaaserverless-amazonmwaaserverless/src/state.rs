@@ -38,6 +38,11 @@
 //! is caller-driven data held per version, and is capped at
 //! [`workflow_definition::MAX_DEFINITION_BYTES`] before a byte of the object is
 //! buffered, so the versions x content product is finite too.
+//! A run's `pending_log_lines` — the output it owes the log group its workflow configured
+//! ([`run_logs`]) — is not caller-driven growth either: a line exists because a transition
+//! of that run was materialised, so the queue holds at most the lines one execution
+//! produces, which [`run_logs::MAX_PENDING_LOG_LINES`] caps, and the call that produced
+//! them empties it.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::LazyLock;
@@ -62,6 +67,10 @@ pub mod workflow_definition;
 
 /// The task graph a run executes, built from the definition its version froze.
 pub mod workflow_execution;
+
+/// Exporting a run's own execution output to the CloudWatch Logs log group its
+/// workflow's `LoggingConfiguration` names.
+pub mod run_logs;
 
 /// The region used in minted ARNs when the request carries no usable SigV4
 /// credential scope. Every generated emulator defaults to `us-east-1`.
@@ -315,6 +324,20 @@ impl WorkflowVersionRecord {
     }
 }
 
+/// The CloudWatch Logs log group a version's configuration names as the destination of
+/// its runs' output, and `None` for a version that configures no logging.
+///
+/// It is `LoggingConfiguration.LogGroupName`, "the name of the CloudWatch log group where
+/// workflow execution logs are stored" — the one place the destination is read out of a
+/// snapshot, so a run that was started and a run a trigger fired export to the same group.
+pub fn configured_log_group(snapshot: &WorkflowSnapshot) -> Option<String> {
+    snapshot
+        .logging_configuration
+        .as_ref()
+        .map(|configuration| configuration.log_group_name.clone())
+        .filter(|name| !name.is_empty())
+}
+
 /// A run started under a workflow.
 #[derive(Debug, Clone)]
 pub struct WorkflowRun {
@@ -347,6 +370,19 @@ pub struct WorkflowRun {
     /// The instant the clock owes this run's NEXT status change. Stored, never
     /// slept on, and advanced by [`WorkflowRun::settle`] as each change lands.
     pub next_status_at: SystemTime,
+    /// Where this run's execution output is EXPORTED to: the CloudWatch Logs log
+    /// group named by the `LoggingConfiguration` of the version it runs, frozen when
+    /// the run was recorded the way its execution plan is ([`run_logs`]). `None` for
+    /// a run whose version configures no logging: nothing documents a destination for
+    /// its output, so none is exported and its task instances name no `LogStream`.
+    pub log_group_name: Option<String>,
+    /// The lines this run has produced and not yet delivered to that group. Filled as
+    /// each transition is materialised and emptied by the call that materialised it,
+    /// once that call has released this store ([`WorkflowRun::take_pending_log_lines`],
+    /// [`run_logs::publish`]), so this service's store and CloudWatch Logs' are never
+    /// locked at once. Bounded by [`run_logs::MAX_PENDING_LOG_LINES`], which holds
+    /// every line one run's whole execution can produce.
+    pub pending_log_lines: Vec<run_logs::LogLine>,
     /// Where this run falls in the store's creation order: the value of the
     /// monotonic mint counter ([`ComAmazonawsMwaaserverlessAmazonmwaaserverlessState::mint_seq`])
     /// at the moment the run was recorded. It breaks a tie between two runs the
@@ -418,6 +454,11 @@ impl WorkflowRun {
     /// A terminal status is never left: the loop stops at any status no
     /// transition is owed from, which is what makes a settled run stable across
     /// reads.
+    ///
+    /// Every status change it applies, and every task instance it starts or ends, is
+    /// also a line the run owes the log group its workflow configured, queued here as
+    /// the change is made ([`run_logs`]): the output a run produces is produced by the
+    /// execution being materialised, so the two cannot come apart.
     pub fn settle(&mut self, now: SystemTime) -> bool {
         let mut changed = false;
         while now >= self.next_status_at {
@@ -427,6 +468,7 @@ impl WorkflowRun {
                     self.status = RUN_STATUS_QUEUED.to_string();
                     self.modified_at = due;
                     self.next_status_at = due + RUN_DEQUEUED_AFTER;
+                    self.log_status_reached(due);
                 }
                 RUN_STATUS_QUEUED => {
                     self.modified_at = due;
@@ -435,9 +477,11 @@ impl WorkflowRun {
                             self.status = RUN_STATUS_FAILED.to_string();
                             self.complete_at(due);
                             self.error_message = Some(reason);
+                            self.log_status_reached(due);
                         }
                         None => {
                             self.status = RUN_STATUS_RUNNING.to_string();
+                            self.log_status_reached(due);
                             self.start_declared_tasks(due);
                             self.next_status_at = due + TASK_LEVEL_RUNS_FOR;
                         }
@@ -448,6 +492,7 @@ impl WorkflowRun {
                     if self.advance_declared_tasks(due) {
                         self.status = RUN_STATUS_SUCCESS.to_string();
                         self.complete_at(due);
+                        self.log_status_reached(due);
                     } else {
                         self.next_status_at = due + TASK_LEVEL_RUNS_FOR;
                     }
@@ -457,6 +502,7 @@ impl WorkflowRun {
                     self.modified_at = due;
                     self.complete_at(due);
                     self.cancel_unfinished_tasks(due);
+                    self.log_status_reached(due);
                 }
                 // Terminal, or a status whose exit no clock owes.
                 _ => break,
@@ -464,6 +510,75 @@ impl WorkflowRun {
             changed = true;
         }
         changed
+    }
+
+    /// Queue one line for the stream `stream` at `at`, when this run has a log group to
+    /// export to ([`Self::log_group_name`]) and has not already queued every line one
+    /// run can owe ([`run_logs::MAX_PENDING_LOG_LINES`]).
+    fn queue_log_line(&mut self, stream: String, at: SystemTime, message: String) {
+        let Some(log_group) = self.log_group_name.clone() else {
+            return;
+        };
+        if self.pending_log_lines.len() >= run_logs::MAX_PENDING_LOG_LINES {
+            return;
+        }
+        self.pending_log_lines.push(run_logs::LogLine {
+            log_group,
+            log_stream: stream,
+            at,
+            message,
+        });
+    }
+
+    /// Take the lines this run owes its log group, leaving none behind: what the
+    /// calling handler delivers once it has released this store
+    /// ([`run_logs::publish`]).
+    pub fn take_pending_log_lines(&mut self) -> Vec<run_logs::LogLine> {
+        ::std::mem::take(&mut self.pending_log_lines)
+    }
+
+    /// Queue the line this run's own stream owes for having been ADMITTED, dated from
+    /// the instant it was created.
+    ///
+    /// Called by each of the two places a run enters the store — a caller's
+    /// `StartWorkflowRun` and a workflow's own trigger
+    /// ([`ComAmazonawsMwaaserverlessAmazonmwaaserverlessState::fire_due_scheduled_runs`])
+    /// — so a run nothing started exports nothing.
+    pub fn log_admitted(&mut self) {
+        let stream = run_logs::run_log_stream(&self.run_id);
+        let message = format!(
+            "Workflow run {} of workflow {} version {} was accepted as a {} run.",
+            self.run_id, self.workflow_arn, self.workflow_version, self.run_type
+        );
+        let at = self.created_at;
+        self.queue_log_line(stream, at, message);
+    }
+
+    /// Queue the line this run's own stream owes for the status it has JUST reached:
+    /// the status itself while the run is still on its way somewhere, and the outcome
+    /// it finished with — the span it occupied and, for a run that failed, the reason
+    /// it reports — once it has reached a status it never leaves.
+    fn log_status_reached(&mut self, at: SystemTime) {
+        let stream = run_logs::run_log_stream(&self.run_id);
+        if !self.is_terminal() {
+            let message = format!(
+                "Workflow run {} entered status {}.",
+                self.run_id, self.status
+            );
+            self.queue_log_line(stream, at, message);
+            return;
+        }
+        let message = format!(
+            "Workflow run {} finished with status {} after {} seconds.",
+            self.run_id,
+            self.status,
+            self.duration.unwrap_or_default()
+        );
+        self.queue_log_line(stream.clone(), at, message);
+        if let Some(reason) = self.error_message.clone() {
+            let message = format!("Workflow run {} failed: {reason}", self.run_id);
+            self.queue_log_line(stream, at, message);
+        }
     }
 
     /// Record this run as COMPLETE at `at`: the completion instant and the duration
@@ -480,33 +595,56 @@ impl WorkflowRun {
     ///
     /// An instance already stored under a planned identifier is left alone, so this
     /// writes each instance once however often the clock is advanced.
+    ///
+    /// An instance that STARTS here names the log stream its attempt writes to
+    /// ([`run_logs::task_log_stream`]) and owes that stream the line saying it started;
+    /// one that is still waiting names none, because no execution of it has written
+    /// anything yet — `LogStream` is "the CloudWatch log stream name for this task
+    /// instance execution".
     fn start_declared_tasks(&mut self, at: SystemTime) {
+        let run_id = self.run_id.clone();
+        let exporting = self.log_group_name.is_some();
+        // The lines the instances started here owe, collected while the plan is
+        // borrowed and queued once it is not.
+        let mut lines: Vec<(String, String)> = Vec::new();
         for task in &self.execution.tasks {
+            if self.task_instances.contains_key(&task.task_instance_id) {
+                continue;
+            }
             let running = task.level == 0;
+            // The run executes a declared task once, so its instance is the first
+            // attempt at it.
+            let attempt_number = FIRST_ATTEMPT_NUMBER;
+            let log_stream = (running && exporting)
+                .then(|| run_logs::task_log_stream(&run_id, &task.task_instance_id, attempt_number));
+            let instance = TaskInstance {
+                task_instance_id: task.task_instance_id.clone(),
+                task_id: Some(task.task_id.clone()),
+                status: if running {
+                    TASK_INSTANCE_STATUS_RUNNING.to_string()
+                } else {
+                    TASK_INSTANCE_STATUS_SCHEDULED.to_string()
+                },
+                operator_name: task.operator_name.clone(),
+                attempt_number: Some(attempt_number),
+                started_at: running.then_some(at),
+                ended_at: None,
+                modified_at: at,
+                error_message: None,
+                // The stream this attempt's output goes to, for an attempt that has
+                // started; nothing ran an operator that could push a value to another
+                // task.
+                log_stream: log_stream.clone(),
+                xcom: BTreeMap::new(),
+            };
+            if let Some(stream) = log_stream {
+                lines.push((stream, task_started_message(&instance)));
+            }
             self.task_instances
-                .entry(task.task_instance_id.clone())
-                .or_insert_with(|| TaskInstance {
-                    task_instance_id: task.task_instance_id.clone(),
-                    task_id: Some(task.task_id.clone()),
-                    status: if running {
-                        TASK_INSTANCE_STATUS_RUNNING.to_string()
-                    } else {
-                        TASK_INSTANCE_STATUS_SCHEDULED.to_string()
-                    },
-                    operator_name: task.operator_name.clone(),
-                    // The run executes a declared task once, so its instance is the
-                    // first attempt at it.
-                    attempt_number: Some(1),
-                    started_at: running.then_some(at),
-                    ended_at: None,
-                    modified_at: at,
-                    error_message: None,
-                    // Nothing in this process writes a task's log events, so the
-                    // instance names no log stream, and nothing ran an operator that
-                    // could push a value to another task.
-                    log_stream: None,
-                    xcom: BTreeMap::new(),
-                });
+                .insert(task.task_instance_id.clone(), instance);
+        }
+        for (stream, message) in lines {
+            self.queue_log_line(stream, at, message);
         }
     }
 
@@ -515,19 +653,32 @@ impl WorkflowRun {
     ///
     /// Reports whether the execution is now COMPLETE — no level was left to start, which
     /// is also the answer for a run whose definition declared no task at all.
+    ///
+    /// Each attempt that ends owes its own stream the outcome it ended with, and each
+    /// attempt that starts names the stream it writes to and owes it the line saying so
+    /// ([`Self::start_declared_tasks`]).
     fn advance_declared_tasks(&mut self, at: SystemTime) -> bool {
         let Some(level) = self.running_level() else {
             return true;
         };
+        let run_id = self.run_id.clone();
+        let exporting = self.log_group_name.is_some();
+        let mut lines: Vec<(String, String)> = Vec::new();
         for id in self.task_instance_ids_at(level) {
             if let Some(instance) = self.task_instances.get_mut(&id) {
                 instance.status = TASK_INSTANCE_STATUS_SUCCESS.to_string();
                 instance.ended_at = Some(at);
                 instance.modified_at = at;
+                if let Some(stream) = instance.log_stream.clone() {
+                    lines.push((stream, task_finished_message(instance)));
+                }
             }
         }
         let next = self.task_instance_ids_at(level + 1);
         if next.is_empty() {
+            for (stream, message) in lines {
+                self.queue_log_line(stream, at, message);
+            }
             return true;
         }
         for id in next {
@@ -535,7 +686,15 @@ impl WorkflowRun {
                 instance.status = TASK_INSTANCE_STATUS_RUNNING.to_string();
                 instance.started_at = Some(at);
                 instance.modified_at = at;
+                let stream = exporting.then(|| task_log_stream_of(&run_id, instance));
+                instance.log_stream = stream.clone();
+                if let Some(stream) = stream {
+                    lines.push((stream, task_started_message(instance)));
+                }
             }
+        }
+        for (stream, message) in lines {
+            self.queue_log_line(stream, at, message);
         }
         false
     }
@@ -568,8 +727,11 @@ impl WorkflowRun {
     /// shutdown reached it ran to neither success nor failure.
     ///
     /// Only the two statuses this emulator's own execution assigns are ended, so an
-    /// instance that had already finished keeps the outcome it finished with.
+    /// instance that had already finished keeps the outcome it finished with. An
+    /// instance whose attempt had STARTED owes the stream it was writing to the line
+    /// saying how it ended; one that never started wrote nothing and names no stream.
     fn cancel_unfinished_tasks(&mut self, at: SystemTime) {
+        let mut lines: Vec<(String, String)> = Vec::new();
         for instance in self.task_instances.values_mut() {
             if instance.status != TASK_INSTANCE_STATUS_RUNNING
                 && instance.status != TASK_INSTANCE_STATUS_SCHEDULED
@@ -579,6 +741,12 @@ impl WorkflowRun {
             instance.status = TASK_INSTANCE_STATUS_CANCELLED.to_string();
             instance.ended_at = instance.started_at.map(|_| at);
             instance.modified_at = at;
+            if let Some(stream) = instance.log_stream.clone() {
+                lines.push((stream, task_finished_message(instance)));
+            }
+        }
+        for (stream, message) in lines {
+            self.queue_log_line(stream, at, message);
         }
     }
 
@@ -605,8 +773,59 @@ impl WorkflowRun {
         self.status = RUN_STATUS_STOPPING.to_string();
         self.modified_at = now;
         self.next_status_at = now + RUN_STOPPED_AFTER;
+        self.log_status_reached(now);
         true
     }
+}
+
+/// The line a task instance's own stream owes for the attempt that has just STARTED: the
+/// status the instance entered, and the operator the definition declared for it when it
+/// declared one this service can report.
+///
+/// The line states the TRANSITION that was materialised and nothing beyond it: no worker
+/// ran the task and no operator was executed here (`workflow_execution`), so the text
+/// claims neither.
+fn task_started_message(instance: &TaskInstance) -> String {
+    let task_id = instance
+        .task_id
+        .as_deref()
+        .unwrap_or(&instance.task_instance_id);
+    let attempt = instance.attempt_number.unwrap_or(FIRST_ATTEMPT_NUMBER);
+    let status = &instance.status;
+    match instance.operator_name.as_deref() {
+        Some(operator) => format!(
+            "Task {task_id} attempt {attempt} entered status {status}, declared operator \
+             {operator}."
+        ),
+        None => format!("Task {task_id} attempt {attempt} entered status {status}."),
+    }
+}
+
+/// The line a task instance's own stream owes for the attempt that has just ENDED: the
+/// status it ended in, and the span it occupied for an attempt that had started.
+fn task_finished_message(instance: &TaskInstance) -> String {
+    let task_id = instance
+        .task_id
+        .as_deref()
+        .unwrap_or(&instance.task_instance_id);
+    let attempt = instance.attempt_number.unwrap_or(FIRST_ATTEMPT_NUMBER);
+    let status = &instance.status;
+    match instance.duration_in_seconds() {
+        Some(seconds) => format!(
+            "Task {task_id} attempt {attempt} entered status {status} after {seconds} seconds."
+        ),
+        None => format!("Task {task_id} attempt {attempt} entered status {status}."),
+    }
+}
+
+/// The stream one task instance's attempt writes to, as the run that holds it names it
+/// ([`run_logs::task_log_stream`]).
+fn task_log_stream_of(run_id: &str, instance: &TaskInstance) -> String {
+    run_logs::task_log_stream(
+        run_id,
+        &instance.task_instance_id,
+        instance.attempt_number.unwrap_or(FIRST_ATTEMPT_NUMBER),
+    )
 }
 
 /// One task instance of a run: the record of a single task of the workflow
@@ -660,6 +879,11 @@ impl TaskInstance {
         ))
     }
 }
+
+/// Which attempt an instance is when it names no attempt number: a run executes a
+/// declared task once, so the instances this service's own execution records are all the
+/// first attempt at their task.
+pub const FIRST_ATTEMPT_NUMBER: i32 = 1;
 
 /// The `TaskInstanceStatus` values this service's execution assigns, as the model
 /// spells them (`smithy_query(query="shape", shape="TaskInstanceStatus")`).
@@ -874,6 +1098,17 @@ impl Workflow {
             }
         }
         stopped
+    }
+
+    /// Take the lines every run of this workflow owes its log group, leaving none
+    /// behind: what a handler that moved a whole workflow's runs — a teardown stopping
+    /// the executions it takes with it ([`Self::stop_runs`]) — delivers once it has
+    /// released this store ([`run_logs::publish`]).
+    pub fn take_pending_log_lines(&mut self) -> Vec<run_logs::LogLine> {
+        self.runs
+            .values_mut()
+            .flat_map(WorkflowRun::take_pending_log_lines)
+            .collect()
     }
 }
 
@@ -1239,8 +1474,10 @@ impl ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
             // The version in force and the plan a run of it follows are resolved ONCE
             // for this workflow's whole catch-up: every firing of it executes the same
             // frozen definition, so the definition content is neither cloned nor read
-            // again per firing.
-            let Some((version, execution)) = self.active_execution(&arn) else {
+            // again per firing. The log group that version configures is resolved with
+            // them, because it is where the runs these firings produce export their
+            // output.
+            let Some((version, execution, log_group_name)) = self.active_execution(&arn) else {
                 continue;
             };
             let mut caught_up = 0;
@@ -1263,7 +1500,7 @@ impl ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
                 let nonce = self.next_nonce(due_at);
                 let sequence = self.mint_seq;
                 let run_id = mint_run_id(&arn, &nonce);
-                let run = WorkflowRun {
+                let mut run = WorkflowRun {
                     run_id: run_id.clone(),
                     workflow_arn: arn.clone(),
                     workflow_version: version.clone(),
@@ -1286,8 +1523,13 @@ impl ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
                     task_instances: BTreeMap::new(),
                     execution: execution.clone(),
                     next_status_at: due_at + RUN_ADMITTED_AFTER,
+                    log_group_name: log_group_name.clone(),
+                    pending_log_lines: Vec::new(),
                     sequence,
                 };
+                // The first line this run's output owes: it was admitted, by the
+                // workflow's own trigger, at the instant the firing fell due.
+                run.log_admitted();
 
                 let Some(workflow) = self.workflows.get_mut(&arn) else {
                     break;
@@ -1301,9 +1543,18 @@ impl ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
         fired
     }
 
-    /// The version in force for `arn` and the execution plan a run of that version
-    /// follows, built once from the definition content the version froze.
-    fn active_execution(&self, arn: &str) -> Option<(String, workflow_execution::ExecutionPlan)> {
+    /// The version in force for `arn`, the execution plan a run of that version
+    /// follows, built once from the definition content the version froze, and the
+    /// CloudWatch Logs log group that version's `LoggingConfiguration` names — where a
+    /// run of it exports its output ([`run_logs`]).
+    fn active_execution(
+        &self,
+        arn: &str,
+    ) -> Option<(
+        String,
+        workflow_execution::ExecutionPlan,
+        Option<String>,
+    )> {
         let workflow = self.workflows.get(arn)?;
         let version = workflow.version(None)?;
         Some((
@@ -1311,6 +1562,7 @@ impl ComAmazonawsMwaaserverlessAmazonmwaaserverlessState {
             workflow_execution::ExecutionPlan::of(
                 version.snapshot.workflow_definition.as_deref(),
             ),
+            configured_log_group(&version.snapshot),
         ))
     }
 
@@ -3237,4 +3489,50 @@ pub fn invalid_page_token(operation: &str) -> ValidationException {
             ),
         }]),
     }
+}
+
+/// What CloudWatch Logs can hold a log group under, read from the SHARED rule rather than
+/// restated here: the predicate over a whole name and the one sentence a refusal states.
+/// Re-exported rather than wrapped, so this service's own suites read the rule off `state`
+/// while the rule itself has exactly one definition in the tree.
+pub use ::service_common::cloudwatch_logs::{is_log_group_name, log_group_name_requirement};
+
+/// The wire path of the log group member a refusal is keyed by.
+pub const LOG_GROUP_NAME_MEMBER: &str = "LoggingConfiguration.LogGroupName";
+
+/// Refuse a `LoggingConfiguration` naming a log group CloudWatch Logs could not hold.
+///
+/// The member is an instruction to CREATE and WRITE a log group — it is where this
+/// service exports what a run of the workflow produces ([`run_logs`]) — so the names it
+/// admits are the names the service that would hold that group admits, and a value
+/// outside them names a group no reader could ever reach. `LogGroupName` targets a bare
+/// `String` with neither `@length` nor `@pattern`
+/// (`smithy_query(query="shape", shape="LoggingConfiguration")`), so the boundary's
+/// constraint walk cannot refuse any of it; the refusal carries the same shape, reason and
+/// `FieldList` a constraint failure does, naming the member at fault.
+///
+/// Every operation that ACCEPTS the configuration judges it this way, before anything is
+/// written, so a refused request leaves the workflow exactly as it was.
+pub fn check_logging_configuration(
+    configuration: Option<&LoggingConfiguration>,
+) -> Result<(), ValidationException> {
+    let Some(name) = configuration.map(|configuration| configuration.log_group_name.as_str())
+    else {
+        return Ok(());
+    };
+    if is_log_group_name(name) {
+        return Ok(());
+    }
+    let clause = format!(
+        "Value at '{LOG_GROUP_NAME_MEMBER}' failed to satisfy constraint: Member {}",
+        log_group_name_requirement()
+    );
+    Err(ValidationException {
+        message: format!("1 validation error detected: {clause}"),
+        reason: REASON_FIELD_VALIDATION_FAILED.to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: LOG_GROUP_NAME_MEMBER.to_string(),
+            message: clause,
+        }]),
+    })
 }

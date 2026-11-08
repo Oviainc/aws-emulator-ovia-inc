@@ -271,7 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.task_instance_id)
             .ok_or_else(unresolved_task_instance)?;
 
-        Ok(GetTaskInstanceOutput {
+        let reported = GetTaskInstanceOutput {
             // The run the instance belongs to owns these three, so they are read
             // from it and never echoed from the request.
             workflow_arn: run.workflow_arn.clone(),
@@ -299,7 +299,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect()
             }),
-        })
+        };
+
+        // The output the transitions above produced, exported with NO store of this
+        // service held, so the two services' stores are never locked at once
+        // (`crate::state::run_logs`).
+        let exported = run.take_pending_log_lines();
+        drop(store);
+        crate::state::run_logs::publish(&*self.engine, &region, exported);
+        Ok(reported)
     }
 }
 

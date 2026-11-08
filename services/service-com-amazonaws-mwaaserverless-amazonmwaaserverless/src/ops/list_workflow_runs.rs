@@ -272,6 +272,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             run.settle(now);
         }
 
+        // The output those transitions produced, exported below once this store's guard
+        // is released (`crate::state::run_logs`).
+        let exported = workflow.take_pending_log_lines();
+
         // The page size this walk serves, through the one derivation every paginated
         // listing of this service shares (`crate::state::page_size`).
         let page_size = crate::state::page_size(input.max_results);
@@ -311,12 +315,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             _ => None,
         };
 
-        Ok(ListWorkflowRunsOutput {
+        let reported = ListWorkflowRunsOutput {
             // The page itself — the `@paginated` `items` member — so "no runs on this
             // page" is the empty list rather than an absent member.
             workflow_runs: Some(workflow_runs),
             next_token,
-        })
+        };
+
+        // Delivered with NO store of this service held, so the two services' stores are
+        // never locked at once.
+        drop(store);
+        crate::state::run_logs::publish(&*self.engine, &region, exported);
+        Ok(reported)
     }
 }
 

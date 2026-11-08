@@ -222,7 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         run.begin_stop(now);
 
         // Answer from the stored run, never from the values just computed.
-        Ok(StopWorkflowRunOutput {
+        let stopped = StopWorkflowRunOutput {
             workflow_arn: Some(run.workflow_arn.clone()),
             workflow_version: Some(run.workflow_version.clone()),
             run_id: Some(run.run_id.clone()),
@@ -230,7 +230,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // store now holds, which is `STOPPING` for a run this call stopped and the
             // terminal status it already had for one that had finished.
             status: Some(run.status.clone()),
-        })
+        };
+
+        // What the run produced on its way out, exported with NO store of this service
+        // held, so the two services' stores are never locked at once
+        // (`crate::state::run_logs`).
+        let exported = run.take_pending_log_lines();
+        drop(store);
+        crate::state::run_logs::publish(&*self.engine, &region, exported);
+        Ok(stopped)
     }
 }
 

@@ -20,6 +20,12 @@
 //! materialised first (`crate::state::WorkflowRun::settle`), and the replay therefore
 //! answers the same status `GetWorkflowRun` and `ListWorkflowRuns` answer for that record.
 //!
+//! What the run PRODUCES while it executes is exported to the CloudWatch Logs log group the
+//! version it runs configured (`crate::state::run_logs`), because that configuration is
+//! where "logs are automatically exported … using remote logging functionality": the
+//! admission this call records is the first line of it, and every later transition adds its
+//! own as the clock makes it due.
+//!
 //! To start a run this operation must resolve the workflow VERSION to run — the one
 //! the request names, else the workflow's latest — so a workflow or a version the
 //! store does not hold is the modelled `ResourceNotFoundException` naming that
@@ -303,7 +309,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // has since been owed.
             run.settle(now);
 
-            return Ok(response_for(run));
+            // The output those changes produced, exported below once this store's guard
+            // is released.
+            let exported = run.take_pending_log_lines();
+            let replay = response_for(run);
+            drop(store);
+            crate::state::run_logs::publish(&*self.engine, &region, exported);
+            return Ok(replay);
         }
 
         // Run the requested version, defaulting to the workflow's latest. A workflow
@@ -335,6 +347,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let execution = crate::state::workflow_execution::ExecutionPlan::of(
             version.snapshot.workflow_definition.as_deref(),
         );
+        // Where this run's output is exported: the log group that same version's
+        // `LoggingConfiguration` names, frozen with the plan, so a run keeps the
+        // destination configured for the version it executes however the workflow is
+        // updated afterwards.
+        let log_group_name = crate::state::configured_log_group(&version.snapshot);
         let version = version.version.clone();
 
         // The emulator's own ceiling on this workflow's run store, refused with the
@@ -361,7 +378,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instant, so a run listing has a TOTAL creation order to walk.
         let sequence = store.mint_seq;
         let run_id = crate::state::mint_run_id(&input.workflow_arn, &nonce);
-        let run = crate::state::WorkflowRun {
+        let mut run = crate::state::WorkflowRun {
             run_id: run_id.clone(),
             workflow_arn: input.workflow_arn.clone(),
             workflow_version: version,
@@ -389,8 +406,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `STARTING` this call reported (`crate::state::WorkflowRun::settle`
             // carries it on through the rest of the lifecycle).
             next_status_at: now + crate::state::RUN_ADMITTED_AFTER,
+            log_group_name,
+            pending_log_lines: Vec::new(),
             sequence,
         };
+        // The first line this run's output owes: the caller's start admitted it.
+        run.log_admitted();
 
         let workflow = store
             .workflow_in_mut(&region, &input.workflow_arn)
@@ -411,10 +432,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Answer from the stored run, never from the values just computed.
         let stored = store
-            .workflow_in(&region, &input.workflow_arn)
-            .and_then(|workflow| workflow.runs.get(&run_id))
+            .workflow_in_mut(&region, &input.workflow_arn)
+            .and_then(|workflow| workflow.runs.get_mut(&run_id))
             .ok_or_else(unavailable)?;
-        Ok(response_for(stored))
+        let exported = stored.take_pending_log_lines();
+        let started = response_for(stored);
+
+        // The run's output goes to the CloudWatch Logs group its version configured —
+        // "Logs are automatically exported to your specified CloudWatch log group" — and
+        // it is delivered with NO store of this service held, so the two services' stores
+        // are never locked at once.
+        drop(store);
+        crate::state::run_logs::publish(&*self.engine, &region, exported);
+        Ok(started)
     }
 }
 

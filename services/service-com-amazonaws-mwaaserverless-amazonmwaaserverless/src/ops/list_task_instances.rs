@@ -252,6 +252,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // tasks its definition declared, which is what decides which instances it holds
         // and what each of them reports — the same step `GetWorkflowRun` takes.
         run.settle(now);
+        // The output those transitions produced, exported below once this store's guard is
+        // released (`crate::state::run_logs`).
+        let exported = run.take_pending_log_lines();
         let run = &*run;
 
         // A run holds its instances keyed by `TaskInstanceId`, so the walk is that key's
@@ -290,12 +293,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|task| summarize(run, task))
             .collect();
 
-        Ok(ListTaskInstancesOutput {
+        let reported = ListTaskInstancesOutput {
             // The page itself — the `@paginated` `items` member — so "no task instances
             // on this page" is the empty list rather than an absent member.
             task_instances: Some(task_instances),
             next_token,
-        })
+        };
+
+        // Delivered with NO store of this service held, so the two services' stores are
+        // never locked at once.
+        drop(store);
+        crate::state::run_logs::publish(&*self.engine, &region, exported);
+        Ok(reported)
     }
 }
 

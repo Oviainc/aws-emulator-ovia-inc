@@ -535,10 +535,13 @@ fn validate_input(input: &CreateWorkflowInput) -> Result<(), ValidationException
     }
 
     let violations = crate::state::validate_members(&members);
-    if violations.is_empty() {
-        return Ok(());
+    if !violations.is_empty() {
+        return Err(crate::state::constraint_validation_exception(&violations));
     }
-    Err(crate::state::constraint_validation_exception(&violations))
+    // The log group the configuration names is where this service EXPORTS what a run of
+    // the workflow produces (`crate::state::run_logs`), so it has to be a name CloudWatch
+    // Logs can hold a group under — a rule the member declares no constraint for.
+    crate::state::check_logging_configuration(input.logging_configuration.as_ref())
 }
 
 /// The modelled server error for a store this handler could not reach.
