@@ -449,4 +449,8 @@ mod proxy_integration_qualified_function;
 // parameter the response does not carry.
 #[path = "all/gateway_response_representation.rs"]
 mod gateway_response_representation;
+// Appended for the reason the note above gives: the VPC endpoint an access association's
+// `accessAssociationSource` must name, resolved against the service that owns endpoints.
+#[path = "all/domain_name_access_association_endpoint.rs"]
+mod domain_name_access_association_endpoint;
 

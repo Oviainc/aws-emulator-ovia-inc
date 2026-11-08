@@ -2,11 +2,16 @@
 
 //! @op CreateDomainNameAccessAssociation
 //! IMPLEMENTED: stores one `DomainNameAccessAssociation` between an access association
-//! source and a stored PRIVATE custom domain name, and reports the record it wrote. The
-//! pair `(domain name, access association source)` IS the association, so a second create
-//! of a pair this account already holds is the modelled `ConflictException` — decided and
-//! written under one store lock, so concurrent creates of one pair store exactly one
-//! record.
+//! source and a stored PRIVATE custom domain name, and reports the record it wrote. BOTH
+//! resources the association binds are resolved before anything is written: the domain name
+//! against this service's own records, and the source against the VPC endpoints Amazon EC2
+//! holds for the account ([`crate::state::vpc_endpoints`]), because with
+//! `accessAssociationSourceType` `VPCE` the source "is the VPC endpoint ID" — so an
+//! identifier naming no endpoint is the modelled `BadRequestException` rather than a stored
+//! association that can never route. The pair `(domain name, access association source)` IS
+//! the association, so a second create of a pair this account already holds is the modelled
+//! `BadRequestException` — decided and written under one store lock, so concurrent creates
+//! of one pair store exactly one record.
 //!
 //! ## Shape of an operation
 //!
@@ -250,23 +255,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // checked for membership of its value set here: it is a modelled enum, so a value
         // outside it is refused before this handler runs.
         bound_input(&input).map_err(bad_request)?;
-        // The SOURCE is read as the identifier its type says it is: with
-        // `accessAssociationSourceType` `VPCE`, "the value is the VPC endpoint ID"
-        // (`accessAssociationSource`), so a value that is not one names no endpoint this
-        // association could ever be resolved through and is refused BEFORE anything is
-        // written — the identifier refusal this service answers an unreadable identifier
-        // with.
-        if input.access_association_source_type == VPCE_SOURCE_TYPE
-            && !crate::state::is_vpc_endpoint_id(&input.access_association_source)
-        {
-            return Err(bad_request(
-                crate::state::INVALID_ACCESS_ASSOCIATION_SOURCE.to_string(),
-            ));
-        }
         let domain_name_key = domain_name_key_of(&input.domain_name_arn)
             .ok_or_else(|| bad_request(crate::state::INVALID_DOMAIN_NAME_ARN.to_string()))?;
 
         let region = crate::state::request_region(ctx.parts());
+
+        // The SOURCE is RESOLVED as the resource its type says it names: with
+        // `accessAssociationSourceType` `VPCE`, "the value is the VPC endpoint ID"
+        // (`accessAssociationSource`), and an access association binds a private custom
+        // domain name to that endpoint — so the identifier must name a VPC endpoint the
+        // account has in the Region the caller addressed, or the request names a resource to
+        // bind to that is not there. VPC endpoints are Amazon EC2's records, so the question
+        // is put to the service that owns them, exactly as the domain name is resolved
+        // against the records this service owns ([`crate::state::vpc_endpoints`]); a value
+        // that is not even shaped like an endpoint id is refused without a hop, with the one
+        // sentence this whole class is refused with. Both happen BEFORE the store lock is
+        // taken, so an unresolvable source writes nothing.
+        if input.access_association_source_type == VPCE_SOURCE_TYPE {
+            if !crate::state::is_vpc_endpoint_id(&input.access_association_source) {
+                return Err(bad_request(
+                    crate::state::invalid_access_association_source(
+                        &input.access_association_source,
+                    ),
+                ));
+            }
+            crate::state::vpc_endpoints::resolve_access_association_source(
+                ctx,
+                &region,
+                &input.access_association_source,
+            )
+            .await
+            .map_err(bad_request)?;
+        }
 
         let mut store = state.lock();
 

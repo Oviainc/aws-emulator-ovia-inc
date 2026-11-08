@@ -105,6 +105,13 @@ service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice 
 # `service_common::iam_authorization`, the tree's one evaluation of policy documents.
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# A domain name access association names a VPC endpoint as its `accessAssociationSource`,
+# and VPC endpoints are Amazon EC2's records: the identifier a create carries is resolved
+# against that service over the in-process transport before anything is stored
+# (`state::vpc_endpoints`), so this service keeps no second reading of which endpoints the
+# account has. Only the generated client is needed, as the sibling apigatewayv2 service
+# declares it for the same hop.
+aws-sdk-ec2 = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -125,6 +132,11 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # The .zip deployment package such a function is created from, written in memory the way a
 # caller uploads one — the same reader/writer the Lambda crate's own invoke suites use.
 zip = { version = "9", default-features = false, features = ["deflate"] }
+# A domain name access association's source is resolved against the VPC endpoints Amazon
+# EC2 holds, so that service is mounted beside this one on the suite's own engine and every
+# endpoint a case names is created through EC2's OWN API rather than written into a store by
+# hand (`tests/all/domain_name_access_association_endpoint.rs`).
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # Percent-encoding for the `resourceArn` @httpLabel a tag call puts in its URI path: the
 # encoding itself is the crate's, as the sibling medialive/codeartifact suites do it,
 # rather than a tenth hand-written copy of RFC 3986.

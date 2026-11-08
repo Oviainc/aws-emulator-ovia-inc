@@ -1,16 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! End-to-end tests for the `accessAssociationSource` a domain name access association is
-//! created with: which values name a VPC endpoint and which are refused.
+//! created with: which values can be READ as a VPC endpoint id at all.
 //!
 //! The RULE under test, one level above the recorded call:
 //!
 //! > With `accessAssociationSourceType` `VPCE`, `CreateDomainNameAccessAssociation`'s
 //! > `accessAssociationSource` must be the ID of a VPC endpoint — the prefix EC2 mints every
 //! > endpoint id under and one of its two hexadecimal widths, in lower case. A value that is
-//! > not one is the modelled `BadRequestException` (400) carrying this service's identifier
-//! > refusal, and NOTHING is created: no association is stored and the collection still
-//! > reports exactly the records the admitted creates made.
+//! > not one is the modelled `BadRequestException` (400) carrying the identifier the request
+//! > sent followed by the fixed text " is not a valid VPC endpoint id", and NOTHING is
+//! > created: no association is stored and the collection still reports exactly the records
+//! > the admitted creates made.
 //!
 //! The rows span what that rule generalises over: each width EC2 mints and one glyph either
 //! side of each, the uppercase spelling of an otherwise well-formed id, a non-hexadecimal
@@ -18,12 +19,18 @@
 //! endpoint service, an endpoint connection), a bare prefix, an ARN of an endpoint rather
 //! than its id, and a value carrying no prefix at all.
 //!
+//! The OTHER half of the same rule — that a well-formed id must also name an endpoint the
+//! account HAS — is `domain_name_access_association_endpoint`, which mounts the service that
+//! owns VPC endpoints beside this one. This suite mounts only this service, so that hop
+//! cannot be made and is evidence of nothing: a well-formed id is admitted here, which is
+//! what makes these rows about the FORM alone.
+//!
 //! Every case drives the real wire path through [`Gateway`], this crate's one wire-test
 //! harness, and reuses the access-association suite's own create, list and private-domain
 //! helpers rather than a second spelling of them.
 
 use serde_json::json;
-use service_com_amazonaws_apigateway_backplanecontrolservice::state::INVALID_ACCESS_ASSOCIATION_SOURCE;
+use service_com_amazonaws_apigateway_backplanecontrolservice::state::invalid_access_association_source;
 
 use crate::domain_name_access_associations::{
     association_body, create_association, list_associations, private_domain,
@@ -114,8 +121,10 @@ async fn an_access_association_source_must_be_a_vpc_endpoint_id() {
         );
         let message = string_member(&answer.body, "message", case);
         assert_eq!(
-            message, INVALID_ACCESS_ASSOCIATION_SOURCE,
-            "case {case:?}: expected the identifier refusal, got {message:?}"
+            message,
+            invalid_access_association_source(source),
+            "case {case:?}: expected the identifier refusal naming the source sent, got \
+             {message:?}"
         );
     }
 

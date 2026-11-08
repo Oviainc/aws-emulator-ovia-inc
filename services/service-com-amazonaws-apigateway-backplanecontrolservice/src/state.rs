@@ -3806,13 +3806,17 @@ pub fn is_vpc_endpoint_id(value: &str) -> bool {
 }
 
 /// The `BadRequestException` message for an `accessAssociationSource` that is not the id of
-/// a VPC endpoint, which is what a `VPCE` access association's source must be ("For a VPCE,
-/// the value is the VPC endpoint ID").
+/// a VPC endpoint of the account, which is what a `VPCE` access association's source must be
+/// ("For a VPCE, the value is the VPC endpoint ID").
 ///
-/// VERBATIM from the recorded refusal of a malformed source, which asserts this sentence
-/// exactly: entirely fixed text for the class, naming the kind of identifier the request got
-/// wrong and echoing none of the value it sent.
-pub const INVALID_ACCESS_ASSOCIATION_SOURCE: &str = "Invalid VPC endpoint ID specified.";
+/// VERBATIM from the recorded refusal, which asserts the sentence exactly: the VARIABLE part
+/// is the identifier the request sent, and the fixed text is " is not a valid VPC endpoint
+/// id". ONE sentence for the whole class — a value that is not shaped like an endpoint id and
+/// one that is but names no endpoint of the account are the same fact about the same member,
+/// so both are refused with it.
+pub fn invalid_access_association_source(access_association_source: &str) -> String {
+    format!("{access_association_source} is not a valid VPC endpoint id")
+}
 
 /// The `ConflictException` message for a custom domain name a stored
 /// `DomainNameAccessAssociation` still depends on, which is what `DeleteDomainName`
@@ -4365,3 +4369,7 @@ pub use patches::*;
 
 /// The `Model` records every created REST API already holds; see that module.
 pub mod default_models;
+
+/// The VPC endpoints the account has, as Amazon EC2 reports them — what an access
+/// association's source identifier is resolved against; see that module.
+pub mod vpc_endpoints;
