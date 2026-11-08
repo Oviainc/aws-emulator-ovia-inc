@@ -50,6 +50,14 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # service judges the document that service's `PutBucketPolicy` wrote. A delivery also
 # WRITES the export's file through that same store.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The destination BUCKET and the billing view a `BILLING_VIEW_ARN` table property scopes a
+# table to are resources of other services, which a submitted definition is resolved against
+# over the in-process callback (`OperationContext::callback`): Amazon S3's `HeadBucket`
+# answers whether it holds the bucket for the owner the request states, and AWS Billing's
+# `GetBillingView` whether the account holds the view. Only the generated clients are needed
+# — the emulator supplies the transport.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+aws-sdk-billing = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # The export file a delivery writes, in the encodings `S3OutputConfigurations` publishes:
 # `csv` lays out the delimited text (so quoting is the maintained implementation's),
 # `flate2` is the GZIP stream, `zip` the ZIP archive, and `parquet` the Apache
@@ -73,6 +81,10 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # The delivery-grant suite creates its destination buckets and puts their policies through
 # Amazon S3's own operations.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The BILLING VIEW a table property scopes a table to is one AWS Billing holds, so the suite
+# about resolving it mounts that service beside this one on the same engine and reads the
+# account's views back through its own operations.
+service-com-amazonaws-billing-awsbilling = { workspace = true }
 # The delivery suite READS BACK the export file a delivery wrote, so it decodes the object
 # with the same maintained implementations the delivery encoded it with.
 csv = "1.3"

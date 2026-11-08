@@ -23,6 +23,10 @@
 //! operations read it. [`query`] reads a submitted `DataQuery` against that catalog, for
 //! the two operations that accept an export definition, and [`destination`] reads the
 //! `DestinationConfigurations` of the same definition for the same two operations.
+//! [`referenced_resources`] completes that reading for the parts of a definition that name
+//! a resource of ANOTHER service — the destination bucket in Amazon S3, and the billing
+//! view a table property scopes a table to in AWS Billing — each resolved against the
+//! service that holds it.
 //!
 //! Two more things the store holds, each read by a layer rather than by one handler:
 //!
@@ -53,6 +57,7 @@ pub mod catalog;
 pub mod delivery;
 pub mod destination;
 pub mod query;
+pub mod referenced_resources;
 
 // The DELIVERY of an export — the file it writes into the destination bucket and the
 // statuses the execution recording it moves through — is reached as `crate::state::…` by
@@ -81,6 +86,15 @@ pub use destination::{
     delivers_output_encoding, supported_compressions, validate_delivery_grant,
     validate_destination_configurations, BUCKET_PERMISSION_VALIDATION_FAILED, DELIVERY_ACTION,
     DELIVERY_SERVICE_PRINCIPAL, SUPPORTED_OUTPUT_ENCODINGS,
+};
+
+// The resources of OTHER services a submitted definition names — the destination bucket and
+// the billing view a table property scopes a table to — are resolved against the services
+// that hold them by those same two operations, so this reader sits beside the two above
+// rather than in either operation file.
+pub use referenced_resources::{
+    destination_bucket_verdict, unresolved_billing_view, validate_referenced_resources,
+    DestinationVerdict,
 };
 
 // The authorization decision is reached as `crate::state::…` by every operation whose

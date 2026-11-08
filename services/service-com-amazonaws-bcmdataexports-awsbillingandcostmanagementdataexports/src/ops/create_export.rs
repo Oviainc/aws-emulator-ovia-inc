@@ -8,7 +8,9 @@
 //! configuration in force, the way the service reports it — so `GetExport`,
 //! `ListExports` and `ListTagsForResource` read back exactly what the service stored. A
 //! definition whose destination configuration names a delivery this service does not
-//! write is refused instead of stored, as is a `ResourceTags` claiming the reserved
+//! write is refused instead of stored — as is one whose destination bucket, or whose
+//! `BILLING_VIEW_ARN` table property, names a resource the service that owns it reports is
+//! not there — and so is a `ResourceTags` claiming the reserved
 //! `aws:` tag-key namespace ([`crate::state::RESERVED_TAG_KEY_PREFIX`]).
 //!
 //! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
@@ -239,6 +241,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Region that names no bucket — can never be served, so it is refused rather than
         // persisted. See `crate::state::destination`.
         crate::state::validate_destination_configurations(&export.destination_configurations)
+            .map_err(CreateExportErrorModeled::ValidationException)?;
+
+        // The destination's BUCKET, the account the request states as its owner, and the
+        // billing view a `BILLING_VIEW_ARN` table property scopes a table to are resources
+        // of OTHER services: each is resolved where the service that owns it holds it,
+        // before anything is persisted, because an export delivered to a bucket that is not
+        // there — or scoped to a billing view that does not exist — could never be served.
+        // See `crate::state::referenced_resources`.
+        crate::state::validate_referenced_resources(ctx, &export)
+            .await
             .map_err(CreateExportErrorModeled::ValidationException)?;
 
         // The destination's DELIVERY GRANT is the last thing judged before anything is

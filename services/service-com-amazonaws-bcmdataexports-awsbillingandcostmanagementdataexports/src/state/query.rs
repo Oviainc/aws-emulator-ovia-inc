@@ -138,7 +138,11 @@ const QUERY_STATEMENT_FIELD: &str = "Export.DataQuery.QueryStatement";
 
 /// The modelled input member a table-configuration refusal names
 /// (`DataQuery$TableConfigurations`).
-const TABLE_CONFIGURATIONS_FIELD: &str = "Export.DataQuery.TableConfigurations";
+///
+/// `pub(crate)` because a refusal of a table-property VALUE this service resolves against
+/// another service ([`super::referenced_resources`]) names the same member rather than a
+/// second spelling of it.
+pub(crate) const TABLE_CONFIGURATIONS_FIELD: &str = "Export.DataQuery.TableConfigurations";
 
 /// The most DISTINCT tables one `QueryStatement` may name.
 ///

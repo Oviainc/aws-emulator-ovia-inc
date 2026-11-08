@@ -9,9 +9,11 @@
 //!
 //! Because the update "[overwrites] all export parameters", the REPLACEMENT definition is
 //! judged exactly as a create's is — its statement read against the table catalog and the
-//! columns that catalog publishes for the configuration the request states, and its
-//! destination configuration read against the deliveries this service writes — and a
-//! definition this service could not deliver leaves the stored one untouched.
+//! columns that catalog publishes for the configuration the request states, its destination
+//! configuration read against the deliveries this service writes, and the resources of other
+//! services it names (the destination bucket, the billing view a table property scopes a
+//! table to) resolved against the services that hold them — and a definition this service
+//! could not deliver leaves the stored one untouched.
 //!
 //! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
 //! reaching this service's state and the modelled contract still apply.
@@ -238,6 +240,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // anything is written, so the stored destination is left untouched. See
         // `crate::state::destination`.
         crate::state::validate_destination_configurations(&input.export.destination_configurations)
+            .map_err(UpdateExportErrorModeled::ValidationException)?;
+
+        // And the resources of OTHER services the REPLACEMENT names are resolved exactly as
+        // a create's are — the destination bucket and the account stated as its owner in
+        // Amazon S3, the billing view a `BILLING_VIEW_ARN` table property scopes a table to
+        // in AWS Billing — before anything is written, so the stored definition survives a
+        // replacement naming a destination or a billing view that is not there. See
+        // `crate::state::referenced_resources`.
+        crate::state::validate_referenced_resources(ctx, &input.export)
+            .await
             .map_err(UpdateExportErrorModeled::ValidationException)?;
 
         // And the REPLACEMENT destination's delivery grant is judged exactly as a create's

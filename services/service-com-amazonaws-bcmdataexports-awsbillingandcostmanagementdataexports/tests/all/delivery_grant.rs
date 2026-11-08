@@ -49,16 +49,19 @@ const SIGNED_FOR_S3: &str = "AWS4-HMAC-SHA256 \
 /// not about the caller's.
 const ACCOUNT_KEY: &str = "AKIDEXAMPLE";
 
-/// This emulator: this service and Amazon S3 over ONE shared engine, so the policy this
-/// service reads is the document S3's own `PutBucketPolicy` wrote.
+/// This emulator: this service, Amazon S3 and AWS Billing over ONE shared engine, so the
+/// policy this service reads is the document S3's own `PutBucketPolicy` wrote, the bucket it
+/// resolves is one S3's own `CreateBucket` made, and the billing view a definition names is
+/// one AWS Billing itself reports.
 ///
-/// `pub(crate)` so the suite that asserts on the delivery ITSELF
-/// (`tests/all/export_file_delivery.rs`) drives the same two services over the same engine
-/// through this ONE harness instead of growing a second copy of it.
+/// `pub(crate)` so the suites that assert on the delivery ITSELF
+/// (`tests/all/export_file_delivery.rs`) and on resolving the resources a definition names in
+/// other services (`tests/all/referenced_resource_resolution.rs`) drive the same services
+/// over the same engine through this ONE harness instead of growing a second copy of it.
 pub(crate) struct Deliveries {
     router: MultiServiceRouter,
-    /// The engine both services are mounted on, so a suite can read the object store back
-    /// and move a stored due instant the service itself reads.
+    /// The engine every service here is mounted on, so a suite can read the object store
+    /// back and move a stored due instant the service itself reads.
     engine: Arc<engine::InMemoryEngine>,
 }
 
@@ -77,12 +80,47 @@ impl Deliveries {
         router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
             Arc::clone(&engine),
         ));
+        // AWS Billing holds the account's billing views, which is where a definition's
+        // `BILLING_VIEW_ARN` table property is resolved: a definition naming none (as every
+        // row of this suite does) asks it nothing.
+        router.register_service(service_com_amazonaws_billing_awsbilling::EmulatedService::new(
+            Arc::clone(&engine),
+        ));
         Self { router, engine }
     }
 
-    /// The engine both services are mounted on.
+    /// The engine every service here is mounted on.
     pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
         &self.engine
+    }
+
+    /// One call to AWS BILLING, signed for the pinned Region, answering the status and the
+    /// parsed body that service served.
+    pub(crate) async fn billing(&self, operation: &str, body: &Value) -> (u16, Value) {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("content-type", "application/x-amz-json-1.0")
+            .header("x-amz-target", format!("AWSBilling.{operation}"))
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential={ACCOUNT_KEY}/20261021/{PINNED_REGION}/\
+                     billing/aws4_request, SignedHeaders=host;x-amz-target, Signature=0"
+                ),
+            )
+            .body(Bytes::from(
+                serde_json::to_vec(body).expect("the request body serializes"),
+            ))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let parsed = if response.body().is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+        };
+        (status, parsed)
     }
 
     /// One call to this service, signed for `region`.
@@ -791,21 +829,23 @@ async fn an_update_judges_its_replacement_destination() {
     );
 }
 
-/// A destination this emulator's object store can say NOTHING about is not refused: a
-/// refusal has to be grounded in a policy that was read, and a bucket the object store does
-/// not hold reports nothing about the policy a real one would carry.
+/// A destination the object store REPORTS it does not hold is refused, not accepted: with
+/// Amazon S3 beside this service, a bucket that was never created is a bucket that service
+/// answers about, and no grant can be read off a bucket that is not there.
+///
+/// The rule — every resource of another service a definition names is resolved against the
+/// service that holds it — is tabled in `tests/all/referenced_resource_resolution.rs`. This
+/// row stands here so the unpolicied-bucket refusals above cannot be mistaken for the answer
+/// to a destination that does not exist at all.
 #[tokio::test]
-async fn a_destination_the_object_store_does_not_hold_is_not_refused_on_absent_evidence() {
+async fn a_destination_the_object_store_reports_it_does_not_hold_is_refused() {
     let emulator = Deliveries::new();
 
-    let created = emulator
-        .ok(
+    let (status, body) = emulator
+        .call(
             "CreateExport",
             &create_request("no_such_bucket", "delivery-grant-never-created", "exports/daily"),
         )
         .await;
-    assert!(
-        created["ExportArn"].is_string(),
-        "a destination the object store does not hold must not be refused, got {created}"
-    );
+    assert_refused("a destination the object store does not hold", status, &body);
 }

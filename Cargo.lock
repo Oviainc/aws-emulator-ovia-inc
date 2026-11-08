@@ -948,6 +948,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-billing"
+version = "1.79.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "03fdf4f8d24ecadbb7181ae86c80b1c52cf992cfc5791a0f40b6f3bf5dfe9c18"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-cloudformation"
 version = "1.136.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8831,6 +8856,8 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-billing",
+ "aws-sdk-s3",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
@@ -8841,6 +8868,7 @@ dependencies = [
  "http",
  "parquet",
  "serde_json",
+ "service-com-amazonaws-billing-awsbilling",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-s3-amazons3",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",

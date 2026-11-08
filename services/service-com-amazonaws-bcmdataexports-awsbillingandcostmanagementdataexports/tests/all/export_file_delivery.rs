@@ -809,15 +809,16 @@ async fn a_projection_past_the_delivered_column_bound_is_not_delivered() {
 /// RULE, the other half: a destination this service cannot write to fails the delivery with
 /// the modelled reason, writes no object, and leaves the export reporting no generation.
 ///
-/// The rows differ along WHY the write cannot be made: a destination the object store does
-/// not hold at all (which a create is not refused for, since nothing was read about it), and
-/// one whose policy granted the delivery when the definition was accepted and does not any
-/// more.
+/// The rows differ along WHY the write cannot be made: a destination the object store held
+/// when the definition was accepted and does not hold any more, and one whose policy granted
+/// the delivery then and does not grant it now. Both are changes made AFTER the create — a
+/// destination the object store already reported absent is refused by the create itself (see
+/// `tests/all/referenced_resource_resolution.rs`), so it never reaches a delivery.
 #[tokio::test]
 async fn a_destination_that_refuses_the_write_fails_the_delivery() {
-    for (index, (case, hold_bucket, revoke)) in [
-        ("a destination the object store does not hold", false, false),
-        ("a destination whose grant was taken away", true, true),
+    for (index, (case, remove_bucket, revoke)) in [
+        ("a destination the object store no longer holds", true, false),
+        ("a destination whose grant was taken away", false, true),
     ]
     .into_iter()
     .enumerate()
@@ -825,11 +826,9 @@ async fn a_destination_that_refuses_the_write_fails_the_delivery() {
         let emulator = Deliveries::new();
         let bucket = format!("export-refused-{index}");
         let name = format!("export_refused_{index}");
-        if hold_bucket {
-            emulator
-                .bucket_with(&bucket, Some(&published_grant(&bucket)))
-                .await;
-        }
+        emulator
+            .bucket_with(&bucket, Some(&published_grant(&bucket)))
+            .await;
         let table = rows();
         let row = &table[0];
         let created = emulator
@@ -839,6 +838,17 @@ async fn a_destination_that_refuses_the_write_fails_the_delivery() {
             .as_str()
             .unwrap_or_else(|| panic!("case {case:?}: CreateExport returns an ExportArn"))
             .to_string();
+        if remove_bucket {
+            // `DELETE /<bucket>` — the destination is taken away through Amazon S3's own
+            // `DeleteBucket`, so the delivery finds what a client would have left it.
+            let (status, body) = emulator.s3_request("DELETE", &format!("/{bucket}"), &[]).await;
+            assert_eq!(
+                status,
+                204,
+                "case {case:?}: expected DeleteBucket 204, got {status} with {}",
+                String::from_utf8_lossy(&body)
+            );
+        }
         if revoke {
             // The same document, granting the write to another service's principal: this
             // one is no longer permitted to deliver.
@@ -883,7 +893,7 @@ async fn a_destination_that_refuses_the_write_fails_the_delivery() {
             "case {case:?}: no file was generated, so LastRefreshedAt must stay absent, got \
              {export_status}"
         );
-        if hold_bucket {
+        if !remove_bucket {
             assert_eq!(
                 listed_keys(&emulator, &bucket, row.prefix).await,
                 Vec::<String>::new(),

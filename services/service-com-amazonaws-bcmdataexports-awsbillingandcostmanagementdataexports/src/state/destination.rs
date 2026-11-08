@@ -29,11 +29,13 @@
 //! overwriting all export parameters" and therefore re-judges the replacement destination
 //! exactly as a create's.
 //!
-//! What this module does NOT judge is whether a well-formed destination is one the caller
-//! owns: the bucket lives in Amazon S3, not in this service's state. What it DOES judge
-//! there is the one precondition the service evaluates per call before it accepts a
-//! definition at all — the destination bucket's own policy must grant this service's
-//! principal the object write the delivery performs ([`validate_delivery_grant`]).
+//! What this module does NOT judge is whether the bucket a well-formed destination names is
+//! THERE, or whose it is: the bucket lives in Amazon S3, not in this service's state, so
+//! both of those are resolved against that service ([`super::referenced_resources`]). What
+//! this module DOES judge about it is the one precondition the service evaluates per call
+//! before it accepts a definition at all — the destination bucket's own policy must grant
+//! this service's principal the object write the delivery performs
+//! ([`validate_delivery_grant`]).
 
 use super::{clip_for_message, field_validation_failed};
 use crate::ops::types::{DestinationConfigurations, S3Destination, ValidationException};
@@ -47,7 +49,16 @@ const COMPRESSION_FIELD: &str =
 const S3_REGION_FIELD: &str = "Export.DestinationConfigurations.S3Destination.S3Region";
 
 /// The input member a refused destination BUCKET names.
-const S3_BUCKET_FIELD: &str = "Export.DestinationConfigurations.S3Destination.S3Bucket";
+///
+/// `pub(crate)` because the resolution of that bucket against the service that HOLDS it
+/// ([`super::referenced_resources`]) names the same member rather than a second spelling of
+/// it.
+pub(crate) const S3_BUCKET_FIELD: &str =
+    "Export.DestinationConfigurations.S3Destination.S3Bucket";
+
+/// The input member a refusal of the destination's stated bucket OWNER names.
+pub(crate) const S3_BUCKET_OWNER_FIELD: &str =
+    "Export.DestinationConfigurations.S3Destination.S3BucketOwner";
 
 /// The encodings a data export is delivered in: each `FormatOption` the service writes,
 /// with the `CompressionOption` values it writes that format under.
@@ -168,10 +179,12 @@ pub const BUCKET_PERMISSION_VALIDATION_FAILED: &str = "S3 bucket permission vali
 /// `export_arn` is the export the delivery is for: the ARN the create just minted, or the
 /// ARN of the export an update replaces.
 ///
-/// A destination this emulator's object store can say NOTHING about — a bucket it does not
-/// hold, or no object store on this engine at all — is not refused: a refusal has to be
-/// grounded in a policy that was read, and the bucket's absence is a different fact about
-/// a different service, reported by the read that would fail rather than guessed here.
+/// A destination whose POLICY this emulator's object store can say nothing about — no object
+/// store on this engine at all, or a bucket it does not hold — is not refused here: a refusal
+/// from this function has to be grounded in a policy that was read. Whether the bucket is
+/// there at all is a different fact about a different service, resolved against that service
+/// before this runs ([`super::referenced_resources::destination_bucket_verdict`]), and a
+/// delivery that finds the bucket gone later reports it as the delivery it could not make.
 pub fn validate_delivery_grant<Eng: Send + Sync + 'static>(
     engine: &Eng,
     destination: &DestinationConfigurations,

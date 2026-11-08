@@ -71,6 +71,8 @@ mod query_column_selection;
 mod query_statement_subset;
 #[path = "all/quota_service_code.rs"]
 mod quota_service_code;
+#[path = "all/referenced_resource_resolution.rs"]
+mod referenced_resource_resolution;
 #[path = "all/refusal_message_bound.rs"]
 mod refusal_message_bound;
 #[path = "all/refusal_message_bounds.rs"]
