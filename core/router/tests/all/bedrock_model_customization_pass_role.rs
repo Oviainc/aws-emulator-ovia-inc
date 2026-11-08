@@ -28,9 +28,12 @@
 //! pass carries and holds, the same key with another account's value, a key the pass carries
 //! no value for), where the role lives (the default path and a path), which account the ARN
 //! names, whether the role was ever created, and — because the decision is taken over the
-//! request as submitted — every form `baseModelIdentifier` takes (a bare `vendor.model` id, a
-//! `:foundation-model/` ARN, a `:custom-model/` ARN) whether or not it resolves to anything
-//! this service publishes.
+//! request as submitted — every form `baseModelIdentifier` takes that IDENTIFIES a
+//! customizable base model variant (a `:foundation-model/` ARN, a `:custom-model/` ARN, a
+//! bare id carrying the version qualifier such a variant is published under) whether or not
+//! it resolves to anything this service publishes. A value that identifies no such variant —
+//! a bare `vendor.model` id with no qualifier — is read AHEAD of the pass, so those rows are
+//! answered by that reading instead; the corpus records both halves of that ordering.
 
 use std::sync::Arc;
 
@@ -52,6 +55,10 @@ const ACCOUNT: &str = "000000000000";
 /// The sentence Amazon Bedrock states a denied pass-role with, spelled here so this suite
 /// pins the wording a client sees rather than reading it off the service.
 const PASS_ROLE_REFUSAL: &str = "Cross-account pass role is not allowed.";
+
+/// The sentence Amazon Bedrock states for a value that identifies no customizable base
+/// model variant, spelled here so this suite pins the wording a client sees.
+const INVALID_MODEL_IDENTIFIER: &str = "The provided model identifier is invalid.";
 
 /// `ModelCustomizationJobStatus` — the status a job that has just been created carries
 /// (`smithy_query(query="shape",shape="ModelCustomizationJobStatus")`).
@@ -444,8 +451,9 @@ async fn create_roles(router: &MultiServiceRouter) {
     }
 }
 
-/// A base model the catalog this emulator serves publishes as supporting `FINE_TUNING`, read
-/// through `ListFoundationModels` exactly as a caller would.
+/// A base model the catalog this emulator serves publishes as supporting `FINE_TUNING`,
+/// read through `ListFoundationModels` exactly as a caller would — the training-qualified
+/// id Amazon Bedrock publishes a customizable model under.
 async fn fine_tuning_base_model(router: &MultiServiceRouter) -> String {
     let (status, _, listed) = bedrock(
         router,
@@ -640,6 +648,11 @@ enum AdmittedAnswer {
     /// [`UNOFFERED_MODEL_ERRORS`] and pins what the ordering rule settles: the answer is the
     /// identifier's own and not the authorization's.
     ReportsAClientError,
+    /// The value identifies no customizable base model variant at all — a bare id carrying
+    /// no version qualifier — which is read AHEAD of the pass, so this row is answered by
+    /// that reading under EVERY role: 400 `ValidationException` carrying the service's fixed
+    /// invalid-model-identifier sentence.
+    RefusedOnItsForm,
 }
 
 /// The roles a pass is refused on, spanning both halves of a pass IAM withholds: a role of
@@ -656,12 +669,13 @@ const REFUSING_ROLES: &[(&str, &str)] = &[
 ];
 
 /// RULE (the ordering half): the pass is authorized BEFORE anything the request names is
-/// resolved, so the same body draws the 403 wherever the grant does not cover the pass —
-/// whatever `baseModelIdentifier` would have resolved to, in every form the member's
-/// published pattern admits (a bare `vendor.model` id, a `:foundation-model/` ARN, a
-/// `:custom-model/` ARN), and such a refusal writes nothing whichever form it carried — and
-/// draws that identifier's OWN answer wherever the grant does cover the pass, so an admitting
-/// decision does not swallow what follows it either.
+/// RESOLVED, so the same body draws the 403 wherever the grant does not cover the pass —
+/// whatever `baseModelIdentifier` would have resolved to, in every form that IDENTIFIES a
+/// customizable base model variant (a `:foundation-model/` ARN, a `:custom-model/` ARN, a
+/// bare id carrying that variant's version qualifier) — and draws that identifier's OWN
+/// answer wherever the grant does cover the pass, so an admitting decision does not swallow
+/// what follows it either. Ahead of both stands the FORM of the identifier: a bare id
+/// carrying no qualifier identifies no variant to customize and is refused under every role.
 #[tokio::test]
 async fn the_pass_is_authorized_before_the_request_is_resolved() {
     let router = emulator();
@@ -680,7 +694,7 @@ async fn the_pass_is_authorized_before_the_request_is_resolved() {
     // all, which is what the rule generalises over.
     let rows: Vec<(&str, String, AdmittedAnswer)> = vec![
         (
-            "the published base model, by its bare id",
+            "the published base model, by its qualified bare id",
             published.clone(),
             AdmittedAnswer::MintsJob,
         ),
@@ -692,7 +706,7 @@ async fn the_pass_is_authorized_before_the_request_is_resolved() {
         (
             "a model past its end of life, by its bare id",
             END_OF_LIFE_MODEL_IDS[0].to_string(),
-            AdmittedAnswer::ReportsAClientError,
+            AdmittedAnswer::RefusedOnItsForm,
         ),
         (
             "a model past its end of life, by its foundation-model ARN",
@@ -713,7 +727,7 @@ async fn the_pass_is_authorized_before_the_request_is_resolved() {
         (
             "an id that names no model at all",
             "acme.not-a-model-v1".to_string(),
-            AdmittedAnswer::ReportsItAbsent,
+            AdmittedAnswer::RefusedOnItsForm,
         ),
         (
             "a custom-model ARN this account does not hold",
@@ -732,11 +746,19 @@ async fn the_pass_is_authorized_before_the_request_is_resolved() {
                 Some(create_body(&stem, base_model, &role_arn(role))),
             )
             .await;
+            let expected = match admitted {
+                // The identifier's own form is read first, so this row is answered by that
+                // reading whatever the role is.
+                AdmittedAnswer::RefusedOnItsForm => {
+                    (400, "ValidationException", INVALID_MODEL_IDENTIFIER)
+                }
+                _ => (403, "AccessDeniedException", PASS_ROLE_REFUSAL),
+            };
             assert_eq!(
                 (status, error.as_str(), text(&refused, "message").as_str()),
-                (403, "AccessDeniedException", PASS_ROLE_REFUSAL),
+                expected,
                 "case {case:?} ({base_model}) with {role_case:?}: the pass decision comes \
-                 first, whatever the identifier resolves to, got {status} {error} ({refused})"
+                 first for every identifier it resolves, got {status} {error} ({refused})"
             );
 
             // The refusal wrote nothing: no job under the name it carried, and no custom
@@ -794,6 +816,13 @@ async fn the_pass_is_authorized_before_the_request_is_resolved() {
                 (404, "ResourceNotFoundException"),
                 "case {case:?} ({base_model}): with a passable role the identifier's own \
                  resolution answers, got {status} {error} ({resolved})"
+            ),
+            AdmittedAnswer::RefusedOnItsForm => assert_eq!(
+                (status, error.as_str(), text(&resolved, "message").as_str()),
+                (400, "ValidationException", INVALID_MODEL_IDENTIFIER),
+                "case {case:?} ({base_model}): a value identifying no customizable base \
+                 model variant is refused on its form whatever the role, got {status} \
+                 {error} ({resolved})"
             ),
             AdmittedAnswer::ReportsAClientError => assert!(
                 UNOFFERED_MODEL_ERRORS

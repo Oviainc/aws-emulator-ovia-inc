@@ -24,7 +24,10 @@
 //! 2. **An identifier no stored job answers to is refused** with 404
 //!    `ResourceNotFoundException` — on the read and on the stop — over rows spanning a name
 //!    no job carries, a live name of another region, a well-formed ARN that was never
-//!    minted and a prefix of a live name.
+//!    minted and a prefix of a live name. A job ARN naming ANOTHER region is refused one
+//!    step earlier instead, with this service's own ARN sentence (400
+//!    `ValidationException`, `arn_inputs.rs`): such an ARN is not usable at this endpoint
+//!    at all, so it is never resolved against the store.
 //! 3. **The listing is filtered, ordered and paged** by the operation's own members:
 //!    `nameContains`, `statusEquals` and the creation-time bounds each have to hold,
 //!    `sortOrder` turns the order round, `maxResults` bounds the page and `nextToken`
@@ -596,15 +599,10 @@ async fn an_identifier_no_job_answers_to_is_not_found() {
         "arn:aws:bedrock:{REGION}:{ACCOUNT}:model-customization-job/{}/abcdef012345",
         fine_tuning_model(0)
     );
-    let other_region_arn = format!(
-        "arn:aws:bedrock:{other_region}:{ACCOUNT}:model-customization-job/{}/abcdef012345",
-        fine_tuning_model(0)
-    );
     let rows: Vec<(&str, String)> = vec![
         ("a name no job carries", "no-such-job".to_string()),
         ("a live name of another region", "elsewhere-job".to_string()),
         ("a well-formed ARN never minted", never_minted),
-        ("an ARN of another region", other_region_arn),
         ("a prefix of a live name", "live".to_string()),
     ];
     for (case, identifier) in rows {

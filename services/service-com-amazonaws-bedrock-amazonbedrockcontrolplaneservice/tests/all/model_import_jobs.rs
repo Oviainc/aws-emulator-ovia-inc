@@ -15,8 +15,10 @@
 //!    ARN and the bare `jobName` — address the same job.
 //! 2. **An identifier no stored job answers to is refused** with 404
 //!    `ResourceNotFoundException`, over rows spanning a never-created name, a live name in
-//!    another region, a well-formed ARN that was never minted, an ARN of another region and
-//!    a prefix of a live name.
+//!    another region, a well-formed ARN that was never minted and a prefix of a live name.
+//!    A job ARN naming ANOTHER region is refused one step earlier instead, with this
+//!    service's own ARN sentence (400 `ValidationException`, `arn_inputs.rs`): such an ARN
+//!    is not usable at this endpoint at all, so it is never resolved against the store.
 //! 3. **`status` is non-terminal first and settles to `Completed`**: `InProgress` straight
 //!    after the create with no `endTime`, `Completed` with an `endTime` once
 //!    `IMPORT_JOB_COMPLETE_AFTER` has passed — and the settle is owed by the clock, not by
@@ -417,10 +419,6 @@ async fn an_unknown_job_identifier_is_refused_as_not_found() {
         (
             "a well-formed job ARN that was never minted",
             format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:model-import-job/aaaaaaaaaaaa"),
-        ),
-        (
-            "the live job's ARN with another region",
-            live_arn.replace(REGION, "eu-west-1"),
         ),
         (
             "a prefix of the live job's name",

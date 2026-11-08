@@ -21,9 +21,10 @@
 //! ARN-valued member carries, and nothing in it marks which resources bedrock checks
 //! itself. WHICH resources those are is recorded too, in both directions: the same probe
 //! generator's ARN, from the same foreign region, is answered with the service's own
-//! sentence for a `custom-model`, `model-copy-job`, `model-invocation-job` or
-//! `provisioned-model`, and with the framework's constraint envelope for an
-//! `advanced-prompt-optimization-job` or an `evaluation-job`.
+//! sentence for a `custom-model`, `model-copy-job`, `model-invocation-job`,
+//! `provisioned-model`, `model-customization-job` or `model-import-job`, and with the
+//! framework's constraint envelope for an `advanced-prompt-optimization-job` or an
+//! `evaluation-job`.
 //! `crate::state::SELF_VALIDATED_RESOURCE_TYPES` is that catalog; the rows below drive
 //! both sides of it.
 //!
@@ -128,6 +129,19 @@ fn provisioned_model_arn(region: &str, id: &str) -> String {
 /// `model-invocation-job/[a-z0-9]{12}`.
 fn invocation_job_arn(region: &str, id: &str) -> String {
     format!("arn:aws:bedrock:{region}:{ACCOUNT}:model-invocation-job/{id}")
+}
+
+/// A model-customization-job ARN. `ModelCustomizationJobIdentifier` declares the resource
+/// as `model-customization-job/<base model>/[a-z0-9]{12}`, the base model carrying the
+/// `<provider>.<model>` form and up to two `:` qualifiers.
+fn customization_job_arn(region: &str, resource: &str) -> String {
+    format!("arn:aws:bedrock:{region}:{ACCOUNT}:model-customization-job/{resource}")
+}
+
+/// A model-import-job ARN. `ModelImportJobIdentifier` declares the resource as
+/// `model-import-job/[a-z0-9]{12}`.
+fn import_job_arn(region: &str, id: &str) -> String {
+    format!("arn:aws:bedrock:{region}:{ACCOUNT}:model-import-job/{id}")
 }
 
 /// Every ARN-bearing request this suite drives.
@@ -273,6 +287,57 @@ fn cases() -> Vec<Case> {
             ),
             body: None,
             expect: region_sentence(),
+        },
+        Case {
+            case: "a model-customization-job ARN from another region, read (recorded)",
+            region: HOME,
+            method: "GET",
+            path: format!(
+                "/model-customization-jobs/{}",
+                label(&customization_job_arn(
+                    "us-east-1",
+                    "amazon.titan-text-lite-v1/abcdef012345"
+                ))
+            ),
+            body: None,
+            expect: region_sentence(),
+        },
+        Case {
+            case: "a model-customization-job ARN from another region, stopped (recorded)",
+            region: HOME,
+            method: "POST",
+            path: format!(
+                "/model-customization-jobs/{}/stop",
+                label(&customization_job_arn(
+                    "eu-central-1",
+                    "meta.llama3-70b-instruct-v1:0/abcdef012345"
+                ))
+            ),
+            body: None,
+            expect: region_sentence(),
+        },
+        Case {
+            case: "a model-import-job ARN from another region, read (recorded)",
+            region: HOME,
+            method: "GET",
+            path: format!(
+                "/model-import-jobs/{}",
+                label(&import_job_arn("us-east-1", "abcdef012345"))
+            ),
+            body: None,
+            expect: region_sentence(),
+        },
+        Case {
+            // The same ARN read from its OWN region: the region compared is the request's.
+            case: "a model-import-job ARN read from its own region",
+            region: "us-east-1",
+            method: "GET",
+            path: format!(
+                "/model-import-jobs/{}",
+                label(&import_job_arn("us-east-1", "abcdef012345"))
+            ),
+            body: None,
+            expect: Expect::Accepted,
         },
         // ---- an in-region ARN of the wrong form: the format sentence -------------
         Case {

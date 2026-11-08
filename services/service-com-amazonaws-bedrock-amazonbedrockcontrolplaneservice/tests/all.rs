@@ -165,5 +165,7 @@ mod support;
 mod tagging;
 #[path = "all/use_case_for_model_access.rs"]
 mod use_case_for_model_access;
+#[path = "all/unresolved_model_identifier.rs"]
+mod unresolved_model_identifier;
 #[path = "all/validation_message_wording.rs"]
 mod validation_message_wording;

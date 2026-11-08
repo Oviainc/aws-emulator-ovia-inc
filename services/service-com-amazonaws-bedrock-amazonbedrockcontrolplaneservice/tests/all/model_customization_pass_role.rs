@@ -24,12 +24,14 @@
 //!    modelled `AccessDeniedException` (`@httpError(403)`) carrying the one sentence the
 //!    service states that denial with — over rows differing in the other account's digits,
 //!    the path the role sits behind, the partition and the length.
-//! 3. **The decision stands in front of everything the request names**: the same body that a
-//!    LATER step refuses (a `baseModelIdentifier` the catalog does not publish, a
-//!    customization the base model is not published for, more tags than a resource may
-//!    carry) draws the 403 when the role is another account's, and draws that later step's
-//!    own refusal when the role is this account's — so the authorization is taken first and
-//!    an admitting decision does not swallow what follows it.
+//! 3. **The decision stands in front of everything the request RESOLVES, but behind the
+//!    FORM of the model identifier it carries**: a `baseModelIdentifier` that identifies no
+//!    customizable base model variant (a bare id with no version qualifier) draws that
+//!    reading's own 400 under either role, while a body a step behind the pass refuses (a
+//!    `custom-model` ARN this account does not hold, a customization the base model is not
+//!    published for, more tags than a resource may carry) draws the 403 when the role is
+//!    another account's and that later step's own refusal when the role is this account's —
+//!    so an admitting decision does not swallow what follows it.
 //! 4. **A denied pass leaves nothing behind**: `GetModelCustomizationJob` answers 404 for the
 //!    `jobName` it carried, `ListModelCustomizationJobs(nameContains=<jobName>)` reports no
 //!    job, `ListCustomModels(nameContains=<customModelName>)` reports no model, and a repeat
@@ -80,7 +82,9 @@ const CUSTOMIZATION_TYPES: &[&str] = &[
 const DEFAULT_CUSTOMIZATION: &str = "FINE_TUNING";
 
 /// A base model the catalog publishes as supporting `FINE_TUNING`: the identifier a caller
-/// that read `ListFoundationModels` would submit.
+/// that read `ListFoundationModels(byCustomizationType=FINE_TUNING)` would submit. Amazon
+/// Bedrock publishes a customizable model under its training-qualified id, so this is the
+/// id the catalog carries the customization on.
 fn fine_tuning_model() -> &'static str {
     CATALOG
         .iter()
@@ -89,12 +93,23 @@ fn fine_tuning_model() -> &'static str {
         .expect("the catalog must publish a base model supporting FINE_TUNING")
 }
 
+/// A base model the catalog publishes whose id carries NO version qualifier: the on-demand
+/// spelling of a published model, which identifies no customizable variant of it.
+fn unqualified_model() -> &'static str {
+    CATALOG
+        .iter()
+        .find(|model| !model.model_id.contains(':'))
+        .map(|model| model.model_id)
+        .expect("the catalog must publish a model whose id carries no version qualifier")
+}
+
 /// A published base model and a modelled `CustomizationType` that model is NOT published
 /// for: the pair a later step of the create refuses, taken from the catalog rather than
 /// written out.
 fn unsupported_pair() -> (&'static str, &'static str) {
     CATALOG
         .iter()
+        .filter(|model| !model.customizations_supported.is_empty())
         .find_map(|model| {
             CUSTOMIZATION_TYPES
                 .iter()
@@ -633,19 +648,22 @@ async fn a_role_of_another_account_cannot_be_passed_and_the_refusal_stores_nothi
 }
 
 #[tokio::test]
-async fn the_pass_role_decision_is_taken_before_the_request_is_resolved() {
+async fn the_model_identifier_is_read_before_the_pass_role_decision() {
     let emu = emulator();
     let model = fine_tuning_model();
     let (unsupported_model, unsupported_customization) = unsupported_pair();
     let foreign_role = "arn:aws:iam::210987654321:role/bedrock-customization";
 
-    // Each row is a body a LATER step of the create refuses, with the status and code that
-    // step answers. The same body is submitted twice: with a role of another account, where
-    // the authorization answers first, and with a role of this account, where it admits and
-    // the later step answers.
-    let rows: Vec<(&str, Value, u16, &str)> = vec![
+    // Each row is a body ONE step of the create refuses, with the status and code that step
+    // answers and whether that step is taken AHEAD of the pass-role decision. The same body
+    // is submitted twice: with a role of another account, and with a role of this account.
+    // A step ahead of the pass answers in BOTH legs — the FORM of the identifier a request
+    // asks to customize is read before who may ask for it — while a step behind it (every
+    // step that RESOLVES what the request named, the catalogue included) answers only once
+    // the pass is admitted.
+    let rows: Vec<(&str, Value, u16, &str, bool)> = vec![
         (
-            "a baseModelIdentifier the catalog does not publish",
+            "a baseModelIdentifier that identifies no model variant",
             json!({
                 "jobName": "order-unknown-model",
                 "customModelName": "OrderUnknownModel",
@@ -653,8 +671,22 @@ async fn the_pass_role_decision_is_taken_before_the_request_is_resolved() {
                 "trainingDataConfig": { "s3Uri": "s3://customization-data/train.jsonl" },
                 "outputDataConfig": { "s3Uri": "s3://customization-output/" },
             }),
-            404,
-            "ResourceNotFoundException",
+            400,
+            "ValidationException",
+            true,
+        ),
+        (
+            "a published model by its unqualified on-demand id",
+            json!({
+                "jobName": "order-unqualified-model",
+                "customModelName": "OrderUnqualifiedModel",
+                "baseModelIdentifier": unqualified_model(),
+                "trainingDataConfig": { "s3Uri": "s3://customization-data/train.jsonl" },
+                "outputDataConfig": { "s3Uri": "s3://customization-output/" },
+            }),
+            400,
+            "ValidationException",
+            true,
         ),
         (
             "a custom-model ARN this account does not hold",
@@ -668,6 +700,7 @@ async fn the_pass_role_decision_is_taken_before_the_request_is_resolved() {
             }),
             404,
             "ResourceNotFoundException",
+            false,
         ),
         (
             "a customization the base model is not published for",
@@ -681,6 +714,7 @@ async fn the_pass_role_decision_is_taken_before_the_request_is_resolved() {
             }),
             400,
             "ValidationException",
+            false,
         ),
         (
             "more tags than either tagged resource may carry",
@@ -695,10 +729,11 @@ async fn the_pass_role_decision_is_taken_before_the_request_is_resolved() {
             }),
             400,
             "TooManyTagsException",
+            false,
         ),
     ];
 
-    for (case, body, later_status, later_code) in rows {
+    for (case, body, step_status, step_code, ahead_of_the_pass) in rows {
         let with_role = |role: &str| {
             let mut body = body.clone();
             body.as_object_mut()
@@ -707,38 +742,37 @@ async fn the_pass_role_decision_is_taken_before_the_request_is_resolved() {
             body
         };
 
-        let refused = create(&emu, REGION, with_role(foreign_role)).await;
+        let foreign = create(&emu, REGION, with_role(foreign_role)).await;
+        let (expected_status, expected_code, expected_message) = if ahead_of_the_pass {
+            (step_status, step_code, None)
+        } else {
+            (403, "AccessDeniedException", Some(PASS_ROLE_REFUSAL))
+        };
         assert_eq!(
-            refused.status, 403,
-            "case {case:?}: the pass-role decision answers before the step that would refuse \
-             this body, got {} {:?}",
-            refused.status, refused.body
+            (foreign.status, foreign.error.as_deref()),
+            (expected_status, Some(expected_code)),
+            "case {case:?}: with a role of another account the answer is the step that runs \
+             first ({expected_status} {expected_code}), got {} {:?}",
+            foreign.status,
+            foreign.body
         );
-        assert_eq!(
-            refused.error.as_deref(),
-            Some("AccessDeniedException"),
-            "case {case:?}: the refusal is the authorization's, got {:?}",
-            refused.error
-        );
-        assert_eq!(
-            refusal_message(&refused),
-            PASS_ROLE_REFUSAL,
-            "case {case:?}: expected the pass-role denial {PASS_ROLE_REFUSAL:?}, got {:?}",
-            refusal_message(&refused)
-        );
+        if let Some(expected_message) = expected_message {
+            assert_eq!(
+                refusal_message(&foreign),
+                expected_message,
+                "case {case:?}: expected the pass-role denial {expected_message:?}, got {:?}",
+                refusal_message(&foreign)
+            );
+        }
 
-        let later = create(&emu, REGION, with_role(&own_role("bedrock-customization"))).await;
+        let own = create(&emu, REGION, with_role(&own_role("bedrock-customization"))).await;
         assert_eq!(
-            later.status, later_status,
-            "case {case:?}: with a role of this account the pass is admitted and the later \
-             step answers {later_status}, got {} {:?}",
-            later.status, later.body
-        );
-        assert_eq!(
-            later.error.as_deref(),
-            Some(later_code),
-            "case {case:?}: expected the later step's {later_code}, got {:?}",
-            later.error
+            (own.status, own.error.as_deref()),
+            (step_status, Some(step_code)),
+            "case {case:?}: with a role of this account the pass is admitted and the step \
+             answers {step_status} {step_code}, got {} {:?}",
+            own.status,
+            own.body
         );
     }
 

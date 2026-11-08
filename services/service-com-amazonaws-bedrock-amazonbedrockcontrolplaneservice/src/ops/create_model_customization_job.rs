@@ -2,12 +2,24 @@
 
 //! @op CreateModelCustomizationJob
 //!
-//! Hands Amazon Bedrock a role and asks it to customize a base model, so the request is
-//! decided by the `iam:PassRole` step for `roleArn` BEFORE anything it names is resolved
+//! Hands Amazon Bedrock a role and asks it to customize a base model. What the request
+//! ASKS FOR is read first, as a question about the identifier's FORM:
+//! `baseModelIdentifier` has to identify a base model variant Amazon Bedrock customizes
+//! ([`crate::state::names_a_customizable_base_model`]) — a model ARN, or a bare model id
+//! carrying the version qualifier the customizable variant is published under — and a value
+//! that identifies none is refused 400 `ValidationException` carrying
+//! [`crate::state::INVALID_MODEL_IDENTIFIER_MESSAGE`] before anything else is decided.
+//!
+//! Behind that, the request is decided by the `iam:PassRole` step for `roleArn` BEFORE
+//! anything it names is RESOLVED
 //! ([`crate::state::job_pass_role_denial`] asks whether the value names a role of
 //! the CALLER'S OWN account that this account's IAM holds and whose trust policy grants
 //! Amazon Bedrock the assume THIS pass would make): a role the caller may not pass is the
-//! modelled `AccessDeniedException`, and such a refusal writes nothing at all.
+//! modelled `AccessDeniedException`, and such a refusal writes nothing at all. Only then is
+//! the identifier resolved against the published catalog, so an identifier that resolves to
+//! no model is the answer to a request whose pass was admitted
+//! ([`crate::state::unresolved_model`]: 404 `ResourceNotFoundException` for an ARN of one of
+//! this service's own model resources, 400 `ValidationException` otherwise).
 //!
 //! Where that decision admits the pass the customization starts: the job is minted
 //! `InProgress` and the clock owes it its terminal status, which is what brings the custom
@@ -209,13 +221,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx.parts());
 
+        // What the request ASKS FOR is read before who may ask for it: Amazon Bedrock reads
+        // the FORM of `baseModelIdentifier` — the base model variant a customization runs
+        // on — ahead of the `iam:PassRole` step below, so a value that identifies no such
+        // variant is answered as un-usable input rather than with a report about the role
+        // ([`crate::state::names_a_customizable_base_model`]). It is a question about the
+        // identifier alone, so it needs neither the store nor the clock. Whether the model
+        // it names EXISTS is settled behind that step, which is what the corpus records for
+        // an ARN-spelled identifier of a model this service offers no longer: the pass-role
+        // refusal, not the identifier's.
+        if !crate::state::names_a_customizable_base_model(&input.base_model_identifier) {
+            return Err(
+                CreateModelCustomizationJobErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::INVALID_MODEL_IDENTIFIER_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // The `iam:PassRole` step for `roleArn`, ahead of the store and ahead of every
         // resource this request names: the role is one Amazon Bedrock takes on to run the
         // customization, so whether this caller may pass it is settled before
-        // `baseModelIdentifier` is resolved — a denied pass is an authorization refusal
+        // `baseModelIdentifier` is RESOLVED — a denied pass is an authorization refusal
         // rather than a report about a model — and it leaves no job and no custom model
-        // behind. See `crate::state::job_pass_role_denial` for the decision,
-        // which is grounded in what this account's IAM answers about the role.
+        // behind. See `crate::state::job_pass_role_denial` for the decision, which is
+        // grounded in what this account's IAM answers about the role.
         //
         // The pass states NO source ARN: a customization job's ARN carries the base model
         // before its id (`ModelCustomizationJobArn`:
@@ -235,6 +269,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
                 CreateModelCustomizationJobErrorModeled::InternalServerException(
@@ -334,21 +369,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 let Some(model) = resolved else {
                     // Neither a published foundation model nor a custom model of this
                     // account, so the identifier names no base model there is anything to
-                    // customize — reported absent, exactly as
-                    // `ops/create_provisioned_model_throughput.rs` reports a `modelId` the
-                    // catalog does not carry.
-                    return Err(
-                        CreateModelCustomizationJobErrorModeled::ResourceNotFoundException(
-                            ResourceNotFoundException {
-                                message: Some(format!(
-                                    "baseModelIdentifier {} does not name a base model in this \
-                                     account in {region}",
-                                    input.base_model_identifier
-                                )),
-                            },
-                        )
-                        .into(),
+                    // customize — refused as the spelling it IS, the one reading every
+                    // model-identifying member of this service shares.
+                    let refusal = crate::state::unresolved_model(
+                        &input.base_model_identifier,
+                        crate::state::BASE_MODEL_RESOURCES,
                     );
+                    let message = Some(refusal.message(&input.base_model_identifier));
+                    return Err(if refusal.missing_resource() {
+                        CreateModelCustomizationJobErrorModeled::ResourceNotFoundException(
+                            ResourceNotFoundException { message },
+                        )
+                    } else {
+                        CreateModelCustomizationJobErrorModeled::ValidationException(
+                            ValidationException { message },
+                        )
+                    }
+                    .into());
                 };
                 model
             }

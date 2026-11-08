@@ -7,9 +7,12 @@
 //! Reports the imported model a `modelIdentifier` names — either spelling, the imported
 //! model's ARN or its bare name — out of the import job that holds it
 //! ([`crate::state::ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::imported_model`]),
-//! and refuses an identifier no imported
-//! model answers to with 404 `ResourceNotFoundException`. An import that has not finished
-//! has imported no model, so an identifier naming one is refused the same way.
+//! and refuses an identifier no imported model answers to as the spelling it IS
+//! ([`crate::state::unresolved_model`]): 404 `ResourceNotFoundException` for an
+//! `imported-model` ARN that names none, and 400 `ValidationException` carrying
+//! [`crate::state::INVALID_MODEL_IDENTIFIER_MESSAGE`] for a bare name this service cannot
+//! resolve to a model at all. An import that has not finished has imported no model, so an
+//! identifier naming one is refused the same way.
 //!
 //! This operation is `@readonly`, and the ONE write it makes is the status transition the
 //! CLOCK already made due on the import job it reads
@@ -197,14 +200,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some((job, ended_at)) = store.imported_model(&input.model_identifier, &region, now)
         else {
-            return Err(GetImportedModelErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(format!(
-                        "no imported model answers to {} in this account in {region}",
-                        input.model_identifier
-                    )),
-                },
-            )
+            // `modelIdentifier` admits the model's ARN or its bare NAME, and the two
+            // unresolvable spellings are not the same failure — the one reading every
+            // model-identifying member shares ([`crate::state::unresolved_model`]), each
+            // answering it with the error its own model declares for that class. A model
+            // whose import has not completed yet exists no more than one nothing imported,
+            // so it is read the same way.
+            let refusal = crate::state::unresolved_model(
+                &input.model_identifier,
+                crate::state::IMPORTED_MODEL_RESOURCES,
+            );
+            let message = Some(refusal.message(&input.model_identifier));
+            return Err(if refusal.missing_resource() {
+                GetImportedModelErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException { message },
+                )
+            } else {
+                GetImportedModelErrorModeled::ValidationException(ValidationException { message })
+            }
             .into());
         };
 

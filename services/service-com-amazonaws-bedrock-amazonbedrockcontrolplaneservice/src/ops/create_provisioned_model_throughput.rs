@@ -23,9 +23,12 @@
 //!   live Provisioned Throughputs of one name in one region could not both be addressed by
 //!   it: a second create of a live name is refused with 400 `ValidationException`.
 //! * `modelId` names the base model the throughput is bought over, as a model ARN or a bare
-//!   model id ([`crate::state::FoundationModelCatalog::resolve_base_model`]). A model no
-//!   model id of this service names is no resource to provision — 404
-//!   `ResourceNotFoundException` — while a model that EXISTS and is offered under no
+//!   model id ([`crate::state::FoundationModelCatalog::resolve_base_model`]). An identifier
+//!   that names no model of this service is refused as the spelling it IS
+//!   ([`crate::state::unresolved_model`]): 400 `ValidationException` carrying
+//!   [`crate::state::INVALID_MODEL_IDENTIFIER_MESSAGE`] for the bare model-id spelling,
+//!   which is no ARN to report missing, and 404 `ResourceNotFoundException` for an ARN of
+//!   one of this service's own model resources. A model that EXISTS and is offered under no
 //!   Provisioned Throughput is refused with 400 `ValidationException`: one the catalog
 //!   carries without it ([`crate::state::supports_provisioned_throughput`]), and one this
 //!   service recognises and offers no longer
@@ -264,7 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // model this service recognises and offers no longer, are both models that exist
         // and are offered under no Provisioned Throughput — one 400 `ValidationException`
         // about the purchase ([`crate::state::MODEL_NOT_SUPPORTED_FOR_PROVISIONED_THROUGHPUT`])
-        // — while only an identifier naming no model at all is a resource to report missing.
+        // — while an identifier naming no model at all is refused as the spelling it is.
         let not_provisionable = || {
             CreateProvisionedModelThroughputErrorModeled::ValidationException(
                 ValidationException {
@@ -278,17 +281,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::BaseModelIdentity::Offered(model) => *model,
             crate::state::BaseModelIdentity::Retired => return Err(not_provisionable().into()),
             crate::state::BaseModelIdentity::Unknown => {
-                return Err(
+                // An identifier that resolves to no model is refused as the spelling it IS
+                // — the one reading every model-identifying member shares
+                // ([`crate::state::unresolved_model`]): an ARN of one of this service's own
+                // model resources is a resource to report missing, while `modelId`'s bare
+                // model-id spelling names no ARN at all and is a value this service cannot
+                // read as a model, which is an input fault.
+                let refusal = crate::state::unresolved_model(
+                    &input.model_id,
+                    crate::state::BASE_MODEL_RESOURCES,
+                );
+                let message = Some(refusal.message(&input.model_id));
+                return Err(if refusal.missing_resource() {
                     CreateProvisionedModelThroughputErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(format!(
-                                "modelId {} does not name a model in this account",
-                                input.model_id
-                            )),
-                        },
+                        ResourceNotFoundException { message },
                     )
-                    .into(),
-                )
+                } else {
+                    CreateProvisionedModelThroughputErrorModeled::ValidationException(
+                        ValidationException { message },
+                    )
+                }
+                .into());
             }
         };
         if !crate::state::supports_provisioned_throughput(&model) {

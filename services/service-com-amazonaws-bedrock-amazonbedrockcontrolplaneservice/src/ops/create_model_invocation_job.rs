@@ -312,9 +312,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // OFFERED (`crate::state::FoundationModelCatalog::resolve_base_model`): a
             // retired model's id names a model, so the submission is judged on what it
             // asks for rather than reported as naming nothing. A value naming none of
-            // these families names no model there is anything to invoke, reported absent
-            // exactly as `ops/create_model_customization_job.rs` reports a base model the
-            // catalog does not carry.
+            // these families names no model there is anything to invoke, refused exactly
+            // as `ops/create_model_customization_job.rs` refuses a base model identifier
+            // the catalog does not carry.
             let names_a_model = !matches!(
                 store.foundation_models.resolve_base_model(&input.model_id),
                 crate::state::BaseModelIdentity::Unknown
@@ -324,17 +324,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .inference_profile_arn_of(&input.model_id, &region)
                     .is_some();
             if !names_a_model {
-                return Err(
-                    CreateModelInvocationJobErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException {
-                            message: Some(format!(
-                                "modelId {} does not name a model in this account in {region}",
-                                input.model_id
-                            )),
-                        },
-                    )
-                    .into(),
+                // An identifier that resolves to no model of any of those families is
+                // refused as the spelling it IS — the one reading every model-identifying
+                // member shares ([`crate::state::unresolved_model`]).
+                let refusal = crate::state::unresolved_model(
+                    &input.model_id,
+                    crate::state::INVOCATION_MODEL_RESOURCES,
                 );
+                let message = Some(refusal.message(&input.model_id));
+                return Err(if refusal.missing_resource() {
+                    CreateModelInvocationJobErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException { message },
+                    )
+                } else {
+                    CreateModelInvocationJobErrorModeled::ValidationException(
+                        ValidationException { message },
+                    )
+                }
+                .into());
             }
 
             // The account's batch inference job quota. Enforcing it here is also what bounds

@@ -258,10 +258,26 @@ pub fn tagging_resource_not_found_message(resource_arn: &str) -> String {
         .map(|arn| arn.resource_type())
     {
         Some(resource_type) if !resource_type.is_empty() => {
-            format!("{} not found", resource_type_noun(resource_type))
+            resource_type_not_found_message(resource_type)
         }
         _ => "Resource not found".to_string(),
     }
+}
+
+/// What this service answers for an ARN of one of its own resource types that names no such
+/// resource: the type as the noun phrase that opens the sentence, and nothing of the request
+/// in it.
+///
+/// RECORDED behaviour, stated once here because the sentence belongs to the RESOURCE TYPE
+/// rather than to the operation that reported it missing: a resource of one type reports
+/// itself absent the same way whichever member carried its ARN. The sentence carries no
+/// full stop, which is how the corpus records it; the one resource whose recorded sentence
+/// ends in one keeps its own constant ([`CUSTOM_MODEL_NOT_FOUND_MESSAGE`]) rather than being
+/// bent to this rendering, because a message is recorded wording and not a format to
+/// normalise.
+#[must_use]
+pub fn resource_type_not_found_message(resource_type: &str) -> String {
+    format!("{} not found", resource_type_noun(resource_type))
 }
 
 /// A resource type as the noun phrase that OPENS a sentence about it: the type spelled as
@@ -879,54 +895,122 @@ pub const CUSTOM_MODEL_NOT_FOUND_MESSAGE: &str = "Custom model not found.";
 pub const INVALID_MODEL_IDENTIFIER_MESSAGE: &str =
     ::service_com_amazonaws_bedrockruntime_amazonbedrockfrontendservice::state::INVALID_MODEL_IDENTIFIER_MESSAGE;
 
-/// How a `ModelIdentifier` that resolves to no custom model of this account and Region is
-/// refused — the ONE reading of that failure every operation addressing a custom model by
-/// that member shares ([`unresolved_custom_model`]).
+/// How a value submitted to a member that IDENTIFIES a model — a `ModelIdentifier`, an
+/// `ImportedModelIdentifier`, a `baseModelIdentifier`, a `modelId` — and which this
+/// service resolved to NO model is refused.
+///
+/// Such a member admits several spellings of one model (the ARN of a resource this service
+/// holds, a bare foundation model id, a bare model name), and an unresolvable value is not
+/// the same failure in each: WHICH it is comes off the spelling the caller used, never off
+/// what the store happens to hold.
+///
+/// * an ARN of one of the resource types the operation RESOLVES that member against names a
+///   resource to report missing — `ResourceNotFoundException` (404), which is what that
+///   error documents itself as ("The specified resource Amazon Resource Name (ARN) was not
+///   found. Check the Amazon Resource Name (ARN) and try your request again") — carrying
+///   that resource type's own not-found sentence;
+/// * every other spelling the member admits is a value this service cannot read as the
+///   model the operation addresses, which is an INPUT fault: `ValidationException` (400)
+///   carrying the fixed [`INVALID_MODEL_IDENTIFIER_MESSAGE`].
+///
+/// Keeping them apart is what lets a caller act on the answer: 400 says "fix the request",
+/// where 404 is routinely retried as eventual consistency. It is the same split the
+/// published catalogue makes for a `modelIdentifier` ([`unoffered_foundation_model`]) and
+/// the inference plane makes for the same member, read here for every member that resolves
+/// one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UnresolvedCustomModel {
-    /// The value is a `custom-model` ARN of this service's namespace that names no stored
-    /// model, so it is an ARN to report missing: `ResourceNotFoundException` (404), which is
-    /// what that error documents itself as ("The specified resource Amazon Resource Name
-    /// (ARN) was not found. Check the Amazon Resource Name (ARN) and try your request
-    /// again"), carrying [`CUSTOM_MODEL_NOT_FOUND_MESSAGE`].
-    MissingArn,
-    /// The value is one of the member's other spellings — a bare model NAME — that names no
-    /// model, so there is no ARN to report missing: it is an identifier this service could
-    /// not resolve, which is `ValidationException` (400) carrying
-    /// [`INVALID_MODEL_IDENTIFIER_MESSAGE`].
-    UnresolvableIdentifier,
+pub enum UnresolvedModel {
+    /// An ARN of one of the resource types the operation resolves the identifier against,
+    /// naming no such resource — the type it named.
+    MissingResource(&'static str),
+    /// Any other spelling the member admits: a bare foundation model id, a bare model name,
+    /// an ARN of a resource type this operation does not resolve the member against.
+    UnreadableIdentifier,
 }
 
-impl UnresolvedCustomModel {
-    /// The sentence this refusal carries. Fixed text in both readings: neither quotes the
-    /// identifier the request addressed, so the two spellings of one missing model are told
-    /// apart by the error, never by a value echoed back.
+impl UnresolvedModel {
+    /// Whether this reading reports a missing RESOURCE (404) rather than un-usable input
+    /// (400) — the one question an operation asks to pick the error its own model declares
+    /// for the class.
     #[must_use]
-    pub fn message(self) -> &'static str {
+    pub fn missing_resource(self) -> bool {
+        matches!(self, Self::MissingResource(_))
+    }
+
+    /// The sentence this refusal carries: the not-found sentence of the resource type the
+    /// ARN named, or the fixed one for an identifier this service cannot read.
+    ///
+    /// Fixed text for every reading whose fault is the CLASS of the identifier rather than
+    /// the value in it; the missing `foundation-model` ARN echoes the ARN the request
+    /// addressed, because that is the resource it reports absent and that is how the
+    /// catalogue's own read is recorded reporting it.
+    #[must_use]
+    pub fn message(self, identifier: &str) -> String {
         match self {
-            Self::MissingArn => CUSTOM_MODEL_NOT_FOUND_MESSAGE,
-            Self::UnresolvableIdentifier => INVALID_MODEL_IDENTIFIER_MESSAGE,
+            Self::MissingResource(CUSTOM_MODEL_RESOURCE_TYPE) => {
+                CUSTOM_MODEL_NOT_FOUND_MESSAGE.to_string()
+            }
+            Self::MissingResource(FOUNDATION_MODEL_RESOURCE_TYPE) => {
+                foundation_model_not_found(identifier)
+            }
+            Self::MissingResource(resource_type) => resource_type_not_found_message(resource_type),
+            Self::UnreadableIdentifier => INVALID_MODEL_IDENTIFIER_MESSAGE.to_string(),
         }
     }
 }
 
-/// How `identifier` — a `ModelIdentifier` that [`ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::custom_model`]
-/// resolved to nothing — is refused.
+/// How `identifier` — a value submitted to a model-identifying member that this service
+/// resolved to no model — is refused, where `resolved_against` are the ARN resource types
+/// the operation looked it up in.
 ///
-/// The member's `@pattern` admits the model's ARN **or** its bare name
-/// (`smithy_query(query="operation",operation="GetCustomModel,DeleteCustomModel")`), and the
-/// two unresolvable spellings are not the same failure, so which one the caller sent is read
-/// off the value through this crate's one ARN parse ([`names_arn_of`]). Stated once because
-/// the reading belongs to the RESOURCE rather than to one operation: a read and a delete of
-/// an identifier that resolves to no custom model refuse it alike.
+/// Stated once because the reading belongs to the IDENTIFIER rather than to one operation:
+/// every operation that resolves a model identifier refuses one it cannot resolve the same
+/// way, and `resolved_against` is the only thing that differs between them — the families
+/// that operation asks, which is what decides whether an ARN spelling names a resource
+/// there is anything to report missing. The spelling is read through this crate's one ARN
+/// parse, so no two readings of "is this an ARN of ours" disagree; a value that is no ARN
+/// of this service's namespace names no resource of it at all.
 #[must_use]
-pub fn unresolved_custom_model(identifier: &str) -> UnresolvedCustomModel {
-    if names_arn_of(identifier, CUSTOM_MODEL_RESOURCE_TYPE) {
-        UnresolvedCustomModel::MissingArn
-    } else {
-        UnresolvedCustomModel::UnresolvableIdentifier
-    }
+pub fn unresolved_model(identifier: &str, resolved_against: &[&'static str]) -> UnresolvedModel {
+    let Some(arn) = ::service_common::arn::parse_of(identifier, ARN_NAMESPACE) else {
+        return UnresolvedModel::UnreadableIdentifier;
+    };
+    let named = arn.resource_type();
+    resolved_against
+        .iter()
+        .find(|resource_type| **resource_type == named)
+        .map_or(UnresolvedModel::UnreadableIdentifier, |resource_type| {
+            UnresolvedModel::MissingResource(resource_type)
+        })
 }
+
+/// The ARN resource types the imported model family resolves an `ImportedModelIdentifier`
+/// against: the model's own ARN, beside the bare model NAME the same member admits
+/// (`smithy_query(query="operation",operation="GetImportedModel")`).
+pub const IMPORTED_MODEL_RESOURCES: &[&str] = &[IMPORTED_MODEL_RESOURCE_TYPE];
+
+/// The ARN resource types a base-model member is resolved against: the published
+/// catalogue's `foundation-model` ARNs and the `custom-model` ARNs of this account, which
+/// are the two ARN forms `BaseModelIdentifier` and `ModelIdentifier` admit
+/// (`smithy_query(query="shape",shape="BaseModelIdentifier,ModelIdentifier")`).
+pub const BASE_MODEL_RESOURCES: &[&str] =
+    &[FOUNDATION_MODEL_RESOURCE_TYPE, CUSTOM_MODEL_RESOURCE_TYPE];
+
+/// The ARN resource types a custom-model member is resolved against: only the model's own
+/// ARN. `ModelIdentifier` admits a `foundation-model` ARN too, but an operation of the
+/// custom model resource resolves the member against the CUSTOM models alone, so such a
+/// value names no resource it could report missing.
+pub const CUSTOM_MODEL_RESOURCES: &[&str] = &[CUSTOM_MODEL_RESOURCE_TYPE];
+
+/// The ARN resource types a batch inference `modelId` is resolved against: the two base
+/// model forms, and the inference profiles the same member admits
+/// (`smithy_query(query="shape",shape="ModelId")`).
+pub const INVOCATION_MODEL_RESOURCES: &[&str] = &[
+    FOUNDATION_MODEL_RESOURCE_TYPE,
+    CUSTOM_MODEL_RESOURCE_TYPE,
+    INFERENCE_PROFILE_RESOURCE_TYPE,
+    APPLICATION_INFERENCE_PROFILE_RESOURCE_TYPE,
+];
 
 /// What a create whose artifacts are named by a `modelSourceConfig` answers as its
 /// `ValidationException` message when the request names no role Amazon Bedrock can read
@@ -949,6 +1033,47 @@ pub const INVALID_ROLE_ARN_MESSAGE: &str = "The provided role ARN is invalid.";
 /// size" (`smithy_query(query="doc",shape="CreateModelCustomizationJob")`) — so this is
 /// the status a job carries from the call that starts it.
 pub const MODEL_CUSTOMIZATION_JOB_STATUS_IN_PROGRESS: &str = "InProgress";
+
+/// Whether `base_model_identifier` is spelled the way Amazon Bedrock identifies the base
+/// model a CUSTOMIZATION job runs on, which is read ahead of everything else the request
+/// names — the `iam:PassRole` step for `roleArn` included.
+///
+/// A customization runs on a TRAINING VARIANT of a published model rather than on the model
+/// a caller invokes on demand, and Amazon Bedrock publishes that variant under the model id
+/// with its version qualifiers (`<provider>.<model>:<version>:<context length>`,
+/// `ModelCustomizationJobArn` admits `([:][a-z0-9-]{1,63}){0,2}` after the model name for
+/// exactly that reason). So two spellings identify one:
+///
+/// * an ARN of a model resource of this service's namespace — the published model's
+///   `foundation-model` ARN, or the `custom-model` ARN of a model this account customized
+///   already, which names the model RESOURCE and carries its own qualifiers;
+/// * a bare model id carrying at least one of those qualifiers.
+///
+/// A bare `<provider>.<model>` id with no qualifier at all names the on-demand model and no
+/// customizable variant of it, so it identifies nothing this operation can customize and is
+/// refused with [`INVALID_MODEL_IDENTIFIER_MESSAGE`] — RECORDED behaviour, and recorded for
+/// the two spellings in both directions: the corpus records that refusal for an unqualified
+/// bare id, and records an ARN-spelled identifier of a model this service offers no longer
+/// reaching the pass-role decision behind this check instead.
+///
+/// This is a question about the identifier's FORM, so it reads no state and resolves
+/// nothing: whether the variant it names exists is the catalogue's answer, taken behind the
+/// pass-role step.
+#[must_use]
+pub fn names_a_customizable_base_model(base_model_identifier: &str) -> bool {
+    if ::service_common::arn::parse_of(base_model_identifier, ARN_NAMESPACE).is_some() {
+        return true;
+    }
+    // The bare form: a `<provider>.<model>` id followed by at least one `:<qualifier>`
+    // segment, every qualifier non-empty — the shape `ModelCustomizationJobArn` spells
+    // after the model name.
+    let Some((model, qualifiers)) = base_model_identifier.split_once(':') else {
+        return false;
+    };
+    model.contains('.')
+        && !qualifiers.is_empty()
+        && qualifiers.split(':').all(|qualifier| !qualifier.is_empty())
+}
 
 /// `ModelCustomizationJobStatus` once the customization has finished — the terminal status
 /// the one above is owed its move to.

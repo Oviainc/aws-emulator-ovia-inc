@@ -27,8 +27,11 @@
 //!    for the region it addressed, and a committed one is admitted up to the granted units
 //!    and refused past them.
 //! 4. **`modelId` must name a base model the account's catalog offers with Provisioned
-//!    Throughput**: a model the catalog does not carry is 404 `ResourceNotFoundException`,
-//!    one it carries but offers on demand only is 400 `ValidationException`.
+//!    Throughput**: a model the catalog does not carry is refused as the spelling it IS —
+//!    400 `ValidationException` for the bare model-id spelling, which is no ARN to report
+//!    missing, and 404 `ResourceNotFoundException` for an ARN of one of this service's own
+//!    model resources — while one it carries but offers on demand only is 400
+//!    `ValidationException` about the purchase.
 //! 5. **`status` is non-terminal first and settles to `InService`**: `Creating` straight
 //!    after a create, `InService` once `PROVISIONED_MODEL_SETTLE_AFTER` has passed — and
 //!    the settle is owed by the clock, not by the read.
@@ -89,6 +92,11 @@ const ON_DEMAND_ONLY_MODELS: &[&str] = &[
 /// `CommitmentDuration` is `[OneMonth, SixMonths]`
 /// (`smithy_query(query="shape",shape="CommitmentDuration")`).
 const COMMITMENTS: &[&str] = &["OneMonth", "SixMonths"];
+
+/// The two fixed sentences a `modelId` that resolves to no model is refused with, written
+/// out here rather than read off the crate so this suite pins the wording a client reads.
+const INVALID_MODEL_IDENTIFIER: &str = "The provided model identifier is invalid.";
+const CUSTOM_MODEL_NOT_FOUND: &str = "Custom model not found.";
 
 /// `ProvisionedModelStatus` is `[Creating, InService, Updating, Failed]`
 /// (`smithy_query(query="shape",shape="ProvisionedModelStatus")`).
@@ -662,35 +670,57 @@ async fn the_no_commitment_quota_refusal_hands_over_the_service_limit_increase_c
 async fn a_model_the_catalog_does_not_offer_for_provisioning_is_refused() {
     let emu = emulator();
 
-    // A model the published catalog does not carry is no resource to provision, whichever
-    // `ModelIdentifier` spelling names it.
-    let unknown: Vec<(&str, String)> = vec![
-        ("a bare id no row carries", "amazon.titan-not-a-model".to_string()),
+    // A model the published catalog does not carry is a model this service cannot resolve,
+    // and the `ModelIdentifier` spelling that named it decides HOW that is reported: an ARN
+    // of one of this service's own model resources names a resource to report missing, while
+    // the bare model-id spelling is no ARN at all and is un-usable input.
+    let unknown: Vec<(&str, String, u16, &str, String)> = vec![
+        (
+            "a bare id no row carries",
+            "amazon.titan-not-a-model".to_string(),
+            400,
+            "ValidationException",
+            INVALID_MODEL_IDENTIFIER.to_string(),
+        ),
         (
             "the ARN of a model no row carries",
             model_arn(REGION, "amazon.titan-not-a-model"),
+            404,
+            "ResourceNotFoundException",
+            format!(
+                "Could not resolve the model from the provided model identifier: {}",
+                model_arn(REGION, "amazon.titan-not-a-model")
+            ),
         ),
         (
             "a live model id with a suffix",
             format!("{}-2", PROVISIONABLE_MODELS[0]),
+            400,
+            "ValidationException",
+            INVALID_MODEL_IDENTIFIER.to_string(),
         ),
         (
             "a custom model ARN this account holds no model for",
             format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:custom-model/amazon.titan-text-lite-v1/abcdefghijkl"),
+            404,
+            "ResourceNotFoundException",
+            CUSTOM_MODEL_NOT_FOUND.to_string(),
         ),
     ];
-    for (case, model_id, ) in unknown {
+    for (case, model_id, status, code, sentence) in unknown {
         let reply = create(&emu, committed_body("pt-unknown-model", &model_id)).await;
         assert_eq!(
-            reply.status, 404,
-            "case {case}: the create must answer 404, got {} {:?}",
-            reply.status, reply.body
+            (reply.status, reply.error.as_deref()),
+            (status, Some(code)),
+            "case {case}: the create must answer {status} {code}, got {} {:?}",
+            reply.status,
+            reply.body
         );
         assert_eq!(
-            reply.error.as_deref(),
-            Some("ResourceNotFoundException"),
-            "case {case}: the create must answer ResourceNotFoundException, got {:?}",
-            reply.error
+            refusal_message(&reply),
+            sentence,
+            "case {case}: the refusal states the sentence of its class, got {:?}",
+            refusal_message(&reply)
         );
     }
 

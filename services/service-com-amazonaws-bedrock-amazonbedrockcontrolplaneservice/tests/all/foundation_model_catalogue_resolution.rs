@@ -292,15 +292,43 @@ async fn a_provisioned_throughput_purchase_refuses_a_model_that_exists_as_not_su
                     reply.body
                 );
             }
-            Named::MissingArn | Named::UnreadableId => assert_eq!(
-                (reply.status, code(&reply)),
-                (404, "ResourceNotFoundException"),
-                "case {case}: an identifier naming no model at all has no resource to \
-                 provision, got {} {} {:?}",
-                reply.status,
-                code(&reply),
-                reply.body
-            ),
+            // An identifier that names no model at all is refused as the spelling it IS,
+            // exactly as the read of the catalogue refuses it: the ARN spelling reports a
+            // missing resource, the bare id is an input fault.
+            Named::MissingArn => {
+                assert_eq!(
+                    (reply.status, code(&reply)),
+                    (404, "ResourceNotFoundException"),
+                    "case {case}: an ARN naming no model has no resource to provision, got {} \
+                     {} {:?}",
+                    reply.status,
+                    code(&reply),
+                    reply.body
+                );
+                assert_eq!(
+                    message(&case, &reply),
+                    bedrock::state::foundation_model_not_found(&identifier),
+                    "case {case}: the refusal must name the identifier it could not resolve, \
+                     got {:?}",
+                    reply.body
+                );
+            }
+            Named::UnreadableId => {
+                assert_eq!(
+                    (reply.status, code(&reply)),
+                    (400, "ValidationException"),
+                    "case {case}: a bare id naming no model is an input fault, got {} {} {:?}",
+                    reply.status,
+                    code(&reply),
+                    reply.body
+                );
+                assert_eq!(
+                    message(&case, &reply),
+                    bedrock::state::INVALID_MODEL_IDENTIFIER_MESSAGE,
+                    "case {case}: the refusal must be the service's fixed sentence, got {:?}",
+                    reply.body
+                );
+            }
         }
     }
 
@@ -480,15 +508,42 @@ async fn a_batch_submission_naming_a_model_the_service_knows_is_not_reported_abs
                     read.body
                 );
             }
-            Named::MissingArn | Named::UnreadableId => assert_eq!(
-                (reply.status, code(&reply)),
-                (404, "ResourceNotFoundException"),
-                "case {case}: an identifier naming no model has nothing to invoke, got {} {} \
-                 {:?}",
-                reply.status,
-                code(&reply),
-                reply.body
-            ),
+            // An identifier that names no model at all is refused as the spelling it IS,
+            // exactly as the read of the catalogue refuses it.
+            Named::MissingArn => {
+                assert_eq!(
+                    (reply.status, code(&reply)),
+                    (404, "ResourceNotFoundException"),
+                    "case {case}: an ARN naming no model has nothing to invoke, got {} {} \
+                     {:?}",
+                    reply.status,
+                    code(&reply),
+                    reply.body
+                );
+                assert_eq!(
+                    message(&case, &reply),
+                    bedrock::state::foundation_model_not_found(&identifier),
+                    "case {case}: the refusal must name the identifier it could not resolve, \
+                     got {:?}",
+                    reply.body
+                );
+            }
+            Named::UnreadableId => {
+                assert_eq!(
+                    (reply.status, code(&reply)),
+                    (400, "ValidationException"),
+                    "case {case}: a bare id naming no model is an input fault, got {} {} {:?}",
+                    reply.status,
+                    code(&reply),
+                    reply.body
+                );
+                assert_eq!(
+                    message(&case, &reply),
+                    bedrock::state::INVALID_MODEL_IDENTIFIER_MESSAGE,
+                    "case {case}: the refusal must be the service's fixed sentence, got {:?}",
+                    reply.body
+                );
+            }
         }
     }
 }

@@ -23,8 +23,10 @@
 //!    `ResourceNotFoundException`, over rows spanning a never-minted id, a well-formed ARN
 //!    that was never minted and a live job of another region.
 //! 4. **`modelId` is resolved against the published catalog**: an identifier that names no
-//!    model of this account is 404 `ResourceNotFoundException`, while every model the
-//!    catalog publishes is accepted.
+//!    model of this account is refused as the spelling it IS — 404
+//!    `ResourceNotFoundException` for an ARN of one of this service's own resource types,
+//!    400 `ValidationException` for a bare model id, which is no ARN to report missing —
+//!    while every model the catalog publishes is accepted.
 //! 5. **`status` walks the documented progression on the submission's own clock**: `Submitted`
 //!    with no `endTime` straight after the create, then `Validating`, then `Scheduled`, then
 //!    `InProgress`, each dwelling its own span and each stamped at the instant that span fell
@@ -262,6 +264,11 @@ const ROLE_ARNS: &[&str] = &[
 /// `S3InputFormat` — the one value the modelled enum carries
 /// (`crate::ops::types::S3_INPUT_FORMAT_VALUES`).
 const S3_INPUT_FORMAT: &str = "JSONL";
+
+/// The fixed sentence Amazon Bedrock states for a model identifier it cannot read as a
+/// model at all, written out here rather than read off the crate so this suite pins the
+/// wording a client reads.
+const INVALID_MODEL_IDENTIFIER: &str = "The provided model identifier is invalid.";
 
 // ---------------------------------------------------------------------------------------
 // Request helpers.
@@ -803,34 +810,63 @@ async fn the_model_is_resolved_against_the_published_catalog() {
     }
 
     let emu = emulator();
-    // And an identifier naming no model of this account is reported absent.
-    let unknown = [
-        ("a bare id no catalog row carries", "nosuchmodel".to_string()),
+    // And an identifier naming no model of this account is refused as the spelling it IS:
+    // an ARN of one of this service's own resource types reports that resource missing,
+    // while the bare model-id spelling is no ARN at all and is un-usable input.
+    let custom_model = format!(
+        "arn:aws:bedrock:{REGION}:{ACCOUNT}:custom-model/nosuch.model-v1/cccccccccccc"
+    );
+    let profile = format!(
+        "arn:aws:bedrock:{REGION}:{ACCOUNT}:application-inference-profile/dddddddddddd"
+    );
+    let unknown: Vec<(&str, String, u16, &str, String)> = vec![
+        (
+            "a bare id no catalog row carries",
+            "nosuchmodel".to_string(),
+            400,
+            "ValidationException",
+            INVALID_MODEL_IDENTIFIER.to_string(),
+        ),
         (
             "a foundation model ARN no catalog row carries",
             foundation_model_arn(REGION, "nosuch.model-v1"),
+            404,
+            "ResourceNotFoundException",
+            format!(
+                "Could not resolve the model from the provided model identifier: {}",
+                foundation_model_arn(REGION, "nosuch.model-v1")
+            ),
         ),
         (
             "a custom model ARN that was never minted",
-            format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:custom-model/nosuch.model-v1/cccccccccccc"),
+            custom_model,
+            404,
+            "ResourceNotFoundException",
+            "Custom model not found.".to_string(),
         ),
         (
             "an inference profile ARN that was never minted",
-            format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:application-inference-profile/dddddddddddd"),
+            profile,
+            404,
+            "ResourceNotFoundException",
+            "Application inference profile not found".to_string(),
         ),
     ];
-    for (case, model_id) in unknown {
+    for (case, model_id, status, code, sentence) in unknown {
         let reply = create(&emu, create_body("batch-unknown-model", &model_id)).await;
         assert_eq!(
-            reply.status, 404,
-            "case {case}: {model_id} names no model, so the create must answer 404, got {} {:?}",
-            reply.status, reply.body
+            (reply.status, reply.error.as_deref()),
+            (status, Some(code)),
+            "case {case}: {model_id} names no model, so the create must answer {status} \
+             {code}, got {} {:?}",
+            reply.status,
+            reply.body
         );
         assert_eq!(
-            reply.error.as_deref(),
-            Some("ResourceNotFoundException"),
-            "case {case}: the create must answer ResourceNotFoundException, got {:?}",
-            reply.error
+            reply.get("message").as_str(),
+            Some(sentence.as_str()),
+            "case {case}: the refusal states the sentence of its class, got {:?}",
+            reply.get("message")
         );
     }
 }

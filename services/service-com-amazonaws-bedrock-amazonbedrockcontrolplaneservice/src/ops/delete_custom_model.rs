@@ -26,7 +26,7 @@
 //!   model of this account and Region — including one a concurrent delete has already
 //!   removed — is refused as the spelling it IS, the one reading of that failure every
 //!   operation addressing this resource shares
-//!   ([`crate::state::unresolved_custom_model`]): 404 `ResourceNotFoundException` for an
+//!   ([`crate::state::unresolved_model`]): 404 `ResourceNotFoundException` for an
 //!   ARN, which is what that error documents ("The specified resource Amazon Resource Name
 //!   (ARN) was not found"), carrying this resource's not-found sentence
 //!   ([`crate::state::CUSTOM_MODEL_NOT_FOUND_MESSAGE`]); while a bare NAME that resolves to
@@ -182,22 +182,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|record| record.arn.clone())
         else {
             // An identifier that resolves to nothing is refused as the spelling it IS —
-            // this resource's one reading of that failure
-            // ([`crate::state::unresolved_custom_model`]), answered here with the errors
-            // this operation's own model declares for the two classes.
-            let refusal = crate::state::unresolved_custom_model(&input.model_identifier);
-            let message = Some(refusal.message().to_string());
-            return Err(match refusal {
-                crate::state::UnresolvedCustomModel::MissingArn => {
-                    DeleteCustomModelErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException { message },
-                    )
-                }
-                crate::state::UnresolvedCustomModel::UnresolvableIdentifier => {
-                    DeleteCustomModelErrorModeled::ValidationException(ValidationException {
-                        message,
-                    })
-                }
+            // the one reading of that failure every model-identifying member shares
+            // ([`crate::state::unresolved_model`]), answered here with the errors this
+            // operation's own model declares for the two classes.
+            let refusal = crate::state::unresolved_model(
+                &input.model_identifier,
+                crate::state::CUSTOM_MODEL_RESOURCES,
+            );
+            let message = Some(refusal.message(&input.model_identifier));
+            return Err(if refusal.missing_resource() {
+                DeleteCustomModelErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException { message },
+                )
+            } else {
+                DeleteCustomModelErrorModeled::ValidationException(ValidationException { message })
             }
             .into());
         };

@@ -205,20 +205,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(record) = store.custom_model(&input.model_identifier, &region, now) else {
             // `modelIdentifier` admits the model's ARN or its bare NAME, and the two
-            // unresolvable spellings are not the same failure — the reading every operation
-            // of this resource shares ([`crate::state::unresolved_custom_model`]), each
+            // unresolvable spellings are not the same failure — the one reading every
+            // model-identifying member shares ([`crate::state::unresolved_model`]), each
             // answering it with the error its own model declares for that class.
-            let refusal = crate::state::unresolved_custom_model(&input.model_identifier);
-            let message = Some(refusal.message().to_string());
-            return Err(match refusal {
-                crate::state::UnresolvedCustomModel::MissingArn => {
-                    GetCustomModelErrorModeled::ResourceNotFoundException(
-                        ResourceNotFoundException { message },
-                    )
-                }
-                crate::state::UnresolvedCustomModel::UnresolvableIdentifier => {
-                    GetCustomModelErrorModeled::ValidationException(ValidationException { message })
-                }
+            let refusal = crate::state::unresolved_model(
+                &input.model_identifier,
+                crate::state::CUSTOM_MODEL_RESOURCES,
+            );
+            let message = Some(refusal.message(&input.model_identifier));
+            return Err(if refusal.missing_resource() {
+                GetCustomModelErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message,
+                })
+            } else {
+                GetCustomModelErrorModeled::ValidationException(ValidationException { message })
             }
             .into());
         };

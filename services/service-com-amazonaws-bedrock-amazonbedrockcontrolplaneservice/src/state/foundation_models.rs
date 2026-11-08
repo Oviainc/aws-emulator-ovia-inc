@@ -247,6 +247,23 @@ pub(super) const fn also_provisioned(model: FoundationModel) -> FoundationModel 
     }
 }
 
+/// The same row, publishing the CUSTOMIZATIONS the model's training variant accepts.
+///
+/// Amazon Bedrock publishes a customizable model under its TRAINING-QUALIFIED id — the
+/// model id with its version and context-length qualifiers — and it is that id a
+/// customization job names, so the customizations belong to the variant's row and the
+/// on-demand row publishes none. One published model, two ids a client may address it by,
+/// each publishing what it is offered for.
+pub(super) const fn customizable(
+    model: FoundationModel,
+    customizations_supported: &'static [&'static str],
+) -> FoundationModel {
+    FoundationModel {
+        customizations_supported,
+        ..model
+    }
+}
+
 /// Every foundation model this emulator's Amazon Bedrock offers, in `modelId` order.
 ///
 /// Amazon Bedrock publishes its base models rather than letting a caller create one —
@@ -413,7 +430,7 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         input_modalities: IN_TEXT_AND_IMAGE,
         output_modalities: OUT_EMBEDDING,
         response_streaming_supported: false,
-        customizations_supported: FINE_TUNING,
+        customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         features_supported: BATCH_ONLY,
         lifecycle_status: LIFECYCLE_ACTIVE,
@@ -421,16 +438,21 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         legacy_window: None,
     },
     // The same two Titan embedding models under the VERSION-QUALIFIED ids the catalog also
-    // publishes them under: one published model, two ids a client may address it by.
-    also_provisioned(embedding_model(
-        "amazon.titan-embed-image-v1:0",
-        "Titan Embed Image",
-        "Amazon",
-        "Titan",
-        IN_TEXT_AND_IMAGE,
-        BATCH_ONLY,
-        "2023-11-29T00:00:00Z",
-    )),
+    // publishes them under: one published model, two ids a client may address it by. The
+    // qualified id is the one a customization names, so it is the row that publishes the
+    // customizations the model accepts ([`customizable`]).
+    customizable(
+        also_provisioned(embedding_model(
+            "amazon.titan-embed-image-v1:0",
+            "Titan Embed Image",
+            "Amazon",
+            "Titan",
+            IN_TEXT_AND_IMAGE,
+            BATCH_ONLY,
+            "2023-11-29T00:00:00Z",
+        )),
+        FINE_TUNING,
+    ),
     also_provisioned(embedding_model(
         "amazon.titan-embed-text-v1",
         "Titan Embed Text",
@@ -472,15 +494,49 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         input_modalities: IN_TEXT_AND_IMAGE,
         output_modalities: OUT_IMAGE,
         response_streaming_supported: false,
-        customizations_supported: FINE_TUNING,
+        customizations_supported: NO_CUSTOMIZATION,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         features_supported: NO_FEATURES,
         lifecycle_status: LIFECYCLE_ACTIVE,
         start_of_life_time: "2023-11-29T00:00:00Z",
         legacy_window: None,
     },
+    // The same model under the version-qualified id a customization names.
+    customizable(
+        also_provisioned(image_model(
+            "amazon.titan-image-generator-v1:0",
+            "Titan Image Gen G1",
+            "Amazon",
+            "Titan",
+            IN_TEXT_AND_IMAGE,
+            NO_FEATURES,
+            "2023-11-29T00:00:00Z",
+        )),
+        FINE_TUNING,
+    ),
     FoundationModel {
         model_id: "amazon.titan-text-lite-v1",
+        model_name: "Titan Text Lite",
+        provider_name: "Amazon",
+        model_family: "Titan",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_ONLY,
+        lifecycle_status: LIFECYCLE_LEGACY,
+        start_of_life_time: "2023-09-28T00:00:00Z",
+        legacy_window: Some(LegacyWindow {
+            entered_at: "2025-04-30T00:00:00Z",
+            end_of_life_at: "2027-04-30T00:00:00Z",
+        }),
+    },
+    // The same model under the training-qualified id a customization names: the version and
+    // the context length, which is how Amazon Bedrock publishes a customizable Titan text
+    // variant.
+    FoundationModel {
+        model_id: "amazon.titan-text-lite-v1:0:4k",
         model_name: "Titan Text Lite",
         provider_name: "Amazon",
         model_family: "Titan",
@@ -702,6 +758,25 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
         input_modalities: IN_TEXT,
         output_modalities: OUT_TEXT,
         response_streaming_supported: true,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_ONLY,
+        lifecycle_status: LIFECYCLE_LEGACY,
+        start_of_life_time: "2023-09-28T00:00:00Z",
+        legacy_window: Some(LegacyWindow {
+            entered_at: "2025-04-30T00:00:00Z",
+            end_of_life_at: "2027-06-30T00:00:00Z",
+        }),
+    },
+    // The same model under the training-qualified id a customization names.
+    FoundationModel {
+        model_id: "cohere.command-light-text-v14:7:4k",
+        model_name: "Command Light",
+        provider_name: "Cohere",
+        model_family: "Command",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
         customizations_supported: FINE_TUNING,
         inference_types_supported: ON_DEMAND_AND_PROVISIONED,
         features_supported: BATCH_ONLY,
@@ -714,6 +789,25 @@ pub const FOUNDATION_MODELS: &[FoundationModel] = &[
     },
     FoundationModel {
         model_id: "cohere.command-text-v14",
+        model_name: "Command",
+        provider_name: "Cohere",
+        model_family: "Command",
+        input_modalities: IN_TEXT,
+        output_modalities: OUT_TEXT,
+        response_streaming_supported: true,
+        customizations_supported: NO_CUSTOMIZATION,
+        inference_types_supported: ON_DEMAND_AND_PROVISIONED,
+        features_supported: BATCH_ONLY,
+        lifecycle_status: LIFECYCLE_LEGACY,
+        start_of_life_time: "2023-09-28T00:00:00Z",
+        legacy_window: Some(LegacyWindow {
+            entered_at: "2025-04-30T00:00:00Z",
+            end_of_life_at: "2027-06-30T00:00:00Z",
+        }),
+    },
+    // The same model under the training-qualified id a customization names.
+    FoundationModel {
+        model_id: "cohere.command-text-v14:7:4k",
         model_name: "Command",
         provider_name: "Cohere",
         model_family: "Command",
@@ -2460,15 +2554,18 @@ impl UnofferedFoundationModel {
 ///
 /// Stated once because the reading belongs to the published CATALOG rather than to one
 /// operation: every read that resolves a model identifier against it refuses an identifier
-/// it cannot resolve the same way.
+/// it cannot resolve the same way. The two readings that are not about the model's LIFECYCLE
+/// are the spelling split every model-identifying member shares
+/// ([`unresolved_model`]), read here against the one family this catalogue resolves, so the
+/// split exists once.
 #[must_use]
 pub fn unoffered_foundation_model(identifier: &str) -> UnofferedFoundationModel {
     if RETIRED_FOUNDATION_MODELS.contains(&base_model_id_of(identifier)) {
-        UnofferedFoundationModel::PastEndOfLife
-    } else if names_arn_of(identifier, FOUNDATION_MODEL_RESOURCE_TYPE) {
-        UnofferedFoundationModel::MissingArn
-    } else {
-        UnofferedFoundationModel::UnreadableIdentifier
+        return UnofferedFoundationModel::PastEndOfLife;
+    }
+    match unresolved_model(identifier, &[FOUNDATION_MODEL_RESOURCE_TYPE]) {
+        UnresolvedModel::MissingResource(_) => UnofferedFoundationModel::MissingArn,
+        UnresolvedModel::UnreadableIdentifier => UnofferedFoundationModel::UnreadableIdentifier,
     }
 }
 

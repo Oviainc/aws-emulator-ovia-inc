@@ -19,10 +19,14 @@
 //!    under either spelling, and once `IMPORT_JOB_COMPLETE_AFTER` has passed the same
 //!    read answers 200 — and the model's `creationTime` is the instant the import ended,
 //!    which the clock owed, so reading twice reports the very same body.
-//! 3. **An identifier no imported model answers to is refused** with 404
-//!    `ResourceNotFoundException`, over rows spanning a never-imported name, a live name
-//!    in another region, a well-formed imported-model ARN that was never minted, an ARN of
-//!    another region and a prefix of a live name.
+//! 3. **An identifier no imported model answers to is refused as the spelling it IS**: an
+//!    `imported-model` ARN that names none is 404 `ResourceNotFoundException` carrying that
+//!    resource's own not-found sentence, while a bare model NAME that resolves to nothing is
+//!    no ARN to report missing but an identifier this service cannot read as a model, which
+//!    is 400 `ValidationException` carrying the one sentence Amazon Bedrock states for that
+//!    class. Rows span a never-imported name, a live name in another region, a well-formed
+//!    imported-model ARN that was never minted, an ARN of another region and a prefix of a
+//!    live name.
 //!
 //! Every expectation is derived from the model, cited per row
 //! (`smithy_query(query="operation",operation="CreateModelImportJob,GetModelImportJob,GetImportedModel")`
@@ -69,6 +73,12 @@ const IMPORT_SPAN: std::time::Duration =
 /// The three members Amazon Bedrock derives from the imported model's artifacts
 /// (`smithy_query(query="operation",operation="GetImportedModel")`).
 const ARTIFACT_MEMBERS: &[&str] = &["modelArchitecture", "instructSupported", "customModelUnits"];
+
+/// The two fixed sentences an identifier that resolves to no imported model is refused
+/// with, written out here rather than read off the crate so this suite pins the wording a
+/// client reads.
+const INVALID_MODEL_IDENTIFIER: &str = "The provided model identifier is invalid.";
+const IMPORTED_MODEL_NOT_FOUND: &str = "Imported model not found";
 
 // ---------------------------------------------------------------------------------------
 // Request helpers.
@@ -381,22 +391,31 @@ async fn a_model_is_readable_only_once_its_import_has_completed() {
     let model_arn = running.text("importedModelArn");
 
     // Both spellings of the identifier, while the import has not finished: the model the
-    // import will create does not exist yet.
-    for (case, identifier) in [
-        ("by modelArn while importing", model_arn.as_str()),
-        ("by modelName while importing", "SettlingImportedModel"),
+    // import will create does not exist yet, and each spelling is refused as the spelling it
+    // IS — an `imported-model` ARN as a resource that is not there, a bare model NAME as an
+    // identifier this service cannot resolve to a model at all.
+    for (case, identifier, status, code) in [
+        (
+            "by modelArn while importing",
+            model_arn.as_str(),
+            404,
+            "ResourceNotFoundException",
+        ),
+        (
+            "by modelName while importing",
+            "SettlingImportedModel",
+            400,
+            "ValidationException",
+        ),
     ] {
         let early = get_model(&emu, REGION, identifier).await;
         assert_eq!(
-            early.status, 404,
-            "case {case}: an import that has not completed has created no model, got {} {:?}",
-            early.status, early.body
-        );
-        assert_eq!(
-            early.error.as_deref(),
-            Some("ResourceNotFoundException"),
-            "case {case}: the refusal is the modelled ResourceNotFoundException, got {:?}",
-            early.error
+            (early.status, early.error.as_deref()),
+            (status, Some(code)),
+            "case {case}: an import that has not completed has created no model, so \
+             {identifier:?} is refused {status} {code}, got {} {:?}",
+            early.status,
+            early.body
         );
     }
 
@@ -517,37 +536,60 @@ async fn an_identifier_no_imported_model_answers_to_is_refused() {
 
     // Rows span the ways an identifier can name nothing in the signing region: a name
     // nothing imported, a name that lives in another region, a well-formed ARN that was
-    // never minted, an ARN of another region, and a prefix of a live name.
+    // never minted, an ARN of another region, and a prefix of a live name — each refused as
+    // the spelling it IS, with the fixed sentence its class carries.
     let never_minted = format!("arn:aws:bedrock:{REGION}:{ACCOUNT}:imported-model/aaaaaaaaaaaa");
-    let rows: Vec<(&str, &str)> = vec![
-        ("a name nothing imported", "NoSuchModel"),
-        ("a name that lives in another region", "ElsewhereModel"),
-        ("a well-formed ARN never minted", never_minted.as_str()),
+    let rows: Vec<(&str, &str, u16, &str, &str)> = vec![
+        (
+            "a name nothing imported",
+            "NoSuchModel",
+            400,
+            "ValidationException",
+            INVALID_MODEL_IDENTIFIER,
+        ),
+        (
+            "a name that lives in another region",
+            "ElsewhereModel",
+            400,
+            "ValidationException",
+            INVALID_MODEL_IDENTIFIER,
+        ),
+        (
+            "a well-formed ARN never minted",
+            never_minted.as_str(),
+            404,
+            "ResourceNotFoundException",
+            IMPORTED_MODEL_NOT_FOUND,
+        ),
         (
             "an ARN of another region",
             elsewhere_model_arn.as_str(),
+            404,
+            "ResourceNotFoundException",
+            IMPORTED_MODEL_NOT_FOUND,
         ),
-        ("a prefix of a live name", "Live"),
+        (
+            "a prefix of a live name",
+            "Live",
+            400,
+            "ValidationException",
+            INVALID_MODEL_IDENTIFIER,
+        ),
     ];
-    for (case, identifier) in rows {
+    for (case, identifier, status, code, sentence) in rows {
         let refused = get_model(&emu, REGION, identifier).await;
         assert_eq!(
-            refused.status, 404,
-            "case {case}: {identifier:?} names no imported model in this region, got {} {:?}",
-            refused.status, refused.body
+            (refused.status, refused.error.as_deref()),
+            (status, Some(code)),
+            "case {case}: {identifier:?} names no imported model in this region, so it is \
+             refused {status} {code}, got {} {:?}",
+            refused.status,
+            refused.body
         );
         assert_eq!(
-            refused.error.as_deref(),
-            Some("ResourceNotFoundException"),
-            "case {case}: the refusal is the modelled ResourceNotFoundException, got {:?}",
-            refused.error
-        );
-        assert!(
-            refused
-                .get("message")
-                .as_str()
-                .is_some_and(|message| message.contains(identifier)),
-            "case {case}: the refusal states the identifier it could not resolve, got {:?}",
+            refused.get("message").as_str(),
+            Some(sentence),
+            "case {case}: the refusal states the fixed sentence of its class, got {:?}",
             refused.get("message")
         );
     }

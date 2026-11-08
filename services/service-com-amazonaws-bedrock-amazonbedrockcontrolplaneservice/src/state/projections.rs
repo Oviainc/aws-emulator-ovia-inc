@@ -818,6 +818,19 @@ pub fn custom_model_deployment_summary(
 /// ([`names_arn_of`]).
 pub const CUSTOM_MODEL_RESOURCE_TYPE: &str = "custom-model";
 
+/// The ARN resource type an imported model carries, as `ImportedModelArn` spells it before
+/// the model's own id (`smithy_query(query="operation",operation="GetImportedModel")`).
+pub const IMPORTED_MODEL_RESOURCE_TYPE: &str = "imported-model";
+
+/// The ARN resource types an inference profile carries: the one a profile Amazon Bedrock
+/// publishes is spelled with, and the one a profile this account created is, as
+/// `InferenceProfileArn` spells them
+/// (`^arn:…:(inference-profile|application-inference-profile)/[a-zA-Z0-9-:.]+$`).
+pub const INFERENCE_PROFILE_RESOURCE_TYPE: &str = "inference-profile";
+
+/// See [`INFERENCE_PROFILE_RESOURCE_TYPE`].
+pub const APPLICATION_INFERENCE_PROFILE_RESOURCE_TYPE: &str = "application-inference-profile";
+
 /// Whether `value` is an ARN of this service's own namespace naming a resource of
 /// `resource_type`, rather than one of the other spellings a member admits.
 ///
@@ -1169,12 +1182,16 @@ pub const ARN_INVALID: &str = "Provided ARN is invalid.";
 /// the corpus records BOTH answers for ARNs of the same shape and the same foreign
 /// region:
 ///
-/// * these four resources answer this service's own sentences —
+/// * these six resources answer this service's own sentences —
 ///   `custom-model` (`CreateCustomModelDeployment.modelArn`,
 ///   `CreateModelCopyJob.sourceModelArn`), `model-copy-job` (`GetModelCopyJob.jobArn`),
-///   `model-invocation-job` (`Get`/`StopModelInvocationJob.jobIdentifier`) and
+///   `model-invocation-job` (`Get`/`StopModelInvocationJob.jobIdentifier`),
 ///   `provisioned-model` (`Get`/`Update`/`DeleteProvisionedModelThroughput
-///   .provisionedModelId`);
+///   .provisionedModelId`), `model-customization-job`
+///   (`Get`/`StopModelCustomizationJob.jobIdentifier`) and `model-import-job`
+///   (`GetModelImportJob.jobIdentifier`), the last two recorded answering the region
+///   sentence for a well-formed job ARN of another region where the lookup would
+///   otherwise report the job missing;
 /// * an `advanced-prompt-optimization-job` and an `evaluation-job` ARN from the SAME
 ///   foreign region, submitted by the same probe generator, are refused with the
 ///   framework's constraint envelope instead — recorded in
@@ -1190,6 +1207,8 @@ pub const ARN_INVALID: &str = "Provided ARN is invalid.";
 pub const SELF_VALIDATED_RESOURCE_TYPES: &[&str] = &[
     CUSTOM_MODEL_RESOURCE_TYPE,
     "model-copy-job",
+    "model-customization-job",
+    "model-import-job",
     "model-invocation-job",
     "provisioned-model",
 ];

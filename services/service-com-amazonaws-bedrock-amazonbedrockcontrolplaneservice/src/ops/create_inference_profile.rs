@@ -336,5 +336,6 @@ fn source_model_id(source_arn: &str) -> &str {
 
 /// The ARN resource type a system-defined inference profile carries, as `copyFrom`'s
 /// pattern spells it beside `foundation-model`
-/// (`smithy_query(query="shape",shape="InferenceProfileModelSource")`).
-const SYSTEM_DEFINED_PROFILE_RESOURCE_TYPE: &str = "inference-profile";
+/// (`smithy_query(query="shape",shape="InferenceProfileModelSource")`) — the one the state
+/// module states for every surface that reads it.
+const SYSTEM_DEFINED_PROFILE_RESOURCE_TYPE: &str = crate::state::INFERENCE_PROFILE_RESOURCE_TYPE;
