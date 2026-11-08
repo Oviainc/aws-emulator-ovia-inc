@@ -30,6 +30,15 @@ service-com-amazonaws-servicediscovery-route53autonaming-v20170314 = { workspace
 # resources, held in its own store in the shared engine, so this is a cross-service READ
 # rather than a copy kept here. No cycle: that crate depends on no service crate.
 service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+# `eventbridge_client`: the ONE in-process EventBridge client an emulated service publishes
+# an event through, so this crate configures no second copy of that hop.
+service-common = { path = "../common" }
+# The AWS SDK for EventBridge, driven over the in-process callback
+# (`OperationContext::callback`): Amazon ECS publishes an `ECS Task State Change` event onto
+# the account's default event bus as a task moves through its statuses
+# (`state::task_events`). Only the generated client is needed — the emulator supplies the
+# transport, so the SDK's own HTTPS stack is left out.
+aws-sdk-eventbridge = { version = "1", default-features = false }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -38,7 +47,9 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# `time`: the clock pump that publishes a task's transitions as they fall due waits for the
+# earliest due instant the store holds (`state::task_events::drive_task_clock`).
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -50,6 +61,12 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# EventBridge and Amazon SQS are mounted beside Amazon ECS on one engine in the integration
+# tests, because this service publishes an `ECS Task State Change` event onto the default
+# event bus as a task moves and a rule on that bus delivers it to an SQS queue: without them
+# mounted there is nothing for the publication to reach.
+service-com-amazonaws-eventbridge-awsevents = { workspace = true }
+service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 
 [lints]
 workspace = true

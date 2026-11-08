@@ -1114,6 +1114,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // since it takes the Amazon EC2 store's lock
         // ([`crate::state::evaluate_image_pulls`]).
         crate::state::evaluate_image_pulls(&*self.engine);
+        // The statuses the scheduler's placements and stops left on this service's tasks are
+        // `ECS Task State Change` events on the account's default event bus, and the
+        // transitions the clock still owes them are published as they fall due
+        // ([`crate::state::publish_task_state_changes`]).
+        crate::state::publish_task_state_changes(ctx, &self.engine, &region);
         Ok(UpdateServiceOutput {
             service: Some(view),
         })

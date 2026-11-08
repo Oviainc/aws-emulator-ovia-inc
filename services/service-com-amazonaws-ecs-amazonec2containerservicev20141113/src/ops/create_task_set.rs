@@ -658,6 +658,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::state::evaluate_image_pulls`]).
         drop(guard);
         crate::state::evaluate_image_pulls(&*self.engine);
+        // The status each task this placement left is an `ECS Task State Change` on the
+        // account's default event bus, and the transitions the clock still owes those tasks
+        // are published as they fall due
+        // ([`crate::state::publish_task_state_changes`]).
+        crate::state::publish_task_state_changes(ctx, &self.engine, &region);
         Ok(CreateTaskSetOutput {
             task_set: Some(view),
         })

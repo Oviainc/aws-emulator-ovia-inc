@@ -514,6 +514,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             task.version += 1;
         }
 
+        // The status this report put the task in is an `ECS Task State Change` on the
+        // account's default event bus ([`crate::state::publish_task_state_changes`]). The
+        // guard is dropped first, so no lock is held across the publication.
+        drop(guard);
+        crate::state::publish_task_state_changes(ctx, &self.engine, &region);
+
         // "Acknowledgement of the state change" — the report was taken, which is what the
         // agent plane answers a report it has recorded with.
         Ok(SubmitTaskStateChangeOutput {

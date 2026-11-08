@@ -197,6 +197,8 @@ mod task_set_creation;
 mod task_set_deletion;
 #[path = "all/task_sets.rs"]
 mod task_sets;
+#[path = "all/task_state_change_events.rs"]
+mod task_state_change_events;
 #[path = "all/task_state_reports.rs"]
 mod task_state_reports;
 #[path = "all/update_container_instances_state_failures.rs"]

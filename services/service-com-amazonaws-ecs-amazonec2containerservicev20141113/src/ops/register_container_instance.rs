@@ -451,6 +451,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ([`crate::state::evaluate_image_pulls`]).
             drop(guard);
             crate::state::evaluate_image_pulls(&*self.engine);
+            // The placement this registration gave each parked task moves that task, which
+            // is an `ECS Task State Change` on the account's default event bus
+            // ([`crate::state::publish_task_state_changes`]).
+            crate::state::publish_task_state_changes(ctx, &self.engine, &region);
             return Ok(RegisterContainerInstanceOutput { container_instance });
         }
 
@@ -513,6 +517,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the Amazon EC2 store's lock ([`crate::state::evaluate_image_pulls`]).
         drop(guard);
         crate::state::evaluate_image_pulls(&*self.engine);
+        // The placement this registration gave each parked task moves that task, which is
+        // an `ECS Task State Change` on the account's default event bus
+        // ([`crate::state::publish_task_state_changes`]).
+        crate::state::publish_task_state_changes(ctx, &self.engine, &region);
 
         Ok(RegisterContainerInstanceOutput { container_instance })
     }

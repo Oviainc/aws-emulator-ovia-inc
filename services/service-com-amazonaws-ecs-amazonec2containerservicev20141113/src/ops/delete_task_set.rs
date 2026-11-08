@@ -202,6 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cluster_name = arn_cluster
             .unwrap_or_else(|| crate::state::cluster_name_from_reference(Some(&input.cluster)));
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
 
         let mut guard = state.lock();
         guard.advance_clock(now);
@@ -291,6 +292,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what asks for a task set's tags ("If this field is omitted, tags aren't
         // included"), so the deleted task set is reported without them.
         let view = guard.task_set_view(&deleted, crate::state::TaskSetFields::default());
+        // The stop this delete asked of the task set's tasks is an `ECS Task State Change`
+        // per task on the account's default event bus, and the `STOPPED` the clock still
+        // owes each of them is published when it falls due
+        // ([`crate::state::publish_task_state_changes`]). The guard is dropped first, so no
+        // lock is held across the publication.
+        drop(guard);
+        crate::state::publish_task_state_changes(ctx, &self.engine, &region);
         Ok(DeleteTaskSetOutput {
             task_set: Some(view),
         })

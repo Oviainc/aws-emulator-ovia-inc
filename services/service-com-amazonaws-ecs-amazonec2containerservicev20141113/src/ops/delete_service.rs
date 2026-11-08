@@ -222,6 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             (None, requested) => crate::state::cluster_name_from_reference(requested),
         };
         let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
 
         let mut guard = state.lock();
         guard.advance_clock(now);
@@ -284,6 +285,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let registrations = guard.cloud_map_registrations();
         drop(guard);
         crate::state::reconcile_cloud_map_instances(&*self.engine, &registrations);
+        // The stop this delete asked of the service's tasks is an `ECS Task State Change`
+        // per task on the account's default event bus, and the `STOPPED` the clock still
+        // owes each of them is published when it falls due
+        // ([`crate::state::publish_task_state_changes`]).
+        crate::state::publish_task_state_changes(ctx, &self.engine, &region);
         Ok(DeleteServiceOutput {
             service: Some(view),
         })

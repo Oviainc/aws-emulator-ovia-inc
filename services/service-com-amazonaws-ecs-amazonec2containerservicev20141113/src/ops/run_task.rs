@@ -747,6 +747,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         drop(guard);
         crate::state::evaluate_image_pulls(&*self.engine);
 
+        // The status each task this call placed now reports is an `ECS Task State Change`
+        // on the account's default event bus, and the transitions the clock still owes
+        // these tasks are published as they fall due
+        // ([`crate::state::publish_task_state_changes`]). The store's guard is dropped
+        // above, so no lock is held across the publication.
+        crate::state::publish_task_state_changes(ctx, &self.engine, &region);
+
         Ok(RunTaskOutput {
             tasks: Some(created),
             failures: Some(Vec::new()),

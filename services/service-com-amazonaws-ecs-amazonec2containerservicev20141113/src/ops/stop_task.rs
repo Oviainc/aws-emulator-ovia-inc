@@ -253,8 +253,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `StopTask` has no `include` member to narrow the response with, so the task it
         // just mutated is reported with its tags.
-        Ok(StopTaskOutput {
-            task: Some(task.view(true)),
-        })
+        let view = task.view(true);
+        // The status this stop put the task in is an `ECS Task State Change` on the
+        // account's default event bus, and the `STOPPED` the clock still owes it is
+        // published when it falls due ([`crate::state::publish_task_state_changes`]). The
+        // guard is dropped first, so no lock is held across the publication.
+        drop(guard);
+        crate::state::publish_task_state_changes(ctx, &self.engine, &region);
+
+        Ok(StopTaskOutput { task: Some(view) })
     }
 }

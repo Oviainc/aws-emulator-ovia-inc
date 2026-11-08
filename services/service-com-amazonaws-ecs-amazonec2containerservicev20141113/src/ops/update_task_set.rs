@@ -318,6 +318,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ([`crate::state::evaluate_image_pulls`]).
         drop(guard);
         crate::state::evaluate_image_pulls(&*self.engine);
+        // The statuses this rescale left on the task set's tasks are `ECS Task State
+        // Change` events on the account's default event bus, and the transitions the clock
+        // still owes them are published as they fall due
+        // ([`crate::state::publish_task_state_changes`]).
+        crate::state::publish_task_state_changes(ctx, &self.engine, &region);
         Ok(UpdateTaskSetOutput {
             task_set: Some(view),
         })

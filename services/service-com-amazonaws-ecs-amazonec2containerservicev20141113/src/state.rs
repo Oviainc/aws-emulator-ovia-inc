@@ -76,8 +76,15 @@
 //! `advance_service_deployments` materialises each of them. A hook whose target type
 //! invokes a Lambda function pauses nothing here: no function is invoked, so no rollout is
 //! reported as waiting on work that is not being done.
+//!
+//! ## The transitions that are PUBLISHED
+//!
+//! Every status a task moves into is also an EventBridge event: `task_events` compares what
+//! this store holds against what was last published and puts an `ECS Task State Change`
+//! onto the account's default bus for each move, so a client can watch a task without
+//! calling Amazon ECS again.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
 use ::aws_smithy_types::DateTime;
@@ -192,6 +199,11 @@ pub use task_overrides::*;
 
 /// The whole in-memory store: every operation's reads and writes against the maps below.
 mod store;
+
+/// The `ECS Task State Change` events this service publishes as a task moves, and the
+/// clock pump that publishes the transitions nobody is waiting on a call for.
+mod task_events;
+pub use task_events::*;
 
 /// The region an ARN carries when the request is unsigned (so it has no SigV4
 /// credential scope to read a region from). `emulator_arn`'s own documented default.
@@ -3728,4 +3740,20 @@ pub struct ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// Monotonic source of the names Amazon ECS generates for an Express service whose
     /// request named none, so every generated name is distinct.
     next_express_gateway_seq: u64,
+    /// The task state changes this store has observed and not published to EventBridge
+    /// yet, oldest first — see [`task_events`].
+    pending_task_events: VecDeque<TaskStateChange>,
+    /// `taskArn` -> the `(lastStatus, desiredStatus)` pair last published for that task, so
+    /// a transition is recognised once however it was written and published exactly once
+    /// ([`Self::record_task_state_changes`]).
+    published_task_status: HashMap<String, TaskStatusPair>,
+    /// Whether one task clock pump is already running against this store
+    /// ([`drive_task_clock`]).
+    task_clock_pump_running: bool,
+    /// Which claim the running pump holds, so a pump releases its own and never a later
+    /// pump's (see [`Self::release_task_clock_pump`]).
+    task_clock_pump_generation: u64,
+    /// The running pump's task handle, kept so the pump it replaces is aborted rather than
+    /// merely forgotten (see [`Self::set_task_clock_pump`]).
+    task_clock_pump: Option<::tokio::task::JoinHandle<()>>,
 }
