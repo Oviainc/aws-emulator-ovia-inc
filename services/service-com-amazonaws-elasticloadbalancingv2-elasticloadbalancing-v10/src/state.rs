@@ -3179,6 +3179,15 @@ pub struct RegisteredTarget {
     /// registration `DeregisterTargets` put in `draining`; `None` for one nothing has
     /// deregistered ([`target_health`]).
     pub draining_until: Option<SystemTime>,
+    /// The workload whose own scheduler registered this target, when another emulated
+    /// service owns the registration rather than a `RegisterTargets` caller: the identifier
+    /// of the task, instance or function it stands for.
+    ///
+    /// `None` for every registration a caller made through this service's own API, which is
+    /// what keeps the two apart: a scheduler that reconciles its workload's registrations
+    /// (an Amazon ECS service registering the tasks its `loadBalancers` bind) may add and
+    /// remove the registrations it owns and must leave a caller's own alone.
+    pub registered_for: Option<String>,
 }
 
 /// How a registration is keyed in a target group: the target id and the port the target

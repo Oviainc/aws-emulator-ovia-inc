@@ -242,6 +242,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let registrations = guard.cloud_map_registrations();
         drop(guard);
         crate::state::reconcile_cloud_map_instances(&*self.engine, &registrations);
+        // And so were the target registrations those tasks hold in the Elastic Load Balancing
+        // v2 groups their service binds ([`crate::state::settle_load_balancer_targets`]).
+        crate::state::settle_load_balancer_targets(&*self.engine);
 
         Ok(DescribeServicesOutput {
             services: Some(services),

@@ -285,6 +285,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let registrations = guard.cloud_map_registrations();
         drop(guard);
         crate::state::reconcile_cloud_map_instances(&*self.engine, &registrations);
+        // And neither does it keep a target in the load balancers its bindings named: the
+        // tasks that were registered are stopping, so their targets drain
+        // ([`crate::state::settle_load_balancer_targets`]).
+        crate::state::settle_load_balancer_targets(&*self.engine);
         // The stop this delete asked of the service's tasks is an `ECS Task State Change`
         // per task on the account's default event bus, and the `STOPPED` the clock still
         // owes each of them is published when it falls due

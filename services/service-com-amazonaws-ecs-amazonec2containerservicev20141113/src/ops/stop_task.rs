@@ -7,6 +7,14 @@
 //! to `STOPPING`"). Reaching `STOPPED` is owed by the clock — see `crate::state` — so a
 //! later `DescribeTasks` observes it.
 //!
+//! What the stop owes OUTSIDE this service is settled once the store's guard is released:
+//! the target this task held in the Elastic Load Balancing v2 groups its service binds is
+//! deregistered, so it drains and then leaves the group
+//! (`crate::state::settle_load_balancer_targets`), and the status the task moved into — plus
+//! the `STOPPED` the clock still owes it — is published as an `ECS Task State Change` event
+//! on the account's default EventBridge bus
+//! (`crate::state::publish_task_state_changes`), with no further call.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -254,11 +262,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `StopTask` has no `include` member to narrow the response with, so the task it
         // just mutated is reported with its tags.
         let view = task.view(true);
-        // The status this stop put the task in is an `ECS Task State Change` on the
-        // account's default event bus, and the `STOPPED` the clock still owes it is
-        // published when it falls due ([`crate::state::publish_task_state_changes`]). The
-        // guard is dropped first, so no lock is held across the publication.
+        // A task that is stopping serves no traffic: the target it held in the Elastic Load
+        // Balancing v2 groups its service binds is deregistered, so it drains and then leaves
+        // the group ([`crate::state::settle_load_balancer_targets`]). The status this stop put
+        // the task in is an `ECS Task State Change` on the account's default event bus, and
+        // the `STOPPED` the clock still owes it is published when it falls due
+        // ([`crate::state::publish_task_state_changes`]). The guard is dropped first, so no
+        // lock is held across either.
         drop(guard);
+        crate::state::settle_load_balancer_targets(&*self.engine);
         crate::state::publish_task_state_changes(ctx, &self.engine, &region);
 
         Ok(StopTaskOutput { task: Some(view) })

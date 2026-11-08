@@ -200,6 +200,11 @@ pub use task_overrides::*;
 /// The whole in-memory store: every operation's reads and writes against the maps below.
 mod store;
 
+/// The Elastic Load Balancing v2 targets a load-balanced service's RUNNING tasks occupy,
+/// and the drain a stopped task's target leaves through.
+mod load_balancer_targets;
+pub use load_balancer_targets::*;
+
 /// The `ECS Task State Change` events this service publishes as a task moves, and the
 /// clock pump that publishes the transitions nobody is waiting on a call for.
 mod task_events;

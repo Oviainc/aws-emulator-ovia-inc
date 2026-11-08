@@ -306,11 +306,22 @@ impl AttachmentRecord {
     /// not been attached yet — read off the stored details rather than recomputed, so it is
     /// the value a caller of `DescribeTasks` sees.
     pub fn private_ipv4_address(&self) -> Option<&str> {
+        self.detail(ATTACHMENT_DETAIL_PRIVATE_IPV4_ADDRESS)
+    }
+
+    /// The subnet this attachment's interface was placed in, read off the stored details
+    /// the same way — the subnet the launch supplied
+    /// (`AwsVpcConfiguration$subnets`), and `None` for an attachment carrying none.
+    pub fn subnet_id(&self) -> Option<&str> {
+        self.detail(ATTACHMENT_DETAIL_SUBNET_ID)
+    }
+
+    /// The value the `Attachment$details` entry named `name` carries, and `None` when this
+    /// attachment carries no such entry.
+    fn detail(&self, name: &str) -> Option<&str> {
         self.details
             .iter()
-            .find(|detail| {
-                detail.name.as_deref() == Some(ATTACHMENT_DETAIL_PRIVATE_IPV4_ADDRESS)
-            })
+            .find(|detail| detail.name.as_deref() == Some(name))
             .and_then(|detail| detail.value.as_deref())
     }
 

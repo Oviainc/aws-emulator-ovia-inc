@@ -244,6 +244,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // target that was draining returns it to service: it is checked from
                     // now rather than removed when the drain it was in runs out.
                     draining_until: None,
+                    // A registration this API made is the CALLER's: no other service's
+                    // scheduler owns it, so no reconcile of another workload's targets may
+                    // take it out of the group.
+                    registered_for: None,
                 },
             );
         }

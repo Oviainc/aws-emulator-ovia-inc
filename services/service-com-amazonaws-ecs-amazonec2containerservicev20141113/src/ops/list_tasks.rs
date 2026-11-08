@@ -354,6 +354,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let end = start.saturating_add(page_size).min(matching.len());
         let task_arns = matching[start.min(matching.len())..end].to_vec();
         let next_token = matching.get(end).cloned();
+        // The clock pass above may have started or stopped tasks of a service that binds a
+        // target group: that registration was owed at the instant those tasks moved, so it is
+        // materialised here — with OUR guard dropped first, since the write takes the Elastic
+        // Load Balancing v2 store's lock
+        // ([`crate::state::settle_load_balancer_targets`]).
+        drop(guard);
+        crate::state::settle_load_balancer_targets(&*self.engine);
 
         Ok(ListTasksOutput {
             task_arns: Some(task_arns),

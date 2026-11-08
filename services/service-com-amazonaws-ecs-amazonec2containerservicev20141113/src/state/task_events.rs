@@ -653,6 +653,11 @@ pub fn drive_task_clock<Eng: Send + Sync + 'static>(
                 .clamp(MIN_CLOCK_WAIT, MAX_CLOCK_WAIT);
             ::tokio::time::sleep(wait).await;
             state.lock().advance_clock(SystemTime::now());
+            // A task the clock has just started or stopped is one the load balancers its
+            // service binds have to be brought in line with — the same side effect the door
+            // that wrote a status settles, owed here for the statuses NO door wrote
+            // ([`super::settle_load_balancer_targets`]).
+            super::settle_load_balancer_targets(&*engine);
             publish_pending(&callback, &*engine, &region).await;
         }
         if capped {

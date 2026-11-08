@@ -33,7 +33,8 @@ use std::time::{Duration, SystemTime};
 use crate::ops::types::{TargetDescription, TargetHealth, TargetHealthDescription};
 
 use super::{
-    target_group_attribute, RegisteredTarget, TargetGroupRecord, TargetKey, SETTLE_AFTER,
+    target_group_attribute, targets_per_target_group, RegisteredTarget, TargetGroupRecord,
+    TargetKey, SETTLE_AFTER,
 };
 
 /// The target group attribute that holds how long a deregistering target drains, from
@@ -170,6 +171,75 @@ impl TargetGroupRecord {
                 target.draining_until = Some(due_at(now, drains_for));
             }
         }
+    }
+
+    /// The registrations of this group that another emulated service's SCHEDULER owns,
+    /// each as the key it is stored under and the workload it stands for
+    /// ([`RegisteredTarget::registered_for`]).
+    ///
+    /// What a scheduler reconciling its workload's registrations may act on: a
+    /// registration a `RegisterTargets` caller made is absent from this, so a reconcile
+    /// cannot take a caller's own target out of the group. It answers EVERY scheduler's,
+    /// because this service cannot know whose a workload is — the caller filters the answer
+    /// to the workloads it owns, so two schedulers sharing one group leave each other's
+    /// registrations alone.
+    pub fn scheduler_registrations(&self) -> Vec<(TargetKey, String)> {
+        self.targets
+            .iter()
+            .filter_map(|(key, target)| {
+                target
+                    .registered_for
+                    .as_ref()
+                    .map(|workload| (key.clone(), workload.clone()))
+            })
+            .collect()
+    }
+
+    /// Register the target `id` (on `port`, else this group's own) for `workload`, on
+    /// behalf of the emulated service whose scheduler owns that workload — the Amazon ECS
+    /// service registering a task its `loadBalancers` bind.
+    ///
+    /// The registration is this group's own in every respect a reader sees: it is keyed and
+    /// health-checked exactly as `RegisterTargets` keys and checks one, so it begins
+    /// `initial` and reaches `healthy` one settling span later
+    /// ([`TargetGroupRecord::health_of`]). It carries the workload it stands for, which is
+    /// what lets the scheduler that added it take it out again.
+    ///
+    /// Nothing is replaced: a key this group already holds — whether a caller registered it
+    /// or the same workload did — is left exactly as it is, so a reconcile does not restart
+    /// a drain or a health check. A group already holding its quota of targets
+    /// ([`targets_per_target_group`]) takes no further registration, the same bound
+    /// `RegisterTargets` refuses past.
+    ///
+    /// Answers whether this call added a registration.
+    pub fn register_for(
+        &mut self,
+        id: &str,
+        port: Option<i32>,
+        availability_zone: Option<String>,
+        workload: &str,
+        now: SystemTime,
+    ) -> bool {
+        let key: TargetKey = (id.to_string(), port.or(self.port));
+        if self.targets.contains_key(&key) {
+            return false;
+        }
+        if self.targets.len() >= targets_per_target_group(self) {
+            return false;
+        }
+        self.targets.insert(
+            key.clone(),
+            RegisteredTarget {
+                id: key.0,
+                port: key.1,
+                availability_zone,
+                registered_at: now,
+                healthy_at: now + SETTLE_AFTER,
+                draining_until: None,
+                registered_for: Some(workload.to_string()),
+            },
+        );
+        true
     }
 
     /// Materialise what the clock already owes this group: a registration whose draining

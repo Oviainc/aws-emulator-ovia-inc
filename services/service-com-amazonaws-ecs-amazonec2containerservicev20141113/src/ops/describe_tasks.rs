@@ -254,6 +254,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let registrations = guard.cloud_map_registrations();
         drop(guard);
         crate::state::reconcile_cloud_map_instances(&*self.engine, &registrations);
+        // The same clock pass may have started or stopped tasks of a service that binds a
+        // target group: that registration was owed at the instant those tasks moved too, so
+        // it is materialised here for the same reason
+        // ([`crate::state::settle_load_balancer_targets`]).
+        crate::state::settle_load_balancer_targets(&*self.engine);
 
         Ok(DescribeTasksOutput {
             tasks: Some(tasks),

@@ -561,7 +561,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the Amazon EC2 store's lock ([`crate::state::evaluate_image_pulls`]).
         drop(guard);
         crate::state::evaluate_image_pulls(&*self.engine);
-
         // The status each task this call placed now reports is an `ECS Task State Change`
         // on the account's default event bus, and the transitions the clock still owes
         // these tasks are published as they fall due

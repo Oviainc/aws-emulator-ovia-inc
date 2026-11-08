@@ -1075,6 +1075,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // since it takes the Amazon EC2 store's lock
         // ([`crate::state::evaluate_image_pulls`]).
         crate::state::evaluate_image_pulls(&*self.engine);
+        // A service that binds a target group registers each of its tasks in that group once
+        // the task is running, so the group is brought in line with what this create placed —
+        // with OUR guard dropped, since the write takes the Elastic Load Balancing v2 store's
+        // lock ([`crate::state::settle_load_balancer_targets`]).
+        crate::state::settle_load_balancer_targets(&*self.engine);
         // The statuses the scheduler's placements left on this service's tasks are `ECS Task
         // State Change` events on the account's default event bus, and the transitions the
         // clock still owes them are published as they fall due
