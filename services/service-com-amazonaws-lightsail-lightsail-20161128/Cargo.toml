@@ -29,6 +29,17 @@ hex = { workspace = true }
 # from lives in the ONE object store this emulator holds — Amazon S3's own — which
 # this service provisions a bucket in and reads the object presence of.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The OpenSSH key, certificate and fingerprint formats: the temporary key pair
+# `GetInstanceAccessDetails` grants, and the SSH host key it records for an
+# instance, are real Ed25519 key material described by this crate.
+ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519", "getrandom"] }
+# The X.509 RDP certificate an RDP access to a Windows instance witnesses.
+rcgen = "0.13"
+# The SHA-1 half of a host key's two published fingerprints.
+sha1 = "0.10"
+# The base64 body of an OpenSSH public key line, and the encoding OpenSSH
+# publishes a key fingerprint in.
+base64 = "0.22"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -36,6 +47,13 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The granted temporary key material is read back with the SAME OpenSSH key crate
+# the service writes it with, so a test asserts a real key rather than a shape.
+ssh-key = { version = "0.6", default-features = false, features = ["alloc", "ed25519", "getrandom"] }
+# The DER behind a reported RDP certificate's PEM, which its published
+# fingerprints are checked against.
+base64 = "0.22"
+sha1 = "0.10"
 # `time` for the tests that wait on a clock-owed instance transition.
 tokio = { workspace = true, features = ["time"] }
 # An XML reader for the `ListObjectsV2` body the bucket object data plane answers

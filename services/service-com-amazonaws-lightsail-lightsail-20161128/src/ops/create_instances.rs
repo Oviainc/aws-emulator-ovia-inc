@@ -351,6 +351,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // recorded when the browser-based access path witnesses it
                     // (`HostKeyAttributes$witnessedAt`).
                     known_host_keys: Vec::new(),
+                    // And nobody has asked for access to it: the temporary SSH
+                    // key pair and the Windows Administrator password an access
+                    // is told are granted by `GetInstanceAccessDetails`.
+                    access: crate::state::StoredInstanceAccess::default(),
                 });
                 operations.push(
                     store

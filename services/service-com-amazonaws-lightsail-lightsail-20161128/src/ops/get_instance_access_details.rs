@@ -1,15 +1,50 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetInstanceAccessDetails
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetInstanceAccessDetails`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Grants temporary access to one virtual private server and reports it: the
+//! temporary SSH keys an SSH access uses, the Administrator password an RDP
+//! access to a Windows instance uses, and the host key the service has recorded
+//! for the instance.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetInstanceAccessDetails::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! ## What this operation does
+//!
+//! "Returns temporary SSH keys you can use to connect to a specific virtual
+//! private server, or instance" — so this call CREATES the access it reports,
+//! against the one stored instance record its `instanceName` resolves to:
+//!
+//! * the protocol is the one the request names, and `ssh` when it names none
+//!   ("The protocol to use to connect to your instance. Defaults to ssh");
+//! * an SSH access is granted a real temporary OpenSSH key pair, reported as
+//!   `privateKey` and `certKey` with the instant it expires — `certKey` being
+//!   the OpenSSH certificate issued over the pair's public half, which names the
+//!   instance's login user and expires with the grant, and the public half
+//!   itself for a blueprint this service publishes no login user for, since a
+//!   certificate states the user it is good for. The SAME pair is
+//!   reported again while that grant is live — the keys are what this call
+//!   created, so a second call does not silently retire the pair the first
+//!   answer handed out — and a fresh pair is granted once it has expired;
+//! * an RDP access to a Windows instance is told the instance's Administrator
+//!   password, or what is needed to decrypt it, under the conditions
+//!   `InstanceAccessDetails$password` and `$passwordData` state. An instance of
+//!   any other platform is told neither: both members are documented "for a
+//!   Windows Server-based instance";
+//! * the host key the instance itself presents is RECORDED on it — "the time
+//!   that the SSH host key or RDP certificate was recorded by Lightsail"
+//!   (`HostKeyAttributes$witnessedAt`) — and reported from then on, so two
+//!   accesses to one instance are authenticated by the same key. Which key that
+//!   is follows the instance's platform: its SSH host key on a Linux/Unix
+//!   instance, its RDP certificate on a Windows one. `DeleteKnownHostKeys`
+//!   empties that record, and the next access witnesses the key afresh, which is
+//!   how a caller recovers from a host key mismatch.
+//! * the addresses and the user name are the instance's own, the same values
+//!   `GetInstance` reports for it.
+//!
+//! The store does the granting ([`crate::state::ComAmazonawsLightsailLightsail20161128State::grant_instance_access`]),
+//! so every value reported is one the service holds for that instance; a name
+//! the store does not hold is refused with this service's `DoesNotExist`
+//! envelope, having granted nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +200,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetInstanceAccessDetails` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetInstanceAccessDetailsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetInstanceAccessDetails"))
+        // `instanceName` is a modelled `@required` member carrying the modelled
+        // `ResourceName` pattern, and `protocol` targets the modelled
+        // `InstanceAccessProtocol` enum, so the centralized walk refused an
+        // absent name, a malformed one and a protocol outside that enum before
+        // this body ran.
+        let name = input.instance_name;
+        // "The protocol to use to connect to your instance. Defaults to ssh"
+        // (`GetInstanceAccessDetailsRequest$protocol`).
+        let protocol = input
+            .protocol
+            .unwrap_or_else(|| crate::state::INSTANCE_ACCESS_PROTOCOL_SSH.to_string());
+        let now = crate::state::now_ms();
+
+        let details = crate::state::with_state(&*self.engine, |store| {
+            store
+                .grant_instance_access(&name, &protocol, now)
+                .ok_or_else(|| not_found(&name))
+        })
+        .ok_or_else(unavailable)??;
+
+        // Audit record for a call that hands out a credential: who asked, which
+        // instance over which protocol, and when the keys it granted expire —
+        // never the private key, the certificate or the password, which only the
+        // caller gets.
+        ::tracing::info!(
+            audit = true,
+            operation = Self::NAME,
+            outcome = "granted",
+            instance_name = %name,
+            protocol = %protocol,
+            presented_access_key_id = %::engine::extract_akid(&ctx.parts().headers),
+            expires_at_epoch_seconds = details.expires_at.map(|expires| expires.secs()),
+            "temporary instance access granted"
+        );
+
+        Ok(GetInstanceAccessDetailsOutput {
+            access_details: Some(details),
+        })
     }
+}
+
+/// No instance of that name is stored, so there is no instance to grant access
+/// to: Lightsail's `DoesNotExist` rejection — HTTP 400, wire error
+/// `NotFoundException`, body `code` `DoesNotExist` and a message naming the
+/// resource type and the requested name.
+fn not_found(name: &str) -> GetInstanceAccessDetailsError {
+    crate::scaffolded::Scaffolded::resource_does_not_exist(
+        crate::state::RESOURCE_TYPE_INSTANCE,
+        name,
+    )
+}
+
+/// The store is unreachable — the engine is not the shared in-memory one. A
+/// modelled server fault, never a fresh engine.
+fn unavailable() -> GetInstanceAccessDetailsError {
+    GetInstanceAccessDetailsErrorModeled::ServiceException(ServiceException {
+        message: Some("the Lightsail instance store is unavailable".to_string()),
+        ..Default::default()
+    })
+    .into()
 }

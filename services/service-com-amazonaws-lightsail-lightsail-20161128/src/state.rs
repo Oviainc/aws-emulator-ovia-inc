@@ -4453,6 +4453,11 @@ pub use instances::*;
 mod gui_sessions;
 pub use gui_sessions::*;
 
+/// The temporary access the service grants to one instance, and the host key its
+/// browser-based access path has witnessed.
+mod instance_access;
+pub use instance_access::*;
+
 /// Block storage disks and their snapshots.
 mod disks;
 pub use disks::*;

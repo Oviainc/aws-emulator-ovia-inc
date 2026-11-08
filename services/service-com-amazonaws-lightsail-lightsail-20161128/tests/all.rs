@@ -211,6 +211,8 @@ mod gui_session_access_details;
 mod gui_session_start;
 #[path = "all/gui_session_stop.rs"]
 mod gui_session_stop;
+#[path = "all/instance_access_details.rs"]
+mod instance_access_details;
 #[path = "all/instance_delete_attachments.rs"]
 mod instance_delete_attachments;
 #[path = "all/instance_delete_bucket_access.rs"]

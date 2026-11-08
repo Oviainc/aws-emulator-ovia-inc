@@ -437,6 +437,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // (`HostKeyAttributes$witnessedAt`), and a snapshot reports
                     // none to carry over.
                     known_host_keys: Vec::new(),
+                    // And nobody has asked for access to it: a temporary SSH key
+                    // pair and the Windows Administrator password are granted by
+                    // `GetInstanceAccessDetails`, and a snapshot carries neither
+                    // over.
+                    access: crate::state::StoredInstanceAccess::default(),
                 });
                 // Each mapped disk is restored as a block storage disk of its
                 // own and attached to the new instance at the device path it was

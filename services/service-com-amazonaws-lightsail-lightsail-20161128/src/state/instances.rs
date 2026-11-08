@@ -63,6 +63,14 @@ pub struct StoredInstance {
     /// `DeleteKnownHostKeys` is what empties it again, which is how a caller
     /// recovers from a host key mismatch.
     pub known_host_keys: Vec<HostKeyAttributes>,
+    /// The temporary access `GetInstanceAccessDetails` has granted FOR this
+    /// instance: the live temporary SSH key pair, and the Windows Administrator
+    /// password the service holds for it.
+    ///
+    /// On the instance's own record, as its GUI session access and its recorded
+    /// host keys are: access is access to THAT instance, so deleting the
+    /// instance takes every grant made for it with it.
+    pub access: StoredInstanceAccess,
 }
 
 /// The state of an instance's metadata options while the service is still
