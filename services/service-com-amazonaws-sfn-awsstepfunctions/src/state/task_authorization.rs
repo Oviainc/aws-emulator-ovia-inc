@@ -227,6 +227,49 @@ fn iam_state<Eng: Send + Sync + 'static>(
     ::service_com_amazonaws_iam_awsidentitymanagementv20100508::state::service_state(engine)
 }
 
+/// What one walk ACTS AS while it performs its states' work: the execution role its
+/// integration calls are made as, and the EventBridge connections its HTTP Tasks
+/// authenticate their requests through.
+///
+/// Both are decided from another service's own store, reached through the shared engine,
+/// and neither is anything the walk itself can read — which is why they are handed to it
+/// as closures ([`RoleGate`], [`super::http_task::Connections`]) rather than as records.
+#[derive(Clone, Default)]
+pub struct Acting {
+    /// What decides whether the execution role may make a call ([`role_gate`]).
+    pub role: Option<RoleGate>,
+    /// What resolves the connection an HTTP Task names
+    /// ([`super::http_task::connections`]).
+    pub connections: Option<super::http_task::Connections>,
+}
+
+/// Debug without disclosing anything either closure reads: a connection holds
+/// credentials, and a role's policies are another service's records.
+impl ::std::fmt::Debug for Acting {
+    fn fmt(&self, formatter: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        formatter
+            .debug_struct("Acting")
+            .field("role", &self.role.is_some())
+            .field("connections", &self.connections.is_some())
+            .finish()
+    }
+}
+
+/// What a walk of this execution acts as: see [`Acting`], [`role_gate`] and
+/// [`super::http_task::connections`], each of which answers nothing for an engine
+/// carrying no store to read.
+pub fn acting<Eng: Send + Sync + 'static>(
+    engine: &Arc<Eng>,
+    region: &str,
+    role_arn: &str,
+    unassumable: Option<Failed>,
+) -> Acting {
+    Acting {
+        role: role_gate(engine, region, role_arn, unassumable),
+        connections: super::http_task::connections(engine),
+    }
+}
+
 /// Why the role `role_arn` may not perform `action` on `resource`, as the service
 /// named `service` words that refusal, or `None` when nothing of the kind can be shown
 /// (see the module docs for the cases that show nothing).

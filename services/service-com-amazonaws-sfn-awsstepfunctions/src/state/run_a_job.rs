@@ -223,13 +223,13 @@ async fn resolve<Eng: Send + Sync + 'static>(
         // continuation, so a role that cannot be assumed fails the task.
         let unassumable =
             super::task_authorization::unassumable_role(callback, &region, &context.role_arn).await;
-        let role = super::task_authorization::role_gate(
+        let acting = super::task_authorization::acting(
             engine,
             &region,
             &context.role_arn,
             unassumable,
         );
-        integration::interpret_through(callback, depth, &region, role, move |tasks| {
+        integration::interpret_through(callback, depth, &region, acting, move |tasks| {
             super::plan_job_reply(
                 &definition,
                 &input,

@@ -304,7 +304,10 @@ const LAMBDA_ROLE_ARN: &str = "arn:aws:iam::000000000000:role/LambdaExecutionRol
 const TERMINAL_PATIENCE: Duration = PAST_THE_EXECUTION_DELAY.saturating_add(Duration::from_secs(30));
 
 /// A response body, parsed; the null document for an empty one.
-fn parsed(bytes: Bytes) -> Value {
+///
+/// `pub(crate)`, not private: `tests/all.rs` is this binary's crate root, so a sibling
+/// suite reads a response through this rather than carrying a second copy of it.
+pub(crate) fn parsed(bytes: Bytes) -> Value {
     if bytes.is_empty() {
         Value::Null
     } else {
@@ -320,7 +323,9 @@ fn parsed(bytes: Bytes) -> Value {
 /// `source` as a deployment package: one `.py` module named after the handler's own
 /// module, in a .zip archive, base64-encoded because `FunctionCode$ZipFile` is a blob
 /// and a `restJson1` request carries a blob base64-encoded in its JSON body.
-fn package(source: &str) -> String {
+///
+/// `pub(crate)` for the reason [`parsed`] is.
+pub(crate) fn package(source: &str) -> String {
     let mut archive = ::zip::ZipWriter::new(::std::io::Cursor::new(Vec::new()));
     let options: ::zip::write::SimpleFileOptions = ::zip::write::SimpleFileOptions::default()
         .compression_method(::zip::CompressionMethod::Deflated);

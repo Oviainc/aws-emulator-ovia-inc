@@ -401,7 +401,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let unassumable =
             crate::state::task_authorization::unassumable_role(ctx.callback(), &region, &role_arn)
                 .await;
-        let role = crate::state::task_authorization::role_gate(
+        let acting = crate::state::task_authorization::acting(
             &self.engine,
             &region,
             &role_arn,
@@ -410,7 +410,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let interpreted = {
             let definition = definition.clone();
             let execution_input = execution_input.clone();
-            crate::state::integration::interpret(ctx, &region, role, move |tasks| {
+            crate::state::integration::interpret(ctx, &region, acting, move |tasks| {
                 crate::state::plan_run_settling_after(
                     &crate::state::RunAttempt {
                         definition: &definition,

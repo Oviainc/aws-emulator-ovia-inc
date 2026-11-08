@@ -4317,6 +4317,7 @@ fn round_up_to(value: i64, increment: i64) -> i64 {
 pub mod asl;
 pub mod encryption;
 pub mod events;
+pub mod http_task;
 pub mod integration;
 pub mod item_batcher;
 pub mod item_reader;

@@ -256,6 +256,14 @@ const SQS_NAMESPACE: &str = "sqs";
 /// (`arn:aws:states:::aws-sdk:<service>:<action>`).
 const AWS_SDK_SEGMENT: &str = "aws-sdk";
 
+/// The kind a `Resource` names Step Functions' own HTTP Task by, and that integration's
+/// one action (`arn:aws:states:::http:invoke`): the work is an HTTP request to an
+/// endpoint the state's parameters name rather than a call on another service's
+/// operation ([`super::http_task`]).
+const HTTP_NAMESPACE: &str = "http";
+/// See [`HTTP_NAMESPACE`].
+const HTTP_INVOKE_ACTION: &str = "invoke";
+
 /// The wire error code an emulated service answers for an operation nobody has
 /// implemented yet (`crate::scaffolded`). It is this emulator's own gap rather than
 /// the service refusing the call, so a task that meets it reports that nothing ran.
@@ -974,6 +982,7 @@ pub fn dataset_call(operation: &str) -> Option<Call> {
         epoch_millis: &[],
         targets: None,
         invokes: None,
+        endpoint: false,
     })
 }
 
@@ -1039,6 +1048,18 @@ pub struct Call {
     /// function's event instead ([`Call::operation_input`]), and the task's result is
     /// the function's own response payload ([`reported_result`]).
     pub invokes: Option<String>,
+    /// Whether the work is an HTTP REQUEST the state's own parameters describe rather
+    /// than an API call to an operation of a service ([`super::http_task`]).
+    ///
+    /// True for exactly one `Resource`, Step Functions' own HTTP Task
+    /// (`arn:aws:states:::http:invoke`): its endpoint, method, headers, query and body
+    /// are the task's parameters and its result is that endpoint's own response, so
+    /// NONE of the wire facts an [`Api`] states is read for it — no operation's input
+    /// is built ([`wired`]), no response document is read as an operation's output
+    /// ([`answer_of`]) and no [`TARGET_RESOURCES`] entry names a resource it acts on.
+    /// The entry it carries is this service's own, because `http:invoke` is Step
+    /// Functions' own integration, served by Step Functions.
+    pub endpoint: bool,
 }
 
 /// The member of `Invoke`'s input that names the function to invoke, which that
@@ -1081,6 +1102,16 @@ impl Call {
         );
         input.insert(PAYLOAD_MEMBER.to_string(), document.clone());
         Value::Object(input)
+    }
+
+    /// How a refusal of this call NAMES the work it is: the operation and the service
+    /// for a call to a service's API, and the request itself for the HTTP Task, which
+    /// calls no operation of any service ([`Call::endpoint`]).
+    fn described(&self) -> String {
+        match self.endpoint {
+            true => "the HTTP request this task makes".to_string(),
+            false => format!("the '{}' call of {}", self.operation, self.api.sdk_id),
+        }
     }
 }
 
@@ -1780,9 +1811,8 @@ impl Tasks for Unserved {
         Err(Failed {
             error: super::asl::RUNTIME_ERROR.to_string(),
             cause: format!(
-                "the '{}' call of {} is not made outside an execution, so nothing was run for \
-                 this task",
-                call.operation, call.api.sdk_id
+                "{} is not made outside an execution, so nothing was run for this task",
+                call.described()
             ),
         })
     }
@@ -1840,6 +1870,11 @@ pub fn read(resource: &str) -> Result<Call, String> {
              'GetActivityTask' for it rather than being an integration call, so no call was \
              made and nothing was run for it"
         ));
+    }
+    // Step Functions' own HTTP Task names no other service: the work is one HTTP
+    // request the state's parameters describe ([`super::http_task`]).
+    if service == HTTP_NAMESPACE {
+        return http_invoke(&shown, action);
     }
     // "<action>.sync", "<action>.sync:2" and "<action>.waitForTaskToken" name an
     // integration PATTERN after the action: the action is what is called either way,
@@ -1957,6 +1992,55 @@ pub fn read(resource: &str) -> Result<Call, String> {
         // Only a `Resource` that names a function itself invokes one directly; this
         // one named an integration, whose request is the document the state built.
         invokes: None,
+        endpoint: false,
+    })
+}
+
+/// The HTTP Task `arn:aws:states:::http:invoke` names: one HTTP request to the endpoint
+/// the state's own parameters name, made and reported by [`super::http_task`].
+///
+/// `action` is everything the `Resource` wrote after the `http` kind, so an action that
+/// is not the one this integration has — including the integration PATTERNS written
+/// after one (`.sync`, `.waitForTaskToken`), which this integration does not take —
+/// names work no request is made for rather than a request assembled out of it.
+///
+/// `shown` is the `Resource` as a cause may echo it ([`super::asl::echoed`]).
+fn http_invoke(shown: &str, action: &str) -> Result<Call, String> {
+    if action != HTTP_INVOKE_ACTION {
+        return Err(format!(
+            "'{shown}' names '{}' of this service's HTTP Task, which performs only its \
+             '{HTTP_INVOKE_ACTION}' action, so nothing was run for it",
+            super::asl::echoed(action)
+        ));
+    }
+    let api = APIS
+        .iter()
+        .find(|api| api.namespace == STATES_NAMESPACE)
+        .ok_or_else(|| {
+            format!("'{shown}' names this service's HTTP Task, which this emulator does not make")
+        })?;
+    Ok(Call {
+        // `http:invoke` is Step Functions' OWN integration, served by Step Functions
+        // itself, so the entry is this service's — and none of its wire facts is read
+        // for this call, whose request is the task's parameters rather than an
+        // operation's input ([`Call::endpoint`]).
+        api,
+        operation: HTTP_INVOKE_ACTION.to_string(),
+        // Every one of these belongs to a call on a service's operation, and this call
+        // is on none: there is no REST binding to build a request with, no job to park
+        // at, no token to wait for, no member to convert, no SDK response to wrap and
+        // no resource of another service the call acts on.
+        rest: None,
+        job: None,
+        callback: false,
+        parsed_output: false,
+        json_text: &[],
+        json_text_at: &[],
+        sdk_envelope: false,
+        epoch_millis: &[],
+        targets: None,
+        invokes: None,
+        endpoint: true,
     })
 }
 
@@ -2005,6 +2089,7 @@ fn direct_invocation(function: &str, shown: &str) -> Result<Call, String> {
             .iter()
             .find(|entry| entry.integration == LAMBDA_INVOKE_INTEGRATION),
         invokes: Some(function.to_string()),
+        endpoint: false,
     })
 }
 
@@ -2109,6 +2194,7 @@ fn pattern_call(api: &'static Api, operation: &str) -> Call {
         epoch_millis: &[],
         targets: None,
         invokes: None,
+        endpoint: false,
     }
 }
 
@@ -2232,12 +2318,13 @@ pub type RoleGate = ::std::sync::Arc<dyn Fn(&Call, &Value) -> Option<Failed> + S
 /// What a task fails with when the call could not be handed over or answered at all
 /// — the walk and the operation running it parted company, which is this emulator
 /// failing to ask rather than the service refusing.
-fn unavailable(operation: &str) -> Failed {
+fn unavailable(call: &Call) -> Failed {
     Failed {
         error: super::asl::RUNTIME_ERROR.to_string(),
         cause: format!(
-            "the '{operation}' call this task makes could not be handed to the request running \
-             the execution, so nothing was run for it"
+            "{} could not be handed to the request running the execution, so nothing was run \
+             for it",
+            call.described()
         ),
     }
 }
@@ -2254,9 +2341,9 @@ fn still_calling(call: &Call) -> Failed {
     Failed {
         error: super::asl::TIMEOUT_ERROR.to_string(),
         cause: format!(
-            "the '{}' call of {} could not be made while the call this execution made before it \
-             has still not answered, so nothing was run for it",
-            call.operation, call.api.sdk_id
+            "{} could not be made while the call this execution made before it has still not \
+             answered, so nothing was run for it",
+            call.described()
         ),
     }
 }
@@ -2268,10 +2355,10 @@ fn too_deep(call: &Call) -> Failed {
     Failed {
         error: super::asl::RUNTIME_ERROR.to_string(),
         cause: format!(
-            "the '{}' call of {} would be made from a chain of in-process calls already \
+            "{} would be made from a chain of in-process calls already \
              {MAX_CALL_CHAIN_DEPTH} deep, which is as deep as this emulator carries one, so \
              nothing was run for it",
-            call.operation, call.api.sdk_id
+            call.described()
         ),
     }
 }
@@ -2287,8 +2374,8 @@ fn timed_out(call: &Call, waited: Duration) -> Failed {
     Failed {
         error: super::asl::TIMEOUT_ERROR.to_string(),
         cause: format!(
-            "the '{}' call of {} did not answer inside the {:?} this task waits for one",
-            call.operation, call.api.sdk_id, waited
+            "{} did not answer inside the {waited:?} this task waits for one",
+            call.described()
         ),
     }
 }
@@ -2322,7 +2409,7 @@ impl Tasks for Dispatcher {
         match self.calls.try_send(handover) {
             Ok(()) => {}
             Err(::tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                return Err(unavailable(&call.operation))
+                return Err(unavailable(call))
             }
             Err(::tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                 return Err(still_calling(call))
@@ -2333,9 +2420,7 @@ impl Tasks for Dispatcher {
         match answered.recv_timeout(waited) {
             Ok(answer) => answer,
             Err(::std::sync::mpsc::RecvTimeoutError::Timeout) => Err(timed_out(call, waited)),
-            Err(::std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                Err(unavailable(&call.operation))
-            }
+            Err(::std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(unavailable(call)),
         }
     }
 
@@ -2359,18 +2444,19 @@ impl Tasks for Dispatcher {
 /// the walk, where [`MAX_CALL_CHAIN_DEPTH`] decides whether another call is made.
 ///
 /// `region` is the Region the calls are made in: the execution's own, which is the
-/// Region its state machine's ARN names.
+/// Region its state machine's ARN names, and `acting` is what this walk performs its
+/// work AS ([`super::task_authorization::Acting`]).
 pub async fn interpret<Work, Outcome>(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
-    role: Option<RoleGate>,
+    acting: super::task_authorization::Acting,
     work: Work,
 ) -> Result<Outcome, ::tokio::task::JoinError>
 where
     Work: FnOnce(&dyn Tasks) -> Outcome + Send + 'static,
     Outcome: Send + 'static,
 {
-    interpret_through(ctx.callback(), chain_depth(ctx), region, role, work).await
+    interpret_through(ctx.callback(), chain_depth(ctx), region, acting, work).await
 }
 
 /// As [`interpret`], from a callback handle and a chain depth rather than from a
@@ -2385,7 +2471,7 @@ pub async fn interpret_through<Work, Outcome>(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     depth: u8,
     region: &str,
-    role: Option<RoleGate>,
+    acting: super::task_authorization::Acting,
     work: Work,
 ) -> Result<Outcome, ::tokio::task::JoinError>
 where
@@ -2395,6 +2481,8 @@ where
     // One call is in flight at a time: the walk waits for each answer before it
     // transitions, so a deeper channel would buffer nothing.
     let (calls, mut handovers) = ::tokio::sync::mpsc::channel::<Handover>(1);
+    let role = acting.role;
+    let connections = acting.connections;
     let walk = ::tokio::task::spawn_blocking(move || {
         let dispatcher = Dispatcher {
             calls,
@@ -2411,16 +2499,29 @@ where
             // over rather than waiting for a target that is still holding the
             // previous one (`GetActivityTask` is a long poll). Nothing is faked for
             // an abandoned call: the walk reported the timeout itself.
-            let answer =
-                match ::tokio::time::timeout(
-                    MAX_CALL_DURATION,
-                    call_api(callback, region, &handover.call, &handover.request),
-                )
-                .await
-                {
-                    Ok(answer) => answer,
-                    Err(_elapsed) => Err(timed_out(&handover.call, MAX_CALL_DURATION)),
-                };
+            // The HTTP Task's work is a request to the endpoint its own parameters
+            // name rather than a call on a service's operation, so it is made by the
+            // module that owns that reading — over the same transport, under the same
+            // ceiling, and reported to the walk through the same seam.
+            let made = async {
+                match handover.call.endpoint {
+                    true => {
+                        super::http_task::invoke(
+                            callback,
+                            connections.as_ref(),
+                            &handover.request,
+                        )
+                        .await
+                    }
+                    false => {
+                        call_api(callback, region, &handover.call, &handover.request).await
+                    }
+                }
+            };
+            let answer = match ::tokio::time::timeout(MAX_CALL_DURATION, made).await {
+                Ok(answer) => answer,
+                Err(_elapsed) => Err(timed_out(&handover.call, MAX_CALL_DURATION)),
+            };
             // A walk that has stopped waiting — it timed out, or it is gone — cannot
             // be told; it reported the timeout itself.
             let _ = handover.answer.send(answer);
@@ -2646,20 +2747,31 @@ fn form_body(operation: &str, version: &str, document: &Value) -> Result<String,
             }
         };
         body.push('&');
-        body.push_str(&::percent_encoding::utf8_percent_encode(member, FORM_FIELD).to_string());
+        body.push_str(
+            &::percent_encoding::utf8_percent_encode(member, UNRESERVED_ONLY).to_string(),
+        );
         body.push('=');
-        body.push_str(&::percent_encoding::utf8_percent_encode(&field, FORM_FIELD).to_string());
+        body.push_str(
+            &::percent_encoding::utf8_percent_encode(&field, UNRESERVED_ONLY).to_string(),
+        );
     }
     Ok(body)
 }
 
-/// The characters a form field escapes: everything but RFC 3986's unreserved set,
-/// which is the encoding AWS's own canonical request states for a query component.
-const FORM_FIELD: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'.')
-    .remove(b'_')
-    .remove(b'~');
+/// The characters a value percent-encoded as ONE component escapes: everything but RFC
+/// 3986's unreserved set, which is the encoding AWS's own canonical request states for a
+/// query component and what a form field carries.
+///
+/// `pub(super)`, because it is the same set wherever a value of this crate is written
+/// into a query or a form: the field of the form an `awsQuery` request IS
+/// ([`form_body`]), and the query parameter and form field an HTTP Task sends
+/// ([`super::http_task`]).
+pub(super) const UNRESERVED_ONLY: &::percent_encoding::AsciiSet =
+    &::percent_encoding::NON_ALPHANUMERIC
+        .remove(b'-')
+        .remove(b'.')
+        .remove(b'_')
+        .remove(b'~');
 
 impl Rest {
     /// The request this operation's bindings put `document` on the wire as.

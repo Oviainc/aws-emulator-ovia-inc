@@ -74,6 +74,12 @@ service-com-amazonaws-kms-trentservice = { workspace = true }
 # what a `Task` state's integration call is made as: read out of IAM's own store, so
 # this service judges that call against the documents IAM's handlers wrote.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The EventBridge CONNECTION an HTTP Task's `Authentication.ConnectionArn` names: its
+# state and the credentials it holds, read out of EventBridge's own store — the same
+# records `CreateConnection` wrote and an api-destination invocation carries — so a
+# request this service makes through a connection and one EventBridge makes through it
+# cannot disagree about what that connection authorizes.
+service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 # The principal a request's access key id speaks for, read out of STS's own store —
 # the same place `sts:GetCallerIdentity` answers from — so the `iam:PassRole` a
 # control-plane request makes is decided for the identity that signed it.
@@ -97,7 +103,6 @@ service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 # `tests/all/execution_status_change_events.rs`, because an execution's status changes are
 # published onto the default event bus and a rule on that bus delivers them to an SQS
 # queue target: without them mounted there is nothing for the publication to reach.
-service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # The same, for the service a `Task` state whose `Resource` names a Lambda FUNCTION
 # invokes (`tests/all/lambda_task_control_flow.rs`): the function really runs there, so

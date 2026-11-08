@@ -424,13 +424,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &context.role_arn,
             )
             .await;
-            let role = crate::state::task_authorization::role_gate(
+            let acting = crate::state::task_authorization::acting(
                 &self.engine,
                 &region,
                 &context.role_arn,
                 unassumable,
             );
-            crate::state::integration::interpret(ctx, &region, role, move |tasks| {
+            crate::state::integration::interpret(ctx, &region, acting, move |tasks| {
                 crate::state::plan_callback_reply(
                     &definition,
                     &execution_input,
