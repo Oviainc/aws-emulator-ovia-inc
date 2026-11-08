@@ -52,15 +52,36 @@ visible with the code rather than only in a review:
   addresses, bounded by `state::MAX_QUERY_DATABASES`, and the number of retained
   executions by `state::MAX_QUERY_EXECUTIONS` — each holds a result set, so both are
   needed for the per-query caps to bound anything.
-* **What it does not do yet.** Registering what a `CREATE TABLE` defines in the Glue Data
-  Catalog is not part of this slice: Athena's metadata reads project Glue (see
-  `src/state.rs`), and wiring DDL through to it belongs with the DDL operations' own
-  issues. Until then a table defined through a query is visible to later queries in the
-  same database and not to `ListTableMetadata`. A failed query's `StateChangeReason` is
-  also the engine's OWN diagnostic (with anything path-shaped redacted) or this
+* **Where the data comes from.** A statement is first read as what it IS
+  (`src/state/catalog_sql/statement.rs`, the maintained SQL parser): a statement that
+  defines or reports a catalog object is performed against the AWS Glue Data Catalog
+  (`src/state/catalog_sql/ddl.rs`) — the catalog `AwsDataCatalog` names, which this
+  emulator holds in the glue crate's own store — and a statement that reads a relation has
+  it resolved through that catalog, with the OBJECTS at the relation's location decoded by
+  the SerDe the catalog recorded (`src/state/catalog_sql/data.rs`) and handed to the engine
+  as the rows it computes over. So the crate reads the object store (the s3 crate's state)
+  and the catalog, and writes only the catalog entries its DDL defines — recording, for a
+  table its DDL registers, the input format, output format and serialization library the
+  statement's own `STORED AS` and `ROW FORMAT` declared, which is also what decides whether
+  a later read can decode that table's objects at all. What ONE statement may ask for is
+  bounded by one budget carried through the whole resolution and every read it drives: the
+  relations it may resolve (`query_engine::MAX_RESOLVED_RELATIONS`, which caps the product
+  of the relations a statement names and the levels of view they are defined over), the rows
+  and bytes it may materialise (`MAX_MATERIALISED_ROWS`, `MAX_MATERIALISED_BYTES`) and the
+  wall clock it may spend (`MAX_QUERY_DEADLINE`) — so the objects a caller puts at one
+  location, and the views it defines over one another, cannot decide how much this process
+  holds or how long it works. The statement text is bounded before it is parsed, by a token
+  count, because the tree every walk here recurses over is at most one node per token.
+* **What it does not do yet.** A table a statement defines in the ENGINE rather than in the
+  catalog (a plain `CREATE TABLE`, a `CREATE TABLE AS SELECT`) is visible to later queries
+  in the same database and not to `ListTableMetadata`, and no query result object is written
+  to the results location — both have their own issues. A failed query the ENGINE refused
+  reports the engine's OWN diagnostic (with anything path-shaped redacted) or this
   emulator's wording for a bound it stopped the run at, so it does not match the wording
   Athena's own engine would use for the same failure — a message-fidelity gap for its own
-  issue, not a reason to invent a message no engine produced.
+  issue, not a reason to invent a message no engine produced. A failure of one of the
+  catalog's own classes does carry Athena's category, error type and message
+  (`catalog_sql::Failure`).
 * **Alternatives considered.** A pure-Rust SQL engine would remove the native component,
   at the cost of a different SQL dialect and far less exercised code on the same
   untrusted-input path; the engine already linked by the workspace was preferred. If the

@@ -104,7 +104,7 @@ use super::types::*;
 
 use ::std::time::{Duration, SystemTime};
 
-use crate::state::query_engine;
+use crate::state::{catalog_sql, query_engine};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -191,9 +191,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(internal_server("Athena state is not reachable on this engine"));
         };
 
-        // The SQL is PARSED to classify it, before any lock is taken; what it computes
-        // is the engine's own answer below.
-        let submitted = query_engine::submitted(&query_string);
+        // The catalog and database an unqualified name in the statement resolves
+        // against: the ones its context names, or the defaults Athena resolves against.
+        let query_context = catalog_sql::statement::QueryContext {
+            catalog: context
+                .catalog
+                .clone()
+                .unwrap_or_else(|| crate::state::GLUE_DATA_CATALOG_NAME.to_string()),
+            database: context
+                .database
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_QUERY_DATABASE.to_string()),
+        };
+        // The statement is READ before any lock is taken — what it is, what it addresses
+        // and how it runs; what it computes is the catalog's and the engine's own answer
+        // below.
+        let reading = catalog_sql::statement::read(&query_string, &query_context);
         let id = crate::state::new_query_execution_id();
         let submitted_at = SystemTime::now();
         // Everything that reads or writes the registry happens here, and the lock is
@@ -274,15 +287,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The engine database a query runs in is the one its context addresses: the
             // catalog and database it names, or the defaults an unqualified query
             // resolves against.
-            let catalog = context
-                .catalog
-                .clone()
-                .unwrap_or_else(|| crate::state::GLUE_DATA_CATALOG_NAME.to_string());
-            let database = context
-                .database
-                .clone()
-                .unwrap_or_else(|| crate::state::DEFAULT_QUERY_DATABASE.to_string());
-            let handle = match store.query_database(&catalog, &database) {
+            let handle = match store
+                .query_database(&query_context.catalog, &query_context.database)
+            {
                 Ok(handle) => handle,
                 Err(message) => return Err(internal_server(&message)),
             };
@@ -293,8 +300,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let record = crate::state::QueryExecutionRecord {
                 id: id.clone(),
                 query_string: query_string.clone(),
-                statement_type: submitted.statement_type.map(str::to_string),
-                substatement_type: submitted.substatement_type.map(str::to_string),
+                statement_type: reading.statement_type.map(str::to_string),
+                substatement_type: reading.substatement_type.map(str::to_string),
                 work_group,
                 context,
                 result_configuration,
@@ -320,18 +327,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             handle
         };
 
-        let completion = match submitted.statements {
+        let completion = match reading.statements {
             // One statement, or text this parser could not read at all — in which case
             // the engine is the one that reports why.
             Some(1) | None => {
                 let sql = query_string.clone();
-                let counts_rows = submitted.counts_rows;
                 let parameters = execution_parameters.clone();
-                // The engine is synchronous and CPU-bound, so it runs on a blocking
-                // thread rather than on an async worker, and under the deadline and step
-                // budget `query_engine::run` installs.
+                let engine = ::std::sync::Arc::clone(&self.engine);
+                // The statement runs on a blocking thread: the catalog's store, the
+                // object store and the SQL engine are all synchronous, and the engine is
+                // CPU-bound, so none of that work belongs on an async worker. The bounds
+                // one run is held to are installed by `catalog_sql::execute`.
                 let run = ::tokio::task::spawn_blocking(move || {
-                    query_engine::run(&prepared, &sql, counts_rows, &parameters)
+                    catalog_sql::execute(
+                        &*engine,
+                        &prepared,
+                        &sql,
+                        reading,
+                        &query_context,
+                        &parameters,
+                        SystemTime::now(),
+                    )
                 })
                 .await;
                 run.unwrap_or_else(|_| query_engine::Completion {

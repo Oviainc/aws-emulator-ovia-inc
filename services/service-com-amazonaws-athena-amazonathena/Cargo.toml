@@ -12,9 +12,11 @@ engine = { workspace = true }
 # operations read the databases and tables out of Glue's own store rather than keeping a
 # second copy of them here.
 service-com-amazonaws-glue-awsglue = { workspace = true }
-# A notebook imported from a `NotebookS3LocationUri` IS the object that location names, so
-# the import reads it out of the one object store this emulator has rather than reporting
-# success for content nothing holds.
+# The object store two things here reach: the DATA a catalog table reads is the objects at
+# its location, so a query over such a table reads them out of it; and a notebook imported
+# from a `NotebookS3LocationUri` IS the object that location names, so the import reads it
+# out of the one object store this emulator has rather than reporting success for content
+# nothing holds.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
 # `page_tokens`: the authenticated continuation token every paginated read here hands
 # back, so a `NextToken` this process did not mint names no page.
@@ -39,9 +41,18 @@ service-common = { path = "../common" }
 # length, column, depth and compound-select limits. `limits` and `hooks` are the features
 # those controls need; `load_extension` is deliberately absent.
 rusqlite = { version = "0.37", features = ["bundled", "column_decltype", "hooks", "limits"] }
+# `regex`: the pattern a `SHOW TABLES`/`SHOW VIEWS` statement narrows its answer by is
+# matched by the linear-time matcher the Data Catalog's own listings use, not by a
+# hand-rolled one.
+regex = "1.13"
+# `csv`: the objects under a table's location are DELIMITED TEXT, so the records and
+# fields a read decodes out of them are read by the maintained reader for that format
+# rather than by a splitter written here — the separator, the quoting and the line
+# terminators come from the table's own SerDe.
+csv = "1.4"
 # `StatementType` is read off the PARSE of the submitted SQL rather than off its leading
 # word, with the maintained parser this workspace already uses for caller-supplied SQL.
-sqlparser = "0.59"
+sqlparser = { version = "0.59", features = ["visitor"] }
 # Mints the version-4 UUID a `QueryExecutionId` is.
 uuid = { version = "1", features = ["v4"] }
 # Renders the authenticated bytes of a page token, and a binary result value, as hex.

@@ -23,9 +23,10 @@
 //! holding a second copy that could drift from the catalog a client writes through.
 //!
 //! QUERY EXECUTIONS are the service's other resource, and the one with a lifecycle:
-//! `StartQueryExecution` RUNS the submitted SQL on a real engine ([`query_engine`]) and
-//! stores what it produced in a [`QueryExecutionRecord`], and every later read —
-//! `GetQueryExecution`, `GetQueryResults`, `ListQueryExecutions`,
+//! `StartQueryExecution` RUNS the submitted statement — against the Data Catalog, or on a
+//! real SQL engine over the rows the catalog's tables hold ([`catalog_sql`],
+//! [`query_engine`]) — and stores what it produced in a [`QueryExecutionRecord`], and
+//! every later read — `GetQueryExecution`, `GetQueryResults`, `ListQueryExecutions`,
 //! `BatchGetQueryExecution` — answers out of that record. The record's `Status.State`
 //! is DERIVED from the clock and the stored outcome
 //! ([`QueryExecutionRecord::state_at`]), so a query a caller reads straight back is
@@ -40,6 +41,9 @@
 
 /// The SQL engine a query execution runs on, and the result set it produces.
 pub mod query_engine;
+
+/// What a submitted statement means to the AWS Glue Data Catalog, and how it is run.
+pub mod catalog_sql;
 
 /// The notebooks a Spark enabled workgroup holds, and the ipynb content of each.
 mod notebooks;
@@ -1037,18 +1041,23 @@ impl QueryExecutionRecord {
     ///
     /// A statement whose results are ROWS — one Athena classifies as DML — has them only
     /// once it has SUCCEEDED. A statement whose result is the engine's TEXT output — one
-    /// Athena classifies as DDL or UTILITY — has that output as soon as the engine
-    /// reported on it, whether it reported the statement done or the statement in error,
-    /// and the result set that output carries is the empty one. A query still running,
-    /// one a caller cancelled and one this emulator stopped before the engine could
-    /// report produced no output at all, so there is nothing to read from any of them.
+    /// Athena classifies as DDL or UTILITY — has that output as soon as the statement was
+    /// REPORTED ON, whether what reported was the engine (the statement ran, or ran into
+    /// an error) or the data catalog (the statement named something it does not hold), and
+    /// the result set that output carries is the empty one. A query still running, one a
+    /// caller cancelled and one this emulator stopped before anything could report
+    /// produced no output at all, so there is nothing to read from any of them.
     pub fn readable_result_at(&self, now: SystemTime) -> Option<&query_engine::StoredResultSet> {
         match self.state_at(now) {
             QUERY_STATE_SUCCEEDED => self.result_set_at(now),
             QUERY_STATE_FAILED
                 if self.writes_text_output()
                     && self.failure().is_some_and(|(_, cause)| {
-                        cause == query_engine::FailureCause::Sql
+                        matches!(
+                            cause,
+                            query_engine::FailureCause::Sql
+                                | query_engine::FailureCause::Athena { .. }
+                        )
                     }) =>
             {
                 Some(&query_engine::TEXT_OUTPUT_RESULT_SET)
@@ -1146,10 +1155,18 @@ impl QueryExecutionRecord {
             error_category: Some(match cause {
                 query_engine::FailureCause::Sql => ERROR_CATEGORY_USER,
                 query_engine::FailureCause::Emulator => ERROR_CATEGORY_OTHER,
+                // A failure of one of Athena's own classes carries that class's
+                // category, which is neither the engine's doing nor a bound of this
+                // emulator.
+                query_engine::FailureCause::Athena { category, .. } => category,
             }),
-            // Athena's error TYPE is a published code per failure; the engine
-            // reports no such code, so none is invented here.
-            error_type: None,
+            // Athena's error TYPE is a published code per failure class: the one
+            // reported is the one the failure's own class carries, and a failure the
+            // engine reported carries none, so none is invented for it.
+            error_type: match cause {
+                query_engine::FailureCause::Athena { error_type, .. } => error_type,
+                _ => None,
+            },
             // "The FAILED state is always terminal with no automatic retry."
             retryable: false,
             error_message: Some(message.to_string()),

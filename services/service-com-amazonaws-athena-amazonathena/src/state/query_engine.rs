@@ -15,9 +15,10 @@
 //!
 //! One [`Database`] per catalog and database name a query addresses, so two queries in
 //! the same database see each other's writes and a query in another database does not.
-//! Registering what a `CREATE TABLE` defines in the Glue Data Catalog is NOT part of this
-//! slice: Athena's metadata reads project Glue (see [`super`]), and wiring DDL through to
-//! it belongs with the DDL operations' own issues.
+//! What a statement MEANS to the AWS Glue Data Catalog — the tables and views its DDL
+//! defines, and the catalog relations its reads resolve to — is not decided here: this
+//! slice runs SQL and holds rows, and [`super::catalog_sql`] is what resolves a statement
+//! against the catalog and hands the objects it reads to [`run_over`].
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -94,6 +95,35 @@ const MAX_RESULT_CELLS: usize = 200_000;
 
 /// How many bytes of materialised result one query's result set may retain.
 const MAX_RESULT_BYTES: usize = 4 * 1024 * 1024;
+
+/// How many rows one query may MATERIALISE from the Data Catalog: the rows of every
+/// catalog table it reads, held in the engine database for the length of the run.
+///
+/// The EMULATOR's own bound, with no AWS counterpart (Athena scans whatever the table's
+/// location holds): without it the objects a caller put at one location would decide how
+/// much this process holds for one query.
+pub const MAX_MATERIALISED_ROWS: usize = 200_000;
+
+/// How many BYTES of object data one query may read while materialising the catalog
+/// tables it reads; the byte counterpart of [`MAX_MATERIALISED_ROWS`].
+pub const MAX_MATERIALISED_BYTES: usize = 8 * 1024 * 1024;
+
+/// How many VALUES (rows times columns) one query may materialise from the Data Catalog.
+///
+/// The EMULATOR's own bound, and the one that bounds the PRODUCT the row count alone does
+/// not: how many rows an object holds and how many columns a table declares are both
+/// caller-chosen, and one value costs memory whatever it holds, so a row of a wide table
+/// is charged for its width.
+pub const MAX_MATERIALISED_CELLS: usize = 500_000;
+
+/// How many RELATIONS one statement may resolve through the data catalog, counted over
+/// the whole statement and every level of view it reads through.
+///
+/// The EMULATOR's own bound, and the one that caps the PRODUCT rather than each factor:
+/// a statement names at most as many relations as its own parse carries, and each of
+/// those may be a view over as many more, so without one total count the work would grow
+/// with the product of the two. Reaching it fails the query rather than resolving on.
+pub const MAX_RESOLVED_RELATIONS: usize = 256;
 
 /// What one retained cell costs beyond its payload, charged against
 /// [`MAX_RESULT_BYTES`] so a NULL cell is never free.
@@ -446,6 +476,16 @@ pub enum FailureCause {
     /// authorizer refused the statement outright. The SQL is not wrong; what it asked
     /// for is not allowed here, or it outgrew what is allowed.
     Emulator,
+    /// A failure of one of Athena's OWN classes, carrying the category and the error type
+    /// Athena publishes for it: a name the data catalog does not hold, an object it
+    /// already holds, a view a statement addresses that is not one. The classification
+    /// comes from the class of the failure, never from the engine.
+    Athena {
+        /// The `AthenaError$ErrorCategory` of that class.
+        category: i32,
+        /// The `AthenaError$ErrorType` Athena publishes for it, where it publishes one.
+        error_type: Option<i32>,
+    },
 }
 
 /// One run: what it produced, and how long the engine took.
@@ -461,7 +501,7 @@ pub struct Completion {
 /// in order.
 ///
 /// `counts_rows` says whether the engine counts the rows this statement writes, which is
-/// what decides whether a row count is reported at all (see [`Submitted`]).
+/// what decides whether a row count is reported at all.
 ///
 /// BLOCKING, deliberately: the engine is synchronous, so a caller must put this on a
 /// blocking pool (`tokio::task::spawn_blocking`) rather than run it on an async worker.
@@ -473,6 +513,62 @@ pub fn run(
     counts_rows: bool,
     parameters: &[String],
 ) -> Completion {
+    run_over(handle, &[], sql, counts_rows, parameters, 0)
+}
+
+/// One object a statement reads that lives OUTSIDE the engine: a catalog table's rows, or
+/// a catalog view's query, held in the engine database for the length of the run.
+#[derive(Debug, Clone)]
+pub enum LocalObject {
+    /// A table and the rows it holds.
+    Table(LocalTable),
+    /// A view and the query its rows come from.
+    View {
+        /// The name the view is reachable under.
+        name: String,
+        /// The SQL its rows come from, already naming the objects it reads.
+        sql: String,
+    },
+}
+
+/// One table a statement reads, as the engine holds it.
+#[derive(Debug, Clone)]
+pub struct LocalTable {
+    /// The name its rows are reachable under.
+    pub name: String,
+    /// Its columns, in order.
+    pub columns: Vec<LocalColumn>,
+    /// Its rows: one value per column, in column order.
+    pub rows: Vec<Vec<rusqlite::types::Value>>,
+}
+
+/// One column of a [`LocalTable`].
+#[derive(Debug, Clone)]
+pub struct LocalColumn {
+    /// The column name.
+    pub name: String,
+    /// The type the engine holds it as, which is also the type a result set reports for
+    /// it.
+    pub declared: &'static str,
+}
+
+/// Run `sql` over `objects`: materialise each one in the engine database, then run the
+/// statement that reads them.
+///
+/// `scanned_bytes` is what reading those objects cost, which for a statement over catalog
+/// tables is the data the query scanned and therefore what `DataScannedInBytes` reports;
+/// a statement over nothing but the engine's own tables reports the engine's own measure.
+///
+/// BLOCKING, exactly as [`run`] is, and under the same bounds: materialising happens
+/// inside the same armed deadline and step budget as the statement itself.
+pub fn run_over(
+    handle: &DatabaseHandle,
+    objects: &[LocalObject],
+    sql: &str,
+    counts_rows: bool,
+    parameters: &[String],
+    scanned_bytes: i64,
+) -> Completion {
     let database = handle.lock().unwrap_or_else(PoisonError::into_inner);
     let guard = Arc::new(RunGuard::default());
     let handler = Arc::clone(&guard);
@@ -483,7 +579,8 @@ pub fn run(
     let started = Instant::now();
     guard.arm(MAX_QUERY_DEADLINE, step_budget());
     database.reads_stored_data.store(false, Ordering::SeqCst);
-    let produced = execute_once(&database.connection, sql, parameters);
+    let produced = materialise(&database.connection, objects)
+        .and_then(|()| execute_once(&database.connection, sql, parameters));
     guard.disarm();
     let engine_time = started.elapsed();
     let read_stored_data = database.reads_stored_data.load(Ordering::SeqCst);
@@ -498,9 +595,20 @@ pub fn run(
             // report: `UpdateCount` is "the number of rows inserted".
             update_count: None,
             // `DataScannedInBytes` is "the number of bytes in the data that was
-            // queried", so a statement that read no stored data at all scanned nothing,
-            // however many values it computed from literals and functions.
-            data_scanned_bytes: if read_stored_data { data_scanned_bytes } else { 0 },
+            // queried": for a statement over CATALOG tables that is the object data this
+            // read scanned at their locations, and for one over nothing but this engine's
+            // own tables it is what the engine read — so a statement that read no stored
+            // data at all scanned nothing, however many values it computed from literals
+            // and functions.
+            data_scanned_bytes: if objects.is_empty() {
+                if read_stored_data {
+                    data_scanned_bytes
+                } else {
+                    0
+                }
+            } else {
+                scanned_bytes
+            },
         },
         Ok(Produced::Affected(rows)) => Outcome::Succeeded {
             result: StoredResultSet::default(),
@@ -582,6 +690,84 @@ impl RunFailure {
             Self::Bound(_) => FailureCause::Emulator,
         }
     }
+}
+
+/// Define each object a statement reads in this database, so the statement that follows
+/// reads the rows the CATALOG holds for it.
+///
+/// A table is replaced on every run rather than kept: the objects at a table's location
+/// are what a query reads, so each run reads them again and no earlier run's rows can
+/// answer a later query. The names are the qualified ones the resolution chose, so
+/// nothing an earlier statement defined in this database is overwritten.
+fn materialise(
+    connection: &rusqlite::Connection,
+    objects: &[LocalObject],
+) -> Result<(), RunFailure> {
+    for object in objects {
+        let name = match object {
+            LocalObject::Table(table) => &table.name,
+            LocalObject::View { name, .. } => name,
+        };
+        let quoted = quoted_name(name);
+        // The name may hold either kind of object from an earlier run, and dropping the
+        // wrong kind is the engine's own error rather than this one's, so both are tried.
+        let _ = connection.execute_batch(&format!("DROP VIEW IF EXISTS {quoted};"));
+        let _ = connection.execute_batch(&format!("DROP TABLE IF EXISTS {quoted};"));
+        match object {
+            LocalObject::Table(table) => {
+                let declarations: Vec<String> = table
+                    .columns
+                    .iter()
+                    .map(|column| format!("{} {}", quoted_name(&column.name), column.declared))
+                    .collect();
+                connection.execute_batch(&format!(
+                    "CREATE TABLE {quoted} ({});",
+                    declarations.join(", ")
+                ))?;
+                let placeholders = vec!["?"; table.columns.len()].join(", ");
+                let mut insert =
+                    connection.prepare(&format!("INSERT INTO {quoted} VALUES ({placeholders})"))?;
+                for row in &table.rows {
+                    insert.execute(rusqlite::params_from_iter(row.iter()))?;
+                }
+            }
+            LocalObject::View { sql, .. } => {
+                connection.execute_batch(&format!("CREATE VIEW {quoted} AS {sql};"))?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether this database already holds a table or view called `name`.
+///
+/// The read seam for a relation the data catalog holds nothing for: a statement may
+/// address a table an earlier statement defined in this database, and this is what says
+/// whether it did.
+pub fn holds_relation(handle: &DatabaseHandle, name: &str) -> bool {
+    let database = handle.lock().unwrap_or_else(PoisonError::into_inner);
+    database
+        .connection
+        .query_row(
+            "SELECT 1 FROM sqlite_master WHERE type IN ('table', 'view') \
+             AND name = ?1 COLLATE NOCASE",
+            [name],
+            |row| row.get::<_, i64>(0),
+        )
+        .is_ok()
+}
+
+/// One identifier as the engine reads it: quoted, so a name carrying a separator is one
+/// name and not a qualified one.
+fn quoted_name(name: &str) -> String {
+    format!("\"{}\"", name.replace('"', "\"\""))
+}
+
+/// The `ColumnInfo` of a column of CHARACTER data the catalog itself projects — the one
+/// column a `SHOW` statement answers with, or a column of the catalog's own reporting
+/// tables.
+pub fn varchar_column(name: &str) -> ColumnInfo {
+    column_metadata(name, Some(ColumnType::VarChar))
 }
 
 /// Prepare and run one statement, keeping no more of its result than the bounds above
@@ -964,135 +1150,6 @@ fn scrub_paths(message: &str) -> String {
         at_token_start = false;
     }
     scrubbed
-}
-
-/// What the SQL of one query execution IS: how many statements it carries, the
-/// `StatementType` of the one it carries when it carries exactly one, and whether the
-/// engine counts the rows that statement writes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Submitted {
-    /// How many statements the text parses as, or `None` when it does not parse at all —
-    /// in which case the engine is the one that reports why.
-    pub statements: Option<usize>,
-    /// The `StatementType` of the single statement submitted, when there is one.
-    pub statement_type: Option<&'static str>,
-    /// Whether this statement is one whose written rows the engine counts: an `INSERT`,
-    /// `UPDATE`, `DELETE` or `MERGE`. A `CREATE TABLE AS SELECT` is a data-manipulating
-    /// statement too, but the engine does not count the rows it writes, so it is not one
-    /// of these.
-    pub counts_rows: bool,
-    /// The `SubstatementType` of the single statement submitted, when its kind has one;
-    /// see [`substatement_type_of`].
-    pub substatement_type: Option<&'static str>,
-}
-
-/// Read `sql` as the statements it carries.
-///
-/// The text is PARSED, by the maintained SQL parser this workspace already uses, rather
-/// than classified from its leading word: `StatementType` is a fact about the statement's
-/// grammar, so it is read off the parse and not off the spelling.
-pub fn submitted(sql: &str) -> Submitted {
-    let dialect = ::sqlparser::dialect::GenericDialect {};
-    let Ok(statements) = ::sqlparser::parser::Parser::parse_sql(&dialect, sql) else {
-        return Submitted {
-            statements: None,
-            statement_type: None,
-            counts_rows: false,
-            substatement_type: None,
-        };
-    };
-    let single = match statements.as_slice() {
-        [statement] => Some(statement),
-        _ => None,
-    };
-    Submitted {
-        statements: Some(statements.len()),
-        statement_type: single.map(statement_type_of),
-        counts_rows: single.is_some_and(counts_rows),
-        substatement_type: single.and_then(substatement_type_of),
-    }
-}
-
-/// The `SubstatementType` of one parsed statement.
-///
-/// `QueryExecution$SubstatementType` documents it as "The kind of query statement that
-/// was run" — a finer classification than the three `StatementType` classes, naming the
-/// statement's own kind in upper snake case. Read off the PARSE, like
-/// [`statement_type_of`], and `None` for a kind that has no such name here: a statement
-/// whose kind cannot be named reports none rather than a guess.
-fn substatement_type_of(statement: &::sqlparser::ast::Statement) -> Option<&'static str> {
-    use ::sqlparser::ast::{ObjectType, Statement};
-    Some(match statement {
-        // A `CREATE TABLE AS SELECT` is named after both halves of what it does; see
-        // `statement_type_of`, which classifies it with the statements that manipulate
-        // data for the same reason.
-        Statement::CreateTable(create) if create.query.is_some() => "CREATE_TABLE_AS_SELECT",
-        Statement::CreateTable(..) => "CREATE_TABLE",
-        Statement::Query(..) => "SELECT",
-        Statement::Insert(..) => "INSERT_INTO",
-        Statement::Update { .. } => "UPDATE",
-        Statement::Delete(..) => "DELETE",
-        Statement::Merge { .. } => "MERGE",
-        Statement::CreateView { .. } => "CREATE_VIEW",
-        // A schema and a database are the same object to Athena, whose catalogs hold
-        // databases.
-        Statement::CreateDatabase { .. } | Statement::CreateSchema { .. } => "CREATE_DATABASE",
-        Statement::AlterTable { .. } => "ALTER_TABLE",
-        Statement::Truncate { .. } => "TRUNCATE_TABLE",
-        Statement::Drop { object_type, .. } => match object_type {
-            ObjectType::Table => "DROP_TABLE",
-            ObjectType::View => "DROP_VIEW",
-            ObjectType::Schema | ObjectType::Database => "DROP_DATABASE",
-            _ => return None,
-        },
-        Statement::ShowTables { .. } => "SHOW_TABLES",
-        Statement::ShowDatabases { .. } | Statement::ShowSchemas { .. } => "SHOW_DATABASES",
-        Statement::ShowColumns { .. } => "SHOW_COLUMNS",
-        Statement::ShowCreate { .. } => "SHOW_CREATE_TABLE",
-        Statement::Explain { .. } | Statement::ExplainTable { .. } => "EXPLAIN",
-        _ => return None,
-    })
-}
-
-/// Whether the engine counts the rows this statement writes; see
-/// [`Submitted::counts_rows`].
-fn counts_rows(statement: &::sqlparser::ast::Statement) -> bool {
-    use ::sqlparser::ast::Statement;
-    matches!(
-        statement,
-        Statement::Insert(..)
-            | Statement::Update { .. }
-            | Statement::Delete(..)
-            | Statement::Merge { .. }
-    )
-}
-
-/// The `StatementType` of one parsed statement.
-///
-/// Athena documents the three classes `StatementType` names: a statement that queries or
-/// changes DATA is DML, one that DEFINES an object is DDL, and everything else — the
-/// statements that ask the engine about itself or set up a session — is UTILITY.
-fn statement_type_of(statement: &::sqlparser::ast::Statement) -> &'static str {
-    use ::sqlparser::ast::Statement;
-    match statement {
-        // `CREATE TABLE AS SELECT` defines a table AND writes the rows a query
-        // produced, and Athena classifies it with the statements that manipulate data.
-        Statement::CreateTable(create) if create.query.is_some() => STATEMENT_TYPE_DML,
-        Statement::Query(..)
-        | Statement::Insert(..)
-        | Statement::Update { .. }
-        | Statement::Delete(..)
-        | Statement::Merge { .. } => STATEMENT_TYPE_DML,
-        Statement::CreateTable(..)
-        | Statement::CreateView { .. }
-        | Statement::CreateIndex(..)
-        | Statement::CreateSchema { .. }
-        | Statement::CreateDatabase { .. }
-        | Statement::AlterTable { .. }
-        | Statement::Drop { .. }
-        | Statement::Truncate { .. } => STATEMENT_TYPE_DDL,
-        _ => STATEMENT_TYPE_UTILITY,
-    }
 }
 
 #[cfg(test)]
