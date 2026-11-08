@@ -209,6 +209,10 @@ pub use policy_documents::*;
 mod deliveries;
 pub use deliveries::*;
 
+/// How a refusal about a PAIR of input parameters is worded, for every pair this service
+/// checks across two members.
+pub mod parameter_pairs;
+
 /// The region an ARN carries when the request is unsigned, so no SigV4 credential
 /// scope names one. Generated emulators default to `us-east-1`.
 pub const DEFAULT_REGION: &str = "us-east-1";
@@ -4333,17 +4337,18 @@ pub fn log_group_name_from_identifier(identifier: &str) -> &str {
 /// checked across two members, which no single member's constraint can express, and the
 /// recorded refusal for a request naming both selectors is `400 ValidationException:
 /// LogGroup name and LogGroup ARN are mutually exclusive parameters.` — which is why each
-/// caller widens that shape in through `extra_errors`. The sentences live here, beside the
-/// check that decides them, and name the two selectors the way the service names them: the
-/// log group's NAME and its ARN.
-pub const LOG_GROUP_SELECTORS_EXCLUSIVE: &str =
-    "LogGroup name and LogGroup ARN are mutually exclusive parameters.";
+/// caller widens that shape in through `extra_errors`. The two selectors are named here, the
+/// way the service names them — the log group's NAME and its ARN — and the SENTENCE is the
+/// service's one exclusive-pair form ([`parameter_pairs::mutually_exclusive`]).
+pub static LOG_GROUP_SELECTORS_EXCLUSIVE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| parameter_pairs::mutually_exclusive("LogGroup name", "LogGroup ARN"));
 
 /// The refusal for a request that names neither selector; see
 /// [`LOG_GROUP_SELECTORS_EXCLUSIVE`]. Both sentences are the service's own fixed wording
 /// for a request-independent refusal, and both name the selectors as the service names
 /// them rather than as the members spell them.
-pub const LOG_GROUP_SELECTOR_REQUIRED: &str = "Either LogGroupName or LogGroupArn must be provided.";
+pub static LOG_GROUP_SELECTOR_REQUIRED: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| parameter_pairs::either_required("LogGroupName", "LogGroupArn"));
 
 /// Resolve the log group an operation's `logGroupName` / `logGroupIdentifier` pair
 /// names. The model documents them as mutually exclusive with one of them required, so
@@ -4356,8 +4361,8 @@ pub fn resolve_log_group_target(
     match (log_group_name, log_group_identifier) {
         (Some(name), None) => Ok(name.to_string()),
         (None, Some(identifier)) => Ok(log_group_name_from_identifier(identifier).to_string()),
-        (Some(_), Some(_)) => Err(LOG_GROUP_SELECTORS_EXCLUSIVE.to_string()),
-        (None, None) => Err(LOG_GROUP_SELECTOR_REQUIRED.to_string()),
+        (Some(_), Some(_)) => Err(LOG_GROUP_SELECTORS_EXCLUSIVE.clone()),
+        (None, None) => Err(LOG_GROUP_SELECTOR_REQUIRED.clone()),
     }
 }
 
@@ -4395,13 +4400,18 @@ pub fn resolve_kms_key_target(
                 ))
             }
         }
-        (Some(_), Some(_)) => Err(
-            "logGroupName and resourceIdentifier are mutually exclusive; specify only one"
-                .to_string(),
-        ),
-        (None, None) => {
-            Err("either logGroupName or resourceIdentifier must be specified".to_string())
-        }
+        // The same pair forms as every other two-member check of this service
+        // ([`parameter_pairs`]), over the two members this one relates — which the
+        // operation's own documentation names in their member spellings ("you specify
+        // either the logGroupName parameter or the resourceIdentifier parameter").
+        (Some(_), Some(_)) => Err(parameter_pairs::mutually_exclusive(
+            "logGroupName",
+            "resourceIdentifier",
+        )),
+        (None, None) => Err(parameter_pairs::either_required(
+            "logGroupName",
+            "resourceIdentifier",
+        )),
     }
 }
 

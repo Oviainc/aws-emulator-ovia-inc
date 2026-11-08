@@ -451,15 +451,18 @@ pub enum LookupTableSource {
 /// members, which no single member's constraint can express, so it is answered with the
 /// `ValidationException` the lookup-table operations model rather than with their
 /// `InvalidParameterException`.
-pub const LOOKUP_TABLE_SOURCE_EXCLUSIVE: &str =
-    "tableBody and queryId are mutually exclusive parameters.";
+pub static LOOKUP_TABLE_SOURCE_EXCLUSIVE: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        super::parameter_pairs::mutually_exclusive("tableBody", "queryId")
+    });
 
 /// The refusal for a lookup-table write that names neither content source: a table is
 /// created "by uploading CSV data or from CloudWatch Logs query results" and updated by
 /// "replacing all of its content with new CSV data or CloudWatch Logs query results", so a
 /// create or an update naming neither names nothing to fill the table from. See
 /// [`LOOKUP_TABLE_SOURCE_EXCLUSIVE`] for the error shape.
-pub const LOOKUP_TABLE_SOURCE_REQUIRED: &str = "Either tableBody or queryId must be provided.";
+pub static LOOKUP_TABLE_SOURCE_REQUIRED: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| super::parameter_pairs::either_required("tableBody", "queryId"));
 
 /// Resolve what a lookup-table request populates the table from. `Ok(None)` is a request
 /// that names NEITHER source, which neither a create nor an update may be: both state "You
@@ -475,7 +478,7 @@ pub fn resolve_lookup_table_source(
     match (table_body, query_id) {
         (Some(body), None) => Ok(Some(LookupTableSource::TableBody(body.to_string()))),
         (None, Some(query_id)) => Ok(Some(LookupTableSource::QueryId(query_id.to_string()))),
-        (Some(_), Some(_)) => Err(LOOKUP_TABLE_SOURCE_EXCLUSIVE.to_string()),
+        (Some(_), Some(_)) => Err(LOOKUP_TABLE_SOURCE_EXCLUSIVE.clone()),
         (None, None) => Ok(None),
     }
 }

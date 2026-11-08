@@ -173,6 +173,8 @@ mod metric_filters;
 mod metric_transformation_exclusion_wording;
 #[path = "all/missing_destination_refusal.rs"]
 mod missing_destination_refusal;
+#[path = "all/parameter_pair_refusals.rs"]
+mod parameter_pair_refusals;
 #[path = "all/put_log_events_batch_constraints.rs"]
 mod put_log_events_batch_constraints;
 #[path = "all/query_and_stream_refusal_text.rs"]

@@ -1008,17 +1008,6 @@ mod cloudformation_wafv2_protection_stack;
 // answered with, and the one stream record each new item they write carries.
 #[path = "all/apigateway_repeated_stage_requests.rs"]
 mod apigateway_repeated_stage_requests;
-// Declared here, in this same head region, for the reason the entry above records: what a
-// deployed `AWS_IAM` method makes of the credential its request presents, on a router that
-// verifies request signatures.
-#[path = "all/apigateway_iam_authenticated_invoke.rs"]
-mod apigateway_iam_authenticated_invoke;
-#[path = "all/cloudformation_rollback_triggers_revert_the_operation.rs"]
-mod cloudformation_rollback_triggers_revert_the_operation;
-#[path = "all/cloudformation_wafv2_protection_stack.rs"]
-mod cloudformation_wafv2_protection_stack;
-#[path = "all/lambda_sqs_event_source_batching_window.rs"]
-mod lambda_sqs_event_source_batching_window;
 // Declared HERE, beside the sibling suites above in the same quiet `n`/`o` gap, for the
 // reason those entries record: the appended tail at the end of this file and the `e…` span
 #[path = "all/eks_control_plane_logs.rs"]
@@ -1026,5 +1015,3 @@ mod eks_control_plane_logs;
 // Declared in this same head region, for the reason the note above records.
 #[path = "all/bedrock_agentcore_data_plane_parent_resources.rs"]
 mod bedrock_agentcore_data_plane_parent_resources;
-#[path = "all/cloudformation_asset_bucket_publishing_role.rs"]
-mod cloudformation_asset_bucket_publishing_role;

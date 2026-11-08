@@ -269,11 +269,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "logGroupNamePattern and logGroupNamePrefix are mutually exclusive. Only one
-        // of these parameters can be passed."
+        // of these parameters can be passed." The refusal is the service's one
+        // exclusive-pair sentence, naming the two filters the way the service names them —
+        // the log group name's PREFIX and its PATTERN — and carrying neither value.
         if input.log_group_name_prefix.is_some() && input.log_group_name_pattern.is_some() {
-            return Err(invalid(
-                "logGroupNamePrefix and logGroupNamePattern are mutually exclusive; specify only one",
-            ));
+            return Err(invalid(&crate::state::parameter_pairs::mutually_exclusive(
+                "LogGroup name prefix",
+                "LogGroup name pattern",
+            )));
         }
 
         // "When includeLinkedAccounts is set to true, use this parameter [

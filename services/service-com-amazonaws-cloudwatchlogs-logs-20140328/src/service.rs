@@ -385,6 +385,12 @@ const PUBLISHED_ENUM_ORDERS: &[&[&str]] = &[
     // model's declaration and the documentation of the enum itself — "which can be either
     // random or grouped by log stream" — state the values in that order.
     &["Random", "ByLogStream"],
+    // How a log-stream listing is ordered (`cloudwatchlogs#OrderBy`), published with the
+    // stream-name value first: the model's declaration and the documentation of
+    // `DescribeLogStreams$orderBy` — "If the value is LogStreamName, the results are
+    // ordered by log stream name. If the value is LastEventTime, …" — state the values in
+    // that order.
+    &["LogStreamName", "LastEventTime"],
 ];
 
 /// The order this service states the admissible set `allowed` in, or `None` when AWS

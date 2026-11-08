@@ -138,8 +138,9 @@ const MAX_UPDATE_BYTES: usize = 1_048_576;
 /// (`StartLiveTailRequest$logStreamNames`). Worded like the service's other
 /// exclusive-pair sentences ([`crate::state::LOG_GROUP_SELECTORS_EXCLUSIVE`]), naming the
 /// two members the request spells.
-const STREAM_SELECTORS_EXCLUSIVE: &str =
-    "logStreamNames and logStreamNamePrefixes are mutually exclusive parameters.";
+static STREAM_SELECTORS_EXCLUSIVE: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    crate::state::parameter_pairs::mutually_exclusive("logStreamNames", "logStreamNamePrefixes")
+});
 
 /// The refusal for a request that selects streams while tailing more than one log group:
 /// "You can specify this parameter only if you specify only one log group in
@@ -196,7 +197,7 @@ impl<Eng: Send + Sync + 'static> StartLiveTail<Eng> {
         // "If you specify this field, you can't also specify the logStreamNamePrefixes
         // field", and either selector needs a single log group.
         if input.log_stream_names.is_some() && input.log_stream_name_prefixes.is_some() {
-            return Err(invalid(STREAM_SELECTORS_EXCLUSIVE.to_string()));
+            return Err(invalid(STREAM_SELECTORS_EXCLUSIVE.clone()));
         }
         let selects_streams =
             input.log_stream_names.is_some() || input.log_stream_name_prefixes.is_some();

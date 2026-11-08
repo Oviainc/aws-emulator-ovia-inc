@@ -48,11 +48,13 @@ const LOG_GROUP_CLASS_SET: &str = "DELIVERY, INFREQUENT_ACCESS, STANDARD";
 /// declared `DATA_SOURCE_NAME_TYPE_AND_FORMAT`, `DATA_SOURCE_NAME_AND_TYPE`.
 const GROUP_BY_SET: &str = "DATA_SOURCE_NAME_AND_TYPE, DATA_SOURCE_NAME_TYPE_AND_FORMAT";
 
-/// `cloudwatchlogs#OrderBy`, mixed-case values and no published order of its own, so the
-/// ascending order of the values stands whatever the spelling. Source:
-/// `smithy_query(query="shape", shape="OrderBy")` — declared `LogStreamName`,
-/// `LastEventTime`.
-const ORDER_BY_SET: &str = "LastEventTime, LogStreamName";
+/// `cloudwatchlogs#OrderBy` as this service states it: the published order, the stream-name
+/// value first. Source: `smithy_query(query="shape", shape="OrderBy")` — declared
+/// `LogStreamName`, `LastEventTime` — and the documentation of
+/// `DescribeLogStreams$orderBy`, which states them in the same order ("If the value is
+/// LogStreamName, the results are ordered by log stream name. If the value is
+/// LastEventTime, the results are ordered by the event time").
+const ORDER_BY_SET: &str = "LogStreamName, LastEventTime";
 
 /// The log group every row that needs one names.
 const GROUP: &str = "enum-value-set-order";

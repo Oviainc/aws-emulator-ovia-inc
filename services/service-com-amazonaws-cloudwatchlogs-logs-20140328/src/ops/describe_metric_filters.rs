@@ -173,8 +173,19 @@ impl Cursor {
 /// metricNamespace parameter" — and `metricNamespace`, which documents the same of
 /// `metricName`. A metric is identified by both together, so one without the other selects
 /// nothing the service can resolve.
-const METRIC_IDENTITY_PAIR_REQUIRED: &str =
-    "metricName and metricNamespace must be specified together";
+///
+/// Worded through the service's one paired-parameter form
+/// ([`crate::state::parameter_pairs::must_contain_both`]), which names the request in the
+/// operation's own words and the two members as AWS states them.
+static METRIC_IDENTITY_PAIR_REQUIRED: std::sync::LazyLock<String> = std::sync::LazyLock::new(
+    || {
+        crate::state::parameter_pairs::must_contain_both(
+            "Describe Metric Filters",
+            "MetricName",
+            "MetricNamespace",
+        )
+    },
+);
 
 /// The `DescribeMetricFilters` operation.
 ///
@@ -240,7 +251,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The two metric-identity members document each other as required: either both or
         // neither.
         if input.metric_name.is_some() != input.metric_namespace.is_some() {
-            return Err(invalid(METRIC_IDENTITY_PAIR_REQUIRED));
+            return Err(invalid(&METRIC_IDENTITY_PAIR_REQUIRED));
         }
 
         // "Lists the specified metric filters" — a request that names a log group lists
