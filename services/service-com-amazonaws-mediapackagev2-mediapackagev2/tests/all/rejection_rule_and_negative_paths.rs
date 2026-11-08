@@ -44,17 +44,22 @@ const ACCOUNT: &str = "000000000000";
 // The service's fixed rejection sentences, spelled out here so this suite pins the
 // WORDING as well as the rule. Each is one sentence per resource type and per rejection
 // class, and carries nothing from the request.
-const CHANNEL_GROUP_NOT_FOUND: &str = "MediaPackage can't process your request because we \
-     can't find your channel group. Verify your channel group name or add a channel group \
-     and then try again";
-const CHANNEL_NOT_FOUND: &str = "MediaPackage can't process your request because we can't \
-     find your channel. Verify your channel name or add a channel and then try again";
-const ORIGIN_ENDPOINT_NOT_FOUND: &str = "MediaPackage can't process your request because we \
-     can't find your origin endpoint. Verify your origin endpoint name or add an origin \
-     endpoint and then try again";
-const HARVEST_JOB_NOT_FOUND: &str = "MediaPackage can't process your request because we \
-     can't find your harvest job. Verify your harvest job id or create a harvest job and \
-     then try again";
+//
+// `pub(crate)` on the not-found four because they are the crate's ONE spelling of those
+// sentences: `not_found_wording_per_kind` asserts the per-KIND rule over them rather than
+// writing a second copy of each, so one wording change lands in one place.
+pub(crate) const CHANNEL_GROUP_NOT_FOUND: &str = "MediaPackage can't process your request \
+     because we can't find your channel group. Verify your channel group name or add a \
+     channel group and then try again";
+pub(crate) const CHANNEL_NOT_FOUND: &str = "MediaPackage can't process your request because \
+     we can't find your channel. Verify your channel name or add a channel and then try \
+     again";
+pub(crate) const ORIGIN_ENDPOINT_NOT_FOUND: &str = "MediaPackage can't process your request \
+     because we can't find your origin endpoint. Verify your origin endpoint name or add an \
+     origin endpoint and then try again";
+pub(crate) const HARVEST_JOB_NOT_FOUND: &str = "MediaPackage can't process your request \
+     because we can't find your harvest job. Verify your harvest job id or create a harvest \
+     job and then try again";
 const RESOURCE_ALREADY_EXISTS: &str = "MediaPackage can't create the resource you requested \
      because a resource with that name already exists. Verify the name of the resource and \
      then try again";
@@ -264,7 +269,11 @@ fn endpoint_arn(group: &str, channel: &str, endpoint: &str) -> String {
 /// Assert one refusal: its status, its wire code, the discriminator member the shape
 /// carries, the exact fixed sentence, and that NONE of the identifiers the request
 /// carried appears anywhere in the body.
-fn assert_fixed_refusal(
+///
+/// `pub(crate)` because it is the ONE fixed-refusal assertion this crate's suites share:
+/// `not_found_wording_per_kind` drives the per-kind not-found rule through it rather than
+/// restating these five checks.
+pub(crate) fn assert_fixed_refusal(
     case: &str,
     answer: &Answer,
     status: u16,
