@@ -19,9 +19,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    CreateAccessPointOutput, CreateFileSystemOutput, CreateMountTargetOutput,
-    CreateReplicationConfigurationOutput, Destination, FileSystemSize, LifecyclePolicy, PosixUser,
-    RootDirectory, Tag, UpdateFileSystemOutput, UpdateFileSystemProtectionOutput,
+    BackupPolicy, CreateAccessPointOutput, CreateFileSystemOutput, CreateMountTargetOutput,
+    CreateReplicationConfigurationOutput, Destination, FileSystemSize, LifecyclePolicy,
+    PolicyNotFound, PosixUser, RootDirectory, Tag, UpdateFileSystemOutput,
+    UpdateFileSystemProtectionOutput,
 };
 
 /// Values of the modelled `LifeCycleState` enum this slice produces
@@ -63,6 +64,21 @@ pub const PROTECTION_DISABLED: &str = "DISABLED";
 /// "REPLICATING – The file system is being used as the destination file system in a
 /// replication configuration." See [`PROTECTION_ENABLED`].
 pub const PROTECTION_REPLICATING: &str = "REPLICATING";
+
+/// Values of the modelled `Status` enum a backup policy carries
+/// (`smithy_query(query="shape",shape="Status")` -> ENABLED | ENABLING | DISABLED |
+/// DISABLING). `BackupPolicy$Status`: "ENABLED – EFS is automatically backing up the file
+/// system."
+pub const BACKUP_ENABLED: &str = "ENABLED";
+/// "ENABLING – EFS is turning on automatic backups for the file system." See
+/// [`BACKUP_ENABLED`].
+pub const BACKUP_ENABLING: &str = "ENABLING";
+/// "DISABLED – Automatic back ups are turned off for the file system." See
+/// [`BACKUP_ENABLED`].
+pub const BACKUP_DISABLED: &str = "DISABLED";
+/// "DISABLING – EFS is turning off automatic backups for the file system." See
+/// [`BACKUP_ENABLED`].
+pub const BACKUP_DISABLING: &str = "DISABLING";
 
 /// `CreateReplicationConfiguration`: "There can only be one destination file system in a
 /// replication configuration", and its `Destinations` member: "Only one destination
@@ -258,6 +274,89 @@ pub struct PendingThroughput {
     pub provisioned_throughput_in_mibps: Option<f64>,
 }
 
+/// One file system's backup policy, as a create or a `PutBackupPolicy` last set it.
+///
+/// A backup policy is a resource a file system CARRIES rather than a status every file
+/// system has: a file system none was ever set on holds no record at all, which is what
+/// the backup-policy read refuses with `PolicyNotFound`. Two of the four `Status` values
+/// are transient — "EFS is turning on automatic backups for the file system" and "EFS is
+/// turning off automatic backups" — so the phase a set is in and the instant the clock
+/// owes it its settled status live together here, the same way a file system's own
+/// `creating`/`updating` phase and its [`FileSystem::available_at`] do.
+#[derive(Debug, Clone)]
+pub struct BackupPolicyRecord {
+    /// One of [`BACKUP_ENABLED`], [`BACKUP_ENABLING`], [`BACKUP_DISABLED`] and
+    /// [`BACKUP_DISABLING`].
+    pub status: String,
+    /// When the clock owes a transient status the settled one it converges on; see
+    /// [`CREATING_FOR`].
+    pub settled_at: SystemTime,
+}
+
+impl BackupPolicyRecord {
+    /// The policy a request for `status` leaves on a file system currently holding
+    /// `current`.
+    ///
+    /// Turning automatic backups on or off is a change EFS applies in the background, so
+    /// a request that CHANGES the policy is accepted into the transient phase
+    /// ([`transient_backup_status`]) and the settled status is owed [`CREATING_FOR`]
+    /// later; a request for the status the policy already carries changes nothing and
+    /// settles at once, so a replayed request cannot push a settled policy back into a
+    /// transient phase.
+    pub fn requested(current: Option<&Self>, status: &str, now: SystemTime) -> Self {
+        let settled = settled_backup_status(status);
+        if current.is_some_and(|held| held.status == settled) {
+            return Self {
+                status: settled.to_string(),
+                settled_at: now,
+            };
+        }
+        Self {
+            status: transient_backup_status(settled).to_string(),
+            settled_at: now + CREATING_FOR,
+        }
+    }
+
+    /// This policy as the modelled `BackupPolicy`.
+    pub fn describe(&self) -> BackupPolicy {
+        BackupPolicy {
+            status: self.status.clone(),
+        }
+    }
+
+    /// Apply the settled status the clock owes this policy, if it is due.
+    fn settle(&mut self, now: SystemTime) {
+        if self.settled_at <= now {
+            self.status = settled_backup_status(&self.status).to_string();
+        }
+    }
+}
+
+/// The settled `Status` a backup-policy status converges on: [`BACKUP_ENABLING`] settles
+/// at [`BACKUP_ENABLED`] and [`BACKUP_DISABLING`] at [`BACKUP_DISABLED`], and a settled
+/// status is its own. Stated once, so the status a set asks for, the status it reports
+/// while it is in flight and the status a later read converges on cannot disagree.
+pub fn settled_backup_status(status: &str) -> &'static str {
+    match status {
+        BACKUP_ENABLED | BACKUP_ENABLING => BACKUP_ENABLED,
+        BACKUP_DISABLED | BACKUP_DISABLING => BACKUP_DISABLED,
+        // The modelled `Status` enum declares exactly those four values and the boundary
+        // refuses anything outside the closure, so no other value reaches here; one that
+        // somehow did is read as automatic backups being OFF rather than on.
+        _ => BACKUP_DISABLED,
+    }
+}
+
+/// The transient `Status` EFS reports while it moves a backup policy to the settled
+/// status `settled`; see [`settled_backup_status`].
+pub fn transient_backup_status(settled: &str) -> &'static str {
+    if settled == BACKUP_ENABLED {
+        BACKUP_ENABLING
+    } else {
+        BACKUP_DISABLING
+    }
+}
+
 /// One stored EFS file system. `NumberOfMountTargets` is not a field: it is the length
 /// of [`Self::mount_target_ids`], so the count cannot drift from the mount targets that
 /// back it.
@@ -294,9 +393,16 @@ pub struct FileSystem {
     pub kms_key_id: Option<String>,
     pub availability_zone_name: Option<String>,
     pub availability_zone_id: Option<String>,
-    /// Whether automatic backups were requested at creation. Read by the backup-policy
-    /// operations, which are still scaffolded.
-    pub backup: bool,
+    /// This file system's backup policy, and `None` while none has ever been set on it —
+    /// which is what the backup-policy read refuses with `PolicyNotFound`. A create that
+    /// asks for automatic backups (`CreateFileSystem$Backup`) sets one; see
+    /// [`BackupPolicyRecord`].
+    pub backup_policy: Option<BackupPolicyRecord>,
+    /// This file system's `FileSystemPolicy`, as `PutFileSystemPolicy` last stored it,
+    /// and `None` while none has been stored — which is what the policy read refuses with
+    /// `PolicyNotFound`. "EFS file system policies have a 20,000 character limit" and a
+    /// file system carries ONE policy, so it lives on the record and goes away with it.
+    pub file_system_policy: Option<String>,
     /// The last known metered size, in bytes, and when it was metered — `None` while no
     /// metering has happened, which is what leaves `SizeInBytes.Timestamp` ("the time at
     /// which the size of data, returned in the Value field, was determined") out of the
@@ -690,6 +796,11 @@ impl ComAmazonawsEfsMagnolioapiserviceV20150201State {
     /// anybody called, so a reporting operation may apply it.
     pub fn materialize_due_transitions(&mut self, now: SystemTime) {
         for file_system in self.file_systems.values_mut() {
+            // A backup policy EFS is turning on or off settles at the status the clock
+            // owes it, which is owed independently of the file system's own phase.
+            if let Some(backup_policy) = file_system.backup_policy.as_mut() {
+                backup_policy.settle(now);
+            }
             if (file_system.life_cycle_state == LIFE_CYCLE_CREATING
                 || file_system.life_cycle_state == LIFE_CYCLE_UPDATING)
                 && file_system.available_at <= now
@@ -1227,6 +1338,20 @@ pub const NO_REPLICATIONS_FOUND_MESSAGE: &str = "No replications found.";
 /// the REQUEST named (bare, not [`quoted`]), terminated with a period.
 pub fn replication_configuration_not_found_message(file_system_id: &str) -> String {
     format!("Cannot find a replication configuration for file system {file_system_id}.")
+}
+
+/// `PolicyNotFound`'s refusal, as BOTH policy reads of this service answer it while the
+/// file system carries no policy of the kind asked for.
+///
+/// It carries NO sentence: the refusal reports the error class and nothing from the
+/// request or from state, so the `Message` member is absent (the error document still
+/// carries the key, as JSON `null` — see [`crate::service::wire`]). Built here once, so
+/// the backup-policy read and the file-system-policy read refuse identically.
+pub fn policy_not_found() -> PolicyNotFound {
+    PolicyNotFound {
+        error_code: Some("PolicyNotFound".to_string()),
+        message: None,
+    }
 }
 
 /// `FileSystemAlreadyExists`' message — "Returned if the file system you are trying to

@@ -430,8 +430,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .as_deref()
                         .map(efs::availability_zone_id),
                     // `CreateFileSystem$Backup`: "Default is false. However, if you
-                    // specify an AvailabilityZoneName, the default is true."
-                    backup: requested.availability_zone_name.is_some(),
+                    // specify an AvailabilityZoneName, the default is true." A file
+                    // system minted with automatic backups carries a backup policy; one
+                    // minted without carries none at all.
+                    backup_policy: requested.availability_zone_name.is_some().then(|| {
+                        efs::BackupPolicyRecord::requested(None, efs::BACKUP_ENABLED, now)
+                    }),
+                    // A file system Amazon EFS mints here carries no FileSystemPolicy
+                    // until PutFileSystemPolicy stores one.
+                    file_system_policy: None,
                     size_in_bytes: 0,
                     // Nothing has metered this file system yet, which is what leaves
                     // `SizeInBytes.Timestamp` out of its description.

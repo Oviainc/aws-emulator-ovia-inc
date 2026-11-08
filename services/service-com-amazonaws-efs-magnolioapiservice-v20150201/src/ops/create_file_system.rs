@@ -457,7 +457,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .map(efs::availability_zone_id);
         // "Default is false. However, if you specify an AvailabilityZoneName, the
-        // default is true."
+        // default is true." A create that asks for automatic backups is what SETS the
+        // file system's backup policy; one that does not leaves it carrying none at all,
+        // which is what the backup-policy read reports as `PolicyNotFound`.
         let backup = input
             .backup
             .unwrap_or(input.availability_zone_name.is_some());
@@ -486,7 +488,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             kms_key_id,
             availability_zone_name: input.availability_zone_name.clone(),
             availability_zone_id,
-            backup,
+            backup_policy: backup
+                .then(|| efs::BackupPolicyRecord::requested(None, efs::BACKUP_ENABLED, now)),
+            // A new file system carries no FileSystemPolicy until PutFileSystemPolicy
+            // stores one.
+            file_system_policy: None,
             size_in_bytes: 0,
             // Nothing has metered this file system yet, which is what leaves
             // `SizeInBytes.Timestamp` out of its description.

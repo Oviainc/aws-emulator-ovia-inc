@@ -441,21 +441,19 @@ async fn the_framework_documents_carry_a_string_message_member() {
         ));
     }
 
-    // The backup-policy and file-system-policy reads are still scaffolded (they have
-    // their own stub issues), so they answer the 501 whose message names the operation.
-    let file_system_id = efs.available_file_system("framework-documents").await;
+    // Two reads of this service are still scaffolded (they have their own stub issues),
+    // so they answer the 501 whose message names the operation.
+    let mount_target_id = "fsmt-0123456789abcdef";
     for (operation, path) in [
-        ("DescribeBackupPolicy", "backup-policy"),
-        ("DescribeFileSystemPolicy", "policy"),
+        ("DescribeAccountPreferences", "/2015-02-01/account-preferences".to_string()),
+        (
+            "DescribeMountTargetSecurityGroups",
+            format!("/2015-02-01/mount-targets/{mount_target_id}/security-groups"),
+        ),
     ] {
         rows.push((
-            format!("{operation}({file_system_id})"),
-            efs.send(
-                "GET",
-                &format!("/2015-02-01/file-systems/{file_system_id}/{path}"),
-                None,
-            )
-            .await,
+            format!("{operation}({path})"),
+            efs.send("GET", &path, None).await,
             501,
             "NotImplemented",
         ));

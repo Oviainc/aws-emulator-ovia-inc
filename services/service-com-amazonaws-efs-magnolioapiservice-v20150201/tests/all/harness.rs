@@ -151,6 +151,57 @@ impl Emulator {
         .await
     }
 
+    /// `GET /2015-02-01/file-systems/{FileSystemId}/backup-policy`, the modelled
+    /// `DescribeBackupPolicy` binding.
+    pub async fn describe_backup_policy(&self, id: &str) -> Reply {
+        self.send(
+            "GET",
+            &format!("/2015-02-01/file-systems/{id}/backup-policy"),
+            None,
+        )
+        .await
+    }
+
+    /// `PUT /2015-02-01/file-systems/{FileSystemId}/backup-policy`, the modelled
+    /// `PutBackupPolicy` binding.
+    pub async fn put_backup_policy(&self, id: &str, body: Value) -> Reply {
+        self.send(
+            "PUT",
+            &format!("/2015-02-01/file-systems/{id}/backup-policy"),
+            Some(body),
+        )
+        .await
+    }
+
+    /// `GET /2015-02-01/file-systems/{FileSystemId}/policy`, the modelled
+    /// `DescribeFileSystemPolicy` binding.
+    pub async fn describe_file_system_policy(&self, id: &str) -> Reply {
+        self.send("GET", &format!("/2015-02-01/file-systems/{id}/policy"), None)
+            .await
+    }
+
+    /// `PUT /2015-02-01/file-systems/{FileSystemId}/policy`, the modelled
+    /// `PutFileSystemPolicy` binding.
+    pub async fn put_file_system_policy(&self, id: &str, body: Value) -> Reply {
+        self.send(
+            "PUT",
+            &format!("/2015-02-01/file-systems/{id}/policy"),
+            Some(body),
+        )
+        .await
+    }
+
+    /// `DELETE /2015-02-01/file-systems/{FileSystemId}/policy`, the modelled
+    /// `DeleteFileSystemPolicy` binding.
+    pub async fn delete_file_system_policy(&self, id: &str) -> Reply {
+        self.send(
+            "DELETE",
+            &format!("/2015-02-01/file-systems/{id}/policy"),
+            None,
+        )
+        .await
+    }
+
     pub async fn create_replication_configuration(&self, source_id: &str, body: Value) -> Reply {
         self.send(
             "POST",

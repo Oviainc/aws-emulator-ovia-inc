@@ -15,6 +15,8 @@
 mod access_point_deletion;
 #[path = "all/access_point_lifecycle.rs"]
 mod access_point_lifecycle;
+#[path = "all/backup_policy.rs"]
+mod backup_policy;
 #[path = "all/delete_access_point.rs"]
 mod delete_access_point;
 #[path = "all/error_document_message.rs"]
@@ -25,6 +27,8 @@ mod error_message_construction;
 mod file_system_description;
 #[path = "all/file_system_lifecycle.rs"]
 mod file_system_lifecycle;
+#[path = "all/file_system_policy.rs"]
+mod file_system_policy;
 #[path = "all/harness.rs"]
 mod harness;
 #[path = "all/lifecycle_configuration.rs"]

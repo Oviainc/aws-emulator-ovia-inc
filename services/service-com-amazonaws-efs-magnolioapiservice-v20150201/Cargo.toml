@@ -20,6 +20,10 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
+# The tree's one reading of the IAM JSON policy language and its one evaluation of a
+# resource policy against a request, for `PutFileSystemPolicy`'s document grammar and its
+# policy-lockout safety check.
+service-common = { path = "../common" }
 tracing = { workspace = true }
 
 [build-dependencies]
