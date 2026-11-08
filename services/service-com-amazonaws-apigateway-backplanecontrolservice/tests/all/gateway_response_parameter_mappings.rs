@@ -180,10 +180,12 @@ async fn a_key_that_is_not_a_mapping_expression_is_refused_by_both_writers() {
                 message.contains(key),
                 "case {case}: expected the message to name the key {key:?}, got {message:?}"
             );
-            // Nothing was stored for the type the request addressed.
+            // Nothing was stored for the type the request addressed: it still reports no
+            // configured response parameter.
             let read = get_gateway_response(&gateway, &api, response_type).await;
-            assert!(
-                read.body["responseParameters"].is_null(),
+            assert_eq!(
+                read.body["responseParameters"],
+                json!({}),
                 "case {case}: expected no stored mappings, got {:?}",
                 read.body["responseParameters"]
             );
@@ -207,8 +209,9 @@ async fn a_key_that_is_not_a_mapping_expression_is_refused_by_both_writers() {
         .await;
         assert_failure(&answer, 400, BAD_REQUEST, &case_both);
         let read = get_gateway_response(&gateway, &api, "DEFAULT_4XX").await;
-        assert!(
-            read.body["responseParameters"].is_null(),
+        assert_eq!(
+            read.body["responseParameters"],
+            json!({}),
             "case {case_both}: expected no stored mappings, got {:?}",
             read.body["responseParameters"]
         );

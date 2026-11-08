@@ -2,8 +2,10 @@
 
 //! @op GetGatewayResponse
 //! IMPLEMENTED: reports one gateway response of an API — the customization
-//! `PutGatewayResponse` stored for the response type, or, while the type carries none,
-//! the response API Gateway generates for it (`defaultResponse: true`). A read only.
+//! `PutGatewayResponse` stored for the response type, or, while the type carries none, the
+//! response API Gateway serves for it, which is the class default standing in for the type
+//! where that one is customized ([`crate::state::reported_gateway_response_of`],
+//! `defaultResponse: true`). A read only.
 //!
 //! ## Shape of an operation
 //!
@@ -174,10 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // still has the response API Gateway generates for it. The response type itself
         // is a path label the model constrains to the `GatewayResponseType` enum, so the
         // boundary validator has already refused anything outside it.
-        Ok(api
-            .gateway_responses
-            .get(&input.response_type)
-            .cloned()
-            .unwrap_or_else(|| crate::state::default_gateway_response(&input.response_type)))
+        //
+        // Reported through `reported_gateway_response_of`, so the two string-to-string
+        // maps are carried whether or not a developer has configured either of them.
+        Ok(crate::state::reported_gateway_response_of(
+            api,
+            &input.response_type,
+        ))
     }
 }

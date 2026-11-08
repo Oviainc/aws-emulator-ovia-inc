@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetGatewayResponses
-//! IMPLEMENTED: reports the WHOLE gateway response collection of one API. Every modelled
-//! `GatewayResponseType` has a gateway response from the moment the API is created, so the
-//! collection is, per type, the customization `PutGatewayResponse` stored for it
-//! (`RestApiEntry::gateway_responses`) or, while it carries none, the response API Gateway
-//! generates for it ([`crate::state::default_gateway_response`], `defaultResponse: true`)
-//! — the same rule `GetGatewayResponse` reads one type through, so a listing and a single
-//! read cannot disagree. A read only.
+//! IMPLEMENTED: reports the WHOLE gateway response collection of one API, in the order API
+//! Gateway reports it in. Every modelled `GatewayResponseType` has a gateway response from
+//! the moment the API is created, so the collection is, per type, the customization
+//! `PutGatewayResponse` stored for it (`RestApiEntry::gateway_responses`) or, while it
+//! carries none, the response API Gateway serves for the type
+//! ([`crate::state::reported_gateway_response_of`], `defaultResponse: true`) — the same rule
+//! `GetGatewayResponse` reads one type through, so a listing and a single read cannot
+//! disagree. A read only.
 //!
 //! ## Shape of an operation
 //!
@@ -167,20 +168,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        // One entry per modelled response type, in the catalog's order: the API's
-        // customization of that type where a developer has put one, and otherwise the
-        // gateway response API Gateway generates for it. `GATEWAY_RESPONSE_TYPE_VALUES` is
-        // the modelled `GatewayResponseType` enum's own value list, so the collection
-        // covers exactly the supported response types and no hand-kept second list can
-        // drift from it.
-        let items = GATEWAY_RESPONSE_TYPE_VALUES
-            .iter()
-            .map(|response_type| {
-                api.gateway_responses
-                    .get(*response_type)
-                    .cloned()
-                    .unwrap_or_else(|| crate::state::default_gateway_response(response_type))
-            })
+        // One entry per response type the service's catalog holds, IN ITS ORDER: the
+        // API's customization of that type where a developer has put one, and otherwise
+        // the gateway response API Gateway generates for it. The catalog's order is the
+        // order API Gateway reports this collection in — a client that indexes or pages it
+        // positionally reads the entries that way — and its rows cover exactly the
+        // modelled `GatewayResponseType` values (asserted by this crate's tests against
+        // the modelled enum's own value list). Each entry is reported through
+        // `reported_gateway_response`, so every item carries both of its
+        // string-to-string maps, exactly as a single read of that type does.
+        let items = crate::state::gateway_response_catalog()
+            .map(|response_type| crate::state::reported_gateway_response_of(api, response_type))
             .collect();
 
         // "The GatewayResponses collection does not support pagination and the limit does

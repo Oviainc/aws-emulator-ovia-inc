@@ -97,6 +97,17 @@ pub(crate) const GENERATED_STATUS_CODES: &[(&str, Option<&str>)] = &[
     ("WAF_FILTERED", Some("403")),
 ];
 
+/// The `responseTemplates` map a gateway response is reported with while a developer has
+/// written no template of its own for it: API Gateway's own body template, which renders
+/// the refusal's message as a JSON object, under `application/json`.
+///
+/// Source: the API Gateway REST API reference's `GatewayResponse` representation, where
+/// this is the entry every such response carries. Written out here rather than read from
+/// the service, so the test checks the template instead of restating it.
+pub(crate) fn default_response_templates() -> Value {
+    json!({ "application/json": "{\"message\":$context.error.messageString}" })
+}
+
 /// The generated status code of `response_type`, from [`GENERATED_STATUS_CODES`].
 pub(crate) fn generated_status_code(response_type: &str) -> Option<&'static str> {
     GENERATED_STATUS_CODES
@@ -121,6 +132,8 @@ async fn a_gateway_response_put_on_an_api_is_persisted_and_read_back_member_for_
             json!({
                 "responseType": "INTEGRATION_TIMEOUT",
                 "statusCode": "504",
+                "responseParameters": {},
+                "responseTemplates": default_response_templates(),
                 "defaultResponse": false
             }),
         ),
@@ -131,6 +144,8 @@ async fn a_gateway_response_put_on_an_api_is_persisted_and_read_back_member_for_
             json!({
                 "responseType": "DEFAULT_5XX",
                 "statusCode": "500",
+                "responseParameters": {},
+                "responseTemplates": default_response_templates(),
                 "defaultResponse": false
             }),
         ),
@@ -149,6 +164,7 @@ async fn a_gateway_response_put_on_an_api_is_persisted_and_read_back_member_for_
                 "responseParameters": {
                     "gatewayresponse.header.Access-Control-Allow-Origin": "'*'"
                 },
+                "responseTemplates": default_response_templates(),
                 "defaultResponse": false
             }),
         ),
@@ -164,6 +180,7 @@ async fn a_gateway_response_put_on_an_api_is_persisted_and_read_back_member_for_
             json!({
                 "responseType": "UNAUTHORIZED",
                 "statusCode": "401",
+                "responseParameters": {},
                 "responseTemplates": {
                     "application/json": "{\"message\":$context.error.messageString}"
                 },
@@ -205,6 +222,7 @@ async fn a_gateway_response_put_on_an_api_is_persisted_and_read_back_member_for_
             json!({
                 "responseType": "RESOURCE_NOT_FOUND",
                 "statusCode": "404",
+                "responseParameters": {},
                 "responseTemplates": { "application/json": "{}" },
                 "defaultResponse": false
             }),
@@ -216,6 +234,8 @@ async fn a_gateway_response_put_on_an_api_is_persisted_and_read_back_member_for_
             json!({
                 "responseType": "WAF_FILTERED",
                 "statusCode": "100",
+                "responseParameters": {},
+                "responseTemplates": default_response_templates(),
                 "defaultResponse": false
             }),
         ),
@@ -296,19 +316,26 @@ async fn an_uncustomized_response_type_reports_the_response_api_gateway_generate
             "case {response_type}: expected the response type back, got {:?}",
             read.body
         );
-        // Generated, not customized: the flag says so, and neither caller-supplied map
-        // is set.
+        // Generated, not customized: the flag says so.
         assert_eq!(
             read.body["defaultResponse"].as_bool(),
             Some(true),
             "case {response_type}: an uncustomized type is the default response, got {:?}",
             read.body
         );
-        assert!(
-            read.body.get("responseParameters").is_none()
-                && read.body.get("responseTemplates").is_none(),
-            "case {response_type}: a generated response carries neither map, got {:?}",
-            read.body
+        // Both string-to-string maps are reported all the same: no parameter is
+        // configured, and the body template is API Gateway's own.
+        assert_eq!(
+            read.body["responseParameters"],
+            json!({}),
+            "case {response_type}: expected no configured response parameter, got {:?}",
+            read.body["responseParameters"]
+        );
+        assert_eq!(
+            read.body["responseTemplates"],
+            default_response_templates(),
+            "case {response_type}: expected API Gateway's own body template, got {:?}",
+            read.body["responseTemplates"]
         );
         assert_eq!(
             read.body["statusCode"].as_str(),
@@ -411,6 +438,7 @@ async fn a_second_put_of_a_response_type_replaces_the_customization() {
             json!({
                 "responseType": "INTEGRATION_TIMEOUT",
                 "statusCode": "504",
+                "responseParameters": {},
                 "responseTemplates": { "application/json": "{\"message\":\"timeout\"}" },
                 "defaultResponse": false
             }),
@@ -424,6 +452,7 @@ async fn a_second_put_of_a_response_type_replaces_the_customization() {
             json!({
                 "responseType": "INTEGRATION_TIMEOUT",
                 "statusCode": "504",
+                "responseParameters": {},
                 "responseTemplates": { "application/json": "{\"message\":\"timeout\"}" },
                 "defaultResponse": false
             }),
@@ -438,6 +467,7 @@ async fn a_second_put_of_a_response_type_replaces_the_customization() {
                 "responseType": "INTEGRATION_TIMEOUT",
                 "statusCode": "503",
                 "responseParameters": { "gatewayresponse.header.Retry-After": "'30'" },
+                "responseTemplates": default_response_templates(),
                 "defaultResponse": false
             }),
         ),
@@ -447,6 +477,8 @@ async fn a_second_put_of_a_response_type_replaces_the_customization() {
             json!({
                 "responseType": "INTEGRATION_TIMEOUT",
                 "statusCode": "504",
+                "responseParameters": {},
+                "responseTemplates": default_response_templates(),
                 "defaultResponse": false
             }),
         ),

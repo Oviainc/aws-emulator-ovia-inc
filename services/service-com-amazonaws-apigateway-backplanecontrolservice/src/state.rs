@@ -233,9 +233,10 @@ pub struct RestApiEntry {
     /// `GetGatewayResponse` and `GetGatewayResponses`.
     ///
     /// A type with no entry here is not missing: the API still has a gateway response
-    /// for it, the one API Gateway generates itself, which
-    /// [`default_gateway_response`] builds. So this map holds only the customizations,
-    /// and a stored record is always reported with `defaultResponse: false`.
+    /// for it, the one API Gateway serves for the type, which
+    /// [`reported_gateway_response_of`] resolves. So this map holds only the
+    /// customizations, and a stored record is always reported with
+    /// `defaultResponse: false`.
     pub gateway_responses: BTreeMap<String, GetGatewayResponseOutput>,
     /// Every `DocumentationPart` of this API, keyed by documentation part id: the
     /// records `CreateDocumentationPart` and `ImportDocumentationParts` write and
@@ -1726,47 +1727,64 @@ pub fn defaulted_endpoint_configuration(
 // Every API has a gateway response for EVERY modelled `GatewayResponseType` from the
 // moment it is created: until a developer customizes one, it is the response API
 // Gateway generates itself, reported with `defaultResponse: true`. Only the
-// customizations are stored (`RestApiEntry::gateway_responses`); the generated ones are
-// derived from the catalog below, so a read of an uncustomized type and a read of a
-// customized one answer from one rule.
+// customizations are stored (`RestApiEntry::gateway_responses`); what an uncustomized
+// type reports is DERIVED — from the catalog below and from the class default standing in
+// for the type ([`reported_gateway_response_of`]) — so a read of an uncustomized type and
+// a read of a customized one answer from one rule.
 // ---------------------------------------------------------------------------
 
-/// The HTTP status code the gateway response API Gateway GENERATES carries, per
-/// `GatewayResponseType`.
+/// The gateway responses API Gateway generates for an API, IN THE ORDER the service
+/// reports its collection in, each beside the HTTP status code its generated response
+/// carries.
 ///
-/// Hand-written because the model carries the type's values and nothing else:
+/// The ORDER is the collection's own: API Gateway reports the gateway responses of an API
+/// in this sequence rather than by response type, and a client that indexes or pages the
+/// collection positionally reads it that way. Source: the API Gateway REST API
+/// reference's `GatewayResponses` example, which lists the whole collection of an API
+/// nothing has been customized on.
+///
+/// The STATUS CODES come from the API Gateway Developer Guide's gateway response table
+/// ("Setting up gateway responses to customize error responses"), which lists each
+/// response type beside the status code of the response API Gateway returns for it. Both
+/// are hand-written because the model carries the type's values and nothing else:
 /// `smithy_query(query="shape", shape="com.amazonaws.apigateway#GatewayResponseType")`
-/// lists the 21 values with no status code attached, and `GatewayResponse$statusCode`
-/// documents only the member. Source: the API Gateway Developer Guide's gateway
-/// response table ("Setting up gateway responses to customize error responses"), which
-/// lists each response type beside the status code of the response API Gateway returns
-/// for it. `DEFAULT_4XX` and `DEFAULT_5XX` are the two rows that carry NO status code of
-/// their own — each is a fallback for a whole class of responses, which keep their own
-/// code — so they are absent here, which is why [`default_gateway_status_code`] answers
-/// an `Option`.
-const DEFAULT_GATEWAY_STATUS_CODES: &[(&str, &str)] = &[
-    ("ACCESS_DENIED", "403"),
-    ("API_CONFIGURATION_ERROR", "500"),
-    ("AUTHORIZER_CONFIGURATION_ERROR", "500"),
-    ("AUTHORIZER_FAILURE", "500"),
-    ("BAD_REQUEST_BODY", "400"),
-    ("BAD_REQUEST_PARAMETERS", "400"),
-    ("EXPIRED_TOKEN", "403"),
-    ("INTEGRATION_FAILURE", "504"),
-    ("INTEGRATION_TIMEOUT", "504"),
-    ("INVALID_API_KEY", "403"),
-    ("INVALID_SIGNATURE", "403"),
-    ("MISSING_AUTHENTICATION_TOKEN", "403"),
-    ("QUOTA_EXCEEDED", "429"),
-    ("REQUEST_TOO_LARGE", "413"),
-    ("RESOURCE_NOT_FOUND", "404"),
-    ("THROTTLED", "429"),
-    ("UNAUTHORIZED", "401"),
-    ("UNSUPPORTED_MEDIA_TYPE", "415"),
-    ("WAF_FILTERED", "403"),
+/// lists the 21 values alphabetically, with no status code and no collection order
+/// attached, and `GatewayResponse$statusCode` documents only the member. `DEFAULT_4XX`
+/// and `DEFAULT_5XX` are the two rows that carry NO status code of their own — each is a
+/// fallback for a whole class of responses, which keep their own code — which is why
+/// [`default_gateway_status_code`] answers an `Option`.
+const GATEWAY_RESPONSE_CATALOG: &[(&str, Option<&str>)] = &[
+    ("INTEGRATION_FAILURE", Some("504")),
+    ("RESOURCE_NOT_FOUND", Some("404")),
+    ("REQUEST_TOO_LARGE", Some("413")),
+    ("THROTTLED", Some("429")),
+    ("UNSUPPORTED_MEDIA_TYPE", Some("415")),
+    ("AUTHORIZER_CONFIGURATION_ERROR", Some("500")),
+    ("DEFAULT_5XX", None),
+    ("DEFAULT_4XX", None),
+    ("BAD_REQUEST_PARAMETERS", Some("400")),
+    ("BAD_REQUEST_BODY", Some("400")),
+    ("WAF_FILTERED", Some("403")),
+    ("EXPIRED_TOKEN", Some("403")),
+    ("ACCESS_DENIED", Some("403")),
+    ("INVALID_API_KEY", Some("403")),
+    ("UNAUTHORIZED", Some("401")),
+    ("API_CONFIGURATION_ERROR", Some("500")),
+    ("QUOTA_EXCEEDED", Some("429")),
+    ("INTEGRATION_TIMEOUT", Some("504")),
+    ("MISSING_AUTHENTICATION_TOKEN", Some("403")),
+    ("INVALID_SIGNATURE", Some("403")),
+    ("AUTHORIZER_FAILURE", Some("500")),
 ];
 
-/// The status code [`DEFAULT_GATEWAY_STATUS_CODES`] gives `response_type`, or `None` for
+/// Every gateway response type an API has a gateway response for, in the order
+/// [`GATEWAY_RESPONSE_CATALOG`] holds them — which is the order `GetGatewayResponses`
+/// reports the collection in.
+pub fn gateway_response_catalog() -> impl Iterator<Item = &'static str> {
+    GATEWAY_RESPONSE_CATALOG.iter().map(|(kind, _)| *kind)
+}
+
+/// The status code [`GATEWAY_RESPONSE_CATALOG`] gives `response_type`, or `None` for
 /// a type that has none (`DEFAULT_4XX`, `DEFAULT_5XX`) and for a value the catalog does
 /// not name.
 ///
@@ -1774,15 +1792,29 @@ const DEFAULT_GATEWAY_STATUS_CODES: &[(&str, &str)] = &[
 /// `PutGatewayResponse` that set none stores is the one a read of the uncustomized type
 /// would have reported.
 pub fn default_gateway_status_code(response_type: &str) -> Option<&'static str> {
-    DEFAULT_GATEWAY_STATUS_CODES
+    GATEWAY_RESPONSE_CATALOG
         .iter()
         .find(|(kind, _)| *kind == response_type)
-        .map(|(_, status)| *status)
+        .and_then(|(_, status)| *status)
 }
+
+/// The content type of the body template API Gateway generates a gateway response's body
+/// from, and that template.
+///
+/// A gateway response a developer has written no template of its own for still RENDERS a
+/// body, from API Gateway's own template: the error message of the refusal, as a JSON
+/// object. Source: the API Gateway REST API reference's `GatewayResponse` representation,
+/// where this is the `responseTemplates` entry every such response carries;
+/// `$context.error.messageString` is the quoted form of `$context.error.message` (the
+/// Developer Guide's `$context` variable reference).
+pub const DEFAULT_GATEWAY_RESPONSE_TEMPLATE_TYPE: &str = "application/json";
+
+/// The template [`DEFAULT_GATEWAY_RESPONSE_TEMPLATE_TYPE`] names.
+pub const DEFAULT_GATEWAY_RESPONSE_TEMPLATE: &str = "{\"message\":$context.error.messageString}";
 
 /// The gateway response an API reports for `response_type` while no customization is
 /// stored for it: the one API Gateway generates, so `defaultResponse` is `true`, the
-/// status code is the type's own, and neither caller-supplied map is set.
+/// status code is the type's own, and nothing of it is a developer's.
 pub fn default_gateway_response(response_type: &str) -> GetGatewayResponseOutput {
     GetGatewayResponseOutput {
         response_type: Some(response_type.to_string()),
@@ -1791,6 +1823,98 @@ pub fn default_gateway_response(response_type: &str) -> GetGatewayResponseOutput
         response_templates: None,
         default_response: true,
     }
+}
+
+/// The two class defaults, and which status class each stands in for: a gateway response
+/// type whose own status code is in that class and that a developer has not customized
+/// individually is served by the class default's customization.
+///
+/// Source: the API Gateway Developer Guide's gateway response table, where `DEFAULT_4XX`
+/// and `DEFAULT_5XX` are the rows that stand for "all other 4xx" and "all other 5xx"
+/// responses rather than for one condition.
+const GATEWAY_RESPONSE_CLASS_DEFAULTS: [(&str, char); 2] =
+    [("DEFAULT_4XX", '4'), ("DEFAULT_5XX", '5')];
+
+/// The class default standing in for `response_type`: the one whose status class the
+/// type's own status code belongs to, and `None` for a type with no status code of its own
+/// — which is what the two class defaults themselves are.
+fn gateway_response_class_default(response_type: &str) -> Option<&'static str> {
+    let status = default_gateway_status_code(response_type)?;
+    let class = status.chars().next()?;
+    GATEWAY_RESPONSE_CLASS_DEFAULTS
+        .iter()
+        .find(|(_, held)| *held == class)
+        .map(|(class_default, _)| *class_default)
+}
+
+/// The gateway response an API REPORTS for `response_type`, as every reading of one
+/// answers it.
+///
+/// Resolved the way API Gateway serves the response itself: the developer's customization
+/// of that very type where there is one, and otherwise the EFFECTIVE response of the type —
+/// the customization of the class default that stands in for it (`DEFAULT_4XX` for a 4xx
+/// type, `DEFAULT_5XX` for a 5xx one), which is what a response the developer has not
+/// customized individually answers with: its parameters, its templates, and the status
+/// code it answers with where the class default sets one of its own. Nothing of that
+/// stand-in is the type's OWN customization, so the record is still reported with
+/// `defaultResponse: true`, and a class default that sets no status code leaves each type
+/// the status code of its own response.
+///
+/// One copy for `GetGatewayResponse` and `GetGatewayResponses`, so a single read of a type
+/// and the collection entry of that type are one record.
+pub fn reported_gateway_response_of(
+    api: &RestApiEntry,
+    response_type: &str,
+) -> GetGatewayResponseOutput {
+    if let Some(customized) = api.gateway_responses.get(response_type) {
+        return reported_gateway_response(customized.clone());
+    }
+    let mut generated = default_gateway_response(response_type);
+    if let Some(class_default) = gateway_response_class_default(response_type)
+        .and_then(|class_default| api.gateway_responses.get(class_default))
+    {
+        if class_default.status_code.is_some() {
+            generated.status_code = class_default.status_code.clone();
+        }
+        generated.response_parameters = class_default.response_parameters.clone();
+        generated.response_templates = class_default.response_templates.clone();
+    }
+    reported_gateway_response(generated)
+}
+
+/// A gateway response as every REPRESENTATION of one carries it: both of its
+/// string-to-string maps are always reported — `responseParameters` empty while the
+/// response has no parameter configured, and `responseTemplates` carrying API Gateway's
+/// own body template ([`DEFAULT_GATEWAY_RESPONSE_TEMPLATE`]) for a response a developer
+/// has written no template of.
+///
+/// The stored record is the developer's CONFIGURATION — what a put wrote and a patch
+/// edited — so the two maps are filled in here, where a gateway response is reported,
+/// rather than at the write: one copy for `PutGatewayResponse`,
+/// `UpdateGatewayResponse`, `GetGatewayResponse` and `GetGatewayResponses`, so a client
+/// reading a gateway response any of those four ways can always tell which parameters and
+/// which templates it has.
+pub fn reported_gateway_response(
+    mut response: GetGatewayResponseOutput,
+) -> GetGatewayResponseOutput {
+    response
+        .response_parameters
+        .get_or_insert_with(::std::collections::HashMap::new);
+    if response
+        .response_templates
+        .as_ref()
+        .is_none_or(|templates| templates.is_empty())
+    {
+        response.response_templates = Some(
+            [(
+                DEFAULT_GATEWAY_RESPONSE_TEMPLATE_TYPE.to_string(),
+                DEFAULT_GATEWAY_RESPONSE_TEMPLATE.to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+    }
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -4031,6 +4155,16 @@ pub fn request_validator_in_use(
 /// sentence saying the type is not defined on the api, which names neither the type nor
 /// the API, in the shape of the sibling identifier messages above.
 pub const NO_SUCH_GATEWAY_RESPONSE: &str = "Gateway response type not defined on api";
+
+/// The `NotFoundException` message for a `patchOperations` `remove` naming a
+/// `responseParameters` entry the gateway response does not carry.
+///
+/// A `remove` names ONE configured response parameter, so a name the response has no
+/// parameter under removes nothing: API Gateway refuses the request rather than reporting
+/// a removal that never happened. The sentence is entirely fixed — it names neither the
+/// parameter, nor the patch path that carried it, nor the response type — in the shape of
+/// the sibling fixed refusals above.
+pub const INVALID_RESPONSE_PARAMETER_NAME: &str = "Invalid parameter name specified";
 
 /// The `target` every audit record this service emits carries, so a consumer can select
 /// the access trail without reading the rest of the emulator's traces.

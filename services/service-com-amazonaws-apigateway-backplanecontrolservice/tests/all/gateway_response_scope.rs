@@ -26,13 +26,15 @@ use std::collections::BTreeMap;
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_apigateway_backplanecontrolservice::ops::types::GATEWAY_RESPONSE_TYPE_VALUES;
 
-use crate::gateway_response::{generated_status_code, get_gateway_response, put_gateway_response};
+use crate::gateway_response::{
+    default_response_templates, generated_status_code, get_gateway_response, put_gateway_response,
+};
 use crate::rest_api_lifecycle::{assert_failure, create_api, Gateway};
 
 /// The record an UNCUSTOMIZED `response_type` is reported as: the type, the flag that
-/// says API Gateway generated it, and the generated status code where the type has one
-/// (`DEFAULT_4XX` and `DEFAULT_5XX` have none). Neither caller-supplied map is set,
-/// because no caller supplied one.
+/// says API Gateway generated it, the generated status code where the type has one
+/// (`DEFAULT_4XX` and `DEFAULT_5XX` have none), no configured response parameter, and the
+/// body template API Gateway generates the response's body from.
 ///
 /// Shared with the sibling `delete_gateway_response` suite, which asserts a cleared
 /// customization leaves exactly this record behind.
@@ -43,7 +45,51 @@ pub(crate) fn generated_response(response_type: &str) -> Value {
     if let Some(status) = generated_status_code(response_type) {
         record.insert("statusCode".to_string(), json!(status));
     }
+    record.insert("responseParameters".to_string(), json!({}));
+    record.insert(
+        "responseTemplates".to_string(),
+        default_response_templates(),
+    );
     Value::Object(record)
+}
+
+/// Which class default stands in for `response_type`: `DEFAULT_4XX` for a response type
+/// whose own status code is in the 4xx class, `DEFAULT_5XX` for one in the 5xx class, and
+/// none for the two class defaults themselves, which have no status code of their own.
+///
+/// Source: the API Gateway Developer Guide's gateway response table, where those two rows
+/// stand for "all other 4xx" and "all other 5xx" responses rather than for one condition.
+pub(crate) fn class_default_of(response_type: &str) -> Option<&'static str> {
+    match generated_status_code(response_type)?.chars().next()? {
+        '4' => Some("DEFAULT_4XX"),
+        '5' => Some("DEFAULT_5XX"),
+        _ => None,
+    }
+}
+
+/// The record an uncustomized `response_type` is reported as on an API whose CLASS DEFAULT
+/// for that type's status class carries `class_default` — the record a put or patch of
+/// `DEFAULT_4XX`/`DEFAULT_5XX` answered with — and [`generated_response`] where that class
+/// default carries no customization of its own.
+///
+/// A response type a developer has not customized individually is served by the class
+/// default standing in for it, so that stand-in's parameters, templates and, where it sets
+/// one, its status code are what the type reports; the type itself is still uncustomized,
+/// so the record is the one API Gateway generates (`defaultResponse: true`).
+///
+/// Shared with the sibling suites that customize a class default and then read the types it
+/// stands in for.
+pub(crate) fn effective_response(response_type: &str, class_default: Option<&Value>) -> Value {
+    let mut record = generated_response(response_type);
+    if let (Some(class_default), Some(object)) = (class_default, record.as_object_mut()) {
+        for member in ["responseParameters", "responseTemplates"] {
+            object.insert(member.to_string(), class_default[member].clone());
+        }
+        if let Some(status) = class_default.get("statusCode") {
+            object.insert("statusCode".to_string(), status.clone());
+        }
+    }
+    record
 }
 
 #[tokio::test]
@@ -139,14 +185,22 @@ async fn a_gateway_response_is_reported_for_the_api_it_was_put_on_and_no_other()
     }
 
     // Every modelled response type on every API: the customization where this API has
-    // one, the generated response everywhere else.
+    // one, and otherwise the response the API serves for that type — the class default
+    // standing in for it where this API customized that, and the generated response
+    // everywhere else.
     for (api_index, api) in apis.iter().enumerate() {
         for response_type in GATEWAY_RESPONSE_TYPE_VALUES {
             let case = format!("api {api_index}/{response_type}");
             let expected = customized
                 .get(&(api_index, response_type))
                 .cloned()
-                .unwrap_or_else(|| generated_response(response_type));
+                .unwrap_or_else(|| {
+                    effective_response(
+                        response_type,
+                        class_default_of(response_type)
+                            .and_then(|kind| customized.get(&(api_index, kind))),
+                    )
+                });
             let read = get_gateway_response(&gateway, api, response_type).await;
             assert_eq!(
                 read.status, 200,

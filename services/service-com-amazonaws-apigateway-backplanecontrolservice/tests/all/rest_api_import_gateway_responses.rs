@@ -196,8 +196,9 @@ async fn an_imported_definitions_gateway_responses_are_created_with_their_templa
                 );
             }
             match parameter_keys.is_empty() {
-                true => assert!(
-                    record["responseParameters"].is_null(),
+                true => assert_eq!(
+                    record["responseParameters"],
+                    ::serde_json::json!({}),
                     "case {case}: expected no response parameters, got {:?}",
                     record["responseParameters"]
                 ),

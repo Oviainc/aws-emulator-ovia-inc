@@ -32,7 +32,10 @@
 
 use serde_json::{json, Value};
 
-use crate::gateway_response::{generated_status_code, get_gateway_response, put_gateway_response};
+use crate::gateway_response::{
+    default_response_templates, generated_status_code, get_gateway_response, put_gateway_response,
+};
+use crate::gateway_response_scope::effective_response;
 use crate::patch_updates::{patch, patch_ok, replace};
 use crate::rest_api_lifecycle::{assert_failure, create_api, Gateway};
 
@@ -81,6 +84,20 @@ async fn assert_read_back(
     );
 }
 
+/// Whether a row's `patchOperations` can be sent AGAIN and report the same record.
+///
+/// A `remove` of a `responseParameters` entry names a parameter the record carries, so a
+/// second send of the same op names one the first send took away — which the service
+/// refuses rather than answering with the unchanged record.
+fn repeatable(operations: &[Value]) -> bool {
+    !operations.iter().any(|entry| {
+        entry["op"] == "remove"
+            && entry["path"]
+                .as_str()
+                .is_some_and(|path| path.starts_with("/responseParameters/"))
+    })
+}
+
 /// One row of the patch table: the case name, the response type it patches, the
 /// customization it starts from (none for a type still reporting the generated response),
 /// the `patchOperations` it sends, and the whole record the service must report afterwards.
@@ -109,6 +126,7 @@ async fn a_patched_gateway_response_is_stored_and_read_back_member_for_member() 
             json!({
                 "responseType": "INTEGRATION_TIMEOUT",
                 "statusCode": "504",
+                "responseParameters": {},
                 "responseTemplates": {
                     "application/json": "{\"message\":\"the back end timed out\"}"
                 },
@@ -123,6 +141,8 @@ async fn a_patched_gateway_response_is_stored_and_read_back_member_for_member() 
             json!({
                 "responseType": "BAD_REQUEST_PARAMETERS",
                 "statusCode": "422",
+                "responseParameters": {},
+                "responseTemplates": default_response_templates(),
                 "defaultResponse": false
             }),
         ),
@@ -134,6 +154,8 @@ async fn a_patched_gateway_response_is_stored_and_read_back_member_for_member() 
             json!({
                 "responseType": "WAF_FILTERED",
                 "statusCode": "100",
+                "responseParameters": {},
+                "responseTemplates": default_response_templates(),
                 "defaultResponse": false
             }),
         ),
@@ -145,6 +167,8 @@ async fn a_patched_gateway_response_is_stored_and_read_back_member_for_member() 
             json!({
                 "responseType": "RESOURCE_NOT_FOUND",
                 "statusCode": "599",
+                "responseParameters": {},
+                "responseTemplates": default_response_templates(),
                 "defaultResponse": false
             }),
         ),
@@ -160,6 +184,7 @@ async fn a_patched_gateway_response_is_stored_and_read_back_member_for_member() 
             json!({
                 "responseType": "UNAUTHORIZED",
                 "statusCode": "401",
+                "responseParameters": {},
                 "responseTemplates": {
                     "application/json": "{\"message\":$context.error.messageString}"
                 },
@@ -180,6 +205,7 @@ async fn a_patched_gateway_response_is_stored_and_read_back_member_for_member() 
                 "responseParameters": {
                     "gatewayresponse.header.Access-Control-Allow-Origin": "'*'"
                 },
+                "responseTemplates": default_response_templates(),
                 "defaultResponse": false
             }),
         ),
@@ -218,6 +244,7 @@ async fn a_patched_gateway_response_is_stored_and_read_back_member_for_member() 
             json!({
                 "responseType": "QUOTA_EXCEEDED",
                 "statusCode": generated_status_code("QUOTA_EXCEEDED"),
+                "responseParameters": {},
                 "responseTemplates": { "text/plain": "quota reached" },
                 "defaultResponse": false
             }),
@@ -236,12 +263,13 @@ async fn a_patched_gateway_response_is_stored_and_read_back_member_for_member() 
             json!({
                 "responseType": "REQUEST_TOO_LARGE",
                 "statusCode": "413",
+                "responseParameters": {},
                 "responseTemplates": { "application/json": "{\"message\":\"too large\"}" },
                 "defaultResponse": false
             }),
         ),
         (
-            "the last entry of a map removed, which clears the member",
+            "the last entry of a map removed, which leaves the member empty",
             "INVALID_API_KEY",
             Some(json!({
                 "statusCode": "403",
@@ -255,6 +283,8 @@ async fn a_patched_gateway_response_is_stored_and_read_back_member_for_member() 
             json!({
                 "responseType": "INVALID_API_KEY",
                 "statusCode": "403",
+                "responseParameters": {},
+                "responseTemplates": default_response_templates(),
                 "defaultResponse": false
             }),
         ),
@@ -269,6 +299,7 @@ async fn a_patched_gateway_response_is_stored_and_read_back_member_for_member() 
             )],
             json!({
                 "responseType": "DEFAULT_5XX",
+                "responseParameters": {},
                 "responseTemplates": {
                     "application/json": "{\"message\":$context.error.messageString}"
                 },
@@ -288,6 +319,7 @@ async fn a_patched_gateway_response_is_stored_and_read_back_member_for_member() 
                 "responseType": "ACCESS_DENIED",
                 "statusCode": "402",
                 "responseParameters": { "gatewayresponse.header.X-Reason": "'denied'" },
+                "responseTemplates": default_response_templates(),
                 "defaultResponse": false
             }),
         ),
@@ -314,18 +346,23 @@ async fn a_patched_gateway_response_is_stored_and_read_back_member_for_member() 
         assert_read_back(&gateway, &api, response_type, case, expected).await;
 
         // Every op of these rows is idempotent — a set to one value, or a drop of one key
-        // — so sending the same request again reports the same record.
-        let again = patch_ok(
-            &gateway,
-            case,
-            &uri(&api, response_type),
-            operations.clone(),
-        )
-        .await;
-        assert_eq!(
-            &again, expected,
-            "case {case}: the same request again must report {expected:?}, got {again:?}"
-        );
+        // — so sending the same request again reports the same record. A `remove` of a
+        // response PARAMETER is the exception: it names a parameter the record carries, so
+        // a second send of it names one the first send took away (the refusal rows cover
+        // what that answers).
+        if repeatable(operations) {
+            let again = patch_ok(
+                &gateway,
+                case,
+                &uri(&api, response_type),
+                operations.clone(),
+            )
+            .await;
+            assert_eq!(
+                &again, expected,
+                "case {case}: the same request again must report {expected:?}, got {again:?}"
+            );
+        }
     }
 
     // Each row patched its own response type, and they all stand together: an update of
@@ -334,16 +371,20 @@ async fn a_patched_gateway_response_is_stored_and_read_back_member_for_member() 
         assert_read_back(&gateway, &api, response_type, case, expected).await;
     }
 
-    // A type no row touched is untouched by all of it.
+    // A type no row touched carries no customization of its own, so it reports the
+    // response the API serves for it: the 4xx class default a row above customized stands
+    // in for it, and the status code it keeps is its own, since that customization sets
+    // none.
+    let class_default = rows
+        .iter()
+        .find(|(_, response_type, _, _, _)| *response_type == "DEFAULT_4XX")
+        .map(|(_, _, _, _, expected)| expected.clone())
+        .expect("the table customizes the 4xx class default");
     let untouched = get_gateway_response(&gateway, &api, "EXPIRED_TOKEN").await;
+    let expected = effective_response("EXPIRED_TOKEN", Some(&class_default));
     assert_eq!(
-        untouched.body,
-        json!({
-            "responseType": "EXPIRED_TOKEN",
-            "statusCode": generated_status_code("EXPIRED_TOKEN"),
-            "defaultResponse": true
-        }),
-        "case an untouched response type: expected the generated response, got {:?}",
+        untouched.body, expected,
+        "case an untouched response type: expected {expected:?}, got {:?}",
         untouched.body
     );
 }
@@ -358,6 +399,8 @@ async fn a_request_that_asks_for_no_edit_leaves_the_record_as_it_was() {
     let generated = json!({
         "responseType": "MISSING_AUTHENTICATION_TOKEN",
         "statusCode": generated_status_code("MISSING_AUTHENTICATION_TOKEN"),
+        "responseParameters": {},
+        "responseTemplates": default_response_templates(),
         "defaultResponse": true
     });
     seed(
@@ -370,6 +413,8 @@ async fn a_request_that_asks_for_no_edit_leaves_the_record_as_it_was() {
     let customized = json!({
         "responseType": "BAD_REQUEST_BODY",
         "statusCode": "422",
+        "responseParameters": {},
+        "responseTemplates": default_response_templates(),
         "defaultResponse": false
     });
 
@@ -407,6 +452,7 @@ async fn a_patch_this_resource_does_not_support_is_refused_and_changes_nothing()
     let stored = json!({
         "responseType": "INTEGRATION_FAILURE",
         "statusCode": "504",
+        "responseParameters": {},
         "responseTemplates": { "application/json": "{\"message\":\"failed\"}" },
         "defaultResponse": false
     });

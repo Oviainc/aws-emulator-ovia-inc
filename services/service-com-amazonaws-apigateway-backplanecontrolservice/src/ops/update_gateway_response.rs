@@ -175,6 +175,20 @@ fn apply_patch(entry: &mut GetGatewayResponseOutput, patch: &Patch) -> Result<()
                     super::put_gateway_response::invalid_response_parameter(&name),
                 ));
             }
+            // A `remove` names ONE parameter the response HAS. A name it carries no
+            // parameter under removes nothing, so the request is refused rather than
+            // answered with the unchanged record: a client told its removal succeeded
+            // would believe a parameter gone that was never configured.
+            if matches!(patch.op, PatchOpKind::Remove)
+                && entry
+                    .response_parameters
+                    .as_ref()
+                    .is_none_or(|parameters| !parameters.contains_key(&name))
+            {
+                return Err(PatchFailure::NotFound(
+                    crate::state::INVALID_RESPONSE_PARAMETER_NAME.to_string(),
+                ));
+            }
             let mut parameters = crate::state::ordered_map(entry.response_parameters.take());
             patch_string_map(
                 &mut parameters,
@@ -348,23 +362,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A request that asks for no edit changes nothing — so an uncustomized type is
-        // still reported as the generated response afterwards — while an applied patch
-        // makes the record a developer's customization, which is what `defaultResponse`
-        // reports.
-        if !patches.is_empty() {
+        // still reported as the response the API serves for it afterwards — while an
+        // applied patch makes the record a developer's customization, which is what
+        // `defaultResponse` reports.
+        //
+        // The answer is the record as every reading of a gateway response represents it: the
+        // patched record where this request stored one, and otherwise what a read of the
+        // type answers, which for a type with no customization of its own is the class
+        // default standing in for it rather than the bare generated response the patch
+        // started from.
+        let reported = if patches.is_empty() {
+            crate::state::reported_gateway_response_of(api, &input.response_type)
+        } else {
             updated.default_response = false;
             api.gateway_responses
                 .insert(input.response_type.clone(), updated.clone());
-        }
-
-        // The stored record IS the model's `GatewayResponse`, so the update reports it
-        // exactly as `GetGatewayResponse` will read it back.
+            crate::state::reported_gateway_response(updated)
+        };
         Ok(UpdateGatewayResponseOutput {
-            response_type: updated.response_type,
-            status_code: updated.status_code,
-            response_parameters: updated.response_parameters,
-            response_templates: updated.response_templates,
-            default_response: updated.default_response,
+            response_type: reported.response_type,
+            status_code: reported.status_code,
+            response_parameters: reported.response_parameters,
+            response_templates: reported.response_templates,
+            default_response: reported.default_response,
         })
     }
 }

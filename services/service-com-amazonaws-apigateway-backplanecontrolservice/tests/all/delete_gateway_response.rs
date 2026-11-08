@@ -33,7 +33,7 @@ use service_com_amazonaws_apigateway_backplanecontrolservice::ops::types::GATEWA
 
 use crate::gateway_response::{get_gateway_response, put_gateway_response};
 use crate::gateway_response_collection::collection_by_type;
-use crate::gateway_response_scope::generated_response;
+use crate::gateway_response_scope::{class_default_of, effective_response, generated_response};
 use crate::patch_updates::{patch, replace};
 use crate::rest_api_lifecycle::{assert_failure, create_api, Answer, Gateway};
 
@@ -133,6 +133,20 @@ async fn assert_reports(
     );
 }
 
+/// What `response_type` must be reported as on an API whose customizations are
+/// `customizations`: the record stored for that very type, and otherwise the response the
+/// API serves for it — the class default standing in for it where that one is customized,
+/// and the response API Gateway generates otherwise.
+fn expected_record(customizations: &BTreeMap<&str, Value>, response_type: &str) -> Value {
+    match customizations.get(response_type) {
+        Some(record) => record.clone(),
+        None => effective_response(
+            response_type,
+            class_default_of(response_type).and_then(|kind| customizations.get(kind)),
+        ),
+    }
+}
+
 #[tokio::test]
 async fn clearing_a_customization_leaves_the_response_api_gateway_generates_for_that_type() {
     let gateway = Gateway::new();
@@ -141,10 +155,10 @@ async fn clearing_a_customization_leaves_the_response_api_gateway_generates_for_
     // The rows are the modelled enum's own values, so every response type is covered —
     // the two that generate no status code of their own included — and each one carries a
     // different customization body.
-    let mut expected: BTreeMap<&str, Value> = BTreeMap::new();
+    let mut customizations: BTreeMap<&str, Value> = BTreeMap::new();
     for (index, response_type) in GATEWAY_RESPONSE_TYPE_VALUES.iter().enumerate() {
         let record = seed(&gateway, &api, response_type, customization(index)).await;
-        expected.insert(response_type, record);
+        customizations.insert(response_type, record);
     }
 
     for response_type in GATEWAY_RESPONSE_TYPE_VALUES {
@@ -154,15 +168,16 @@ async fn clearing_a_customization_leaves_the_response_api_gateway_generates_for_
             &case,
         );
         // The API still HAS a gateway response of this type — every modelled type always
-        // does — and it is the one API Gateway generates, member for member: the flag, the
-        // generated status code (absent where the type has none) and neither map.
-        expected.insert(response_type, generated_response(response_type));
+        // does — and it is the one API Gateway serves for it with this customization gone:
+        // the class default standing in for the type while that one is still customized,
+        // and otherwise the generated response, member for member.
+        customizations.remove(response_type);
         assert_reports(
             &gateway,
             &api,
             response_type,
             &format!("{case}, then GetGatewayResponse"),
-            &expected[response_type],
+            &expected_record(&customizations, response_type),
         )
         .await;
 
@@ -177,15 +192,17 @@ async fn clearing_a_customization_leaves_the_response_api_gateway_generates_for_
         );
 
         // Both readers answer from one rule: the collection reports the cleared type as
-        // generated and every type not yet deleted with the customization it still holds.
+        // the API serves it and every type not yet deleted with the customization it still
+        // holds.
         let listed: BTreeMap<String, Value> = collection_by_type(&gateway, &api, &case)
             .await
             .into_iter()
             .collect();
-        for (kind, record) in &expected {
+        for kind in GATEWAY_RESPONSE_TYPE_VALUES {
+            let record = expected_record(&customizations, kind);
             assert_eq!(
                 listed.get(*kind),
-                Some(record),
+                Some(&record),
                 "case {case}: the collection must report {record:?} for {kind}, got {:?}",
                 listed.get(*kind)
             );
@@ -208,9 +225,11 @@ async fn a_delete_clears_the_pair_its_uri_names_on_that_api_alone() {
     // The SAME response types customized on every API, with bodies that differ per API, so
     // a record surviving on one API cannot be another's. Rows span the position of the
     // deleted pair among its siblings: the API deleted from is the middle one and the type
-    // deleted is one of several.
+    // deleted is one of several. One of the three types is the 4xx CLASS DEFAULT, so the
+    // types it stands in for are reported through it until it is cleared.
     let types = ["DEFAULT_4XX", "INTEGRATION_TIMEOUT", "QUOTA_EXCEEDED"];
-    let mut expected: BTreeMap<(usize, &str), Value> = BTreeMap::new();
+    let mut customizations: Vec<BTreeMap<&str, Value>> =
+        apis.iter().map(|_| BTreeMap::new()).collect();
     for (api_index, api) in apis.iter().enumerate() {
         for (type_index, response_type) in types.iter().enumerate() {
             let record = seed(
@@ -220,7 +239,7 @@ async fn a_delete_clears_the_pair_its_uri_names_on_that_api_alone() {
                 customization(api_index * types.len() + type_index),
             )
             .await;
-            expected.insert((api_index, response_type), record);
+            customizations[api_index].insert(response_type, record);
         }
     }
 
@@ -235,16 +254,13 @@ async fn a_delete_clears_the_pair_its_uri_names_on_that_api_alone() {
             &delete_gateway_response(&gateway, &apis[api_index], response_type).await,
             case,
         );
-        expected.insert((api_index, response_type), generated_response(response_type));
+        customizations[api_index].remove(response_type);
 
-        // Every modelled type on every API: the customization still held, or the generated
-        // response where this pair was cleared or never customized at all.
+        // Every modelled type on every API: the customization still held, or the response
+        // the API serves for the type once this pair was cleared.
         for (other_index, api) in apis.iter().enumerate() {
             for kind in GATEWAY_RESPONSE_TYPE_VALUES {
-                let want = expected
-                    .get(&(other_index, kind))
-                    .cloned()
-                    .unwrap_or_else(|| generated_response(kind));
+                let want = expected_record(&customizations[other_index], kind);
                 assert_reports(
                     &gateway,
                     api,

@@ -20,7 +20,10 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_apigateway_backplanecontrolservice::ops::types::GATEWAY_RESPONSE_TYPE_VALUES;
 
-use crate::gateway_response::{generated_status_code, get_gateway_response, put_gateway_response};
+use crate::gateway_response::{
+    default_response_templates, generated_status_code, get_gateway_response, put_gateway_response,
+};
+use crate::gateway_response_scope::{class_default_of, effective_response};
 use crate::rest_api_lifecycle::{assert_failure, create_api, page_items, Answer, Gateway};
 
 /// `GetGatewayResponses` for `api`, with `query` appended verbatim (empty for none).
@@ -97,9 +100,15 @@ async fn the_collection_reports_one_gateway_response_per_modelled_response_type(
             Some(true),
             "case {response_type}: an uncustomized type is the default response, got {item:?}"
         );
-        assert!(
-            item.get("responseParameters").is_none() && item.get("responseTemplates").is_none(),
-            "case {response_type}: a generated response carries neither map, got {item:?}"
+        assert_eq!(
+            item["responseParameters"],
+            json!({}),
+            "case {response_type}: expected no configured response parameter, got {item:?}"
+        );
+        assert_eq!(
+            item["responseTemplates"],
+            default_response_templates(),
+            "case {response_type}: expected API Gateway's own body template, got {item:?}"
         );
         assert_eq!(
             item["statusCode"].as_str(),
@@ -205,22 +214,28 @@ async fn the_collection_reports_the_customizations_and_the_generated_rest() {
             );
         }
 
-        // Every type nobody customized still reports the generated response.
+        // Every type nobody customized reports the response the API serves for it: the
+        // class default standing in for it where this API customized that one, and the
+        // generated response otherwise.
         for (response_type, item) in &listed {
             if stored.iter().any(|(kind, _)| kind == response_type) {
                 continue;
             }
-            let expected_status = generated_status_code(response_type);
+            let class_default = class_default_of(response_type).and_then(|kind| {
+                stored
+                    .iter()
+                    .find(|(stored_kind, _)| stored_kind == kind)
+                    .map(|(_, record)| record)
+            });
+            let expected = effective_response(response_type, class_default);
             assert_eq!(
                 item["defaultResponse"].as_bool(),
                 Some(true),
                 "case {case}/{response_type}: expected the generated response, got {item:?}"
             );
             assert_eq!(
-                item["statusCode"].as_str(),
-                expected_status,
-                "case {case}/{response_type}: expected the generated status code \
-                 {expected_status:?}, got {item:?}"
+                item, &expected,
+                "case {case}/{response_type}: expected {expected:?}, got {item:?}"
             );
         }
     }

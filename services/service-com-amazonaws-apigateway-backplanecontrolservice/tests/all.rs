@@ -444,3 +444,9 @@ mod stage_verb_precedence;
 // resolves to.
 #[path = "all/proxy_integration_qualified_function.rs"]
 mod proxy_integration_qualified_function;
+// Appended for the reason the note above gives: what every REPRESENTATION of a gateway
+// response carries, the ORDER its collection is reported in, and the removal of a response
+// parameter the response does not carry.
+#[path = "all/gateway_response_representation.rs"]
+mod gateway_response_representation;
+

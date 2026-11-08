@@ -34,7 +34,9 @@
 
 use serde_json::json;
 
-use crate::gateway_response::{generated_status_code, get_gateway_response, put_gateway_response};
+use crate::gateway_response::{
+    default_response_templates, generated_status_code, get_gateway_response, put_gateway_response,
+};
 use crate::method_integration::{put_integration, resource_with_a_method};
 use crate::patch_path_refusal_templates::INVALID_OP;
 use crate::patch_updates::{baseline, op, patch, patch_ok, replace};
@@ -353,6 +355,8 @@ async fn a_gateway_responses_status_code_takes_a_replace_and_no_other_op() {
     let stored = json!({
         "responseType": RESPONSE_TYPE,
         "statusCode": generated_status_code(RESPONSE_TYPE),
+        "responseParameters": {},
+        "responseTemplates": default_response_templates(),
         "defaultResponse": true
     });
     let uri = format!("/restapis/{api}/gatewayresponses/{RESPONSE_TYPE}");

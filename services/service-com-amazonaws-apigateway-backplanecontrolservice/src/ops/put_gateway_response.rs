@@ -322,12 +322,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         api.gateway_responses
             .insert(input.response_type.clone(), response.clone());
 
+        // The stored record is the developer's configuration; the ANSWER is that record as
+        // a gateway response is represented, carrying both string-to-string maps whether
+        // or not this request configured either.
+        let reported = crate::state::reported_gateway_response(response);
         Ok(PutGatewayResponseOutput {
-            response_type: response.response_type,
-            status_code: response.status_code,
-            response_parameters: response.response_parameters,
-            response_templates: response.response_templates,
-            default_response: response.default_response,
+            response_type: reported.response_type,
+            status_code: reported.status_code,
+            response_parameters: reported.response_parameters,
+            response_templates: reported.response_templates,
+            default_response: reported.default_response,
         })
     }
 }
