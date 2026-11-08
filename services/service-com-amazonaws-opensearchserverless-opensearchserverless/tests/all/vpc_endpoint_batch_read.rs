@@ -35,8 +35,9 @@ const MAX_ID_LEN: usize = 255;
 const NOT_FOUND_CODE: &str = "NOT_FOUND";
 
 /// The `errorMessage` that goes with it, as `BatchGetVpcEndpoint`'s sibling batch readers
-/// word theirs for the same cause with this resource named instead.
-const NOT_FOUND_MESSAGE: &str = "The specified Vpc Endpoint is not found.";
+/// word theirs for the same cause with this resource named instead — the kind spelled
+/// `VpcEndpoint`, one word.
+const NOT_FOUND_MESSAGE: &str = "The specified VpcEndpoint is not found.";
 
 /// A well-formed `VpcEndpointId` that names no stored endpoint: `index` in hexadecimal,
 /// padded to the 17-character suffix width, inside `^vpce-[0-9a-z]*$` and the shape's

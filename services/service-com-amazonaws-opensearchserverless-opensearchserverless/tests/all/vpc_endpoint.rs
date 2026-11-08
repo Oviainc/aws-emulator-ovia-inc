@@ -504,7 +504,7 @@ async fn batch_get_reports_the_not_found_error_detail_for_an_unknown_id() {
         );
         assert_eq!(
             text(error, "errorMessage"),
-            "The specified Vpc Endpoint is not found.",
+            "The specified VpcEndpoint is not found.",
             "case the error detail of {id}: expected the not-found message, got {error}"
         );
     }

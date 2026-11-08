@@ -182,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.vpc_endpoints.get(&input.id) else {
             return Err(DeleteVpcEndpointErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::ERROR_MESSAGE_VPC_ENDPOINT_NOT_FOUND.to_string()),
+                    message: Some(crate::state::vpc_endpoint_not_found_message(&input.id)),
                 },
             )
             .into());
@@ -213,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = store.vpc_endpoints.get_mut(&input.id) else {
             return Err(DeleteVpcEndpointErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(crate::state::ERROR_MESSAGE_VPC_ENDPOINT_NOT_FOUND.to_string()),
+                    message: Some(crate::state::vpc_endpoint_not_found_message(&input.id)),
                 },
             )
             .into());

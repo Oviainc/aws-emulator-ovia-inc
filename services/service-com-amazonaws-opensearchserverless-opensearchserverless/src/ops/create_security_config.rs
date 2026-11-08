@@ -294,9 +294,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::state::audit(Self::NAME, ctx, AuditOutcome::AlreadyExists, Some(&resource));
             return Err(CreateSecurityConfigErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(format!(
-                        "Security config with name {} and type {} already exists",
-                        input.name, input.r#type
+                    message: Some(crate::state::policy_already_exists_message(
+                        &input.name,
+                        &input.r#type,
                     )),
                 },
             )

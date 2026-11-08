@@ -103,6 +103,17 @@ pub const AWS_OWNED_KEY: &str = "auto";
 pub const DELETABLE_STATUSES: [&str; 3] =
     [COLLECTION_ACTIVE, COLLECTION_FAILED, COLLECTION_UPDATE_FAILED];
 
+/// The statuses from which a collection may be UPDATED: the one it is "ready to use" in
+/// and the one an earlier update left it in. A collection whose last update failed is
+/// updatable again — that is how a caller retries the write that failed — while the
+/// non-terminal statuses a collection is on its way through (`CREATING`, `UPDATING`,
+/// `DELETING`) and the terminal `FAILED` of a create that never produced a collection are
+/// not states an update may start from.
+///
+/// The check and the refusal that explains it are read off this one list
+/// ([`collection_not_updatable_message`]), so they can never disagree.
+pub const UPDATABLE_STATUSES: [&str; 2] = [COLLECTION_ACTIVE, COLLECTION_UPDATE_FAILED];
+
 /// `VpcEndpointStatus$PENDING` — "Pending VPCEndpoint resource", the status a managed
 /// interface endpoint is reported in while it is brought up.
 pub const VPC_ENDPOINT_PENDING: &str = "PENDING";
@@ -218,8 +229,11 @@ pub const ERROR_MESSAGE_NOT_FOUND: &str = "The specified Collection is not found
 /// error message describing the reason for the failure", so the wording follows the one
 /// this service's other batch readers document for the same cause
 /// ([`ERROR_MESSAGE_NOT_FOUND`], [`ERROR_MESSAGE_GROUP_NOT_FOUND`]) with the resource this
-/// one reads named instead.
-pub const ERROR_MESSAGE_VPC_ENDPOINT_NOT_FOUND: &str = "The specified Vpc Endpoint is not found.";
+/// one reads named instead — spelled `VpcEndpoint`, ONE word, the way this service names
+/// the resource kind in every refusal about it ([`vpc_endpoint_not_found_message`],
+/// [`vpc_endpoint_absent_conflict_message`]) and in the model's own shape names
+/// (`VpcEndpointDetail`, `VpcEndpointErrorDetail`).
+pub const ERROR_MESSAGE_VPC_ENDPOINT_NOT_FOUND: &str = "The specified VpcEndpoint is not found.";
 
 /// The `errorMessage` a `LifecyclePolicyErrorDetail` carries for an identifier that names
 /// no lifecycle policy, from `LifecyclePolicyErrorDetail$errorMessage`'s own
@@ -2346,11 +2360,22 @@ fn rule_covers(rule: &::aws_smithy_types::Document, resource: &str) -> bool {
 /// check it explains are read off one list and can never disagree, whichever resource's
 /// list it is ([`DELETABLE_STATUSES`], [`VPC_ENDPOINT_DELETABLE_STATUSES`]).
 pub fn statuses_phrase(statuses: &[&str]) -> String {
-    let quoted: Vec<String> = statuses
-        .iter()
-        .map(|status| format!("'{status}'"))
-        .collect();
-    match quoted.split_last() {
+    joined_with_or(statuses.iter().map(|status| format!("'{status}'")))
+}
+
+/// The same list as [`statuses_phrase`] renders, with the status names UNQUOTED — the way
+/// a refusal that names them inline in its own sentence states them
+/// ([`collection_not_updatable_message`]).
+pub fn plain_statuses_phrase(statuses: &[&str]) -> String {
+    joined_with_or(statuses.iter().map(|status| (*status).to_string()))
+}
+
+/// `parts` as one sentence fragment: the last two joined by `or`, every earlier one
+/// comma-separated, which is the form `ConflictException`'s own documentation states a
+/// list of statuses in.
+fn joined_with_or(parts: impl IntoIterator<Item = String>) -> String {
+    let parts: Vec<String> = parts.into_iter().collect();
+    match parts.split_last() {
         Some((last, [])) => last.clone(),
         Some((last, [only])) => format!("{only} or {last}"),
         Some((last, rest)) => format!("{}, or {last}", rest.join(", ")),
@@ -2363,12 +2388,90 @@ pub fn collection_not_found_message(id: &str) -> String {
     format!("Collection with ID {id} is not found")
 }
 
+/// How this service words a collection that is not in a status it may be updated from,
+/// from the collection ID the request addressed and the statuses an update IS accepted in
+/// ([`UPDATABLE_STATUSES`]).
+///
+/// The statuses are read off the same list the precondition checks, so the sentence always
+/// names every status from which the update would have been accepted.
+pub fn collection_not_updatable_message(id: &str) -> String {
+    format!(
+        "Collection Id {id} cannot be updated because it is not in {} Status",
+        plain_statuses_phrase(&UPDATABLE_STATUSES)
+    )
+}
+
+/// How this service words a POLICY resource that is not there, from its own name and type.
+///
+/// This service calls every named, typed resource of its security plane a `Policy` in a
+/// refusal — the data access policy, the security policy, the lifecycle policy, and the
+/// security CONFIGURATION a write addresses ([`security_config_write_not_found_message`]) —
+/// so the one sentence a client keys on is built here rather than in each handler.
+pub fn policy_not_found_message(name: &str, kind: &str) -> String {
+    format!("Policy with name {name} and type {kind} is not found")
+}
+
+/// How this service words a create whose `(type, name)` pair is already taken: the
+/// counterpart of [`policy_not_found_message`], and one wording for every policy resource
+/// a create addresses by that pair.
+pub fn policy_already_exists_message(name: &str, kind: &str) -> String {
+    format!("Policy with name {name} and type {kind} already exists")
+}
+
+/// The type and the name a `SecurityConfigId` encodes, as `(kind, name)`.
+///
+/// An id of the documented `<type>/<account-id>/<name>` form ([`security_config_id`])
+/// carries the type in its FIRST segment and the name in its LAST one, so both are read
+/// back off the id a request addressed the configuration by. `SecurityConfigId` declares no
+/// `@pattern`, so an id carrying no separator at all encodes neither and answers `None`.
+pub fn parse_security_config_id(id: &str) -> Option<(&str, &str)> {
+    let (kind, rest) = id.split_once('/')?;
+    let name = rest.rsplit_once('/').map_or(rest, |(_, name)| name);
+    if kind.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some((kind, name))
+}
+
+/// How the WRITE paths word a security configuration that is not there: as the `Policy`
+/// this service calls it, named by the type and the name its `id` encodes
+/// ([`parse_security_config_id`]). An id encoding neither is named as the id it is, since
+/// there is no name or type in it to render.
+///
+/// `UpdateSecurityConfig` and `DeleteSecurityConfig` address a configuration the way a
+/// caller addresses the other policy resources — by what it IS rather than by its id — and
+/// the READ path keeps the id-addressed wording ([`security_config_not_found_message`]).
+pub fn security_config_write_not_found_message(id: &str) -> String {
+    match parse_security_config_id(id) {
+        Some((kind, name)) => policy_not_found_message(name, kind),
+        None => security_config_not_found_message(id),
+    }
+}
+
+/// How this service words a managed interface endpoint that is not there, from the ID the
+/// request addressed it by: the kind spelled `VpcEndpoint`, the id SINGLE-QUOTED, and a
+/// trailing period.
+///
+/// The id is what a caller deleting several endpoints tells one refusal from another by, so
+/// it is rendered rather than left out. This is the wording of the operations that model
+/// `ResourceNotFoundException`; one that models none words the same cause as a conflict
+/// ([`vpc_endpoint_absent_conflict_message`]).
+pub fn vpc_endpoint_not_found_message(id: &str) -> String {
+    format!("VpcEndpoint with ID '{id}' cannot be found.")
+}
+
+/// How an operation that models NO not-found error words a managed interface endpoint that
+/// is not there: as the state conflict it reports instead, naming the same id.
+pub fn vpc_endpoint_absent_conflict_message(id: &str) -> String {
+    format!("The VpcEndpoint with Id '{id}' is not exist.")
+}
+
 /// How this service words a security configuration that is not there, from the `id` the
 /// request addressed it by.
 ///
-/// One wording for every operation that takes a `SecurityConfigId`, so a read, a write and
-/// a delete of an id nothing is stored under cannot disagree about the refusal a client
-/// keys on.
+/// The wording of the READ path, which addresses the configuration by its id and so names
+/// the id back. The WRITE paths name the configuration as the policy it is
+/// ([`security_config_write_not_found_message`]).
 pub fn security_config_not_found_message(id: &str) -> String {
     format!("Security config with id: {id} does not exist")
 }
@@ -2505,12 +2608,22 @@ pub fn index_schema_bounds_message() -> String {
     )
 }
 
+/// How this service words a collection group that is not there, from the ID a request
+/// addressed it by: the kind spelled `CollectionGroup` as one word, the id SINGLE-QUOTED,
+/// and a trailing period — the same spelling of the kind that
+/// [`collection_group_not_empty_message`] uses.
+///
+/// The wording of the operations that model `ResourceNotFoundException` for a
+/// `CollectionGroupId`. A request that names the group by NAME is answered with
+/// [`collection_group_name_not_found_message`].
+pub fn collection_group_not_found_message(id: &str) -> String {
+    format!("CollectionGroup with ID '{id}' cannot be found.")
+}
+
 /// How this service words a collection group that is not there, from its NAME — the way a
 /// request that names the group it wants its collection in addresses one. The
-/// id-addressed wording ("Collection group with ID ... is not found", the counterpart of
-/// [`collection_not_found_message`]) is what the operations that take a
-/// `CollectionGroupId` answer with.
-pub fn collection_group_not_found_message(name: &str) -> String {
+/// id-addressed wording is [`collection_group_not_found_message`].
+pub fn collection_group_name_not_found_message(name: &str) -> String {
     format!("Collection group with name {name} is not found")
 }
 

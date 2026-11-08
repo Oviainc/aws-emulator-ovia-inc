@@ -249,7 +249,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // `id` is the whole identity of a security configuration, so an id that names no
-        // stored record is the modelled 404 rather than a write to nothing.
+        // stored record is the modelled 404 rather than a write to nothing. The refusal
+        // names the configuration as the policy this service calls it, by the name and the
+        // type its id encodes.
         let Some((kind, stored_version)) = store
             .security_configs
             .get(&input.id)
@@ -259,7 +261,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 UpdateSecurityConfigErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(crate::state::security_config_not_found_message(
+                        message: Some(crate::state::security_config_write_not_found_message(
                             &input.id,
                         )),
                     },

@@ -258,19 +258,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // `UpdateVpcEndpoint` models no not-found error (its errors are `ConflictException`,
-        // `InternalServerException` and `ValidationException`), so an id that names no
-        // endpoint is refused as invalid input rather than with an error this operation does
-        // not declare. The record is reached ONCE, mutably: everything below reads it and
-        // then writes it under the same lock.
+        // `UpdateVpcEndpoint` models no not-found error at all (its errors are
+        // `ConflictException`, `InternalServerException` and `ValidationException`), so an
+        // id that names no endpoint is reported as the state conflict `ConflictException`
+        // describes — the request itself is well formed, it is the endpoint's existence
+        // that conflicts with it — rather than as malformed input a client must never
+        // retry. The record is reached ONCE, mutably: everything below reads it and then
+        // writes it under the same lock.
         let updated_at = crate::state::now_epoch_millis();
         let Some(record) = store.vpc_endpoints.get_mut(&input.id) else {
-            return Err(UpdateVpcEndpointErrorModeled::ValidationException(
-                ValidationException {
-                    message: Some(crate::state::ERROR_MESSAGE_VPC_ENDPOINT_NOT_FOUND.to_string()),
-                },
-            )
-            .into());
+            return Err(
+                UpdateVpcEndpointErrorModeled::ConflictException(ConflictException {
+                    message: Some(crate::state::vpc_endpoint_absent_conflict_message(&input.id)),
+                })
+                .into(),
+            );
         };
 
         // An endpoint still being brought up, or already going away, is not in a status it

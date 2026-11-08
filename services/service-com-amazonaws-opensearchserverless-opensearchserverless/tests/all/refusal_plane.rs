@@ -256,8 +256,8 @@ async fn the_deletion_protection_refusal_names_the_collection_by_its_stored_name
 }
 
 // ---------------------------------------------------------------------------
-// The security-configuration not-found refusal: one wording for every operation
-// that takes a `SecurityConfigId`.
+// The security-configuration not-found refusal: the READ path names the id it was
+// given, the WRITE paths name the policy the id encodes.
 // ---------------------------------------------------------------------------
 
 /// The request `operation` needs to address the configuration `id`.
@@ -270,8 +270,23 @@ fn security_config_request(operation: &str, id: &str) -> Value {
     }
 }
 
+/// How `operation` words the configuration `id` names nothing under: the read path names
+/// the id, the write paths name the configuration as the `Policy` this service calls it,
+/// by the type and the name the id's first and last segments carry. An id carrying no
+/// separator encodes neither, so it is named as the id it is.
+fn security_config_absent_message(operation: &str, id: &str) -> String {
+    let encoded = id.split_once('/').map(|(kind, rest)| {
+        let name = rest.rsplit_once('/').map_or(rest, |(_, name)| name);
+        (kind, name)
+    });
+    match (operation, encoded) {
+        ("GetSecurityConfig", _) | (_, None) => format!("Security config with id: {id} does not exist"),
+        (_, Some((kind, name))) => format!("Policy with name {name} and type {kind} is not found"),
+    }
+}
+
 #[tokio::test]
-async fn every_operation_that_takes_a_security_config_id_words_the_404_the_same_way() {
+async fn every_operation_that_takes_a_security_config_id_words_the_404_for_its_own_class() {
     let router = emulator();
 
     // The rows differ along the `SecurityConfigType` the id names (every modelled value,
@@ -308,8 +323,8 @@ async fn every_operation_that_takes_a_security_config_id_words_the_404_the_same_
             );
             assert_eq!(
                 message(&answer),
-                format!("Security config with id: {id} does not exist"),
-                "case {operation}({case:?}): the refusal must name the id it was given, got \
+                security_config_absent_message(operation, id),
+                "case {operation}({case:?}): the refusal must name what it was given, got \
                  {answer}"
             );
         }
@@ -344,9 +359,9 @@ async fn every_operation_that_takes_a_security_config_id_words_the_404_the_same_
         );
         assert_eq!(
             message(&answer),
-            format!("Security config with id: {id} does not exist"),
-            "case {operation}(after the delete): the refusal must name the deleted id, got \
-             {answer}"
+            security_config_absent_message(operation, &id),
+            "case {operation}(after the delete): the refusal must name the deleted \
+             configuration, got {answer}"
         );
     }
 }

@@ -30,9 +30,10 @@ use crate::vpc_endpoint::{
 /// (`smithy_query(query="shape", shape="VpcEndpointStatus")`).
 const DELETING: &str = "DELETING";
 
-/// The `errorMessage` a `VpcEndpointErrorDetail` carries for an id that names no endpoint,
-/// from `VpcEndpointErrorDetail$errorMessage`'s own documented example.
-const NOT_FOUND_MESSAGE: &str = "The specified Vpc Endpoint is not found.";
+/// How `DeleteVpcEndpoint` words the id it was given when no endpoint carries it.
+fn delete_not_found_message(id: &str) -> String {
+    format!("VpcEndpoint with ID '{id}' cannot be found.")
+}
 
 /// The `errorCode` this service's batch readers report for an identifier that names
 /// nothing.
@@ -339,8 +340,8 @@ async fn a_delete_of_an_id_that_names_no_endpoint_is_refused() {
         );
         assert_eq!(
             text(&answer, "message"),
-            NOT_FOUND_MESSAGE,
-            "case {case}: expected the service's not-found wording, got {answer}"
+            delete_not_found_message(id),
+            "case {case}: expected the service's not-found wording naming {id}, got {answer}"
         );
     }
 

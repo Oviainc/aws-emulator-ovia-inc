@@ -297,7 +297,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if store.collection_group_by_name(group).is_none() {
                 return Err(CreateCollectionErrorModeled::ValidationException(
                     ValidationException {
-                        message: Some(crate::state::collection_group_not_found_message(group)),
+                        message: Some(crate::state::collection_group_name_not_found_message(
+                            group,
+                        )),
                     },
                 )
                 .into());

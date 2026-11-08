@@ -397,8 +397,9 @@ async fn a_spent_token_does_not_answer_for_a_resource_that_is_not_there() {
     )
     .await;
 
-    // `UpdateVpcEndpoint` models no not-found error, so an id naming no endpoint is invalid
-    // input — and a spent token cannot turn it into a 200 describing another endpoint.
+    // `UpdateVpcEndpoint` models no not-found error, so an id naming no endpoint is the
+    // state conflict the endpoint's absence is — and a spent token cannot turn it into a
+    // 200 describing another endpoint.
     let unknown = Resource {
         address: json!({ "id": "vpce-00000000000000000" }),
         version: None,
@@ -411,8 +412,8 @@ async fn a_spent_token_does_not_answer_for_a_resource_that_is_not_there() {
     .await;
     assert_eq!(
         (status, code.as_str()),
-        (400, "ValidationException"),
-        "case an id naming no endpoint: expected 400 ValidationException, got {status} {code} with {answer}"
+        (400, "ConflictException"),
+        "case an id naming no endpoint: expected 400 ConflictException, got {status} {code} with {answer}"
     );
 
     // The endpoint the token was first spent on is untouched by that refusal.

@@ -224,18 +224,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
-        // A collection can only be updated from the state it is "ready to use" in: one
+        // A collection can only be updated from a SETTLED status it may be written in: one
         // still being created, already being deleted, or still being reconfigured by an
-        // earlier update is the state conflict `ConflictException` describes.
-        if record.status != crate::state::COLLECTION_ACTIVE {
+        // earlier update is the state conflict `ConflictException` describes. A collection
+        // whose last update failed IS updatable — that retry is how the caller recovers
+        // from it — so the statuses an update is accepted in are read off
+        // `crate::state::UPDATABLE_STATUSES`, which is also the list the refusal names.
+        if !crate::state::UPDATABLE_STATUSES.contains(&record.status.as_str()) {
             return Err(
                 UpdateCollectionErrorModeled::ConflictException(ConflictException {
-                    message: Some(format!(
-                        "Collection with ID {} is in status {} and cannot be updated; it must be {}",
-                        input.id,
-                        record.status,
-                        crate::state::COLLECTION_ACTIVE
-                    )),
+                    message: Some(crate::state::collection_not_updatable_message(&input.id)),
                 })
                 .into(),
             );

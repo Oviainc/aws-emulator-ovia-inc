@@ -22,7 +22,7 @@
 //! that names no group at all.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_opensearchserverless_opensearchserverless::state::collection_group_not_found_message;
+use service_com_amazonaws_opensearchserverless_opensearchserverless::state::collection_group_name_not_found_message;
 
 use crate::collection_group_delete::{detail_at_collection, error_at_collection};
 use crate::collection_group_lifecycle::{batch_get, create_group, detail_at, error_at};
@@ -181,7 +181,7 @@ async fn creating_a_collection_in_an_unstored_group_is_refused_and_stores_nothin
         );
         assert_eq!(
             text(&answer, "message"),
-            collection_group_not_found_message(group),
+            collection_group_name_not_found_message(group),
             "case CreateCollection({collection}) with {what}: the refusal names the group it \
              could not resolve, got {answer}"
         );

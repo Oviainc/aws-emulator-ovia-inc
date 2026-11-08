@@ -170,9 +170,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeleteCollectionGroupErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: Some(format!(
-                            "Collection group with ID {} is not found",
-                            input.id
+                        message: Some(crate::state::collection_group_not_found_message(
+                            &input.id,
                         )),
                     },
                 )

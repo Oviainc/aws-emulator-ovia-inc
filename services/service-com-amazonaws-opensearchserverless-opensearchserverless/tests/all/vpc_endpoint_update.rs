@@ -441,16 +441,31 @@ async fn an_update_outside_the_rule_is_refused_and_stores_nothing() {
 
     // Well-formed `VpcEndpointId`s that name no stored endpoint: one never minted, and one
     // whose suffix is empty — both satisfy `^vpce-[0-9a-z]*$`, so they reach the handler.
-    // The rest sit one past a published bound of the RESULT, or contradict themselves.
+    // `UpdateVpcEndpoint` models NO not-found error, so the endpoint's absence is reported
+    // as the state conflict it is, naming the id the request addressed.
+    for absent in ["vpce-00000000000000000", "vpce-"] {
+        let (status, code, answer) = update_endpoint(
+            &router,
+            json!({ "id": absent, "addSubnetIds": ["subnet-33333333"] }),
+        )
+        .await;
+        assert_eq!(
+            (status, code.as_str()),
+            (CLIENT_ERROR, "ConflictException"),
+            "case an id naming no endpoint ({absent}): expected {CLIENT_ERROR} \
+             ConflictException, got {status} {code} with {answer}"
+        );
+        assert_eq!(
+            text(&answer, "message"),
+            format!("The VpcEndpoint with Id '{absent}' is not exist."),
+            "case an id naming no endpoint ({absent}): expected the refusal to name the id, \
+             got {answer}"
+        );
+    }
+
+    // The rows below sit one past a published bound of the RESULT, contradict themselves, or
+    // break a modelled constraint on the input itself.
     let cases: Vec<(String, Value)> = vec![
-        (
-            "an id that was never minted".to_string(),
-            json!({ "id": "vpce-00000000000000000", "addSubnetIds": ["subnet-33333333"] }),
-        ),
-        (
-            "an id with an empty suffix".to_string(),
-            json!({ "id": "vpce-", "addSubnetIds": ["subnet-33333333"] }),
-        ),
         (
             format!("a removal leaving fewer than {MIN_SUBNET_IDS} subnet"),
             json!({ "id": id, "removeSubnetIds": ["subnet-11111111", "subnet-22222222"] }),

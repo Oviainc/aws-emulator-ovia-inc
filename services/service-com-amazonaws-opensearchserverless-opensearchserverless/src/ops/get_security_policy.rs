@@ -192,9 +192,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 GetSecurityPolicyError::from(
                     GetSecurityPolicyErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
-                            message: Some(format!(
-                                "Policy with name {} and type {} is not found",
-                                input.name, input.r#type
+                            message: Some(crate::state::policy_not_found_message(
+                                &input.name,
+                                &input.r#type,
                             )),
                         },
                     ),
