@@ -435,8 +435,8 @@
 //! the declaration itself states keeps the declaration's value. A type that is not taggable
 //! — `AWS::WAFRegional::IPSet`, which publishes no `Tags` property — is tagged with nothing,
 //! because CloudFormation propagates no tags to one, and a type whose owning API refuses the
-//! reserved `aws:` namespace to its callers carries the stack's own tags without the three
-//! ([`Provisioner::applicable_tags`]).
+//! reserved `aws:` namespace on the path this provisioning call is made over carries the
+//! stack's own tags without the three ([`Provisioner::applicable_tags`]).
 //!
 //! No arm invents a value: a property the template does not declare is absent from the
 //! request, and what the owning service answers is what the stack records. A property an
@@ -1371,10 +1371,13 @@ impl Provisioner {
     /// prefix ... it is reserved for AWS use"): IAM's `CreateRole`, CodePipeline's
     /// `CreatePipeline` and EventBridge Scheduler's `CreateScheduleGroup` all do, in their
     /// own crates' tag validation. AWS sets the
-    /// `aws:cloudformation:*` tags from inside itself, which no public API models and this
-    /// emulator has no privileged channel for, so for such a type those three are left off
-    /// rather than sent to be refused — a stack must not fail over tags CloudFormation adds
-    /// of its own accord. The stack's own tags, which are ordinary keys, are applied either
+    /// `aws:cloudformation:*` tags from inside itself, through no public API: here that
+    /// inside path is the in-process call this provisioning request IS, which the framework
+    /// stamps and a client's request cannot be — so a type whose owning crate reads that
+    /// stamp takes the three (see the paragraph below), and for a type whose crate does not
+    /// they are left off rather than sent to be refused: a stack must not fail over tags
+    /// CloudFormation adds of its own accord. The stack's own tags, which are ordinary keys,
+    /// are applied either
     /// way. ACM is the same case: its `CreateAcmeEndpoint` refuses a reserved key on either
     /// half of a pair, and so do Amazon ECS's `CreateCluster`, Amazon MSK's two cluster
     /// creates, Amazon SQS's `CreateQueue` — which refuses it in its own crate's
@@ -1389,6 +1392,12 @@ impl Provisioner {
     /// creates are the same case again: each takes a `TagList` and refuses a key in the
     /// reserved namespace in its own crate's tag validation, the one check `TagResource`
     /// runs too.
+    ///
+    /// A type whose owning service ADMITS the three on that in-process path — Amazon S3
+    /// Vectors, whose crate refuses a reserved key to an API caller and takes one from a
+    /// provisioning call — is NOT in the set below: the three travel with the create, and
+    /// that service's own `ListTagsForResource` on the handle the stack publishes answers
+    /// with them. A type stays in the set only until its own crate reads that path too.
     fn applicable_tags(self, propagated: &[(String, String)]) -> Vec<(String, String)> {
         let refuses_reserved_keys = matches!(
             self,
@@ -1407,8 +1416,6 @@ impl Provisioner {
                 // `AddTagsToStream` alike — so a stream carries the stack's own tags
                 // without the three.
                 | Self::KinesisStream
-                | Self::S3VectorsVectorBucket
-                | Self::S3VectorsIndex
                 // Amazon S3 refuses a tag key in the reserved namespace on every call that
                 // takes a tag set — the `Tagging` payload of `PutBucketTagging` and
                 // `PutObjectTagging` and the `x-amz-tagging` header of a write alike, in the

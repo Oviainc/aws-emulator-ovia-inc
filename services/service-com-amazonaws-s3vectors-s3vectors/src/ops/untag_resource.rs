@@ -161,9 +161,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The `aws:` tag-key namespace is AWS's own: a tag in it cannot be deleted
         // by a caller any more than it can be created by one, so a request naming
-        // such a key is refused before anything is resolved or removed.
-        crate::state::validate_tag_keys(input.tag_keys.iter().map(String::as_str))
-            .map_err(refusal)?;
+        // such a key is refused before anything is resolved or removed. The service
+        // that set such a tag reaches it on the in-process path instead
+        // (`crate::state::tag_key_origin`), as it does to write one.
+        crate::state::validate_tag_keys(
+            input.tag_keys.iter().map(String::as_str),
+            crate::state::tag_key_origin(ctx),
+        )
+        .map_err(refusal)?;
 
         // Who the request speaks for, resolved before this service's own store is
         // locked, so only one store is ever held at a time.
@@ -171,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The read-modify-write this call makes is taken under the resource's own
         // optimistic lock, which the guard is dropped before the commit span is waited
         // out so another caller can reach the store and be told about the conflict.
-        let arn = {
+        let (arn, write) = {
             let mut store = state.lock();
             // The resource must exist for its tags to be removed: an ARN naming a vector
             // bucket or vector index this store does not hold is the modelled 404, which
@@ -193,10 +198,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
 
-            store
-                .begin_tag_write(&arn, ::std::time::Instant::now())
-                .map_err(conflict)?;
-            arn
+            // The lock is released however this request ends, including at the commit
+            // span below, which is a point the request can be dropped at.
+            let write = crate::state::TagWriteLock::take(
+                &state,
+                &mut store,
+                &arn,
+                ::std::time::Instant::now(),
+            )
+            .map_err(conflict)?;
+            (arn, write)
         };
 
         // The removal takes the span it takes to commit, and its own caller is answered
@@ -207,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The resource may have been deleted while this removal was committing, in which
         // case there is nothing left to remove tags from.
         let resolved = store.tagged_resource_arn("resourceArn", &input.resource_arn);
-        store.end_tag_write(&arn);
+        write.release(&mut store);
         resolved.map_err(refusal)?;
 
         // Removal is BY KEY and idempotent (the operation carries `@idempotent`): a

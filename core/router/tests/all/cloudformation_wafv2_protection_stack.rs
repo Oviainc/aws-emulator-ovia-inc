@@ -597,6 +597,13 @@ async fn a_rule_that_references_another_entity_deploys_and_is_live_in_waf() {
 }
 
 /// The addresses the protection stack's IP set lists, which `GetIPSet` must report back.
+///
+/// The MEMBERSHIP is what the read must report: `IPSet$Addresses` is the set those strings
+/// name, so AWS WAF reports it in the set's own order — a function of the membership rather
+/// than of the order the create listed them in, which that service's own crate holds to
+/// (`service-com-amazonaws-wafv2-awswaf-20190729`'s `state::canonical_ip_set_addresses` and
+/// its `tests/all/ip_set_address_order.rs`). The comparison below is therefore order-free,
+/// with the order held to the one thing it must be: the same on every read.
 const LISTED_ADDRESSES: &[&str] = &["198.51.100.17/32", "203.0.113.0/24"];
 
 /// The name the protection stack declares its web ACL under.
@@ -705,6 +712,21 @@ async fn a_deployed_protection_publishes_identifiers_waf_resolves() {
     assert_eq!(
         addresses, declared,
         "case {case:?}: expected GetIPSet to report the declared addresses, got {read}"
+    );
+    // And the order it reports them in is the set's own: the same list again on a second
+    // read, so a client comparing a read against what it applied sees one answer.
+    let again = waf_ok(
+        &router,
+        case,
+        "GetIPSet",
+        json!({"Name": "protection-set", "Scope": SCOPE, "Id": ip_set_id}),
+    )
+    .await;
+    assert_eq!(
+        again.pointer("/IPSet/Addresses"),
+        read.pointer("/IPSet/Addresses"),
+        "case {case:?}: expected a second GetIPSet to report the addresses in the same order, \
+         got {again}"
     );
 
     // The web ACL's ARN carries the triple that service addresses an entity by, so it can be

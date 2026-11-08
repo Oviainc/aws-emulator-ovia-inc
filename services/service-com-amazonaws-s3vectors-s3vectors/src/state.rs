@@ -705,15 +705,59 @@ pub fn resolve_index_name(
     }
 }
 
-/// Refuse a caller-supplied tag key that lies in the reserved `aws:` namespace.
+/// Who is naming the tag keys one request carries, which is what decides whether a key in
+/// the reserved `aws:` namespace may be written ([`validate_tag_keys`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TagKeyOrigin {
+    /// A request a CLIENT made. A key in the reserved namespace is AWS's own, so such a
+    /// request may neither write nor remove one.
+    Caller,
+    /// A request another emulated service made in-process on behalf of a resource it
+    /// provisions — the path the tags AWS sets from inside itself arrive on, which no
+    /// client's request can be. A key in the reserved namespace travels on it.
+    Service,
+}
+
+/// Where the tag keys this request names came from.
 ///
-/// One implementation serves every operation that takes caller-supplied tag keys —
-/// a create request's `tags`, TagResource's `tags`, UntagResource's `tagKeys` —
-/// because the namespace belongs to AWS whichever member names it. The prefix is
-/// matched case-insensitively, as AWS documents it.
+/// A tag in the reserved namespace is AWS's to set: the refusal
+/// ([`SYSTEM_TAG_REFUSED`]) is the answer to an API CALLER, while the services that own
+/// such a tag set it from inside AWS, through no public API. In this emulator one service
+/// reaches another ONLY through the in-process callback
+/// ([`::smithy_server_runtime::OperationContext::callback`]), so that callback is the
+/// inside path, and the signal is the
+/// [`::smithy_server_runtime::CallbackRecursionDepth`] request EXTENSION the framework's
+/// callback transport stamps on every in-process call. An extension never travels over the
+/// wire: nothing a client can send — on any socket, signed with any credential — sets it,
+/// so a client's reserved key is refused exactly as before. It is the same framework signal
+/// other service crates read to tell an in-process call from a client's request (Amazon
+/// EventBridge's `PutEvents` reads it to tell a service's own event from a published one),
+/// so nothing about the transport is reconstructed here.
+pub fn tag_key_origin(ctx: &::smithy_server_runtime::OperationContext<'_>) -> TagKeyOrigin {
+    match ctx
+        .parts()
+        .extensions
+        .get::<::smithy_server_runtime::CallbackRecursionDepth>()
+    {
+        Some(_) => TagKeyOrigin::Service,
+        None => TagKeyOrigin::Caller,
+    }
+}
+
+/// Refuse a tag key that lies in the reserved `aws:` namespace, where the request naming it
+/// is a caller's ([`TagKeyOrigin`]).
+///
+/// One implementation serves every operation that takes tag keys — a create request's
+/// `tags`, TagResource's `tags`, UntagResource's `tagKeys` — because the namespace belongs
+/// to AWS whichever member names it. The prefix is matched case-insensitively, as AWS
+/// documents it.
 pub fn validate_tag_keys<'a>(
     keys: impl IntoIterator<Item = &'a str>,
+    origin: TagKeyOrigin,
 ) -> Result<(), LookupError> {
+    if origin == TagKeyOrigin::Service {
+        return Ok(());
+    }
     let prefix = RESERVED_TAG_KEY_PREFIX.as_bytes();
     for key in keys {
         let bytes = key.as_bytes();
@@ -897,6 +941,79 @@ impl ComAmazonawsS3vectorsS3vectorsState {
     /// Release the optimistic lock [`Self::begin_tag_write`] took.
     pub fn end_tag_write(&mut self, arn: &str) {
         self.tag_writes.remove(arn);
+    }
+}
+
+/// One tag write's optimistic lock, held for as long as that write is in flight and
+/// released however the request holding it ends.
+///
+/// The lock is taken before the commit span and released after it
+/// ([`ComAmazonawsS3vectorsS3vectorsState::begin_tag_write`] /
+/// [`ComAmazonawsS3vectorsS3vectorsState::end_tag_write`]), and the handler AWAITS that
+/// span in between — which is a point the request can be dropped at: a client that
+/// disconnected, a wait that ran out, a cancelled task. So the release hangs off this
+/// value's `Drop` rather than off the code after that await: a request that goes away gives
+/// the lock up as it goes, instead of leaving the next caller to be told about a conflict
+/// with a write nobody is making any more.
+///
+/// [`Self::release`] is the committed path, taken under a store guard the caller already
+/// holds so the release and the write it belongs to take the lock once between them.
+pub struct TagWriteLock {
+    /// The store the lock lives in, as the shared handle rather than a borrow: a value
+    /// whose `Drop` releases the lock cannot borrow the guard the release needs.
+    state: ::engine::ServiceState<ComAmazonawsS3vectorsS3vectorsState>,
+    /// The resource whose tag state is locked.
+    arn: String,
+    /// Whether the lock is still this value's to release: [`Self::release`] clears it, so
+    /// the committed path does not reach for the store a second time.
+    held: bool,
+}
+
+/// Prints the resource the lock is on — an ARN, which is a public identifier.
+impl ::std::fmt::Debug for TagWriteLock {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.debug_struct("TagWriteLock")
+            .field("arn", &self.arn)
+            .field("held", &self.held)
+            .finish()
+    }
+}
+
+impl TagWriteLock {
+    /// Take the lock on the tag state of the resource `arn` names, under the store guard
+    /// `store`. `Err` is the `ConflictException` message a racing mutation of the same
+    /// resource is answered with ([`ComAmazonawsS3vectorsS3vectorsState::begin_tag_write`]).
+    pub fn take(
+        state: &::engine::ServiceState<ComAmazonawsS3vectorsS3vectorsState>,
+        store: &mut ComAmazonawsS3vectorsS3vectorsState,
+        arn: &str,
+        now: Instant,
+    ) -> Result<Self, String> {
+        store.begin_tag_write(arn, now)?;
+        Ok(Self {
+            state: state.clone(),
+            arn: arn.to_string(),
+            held: true,
+        })
+    }
+
+    /// Release the lock under a store guard the caller holds, which is the committed path:
+    /// the write the caller is about to make and this release happen under the one guard.
+    pub fn release(mut self, store: &mut ComAmazonawsS3vectorsS3vectorsState) {
+        store.end_tag_write(&self.arn);
+        self.held = false;
+    }
+}
+
+impl Drop for TagWriteLock {
+    fn drop(&mut self) {
+        if !self.held {
+            return;
+        }
+        // Every other path out of the write — a refusal after the commit span, and the
+        // request being dropped at it — releases here, so no lock outlives the write it
+        // was taken for.
+        self.state.lock().end_tag_write(&self.arn);
     }
 }
 

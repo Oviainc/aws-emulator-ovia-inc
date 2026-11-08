@@ -162,8 +162,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The `aws:` tag-key namespace is AWS's own, so a key in it is refused
-        // before anything is resolved or stored.
-        crate::state::validate_tag_keys(input.tags.keys().map(String::as_str)).map_err(refusal)?;
+        // before anything is resolved or stored — for a CALLER's request. The tags AWS
+        // sets from inside itself arrive on the in-process path instead
+        // (`crate::state::tag_key_origin`).
+        crate::state::validate_tag_keys(
+            input.tags.keys().map(String::as_str),
+            crate::state::tag_key_origin(ctx),
+        )
+        .map_err(refusal)?;
 
         // Who the request speaks for, resolved before this service's own store is
         // locked, so only one store is ever held at a time.
@@ -171,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The read-modify-write this call makes is taken under the resource's own
         // optimistic lock, which the guard is dropped before the commit span is waited
         // out so another caller can reach the store and be told about the conflict.
-        let arn = {
+        let (arn, write) = {
             let mut store = state.lock();
             // The resource must exist to be tagged: an ARN naming a vector bucket or
             // vector index this store does not hold is the modelled 404.
@@ -213,10 +219,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
 
-            store
-                .begin_tag_write(&arn, ::std::time::Instant::now())
-                .map_err(conflict)?;
-            arn
+            // The lock is released however this request ends, including at the commit
+            // span below, which is a point the request can be dropped at.
+            let write = crate::state::TagWriteLock::take(
+                &state,
+                &mut store,
+                &arn,
+                ::std::time::Instant::now(),
+            )
+            .map_err(conflict)?;
+            (arn, write)
         };
 
         // The write takes the span it takes to commit, and its own caller is answered
@@ -229,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The resource may have been deleted while this write was committing, in which
         // case there is nothing left to tag.
         let resolved = store.tagged_resource_arn("resourceArn", &input.resource_arn);
-        store.end_tag_write(&arn);
+        write.release(&mut store);
         resolved.map_err(refusal)?;
 
         // "Applies one or more user-defined tags … or updates existing tags": a key
