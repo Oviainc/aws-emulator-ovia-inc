@@ -336,6 +336,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
+        // The placement is bounded, by this service's own bound on how many
+        // subnets one placement holds (`crate::state::SUBNETS_PER_GROUP`), and
+        // refused here BEFORE the ids are resolved — so what the owner of
+        // subnets is asked about is bounded by that quota rather than by the
+        // size of the request.
+        if requested_subnets.len() > crate::state::SUBNETS_PER_GROUP {
+            return Err(invalid_value(format!(
+                "{} subnets were supplied; a serverless cache is deployed into at most {}.",
+                requested_subnets.len(),
+                crate::state::SUBNETS_PER_GROUP
+            )));
+        }
 
         // A user group is "available for Valkey and Redis OSS only", so a
         // Memcached request naming one is the incompatible combination rather
@@ -394,17 +406,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every named subnet has to be one the account HAS: the cache's VPC
         // endpoint is deployed into it, so an id that names no subnet could
-        // never carry one. Which subnets the account has is a fact of the
-        // Region (`crate::state::region_subnets`) — the same fact the default
-        // selection below reads, so ElastiCache never selects a subnet it would
-        // itself refuse.
-        let unresolved =
-            crate::state::unresolved_subnets(&region, requested_subnets.iter().map(String::as_str));
-        if !unresolved.is_empty() {
-            return Err(invalid_value(crate::state::invalid_subnets_message(
-                &unresolved,
-            )));
+        // never carry one. Which subnets the account has is Amazon EC2's answer
+        // and nobody else's (`crate::state::ec2_subnets`) — the same source the
+        // default selection below reads, so ElastiCache never selects a subnet
+        // it would itself refuse.
+        let requested: Vec<&str> = requested_subnets.iter().map(String::as_str).collect();
+        let resolved =
+            match crate::state::ec2_subnets::resolve_requested_subnets(ctx, &region, &requested)
+                .await
+            {
+                Ok(resolved) => resolved,
+                Err(unresolved) => {
+                    let unresolved: Vec<&str> = unresolved.iter().map(String::as_str).collect();
+                    return Err(invalid_value(crate::state::invalid_subnets_message(
+                        &unresolved,
+                    )));
+                }
+            };
+        // "All the subnetIds must belong to the same VPC"
+        // (`CreateServerlessCache$SubnetIds`): the endpoint is deployed into one
+        // VPC, so subnets of two is a value the member's own rule excludes, and
+        // the refusal states that rule in the member's own words followed by
+        // which identifier belongs where. Which VPC each belongs to is EC2's
+        // answer, read off the records above.
+        if let Some(first) = resolved.first() {
+            if let Some(mismatched) = resolved.iter().find(|subnet| subnet.vpc_id != first.vpc_id) {
+                return Err(invalid_value(format!(
+                    "All the subnetIds must belong to the same VPC: {} belongs to {} and {} \
+                     belongs to {}.",
+                    mismatched.subnet_id, mismatched.vpc_id, first.subnet_id, first.vpc_id
+                )));
+            }
         }
+        // "If no subnet IDs are given … ElastiCache will select [2 or 3] default
+        // subnets across AZs": the ones it selects are default subnets of the
+        // account's Region, as EC2 reports them, so a later read reports subnets
+        // that exist and a request may name them itself. Resolved before the
+        // store is locked, because asking EC2 is a call out of this handler.
+        let selected_subnets = if requested_subnets.is_empty() {
+            crate::state::ec2_subnets::default_subnets(
+                ctx,
+                &region,
+                crate::state::default_subnet_count(&region),
+            )
+            .await
+            .into_iter()
+            .map(|subnet| subnet.subnet_id)
+            .collect()
+        } else {
+            requested_subnets
+        };
 
         let now = ::std::time::SystemTime::now();
         // `KmsKeyId` is the "ARN of the customer managed key for encrypting the
@@ -471,19 +522,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // "If no subnet IDs are given … ElastiCache will select [2 or 3] default
-        // subnets across AZs": the ones it selects are default subnets of the
-        // account's Region, so a later read reports subnets that exist and a
-        // request may name them itself.
-        let subnet_ids = if requested_subnets.is_empty() {
-            crate::state::selected_default_subnets(&region)
-                .into_iter()
-                .map(|subnet| subnet.subnet_id)
-                .collect()
-        } else {
-            requested_subnets
-        };
-
         let new = crate::state::NewServerlessCache {
             name,
             region,
@@ -494,7 +532,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cache_usage_limits: input.cache_usage_limits,
             kms_key_id,
             security_group_ids: input.security_group_ids.unwrap_or_default(),
-            subnet_ids,
+            subnet_ids: selected_subnets,
             user_group_id: input.user_group_id,
             snapshot_retention_limit: input.snapshot_retention_limit,
             daily_snapshot_time: input.daily_snapshot_time,

@@ -139,9 +139,8 @@ async fn events_of(emulator: &Emulator, case: &str, pairs: &[(&str, &str)]) -> V
 /// wait after which the clock owes a pending status change.
 #[derive(Debug, Clone, Copy)]
 enum Step {
-    /// `CreateCacheSubnetGroup`, with how many of the account's subnets
-    /// (`state::region_subnets`, the only ids the service accepts) to put in the
-    /// group.
+    /// `CreateCacheSubnetGroup`, with how many of the account's subnets (the
+    /// ids EC2 reports, the only ones the service accepts) to put in the group.
     SubnetGroup(&'static str, usize),
     /// `CreateServerlessCache`, with whatever else the request names.
     ServerlessCache(&'static str, &'static [(&'static str, &'static str)]),
@@ -167,7 +166,7 @@ enum Step {
 async fn run_step(emulator: &Emulator, case: &str, step: Step) {
     let (action, pairs) = match step {
         Step::SubnetGroup(name, subnet_count) => {
-            let subnets = account_subnet_ids();
+            let subnets = account_subnet_ids(emulator).await;
             (
                 "CreateCacheSubnetGroup",
                 subnet_group_params(name, "the events suite", &subnets[..subnet_count]),
@@ -681,11 +680,8 @@ type FilterCase = (&'static str, &'static [(&'static str, &'static str)]);
 #[tokio::test]
 async fn source_identifier_and_source_type_filter_the_log() {
     let emulator = Emulator::new();
-    let group = subnet_group_params(
-        "Filter-Group",
-        "the events suite",
-        &account_subnet_ids()[..1],
-    );
+    let account_subnets = account_subnet_ids(&emulator).await;
+    let group = subnet_group_params("Filter-Group", "the events suite", &account_subnets[..1]);
     let created = emulator.call("CreateCacheSubnetGroup", &group).await;
     assert_eq!(
         created.status, 200,

@@ -33,6 +33,16 @@ sha2 = { workspace = true }
 # in-process callback into this same emulator (src/state/kms_key.rs); no network
 # client feature is enabled, because the transport is the emulator's own.
 aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The AWS SDK for EC2, driven over the same in-process callback: the subnets a
+# cache subnet group or a serverless cache is placed in are EC2's resources, so
+# `src/state/ec2_subnets.rs` asks EC2 what the account has rather than deciding
+# it here. Only the generated client is needed — the emulator supplies the
+# transport — and `behavior-version-latest` is what `BehaviorVersion::latest()`
+# in that module is gated behind.
+aws-sdk-ec2 = { version = "1", default-features = false, features = ["behavior-version-latest"] }
+# `arn::region_label`: the ONE reading of a caller-supplied Region as a Region
+# LABEL, which is what the endpoint the EC2 call above is made at is built from.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -41,6 +51,11 @@ emulator-core-build-support = { workspace = true }
 # The encryption suite mounts KMS beside ElastiCache on one engine, because
 # resolving the key a resource names is a call into it.
 service-com-amazonaws-kms-trentservice = { workspace = true }
+# The EC2 service, mounted beside this one in the test harness: that a cache
+# subnet group can be created in the subnets the account HAS can only be driven
+# end to end with the owner of subnets on the same engine. DEV-ONLY: this crate
+# depends on no other service's crate outside its tests.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [lints]
 workspace = true

@@ -76,7 +76,7 @@ fn envelope_request_id(case: &str, body: &str) -> String {
 #[tokio::test]
 async fn every_error_envelope_names_the_request_it_answers() {
     let emulator = Emulator::new();
-    let account_subnets = account_subnet_ids();
+    let account_subnets = account_subnet_ids(&emulator).await;
     // A group that exists, so the duplicate row below is about the name.
     let created = emulator
         .call(
@@ -261,9 +261,10 @@ async fn create_group_and_reread(
 #[tokio::test]
 async fn a_subnet_the_account_does_not_have_is_refused_and_nothing_is_created() {
     // The axis: how many of the named subnets name nothing, and where in the
-    // list they sit. Source of the valid ids: `state::region_subnets`, the
-    // account's network in the Region being signed for.
-    let account_subnets = account_subnet_ids();
+    // list they sit. Source of the valid ids: the service that OWNS subnets,
+    // asked for the account's network in the Region being signed for.
+    let emulator = Emulator::new();
+    let account_subnets = account_subnet_ids(&emulator).await;
     let rows: Vec<(&str, Vec<String>, bool)> = vec![
         (
             "every subnet the account has",
@@ -303,7 +304,6 @@ async fn a_subnet_the_account_does_not_have_is_refused_and_nothing_is_created() 
     ];
 
     for (index, (case, subnet_ids, accepted)) in rows.iter().enumerate() {
-        let emulator = Emulator::new();
         let name = format!("subnet-rule-{index}");
         let (created, described) =
             create_group_and_reread(&emulator, REGION, &name, subnet_ids).await;
@@ -336,7 +336,7 @@ async fn a_subnet_the_account_does_not_have_is_refused_and_nothing_is_created() 
         // built from the request.
         let message = created.text("Error/Message").unwrap_or_default();
         for id in subnet_ids {
-            let invalid = state::resolve_subnet(REGION, id).is_none();
+            let invalid = !account_subnets.contains(id);
             assert_eq!(
                 message.contains(id.as_str()),
                 invalid,
@@ -366,13 +366,16 @@ async fn the_accounts_subnets_are_the_regions_own() {
         ("us-west-1", "us-east-1"),
     ] {
         let emulator = Emulator::new();
-        let own: Vec<String> = state::region_subnets(region)
-            .into_iter()
-            .map(|subnet| subnet.subnet_id)
+        let own_subnets = emulator.account_subnets_in(region).await;
+        let own: Vec<String> = own_subnets
+            .iter()
+            .map(|subnet| subnet.id.clone())
             .collect();
-        let foreign: Vec<String> = state::region_subnets(other)
+        let foreign: Vec<String> = emulator
+            .account_subnets_in(other)
+            .await
             .into_iter()
-            .map(|subnet| subnet.subnet_id)
+            .map(|subnet| subnet.id)
             .collect();
         assert_ne!(
             own, foreign,
@@ -387,7 +390,7 @@ async fn the_accounts_subnets_are_the_regions_own() {
         );
         assert_eq!(
             described.text("CacheSubnetGroup/VpcId"),
-            Some(state::default_vpc_id(region).as_str()),
+            Some(own_subnets[0].vpc.as_str()),
             "case {region}: the group must report the VPC its subnets belong to, got {}",
             described.body
         );
@@ -425,27 +428,26 @@ async fn the_accounts_subnets_are_the_regions_own() {
             "case {region}: the serverless create must answer 200, got {}",
             serverless.body
         );
-        let selected: Vec<String> = state::selected_default_subnets(region)
-            .into_iter()
-            .map(|subnet| subnet.subnet_id)
+        let selected = serverless.all("SubnetId");
+        // The ones it selects are the account's own default subnets, in zone
+        // order, as many as the member publishes for this Region: "ElastiCache
+        // will select [2 or 3] default subnets across AZs in your default VPC".
+        let expected: Vec<&str> = own_subnets
+            .iter()
+            .filter(|subnet| subnet.default_for_az)
+            .map(|subnet| subnet.id.as_str())
+            .take(state::default_subnet_count(region))
             .collect();
-        assert_eq!(
-            serverless.all("SubnetId"),
-            selected.iter().map(String::as_str).collect::<Vec<&str>>(),
-            "case {region}: the selected subnets must be the Region's own, got {:?}",
-            serverless.all("SubnetId")
-        );
         assert_eq!(
             selected.len(),
             state::default_subnet_count(region),
             "case {region}: ElastiCache selects the count the member publishes, got {selected:?}"
         );
-        for id in &selected {
-            assert!(
-                own.contains(id),
-                "case {region}: a selected subnet must be one the account has, got {id:?}"
-            );
-        }
+        assert_eq!(
+            selected, expected,
+            "case {region}: the selected subnets must be the account's own default subnets in \
+             zone order, got {selected:?}"
+        );
     }
 }
 
@@ -453,7 +455,8 @@ async fn the_accounts_subnets_are_the_regions_own() {
 async fn a_serverless_cache_cannot_be_placed_in_a_subnet_the_account_does_not_have() {
     // The same rule on the other operation that takes subnet ids: the rows vary
     // the count and the position of the invalid id.
-    let account_subnets = account_subnet_ids();
+    let emulator = Emulator::new();
+    let account_subnets = account_subnet_ids(&emulator).await;
     let rows: Vec<(&str, Vec<String>, bool)> = vec![
         (
             "two subnets the account has",
@@ -476,7 +479,6 @@ async fn a_serverless_cache_cannot_be_placed_in_a_subnet_the_account_does_not_ha
     ];
 
     for (index, (case, subnet_ids, accepted)) in rows.iter().enumerate() {
-        let emulator = Emulator::new();
         let name = format!("placed-{index}");
         let mut pairs = params(&[("ServerlessCacheName", &name), ("Engine", "redis")]);
         pairs.extend(subnet_pairs("SubnetId", subnet_ids));

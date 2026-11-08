@@ -197,7 +197,7 @@ const DELETE_CASES: &[DeleteCase] = &[
 #[tokio::test]
 async fn a_delete_removes_the_subnet_group_from_the_account() {
     let emulator = Emulator::new();
-    let subnets = account_subnet_ids();
+    let subnets = account_subnet_ids(&emulator).await;
     let before = all_group_names(&emulator).await;
 
     for (case, created_as, deleted_as, subnet_count, tags) in DELETE_CASES {
@@ -291,7 +291,7 @@ async fn a_delete_removes_the_subnet_group_from_the_account() {
 #[tokio::test]
 async fn a_delete_touches_only_the_subnet_group_it_names() {
     let emulator = Emulator::new();
-    let subnets = account_subnet_ids();
+    let subnets = account_subnet_ids(&emulator).await;
 
     for name in ["keep-one", "drop-one", "keep-two", "drop-two"] {
         let created = create_group(&emulator, name, "one of four", &subnets[..2], &[]).await;
@@ -345,7 +345,7 @@ async fn a_delete_touches_only_the_subnet_group_it_names() {
 #[tokio::test]
 async fn a_subnet_group_this_account_does_not_hold_is_the_modelled_not_found() {
     let emulator = Emulator::new();
-    let subnets = account_subnet_ids();
+    let subnets = account_subnet_ids(&emulator).await;
     let created = create_group(&emulator, "held-subnets", "a group that exists", &subnets, &[]).await;
     assert_eq!(
         created.status, 200,
@@ -439,7 +439,7 @@ async fn a_name_no_subnet_group_could_carry_is_refused_as_a_bad_parameter() {
 #[tokio::test]
 async fn a_subnet_group_in_use_cannot_be_deleted() {
     let emulator = Emulator::new();
-    let subnets = account_subnet_ids();
+    let subnets = account_subnet_ids(&emulator).await;
 
     for name in ["cluster-subnets", "replication-group-subnets"] {
         let created = create_group(&emulator, name, "a group in use", &subnets[..2], &[]).await;
@@ -576,7 +576,7 @@ async fn a_subnet_group_in_use_cannot_be_deleted() {
 #[tokio::test]
 async fn a_subnet_group_delete_is_recorded_as_an_event() {
     let emulator = Emulator::new();
-    let subnets = account_subnet_ids();
+    let subnets = account_subnet_ids(&emulator).await;
 
     let created = create_group(&emulator, "Logged-Subnets", "a logged group", &subnets[..1], &[]).await;
     assert_eq!(

@@ -50,7 +50,7 @@ struct CacheCase {
     description: Option<&'static str>,
     /// `sse-kms` when the request named a `KmsKeyId`, else `sse-elasticache`.
     storage_encryption_type: &'static str,
-    /// How many of the account's subnets (`state::region_subnets`) the request
+    /// How many of the account's subnets (the ids EC2 reports) the request
     /// names, or `None` when it names none and ElastiCache selects the Region's
     /// defaults (every row of this table is created in us-east-1).
     subnet_ids: Option<usize>,
@@ -87,8 +87,16 @@ async fn describe_cache(emulator: &Emulator, name: &str) -> Reply {
 }
 
 /// Assert `reply` reports `case`'s resource, naming the case and the actual
-/// value on every failure. `where_from` says which response is under test.
-fn assert_reports_case(case: &CacheCase, where_from: &str, reply: &Reply, status: &str) {
+/// value on every failure. `where_from` says which response is under test, and
+/// `account_subnets` are the subnets the account HAS in the Region the row was
+/// created in, in Availability Zone order, as the owner of subnets reports them.
+fn assert_reports_case(
+    case: &CacheCase,
+    where_from: &str,
+    reply: &Reply,
+    status: &str,
+    account_subnets: &[String],
+) {
     let name = case.name;
     assert_eq!(
         reply.text("ServerlessCacheName"),
@@ -162,16 +170,11 @@ fn assert_reports_case(case: &CacheCase, where_from: &str, reply: &Reply, status
     // request named, or — "For all other Regions, if no subnet IDs are given
     // then ElastiCache will select 3 default subnets across AZs in your default
     // VPC" — the Region's own defaults.
-    let account_subnets: Vec<String> = state::selected_default_subnets("us-east-1")
-        .into_iter()
-        .map(|subnet| subnet.subnet_id)
-        .collect();
+    let account_subnets: Vec<&str> = account_subnets.iter().map(String::as_str).collect();
+    let selected = state::default_subnet_count("us-east-1");
     let expected: Vec<&str> = match case.subnet_ids {
-        Some(count) => account_subnets[..count]
-            .iter()
-            .map(String::as_str)
-            .collect(),
-        None => account_subnets.iter().map(String::as_str).collect(),
+        Some(count) => account_subnets[..count].to_vec(),
+        None => account_subnets[..selected].to_vec(),
     };
     assert_eq!(
         reported_subnets, expected,
@@ -180,8 +183,9 @@ fn assert_reports_case(case: &CacheCase, where_from: &str, reply: &Reply, status
     if case.subnet_ids.is_none() {
         assert_eq!(
             reported_subnets.len(),
-            3,
-            "case {name} ({where_from}): expected 3 default subnets, got {reported_subnets:?}"
+            selected,
+            "case {name} ({where_from}): expected {selected} default subnets, got \
+             {reported_subnets:?}"
         );
     }
 }
@@ -305,12 +309,15 @@ async fn a_created_serverless_cache_is_read_back_from_persisted_state() {
         let emulator = Emulator::new();
         // A row that names subnets names the account's own: those are the only
         // ids `CreateServerlessCache` accepts.
+        let account_subnets: Vec<String> = emulator
+            .account_subnets()
+            .await
+            .into_iter()
+            .filter(|subnet| subnet.default_for_az)
+            .map(|subnet| subnet.id)
+            .collect();
         let mut extra = params(case.extra);
         if let Some(count) = case.subnet_ids {
-            let account_subnets: Vec<String> = state::region_subnets("us-east-1")
-                .into_iter()
-                .map(|subnet| subnet.subnet_id)
-                .collect();
             extra.extend(
                 account_subnets[..count]
                     .iter()
@@ -329,7 +336,13 @@ async fn a_created_serverless_cache_is_read_back_from_persisted_state() {
             created.body
         );
         // A created cache is not ready: it answers the transient status.
-        assert_reports_case(case, "create", &created, state::SERVERLESS_STATUS_CREATING);
+        assert_reports_case(
+            case,
+            "create",
+            &created,
+            state::SERVERLESS_STATUS_CREATING,
+            &account_subnets,
+        );
         assert_eq!(
             created.text("ServerlessCache/ARN"),
             Some(
@@ -362,6 +375,7 @@ async fn a_created_serverless_cache_is_read_back_from_persisted_state() {
             "describe",
             &described,
             state::SERVERLESS_STATUS_AVAILABLE,
+            &account_subnets,
         );
         assert!(
             described.text("CreateTime").is_some(),

@@ -319,7 +319,7 @@ async fn create_resource(
             ]),
         ),
         "subnetgroup" => {
-            let subnets = account_subnet_ids();
+            let subnets = account_subnet_ids(emulator).await;
             (
                 "CreateCacheSubnetGroup",
                 subnet_group_params(name, "the tagging suite", &subnets[..2]),

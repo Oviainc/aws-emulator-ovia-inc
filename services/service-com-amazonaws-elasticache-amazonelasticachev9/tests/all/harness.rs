@@ -17,7 +17,7 @@ use std::time::Duration;
 use bytes::Bytes;
 use service_com_amazonaws_elasticache_amazonelasticachev9::state;
 use service_com_amazonaws_elasticache_amazonelasticachev9::EmulatedService;
-use smithy_server_runtime::MultiServiceRouter;
+use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 /// The region every test signs with unless it is exercising the region rule
 /// itself.
@@ -158,8 +158,29 @@ fn form_encode(value: &str) -> String {
     out
 }
 
-/// An emulator with just this service mounted on a fresh engine, driven
-/// in-process through the production router.
+/// One subnet the ACCOUNT has, as Amazon EC2 — the service that owns subnets,
+/// and the one every ElastiCache placement is resolved against — reports it.
+///
+/// Nothing here derives an identifier, a zone or a VPC: a suite that needs a
+/// subnet id asks the owner for one, exactly as the service under test does.
+#[derive(Debug, Clone)]
+pub struct AccountSubnet {
+    pub id: String,
+    pub zone: String,
+    pub vpc: String,
+    /// Whether this is the default subnet for its Availability Zone — EC2's own
+    /// `DefaultForAz`, which is what makes it one of the subnets ElastiCache
+    /// selects for a request that names none.
+    pub default_for_az: bool,
+}
+
+/// An emulator with this service mounted on a fresh engine BESIDE Amazon EC2,
+/// driven in-process through the production router.
+///
+/// EC2 comes with it because a cache subnet group and a serverless cache are
+/// placed in the subnets the ACCOUNT has, and the only answer to which subnets
+/// those are is the service that owns them — so a deployment without it serves
+/// no placement at all.
 pub struct Emulator {
     router: MultiServiceRouter,
     /// The SINGLE shared engine the router hands to every operation. Held so a
@@ -167,6 +188,9 @@ pub struct Emulator {
     /// scaffolded 501, and then assert over the wire that the handlers answer
     /// FROM that stored state.
     engine: Arc<engine::InMemoryEngine>,
+    /// The in-process seam an AWS SDK client reaches this emulator through, so a
+    /// suite can ask EC2 what the account's network is per Region.
+    callback: EmbeddedEmulator,
 }
 
 impl Emulator {
@@ -178,7 +202,15 @@ impl Emulator {
         // region comes from.
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
-        Self { router, engine }
+        router.register_service(service_com_amazonaws_ec2_amazonec2::EmulatedService::new(
+            Arc::clone(&engine),
+        ));
+        let callback = EmbeddedEmulator::from_router(router.clone());
+        Self {
+            router,
+            engine,
+            callback,
+        }
     }
 
     /// The same emulator with KMS mounted BESIDE this service on the one shared
@@ -192,10 +224,83 @@ impl Emulator {
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        router.register_service(service_com_amazonaws_ec2_amazonec2::EmulatedService::new(
+            Arc::clone(&engine),
+        ));
         router.register_service(
             service_com_amazonaws_kms_trentservice::EmulatedService::new(Arc::clone(&engine)),
         );
-        Self { router, engine }
+        let callback = EmbeddedEmulator::from_router(router.clone());
+        Self {
+            router,
+            engine,
+            callback,
+        }
+    }
+
+    /// An EC2 client for `region` over the in-process callback this emulator
+    /// routes on: no socket is opened, and the endpoint URL is only the address
+    /// that transport routes by.
+    ///
+    /// The very seam this service's own subnet resolution reaches EC2 through,
+    /// so a suite that builds a network with `ec2:CreateVpc`/`ec2:CreateSubnet`
+    /// mints it exactly where a placement will look for it.
+    pub fn ec2(&self, region: &str) -> ::aws_sdk_ec2::Client {
+        let config = ::aws_sdk_ec2::Config::builder()
+            .behavior_version(::aws_sdk_ec2::config::BehaviorVersion::latest())
+            .region(::aws_sdk_ec2::config::Region::new(region.to_string()))
+            .endpoint_url(format!("https://ec2.{region}.amazonaws.com"))
+            .credentials_provider(self.callback.aws_credentials_provider())
+            .http_client(self.callback.http_client())
+            .retry_config(::aws_sdk_ec2::config::retry::RetryConfig::disabled())
+            .timeout_config(::aws_sdk_ec2::config::timeout::TimeoutConfig::disabled())
+            .identity_cache(::aws_sdk_ec2::config::IdentityCache::no_cache())
+            .stalled_stream_protection(
+                ::aws_sdk_ec2::config::StalledStreamProtectionConfig::disabled(),
+            )
+            .build();
+        ::aws_sdk_ec2::Client::from_conf(config)
+    }
+
+    /// The subnets the account has in `region`, as EC2 reports them, ordered by
+    /// Availability Zone.
+    ///
+    /// ASKED, never assumed: these are the ids the owner of subnets answers
+    /// with for this account, which is also what the service under test resolves
+    /// a placement against.
+    pub async fn account_subnets_in(&self, region: &str) -> Vec<AccountSubnet> {
+        let described = self
+            .ec2(region)
+            .describe_subnets()
+            .send()
+            .await
+            .expect("EC2 must report the account's subnets");
+        let mut reported: Vec<AccountSubnet> = described
+            .subnets()
+            .iter()
+            .filter_map(|subnet| {
+                Some(AccountSubnet {
+                    id: subnet.subnet_id()?.to_string(),
+                    zone: subnet.availability_zone()?.to_string(),
+                    vpc: subnet.vpc_id()?.to_string(),
+                    default_for_az: subnet.default_for_az().unwrap_or(false),
+                })
+            })
+            .filter(|subnet| subnet.zone.starts_with(region))
+            .collect();
+        reported.sort_by(|left, right| left.zone.cmp(&right.zone));
+        assert!(
+            reported.len() >= 2,
+            "the account must have at least two subnets in {region} for these cases, got \
+             {reported:?}"
+        );
+        reported
+    }
+
+    /// The subnets the account has in [`REGION`], which is the Region every
+    /// suite signs for unless it is exercising the Region rule itself.
+    pub async fn account_subnets(&self) -> Vec<AccountSubnet> {
+        self.account_subnets_in(REGION).await
     }
 
     /// Send one KMS call through the same router and answer its HTTP status and

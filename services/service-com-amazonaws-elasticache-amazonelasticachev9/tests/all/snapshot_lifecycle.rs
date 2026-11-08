@@ -112,14 +112,11 @@ async fn a_snapshot_reports_the_vpc_of_the_source_clusters_subnet_group() {
     // the source cluster", so it is that stored group's VPC — and a cluster
     // placed in no subnet group reports neither member.
     let emulator = Emulator::new();
+    let account_subnets = account_subnet_ids(&emulator).await;
     let group = emulator
         .call(
             "CreateCacheSubnetGroup",
-            &subnet_group_params(
-                "snap-subnets",
-                "for snapshots",
-                &account_subnet_ids()[..2],
-            ),
+            &subnet_group_params("snap-subnets", "for snapshots", &account_subnets[..2]),
         )
         .await;
     assert_eq!(

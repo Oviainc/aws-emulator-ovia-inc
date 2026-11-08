@@ -272,35 +272,62 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every subnet id has to name a subnet the account HAS: a subnet group
         // is where a cluster is placed, so one built on an id that names
         // nothing could never hold a cluster. Which subnets the account has is
-        // a fact of the Region (`crate::state::region_subnets`), and resolving
-        // them here — before anything is written — is what keeps the group's
-        // zones and VPC the resolved subnets' own rather than invented.
+        // Amazon EC2's answer and nobody else's (`crate::state::ec2_subnets`,
+        // asked over the in-process callback), and resolving them here — before
+        // anything is written — is what keeps the group's zones and VPC the
+        // resolved subnets' own rather than invented.
         //
         // One pass: an id that resolves becomes one of the group's subnets, an
         // id that does not is one the refusal names, so the two cannot drift
         // apart.
-        let mut subnets: Vec<crate::state::SubnetRecord> =
-            Vec::with_capacity(input.subnet_ids.len());
-        let mut unresolved: Vec<&str> = Vec::new();
-        for subnet_id in &input.subnet_ids {
-            match crate::state::resolve_subnet(&region, subnet_id) {
-                Some(subnet) => subnets.push(crate::state::SubnetRecord {
-                    subnet_identifier: subnet.subnet_id,
-                    availability_zone: subnet.availability_zone,
-                }),
-                None => unresolved.push(subnet_id),
-            }
+        let requested: Vec<&str> = input.subnet_ids.iter().map(String::as_str).collect();
+        let resolved =
+            match crate::state::ec2_subnets::resolve_requested_subnets(ctx, &region, &requested)
+                .await
+            {
+                Ok(resolved) => resolved,
+                Err(unresolved) => {
+                    let unresolved: Vec<&str> = unresolved.iter().map(String::as_str).collect();
+                    return Err(
+                        CreateCacheSubnetGroupErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
+                                message: Some(crate::state::invalid_subnets_message(&unresolved)),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            };
+        // The VPC the group reports is the one its subnets sit in, as EC2
+        // reported it. A group is where a cluster is placed and a cluster sits
+        // in ONE VPC, so a request whose resolved subnets do not all belong to
+        // one VPC is refused with the fault the model declares for exactly that,
+        // in the sentence that fault's own documentation states
+        // (`smithy_query(query="doc", shape="SubnetNotAllowedFault")`: "At least
+        // one subnet ID does not match the other subnet IDs"), followed by which
+        // identifier belongs where — read off EC2's records, not built here.
+        // Without it the group would be stored reporting one of the two VPCs.
+        let placement = resolved.first().cloned().unwrap_or_default();
+        let vpc_id = placement.vpc_id.clone();
+        if let Some(mismatched) = resolved.iter().find(|subnet| subnet.vpc_id != vpc_id) {
+            return Err(CreateCacheSubnetGroupErrorModeled::SubnetNotAllowedFault(
+                SubnetNotAllowedFault {
+                    message: Some(format!(
+                        "At least one subnet ID does not match the other subnet IDs: {} belongs \
+                         to {} and {} belongs to {vpc_id}.",
+                        mismatched.subnet_id, mismatched.vpc_id, placement.subnet_id
+                    )),
+                },
+            )
+            .into());
         }
-        if !unresolved.is_empty() {
-            return Err(
-                CreateCacheSubnetGroupErrorModeled::InvalidParameterValueException(
-                    InvalidParameterValueException {
-                        message: Some(crate::state::invalid_subnets_message(&unresolved)),
-                    },
-                )
-                .into(),
-            );
-        }
+        let subnets: Vec<crate::state::SubnetRecord> = resolved
+            .into_iter()
+            .map(|subnet| crate::state::SubnetRecord {
+                subnet_identifier: subnet.subnet_id,
+                availability_zone: subnet.availability_zone,
+            })
+            .collect();
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
@@ -335,9 +362,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             subnets,
             name: name.clone(),
             description: crate::state::stored_description(&input.cache_subnet_group_description),
-            // The VPC of the subnets the group holds, not an invented one:
-            // every subnet the account has belongs to its default VPC.
-            vpc_id: crate::state::default_vpc_id(&region),
+            // The VPC of the subnets the group holds, not an invented one: the
+            // service that owns subnets reported it.
+            vpc_id,
             tags,
         };
         store.cache_subnet_groups.insert(name.clone(), record);

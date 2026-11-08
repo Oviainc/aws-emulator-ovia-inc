@@ -230,3 +230,9 @@ mod access_string_category_refusal;
 // request is both malformed and names a resource this account does not hold.
 #[path = "all/identifier_length_precedence.rs"]
 mod identifier_length_precedence;
+
+// Appended for the same reason: the suite about the ONE source every ElastiCache placement
+// resolves a subnet against (Amazon EC2, the service that owns subnets) and the sentence a
+// placement that names no cache subnet group of this account is refused with.
+#[path = "all/subnet_placement_resolves_against_ec2.rs"]
+mod subnet_placement_resolves_against_ec2;

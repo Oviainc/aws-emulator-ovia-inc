@@ -43,16 +43,18 @@ type PlacementCase = (
 );
 
 /// The subnets the account HAS in [`REGION`] — the only subnet ids a request may
-/// name, derived from the Region exactly as every service that places a resource
-/// in a subnet derives them (`state::region_subnets`, the contract in
-/// `services/common/src/network.rs`).
+/// name, as Amazon EC2 (the service that OWNS subnets, and the one every
+/// ElastiCache placement is resolved against) reports them, ordered by
+/// Availability Zone.
 ///
 /// `pub(crate)` for the same reason as the rest of this harness: the sibling
 /// suites name the same subnets rather than inventing ids the service refuses.
-pub(crate) fn account_subnet_ids() -> Vec<String> {
-    state::region_subnets(REGION)
+pub(crate) async fn account_subnet_ids(emulator: &Emulator) -> Vec<String> {
+    emulator
+        .account_subnets()
+        .await
         .into_iter()
-        .map(|subnet| subnet.subnet_id)
+        .map(|subnet| subnet.id)
         .collect()
 }
 
@@ -489,10 +491,11 @@ async fn a_create_naming_a_resource_this_emulator_does_not_hold_is_refused() {
     let emulator = Emulator::new();
     // A subnet group that DOES exist, so the refusals below are about the
     // named resource and not about the group.
+    let account_subnets = account_subnet_ids(&emulator).await;
     let group = emulator
         .call(
             "CreateCacheSubnetGroup",
-            &subnet_group_params("demo-subnets", "demo", &account_subnet_ids()[..1]),
+            &subnet_group_params("demo-subnets", "demo", &account_subnets[..1]),
         )
         .await;
     assert_eq!(group.status, 200, "the subnet group must be created: {}", group.body);
@@ -1881,7 +1884,7 @@ struct SubnetGroupCase {
     name: &'static str,
     stored_name: &'static str,
     description: &'static str,
-    /// How many of the account's subnets (`state::region_subnets`) the request
+    /// How many of the account's subnets (as EC2 reports them) the request
     /// puts in the group — the axis the group's size varies along, since those
     /// are the only ids the service accepts.
     subnet_count: usize,
@@ -1890,7 +1893,12 @@ struct SubnetGroupCase {
 #[tokio::test]
 async fn a_created_subnet_group_is_read_back_from_persisted_state() {
     // The axis: the name's case, the description, and the number of subnets.
-    let account_subnets = account_subnet_ids();
+    let emulator = Emulator::new();
+    let account_subnets = emulator.account_subnets().await;
+    let account_subnet_ids: Vec<String> = account_subnets
+        .iter()
+        .map(|subnet| subnet.id.clone())
+        .collect();
     let cases = [
         SubnetGroupCase {
             name: "demo-subnets",
@@ -1912,9 +1920,8 @@ async fn a_created_subnet_group_is_read_back_from_persisted_state() {
         },
     ];
 
-    let emulator = Emulator::new();
     for case in &cases {
-        let subnets = &account_subnets[..case.subnet_count];
+        let subnets = &account_subnet_ids[..case.subnet_count];
         let pairs = subnet_group_params(case.name, case.description, subnets);
         let created = emulator.call("CreateCacheSubnetGroup", &pairs).await;
         assert_eq!(
@@ -1954,10 +1961,10 @@ async fn a_created_subnet_group_is_read_back_from_persisted_state() {
         );
         // The zone of each subnet is the zone that subnet SITS in, read off the
         // account's network rather than chosen by position.
-        let expected_zones: Vec<String> = state::region_subnets(REGION)
-            .into_iter()
+        let expected_zones: Vec<String> = account_subnets
+            .iter()
             .take(case.subnet_count)
-            .map(|subnet| subnet.availability_zone)
+            .map(|subnet| subnet.zone.clone())
             .collect();
         assert_eq!(
             described.all("SubnetAvailabilityZone/Name"),
@@ -1994,7 +2001,8 @@ async fn a_created_subnet_group_is_read_back_from_persisted_state() {
     }
 
     // Every group is listed, and each reports the VPC its subnets belong to —
-    // the account's default VPC in the Region, not an id invented per group.
+    // the VPC the service that OWNS subnets reports for them, not an id invented
+    // per group.
     let listed = emulator.call("DescribeCacheSubnetGroups", &[]).await;
     let names = listed.all("CacheSubnetGroups/CacheSubnetGroup/CacheSubnetGroupName");
     assert_eq!(
@@ -2007,18 +2015,18 @@ async fn a_created_subnet_group_is_read_back_from_persisted_state() {
         .into_iter()
         .map(|id| (id, ()))
         .collect();
-    let default_vpc = state::default_vpc_id(REGION);
+    let default_vpc = account_subnets[0].vpc.clone();
     assert_eq!(
         vpc_ids.keys().copied().collect::<Vec<&str>>(),
         vec![default_vpc.as_str()],
-        "every group's subnets belong to the account's default VPC, got {vpc_ids:?}"
+        "every group's subnets belong to the VPC EC2 reports for them, got {vpc_ids:?}"
     );
 }
 
 #[tokio::test]
 async fn a_subnet_group_request_that_cannot_hold_is_refused() {
     let emulator = Emulator::new();
-    let account_subnets = account_subnet_ids();
+    let account_subnets = account_subnet_ids(&emulator).await;
     let first = emulator
         .call(
             "CreateCacheSubnetGroup",
@@ -2029,7 +2037,7 @@ async fn a_subnet_group_request_that_cannot_hold_is_refused() {
 
     // Each row: the case name, the request, and the status plus code it must be
     // answered with. The rows are built rather than listed, because a subnet id
-    // the account HAS is derived from the Region.
+    // the account HAS is one EC2 minted.
     let cases: [BuiltRefusalCase; 7] = [
         (
             "duplicate name",
@@ -2144,7 +2152,7 @@ async fn a_subnet_group_request_that_cannot_hold_is_refused() {
 #[tokio::test]
 async fn subnet_group_pages_are_bounded_and_resumable() {
     let emulator = Emulator::new();
-    let account_subnets = account_subnet_ids();
+    let account_subnets = account_subnet_ids(&emulator).await;
     // One more than the smallest page size the service serves.
     let total = 21;
     for index in 0..total {
@@ -2346,7 +2354,7 @@ async fn the_documented_identifier_port_and_tag_constraints_are_enforced() {
 #[tokio::test]
 async fn the_documented_subnet_group_constraints_are_enforced() {
     let emulator = Emulator::new();
-    let account_subnets = account_subnet_ids();
+    let account_subnets = account_subnet_ids(&emulator).await;
 
     // `CacheSubnetGroupName` "must contain no more than 255 alphanumeric
     // characters or hyphens": the bound is a row and so is one past it. This

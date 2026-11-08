@@ -676,7 +676,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         return Err(
                             CreateCacheClusterErrorModeled::CacheSubnetGroupNotFoundFault(
                                 CacheSubnetGroupNotFoundFault {
-                                    message: Some(format!("Cache subnet group {name} not found.")),
+                                    message: Some(
+                                        crate::state::placement_subnet_group_not_found_message(
+                                            name,
+                                        ),
+                                    ),
                                 },
                             )
                             .into(),

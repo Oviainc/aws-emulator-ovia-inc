@@ -514,9 +514,11 @@ async fn a_blank_resource_description_is_stored_as_a_single_space() {
 
         // A cache subnet group, whose description is its own member.
         let subnet_group = format!("desc-subnets-{index}");
-        let subnets: Vec<String> = state::region_subnets(REGION)
+        let subnets: Vec<String> = emulator
+            .account_subnets()
+            .await
             .into_iter()
-            .map(|subnet| subnet.subnet_id)
+            .map(|subnet| subnet.id)
             .collect();
         let mut pairs = params(&[
             ("CacheSubnetGroupName", &subnet_group),
