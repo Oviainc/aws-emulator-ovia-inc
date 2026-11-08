@@ -2057,11 +2057,12 @@ impl ComAmazonawsEc2Amazonec2State {
     /// your account" (`AssociateAddress`).
     ///
     /// Shared because every path that ends an association does exactly this — the remap
-    /// `AssociateAddress` performs, and `DisassociateAddress` and `ReleaseAddress` once
-    /// they are implemented. The instance the address was associated with also gives up
-    /// the public address it was reporting through it (`Instance$PublicIpAddress`), so the
-    /// instance store and the address store cannot disagree about one address. Storing
-    /// nothing new, it makes no byte charge.
+    /// `AssociateAddress` performs, and the ones `DisassociateAddress` and `ReleaseAddress`
+    /// perform. The INTERFACE the association was recorded on gives it up too
+    /// ([`Self::clear_interface_elastic_ip_association`]), and so does the instance that
+    /// holds that interface, which stops reporting the public address it carried through it
+    /// (`Instance$PublicIpAddress`) — so no reader of the three stores can see an
+    /// association the others no longer have. Storing nothing new, it makes no byte charge.
     ///
     /// A no-op for an allocation id the account holds no address for, so a caller does not
     /// have to look one up first.
@@ -2071,10 +2072,13 @@ impl ComAmazonawsEc2Amazonec2State {
         };
         let public_ip = address.public_ip.clone();
         let was_on = address.instance_id.take();
+        let was_on_interface = address.network_interface_id.take();
         address.association_id = None;
-        address.network_interface_id = None;
         address.network_interface_owner_id = None;
         address.private_ip_address = None;
+        if let Some(network_interface_id) = was_on_interface {
+            self.clear_interface_elastic_ip_association(&network_interface_id, allocation_id);
+        }
         let Some(instance) = was_on.and_then(|instance_id| self.instances.get_mut(&instance_id))
         else {
             return;
@@ -2161,17 +2165,21 @@ impl ComAmazonawsEc2Amazonec2State {
         let associates = options.default_route_table_association.as_deref() == Some(OPTION_ENABLE);
         let propagates = options.default_route_table_propagation.as_deref() == Some(OPTION_ENABLE);
         if associates || propagates {
-            let route_table_id =
-                self.insert_default_transit_gateway_route_table(&transit_gateway_id, spec.created_at);
-            if let Some(route_table) = self.transit_gateway_route_tables.get_mut(&route_table_id) {
-                route_table.default_association_route_table = Some(associates);
-                route_table.default_propagation_route_table = Some(propagates);
-            }
-            if associates {
-                options.association_default_route_table_id = Some(route_table_id.clone());
-            }
-            if propagates {
-                options.propagation_default_route_table_id = Some(route_table_id);
+            if let Some(route_table_id) = self
+                .insert_default_transit_gateway_route_table(&transit_gateway_id, spec.created_at)
+            {
+                if let Some(route_table) =
+                    self.transit_gateway_route_tables.get_mut(&route_table_id)
+                {
+                    route_table.default_association_route_table = Some(associates);
+                    route_table.default_propagation_route_table = Some(propagates);
+                }
+                if associates {
+                    options.association_default_route_table_id = Some(route_table_id.clone());
+                }
+                if propagates {
+                    options.propagation_default_route_table_id = Some(route_table_id);
+                }
             }
         }
         let transit_gateway = TransitGateway {
@@ -2199,7 +2207,11 @@ impl ComAmazonawsEc2Amazonec2State {
     }
 
     /// Mint the DEFAULT transit gateway route table of `transit_gateway_id`, created at
-    /// `at`, and answer its id.
+    /// `at`, and answer its id — or `None`, having written NOTHING, when the store's route
+    /// table ceiling ([`Self::has_transit_gateway_route_table_capacity`]) refuses it, exactly
+    /// as [`Self::insert_transit_gateway_route_table`] refuses an additional table. Nothing in
+    /// this emulator reclaims a stored table, so a write path that did not ask would let a
+    /// caller grow this process without limit.
     ///
     /// The ONE place that table is built, for the create that owes a fresh gateway one and
     /// for the modification that owes one to a gateway whose default role has just been
@@ -2208,11 +2220,18 @@ impl ComAmazonawsEc2Amazonec2State {
     /// ADDITIONAL tables `CreateTransitGatewayRouteTable` makes), and it is created holding
     /// neither default role: which roles it holds is read off the gateway's options by the
     /// caller, which is the one place those roles are decided.
+    ///
+    /// The table is recorded as the gateway's default one
+    /// ([`Self::transit_gateway_default_route_table`]), so a later modification gives an
+    /// enabled role THIS table back instead of minting another.
     pub(super) fn insert_default_transit_gateway_route_table(
         &mut self,
         transit_gateway_id: &str,
         at: SystemTime,
-    ) -> String {
+    ) -> Option<String> {
+        if !self.has_transit_gateway_route_table_capacity() {
+            return None;
+        }
         let route_table_id = self.next_id(TRANSIT_GATEWAY_ROUTE_TABLE_ID_PREFIX);
         let route_table = TransitGatewayRouteTable {
             transit_gateway_route_table_id: Some(route_table_id.clone()),
@@ -2227,7 +2246,9 @@ impl ComAmazonawsEc2Amazonec2State {
         self.add_stored_bytes(transit_gateway_route_table_payload_bytes(&route_table));
         self.transit_gateway_route_tables
             .insert(route_table_id.clone(), route_table);
-        route_table_id
+        self.transit_gateway_default_route_table
+            .insert(transit_gateway_id.to_string(), route_table_id.clone());
+        Some(route_table_id)
     }
 
     /// Apply `modification` to the transit gateway it names, as of `at`, and answer the
@@ -2273,17 +2294,28 @@ impl ComAmazonawsEc2Amazonec2State {
         let mut options = view.options.take().unwrap_or_default();
         let associates = options.default_route_table_association.as_deref() == Some(OPTION_ENABLE);
         let propagates = options.default_route_table_propagation.as_deref() == Some(OPTION_ENABLE);
-        // ONE table serves both default roles, so the table the gateway already holds in
-        // either role is read — and whether a fresh one is needed decided — BEFORE a
-        // disabled role's id is cleared: a call that moves the default role from one option
-        // to the other then reuses that table rather than minting a second one and leaving
-        // the first orphaned.
+        // ONE table serves both default roles, so the table the gateway already holds is read
+        // — and whether a fresh one is needed decided — BEFORE a disabled role's id is
+        // cleared: a call that moves the default role from one option to the other, or that
+        // disables a role and later enables it again, then reuses that table rather than
+        // minting a second one and leaving the first a record nothing names. Which table is
+        // the gateway's DEFAULT one outlives the roles being disabled
+        // ([`Self::transit_gateway_default_route_table`]), where the option ids below do not.
         let held_default_route_table_id = options
             .association_default_route_table_id
             .clone()
-            .or_else(|| options.propagation_default_route_table_id.clone());
-        let mints_a_default_route_table =
-            needs_default_transit_gateway_route_table(Some(&options));
+            .or_else(|| options.propagation_default_route_table_id.clone())
+            .or_else(|| {
+                self.transit_gateway_default_route_table
+                    .get(&modification.transit_gateway_id)
+                    .filter(|route_table_id| {
+                        self.transit_gateway_route_tables
+                            .contains_key(route_table_id.as_str())
+                    })
+                    .cloned()
+            });
+        let mints_a_default_route_table = needs_default_transit_gateway_route_table(Some(&options))
+            && held_default_route_table_id.is_none();
         if !associates {
             options.association_default_route_table_id = None;
         }
@@ -2291,10 +2323,7 @@ impl ComAmazonawsEc2Amazonec2State {
             options.propagation_default_route_table_id = None;
         }
         let default_route_table_id = if mints_a_default_route_table {
-            Some(self.insert_default_transit_gateway_route_table(
-                &modification.transit_gateway_id,
-                at,
-            ))
+            self.insert_default_transit_gateway_route_table(&modification.transit_gateway_id, at)
         } else {
             held_default_route_table_id
         };
@@ -2420,6 +2449,10 @@ impl ComAmazonawsEc2Amazonec2State {
         self.release_stored_bytes(transit_gateway_payload_bytes(&transit_gateway));
         self.transit_gateway_available_at.remove(transit_gateway_id);
         self.transit_gateway_delete_at.remove(transit_gateway_id);
+        // Which table was this gateway's default one is a fact about a gateway that is gone,
+        // so the entry goes with it rather than outliving every gateway the store ever held.
+        self.transit_gateway_default_route_table
+            .remove(transit_gateway_id);
         let route_table_ids: Vec<String> = self
             .transit_gateway_route_tables
             .iter()
@@ -2531,15 +2564,20 @@ impl ComAmazonawsEc2Amazonec2State {
     }
 }
 
-/// The caller-chosen bytes one stored transit gateway route table holds: its tags.
-/// Everything else on the record — the two ids, the state, the default-role flags and the
-/// creation time — is derived by this module, so it is fixed-size.
+/// The bytes one stored transit gateway route table costs: the fixed
+/// [`STORED_RECORD_OVERHEAD_BYTES`] every stored record costs, plus the caller-chosen bytes
+/// of its tags. Everything else on the record — the two ids, the state, the default-role
+/// flags and the creation time — is derived by this module, so it is fixed-size; the
+/// overhead is what keeps a table nobody tagged from being free against
+/// [`MAX_STORED_BYTES`], the default table a gateway comes with included.
 ///
 /// The ONE definition of that charge: `CreateTransitGatewayRouteTable` asks it before the
 /// write and [`ComAmazonawsEc2Amazonec2State::insert_transit_gateway_route_table`] charges
 /// exactly it, so a removal path must give back the same number.
 pub fn transit_gateway_route_table_payload_bytes(route_table: &TransitGatewayRouteTable) -> usize {
-    tag_list_bytes(route_table.tags.as_deref().unwrap_or_default())
+    STORED_RECORD_OVERHEAD_BYTES.saturating_add(tag_list_bytes(
+        route_table.tags.as_deref().unwrap_or_default(),
+    ))
 }
 
 /// The caller-chosen bytes one stored Elastic IP address holds: its tags. Everything else

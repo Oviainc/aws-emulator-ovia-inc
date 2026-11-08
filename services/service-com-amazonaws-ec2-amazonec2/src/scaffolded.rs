@@ -453,13 +453,18 @@ impl<E> Scaffolded<E> {
         )
     }
 
-    /// `InvalidIPAddress.InUse` (HTTP 400): the private address the request asked
-    /// for is already held by another instance.
+    /// `InvalidIPAddress.InUse` (HTTP 400): the address the request asked for is already
+    /// held — a private address another resource has, or an Elastic IP address that still
+    /// carries an association, which "you must disassociate … before you can release it"
+    /// (`ReleaseAddress`).
+    ///
+    /// AWS's sentence for this class is `Address <address> is in use.`, the trailing period
+    /// included, with the address taken from the request or from state.
     pub fn invalid_ip_address_in_use(address: &str) -> Self {
         Self::service_error(
             "InvalidIPAddress.InUse",
             400,
-            format!("Address {address} is in use"),
+            format!("Address {address} is in use."),
         )
     }
 

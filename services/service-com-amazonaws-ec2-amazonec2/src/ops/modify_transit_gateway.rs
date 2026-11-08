@@ -286,8 +286,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // A newly enabled default role has the store MINT the gateway's default route
         // table, so the record ceiling that bounds every other route table write bounds
-        // this one too, and the refusal is the one a create of a route table answers.
+        // this one too, and the refusal is the one a create of a route table answers. A
+        // gateway that already HOLDS a default table has that one given back to the role
+        // instead ([`state::ComAmazonawsEc2Amazonec2State::modify_transit_gateway`]), so
+        // nothing is minted for it and the ceiling has nothing to bound.
+        let holds_a_default_route_table = store
+            .transit_gateway_default_route_table
+            .get(&modification.transit_gateway_id)
+            .is_some_and(|route_table_id| {
+                store
+                    .transit_gateway_route_tables
+                    .contains_key(route_table_id)
+            });
         if state::needs_default_transit_gateway_route_table(applied.options.as_ref())
+            && !holds_a_default_route_table
             && !store.has_transit_gateway_route_table_capacity()
         {
             return Err(state::resource_limit_exceeded(format!(

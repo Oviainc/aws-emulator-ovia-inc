@@ -15,14 +15,14 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
-// EC2 as a regional service: a stored resource is reported only in the Region it was created
-// in, an account has one default VPC per Region, a Region it has not opted into refuses every
-// request, an instance type is offered in some of a Region's zones and not others, and a
-// terminated instance has released its network. Declared beside `prefix_lists` for the reason
-// the note above gives: the sorted neighbourhood and the tail of this file are where every new
-// ec2 suite inserts its lines.
-#[path = "all/region_scoped_state.rs"]
-mod region_scoped_state;
+// What an Elastic IP association binds to and what both sides of it report: the interface
+// the request names or the instance's primary one, the address record `DescribeAddresses`
+// reports, the interface's own `association`, and the `DisassociateAddress` that ends it so
+// `ReleaseAddress` can give the allocation up. Declared beside `prefix_lists` for the reason
+// the note above gives: the sorted neighbourhood and the tail of this file are where every
+// new ec2 suite inserts its lines.
+#[path = "all/elastic_ip_interface_associations.rs"]
+mod elastic_ip_interface_associations;
 // How EC2 words the `IncorrectInstanceState` refusal across the family of operations that
 // act on an instance only from certain lifecycle states: the instance id the request named,
 // the action its state does not admit, and no disclosure of the state itself. Declared
@@ -599,11 +599,6 @@ mod capacity_reservation_billing_requests;
 mod capacity_reservation_cancellation_quotes;
 #[path = "all/capacity_reservation_fleets.rs"]
 mod capacity_reservation_fleets;
-// How a Capacity Reservation Fleet's floating-point members reach the ec2Query wire — the
-// decimal form AWS writes a double in, which is the response envelope's rule rather than
-// this shape's — and the priority every Capacity Reservation of a Fleet reports.
-#[path = "all/capacity_reservation_fleet_wire_values.rs"]
-mod capacity_reservation_fleet_wire_values;
 #[path = "all/carrier_gateways.rs"]
 mod carrier_gateways;
 // What `DescribeClassicLinkInstances` reports out of the ClassicLink link store, and how the
@@ -1526,11 +1521,12 @@ mod instance_attribute_describe;
 // `CapacityManager.Disabled` refusal an account that has not enabled Capacity Manager gets.
 #[path = "all/capacity_manager_metric_dimensions.rs"]
 mod capacity_manager_metric_dimensions;
-// What `ModifyCapacityReservation` applies to a stored Capacity Reservation — its capacity,
-// the condition it is released under and the instances it accepts — which states admit a
-// modification at all, and what it refuses. Declared at the tail of this file, which is
-#[path = "all/modify_capacity_reservation.rs"]
-mod modify_capacity_reservation;
+// EC2 as a regional service: a stored resource is reported only in the Region it was created
+// in, an account has one default VPC per Region, a Region it has not opted into refuses every
+// request, an instance type is offered in some of a Region's zones and not others, and a
+// terminated instance has released its network. Declared beside `prefix_lists` for the reason
+#[path = "all/region_scoped_state.rs"]
+mod region_scoped_state;
 // What `DeleteNetworkInsightsAccessScopeAnalysis` takes out of the Network Access Scope
 // analysis store: the one analysis the request names, answered by its id, with the client
 // token that named it and the bytes it held released — and the ids and dry run it refuses
@@ -1543,6 +1539,18 @@ mod delete_network_insights_access_scope_analysis;
 // this file, which is where every new ec2 suite inserts its lines.
 #[path = "all/deprovision_ipam_pool_cidr.rs"]
 mod deprovision_ipam_pool_cidr;
+// the note above gives: the sorted neighbourhood and the tail of this file are where every new
+// ec2 suite inserts its lines.
+// How a Capacity Reservation Fleet's floating-point members reach the ec2Query wire — the
+// decimal form AWS writes a double in, which is the response envelope's rule rather than
+// this shape's — and the priority every Capacity Reservation of a Fleet reports.
+#[path = "all/capacity_reservation_fleet_wire_values.rs"]
+mod capacity_reservation_fleet_wire_values;
+// What `ModifyCapacityReservation` applies to a stored Capacity Reservation — its capacity,
+// the condition it is released under and the instances it accepts — which states admit a
+// modification at all, and what it refuses. Declared at the tail of this file, which is
+#[path = "all/modify_capacity_reservation.rs"]
+mod modify_capacity_reservation;
 // What `AttachVerifiedAccessTrustProvider` and `DetachVerifiedAccessTrustProvider` change: the
 // trust providers one Verified Access instance reports as attached, read back through
 // `DescribeVerifiedAccessInstances`, the pairs and ids they refuse, how one `ClientToken`

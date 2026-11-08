@@ -2248,6 +2248,20 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// with its gateway, off [`Self::transit_gateway_available_at`], which is the one
     /// instant both move on.
     pub transit_gateway_route_table_available_at: BTreeMap<String, Instant>,
+    /// The DEFAULT transit gateway route table of each gateway that has one, by
+    /// `TransitGatewayId`.
+    ///
+    /// A gateway has at most ONE default route table — "either `defaultRouteTableAssociation`
+    /// or `defaultRouteTablePropagation` must be set to `enable` for Amazon Web Services
+    /// Transit Gateway to create the default transit gateway route table"
+    /// (`TransitGatewayOptions$DefaultRouteTableAssociation`) — and which table that is
+    /// outlives the default ROLES being disabled, where the gateway's own option ids do not.
+    /// So this is where [`ComAmazonawsEc2Amazonec2State::modify_transit_gateway`] finds the
+    /// table to give an enabled role back, rather than minting a second one and leaving the
+    /// first a record nothing names; a table
+    /// [`ComAmazonawsEc2Amazonec2State::insert_transit_gateway_route_table`] ADDED is not one
+    /// of these.
+    pub transit_gateway_default_route_table: BTreeMap<String, String>,
     /// Which attachment propagates its routes into which transit gateway route table, by
     /// (`TransitGatewayRouteTableId`, `TransitGatewayAttachmentId`) — see
     /// [`TransitGatewayPropagationRecord`] and the module docs. One entry per pair, because
@@ -3269,6 +3283,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             transit_gateway_delete_at: BTreeMap::new(),
             transit_gateway_route_tables: BTreeMap::new(),
             transit_gateway_route_table_available_at: BTreeMap::new(),
+            transit_gateway_default_route_table: BTreeMap::new(),
             transit_gateway_propagations: BTreeMap::new(),
             transit_gateway_associations: BTreeMap::new(),
             vpn_gateways: BTreeMap::new(),

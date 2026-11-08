@@ -585,15 +585,14 @@ async fn a_dry_run_reports_the_permission_check_and_removes_nothing() {
 /// The rule reaches every operation that resolves a `NetworkInterfaceId`, not only the
 /// delete: `AssociateAddress` reads THE SAME store, so a malformed value is refused
 /// `InvalidNetworkInterfaceId.Malformed`, a well-formed id the account holds no interface
-/// for `InvalidNetworkInterfaceID.NotFound`, and an id the store DOES hold is no longer
-/// mis-reported as not found — it is answered with the scaffold's 501, because persisting
-/// the association on the interface is work the `AssociateAddress` slice has not done and a
-/// fabricated association would be worse than an honest refusal.
+/// for `InvalidNetworkInterfaceID.NotFound`, and an id the store DOES hold names the
+/// interface the Elastic IP address is then bound to — the association `AssociateAddress`
+/// records on it and on the address.
 ///
 /// This lives beside the store it exercises rather than in `super::associate_address`,
 /// whose own table covers that operation's address and instance rules; the rows here differ
-/// only in what the named interface id is: held by the store, well formed but unheld, or no
-/// interface id at all.
+/// only in what the named interface id is: well formed but unheld, or no interface id at
+/// all, beside the one the store holds.
 #[tokio::test]
 async fn associate_address_resolves_a_network_interface_id_against_the_same_store() {
     let (router, engine) = super::ec2_query::emulator();
@@ -601,13 +600,7 @@ async fn associate_address_resolves_a_network_interface_id_against_the_same_stor
     let stored_interface = seed(&engine, plain(&place));
 
     // (case, the NetworkInterfaceId the request carries, the status, the error code)
-    let cases: [(&str, &str, u16, &str); 3] = [
-        (
-            "an interface the store holds",
-            &stored_interface,
-            501,
-            "NotImplemented",
-        ),
+    let cases: [(&str, &str, u16, &str); 2] = [
         (
             "a well-formed id the store holds no interface for",
             "eni-0123456789abcdef0",
@@ -659,4 +652,45 @@ async fn associate_address_resolves_a_network_interface_id_against_the_same_stor
             "case {case:?}: a refused association must leave the interface where it was"
         );
     }
+
+    // The interface the store DOES hold is served: the association is recorded on it, which
+    // is the same record this suite's delete reads.
+    let case = "an interface the store holds";
+    let (_, allocate_body) =
+        super::ec2_query::call(&router, REGION, "AllocateAddress", &[]).await;
+    let allocation_id = element(&allocate_body, "allocationId").unwrap_or_else(|| {
+        panic!("case {case:?}: AllocateAddress must mint an allocation id: {allocate_body}")
+    });
+    let (status, body) = super::ec2_query::call(
+        &router,
+        REGION,
+        "AssociateAddress",
+        &[
+            param("AllocationId", &allocation_id),
+            param("NetworkInterfaceId", &stored_interface),
+        ],
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected HTTP 200, got {status} with body {body}"
+    );
+    let association_id = element(&body, "associationId").unwrap_or_default();
+    assert!(
+        !association_id.is_empty(),
+        "case {case:?}: the association must be minted, got {body}"
+    );
+    let recorded = engine
+        .state::<Ec2State>()
+        .lock()
+        .network_interfaces
+        .get(&stored_interface)
+        .and_then(|interface| interface.association.clone())
+        .and_then(|association| association.association_id);
+    assert_eq!(
+        recorded.as_deref(),
+        Some(association_id.as_str()),
+        "case {case:?}: the interface must hold the association the call answered, \
+         got {recorded:?}"
+    );
 }

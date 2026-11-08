@@ -7,10 +7,11 @@
 //!
 //! 1. `AssociateAddress` BINDS an Elastic IP address the account holds to one of the
 //!    account's instances and PERSISTS that binding: the service mints the association id,
-//!    `DescribeAddresses` reports it with the instance and the instance's private address,
-//!    and the instance reports the Elastic IP address as its public address through
-//!    `DescribeInstances` — however the request named the address and whether or not it
-//!    named the private address or the reassociation flag;
+//!    `DescribeAddresses` reports it with the instance, the instance's primary network
+//!    interface — the one an instance carries a public address through — and the instance's
+//!    private address, and the instance reports the Elastic IP address as its public address
+//!    through `DescribeInstances` — however the request named the address and whether or not
+//!    it named the private address or the reassociation flag;
 //! 2. the binding is IDEMPOTENT ("this is an idempotent operation. If you perform the
 //!    operation more than once, Amazon EC2 doesn't return an error") and it MOVES on
 //!    request: an address associated again elsewhere leaves the resource it was on, and an
@@ -172,6 +173,13 @@ async fn instance_public_ip(
     ec2_query::element(&body, "ipAddress")
 }
 
+/// The id of the instance's PRIMARY network interface, the one its launch created — what an
+/// association named with an `InstanceId` binds the Elastic IP address to, read through the
+/// harness every suite that needs it shares.
+async fn primary_interface(router: &MultiServiceRouter, case: &str, instance_id: &str) -> String {
+    ec2_query::primary_network_interface(router, REGION, case, instance_id).await
+}
+
 /// One row of the association table: which members name the one address and the one
 /// instance this call binds together.
 struct AssociateRow {
@@ -250,6 +258,7 @@ async fn associating_an_address_with_an_instance_persists_the_binding() {
              was handed out twice"
         );
 
+        let network_interface_id = primary_interface(&router, case, &instance_id).await;
         let stored = stored_address(&router, case, &allocation_id).await;
         assert_eq!(
             stored,
@@ -259,9 +268,9 @@ async fn associating_an_address_with_an_instance_persists_the_binding() {
                 association_id: Some(association_id.clone()),
                 instance_id: Some(instance_id.clone()),
                 private_ip_address: Some(private_ip.clone()),
-                // This emulator holds no network interfaces, so the association names
-                // none: `AssociateAddress` refuses a `NetworkInterfaceId` outright.
-                network_interface_id: None,
+                // An instance carries an Elastic IP address through its primary network
+                // interface, so that is the interface the association names.
+                network_interface_id: Some(network_interface_id),
             },
             "case {case:?}: DescribeAddresses must report the stored association, \
              got {stored:?}"
@@ -379,6 +388,7 @@ async fn an_address_moves_and_the_one_it_displaces_stays_allocated() {
          {first_association}"
     );
     let stored = stored_address(&router, case, &first_allocation).await;
+    let right_interface = primary_interface(&router, case, &right_instance).await;
     assert_eq!(
         stored,
         AddressRow {
@@ -387,7 +397,7 @@ async fn an_address_moves_and_the_one_it_displaces_stays_allocated() {
             association_id: Some(moved_association.clone()),
             instance_id: Some(right_instance.clone()),
             private_ip_address: Some(right_private_ip.clone()),
-            network_interface_id: None,
+            network_interface_id: Some(right_interface.clone()),
         },
         "case {case:?}: the address must now be reported on the right instance, \
          got {stored:?}"
@@ -440,7 +450,7 @@ async fn an_address_moves_and_the_one_it_displaces_stays_allocated() {
             association_id: Some(second_association),
             instance_id: Some(right_instance.clone()),
             private_ip_address: Some(right_private_ip.clone()),
-            network_interface_id: None,
+            network_interface_id: Some(right_interface),
         },
         "case {case:?}: the second address must be the one the instance holds, \
          got {stored:?}"

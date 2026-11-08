@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DisassociateAddress
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DisassociateAddress`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: ends the Elastic IP association the request names, leaving the address
+//! ALLOCATED to the account — "you can disassociate an Elastic IP address without releasing
+//! it" (`ReleaseAddress`) — so a later `ReleaseAddress` sees an address nothing holds.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DisassociateAddress::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Both sides of the association go, through the one store primitive
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::detach_elastic_ip`] that
+//! `AssociateAddress` writes with: the address record `DescribeAddresses` reports keeps only
+//! its allocation, the interface gives up its `NetworkInterface$Association`, and the
+//! instance that held the interface stops reporting the address as its public address. This
+//! is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +156,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DisassociateAddress` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DisassociateAddressErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DisassociateAddress"))
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            dry_run_operation, invalid_address_not_found, invalid_association_id_not_found,
+            is_ipv4_address, require_service_state,
+        };
+
+        // An Elastic IP association is a resource of the account, reached by the id or the
+        // address the request names, so nothing here depends on the request's metadata.
+        let _ = ctx;
+
+        // "The association ID. This parameter is required" (`$AssociationId`), and
+        // `PublicIp` is "Deprecated." — the older way of naming the SAME association,
+        // through the address that carries it. So either names it, and one call names it
+        // once (the reading `AssociateAddress` and `ReleaseAddress` hold their own pairs
+        // to).
+        if input.association_id.is_some() && input.public_ip.is_some() {
+            return Err(Scaffolded::invalid_parameter_combination(
+                "An Elastic IP association is named once, so associationId and publicIp \
+                 may not be given together",
+            ));
+        }
+
+        let state_handle = require_service_state(&*self.engine)?;
+        let mut store = state_handle.lock();
+        // A move the clock already owed is applied first, so the association this call ends
+        // is read off the state the clock owes rather than the one its last caller saw.
+        store.materialize_due_transitions();
+
+        // The ALLOCATION whose association this call ends, resolved before anything else.
+        // An association id no address of the account carries is a refusal, not a no-op — a
+        // caller that disassociates twice has to be able to tell the one it performed from
+        // the one it did not — while a `PublicIp` names the ADDRESS, whose association is
+        // ended whether or not it still has one: "this is an idempotent operation. If you
+        // perform the operation more than once, Amazon EC2 doesn't return an error"
+        // (`DisassociateAddress`).
+        let allocation_id = match (input.association_id.as_deref(), input.public_ip.as_deref()) {
+            (Some(association_id), _) => store
+                .allocation_id_of_elastic_ip_association(association_id)
+                .ok_or_else(|| invalid_association_id_not_found(association_id))?,
+            (None, Some(public_ip)) => {
+                if !is_ipv4_address(public_ip) {
+                    return Err(Scaffolded::invalid_parameter_value(format!(
+                        "Invalid value '{public_ip}' for publicIp. It must be an IPv4 address"
+                    )));
+                }
+                store
+                    .allocation_id_for_public_ip(public_ip)
+                    .ok_or_else(|| invalid_address_not_found(public_ip))?
+            }
+            (None, None) => {
+                return Err(Scaffolded::missing_parameter(
+                    "The request must contain the parameter associationId",
+                ))
+            }
+        };
+
+        // The request is one that would have succeeded, so a dry run stops HERE: "If you
+        // have the required permissions, the error response is DryRunOperation" (`$DryRun`).
+        // Nothing has been disassociated yet, and nothing is.
+        if input.dry_run.unwrap_or(false) {
+            return Err(dry_run_operation());
+        }
+
+        // The one reverse of what `AssociateAddress` recorded: the address keeps its
+        // allocation and loses the association, the interface loses it too, and the instance
+        // that held the interface stops reporting the address.
+        store.detach_elastic_ip(&allocation_id);
+        Ok(DisassociateAddressOutput)
     }
 }

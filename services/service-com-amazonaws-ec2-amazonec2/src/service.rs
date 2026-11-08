@@ -417,9 +417,11 @@ static RETURN_MEMBER: Schema = Schema::new_member(
 /// `CreateSecurityGroup` documents `requestId`, `return` and `groupId`, while
 /// `CreateSecurityGroupResult` in the Smithy model declares only `groupId`,
 /// `tags` and `securityGroupArn` — so the flag has to come from the envelope.
+/// `AssociateAddress` is the same case: it documents `requestId`, `associationId`
+/// and `return`, while `AssociateAddressResult` declares only `AssociationId`.
 /// An operation that reports a created resource instead of a flag (`CreateVpc`
 /// answers `<vpc>` and no `<return>`) is deliberately absent.
-const RETURN_BESIDE_MODELLED_OUTPUT: &[&str] = &["CreateSecurityGroup"];
+const RETURN_BESIDE_MODELLED_OUTPUT: &[&str] = &["AssociateAddress", "CreateSecurityGroup"];
 
 /// An output serialized as itself, then followed by the envelope's `<return>`
 /// success flag.

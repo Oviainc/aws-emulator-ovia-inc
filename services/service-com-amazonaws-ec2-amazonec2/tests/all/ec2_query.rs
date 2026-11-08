@@ -283,6 +283,55 @@ pub async fn described_instance_state(
         .to_string()
 }
 
+/// The id of the PRIMARY network interface of `instance_id`: the interface attached to it at
+/// the lowest device index, which is the one its launch created and the one an Elastic IP
+/// association named with an `InstanceId` binds to.
+///
+/// Read back through `DescribeNetworkInterfaces` narrowed by `attachment.instance-id`, so an
+/// expectation about it is the interface the account really holds. Lives here, beside the
+/// plumbing every suite shares, because more than one suite needs that id.
+pub async fn primary_network_interface(
+    router: &MultiServiceRouter,
+    region: &str,
+    case: &str,
+    instance_id: &str,
+) -> String {
+    let (status, body) = call(
+        router,
+        region,
+        "DescribeNetworkInterfaces",
+        &filters(&[("attachment.instance-id", &[instance_id])]),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: DescribeNetworkInterfaces must report the interfaces of \
+         {instance_id}, got {status} with body {body}"
+    );
+    let parsed = super::wire::document(case, &body);
+    let mut attached: Vec<(i32, String)> = parsed
+        .descendants()
+        .filter(|node| {
+            node.is_element() && super::wire::child(*node, "networkInterfaceId").is_some()
+        })
+        .filter_map(|node| {
+            let network_interface_id = super::wire::child_text(node, "networkInterfaceId")?;
+            let device_index = super::wire::child(node, "attachment")
+                .and_then(|attachment| super::wire::child_text(attachment, "deviceIndex"))
+                .and_then(|index| index.parse::<i32>().ok())?;
+            Some((device_index, network_interface_id))
+        })
+        .collect();
+    attached.sort();
+    attached
+        .into_iter()
+        .map(|(_, network_interface_id)| network_interface_id)
+        .next()
+        .unwrap_or_else(|| {
+            panic!("case {case:?}: {instance_id} must hold a primary network interface: {body}")
+        })
+}
+
 /// XML text as the service wrote it, with the five entities resolved — an error message
 /// quoting a filter name reaches the wire as `&apos;…&apos;`.
 pub fn unescaped(xml_text: &str) -> String {

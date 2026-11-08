@@ -1125,6 +1125,70 @@ async fn moving_a_default_role_between_the_options_keeps_one_default_table() {
     }
 }
 
+/// The same rule read as an INVARIANT over a COUNT: a gateway has at most ONE default route
+/// table, so disabling both default roles and enabling one again gives that table the role
+/// back instead of minting another — however many times the pair of calls is repeated, the
+/// gateway holds exactly one route table.
+#[tokio::test]
+async fn cycling_the_default_roles_keeps_the_one_default_table() {
+    // A bounded number of cycles, well above the one a single recorded call makes: each cycle
+    // that minted a second table would leave a record nothing names behind.
+    const CYCLES: usize = 8;
+
+    let (router, _engine) = emulator();
+    let transit_gateway_id = create_ok("the gateway", &router, &baseline_params()).await;
+    let created = describe_ok("the gateway", &router, &transit_gateway_id).await;
+    let held = option("the gateway", &created, "associationDefaultRouteTableId")
+        .unwrap_or_else(|| panic!("the created gateway must hold a default table: {created}"));
+
+    for cycle in 1..=CYCLES {
+        let case = format!("cycle {cycle}, both roles disabled");
+        let answered = modify_ok(
+            &case,
+            &router,
+            &request(
+                &transit_gateway_id,
+                &[
+                    param("Options.DefaultRouteTableAssociation", OPTION_DISABLE),
+                    param("Options.DefaultRouteTablePropagation", OPTION_DISABLE),
+                ],
+            ),
+        )
+        .await;
+        for name in ["associationDefaultRouteTableId", "propagationDefaultRouteTableId"] {
+            let named = option(&case, &answered, name);
+            assert_eq!(
+                named, None,
+                "case {case:?}: a disabled role must name no table, got {named:?} in {answered}"
+            );
+        }
+
+        let case = format!("cycle {cycle}, association enabled again");
+        let answered = modify_ok(
+            &case,
+            &router,
+            &request(
+                &transit_gateway_id,
+                &[param("Options.DefaultRouteTableAssociation", OPTION_ENABLE)],
+            ),
+        )
+        .await;
+        let named = option(&case, &answered, "associationDefaultRouteTableId");
+        assert_eq!(
+            named.as_deref(),
+            Some(held.as_str()),
+            "case {case:?}: the role must take back the gateway's own default table, \
+             got {named:?} in {answered}"
+        );
+        let tables = describe_route_tables_of(&case, &router, &transit_gateway_id).await;
+        assert_eq!(
+            tables,
+            vec![held.clone()],
+            "case {case:?}: the gateway must still hold exactly one route table, got {tables:?}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // VPC Encryption Control
 // ---------------------------------------------------------------------------

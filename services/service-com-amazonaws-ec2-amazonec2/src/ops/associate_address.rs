@@ -2,18 +2,21 @@
 
 //! @op AssociateAddress
 //! IMPLEMENTED: associates an Elastic IP address the account holds with one of its
-//! instances, minting the association id and persisting it on the stored [`Address`] — the
-//! same record `DescribeAddresses` reports — and on the instance, which reports the
-//! address through `Instance$PublicIpAddress`. This is the ONLY file to touch for this
-//! operation.
+//! instances or network interfaces, minting the association id and persisting it on BOTH
+//! sides — the stored [`Address`] record `DescribeAddresses` reports (with the interface,
+//! its owning account and the private address the Elastic IP is bound to), and the
+//! interface's own `NetworkInterface$Association`, which `DescribeNetworkInterfaces`
+//! reports. This is the ONLY file to touch for this operation.
 //!
-//! A `NetworkInterfaceId` is resolved against the account's network interfaces — the same
-//! store `CreateNetworkInterface` writes and `DescribeNetworkInterfaces` reports: a value
-//! that is not an interface id is refused `InvalidNetworkInterfaceId.Malformed` and a
-//! well-formed id the account holds no interface for `InvalidNetworkInterfaceID.NotFound`.
-//! Associating an address with an INTERFACE rather than with an instance is work this slice
-//! has not done, so an id the store DOES hold is refused rather than answered with an
-//! association nothing persists.
+//! An association BINDS THE ADDRESS TO AN INTERFACE whichever way the request names its
+//! target: a `NetworkInterfaceId` is resolved against the account's network interfaces —
+//! the same store `CreateNetworkInterface` writes and `DescribeNetworkInterfaces` reports:
+//! a value that is not an interface id is refused `InvalidNetworkInterfaceId.Malformed` and
+//! a well-formed id the account holds no interface for `InvalidNetworkInterfaceID.NotFound`
+//! — and an `InstanceId` is resolved to the instance's primary network interface, the one
+//! its launch created, because an instance carries a public address only through an
+//! interface. The instance that holds the interface reports the Elastic IP address as its
+//! public address (`Instance$PublicIpAddress`) either way.
 //!
 //! ## Shape of an operation
 //!
@@ -168,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             internal_error, invalid_address_not_found, invalid_network_interface_id_malformed,
             invalid_network_interface_id_not_found, is_ipv4_address,
             network_interface_id_is_well_formed, require_known_address, require_known_instance,
-            require_service_state, resource_already_associated, ELASTIC_IP_ASSOCIATION_ID_PREFIX,
+            require_service_state, resource_already_associated, ElasticIpAssociationSpec,
         };
 
         // Nothing here depends on the request's metadata: an Elastic IP address and the
@@ -221,7 +224,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "You can specify either the instance ID or the network interface ID, but not
         // both" (`AssociateAddressRequest$InstanceId`), and an address is associated with
         // something, so a request naming neither has not said what to associate it with.
-        let instance_id = match (
+        //
+        // Either way the association BINDS THE ADDRESS TO A NETWORK INTERFACE: an instance
+        // carries a public address only through one, so the id in the request is resolved to
+        // the interface the association is recorded on and both forms then take the one
+        // write path below.
+        let spec = match (
             input.instance_id.as_deref(),
             input.network_interface_id.as_deref(),
         ) {
@@ -233,14 +241,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             (Some(instance_id), None) => {
                 require_known_instance(&store, instance_id)?;
-                instance_id.to_string()
+                // An instance on its way out, or gone, has no interface left to carry an
+                // address. Every other state can: AWS associates an address with a stopped
+                // instance as readily as with a running one.
+                let instance = store.instances.get(instance_id).ok_or_else(|| {
+                    internal_error(format!(
+                        "the instance '{instance_id}' could not be read back"
+                    ))
+                })?;
+                if instance.state.is_terminating() {
+                    return Err(Scaffolded::incorrect_instance_state(
+                        instance_id,
+                        "associated with an Elastic IP address",
+                    ));
+                }
+                // "The instance must have exactly one attached network interface"
+                // (`$InstanceId`) — the primary one its launch created — so that is the
+                // interface the address binds to. An instance this store holds no interface
+                // for names none: the association is still the address's own, and no id a
+                // reader could not resolve is stored.
+                let network_interface_id = store
+                    .primary_network_interface_of_instance(instance_id)
+                    .and_then(|interface| interface.network_interface_id.clone());
+                let held = match network_interface_id.as_deref() {
+                    Some(network_interface_id) => {
+                        store.private_ip_addresses_of_interface(network_interface_id)
+                    }
+                    None => vec![instance.private_ip.clone()],
+                };
+                ElasticIpAssociationSpec {
+                    network_interface_id,
+                    instance_id: Some(instance_id.to_string()),
+                    private_ip_address: bound_private_ip(
+                        &held,
+                        input.private_ip_address.as_deref(),
+                        "instance",
+                        instance_id,
+                    )?,
+                }
             }
             // A malformed id is refused first, the way the service orders the two, and then
-            // an id the store holds no interface for. Associating an address with an
-            // INTERFACE rather than with an instance is work this slice has not done — the
-            // association has to be persisted on the interface itself, which this slice does
-            // not write — so an interface the store DOES hold is answered with the 501
-            // rather than with an association nothing would report.
+            // an id the store holds no interface for.
             (None, Some(network_interface_id)) => {
                 if !network_interface_id_is_well_formed(network_interface_id) {
                     return Err(invalid_network_interface_id_malformed(network_interface_id));
@@ -248,9 +289,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if !store.network_interfaces.contains_key(network_interface_id) {
                     return Err(invalid_network_interface_id_not_found(network_interface_id));
                 }
-                return Err(Scaffolded::not_implemented(
-                    "AssociateAddress with a networkInterfaceId",
-                ));
+                // "The ID of the instance that the address is associated with (if any)"
+                // (`Address$InstanceId`): the instance holding the interface, read off the
+                // attachment, so an interface nothing holds associates the address with no
+                // instance — and one held by an instance on its way out is refused for the
+                // same reason the instance form is.
+                let held_by = store
+                    .network_interface_attachment(network_interface_id)
+                    .and_then(|attachment| attachment.instance_id.clone());
+                if let Some(instance_id) = held_by.as_deref() {
+                    if store
+                        .instances
+                        .get(instance_id)
+                        .is_some_and(|instance| instance.state.is_terminating())
+                    {
+                        return Err(Scaffolded::incorrect_instance_state(
+                            instance_id,
+                            "associated with an Elastic IP address",
+                        ));
+                    }
+                }
+                let held = store.private_ip_addresses_of_interface(network_interface_id);
+                ElasticIpAssociationSpec {
+                    network_interface_id: Some(network_interface_id.to_string()),
+                    instance_id: held_by,
+                    private_ip_address: bound_private_ip(
+                        &held,
+                        input.private_ip_address.as_deref(),
+                        "network interface",
+                        network_interface_id,
+                    )?,
+                }
             }
             (None, None) => {
                 return Err(Scaffolded::missing_parameter(
@@ -260,52 +329,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
-        // An instance on its way out, or gone, has no interface left to carry an address.
-        // Every other state can: AWS associates an address with a stopped instance as
-        // readily as with a running one.
-        let instance = store.instances.get(&instance_id).ok_or_else(|| {
-            internal_error(format!(
-                "the instance '{instance_id}' could not be read back"
-            ))
-        })?;
-        if instance.state.is_terminating() {
-            return Err(Scaffolded::incorrect_instance_state(
-                &instance_id,
-                "associated with an Elastic IP address",
-            ));
-        }
-        // "If no private IP address is specified, the Elastic IP address is associated with
-        // the primary private IP address" (`AssociateAddressRequest$PrivateIpAddress`). An
-        // instance of this emulator is given exactly one private address, its primary one
-        // (`RunInstances`), so that is the only value this member can name — a request
-        // naming any other names an address the instance does not have.
-        let primary_private_ip = instance.private_ip.clone();
-        let private_ip = match input.private_ip_address.as_deref() {
-            None => primary_private_ip,
-            Some(requested) if requested == primary_private_ip => primary_private_ip,
-            Some(requested) => {
-                return Err(Scaffolded::invalid_parameter_value(format!(
-                    "Invalid value '{requested}' for privateIpAddress. The instance \
-                     '{instance_id}' does not have that private IP address"
-                )))
-            }
-        };
+        // "This is an idempotent operation. If you perform the operation more than once,
+        // Amazon EC2 doesn't return an error" (`AssociateAddress`): an association that
+        // already holds keeps the id it was given, so repeating one call changes nothing a
+        // later reader of either store can see.
+        let standing = store.elastic_ip_association_stands(&allocation_id, &spec);
 
         // "Reassociation is automatic, but you can specify false to ensure the operation
         // fails if the Elastic IP address is already associated with another resource"
         // (`AssociateAddressRequest$AllowReassociation`): remapping is the default, and
-        // only an explicit `false` turns an address that is already attached elsewhere
-        // into a refusal. Re-associating it with the resource it is ALREADY on is not a
-        // reassociation at all, so that request is never refused here.
-        let held_by = store
+        // only an explicit `false` turns an address that is already associated elsewhere
+        // into a refusal, which names the association that is in the way. Re-associating it
+        // with the resource it is ALREADY on is not a reassociation at all, so that request
+        // is never refused here.
+        let current = store
             .addresses
             .get(&allocation_id)
-            .and_then(|address| address.instance_id.clone());
-        if let Some(held_by) = held_by.as_deref() {
-            if held_by != instance_id && input.allow_reassociation == Some(false) {
+            .and_then(|address| address.association_id.clone());
+        if let Some(association_id) = current.as_deref() {
+            if standing.is_none() && input.allow_reassociation == Some(false) {
                 return Err(resource_already_associated(format!(
-                    "The address with allocation id '{allocation_id}' is already \
-                     associated with '{held_by}', and allowReassociation is false"
+                    "resource {allocation_id} is already associated with associate-id \
+                     {association_id}"
                 )));
             }
         }
@@ -318,57 +363,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(Scaffolded::dry_run_operation());
         }
 
-        // "This is an idempotent operation. If you perform the operation more than once,
-        // Amazon EC2 doesn't return an error" (`AssociateAddress`): an association that
-        // already holds keeps the id it was given, so repeating one call changes nothing a
-        // later reader of either store can see.
-        let standing = store.addresses.get(&allocation_id).and_then(|address| {
-            let same = address.instance_id.as_deref() == Some(instance_id.as_str())
-                && address.private_ip_address.as_deref() == Some(private_ip.as_str());
-            same.then(|| address.association_id.clone()).flatten()
-        });
         if let Some(association_id) = standing {
             return Ok(AssociateAddressOutput {
                 association_id: Some(association_id),
             });
         }
 
-        // The remap, both ways round: the address leaves whatever it was on, and the
-        // instance gives up whatever address it was reporting — "if you associate an
+        // ONE writer records the association on both sides — the address record
+        // `DescribeAddresses` reports and the interface's own `association` member
+        // `DescribeNetworkInterfaces` reports — and performs the remap "if you associate an
         // Elastic IP address with an instance that has an existing Elastic IP address, the
-        // existing address is disassociated from the instance, but remains allocated to
-        // your account" (`AssociateAddress`). One primitive does both sides, so no record
-        // is left naming an association the other no longer has.
-        store.detach_elastic_ip(&allocation_id);
-        if let Some(displaced) = store.allocation_id_associated_with_instance(&instance_id) {
-            store.detach_elastic_ip(&displaced);
-        }
-
-        // The association id is the service's to mint, never the caller's, and it comes
-        // from the store's own monotonic source, so no two associations share one. The
-        // record stores no caller-chosen bytes — the private address is the instance's own
-        // and the ids are minted or already stored — so there is nothing to charge.
-        let association_id = store.next_id(ELASTIC_IP_ASSOCIATION_ID_PREFIX);
-        let Some(address) = store.addresses.get_mut(&allocation_id) else {
+        // existing address is disassociated from the instance, but remains allocated to your
+        // account" (`AssociateAddress`) describes, so no record is left naming an
+        // association another no longer has.
+        if store.associate_elastic_ip(&allocation_id, &spec).is_none() {
             return Err(internal_error(format!(
-                "the address '{allocation_id}' could not be read back"
+                "the address '{allocation_id}' could not be associated"
             )));
-        };
-        address.association_id = Some(association_id);
-        address.instance_id = Some(instance_id.clone());
-        address.private_ip_address = Some(private_ip);
-        // `networkInterfaceId` and `networkInterfaceOwnerId` stay ABSENT: they name a
-        // network interface, and this emulator holds none to name (see the refusal above),
-        // so an id here would be one no other operation could resolve. `subnetId` stays
-        // absent too — it reports "the subnet where the IP address is allocated"
-        // (`Address$SubnetId`), and this address was allocated out of Amazon's pool rather
-        // than out of a subnet's range.
-        let public_ip = address.public_ip.clone();
-        // The instance now reports the Elastic IP address as its public address
-        // (`Instance$PublicIpAddress`), which is what makes the association visible from
-        // the instance's side as well.
-        if let Some(instance) = store.instances.get_mut(&instance_id) {
-            instance.public_ip = public_ip;
         }
 
         // Read the answer back OUT of the store, so the caller is told what a later
@@ -381,5 +392,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(AssociateAddressOutput {
             association_id: stored.association_id.clone(),
         })
+    }
+}
+
+/// The private address the association binds to, out of the addresses `held` by the
+/// resource the request named (primary first).
+///
+/// "The primary or secondary private IP address to associate with the Elastic IP address.
+/// If no private IP address is specified, the Elastic IP address is associated with the
+/// primary private IP address" (`AssociateAddressRequest$PrivateIpAddress`): a request that
+/// names none takes the primary address, one that names an address the resource holds takes
+/// that one, and one that names any other address names an address the resource does not
+/// have. `kind` and `id` name that resource in the refusal, which is either the instance or
+/// the network interface the request named.
+///
+/// `None` only for a resource that holds no private IPv4 address at all and a request that
+/// named none either: there is then no address for the association to name, and none is
+/// invented.
+fn bound_private_ip<E>(
+    held: &[String],
+    requested: Option<&str>,
+    kind: &str,
+    id: &str,
+) -> Result<Option<String>, crate::scaffolded::Scaffolded<E>> {
+    match requested {
+        Some(requested) if held.iter().any(|address| address == requested) => {
+            Ok(Some(requested.to_string()))
+        }
+        Some(requested) => Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+            format!(
+                "Invalid value '{requested}' for privateIpAddress. The {kind} '{id}' does \
+                 not have that private IP address"
+            ),
+        )),
+        None => Ok(held.first().cloned()),
     }
 }

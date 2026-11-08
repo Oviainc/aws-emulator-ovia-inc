@@ -8,6 +8,7 @@
 //! other primitive there.
 
 use super::*;
+use crate::ops::types::{InstanceNetworkInterfaceAssociation, NetworkInterfaceAssociation};
 
 /// Whether an interface of type `interface_type` has a source/destination check at all.
 ///
@@ -611,8 +612,20 @@ pub(super) fn instance_network_interface_view(
     interface: &NetworkInterface,
     attachment: &NetworkInterfaceAttachment,
 ) -> InstanceNetworkInterface {
+    // The public address the interface holds, in the shape the INSTANCE report carries it
+    // in: the same stored association, which has no member for the allocation or the
+    // association id — those belong to the Elastic IP address record `DescribeAddresses`
+    // reports — so one association cannot read one way here and another through
+    // `DescribeNetworkInterfaces`.
+    let association = |association: &NetworkInterfaceAssociation| InstanceNetworkInterfaceAssociation {
+        carrier_ip: association.carrier_ip.clone(),
+        customer_owned_ip: association.customer_owned_ip.clone(),
+        ip_owner_id: association.ip_owner_id.clone(),
+        public_dns_name: association.public_dns_name.clone(),
+        public_ip: association.public_ip.clone(),
+    };
     InstanceNetworkInterface {
-        association: None,
+        association: interface.association.as_ref().map(association),
         attachment: Some(InstanceNetworkInterfaceAttachment {
             attach_time: attachment.attach_time,
             attachment_id: attachment.attachment_id.clone(),
@@ -645,7 +658,7 @@ pub(super) fn instance_network_interface_view(
             addresses
                 .iter()
                 .map(|address| InstancePrivateIpAddress {
-                    association: None,
+                    association: address.association.as_ref().map(association),
                     primary: address.primary,
                     private_dns_name: address.private_dns_name.clone(),
                     private_ip_address: address.private_ip_address.clone(),
