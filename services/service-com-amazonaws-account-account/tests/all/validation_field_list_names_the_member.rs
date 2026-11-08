@@ -7,17 +7,18 @@
 //! is at fault, the modelled 400 `ValidationException` reports that member in
 //! `fieldList` — "The field where the invalid entry was detected"
 //! (`smithy_query(query="shape", shape="ValidationException")`) — with a message
-//! about it, whichever `ValidationExceptionReason` the refusal carries
-//! (`fieldValidationFailed | invalidRegionOptTarget`, from
-//! `smithy_query(query="shape", shape="ValidationExceptionReason")`). `fieldList`
-//! is left unset only where no single input member is at fault. The reason says
-//! WHY the member is wrong; it does not decide whether a member is named, so two
-//! refusals of the same member report it alike.
+//! about it, and carries reason `fieldValidationFailed`, the
+//! `ValidationExceptionReason` for a member whose value failed validation
+//! (`smithy_query(query="shape", shape="ValidationExceptionReason")`).
+//! `fieldList`
+//! is left unset only where no single input member is at fault. Two refusals of
+//! the same member are told apart by their message, not by whether the member is
+//! named or by the reason reported.
 //!
 //! The table spans what the rule generalises over rather than one request: the
 //! member at fault (`RegionName`, `CountryCode`, `StateOrRegion`, `NextToken`,
 //! `PrimaryEmail`), the operation carrying it (six of them, including both
-//! Region-opt calls and a reporting one), the reason reported, the kind of fault
+//! Region-opt calls and a reporting one), the kind of fault
 //! (a value outside a catalog this service keeps, a value that is catalogued but
 //! not a legal target, a member left out that its sibling made required, a token
 //! this service never minted, a value outside an expression) and whether the
@@ -49,10 +50,10 @@ const SIGNED_FOR_US_EAST_1: &str = "AWS4-HMAC-SHA256 \
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 const VALIDATION_STATUS: u16 = 400;
 
-/// The two `ValidationExceptionReason` values, from
+/// The `ValidationExceptionReason` a refusal detected on one input member
+/// reports, from
 /// `smithy_query(query="shape", shape="ValidationExceptionReason")`.
 const FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
-const INVALID_REGION_OPT_TARGET: &str = "invalidRegionOptTarget";
 
 /// A Region Amazon Web Services turns on for every account, so it is not a
 /// Region-opt target. SOURCE: the AWS General Reference Region table "Available
@@ -181,14 +182,14 @@ fn rows() -> Vec<Row> {
             case: "EnableRegion on a Region enabled by default",
             uri: "/enableRegion",
             request: json!({ "RegionName": DEFAULT_ENABLED[0] }),
-            reason: INVALID_REGION_OPT_TARGET,
+            reason: FIELD_VALIDATION_FAILED,
             member: "RegionName",
         },
         Row {
             case: "DisableRegion on a Region enabled by default",
             uri: "/disableRegion",
             request: json!({ "RegionName": DEFAULT_ENABLED[1] }),
-            reason: INVALID_REGION_OPT_TARGET,
+            reason: FIELD_VALIDATION_FAILED,
             member: "RegionName",
         },
         Row {
@@ -292,9 +293,9 @@ async fn a_refusal_of_one_input_member_names_that_member() {
     }
 }
 
-/// The two refusals of ONE member report it alike: the reason differs, the named
-/// member does not. Both Region-opt calls are checked, since they decide by one
-/// shared rule.
+/// The two refusals of ONE member report it alike: the message differs, the named
+/// member and the reason do not. Both Region-opt calls are checked, since they
+/// decide by one shared rule.
 #[tokio::test]
 async fn the_two_refusals_of_the_region_member_name_it_alike() {
     let router = emulator();
@@ -321,17 +322,25 @@ async fn the_two_refusals_of_the_region_member_name_it_alike() {
             answers.push((case, answer));
         }
 
-        // The two refusals are told apart by `reason`, not by whether the member
-        // at fault is reported.
+        // The two refusals are told apart by their message, not by whether the
+        // member at fault is reported or by the reason they carry.
         let (ref first_case, ref first) = answers[0];
         let (ref second_case, ref second) = answers[1];
         assert_ne!(
-            first.member("reason"),
-            second.member("reason"),
-            "case {first_case:?} vs {second_case:?}: the two refusals must differ in reason, \
+            first.member("message"),
+            second.member("message"),
+            "case {first_case:?} vs {second_case:?}: the two refusals must differ in message, \
              both reported {:?}",
-            first.member("reason")
+            first.member("message")
         );
+        for (case, answer) in [(first_case, first), (second_case, second)] {
+            assert_eq!(
+                answer.member("reason"),
+                FIELD_VALIDATION_FAILED,
+                "case {case:?}: expected reason {FIELD_VALIDATION_FAILED}, got {:?}",
+                answer.body
+            );
+        }
         assert_eq!(
             first.invalid_members(),
             second.invalid_members(),

@@ -76,13 +76,16 @@ use crate::ops::types::{
 /// exists here is active.
 pub const ACTIVE_ACCOUNT_STATE: &str = "ACTIVE";
 
-/// The `ValidationExceptionReason` a refused input member reports: one of that
-/// enum's two values (`fieldValidationFailed | invalidRegionOptTarget`).
+/// The `ValidationExceptionReason` a refusal this service decides about the
+/// value of one named input member reports: `fieldValidationFailed`, one of that
+/// enum's two values (`fieldValidationFailed | invalidRegionOptTarget`,
+/// `smithy_query(query="shape", shape="ValidationExceptionReason")`).
+///
+/// Every refusal below that is detected ON an input member carries it —
+/// whichever member, and whatever is wrong with the value — because that is the
+/// reason the service reports for a member whose value failed validation. The
+/// other value is not a reason any refusal here reports.
 pub const FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
-
-/// The other `ValidationExceptionReason` value: the request named a Region that
-/// cannot be the target of a Region opt-in or opt-out at all.
-pub const INVALID_REGION_OPT_TARGET: &str = "invalidRegionOptTarget";
 
 /// The `PhoneNumberVerificationStatus` the phone number of a stored primary
 /// contact carries before any one-time-passcode flow has run on THAT number:
@@ -295,7 +298,10 @@ pub fn validated_contact_information(
     if contact.state_or_region.is_none()
         && COUNTRIES_REQUIRING_STATE_OR_REGION.contains(&contact.country_code.as_str())
     {
-        return Err(state_or_region_required(&contact.country_code));
+        return Err(member_required_for_country(
+            STATE_OR_REGION_MEMBER,
+            &contact.country_code,
+        ));
     }
     Ok(())
 }
@@ -320,18 +326,25 @@ pub fn unknown_country_code(country_code: &str) -> ValidationException {
     }
 }
 
-/// The `ValidationException` payload for a primary contact address in a country
-/// that requires a state or region and carries none.
+/// The `ValidationException` payload for a primary contact address that leaves
+/// out a member the COUNTRY of that address makes required — a member the model
+/// leaves optional, so the rule is about the pair of members rather than about
+/// either one alone.
 ///
-/// The message names the country the request submitted, which is what tells the
-/// caller why the member it left out was required.
-pub fn state_or_region_required(country_code: &str) -> ValidationException {
-    let rule = format!("{STATE_OR_REGION_MEMBER} is required in {country_code}");
+/// The sentence quotes the modelled (Pascal-case) name of the member that is
+/// missing and the country code the request submitted, which together are what
+/// tells the caller which member it has to supply and why; both are variable, so
+/// the same sentence states the rule for whichever member and whichever country
+/// the structure pairs. `reason` is `fieldValidationFailed` and `fieldList` names
+/// the missing member with the same sentence, like every other refusal this
+/// service decides about one member.
+pub fn member_required_for_country(member: &str, country_code: &str) -> ValidationException {
+    let rule = format!("'{member}' field is required for country '{country_code}'");
     ValidationException {
         message: rule.clone(),
         reason: Some(FIELD_VALIDATION_FAILED.to_string()),
         field_list: Some(vec![ValidationExceptionField {
-            name: STATE_OR_REGION_MEMBER.to_string(),
+            name: member.to_string(),
             message: rule,
         }]),
     }
@@ -1736,19 +1749,18 @@ pub fn unknown_region(region_name: &str) -> ValidationException {
 /// opt-out. The code is taken from the request, so the sentence is the same
 /// statement whichever Region is named.
 ///
-/// `reason` is `invalidRegionOptTarget` — the `ValidationExceptionReason` value
-/// that exists for exactly this refusal — and `fieldList` names the member the
+/// `reason` is [`FIELD_VALIDATION_FAILED`] and `fieldList` names the member the
 /// refusal is ABOUT, which is "the field where the invalid entry was detected":
-/// this request is turned away on its `RegionName` alone, before anything else
-/// about it is looked at, exactly as the sibling refusal of the same member is
-/// ([`unknown_region`]). Which `reason` a refusal carries says why the member is
-/// wrong, not whether a member is at fault, so the two refusals of one member
-/// report that member alike.
+/// the value this request carries in `RegionName` is one the member does not
+/// admit, so the request is turned away on that member alone, before anything
+/// else about it is looked at — exactly as the sibling refusal of the same
+/// member is ([`unknown_region`]). The two refusals of one member are told apart
+/// by their sentence, not by the reason they report.
 pub fn region_not_opt_target(region_name: &str) -> ValidationException {
     let stated = format!("{region_name} is not a valid region for opt-in or opt-out.");
     ValidationException {
         message: stated.clone(),
-        reason: Some(INVALID_REGION_OPT_TARGET.to_string()),
+        reason: Some(FIELD_VALIDATION_FAILED.to_string()),
         field_list: Some(vec![ValidationExceptionField {
             name: REGION_NAME_MEMBER.to_string(),
             message: stated,

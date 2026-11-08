@@ -7,7 +7,7 @@
 //! (`crate::state::REGION_OPT_TRANSITION`). Already enabled or enabling is a
 //! no-op; a Region that is `DISABLING` conflicts (409); a Region enabled by
 //! default is not a Region-opt target and is refused 400 with reason
-//! `invalidRegionOptTarget`.
+//! `fieldValidationFailed` naming `RegionName`.
 //!
 //! ## Shape of an operation
 //!

@@ -8,7 +8,8 @@
 //! Region code at all and is refused 400 `ValidationException` with reason
 //! `fieldValidationFailed` naming the member; a Region the catalog turns on for
 //! every account is not a Region-opt target and is refused 400
-//! `ValidationException` with reason `invalidRegionOptTarget`; every other
+//! `ValidationException` with the same reason, also naming the member, and a
+//! sentence of its own; every other
 //! Region of the catalog is an opt target and the call proceeds. Because it is
 //! ONE rule, the two operations cannot answer a given `RegionName` differently —
 //! each refused case below asserts both answers are the same, byte for byte.
@@ -65,10 +66,9 @@ const OPT_IN: [&str; 5] = [
 /// string is refused by the catalog rule rather than by the boundary.
 const REGION_NAME_MAX: usize = 50;
 
-/// The `ValidationExceptionReason` values this rule reports, from
+/// The `ValidationExceptionReason` this rule reports, from
 /// `smithy_query(query="shape", shape="ValidationExceptionReason")`.
 const FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
-const INVALID_REGION_OPT_TARGET: &str = "invalidRegionOptTarget";
 
 /// The `RegionOptStatus` values this suite reads back, from
 /// `smithy_query(query="shape", shape="RegionOptStatus")`.
@@ -270,8 +270,8 @@ async fn a_region_enabled_by_default_earns_the_same_refusal_from_both_opt_calls(
             );
             assert_eq!(
                 answer.member("reason"),
-                INVALID_REGION_OPT_TARGET,
-                "case {region:?}/{operation}: expected reason {INVALID_REGION_OPT_TARGET}, \
+                FIELD_VALIDATION_FAILED,
+                "case {region:?}/{operation}: expected reason {FIELD_VALIDATION_FAILED}, \
                  got {:?}",
                 answer.body
             );

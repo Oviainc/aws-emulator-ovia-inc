@@ -50,10 +50,10 @@ const SIGNED_FOR_US_EAST_1: &str = "AWS4-HMAC-SHA256 \
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 const VALIDATION_STATUS: u16 = 400;
 
-/// The `ValidationExceptionReason` value that exists for a Region that is not a
-/// Region-opt target, from
+/// The `ValidationExceptionReason` a refusal detected on one input member
+/// reports, from
 /// `smithy_query(query="shape", shape="ValidationExceptionReason")`.
-const INVALID_REGION_OPT_TARGET: &str = "invalidRegionOptTarget";
+const FIELD_VALIDATION_FAILED: &str = "fieldValidationFailed";
 
 /// `MaxResults`' modelled `@range(min: 1, max: 50)` on `ListRegions`, from
 /// `smithy_query(query="operation", operation="ListRegions")`.
@@ -554,8 +554,8 @@ async fn a_region_that_is_not_an_opt_target_is_refused_with_the_opt_target_sente
             );
             assert_eq!(
                 answer.member("reason"),
-                INVALID_REGION_OPT_TARGET,
-                "case {region:?}/{operation}: expected reason {INVALID_REGION_OPT_TARGET}, \
+                FIELD_VALIDATION_FAILED,
+                "case {region:?}/{operation}: expected reason {FIELD_VALIDATION_FAILED}, \
                  got {:?}",
                 answer.body
             );

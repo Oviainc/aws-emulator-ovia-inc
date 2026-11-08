@@ -8,7 +8,7 @@
 //! no-op; a Region that is `ENABLING` conflicts (409) — "you cannot disable the
 //! Region until the enabling process is fully completed"; a Region enabled by
 //! default is not a Region-opt target and is refused 400 with reason
-//! `invalidRegionOptTarget`.
+//! `fieldValidationFailed` naming `RegionName`.
 //!
 //! ## Shape of an operation
 //!

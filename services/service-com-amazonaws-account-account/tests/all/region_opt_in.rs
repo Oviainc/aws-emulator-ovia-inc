@@ -240,8 +240,8 @@ async fn a_default_enabled_region_reports_enabled_by_default_and_is_not_an_opt_t
             );
             assert_eq!(
                 answer.member("reason"),
-                "invalidRegionOptTarget",
-                "case {region:?}/{operation}: expected reason invalidRegionOptTarget, got {:?}",
+                "fieldValidationFailed",
+                "case {region:?}/{operation}: expected reason fieldValidationFailed, got {:?}",
                 answer.body
             );
         }

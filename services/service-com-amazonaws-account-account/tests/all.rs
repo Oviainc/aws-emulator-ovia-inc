@@ -59,6 +59,8 @@ mod primary_email_update_address_in_use;
 mod primary_email_update_in_flight;
 #[path = "all/primary_email_update_self_reaffirmation.rs"]
 mod primary_email_update_self_reaffirmation;
+#[path = "all/refused_member_payload_wording.rs"]
+mod refused_member_payload_wording;
 #[path = "all/region_opt_in.rs"]
 mod region_opt_in;
 #[path = "all/region_opt_in_listing.rs"]
