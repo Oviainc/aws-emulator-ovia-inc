@@ -145,6 +145,15 @@ pub(crate) fn arn_of(resource: &Value) -> String {
         .to_string()
 }
 
+/// The resource id a Device Farm ARN carries, which the ARN of a resource living inside a
+/// project embeds ahead of its own id (`<type>:<project-id>/<resource-id>`).
+pub(crate) fn resource_id(arn: &str) -> String {
+    arn.split(':')
+        .next_back()
+        .unwrap_or_else(|| panic!("ARN carries no resource id: {arn}"))
+        .to_string()
+}
+
 /// A Device Farm ARN this emulator never minted, of resource type `resource_type`.
 pub(crate) fn foreign_arn(resource_type: &str) -> String {
     format!(

@@ -43,6 +43,9 @@ const ARN_MIN_LENGTH: usize = 32;
 /// The other end of that range.
 const ARN_MAX_LENGTH: usize = 1011;
 
+/// The resource type a device-pool ARN carries.
+const DEVICE_POOL_TYPE: &str = "devicepool";
+
 /// One operation addressed by a Device Farm ARN: which member carries it, which resource
 /// type that member names, how that resource is worded in the refusal, and the other
 /// members the request must carry so the ARN is the only thing that can refuse it.
@@ -101,6 +104,13 @@ const ARN_CALLS: &[ArnCall] = &[
         member: "arn",
         resource_type: NETWORK_PROFILE_TYPE,
         entity: "network profile",
+        extra: &[],
+    },
+    ArnCall {
+        op: "GetDevicePool",
+        member: "arn",
+        resource_type: DEVICE_POOL_TYPE,
+        entity: "device pool",
         extra: &[],
     },
 ];

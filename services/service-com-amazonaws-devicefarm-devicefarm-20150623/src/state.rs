@@ -10,7 +10,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::ops::types::{EnvironmentVariable, NetworkProfile, Project, Upload, VpcConfig};
+use crate::ops::types::{
+    DevicePool, EnvironmentVariable, NetworkProfile, Project, Rule, Upload, VpcConfig,
+};
 
 /// The execution timeout a project gets when `CreateProject` is called without
 /// `defaultJobTimeoutMinutes`.
@@ -27,6 +29,18 @@ pub const PROJECT_RESOURCE_TYPE: &str = "project";
 /// The resource type a network-profile ARN carries:
 /// `arn:aws:devicefarm:<region>:<account>:networkprofile:<project-id>/<profile-id>`.
 pub const NETWORK_PROFILE_RESOURCE_TYPE: &str = "networkprofile";
+
+/// The resource type a device-pool ARN carries:
+/// `arn:aws:devicefarm:<region>:<account>:devicepool:<project-id>/<pool-id>`.
+pub const DEVICE_POOL_RESOURCE_TYPE: &str = "devicepool";
+
+/// The only type a device pool created through the API can have.
+///
+/// `DevicePoolType` models two values, and the model's own member documentation splits
+/// them by who owns the pool: a `CURATED` pool is "created and managed by AWS Device
+/// Farm", a `PRIVATE` one "created and managed by the device pool developer" — so a pool a
+/// caller creates is reported as `PRIVATE`.
+pub const DEVICE_POOL_TYPE_PRIVATE: &str = "PRIVATE";
 
 /// The resource type an upload ARN carries:
 /// `arn:aws:devicefarm:<region>:<account>:upload:<project-id>/<upload-id>`.
@@ -108,6 +122,14 @@ pub const PROJECTS_PAGE_SIZE: usize = 50;
 /// above any workflow an emulator serves, and it is what stops the state growing without
 /// end: every record it holds is released by `DeleteProject`.
 pub const PROJECT_QUOTA: usize = 1_000;
+
+/// How many device pools the store holds before `CreateDevicePool` refuses with the
+/// modelled `LimitExceededException`.
+///
+/// Like [`PROJECT_QUOTA`], this is the emulator's OWN bound on the store rather than a
+/// claim about any account's published quota, set far above any workflow an emulator
+/// serves: it is what stops repeated calls growing the state without end.
+pub const DEVICE_POOL_QUOTA: usize = 1_000;
 
 /// How many network profiles the store holds before `CreateNetworkProfile` refuses with
 /// the modelled `LimitExceededException`.
@@ -205,6 +227,44 @@ impl NetworkProfileRecord {
             downlink_jitter_ms: Some(self.downlink_jitter_ms),
             uplink_loss_percent: self.uplink_loss_percent,
             downlink_loss_percent: self.downlink_loss_percent,
+        }
+    }
+}
+
+/// One stored device pool: the single source of truth every `DevicePool` response is
+/// built from.
+///
+/// The pool's rules are the caller's own selection criteria, so they are stored exactly as
+/// the request supplied them and reported back unchanged; `type` is stored as the service
+/// classified the pool rather than as anything the request asked for, and `max_devices` is
+/// absent when the request set no ceiling.
+#[derive(Debug, Clone)]
+pub struct DevicePoolRecord {
+    pub arn: String,
+    /// The project the pool was created in. A device pool OUTLIVES that project (deleting
+    /// a project releases the project record only), so this is the owner the pool was
+    /// minted under and never a guarantee the project is still there.
+    pub project_arn: String,
+    pub name: String,
+    pub description: Option<String>,
+    pub r#type: String,
+    pub rules: Vec<Rule>,
+    pub max_devices: Option<i32>,
+}
+
+impl DevicePoolRecord {
+    /// The modelled `DevicePool` for this record. Every member is read off the record, so a
+    /// response can never carry a value the store does not hold.
+    pub fn to_device_pool(&self) -> DevicePool {
+        DevicePool {
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            description: self.description.clone(),
+            r#type: Some(self.r#type.clone()),
+            // `rules` is a required member of the create request, so a stored pool always
+            // has the list the caller supplied \u2014 an empty one included.
+            rules: Some(self.rules.clone()),
+            max_devices: self.max_devices,
         }
     }
 }
@@ -325,6 +385,8 @@ impl UploadRecord {
 pub struct ComAmazonawsDevicefarmDevicefarm20150623State {
     pub projects: BTreeMap<String, ProjectRecord>,
     pub network_profiles: BTreeMap<String, NetworkProfileRecord>,
+    /// Keyed by device-pool ARN, for the same reasons as `projects`.
+    pub device_pools: BTreeMap<String, DevicePoolRecord>,
     /// Keyed by upload ARN, for the same reasons as `projects`.
     pub uploads: BTreeMap<String, UploadRecord>,
     /// The sequence the next minted project id comes from. Private, and only ever
@@ -334,6 +396,9 @@ pub struct ComAmazonawsDevicefarmDevicefarm20150623State {
     /// The sequence the next minted network-profile id comes from, with the same
     /// guarantee as `next_project_id`.
     next_network_profile_id: u64,
+    /// The sequence the next minted device-pool id comes from, with the same guarantee as
+    /// `next_project_id`.
+    next_device_pool_id: u64,
     /// The sequence the next minted upload id comes from, with the same guarantee as
     /// `next_project_id`.
     next_upload_id: u64,
@@ -370,14 +435,27 @@ impl ComAmazonawsDevicefarmDevicefarm20150623State {
     /// sequence. The ARN is stored on the record and never recomputed.
     pub fn mint_network_profile_arn(&mut self, region: &str, project_arn: &str) -> String {
         self.next_network_profile_id = self.next_network_profile_id.wrapping_add(1);
-        let project_id = devicefarm_resource_id(project_arn, PROJECT_RESOURCE_TYPE).unwrap_or("");
-        ::emulator_server::emulator_arn(
-            "devicefarm",
+        project_child_arn(
             region,
-            &format!(
-                "{NETWORK_PROFILE_RESOURCE_TYPE}:{project_id}/{:016x}-{}",
-                self.next_network_profile_id, RESOURCE_ID_SUFFIX
-            ),
+            project_arn,
+            NETWORK_PROFILE_RESOURCE_TYPE,
+            self.next_network_profile_id,
+        )
+    }
+
+    /// Mint a fresh, unique device-pool ARN in `region` under `project_arn`, advancing the
+    /// store's sequence.
+    ///
+    /// A device pool is a resource that lives inside a project, so its ARN carries both
+    /// ids (`devicepool:<project-id>/<pool-id>`) exactly as a network profile's does. The
+    /// ARN is stored on the record and never recomputed.
+    pub fn mint_device_pool_arn(&mut self, region: &str, project_arn: &str) -> String {
+        self.next_device_pool_id = self.next_device_pool_id.wrapping_add(1);
+        project_child_arn(
+            region,
+            project_arn,
+            DEVICE_POOL_RESOURCE_TYPE,
+            self.next_device_pool_id,
         )
     }
 
@@ -418,6 +496,22 @@ impl ComAmazonawsDevicefarmDevicefarm20150623State {
             devicefarm_resource_id(&record.arn, UPLOAD_RESOURCE_TYPE) == Some(resource_id)
         })
     }
+}
+
+/// The ARN of a resource of type `resource_type` that lives inside `project_arn`, with the
+/// store-supplied `id`.
+///
+/// A Device Farm resource created inside a project carries both ids in the ARN's resource
+/// field, `<type>:<project-id>/<resource-id>`, so the owning project is readable off the
+/// ARN exactly as it is in the service's own ARNs. The account segment and the ARN frame
+/// come from the core's `emulator_arn`.
+fn project_child_arn(region: &str, project_arn: &str, resource_type: &str, id: u64) -> String {
+    let project_id = devicefarm_resource_id(project_arn, PROJECT_RESOURCE_TYPE).unwrap_or("");
+    ::emulator_server::emulator_arn(
+        "devicefarm",
+        region,
+        &format!("{resource_type}:{project_id}/{id:016x}-{RESOURCE_ID_SUFFIX}"),
+    )
 }
 
 /// The fixed tail every minted resource id carries, so an ARN is recognisable as one this
@@ -500,6 +594,9 @@ pub const PROJECT_ENTITY: &str = "project";
 /// How a network profile is named in the prose of a message about one.
 pub const NETWORK_PROFILE_ENTITY: &str = "network profile";
 
+/// How a device pool is named in the prose of a message about one.
+pub const DEVICE_POOL_ENTITY: &str = "device pool";
+
 /// How an upload is named in the prose of a message about one.
 pub const UPLOAD_ENTITY: &str = "upload";
 
@@ -523,6 +620,11 @@ pub fn is_project_arn(arn: &str) -> bool {
 /// Whether `arn` names a network profile.
 pub fn is_network_profile_arn(arn: &str) -> bool {
     is_devicefarm_arn_of_type(arn, NETWORK_PROFILE_RESOURCE_TYPE)
+}
+
+/// Whether `arn` names a device pool.
+pub fn is_device_pool_arn(arn: &str) -> bool {
+    is_devicefarm_arn_of_type(arn, DEVICE_POOL_RESOURCE_TYPE)
 }
 
 /// Whether `arn` names an upload.

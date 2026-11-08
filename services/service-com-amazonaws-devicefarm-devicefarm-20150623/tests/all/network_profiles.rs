@@ -16,7 +16,7 @@ use std::collections::BTreeSet;
 
 use serde_json::{json, Value};
 
-use crate::projects::{arn_of, error_code, foreign_arn, Emulator, DEFAULT_REGION, REGION};
+use crate::projects::{arn_of, error_code, foreign_arn, resource_id, Emulator, DEFAULT_REGION, REGION};
 
 /// The members a `NetworkProfile` response carries besides its ARN, so a row asserts the
 /// WHOLE reported profile rather than the one member it varies.
@@ -64,15 +64,6 @@ fn expected_profile(name: &str, patches: Value) -> Value {
         profile[member] = value.clone();
     }
     profile
-}
-
-/// The resource id a Device Farm ARN carries, which a network-profile ARN embeds ahead of
-/// its own id (`networkprofile:<project-id>/<profile-id>`).
-fn resource_id(arn: &str) -> String {
-    arn.split(':')
-        .next_back()
-        .unwrap_or_else(|| panic!("ARN carries no resource id: {arn}"))
-        .to_string()
 }
 
 /// CreateNetworkProfile mints a profile under an existing project, resolves every shaping
