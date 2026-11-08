@@ -1,15 +1,55 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListFindings
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListFindings`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListFindings::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the external-access findings of the analyzer the request names, COMPUTED from
+//! the resource-based policies this emulator holds for the resources of the analyzer's own
+//! account: a finding is the access one `Allow` statement of such a policy grants to a
+//! principal outside that account.
+//!
+//! Nothing is stored for a finding. Every finding is derived on each read from the policies
+//! their owning services hold ([`crate::state::monitored_resources`]) by the crate's ONE
+//! external-access analysis ([`crate::state::external_access_findings`]), so this operation
+//! writes nothing and two reads of one analyzer report the same findings with the same ids
+//! — the id is DERIVED from what it identifies ([`crate::state::derived_uuid`]) rather than
+//! minted, which is what makes it stable without a stored table of ids.
+//!
+//! ## What a finding is
+//!
+//! The analysis and its rule live in [`crate::state`], shared with the access-preview
+//! analysis so the two cannot drift: one finding per principal outside the zone of trust
+//! (for an account analyzer, the account that owns the resource) that an `Allow` statement
+//! grants access to, marked `isPublic` exactly when the statement admits every principal
+//! with nothing in its `Condition` binding the caller. Each finding carries the statement's
+//! own `Action` list and `Condition` keys, and `status` `ACTIVE`.
+//!
+//! ## What this operation adds to it
+//!
+//! * `analyzerArn` must name a stored analyzer (404 otherwise), and that analyzer must be
+//!   an EXTERNAL access analyzer: "ListFindings is supported only for external access
+//!   analyzers. You must use ListFindingsV2 for internal and unused access analyzers", so a
+//!   request naming an analyzer of the unused-access or internal-access family is refused
+//!   with the service's fixed `ValidationException` for an unsupported action rather than
+//!   answered with findings it does not report.
+//! * `filter` selects the findings a criterion holds for, over the members of a finding;
+//!   `sort` orders them by one of those members; `maxResults`/`nextToken` page over the
+//!   result, so a caller that follows tokens to exhaustion sees every finding once.
+//!
+//! ## What bounds the work
+//!
+//! The findings are not stored, so EVERY call re-derives them from the account's policies
+//! and then matches them against the request's `filter`. The policy parser bounds each
+//! factor of that work (document bytes, statements, element values) but not their product,
+//! and it is the product that decides how much there is to do — so the whole analysis is
+//! bounded: at most [`crate::state::MAX_MONITORED_RESOURCES`] resources read, at most
+//! [`MAX_DERIVED_FINDINGS`] findings, at most [`MAX_FILTER_CRITERIA`] criteria, and at most
+//! [`MAX_ANALYSIS_UNITS`] units of work charged for every policy read, statement visited,
+//! principal considered, string copied into a finding and [`FILTER_BYTES_PER_UNIT`] bytes
+//! compared by a criterion. A call past any of those ceilings is refused with the modelled
+//! `ValidationException` naming the member to change rather than run. Both stages run on
+//! the blocking pool with every store lock already released, exactly as `CheckNoNewAccess`
+//! runs its policy comparison, so a call at the top of its budget cannot starve the async
+//! worker or hold up another request.
 //!
 //! ## Shape of an operation
 //!
@@ -84,6 +124,10 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+// What bounds one call's analysis, shared with the access-preview analysis so the two
+// cannot answer the same question differently.
+use crate::state::{Budget, Exhausted};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -156,18 +200,633 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListFindings` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListFindingsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListFindings"))
+        // A read: the findings are a function of the account's stored resource policies,
+        // the analyzer and the clock, so nothing of the request metadata is consulted and
+        // nothing is written — not by this call and not by the stores it reads.
+        let _ = ctx;
+
+        // The filter and the sort are refused before any store is read: a criterion naming
+        // no member of a finding cannot be applied to any finding, whatever the account
+        // holds.
+        let criteria = filter_criteria(input.filter.as_ref())?;
+        let sort = sort_order(input.sort.as_ref())?;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListFindingsErrorModeled::InternalServerException(crate::state::store_unavailable())
+        })?;
+        // The analyzer is read under this service's lock, which is RELEASED (the block ends
+        // here) before any other store is read or any analysis runs.
+        let (analyzer_arn, analyzer_created_at) = {
+            let state = state.lock();
+
+            // Fixed text, the ARN the caller named in the modelled `resourceId`: every
+            // resource-scoped refusal in this service goes through `crate::state`'s
+            // constructors.
+            let analyzer = state.analyzer_by_arn(&input.analyzer_arn).ok_or_else(|| {
+                ListFindingsErrorModeled::ResourceNotFoundException(
+                    crate::state::analyzer_not_found(&input.analyzer_arn),
+                )
+            })?;
+
+            // "ListFindings is supported only for external access analyzers. You must use
+            // ListFindingsV2 for internal and unused access analyzers" — an analyzer of
+            // either configured family reports no external access, so the request is
+            // refused rather than answered with an empty list, which would claim the
+            // account grants none. The refusal is about the analyzer the request names
+            // rather than about one malformed member, so it carries no `fieldList` and its
+            // message is the service's fixed text for an unsupported action; see
+            // [`crate::state::unsupported_action_exception`], which `StartResourceScan`
+            // refuses the same family with.
+            if analyzer.configured_access().is_some() {
+                return Err(ListFindingsErrorModeled::ValidationException(
+                    crate::state::unsupported_action_exception(),
+                )
+                .into());
+            }
+
+            (analyzer.arn.clone(), analyzer.created_at)
+        };
+
+        // The zone of trust of an account analyzer is the account it monitors, which its
+        // own ARN names; the resources of that account are read out of the services that
+        // own them, each under its own lock and none of them held past the read.
+        let account = crate::state::resource_owner_account(&analyzer_arn, None);
+        let resources = crate::state::monitored_resources(&*self.engine, &account);
+
+        // The whole analysis — deriving the findings from the stored policies, matching
+        // them against the request's criteria and ordering them — reads documents,
+        // allocates findings and compares strings, so it is CPU-bound: it runs on the
+        // blocking pool, the way `CheckNoNewAccess` sends its policy comparison there,
+        // under ONE budget of [`MAX_ANALYSIS_UNITS`]. The budget bounds the work and the
+        // allocation of both stages together; the pool keeps them off the async worker that
+        // serves health checks and every other request. What is left on the worker is
+        // taking one page (at most [`crate::state::MAX_PAGE_SIZE`] items) out of the result.
+        let analysed = ::tokio::task::spawn_blocking(move || {
+            let mut budget = Budget::new(MAX_ANALYSIS_UNITS);
+            let findings = crate::state::external_access_findings(
+                &analyzer_arn,
+                analyzer_created_at,
+                &resources,
+                MAX_DERIVED_FINDINGS,
+                &mut budget,
+            )?;
+            let matching = matching_findings(findings, &criteria, &mut budget)?;
+            Ok::<_, Exhausted>(ordered(matching, sort.as_ref()))
+        })
+        .await;
+        let matching = match analysed {
+            Ok(Ok(matching)) => matching,
+            // The account's policies are analyzable, but reporting their findings would
+            // cost more than this emulator spends on one call: refused, naming the request
+            // member at fault, rather than allocating further.
+            Ok(Err(exhausted)) => {
+                ::tracing::info!(
+                    operation = Self::NAME,
+                    refusal = "budget",
+                    "refused a findings listing past this emulator's analysis ceiling"
+                );
+                return Err(ListFindingsErrorModeled::ValidationException(
+                    crate::state::field_validation_exception(exhausted.member, exhausted.detail),
+                )
+                .into());
+            }
+            // A panic or a cancellation on the pool says nothing about the account's
+            // policies, so it is reported as the server fault it is rather than as an empty
+            // result.
+            Err(error) => {
+                ::tracing::error!(
+                    operation = Self::NAME,
+                    error = %error,
+                    "the external access analysis did not complete"
+                );
+                return Err(ListFindingsErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: "the external access analysis did not complete".to_string(),
+                        retry_after_seconds: None,
+                    },
+                )
+                .into());
+            }
+        };
+
+        let page = crate::state::page(matching, input.max_results, input.next_token.as_deref())
+            .map_err(|error| {
+                ListFindingsErrorModeled::ValidationException(
+                    crate::state::page_validation_exception(&error),
+                )
+            })?;
+
+        Ok(ListFindingsOutput {
+            findings: page.items,
+            next_token: page.next_token,
+        })
     }
+}
+
+// ---------------------------------------------------------------------------
+// What one call of this operation may spend
+// ---------------------------------------------------------------------------
+
+/// How many findings this emulator will report for ONE analyzer.
+///
+/// The findings are not stored, so every call re-derives them: this is the emulator's OWN
+/// ceiling on that work, generous beside the ten full pages
+/// ([`crate::state::MAX_PAGE_SIZE`]) a realistic listing walks, and far below what the
+/// account's stored policies could otherwise ask for — the policy parser bounds each factor
+/// (documents, statements, element values) but not their PRODUCT, and it is the product
+/// that decides how many findings exist.
+const MAX_DERIVED_FINDINGS: usize = 1_000;
+
+/// How much work ONE call's analysis may spend: deriving the findings AND matching them
+/// against the request's criteria, under one ceiling.
+///
+/// A unit is one policy read, one statement visited, one principal considered, one string
+/// copied into a finding, or [`FILTER_BYTES_PER_UNIT`] bytes compared by a filter
+/// criterion — so this bounds the ALLOCATION and the byte-level work of both stages, in the
+/// PRODUCT of their factors rather than in each factor alone, whatever the account's
+/// policies and the request's filter look like. The counterpart of the policy engine's own
+/// budgets (`check_no_new_access::policy::MAX_ACCESS_REQUESTS` and its
+/// `MAX_COMPARISON_STEPS`), which bound the comparison `CheckNoNewAccess` runs.
+const MAX_ANALYSIS_UNITS: u64 = 500_000;
+
+/// How many bytes of string comparison one filter unit buys. A criterion is checked by
+/// comparing a finding's value against a value the request supplied, so what the check
+/// costs is their LENGTH, not just the number of pairs — charging per quantum of bytes is
+/// what keeps one long value from buying unbounded work.
+const FILTER_BYTES_PER_UNIT: usize = 64;
+
+/// How many criteria one `filter` may carry.
+///
+/// A criterion names a member of a finding, and the model gives a finding fourteen of them
+/// (a map-valued one addressable at each of its keys), so a filter past this ceiling is not
+/// a finer query but a multiplier on the match: every criterion is checked against every
+/// finding. The emulator's own ceiling, in the same spirit as the model's `@length(max: 20)`
+/// on each criterion's `ValueList`.
+const MAX_FILTER_CRITERIA: usize = 20;
+
+/// The request member a filter refusal names.
+const FILTER_MEMBER: &str = "filter";
+
+/// The request member a sort refusal names: the attribute the request asked to order by.
+const SORT_ATTRIBUTE_MEMBER: &str = "sort.attributeName";
+
+// ---------------------------------------------------------------------------
+// `filter` and `sort`: which findings are returned, and in what order
+// ---------------------------------------------------------------------------
+
+/// Which member of a finding one filter key reads.
+///
+/// A criterion's key names a member of `FindingSummary`, so the catalog below is the
+/// model's own member list (`smithy_query(query="shape", shape="FindingSummary")`) rather
+/// than a list of accepted spellings: a map-valued member is addressed either as a whole or
+/// by one of its keys (`principal.AWS`, `condition.aws:PrincipalOrgID`), and the `sources`
+/// list by the member of its entries (`sources.type`).
+#[derive(Debug)]
+enum FindingMember {
+    /// A member holding at most one value of its own, read as a borrow of the finding.
+    Scalar(for<'a> fn(&'a FindingSummary) -> Option<&'a str>),
+    /// `action`: the actions the statement allows.
+    Action,
+    /// `principal`, as a whole or at one principal type.
+    Principal(Option<String>),
+    /// `condition`, as a whole or at one condition key.
+    Condition(Option<String>),
+    /// `sources.type`: how the access is granted.
+    SourceType,
+    /// `sources.detail.accessPointArn`.
+    SourceAccessPointArn,
+    /// `sources.detail.accessPointAccount`.
+    SourceAccessPointAccount,
+}
+
+/// The finding members a criterion may read, each with the member name the wire spells it
+/// by. Written out so a key naming no member is refused rather than silently matching
+/// nothing.
+const FILTERABLE_MEMBERS: &[&str] = &[
+    "id",
+    "principal",
+    "action",
+    "resource",
+    "isPublic",
+    "resourceType",
+    "condition",
+    "status",
+    "resourceOwnerAccount",
+    "error",
+    "resourceControlPolicyRestriction",
+    "sources.type",
+    "sources.detail.accessPointArn",
+    "sources.detail.accessPointAccount",
+];
+
+impl FindingMember {
+    /// The member `key` addresses, or `None` when it addresses none.
+    fn parse(key: &str) -> Option<Self> {
+        if let Some(entry) = key.strip_prefix("principal.") {
+            return Some(Self::Principal(Some(entry.to_string())));
+        }
+        if let Some(entry) = key.strip_prefix("condition.") {
+            return Some(Self::Condition(Some(entry.to_string())));
+        }
+        match key {
+            "id" => Some(Self::Scalar(|finding| Some(finding.id.as_str()))),
+            "resource" => Some(Self::Scalar(|finding| finding.resource.as_deref())),
+            // The two spellings a boolean member is filtered by are fixed, so reading it
+            // borrows one of them rather than rendering a string per comparison.
+            "isPublic" => Some(Self::Scalar(|finding| {
+                finding
+                    .is_public
+                    .map(|public| if public { "true" } else { "false" })
+            })),
+            "resourceType" => Some(Self::Scalar(|finding| Some(finding.resource_type.as_str()))),
+            "status" => Some(Self::Scalar(|finding| Some(finding.status.as_str()))),
+            "resourceOwnerAccount" => Some(Self::Scalar(|finding| {
+                Some(finding.resource_owner_account.as_str())
+            })),
+            "error" => Some(Self::Scalar(|finding| finding.error.as_deref())),
+            "resourceControlPolicyRestriction" => Some(Self::Scalar(|finding| {
+                finding.resource_control_policy_restriction.as_deref()
+            })),
+            "action" => Some(Self::Action),
+            "principal" => Some(Self::Principal(None)),
+            "condition" => Some(Self::Condition(None)),
+            "sources.type" => Some(Self::SourceType),
+            "sources.detail.accessPointArn" => Some(Self::SourceAccessPointArn),
+            "sources.detail.accessPointAccount" => Some(Self::SourceAccessPointAccount),
+            _ => None,
+        }
+    }
+
+    /// The values this member holds on `finding`, BORROWED from it: empty when the finding
+    /// does not carry the member, which is what `exists` reads.
+    ///
+    /// Borrowed rather than cloned, so checking a criterion against a finding copies no
+    /// string at all — the cost of a check is the bytes it compares, which is what the
+    /// [`Budget`] is charged for.
+    fn values<'a>(&self, finding: &'a FindingSummary) -> Vec<&'a str> {
+        /// One entry of a map-valued member, or every entry when no key is named.
+        fn entries<'a>(
+            map: Option<&'a std::collections::HashMap<String, String>>,
+            at: Option<&String>,
+        ) -> Vec<&'a str> {
+            let Some(map) = map else {
+                return Vec::new();
+            };
+            match at {
+                Some(key) => map
+                    .get(key.as_str())
+                    .map(String::as_str)
+                    .into_iter()
+                    .collect(),
+                None => map.values().map(String::as_str).collect(),
+            }
+        }
+        /// One member of every finding source.
+        fn of_sources<'a>(
+            finding: &'a FindingSummary,
+            member: impl Fn(&'a FindingSource) -> Option<&'a str>,
+        ) -> Vec<&'a str> {
+            finding
+                .sources
+                .iter()
+                .flatten()
+                .filter_map(member)
+                .collect()
+        }
+        match self {
+            Self::Scalar(read) => read(finding).into_iter().collect(),
+            Self::Action => finding
+                .action
+                .iter()
+                .flatten()
+                .map(String::as_str)
+                .collect(),
+            Self::Principal(at) => entries(finding.principal.as_ref(), at.as_ref()),
+            // `condition` is a REQUIRED member, so it is always there to read: a finding
+            // whose statement constrains nothing carries the empty map.
+            Self::Condition(at) => match at {
+                Some(key) => finding
+                    .condition
+                    .get(key.as_str())
+                    .map(String::as_str)
+                    .into_iter()
+                    .collect(),
+                None => finding.condition.values().map(String::as_str).collect(),
+            },
+            Self::SourceType => of_sources(finding, |source| Some(source.r#type.as_str())),
+            Self::SourceAccessPointArn => of_sources(finding, |source| {
+                source
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| detail.access_point_arn.as_deref())
+            }),
+            Self::SourceAccessPointAccount => of_sources(finding, |source| {
+                source
+                    .detail
+                    .as_ref()
+                    .and_then(|detail| detail.access_point_account.as_deref())
+            }),
+        }
+    }
+}
+
+/// One criterion of the request's `filter`: the finding member it reads, and the
+/// comparisons that member's values must satisfy.
+#[derive(Debug)]
+struct FilterCriterion {
+    member: FindingMember,
+    criterion: Criterion,
+}
+
+impl FilterCriterion {
+    /// Whether `finding` satisfies this criterion, charging the comparison to `budget`.
+    ///
+    /// The operators of one `Criterion` are a CONJUNCTION — a criterion carrying `eq` and
+    /// `contains` demands both — and the values of one operator are a disjunction, which is
+    /// how the model documents them ("an \"equals\" operator to match"). A member holding
+    /// several values (`action`, a whole `principal` map) satisfies a positive operator
+    /// when ANY of its values does, and a negative one only when NONE does.
+    ///
+    /// `Err` once the budget is spent: the match is refused rather than run to the end.
+    fn holds_for(&self, finding: &FindingSummary, budget: &mut Budget) -> Result<bool, Exhausted> {
+        let held = self.member.values(finding);
+        // Reading the member's values is charged for too, so a member holding many of them
+        // costs more than one holding none even before a comparison happens.
+        if !budget.spend(1 + held.len() as u64) {
+            return Err(filter_exhausted());
+        }
+        if let Some(expected) = &self.criterion.eq {
+            if !any_pair(&held, expected, budget, |value, expected| value == expected)? {
+                return Ok(false);
+            }
+        }
+        if let Some(rejected) = &self.criterion.neq {
+            if any_pair(&held, rejected, budget, |value, rejected| value == rejected)? {
+                return Ok(false);
+            }
+        }
+        if let Some(needles) = &self.criterion.contains {
+            if !any_pair(&held, needles, budget, |value, needle| value.contains(needle))? {
+                return Ok(false);
+            }
+        }
+        if let Some(exists) = self.criterion.exists {
+            if exists == held.is_empty() {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// Matching the request's criteria against the account's findings takes more work than one
+/// call spends — so it is the `filter` the caller has to narrow.
+fn filter_exhausted() -> Exhausted {
+    Exhausted {
+        member: FILTER_MEMBER,
+        detail: format!(
+            "matching this filter against the findings of this analyzer takes more than the \
+             {MAX_ANALYSIS_UNITS} steps this emulator spends on one call"
+        ),
+    }
+}
+
+/// Whether `accept` holds for any (held value, criterion value) pair, charged to `budget`
+/// by the BYTES each comparison may touch — so one long value buys no more work than its
+/// length, and the match as a whole is bounded in the product of its factors.
+fn any_pair(
+    held: &[&str],
+    values: &[String],
+    budget: &mut Budget,
+    accept: impl Fn(&str, &str) -> bool,
+) -> Result<bool, Exhausted> {
+    for value in held {
+        for candidate in values {
+            let bytes = value.len().saturating_add(candidate.len());
+            if !budget.spend(1 + (bytes / FILTER_BYTES_PER_UNIT) as u64) {
+                return Err(filter_exhausted());
+            }
+            if accept(value, candidate.as_str()) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// The findings every criterion holds for, in the order they were derived.
+///
+/// Runs beside the derivation on the blocking pool and under the SAME [`Budget`], so one
+/// call's findings-times-criteria work is capped rather than each factor alone.
+fn matching_findings(
+    findings: Vec<(String, FindingSummary)>,
+    criteria: &[FilterCriterion],
+    budget: &mut Budget,
+) -> Result<Vec<(String, FindingSummary)>, Exhausted> {
+    if criteria.is_empty() {
+        return Ok(findings);
+    }
+    let mut matching = Vec::new();
+    for (key, finding) in findings {
+        let mut holds = true;
+        for criterion in criteria {
+            if !criterion.holds_for(&finding, budget)? {
+                holds = false;
+                break;
+            }
+        }
+        if holds {
+            matching.push((key, finding));
+        }
+    }
+    Ok(matching)
+}
+
+/// Read the request's `filter` into the criteria a returned finding must satisfy.
+///
+/// A key naming no member of a finding, and a filter carrying more than
+/// [`MAX_FILTER_CRITERIA`] criteria, are refused with the operation's own
+/// `ValidationException`: it is a field validation, so the message names the member at
+/// fault and the constraint it violated, which is what a client has to fix. The criteria
+/// are ordered by key so a refusal does not depend on the map's layout.
+fn filter_criteria(
+    filter: Option<&std::collections::HashMap<String, Criterion>>,
+) -> Result<Vec<FilterCriterion>, ListFindingsError> {
+    let refuse = |message: String| -> ListFindingsError {
+        ListFindingsErrorModeled::ValidationException(crate::state::field_validation_exception(
+            FILTER_MEMBER,
+            message,
+        ))
+        .into()
+    };
+    let mut keys: Vec<&String> = filter.into_iter().flatten().map(|(key, _)| key).collect();
+    if keys.len() > MAX_FILTER_CRITERIA {
+        // Every criterion is checked against every finding, so the count is a multiplier on
+        // the match and not just a finer query.
+        return Err(refuse(format!(
+            "filter carries {} criteria, more than the {MAX_FILTER_CRITERIA} this emulator \
+             matches against one analyzer's findings",
+            keys.len()
+        )));
+    }
+    keys.sort();
+    let mut criteria = Vec::with_capacity(keys.len());
+    for key in keys {
+        let member = FindingMember::parse(key).ok_or_else(|| {
+            refuse(format!(
+                "filter key {key:?} names no member of a finding; the filterable members \
+                 are {}, and a map-valued member may also be addressed at one of its keys \
+                 (principal.<principal type>, condition.<condition key>)",
+                FILTERABLE_MEMBERS.join(", ")
+            ))
+        })?;
+        criteria.push(FilterCriterion {
+            member,
+            criterion: filter
+                .and_then(|filter| filter.get(key))
+                .cloned()
+                .unwrap_or_default(),
+        });
+    }
+    Ok(criteria)
+}
+
+/// What the request asked the findings to be ordered by: which attribute, and in which
+/// direction.
+#[derive(Debug)]
+struct SortOrder {
+    attribute: SortAttribute,
+    /// `true` for `DESC`, the model's other `OrderBy` value.
+    descending: bool,
+}
+
+/// The attribute a listing is ordered by: a member a filter also reads, one of the
+/// finding's three instants, which order by the instant and not by its rendering, or the
+/// order the analysis derived.
+#[derive(Debug)]
+enum SortAttribute {
+    Member(FindingMember),
+    Instant(fn(&FindingSummary) -> ::aws_smithy_types::DateTime),
+    /// What an order that names no attribute orders by: nothing of the finding, so every
+    /// finding keys the same and the derivation order stands.
+    Derivation,
+}
+
+/// The three instants a finding carries, each sortable by its own value. From the model's
+/// `FindingSummary` members.
+const SORTABLE_INSTANTS: &[&str] = &["createdAt", "analyzedAt", "updatedAt"];
+
+/// The `OrderBy` value that reverses the order, from the model's enum
+/// ([`ORDER_BY_VALUES`]); the other one is the ascending order a request that names none
+/// gets.
+const ORDER_BY_DESCENDING: &str = "DESC";
+
+impl SortAttribute {
+    /// The attribute `name` addresses, or `None` when it addresses no member of a finding.
+    fn parse(name: &str) -> Option<Self> {
+        match name {
+            "createdAt" => Some(Self::Instant(|finding| finding.created_at)),
+            "analyzedAt" => Some(Self::Instant(|finding| finding.analyzed_at)),
+            "updatedAt" => Some(Self::Instant(|finding| finding.updated_at)),
+            _ => FindingMember::parse(name).map(Self::Member),
+        }
+    }
+
+    /// The key `finding` sorts by: an instant as a fixed-width epoch (so it orders by the
+    /// instant), and any other member as its values in order, joined — a member holding
+    /// none sorts before every member that holds one, which is where a finding that does
+    /// not carry the attribute belongs.
+    fn key(&self, finding: &FindingSummary) -> String {
+        match self {
+            Self::Derivation => String::new(),
+            Self::Instant(read) => {
+                let at = read(finding);
+                format!("{:020}.{:09}", at.secs(), at.subsec_nanos())
+            }
+            Self::Member(member) => {
+                let mut held = member.values(finding);
+                held.sort_unstable();
+                held.join("\u{1f}")
+            }
+        }
+    }
+}
+
+/// Read the request's `sort` into the order the findings are reported in.
+///
+/// `None` when the request names no sort: the findings are then reported in the order the
+/// analysis derived them (resource, then statement, then principal), which the model
+/// documents no alternative default for. An `attributeName` naming no member of a finding is
+/// refused with the operation's own `ValidationException` naming it; `orderBy` carries the
+/// model's `OrderBy` enum, so a value outside it is already refused before this handler
+/// runs and what reaches here is one of the two the enum lists.
+fn sort_order(sort: Option<&SortCriteria>) -> Result<Option<SortOrder>, ListFindingsError> {
+    let Some(sort) = sort else {
+        return Ok(None);
+    };
+    // The model gives the member no default, so a request that names no order is ordered
+    // ascending — the direction the analysis derives in.
+    let descending = sort.order_by.as_deref() == Some(ORDER_BY_DESCENDING);
+    let Some(name) = sort.attribute_name.as_deref() else {
+        // An order without an attribute names nothing to order BY, so the derivation order
+        // stands; a `DESC` of it is still a reversal, which is what the caller asked for.
+        return Ok(Some(SortOrder {
+            attribute: SortAttribute::Derivation,
+            descending,
+        }));
+    };
+    let attribute = SortAttribute::parse(name).ok_or_else(|| {
+        ListFindingsError::from(ListFindingsErrorModeled::ValidationException(
+            crate::state::field_validation_exception(
+                SORT_ATTRIBUTE_MEMBER,
+                format!(
+                    "sort.attributeName {name:?} names no member of a finding; the attributes a \
+                     listing can be ordered by are {}, {}, and a map-valued member addressed at \
+                     one of its keys (principal.<principal type>, condition.<condition key>)",
+                    FILTERABLE_MEMBERS.join(", "),
+                    SORTABLE_INSTANTS.join(", ")
+                ),
+            ),
+        ))
+    })?;
+    Ok(Some(SortOrder {
+        attribute,
+        descending,
+    }))
+}
+
+/// The findings in the order the request asked for, each paired with the key the page is
+/// taken by.
+///
+/// The key is the finding's POSITION in that order, so the continuation token names the
+/// place in the ordered result a caller resumes at whatever the order was — the derivation
+/// key cannot do that once a sort reorders the findings. Sorting needs no budget of its
+/// own: it runs over at most [`MAX_DERIVED_FINDINGS`] keys, each built from members the
+/// policy parser has already bounded.
+fn ordered(
+    findings: Vec<(String, FindingSummary)>,
+    sort: Option<&SortOrder>,
+) -> Vec<(String, FindingSummary)> {
+    let mut findings = findings;
+    if let Some(sort) = sort {
+        // Keyed once per finding rather than per comparison, and the derivation key breaks
+        // a tie, so two findings with the same attribute value keep a stable order.
+        let mut keyed: Vec<(String, String, FindingSummary)> = findings
+            .into_iter()
+            .map(|(derived, finding)| (sort.attribute.key(&finding), derived, finding))
+            .collect();
+        keyed.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+        if sort.descending {
+            keyed.reverse();
+        }
+        findings = keyed
+            .into_iter()
+            .map(|(_, derived, finding)| (derived, finding))
+            .collect();
+    }
+    findings
+        .into_iter()
+        .enumerate()
+        .map(|(position, (_, finding))| (format!("{position:08}"), finding))
+        .collect()
 }

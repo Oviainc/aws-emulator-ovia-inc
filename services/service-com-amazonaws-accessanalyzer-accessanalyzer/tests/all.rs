@@ -25,6 +25,8 @@ mod aws_worded_messages;
 mod check_no_public_access;
 #[path = "all/error_payloads.rs"]
 mod error_payloads;
+#[path = "all/external_access_findings.rs"]
+mod external_access_findings;
 #[path = "all/fixed_refusal_texts.rs"]
 mod fixed_refusal_texts;
 #[path = "all/harness.rs"]

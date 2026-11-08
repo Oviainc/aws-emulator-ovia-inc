@@ -36,6 +36,11 @@ jsonc-parser = "0.26"
 # Mints an `accessPreviewId`: the 128 unguessable bits a version-4 UUID carries are
 # taken from a digest over the process's entropy, a counter and the clock.
 sha2 = { workspace = true }
+# An external access analyzer reports findings for the account's own resources, so the
+# analysis reads each resource-based policy out of the service that OWNS it: a role's
+# trust policy from IAM, a bucket policy from S3.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

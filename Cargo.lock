@@ -7750,6 +7750,8 @@ dependencies = [
  "jsonc-parser",
  "percent-encoding",
  "serde_json",
+ "service-com-amazonaws-iam-awsidentitymanagementv20100508",
+ "service-com-amazonaws-s3-amazons3",
  "sha2 0.10.9",
  "tokio",
  "tracing",

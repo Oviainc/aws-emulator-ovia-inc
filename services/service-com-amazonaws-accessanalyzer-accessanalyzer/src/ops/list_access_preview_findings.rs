@@ -133,7 +133,15 @@
 //! * `ThrottlingException` (HTTP 429) — Throttling limit exceeded error.
 //! * `ValidationException` (HTTP 400) — Validation exception error.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
+
+// The analysis a preview shares with the findings of a DEPLOYED resource: one budget type,
+// one refusal type, and the ONE rule for which principals a statement grants external
+// access to, so the two analyses cannot drift apart.
+use crate::state::{
+    external_grants, granted_actions, granted_conditions, principal_account, Budget, Exhausted,
+    ServicePrincipals,
+};
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -281,7 +289,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the worker is taking one page (at most [`crate::state::MAX_PAGE_SIZE`] items)
         // out of the result.
         let analysed = ::tokio::task::spawn_blocking(move || {
-            let mut budget = Budget::new();
+            let mut budget = Budget::new(MAX_ANALYSIS_UNITS);
             let findings = preview_findings(&record, &mut budget)?;
             matching_findings(findings, &criteria, &mut budget)
         })
@@ -363,10 +371,6 @@ const FINDING_SOURCE_TYPE_POLICY: &str = "POLICY";
 const FINDING_SOURCE_TYPE_S3_ACCESS_POINT: &str = "S3_ACCESS_POINT";
 const FINDING_SOURCE_TYPE_S3_ACCESS_POINT_ACCOUNT: &str = "S3_ACCESS_POINT_ACCOUNT";
 
-/// The `Principal` element's wildcard, as a finding reports the principal it stands for:
-/// a statement that admits every principal grants to `*` and the finding says so.
-const EVERY_PRINCIPAL: &str = "*";
-
 /// The request member a policy the STORE holds is blamed on, for the one error text a
 /// finding can carry: the stored document came in as `configurations`.
 const CONFIGURATIONS_MEMBER: &str = "configurations";
@@ -413,42 +417,6 @@ const FILTER_BYTES_PER_UNIT: usize = 64;
 /// every finding. The emulator's own ceiling, in the same spirit as the model's
 /// `@length(max: 20)` on each criterion's `ValueList`.
 const MAX_FILTER_CRITERIA: usize = 20;
-
-/// What an analysis may still spend, charged for every statement visited, principal
-/// considered, string copied into a finding and quantum of bytes compared by a criterion.
-#[derive(Debug)]
-struct Budget {
-    left: u64,
-}
-
-impl Budget {
-    fn new() -> Self {
-        Self {
-            left: MAX_ANALYSIS_UNITS,
-        }
-    }
-
-    /// Charge `units`; `false` once the budget is spent, which stops the analysis
-    /// BEFORE it does the work the units were for.
-    fn spend(&mut self, units: u64) -> bool {
-        match self.left.checked_sub(units) {
-            Some(left) => {
-                self.left = left;
-                true
-            }
-            None => false,
-        }
-    }
-}
-
-/// Why an analyzable preview could not be listed: the analysis is past one of this
-/// emulator's ceilings. Names the request member a client has to change and what the
-/// ceiling is — never the stored configuration's content.
-#[derive(Debug)]
-struct Exhausted {
-    member: &'static str,
-    detail: String,
-}
 
 /// The preview grants more external access than this emulator reports findings for.
 fn too_many_findings() -> Exhausted {
@@ -581,7 +549,13 @@ fn preview_findings(
                         let per_finding = 1
                             + actions.as_ref().map_or(0, Vec::len) as u64
                             + condition.as_ref().map_or(0, HashMap::len) as u64;
-                        for grant in external_grants(statement, &owner_account) {
+                        for grant in external_grants(
+                            statement,
+                            &owner_account,
+                            // An access preview reports a service principal as the
+                            // external access it is asked about; see `ServicePrincipals`.
+                            ServicePrincipals::OutsideZoneOfTrust,
+                        ) {
                             if findings.len() >= MAX_DERIVED_FINDINGS {
                                 return Err(too_many_findings());
                             }
@@ -617,127 +591,6 @@ fn preview_findings(
     }
     findings.sort_by(|left, right| left.0.cmp(&right.0));
     Ok(findings)
-}
-
-/// One external grant a statement makes: which principal it reaches, and whether that
-/// principal is the public.
-#[derive(Debug)]
-struct ExternalGrant {
-    kind: policy::PrincipalKind,
-    value: String,
-    is_public: bool,
-}
-
-/// The principals OUTSIDE the zone of trust that one statement grants access to, in the
-/// order the statement names them.
-///
-/// Empty for a statement that grants nothing (`Deny`), names no principal, or names only
-/// principals of the owning account — which is what "this configuration allows no
-/// external access" means.
-fn external_grants(statement: &policy::Statement, owner_account: &str) -> Vec<ExternalGrant> {
-    if statement.effect != policy::Effect::Allow {
-        return Vec::new();
-    }
-    let Some(principals) = statement.principals.as_ref() else {
-        return Vec::new();
-    };
-
-    // An element that admits EVERY principal reaches principals outside the account
-    // whatever else it lists, and `NotPrincipal` with `Allow` admits every principal the
-    // element does not name — so the grant is to `*`, and the principals such an element
-    // lists are the ones EXCLUDED from it rather than granted to.
-    if principals.any || principals.negated {
-        return vec![ExternalGrant {
-            kind: policy::PrincipalKind::Aws,
-            value: EVERY_PRINCIPAL.to_string(),
-            // The one public-access rule in this crate, which `CheckNoPublicAccess`
-            // answers with: public exactly when no `Condition` clause binds the caller.
-            is_public: super::check_no_public_access::grants_public_access(statement),
-        }];
-    }
-
-    principals
-        .values
-        .iter()
-        .filter(|named| outside_zone_of_trust(named, owner_account))
-        .map(|named| ExternalGrant {
-            kind: named.kind,
-            value: named.value.clone(),
-            // A named principal is one entity, never the public.
-            is_public: false,
-        })
-        .collect()
-}
-
-/// Whether one named principal is outside the zone of trust of `owner_account`.
-///
-/// An `AWS` principal belongs to the account its ARN names (the parser has already
-/// normalised a bare account id to that account's `:root` ARN), so it is inside the zone
-/// of trust exactly when that account is the owning one; a principal whose account cannot
-/// be read — a wildcard account segment, or a value that is not an ARN — is reported
-/// rather than trusted. The other three principal types name no account to compare
-/// against: a service principal, a federated identity and an Amazon S3 canonical user are
-/// all entities the owning account's own principals do not cover, so each is external.
-fn outside_zone_of_trust(named: &policy::NamedPrincipal, owner_account: &str) -> bool {
-    match named.kind {
-        policy::PrincipalKind::Aws => {
-            principal_account(&named.value).is_none_or(|account| account != owner_account)
-        }
-        policy::PrincipalKind::Service
-        | policy::PrincipalKind::Federated
-        | policy::PrincipalKind::CanonicalUser => true,
-    }
-}
-
-/// The account segment of an ARN, or `None` when the value is not an ARN with one.
-///
-/// `arn:<partition>:<service>:<region>:<account>:<resource>` — the account is the fifth
-/// of six colon-separated fields, and the resource part may itself contain `:`.
-fn principal_account(value: &str) -> Option<&str> {
-    let fields: Vec<&str> = value.splitn(6, ':').collect();
-    if fields.len() != 6 || fields[0] != "arn" {
-        return None;
-    }
-    Some(fields[4]).filter(|account| !account.is_empty())
-}
-
-/// The actions a statement allows the external principal to perform, as the finding
-/// reports them.
-///
-/// `None` for a statement written with `NotAction`, which allows every action EXCEPT the
-/// ones it lists: the finding's `action` is "the action in the analyzed policy statement
-/// that an external principal has permission to perform", and that set is not the listed
-/// one — reporting the list would name actions the statement does not allow.
-fn granted_actions(statement: &policy::Statement) -> Option<Vec<String>> {
-    if statement.actions.negated || statement.actions.values.is_empty() {
-        return None;
-    }
-    Some(statement.actions.values.clone())
-}
-
-/// The condition keys a statement constrains, keyed as the document spells them.
-///
-/// `ConditionKeyMap` is one value per key, so a key constrained by several operators (or
-/// accepting several values) reports them as one comma-separated value; `None` for a
-/// statement that carries no `Condition` at all, since the member reports "the condition
-/// in the analyzed policy statement that resulted in a finding".
-fn granted_conditions(statement: &policy::Statement) -> Option<HashMap<String, String>> {
-    if statement.conditions.is_empty() {
-        return None;
-    }
-    let mut accepted: BTreeMap<&str, Vec<String>> = BTreeMap::new();
-    for clause in &statement.conditions {
-        accepted
-            .entry(clause.spelling.as_str())
-            .or_default()
-            .extend(clause.values.iter().cloned());
-    }
-    Some(
-        accepted
-            .into_iter()
-            .map(|(key, values)| (key.to_string(), values.join(",")))
-            .collect(),
-    )
 }
 
 /// How the access a finding reports is granted, for the resource types the model says

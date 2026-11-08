@@ -29,6 +29,12 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::{Duration, SystemTime};
 
+/// The external access the account's own resource-based policies grant: the ONE analysis
+/// every external-access finding this service reports is derived from, and the grant rule
+/// the access-preview analysis shares with it.
+mod external_access;
+pub use external_access::*;
+
 use crate::ops::types::{
     AccessPreview, AccessPreviewStatusReason, AnalyzerConfiguration, AnalyzerSummary,
     ArchiveRuleSummary, CloudTrailProperties, Configuration, ConflictException, Criterion,
