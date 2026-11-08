@@ -16,7 +16,8 @@
 //! other.
 //!
 //! `StartFHIRExportJob` mints an export job only for a data store that is
-//! ACTIVE and `StartFHIRImportJob` is still a scaffold stub, so the job records
+//! ACTIVE and `StartFHIRImportJob` reads an input location out of the emulator's
+//! Amazon S3, so the job records
 //! are seeded into the SAME store the handlers read, through the shared engine
 //! the harness exposes — exactly how `tests/all/fhir_export_job_listing.rs` and
 //! `tests/all/fhir_import_job_listing.rs` seed theirs. Every call that TRIGGERS
@@ -116,6 +117,11 @@ async fn owner(service: &HealthLake, name: &str, token: &'static str) -> Owner {
                 message: None,
                 progress_report: None,
                 validation_level: None,
+                // A record this suite seeds was not started through the API, so
+                // it carries no `ClientToken` and there is no request to
+                // fingerprint.
+                client_token: None,
+                request_fingerprint: String::new(),
             },
         );
     }

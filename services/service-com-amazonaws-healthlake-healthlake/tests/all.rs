@@ -53,6 +53,8 @@ mod fhir_export_job_start;
 mod fhir_import_job_describe;
 #[path = "all/fhir_import_job_listing.rs"]
 mod fhir_import_job_listing;
+#[path = "all/fhir_import_job_start.rs"]
+mod fhir_import_job_start;
 #[path = "all/fhir_rest_and_validate_source.rs"]
 mod fhir_rest_and_validate_source;
 #[path = "all/fhir_update_interaction.rs"]

@@ -13,11 +13,13 @@
 //! `ResourceNotFoundException` in this service's fixed sentence for the
 //! resource that was not found, never with an empty or synthesised job.
 //!
-//! `StartFHIRImportJob` — the operation that MINTS an import job record — is
-//! still a scaffold stub with its own issue, so the rows below are seeded into
-//! the SAME store this handler reads, through the shared engine the harness
-//! exposes (exactly how `tests/all/fhir_export_job_listing.rs` seeds export
-//! jobs and `tests/all/data_transformation_job.rs` seeds transformation jobs).
+//! `StartFHIRImportJob` — the operation that MINTS an import job record — needs
+//! an input location in the emulator's Amazon S3 to read, so the rows below are
+//! seeded directly into the SAME store this handler reads, through the shared
+//! engine the harness exposes (exactly how `tests/all/fhir_export_job_listing.rs`
+//! seeds export jobs and `tests/all/data_transformation_job.rs` seeds
+//! transformation jobs); what a STARTED job records is pinned by
+//! `tests/all/fhir_import_job_start.rs`.
 //! Every `DescribeFHIRImportJob` call itself goes over the real awsJson1_0 wire
 //! through `MultiServiceRouter::dispatch` — the entry point `core/router`
 //! serves — so routing, deserialization, the modelled constraints and the error
@@ -215,6 +217,10 @@ impl Seed {
             message: self.message.map(str::to_string),
             progress_report: progress_report(self.progress),
             validation_level: self.validation_level.map(str::to_string),
+            // A record this suite seeds was not started through the API, so it
+            // carries no `ClientToken` and there is no request to fingerprint.
+            client_token: None,
+            request_fingerprint: String::new(),
         }
     }
 

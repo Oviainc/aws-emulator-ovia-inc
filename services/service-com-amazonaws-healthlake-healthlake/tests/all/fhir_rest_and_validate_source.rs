@@ -69,6 +69,48 @@ impl HealthLake {
         Self { router, engine }
     }
 
+    /// The same harness with the emulator's own Amazon S3 mounted beside this
+    /// service on the ONE shared engine, exactly as the assembled router mounts
+    /// them.
+    ///
+    /// `StartFHIRImportJob` reads the FHIR data its input location names out of
+    /// that service, so the suite that drives an import
+    /// (`tests/all/fhir_import_job_start.rs`) stages its input through Amazon
+    /// S3's OWN operations and the import reads what Amazon S3 really holds.
+    pub(crate) fn with_object_store() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.register_service(
+            service_com_amazonaws_healthlake_healthlake::EmulatedService::new(Arc::clone(&engine)),
+        );
+        router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+            Arc::clone(&engine),
+        ));
+        Self { router, engine }
+    }
+
+    /// An Amazon S3 client over this emulator's own in-process callback — the
+    /// seam an import job reads its input through, so an object staged with this
+    /// client is the object an import reads.
+    pub(crate) fn s3(&self) -> aws_sdk_s3::Client {
+        let callback = smithy_server_runtime::EmbeddedEmulator::from_router(self.router.clone());
+        let config = aws_sdk_s3::Config::builder()
+            .behavior_version(aws_sdk_s3::config::BehaviorVersion::latest())
+            .region(aws_sdk_s3::config::Region::new("us-east-1"))
+            .endpoint_url("https://s3.us-east-1.amazonaws.com".to_string())
+            .force_path_style(true)
+            .credentials_provider(callback.aws_credentials_provider())
+            .http_client(callback.http_client())
+            .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+            .timeout_config(aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+            .identity_cache(aws_sdk_s3::config::IdentityCache::no_cache())
+            .stalled_stream_protection(
+                aws_sdk_s3::config::StalledStreamProtectionConfig::disabled(),
+            )
+            .build();
+        aws_sdk_s3::Client::from_conf(config)
+    }
+
     /// Dispatch one awsJson1_0 control-plane call.
     pub(crate) async fn rpc(&self, operation: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()

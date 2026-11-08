@@ -37,9 +37,11 @@
 //! here — [`ComAmazonawsHealthlakeHealthlakeState::import_jobs`], one by `JobId`,
 //! the other filtered and paged — so an import job is
 //! dropped with the data store it belonged to exactly as an export job is.
-//! `StartFHIRImportJob` is the operation that MINTS one; it is still a scaffold
-//! stub (its own issue), so until it is written the only records in that map are
-//! the ones a test seeds.
+//! `StartFHIRImportJob` is the operation that MINTS one, and its RUN —
+//! [`import_run`] — reads the FHIR data the request's input location names out of
+//! this emulator's own object store and DELIVERS each resource into the data
+//! store's own [`Datastore::fhir_resources`], where the FHIR REST data plane
+//! serves it exactly as it serves one a caller created.
 //!
 //! The data transformation job is the fifth: a job record is addressed by its
 //! own `JobId`, `StartDataTransformationJob` MINTS one in
@@ -52,6 +54,9 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
+
+mod import_run;
+pub use import_run::*;
 
 use crate::ops::types::{
     AnalyticsConfiguration, BackupConfiguration, DatastoreBackupStatus, DatastoreProperties,
@@ -212,9 +217,10 @@ pub fn datastore_in_transition_message(status: DatastoreStatus, action: Datastor
 ///
 /// A typed value rather than a free-form word: the operations of this resource
 /// cannot drift into different spellings of the same sentence, and a new one has
-/// to add its variant here. `UpdateFHIRDatastore` is deliberately absent: it
-/// does not classify a non-`ACTIVE` target as a transition conflict at all, and
-/// states [`DATASTORE_NOT_ACTIVE_MESSAGE`] instead.
+/// to add its variant here. `UpdateFHIRDatastore` and `StartFHIRImportJob` are
+/// deliberately absent: neither classifies a non-`ACTIVE` target as a transition
+/// conflict at all — they draw ONE line, active or not, and state
+/// [`DATASTORE_NOT_ACTIVE_MESSAGE`] through [`Datastore::gate_active`] instead.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DatastoreAction {
     Delete,
@@ -260,8 +266,8 @@ pub enum DatastoreRefusal {
     Gone(String),
 }
 
-/// The sentence `UpdateFHIRDatastore` refuses a data store with when the record
-/// exists but its `DatastoreStatus` is anything other than `ACTIVE`.
+/// The sentence this service refuses an operation with when the record exists
+/// but its `DatastoreStatus` is anything other than `ACTIVE`.
 ///
 /// Fixed, like the texts above: it quotes neither the requested `DatastoreId`
 /// nor the status the record happens to be in, and it reads the same whichever
@@ -269,7 +275,7 @@ pub enum DatastoreRefusal {
 /// being settled and usable, not which stage of the lifecycle it sits at. It
 /// stays inside the modelled `Message` alphabet
 /// (`^([\p{L}\p{Z}\p{N}_.:/=+\-%@]*)$`), so the text is one the model would
-/// admit.
+/// admit. [`Datastore::gate_active`] is the ONE gate that states it.
 pub const DATASTORE_NOT_ACTIVE_MESSAGE: &str = "Specified datastore is not active.";
 
 /// The sentence this service refuses a point-in-time restore with when the
@@ -427,6 +433,27 @@ pub const MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE: usize = 16 << 20;
 /// [`MAX_DATASTORES`] data stores at their own budget cannot multiply into an
 /// unbounded heap.
 pub const MAX_FHIR_RESOURCE_BYTES_TOTAL: usize = 64 << 20;
+
+/// Which of the three ceilings on retained FHIR resources a write reached.
+///
+/// The ceilings are decided once, in
+/// [`ComAmazonawsHealthlakeHealthlakeState::admits_fhir_resource`]; what each
+/// caller keeps for itself is only how its own surface STATES the refusal — the
+/// FHIR `OperationOutcome` the REST data plane answers, or the `Message` an
+/// import job's record carries — so a resource one of them would not retain is
+/// not retained by the other either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FhirRetentionCeiling {
+    /// [`MAX_FHIR_RESOURCES_PER_DATASTORE`]: the data store already holds as
+    /// many resources as this emulator retains for one.
+    ResourceCount,
+    /// [`MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE`]: the data store already retains
+    /// as many resource bytes as this emulator holds for one.
+    DatastoreBytes,
+    /// [`MAX_FHIR_RESOURCE_BYTES_TOTAL`]: every data store together already
+    /// retains as many resource bytes as this emulator holds.
+    StoreBytes,
+}
 
 /// The most tags one data store carries.
 ///
@@ -906,6 +933,34 @@ impl Datastore {
         }
     }
 
+    /// `Ok` when this record is the settled, usable `ACTIVE` data store an
+    /// operation that draws ONE line requires, else the sentence that refusal
+    /// states.
+    ///
+    /// The companion of [`Self::gate_action`] for the operations of this
+    /// resource that do NOT classify a non-`ACTIVE` target as a transition
+    /// conflict: `UpdateFHIRDatastore` and `StartFHIRImportJob` both answer
+    /// every status other than `ACTIVE` — the lifecycle transitions `CREATING`,
+    /// `UPDATING` and `DELETING`, and the terminal `DELETED` — with the same
+    /// refusal, worded [`DATASTORE_NOT_ACTIVE_MESSAGE`], so the answer does not
+    /// depend on which stage of the lifecycle the record sits at. It is NOT a
+    /// not-found: the record is still there and still reported by
+    /// `DescribeFHIRDatastore`, so `ResourceNotFoundException` stays for a
+    /// `DatastoreId` the registry holds no record of.
+    ///
+    /// Reads the status only, and writes nothing: call
+    /// [`ComAmazonawsHealthlakeHealthlakeState::settle_lifecycle`] first, so the
+    /// status this gates on is the one the clock already owes.
+    pub fn gate_active(&self) -> Result<(), &'static str> {
+        match self.status {
+            DatastoreStatus::Active => Ok(()),
+            DatastoreStatus::Creating
+            | DatastoreStatus::Updating
+            | DatastoreStatus::Deleting
+            | DatastoreStatus::Deleted => Err(DATASTORE_NOT_ACTIVE_MESSAGE),
+        }
+    }
+
     /// The FHIR resource of `resource_type` with logical id `id`, or `None` when
     /// this data store holds no such resource.
     pub fn fhir_resource(&self, resource_type: &str, id: &str) -> Option<&FhirResource> {
@@ -1310,6 +1365,18 @@ pub struct ImportJob {
     pub progress_report: Option<JobProgressReport>,
     /// `ValidationLevel` as the request set it, absent when it set none.
     pub validation_level: Option<String>,
+    /// The `ClientToken` the request that started this job carried, if any.
+    ///
+    /// Held ON the job rather than in a second map beside the registry, for the
+    /// reason [`ExportJob::client_token`] is: a token is dropped with the job it
+    /// started — and so with the data store that job belonged to — and cannot
+    /// resolve to a record that is gone.
+    pub client_token: Option<String>,
+    /// A fingerprint of the request that started this job, so a `ClientToken`
+    /// reused with a DIFFERENT request is refused rather than silently answered
+    /// with this job. Built by the operation that mints the record through
+    /// [`request_fingerprint`].
+    pub request_fingerprint: String,
 }
 
 impl ImportJob {
@@ -1931,11 +1998,12 @@ pub struct ComAmazonawsHealthlakeHealthlakeState {
     /// Every FHIR import job, by `JobId`. A `BTreeMap` so
     /// `ListFHIRImportJobs` pages in a stable, resumable order. A job's record
     /// is dropped with the data store it belongs to, by
-    /// this state's own `drop_datastore`. The ceiling on how many job
-    /// records there can be belongs with the operation that MINTS them
-    /// (`StartFHIRImportJob`, still a scaffold stub), which is the only place a
-    /// job count can be refused.
+    /// this state's own `drop_datastore`. Bounded by [`MAX_IMPORT_JOBS`], which
+    /// `StartFHIRImportJob` — the only operation that mints one — refuses past.
     pub import_jobs: BTreeMap<String, ImportJob>,
+    /// How many FHIR import jobs have been started, mixed into the next `JobId`
+    /// so two starts in the same clock tick still get distinct ones.
+    pub import_jobs_started: u64,
     /// Every data transformation job, by `JobId` — the identifier
     /// `DescribeDataTransformationJob` addresses one by. A `BTreeMap` so
     /// `ListDataTransformationJobs` pages in a stable, resumable order. A
@@ -2212,6 +2280,53 @@ impl ComAmazonawsHealthlakeHealthlakeState {
         self.fhir_resource_bytes_total_admits(added, released)
     }
 
+    /// Whether the data store `datastore_id` can RETAIN a resource of `bytes`
+    /// that releases `released` bytes of versions the same write drops, and
+    /// whether that write adds a resource (`retains_one_more`) or writes a
+    /// further version of one the data store already holds.
+    ///
+    /// The three ceilings this emulator holds its retained FHIR resources to, in
+    /// ONE place so every writer charges them identically: how many resources
+    /// one data store holds, how many bytes one data store retains, and how many
+    /// bytes every data store retains together. Each is checked BEFORE anything
+    /// is written, and with `saturating_*`, so no product of caller-chosen
+    /// factors can grow the heap and an arithmetic edge cannot wrap into an
+    /// admission.
+    ///
+    /// The store-wide total goes through [`Self::admits_fhir_resource_bytes`],
+    /// which is why `self` is taken by `&mut`: that ceiling bounds what this
+    /// service HOLDS, so the terminal records whose bytes come back by being
+    /// dropped are reaped before a write is refused for them. The two
+    /// per-data-store ceilings are about the data store being written, which is
+    /// serving and so never terminal, and are unaffected.
+    pub fn admits_fhir_resource(
+        &mut self,
+        datastore_id: &str,
+        bytes: usize,
+        released: usize,
+        retains_one_more: bool,
+    ) -> Result<(), FhirRetentionCeiling> {
+        let held = self
+            .datastores
+            .get(datastore_id)
+            .map_or(0, |datastore| datastore.fhir_resources.len());
+        if retains_one_more && held >= MAX_FHIR_RESOURCES_PER_DATASTORE {
+            return Err(FhirRetentionCeiling::ResourceCount);
+        }
+        let held_bytes = self
+            .datastores
+            .get(datastore_id)
+            .map_or(0, |datastore| datastore.fhir_resource_bytes)
+            .saturating_sub(released);
+        if held_bytes.saturating_add(bytes) > MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE {
+            return Err(FhirRetentionCeiling::DatastoreBytes);
+        }
+        if !self.admits_fhir_resource_bytes(bytes, released) {
+            return Err(FhirRetentionCeiling::StoreBytes);
+        }
+        Ok(())
+    }
+
     /// Whether the retained total AS IT STANDS admits `added` more bytes once
     /// `released` of the bytes it counts come back.
     fn fhir_resource_bytes_total_admits(&self, added: usize, released: usize) -> bool {
@@ -2269,16 +2384,41 @@ impl ComAmazonawsHealthlakeHealthlakeState {
     ///
     /// The companion of [`Self::settle_export_jobs`] for the import job
     /// records, and called for the same reason: the transition was owed at this
-    /// instant whether or not anybody called, so a reporting operation applying
-    /// it is the record catching up with the clock. The ceiling on how many job
-    /// records there can be belongs with the operation that MINTS them
-    /// (`StartFHIRImportJob`, still a scaffold stub), which is the only place a
-    /// job count can be refused, so none is asserted here.
+    /// instant whether or not anybody called. The walk is over the job records
+    /// the store holds, which [`MAX_IMPORT_JOBS`] bounds — refused by the
+    /// operation that MINTS them (`StartFHIRImportJob`), the only place a job
+    /// count can be refused — so it costs the same whatever a caller does.
     pub fn settle_import_jobs(&mut self) {
         let (now, wall_now) = (Instant::now(), SystemTime::now());
         for job in self.import_jobs.values_mut() {
             job.settle(now, wall_now);
         }
+    }
+
+    /// Mint an unused import `JobId`: 32 lowercase hex characters, which
+    /// satisfies the modelled `JobId` bounds (len 1..32, and an alphabet that
+    /// admits hex) and is the form every other identifier this service mints
+    /// takes.
+    pub fn next_import_job_id(&mut self, started_at: SystemTime) -> String {
+        loop {
+            self.import_jobs_started += 1;
+            let id = mint_hex_id(IMPORT_JOB_MINT_DOMAIN, self.import_jobs_started, started_at);
+            if !self.import_jobs.contains_key(&id) {
+                return id;
+            }
+        }
+    }
+
+    /// The import job one `ClientToken` started, or `None` when no held job was
+    /// started with that token.
+    ///
+    /// The token is held ON the job record, so this is a walk over the jobs
+    /// [`MAX_IMPORT_JOBS`] bounds rather than a second map to keep in step with
+    /// the first — the same shape [`Self::export_job_for_client_token`] takes.
+    pub fn import_job_for_client_token(&self, token: &str) -> Option<&ImportJob> {
+        self.import_jobs
+            .values()
+            .find(|job| job.client_token.as_deref() == Some(token))
     }
 
     /// Materialise every transformation job transition the clock has ALREADY
@@ -2513,6 +2653,12 @@ impl ComAmazonawsHealthlakeHealthlakeState {
 /// job has no ARN, so the domain is named here rather than taken from an ARN
 /// prefix.
 const EXPORT_JOB_MINT_DOMAIN: &str = "export-job/";
+
+/// The mint domain a FHIR import job's `JobId` is derived under, so it cannot
+/// collide with an export job's — or any other resource's — id for the same
+/// counter and instant. Like an export job, an import job has no ARN, so the
+/// domain is named here rather than taken from an ARN prefix.
+const IMPORT_JOB_MINT_DOMAIN: &str = "import-job/";
 
 /// The mint domain a data transformation job's `JobId` is derived under, so it
 /// cannot collide with another resource's id for the same counter and instant.

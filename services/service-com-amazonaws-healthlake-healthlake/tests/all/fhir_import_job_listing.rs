@@ -11,12 +11,13 @@
 //! data store the service does not hold is refused with the modelled
 //! `ResourceNotFoundException`, never with an empty page.
 //!
-//! `StartFHIRImportJob` — the operation that MINTS an import job record — is
-//! still a scaffold stub with its own issue, so the rows below are seeded into
-//! the SAME store this handler reads, through the shared engine the harness
-//! exposes (exactly how `tests/all/fhir_export_job_listing.rs` seeds export
-//! jobs and `tests/all/fhir_import_job_describe.rs` seeds import jobs for the
-//! describe path). What ONE import job reports, member by member, is pinned by
+//! `StartFHIRImportJob` — the operation that MINTS an import job record — needs
+//! an input location in the emulator's Amazon S3 to read, so the rows below are
+//! seeded directly into the SAME store this handler reads, through the shared
+//! engine the harness exposes (exactly how `tests/all/fhir_export_job_listing.rs`
+//! seeds export jobs and `tests/all/fhir_import_job_describe.rs` seeds import
+//! jobs for the describe path); what a STARTED job records is pinned by
+//! `tests/all/fhir_import_job_start.rs`. What ONE import job reports, member by member, is pinned by
 //! `tests/all/fhir_import_job_describe.rs`; this suite pins what a LISTING of
 //! them reports.
 //! Every `ListFHIRImportJobs` call itself goes over the real awsJson1_0 wire
@@ -159,6 +160,11 @@ fn seed_jobs(service: &HealthLake, datastore_id: &str, seeds: &[Seed]) -> Vec<St
                     message: None,
                     progress_report: None,
                     validation_level: None,
+                    // A record this suite seeds was not started through the API,
+                    // so it carries no `ClientToken` and there is no request to
+                    // fingerprint.
+                    client_token: None,
+                    request_fingerprint: String::new(),
                 },
             );
         }

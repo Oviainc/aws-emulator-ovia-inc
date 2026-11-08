@@ -1131,39 +1131,46 @@ async fn the_store_bounds_how_many_tags_one_data_store_carries() {
 }
 
 #[tokio::test]
-async fn an_unimplemented_operation_still_answers_501() {
+async fn every_modelled_operation_of_this_service_is_implemented() {
     let service = HealthLake::new();
     let (id, _arn) = service
         .create(&json!({ "DatastoreTypeVersion": "R4" }))
         .await;
 
-    // The rest of the surface is deliberately still scaffolded: for a request
-    // that satisfies every modelled constraint it must answer "nobody has
-    // written it yet", never an empty success. (`UpdateFHIRDatastore` is NOT in
-    // this list any more — it is implemented; see
-    // `control_plane_error_semantics`. Neither is `ListFHIRExportJobs` — see
-    // `fhir_export_job_listing`, nor `ListFHIRImportJobs` — see
-    // `fhir_import_job_listing`, nor `UntagResource` — see
-    // `resource_untagging`.)
-    let cases = [(
-        "StartFHIRImportJob",
-        json!({
-            "DatastoreId": &id,
-            "InputDataConfig": { "S3Uri": "s3://healthlake-import-bucket/input" },
-            "JobOutputDataConfig": {
-                "S3Configuration": {
-                    "S3Uri": "s3://healthlake-import-bucket/output",
-                    "KmsKeyId": "1234abcd-12ab-34cd-56ef-1234567890ab",
-                }
-            },
-            "DataAccessRoleArn": "arn:aws:iam::111122223333:role/HealthLakeImport",
-        }),
-    )];
-    for (operation, request) in cases {
-        let (status, payload) = service.call(operation, &request).await;
-        assert_eq!(
-            status, 501,
-            "case {operation:?}: a scaffolded operation must answer 501, got {status}: {payload}"
-        );
-    }
+    // This suite used to pin the 501 a scaffolded operation answers, over the
+    // operations of this service that were still scaffolds. There are none left:
+    // `StartFHIRImportJob` was the last of them (see
+    // `tests/all/fhir_import_job_start.rs`), so what is asserted here now is the
+    // other half of that rule — a request satisfying every modelled constraint
+    // reaches a handler that reads and writes this service's state, and NO
+    // operation answers "nobody has written it yet" any more.
+    let (status, payload) = service
+        .call(
+            "StartFHIRImportJob",
+            &json!({
+                "DatastoreId": &id,
+                "InputDataConfig": { "S3Uri": "s3://healthlake-import-bucket/input" },
+                "JobOutputDataConfig": {
+                    "S3Configuration": {
+                        "S3Uri": "s3://healthlake-import-bucket/output",
+                        "KmsKeyId": "1234abcd-12ab-34cd-56ef-1234567890ab",
+                    }
+                },
+                "DataAccessRoleArn": "arn:aws:iam::111122223333:role/HealthLakeImport",
+            }),
+        )
+        .await;
+    assert_ne!(
+        status, 501,
+        "no operation of this service is a scaffold any more, got {status}: {payload}"
+    );
+    // The data store is still `CREATING` here, which the implemented handler
+    // refuses with the modelled access-denied answer — a refusal that comes from
+    // the data store's own state rather than from the operation being unwritten.
+    assert_eq!(
+        error_code(&payload),
+        "AccessDeniedException",
+        "a start against a data store that is not ACTIVE must answer \
+         AccessDeniedException, got {payload}"
+    );
 }

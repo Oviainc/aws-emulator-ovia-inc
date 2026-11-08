@@ -28,6 +28,11 @@ hex = { workspace = true }
 # Parses the C-CDA (XML) documents `POST /validate-source` validates; the report is
 # computed by walking a real parse tree rather than by matching on the source text.
 roxmltree = "0.20"
+# Amazon S3 client a `StartFHIRImportJob` run reads the FHIR data its
+# `InputDataConfig` names with (`src/state/import_run.rs`), over the in-process
+# callback into this same emulator: no network client feature is enabled, because
+# the transport is the emulator's own.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -36,6 +41,12 @@ emulator-core-build-support = { workspace = true }
 # The integration tests wait out a stored lifecycle due instant; no handler sleeps,
 # so the `time` feature is enabled here rather than on the shipped crate.
 tokio = { workspace = true, features = ["time"] }
+# The import suite mounts Amazon S3 beside this service on ONE engine, exactly as
+# the assembled router mounts them, and stages the input a job reads through that
+# service's OWN `PutObject` — so what an import reads is what Amazon S3 really
+# holds. DEV-ONLY: this crate depends on no other service's crate outside its
+# tests.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

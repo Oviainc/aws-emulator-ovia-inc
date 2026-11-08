@@ -521,6 +521,11 @@ async fn a_job_the_named_data_store_does_not_hold_is_refused_with_the_fixed_sent
                 message: None,
                 progress_report: None,
                 validation_level: None,
+                // A record this suite seeds was not started through the API, so
+                // it carries no `ClientToken` and there is no request to
+                // fingerprint.
+                client_token: None,
+                request_fingerprint: String::new(),
             },
         );
     }

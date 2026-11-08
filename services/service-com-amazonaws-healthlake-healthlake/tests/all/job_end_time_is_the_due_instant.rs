@@ -25,8 +25,8 @@
 //! `EXPORT_JOB_RUN`, and reads two jobs back in the REVERSE of the order they
 //! ended.
 //!
-//! `StartFHIRImportJob` is still a scaffold stub (its own issue), and a started
-//! export or transformation job is armed with one fixed span, so the rows are
+//! A started import, export or transformation job is armed with one fixed span,
+//! so the rows are
 //! seeded straight into the SAME store the handlers read, through the shared
 //! engine the harness exposes — exactly how `tests/all/fhir_export_job_describe.rs`
 //! and `tests/all/data_transformation_job.rs` seed their rows — which is what
@@ -243,6 +243,11 @@ fn seed(service: &HealthLake, datastore_id: &str, rows: &[Row]) -> (Instant, Sys
                         message: None,
                         progress_report: None,
                         validation_level: None,
+                        // A record this suite seeds was not started through the
+                        // API, so it carries no `ClientToken` and there is no
+                        // request to fingerprint.
+                        client_token: None,
+                        request_fingerprint: String::new(),
                     },
                 );
             }

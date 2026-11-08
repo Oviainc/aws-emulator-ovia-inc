@@ -1,15 +1,47 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartFHIRImportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartFHIRImportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartFHIRImportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a FHIR import job into the data store the request's required
+//! `DatastoreId` names: it MINTS one job record in
+//! [`crate::state::ComAmazonawsHealthlakeHealthlakeState::import_jobs`] — the
+//! ONE map `DescribeFHIRImportJob` and `ListFHIRImportJobs` read back — and
+//! answers the minted `JobId` with the `SUBMITTED` status the record holds.
+//!
+//! The import itself is REAL: the job's run
+//! ([`crate::state::read_import_input`]) reads the FHIR data the request's
+//! `InputDataConfig` names out of this emulator's own Amazon S3 — in process,
+//! through the operation callback — and
+//! [`crate::state::ComAmazonawsHealthlakeHealthlakeState::deliver_import_run`]
+//! stores each resource on the data store's own record, where its FHIR REST data
+//! plane serves it exactly as it serves one a caller created. The counts the run
+//! measured are the job's `JobProgressReport`, and the status the clock then owes
+//! the job follows them: everything scanned imported is `COMPLETED`, some of it
+//! `COMPLETED_WITH_ERRORS`, and none of it `FAILED` with the `Message` saying
+//! why — so no job reports an import the data store did not take.
+//!
+//! The resources land as the job is answered rather than when its status
+//! settles, which is what an import does: a job writes the resources it has read
+//! as it runs, so they are readable while it is still working, and the status a
+//! caller polls for says when the run is over.
+//!
+//! The model documents the operation as importing "into an ACTIVE data store",
+//! and only a settled, usable one serves: a `DatastoreId` the service holds no
+//! record for is the modelled `ResourceNotFoundException`, and a record whose
+//! status is anything else — the lifecycle transitions `CREATING`, `UPDATING`
+//! and `DELETING`, and the terminal `DELETED` — is refused with the modelled
+//! `AccessDeniedException` stating that the data store is not active. That is
+//! the line `UpdateFHIRDatastore` draws too, through the same one gate
+//! ([`crate::state::Datastore::gate_active`]), rather than the
+//! transition-conflict classification the operations that model one use.
+//!
+//! `ClientToken` is this operation's `@idempotencyToken`: a repeat of the SAME
+//! call carrying a token already seen answers out of the job that token started
+//! instead of starting a second one, and a token reused with a DIFFERENT request
+//! is refused. That replay is resolved BEFORE the gates above — the retry a
+//! token exists to make safe is answered out of the record it minted, so a
+//! change made to the data store after the first start cannot turn the repeat
+//! into a refusal.
 //!
 //! ## Shape of an operation
 //!
@@ -178,18 +210,242 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartFHIRImportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartFHIRImportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartFHIRImportJob"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_server(
+                "the HealthLake data store registry is unavailable",
+            ));
+        };
+        let fingerprint = request_fingerprint(&input);
+
+        // Everything that can refuse this start is decided under the store lock
+        // BEFORE the job's run reads a byte of the input: the idempotency replay,
+        // the data store's own state gate and the job-count ceiling. The guard is
+        // SCOPED so the lock is released before this handler awaits the run — no
+        // other caller waits on the store while one import reads its input.
+        {
+            let mut store = state.lock();
+            // Both records must have caught up with the clock before either is
+            // read: the data store registry, because only a settled, usable store
+            // can be imported into, and the job records, because an earlier job
+            // whose transition is already due would otherwise be answered under
+            // the status it has left.
+            store.settle_lifecycle();
+            store.settle_import_jobs();
+            if let Some(answered) = replayed(&store, &input, &fingerprint)? {
+                return Ok(answered);
+            }
+            gate_datastore(&store, &input.datastore_id)?;
+            refuse_a_full_store(&store)?;
+        }
+
+        // The job's own work, with no lock held: the FHIR data the request's
+        // input location names, read out of this emulator's own Amazon S3 through
+        // the in-process callback. What it could not do is the JOB's terminal
+        // status and `Message`, never a refusal of this request.
+        let region = crate::state::request_region(ctx.parts());
+        let run = crate::state::read_import_input(ctx, &region, &input.input_data_config).await;
+
+        let mut store = state.lock();
+        store.settle_lifecycle();
+        store.settle_import_jobs();
+        // The same three decisions again, because the store is only this handler's
+        // for the span of a lock: a repeat under the same token, a data store
+        // deleted, or a store filled, while the input was being read is answered
+        // exactly as it would have been before the read — nothing has been
+        // persisted yet.
+        if let Some(answered) = replayed(&store, &input, &fingerprint)? {
+            return Ok(answered);
+        }
+        gate_datastore(&store, &input.datastore_id)?;
+        refuse_a_full_store(&store)?;
+
+        let now = ::std::time::SystemTime::now();
+        // The resources the run read are DELIVERED into the data store now, so
+        // what the job reports as imported is what the data store holds; the
+        // status that delivery warrants is what the clock owes the job.
+        let outcome = store.deliver_import_run(&input.datastore_id, run, now);
+        let id = store.next_import_job_id(now);
+        let job = crate::state::ImportJob {
+            id: id.clone(),
+            datastore_id: input.datastore_id,
+            name: input.job_name,
+            // A job AWS answers in a non-terminal status owes the clock one
+            // transition. The due instant is stored on the record and
+            // materialised by whichever call reads it next; nothing sleeps.
+            status: crate::state::JobStatus::Submitted,
+            pending: Some((
+                ::std::time::Instant::now() + crate::state::IMPORT_JOB_RUN,
+                outcome.status,
+                outcome.message,
+            )),
+            submitted_at: ::aws_smithy_types::DateTime::from(now),
+            ended_at: None,
+            input_data_config: input.input_data_config,
+            output_data_config: Some(input.job_output_data_config),
+            data_access_role_arn: Some(input.data_access_role_arn),
+            // The `Message` travels WITH the status it explains, so a job still
+            // `SUBMITTED` cannot report why it ended.
+            message: None,
+            // The progress report is of the work the run ALREADY did, so it is
+            // reported from the instant the job exists rather than withheld
+            // until the status settles.
+            progress_report: Some(outcome.report),
+            validation_level: input.validation_level,
+            client_token: input.client_token,
+            request_fingerprint: fingerprint,
+        };
+
+        let output = StartFHIRImportJobOutput {
+            job_id: job.id.clone(),
+            job_status: job.status.as_wire().to_string(),
+            datastore_id: Some(job.datastore_id.clone()),
+        };
+        store.import_jobs.insert(id, job);
+        Ok(output)
     }
+}
+
+/// The job a repeat of this request under an already-seen `ClientToken` is
+/// answered out of, `None` when this is a first start, and an `Err` when the
+/// token was used for a DIFFERENT request.
+///
+/// `ClientToken` is this operation's `@idempotencyToken`: a repeat of the SAME
+/// call carrying a token already seen is answered out of the job that token
+/// started, so one token starts one import job. A token reused with a different
+/// request is a different request, and is refused rather than answered with the
+/// earlier job.
+///
+/// Resolved BEFORE any gate on the data store this start names, like every other
+/// idempotent mint in this crate: the retry a token exists to make safe is
+/// answered out of the record that token minted, so a change made to the data
+/// store AFTER the first start cannot turn the repeat into a refusal.
+fn replayed(
+    store: &crate::state::ComAmazonawsHealthlakeHealthlakeState,
+    input: &StartFHIRImportJobInput,
+    fingerprint: &str,
+) -> Result<Option<StartFHIRImportJobOutput>, StartFHIRImportJobError> {
+    let Some(started) = input
+        .client_token
+        .as_deref()
+        .and_then(|token| store.import_job_for_client_token(token))
+    else {
+        return Ok(None);
+    };
+    if started.request_fingerprint != fingerprint {
+        return Err(StartFHIRImportJobErrorModeled::ValidationException(
+            ValidationException {
+                message: Some(
+                    "ClientToken was already used for a different StartFHIRImportJob request"
+                        .to_string(),
+                ),
+            },
+        )
+        .into());
+    }
+    // Answered out of the STORED record, so a repeat cannot report a status the
+    // job has already left.
+    Ok(Some(StartFHIRImportJobOutput {
+        job_id: started.id.clone(),
+        job_status: started.status.as_wire().to_string(),
+        datastore_id: Some(started.datastore_id.clone()),
+    }))
+}
+
+/// `Ok` when the data store `datastore_id` names can be imported into.
+///
+/// The model documents the operation as importing "into an ACTIVE data store",
+/// and this operation draws the line the way `UpdateFHIRDatastore` draws it —
+/// through the ONE gate that states it, [`crate::state::Datastore::gate_active`]
+/// — rather than as a transition conflict: the record either is ACTIVE or it is
+/// not, and every other status takes the same refusal with the same sentence.
+fn gate_datastore(
+    store: &crate::state::ComAmazonawsHealthlakeHealthlakeState,
+    datastore_id: &str,
+) -> Result<(), StartFHIRImportJobError> {
+    // This service's not-found answer is one fixed text that quotes neither the
+    // requested id nor anything else from the request.
+    let Some(datastore) = store.datastores.get(datastore_id) else {
+        return Err(not_found(
+            crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string(),
+        ));
+    };
+    if let Err(message) = datastore.gate_active() {
+        // A data store that is not ACTIVE cannot be imported into, and the
+        // refusal is the modelled `AccessDeniedException` — the recorded answer
+        // for a start against a data store that is not active — carrying the
+        // sentence this service states that with.
+        return Err(
+            StartFHIRImportJobErrorModeled::AccessDeniedException(AccessDeniedException {
+                message: Some(message.to_string()),
+            })
+            .into(),
+        );
+    }
+    Ok(())
+}
+
+/// `Ok` while the store can hold another import job record.
+///
+/// A job is only dropped with the data store it imported into, so there is
+/// nothing to reap here: a genuinely full store is refused with the quota-shaped
+/// error this operation models.
+fn refuse_a_full_store(
+    store: &crate::state::ComAmazonawsHealthlakeHealthlakeState,
+) -> Result<(), StartFHIRImportJobError> {
+    if store.import_jobs.len() < crate::state::MAX_IMPORT_JOBS {
+        return Ok(());
+    }
+    Err(
+        StartFHIRImportJobErrorModeled::ThrottlingException(ThrottlingException {
+            message: Some(format!(
+                "The maximum number of import jobs ({}) already exists",
+                crate::state::MAX_IMPORT_JOBS
+            )),
+        })
+        .into(),
+    )
+}
+
+/// This operation's 404, stating which resource the service does not hold — the
+/// wording every not-found path in this crate uses.
+fn not_found(message: String) -> StartFHIRImportJobError {
+    StartFHIRImportJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's 500, for a store the handler could not reach at all.
+fn internal_server(message: &str) -> StartFHIRImportJobError {
+    StartFHIRImportJobErrorModeled::InternalServerException(InternalServerException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// A fingerprint of everything this request asks for, so one `ClientToken`
+/// resolves to the import job it started only for a repeat of the SAME request.
+///
+/// Built from the members that define the job — never from the token itself —
+/// with presence of each optional member rendered explicitly. The
+/// length-prefixed folding itself lives in
+/// [`crate::state::request_fingerprint`], shared with the other operations here
+/// that honour an idempotency token.
+fn request_fingerprint(input: &StartFHIRImportJobInput) -> String {
+    crate::state::request_fingerprint([
+        input.datastore_id.clone(),
+        input.data_access_role_arn.clone(),
+        crate::state::optional_field("JobName", input.job_name.as_deref()),
+        crate::state::optional_field("ValidationLevel", input.validation_level.as_deref()),
+        crate::state::optional_field("ProfileId", input.profile_id.as_deref()),
+        crate::state::optional_field("InputFormat", input.input_format.as_deref()),
+        // Both booleans are modelled `required` with a default, so the boundary
+        // has already resolved what the request left out.
+        format!("DriftDetectionEnabled={}", input.drift_detection_enabled),
+        format!("ProvenanceEnabled={}", input.provenance_enabled),
+        // Neither config carries a map, so its derived `Debug` has a canonical
+        // form for a given value, which is all a fingerprint needs.
+        format!("{:?}", input.input_data_config),
+        format!("{:?}", input.job_output_data_config),
+    ])
 }

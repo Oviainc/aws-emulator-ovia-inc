@@ -648,8 +648,10 @@ fn submitted_resource(body: &[u8], resource_type: &str) -> Result<::serde_json::
 /// a security label, a tag) is the caller's and is kept.
 ///
 /// `pub(crate)` because it is the ONE builder of a stored resource's bytes: the
-/// Synthea preload ([`super::synthea`]) writes its records through it too, so a
-/// preloaded resource and a created one are stored, and read back, identically.
+/// Synthea preload ([`super::synthea`]) and a FHIR import job's delivery
+/// ([`crate::state::ComAmazonawsHealthlakeHealthlakeState::deliver_import_run`])
+/// write their records through it too, so a preloaded, an imported and a created
+/// resource are stored, and read back, identically.
 pub(crate) fn stored_content(
     submitted: ::serde_json::Value,
     id: &str,
@@ -782,20 +784,13 @@ fn submitted_within_size(body: &[u8]) -> Result<(), Failure> {
 /// releases `released` bytes of versions this write drops, and whether that write adds a
 /// resource (`retains_one_more`) or writes a further version of one it holds.
 ///
-/// The three ceilings this emulator holds the FHIR data plane to, in one place so a
-/// create and an update charge them identically: how many resources one data store
-/// holds, how many bytes one data store retains, and how many bytes every data store
-/// retains together. Each is checked BEFORE anything is written, and with
-/// `saturating_*`, so no product of caller-chosen factors can grow the heap and an
-/// arithmetic edge cannot wrap into an admission.
-///
-/// The store-wide total is charged through
-/// [`crate::state::ComAmazonawsHealthlakeHealthlakeState::admits_fhir_resource_bytes`],
-/// which is why the store is taken by `&mut`: that ceiling bounds what this service
-/// HOLDS, so the terminal records whose bytes come back by being dropped are reaped
-/// before a write is refused for them — the same answer a full registry gets before a
-/// create is refused. The two per-data-store ceilings are about the data store being
-/// written, which is serving and so never terminal, and are unaffected.
+/// WHICH ceilings a write is held to is decided once, in
+/// [`crate::state::ComAmazonawsHealthlakeHealthlakeState::admits_fhir_resource`], and is
+/// shared with every other writer of a data store's resources — an import job's run
+/// delivers its resources through the same decision — so a resource one of them would
+/// not retain is not retained by the other either. What stays HERE is only how this
+/// surface states the refusal: the FHIR `OperationOutcome` a FHIR client reads, one
+/// sentence per ceiling.
 fn admits(
     store: &mut crate::state::ComAmazonawsHealthlakeHealthlakeState,
     datastore_id: &str,
@@ -803,12 +798,12 @@ fn admits(
     released: usize,
     retains_one_more: bool,
 ) -> Result<(), Failure> {
-    let held = store
-        .datastores
-        .get(datastore_id)
-        .map_or(0, |datastore| datastore.fhir_resources.len());
-    if retains_one_more && held >= crate::state::MAX_FHIR_RESOURCES_PER_DATASTORE {
-        return Err(Failure::new(
+    let Err(ceiling) = store.admits_fhir_resource(datastore_id, bytes, released, retains_one_more)
+    else {
+        return Ok(());
+    };
+    Err(match ceiling {
+        crate::state::FhirRetentionCeiling::ResourceCount => Failure::new(
             507,
             TOO_COSTLY,
             format!(
@@ -816,15 +811,8 @@ fn admits(
                  emulator retains ({})",
                 crate::state::MAX_FHIR_RESOURCES_PER_DATASTORE
             ),
-        ));
-    }
-    let held_bytes = store
-        .datastores
-        .get(datastore_id)
-        .map_or(0, |datastore| datastore.fhir_resource_bytes)
-        .saturating_sub(released);
-    if held_bytes.saturating_add(bytes) > crate::state::MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE {
-        return Err(Failure::new(
+        ),
+        crate::state::FhirRetentionCeiling::DatastoreBytes => Failure::new(
             507,
             TOO_COSTLY,
             format!(
@@ -832,10 +820,8 @@ fn admits(
                  emulator holds for one data store ({})",
                 crate::state::MAX_FHIR_RESOURCE_BYTES_PER_DATASTORE
             ),
-        ));
-    }
-    if !store.admits_fhir_resource_bytes(bytes, released) {
-        return Err(Failure::new(
+        ),
+        crate::state::FhirRetentionCeiling::StoreBytes => Failure::new(
             507,
             TOO_COSTLY,
             format!(
@@ -843,9 +829,8 @@ fn admits(
                  across every data store ({})",
                 crate::state::MAX_FHIR_RESOURCE_BYTES_TOTAL
             ),
-        ));
-    }
-    Ok(())
+        ),
+    })
 }
 
 /// Whether `segment` is a FHIR logical id.
@@ -854,7 +839,11 @@ fn admits(
 /// letters, numerals, '-' and '.', with a length limit of 64 characters" — so exactly
 /// `[A-Za-z0-9\-\.]{1,64}`. An `update` places a resource at a CALLER-chosen id, so this
 /// is the rule that id has to satisfy before it becomes a key of the store.
-fn is_logical_id(segment: &str) -> bool {
+///
+/// `pub(crate)` because every writer of a data store's resources holds a
+/// caller-supplied id to the same rule: an imported resource is stored under the
+/// id its own JSON carries, so that id is checked here too.
+pub(crate) fn is_logical_id(segment: &str) -> bool {
     !segment.is_empty()
         && segment.len() <= MAX_LOGICAL_ID_LEN
         && segment
@@ -870,7 +859,11 @@ fn is_logical_id(segment: &str) -> bool {
 /// type name is served and the resource stored under it; which types a release
 /// defines is its own gap, and a catalogue invented here would reject resource types
 /// HealthLake accepts.
-fn is_resource_type_name(segment: &str) -> bool {
+///
+/// `pub(crate)` for the reason [`is_logical_id`] is: an imported resource is
+/// stored under the type its own `resourceType` names, which is held to the same
+/// rule as the type segment of a FHIR URL.
+pub(crate) fn is_resource_type_name(segment: &str) -> bool {
     segment.len() <= MAX_RESOURCE_TYPE_LEN
         && segment.starts_with(|first: char| first.is_ascii_uppercase())
         && segment.chars().all(|c| c.is_ascii_alphanumeric())

@@ -195,6 +195,11 @@ impl Listing {
                             message: None,
                             progress_report: None,
                             validation_level: None,
+                            // A record this suite seeds was not started through
+                            // the API, so it carries no `ClientToken` and there
+                            // is no request to fingerprint.
+                            client_token: None,
+                            request_fingerprint: String::new(),
                         },
                     );
                 }

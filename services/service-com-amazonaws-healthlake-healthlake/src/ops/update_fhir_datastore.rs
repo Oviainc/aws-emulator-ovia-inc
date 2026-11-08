@@ -193,20 +193,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // This operation accepts the change only from a data store that is
         // ACTIVE, and it draws ONE line: the record either is ACTIVE or it is
-        // not. Every other status — the lifecycle transitions `CREATING`,
-        // `UPDATING` and `DELETING`, and the terminal `DELETED` — takes the
-        // same refusal, so the answer does not depend on which stage of the
-        // lifecycle the record sits at, and the sentence beside it states only
-        // that the data store is not active. The record is still there and
-        // still reported by `DescribeFHIRDatastore`, so this is NOT a not-found:
-        // `ResourceNotFoundException` stays for a `DatastoreId` the registry
-        // holds no record of, which the lookup above already answered. The gate
-        // comes BEFORE any write, so a refused call leaves the record — and the
-        // transition it was already on — exactly as it was.
-        if datastore.status != crate::state::DatastoreStatus::Active {
+        // not — decided once, with the sentence that refusal states, in
+        // `Datastore::gate_active`, which `StartFHIRImportJob` draws the same
+        // line through. The gate comes BEFORE any write, so a refused call
+        // leaves the record — and the transition it was already on — exactly as
+        // it was.
+        if let Err(message) = datastore.gate_active() {
             return Err(UpdateFHIRDatastoreErrorModeled::AccessDeniedException(
                 AccessDeniedException {
-                    message: Some(crate::state::DATASTORE_NOT_ACTIVE_MESSAGE.to_string()),
+                    message: Some(message.to_string()),
                 },
             )
             .into());
