@@ -13,7 +13,7 @@
 //!   placement runs before anything is resolved or stored;
 //! * the half that is a fact about the account's NETWORK — whether those subnets sit in
 //!   different zones — is [`single_zone_defect`] below, decided over the subnets
-//!   [`super::directory_network::resolve_subnet_networks`] already asked Amazon EC2 about
+//!   [`super::ec2_subnets::resolve_subnet_networks`] already asked Amazon EC2 about
 //!   for the same create. No hop of its own: a create resolves its placement ONCE, and that
 //!   one answer serves both this refusal and the record the create stores.
 //!

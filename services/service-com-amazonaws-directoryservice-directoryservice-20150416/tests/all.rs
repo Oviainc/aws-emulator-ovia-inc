@@ -15,8 +15,12 @@
 mod ad_assessment;
 #[path = "all/ad_connector.rs"]
 mod ad_connector;
+#[path = "all/alias_reassignment.rs"]
+mod alias_reassignment;
 #[path = "all/aws_worded_diagnostics.rs"]
 mod aws_worded_diagnostics;
+#[path = "all/certificate_absence_message.rs"]
+mod certificate_absence_message;
 #[path = "all/certificate_deregistration.rs"]
 mod certificate_deregistration;
 #[path = "all/certificate_functions.rs"]
@@ -47,6 +51,8 @@ mod directory_lifecycle;
 mod directory_limits;
 #[path = "all/directory_networking_and_settings.rs"]
 mod directory_networking_and_settings;
+#[path = "all/directory_os_version.rs"]
+mod directory_os_version;
 #[path = "all/directory_settings.rs"]
 mod directory_settings;
 #[path = "all/directory_unsharing.rs"]

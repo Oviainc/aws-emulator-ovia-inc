@@ -153,7 +153,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&input.certificate_id)
             .ok_or_else(|| {
                 DescribeCertificateErrorModeled::CertificateDoesNotExistException(
-                    crate::state::refusal(crate::state::CERTIFICATE_NOT_PRESENT),
+                    crate::state::refusal(crate::state::no_such_certificate(
+                        &input.certificate_id,
+                        &input.directory_id,
+                    )),
                 )
             })?;
 

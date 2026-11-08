@@ -67,10 +67,14 @@
 //! this emulator does not need is state it must not hold.
 
 pub mod directory_network;
+pub mod directory_servers;
+pub mod ec2_subnets;
 pub mod security_log;
 pub mod subnet_zones;
 
-pub use directory_network::{resolve_subnet_networks, server_address, SubnetNetwork};
+pub use directory_network::{server_address, SubnetNetwork};
+pub use directory_servers::{os_version_of, MICROSOFT_AD_OS_VERSION};
+pub use ec2_subnets::resolve_subnet_networks;
 pub use subnet_zones::single_zone_defect;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -2326,6 +2330,12 @@ impl Directory {
         self.server_addresses()
     }
 
+    /// The `OSVersion` this directory reports, or `None` for a type whose operating system
+    /// Directory Service does not name ([`directory_servers::os_version_of`]).
+    pub fn os_version(&self) -> Option<&'static str> {
+        directory_servers::os_version_of(&self.directory_type)
+    }
+
     /// The Availability Zones this directory is in, as the zones of the subnets its servers
     /// were placed in: `DirectoryVpcSettingsDescription$AvailabilityZones` and
     /// `DirectoryConnectSettingsDescription$AvailabilityZones`.
@@ -2738,6 +2748,7 @@ impl Directory {
             access_url: Some(self.access_url()),
             description: self.description.clone(),
             dns_ip_addrs: optional_list(&self.dns_ip_addrs()),
+            os_version: self.os_version().map(str::to_string),
             stage: Some(self.stage.clone()),
             launch_time: Some(as_timestamp(self.launch_time)),
             stage_last_updated_date_time: Some(as_timestamp(self.stage_last_updated)),
@@ -4762,17 +4773,32 @@ pub fn no_such_domain_controller(domain_controller_id: &str) -> String {
     format!("DomainController: '{domain_controller_id}' does not exist.")
 }
 
+/// Why a directory that already carries an alias cannot be given another one, as Directory
+/// Service states it. Shared so the one operation that refuses it and the suite that pins
+/// its wording name the same sentence.
+///
+/// FIXED text, the rule the request broke and what the caller would have to do about it: it
+/// quotes neither the directory nor either alias, because the request is refused for what
+/// the directory IS rather than for the value it named — the caller already has both.
+/// [`refusal`] appends the call's request id, once, which is the only part of the message
+/// that varies.
+pub const ALIAS_ALREADY_ASSIGNED: &str = "The directory in the request already has an alias. \
+     That alias must be deleted before a new alias can be created.";
+
 /// The `CertificateDoesNotExistException` message for an id that names no certificate
 /// registered with the directory the request asked about. Shared so every operation that
 /// resolves a registration (`DescribeCertificate`, `DeregisterCertificate`) says the
 /// same thing about the same failure.
 ///
-/// The error shape's OWN sentence — "The certificate is not present in the system for
-/// describe or deregister activities." — which is how Directory Service words this
-/// refusal: FIXED text, with neither id interpolated, since the ids the call was made
-/// with are what the caller already has. [`refusal`] appends the request id, once.
-pub const CERTIFICATE_NOT_PRESENT: &str =
-    "The certificate is not present in the system for describe or deregister activities.";
+/// Directory Service words this one as the kind of entity, the id the request asked for,
+/// "does not exist for" and the member label of the directory it was looked for in, so the
+/// message names BOTH ids the lookup was made with and the fixed text names which member
+/// each belongs to. The error shape's own documentation sentence is prose describing the
+/// error CLASS, not the message the service sends. [`refusal`] appends the request id,
+/// once.
+pub fn no_such_certificate(certificate_id: &str, directory_id: &str) -> String {
+    format!("Certificate {certificate_id} does not exist for directoryId: {directory_id}")
+}
 
 /// The `CertificateAlreadyExistsException` message for a certificate a directory already
 /// holds: that error shape's own sentence, FIXED text with no interpolated value.

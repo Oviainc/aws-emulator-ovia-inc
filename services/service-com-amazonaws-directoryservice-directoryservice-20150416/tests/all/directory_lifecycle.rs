@@ -511,12 +511,15 @@ async fn an_alias_drives_the_access_url_and_is_assigned_once() {
         );
 
         // "After an alias has been created, it cannot be deleted or reused": neither a
-        // second alias for this directory nor this alias for another one is accepted.
+        // second alias for this directory nor this alias for another one is accepted —
+        // and the two are different failures, so the error classes differ. A directory
+        // that already carries an alias can never be re-aliased, which is the invalid
+        // parameter; an alias another directory reserved is the collision.
         refused(
             &router,
             "CreateAlias",
             json!({ "DirectoryId": &id, "Alias": "another" }),
-            "EntityAlreadyExistsException",
+            "InvalidParameterException",
             &format!("{case}: second alias on the same directory"),
         )
         .await;

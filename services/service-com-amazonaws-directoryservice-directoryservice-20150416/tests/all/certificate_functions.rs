@@ -239,25 +239,26 @@ async fn the_certificate_refusals_state_their_error_classes_own_sentences() {
         .to_string();
 
     // (case, the operation, its body, the sentence that error class states)
-    let rows: [(&str, &str, Value, &str); 3] = [
+    let rows: [(&str, &str, Value, String); 3] = [
         (
             "the same certificate again",
             "RegisterCertificate",
             json!({ "DirectoryId": &directory_id, "CertificateData": &pem }),
-            "The certificate has already been registered into the system.",
+            "The certificate has already been registered into the system.".to_string(),
         ),
         (
             "data that is not a certificate",
             "RegisterCertificate",
             json!({ "DirectoryId": &directory_id, "CertificateData": "not a certificate" }),
-            "The certificate PEM that was provided has incorrect encoding.",
+            "The certificate PEM that was provided has incorrect encoding.".to_string(),
         ),
         (
+            // The not-found refusal is the one of this family that names both ids the
+            // lookup was made with: which certificate, of which directory, is not there.
             "an id no registration answers to",
             "DescribeCertificate",
             json!({ "DirectoryId": &directory_id, "CertificateId": "c-0123456789" }),
-            "The certificate is not present in the system for describe or deregister \
-             activities.",
+            format!("Certificate c-0123456789 does not exist for directoryId: {directory_id}"),
         ),
     ];
 

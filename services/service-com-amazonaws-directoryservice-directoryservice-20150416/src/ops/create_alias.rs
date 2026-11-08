@@ -4,8 +4,12 @@
 //!
 //! Assigns an alias to a stored directory, so the directory reports it as its `Alias`
 //! and in the `AccessUrl` derived from it. The model's own warning — "After an alias has
-//! been created, it cannot be deleted or reused" — is what makes both an alias already
-//! taken and a directory that already has one an `EntityAlreadyExistsException`.
+//! been created, it cannot be deleted or reused" — is what makes the two collisions
+//! refusals, and they are different failures: an alias ANOTHER directory already reserved
+//! is an `EntityAlreadyExistsException` (the caller retries with another value), while a
+//! directory that already carries an alias of its own is an `InvalidParameterException`
+//! stating that rule ([`crate::state::ALIAS_ALREADY_ASSIGNED`]) — that directory can never
+//! be re-aliased, whatever value is sent.
 //!
 //! The directory has to be SERVING for an alias to be assigned to it: a directory still
 //! being built by the transition its create owes is refused with the modelled
@@ -206,23 +210,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An alias is unique across the account and a directory has at most one, so
         // either collision refuses the call and leaves the stored alias as it was. The
-        // index also holds the aliases of deleted directories, which "cannot be
-        // deleted or reused".
+        // two collisions are DIFFERENT failures, and they carry different error classes:
+        // an alias another directory reserved is one the caller can retry with another
+        // value, while a directory that already carries an alias can never be re-aliased
+        // at all. The index also holds the aliases of deleted directories, which "cannot
+        // be deleted or reused".
         if store.aliases.contains_key(&input.alias) {
             return Err(already_exists(format!(
                 "Alias {alias} is already in use",
                 alias = input.alias
             )));
         }
-        if let Some(existing) = store
+        if store
             .directories
             .get(&input.directory_id)
-            .and_then(|directory| directory.alias.clone())
+            .is_some_and(|directory| directory.alias.is_some())
         {
-            return Err(already_exists(format!(
-                "Directory {directory_id} already has the alias {existing}",
-                directory_id = input.directory_id
-            )));
+            return Err(CreateAliasErrorModeled::InvalidParameterException(
+                crate::state::refusal(crate::state::ALIAS_ALREADY_ASSIGNED),
+            )
+            .into());
         }
 
         // The reservation index is the one store here a caller can grow without
