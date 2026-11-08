@@ -2446,6 +2446,36 @@ pub const RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
 /// client-error shape they do model; the rejected value is not echoed.
 pub const INVALID_RESOURCE_ARN_MESSAGE: &str = "Invalid input resource arn";
 
+/// How the tagging surface states a `resourceArn` it refuses, for the value `candidate`
+/// the request carried (`None` when the refusal is about a value this reading cannot
+/// see).
+///
+/// The surface reads the ARN's VENDOR field — the third of
+/// `arn:<partition>:<vendor>:<region>:<account>:<resource>`, the namespace that says
+/// whose resource the value names — before it reads anything else about the value: an
+/// ARN of another vendor names nothing this service can address however the account
+/// changes, so the refusal says which vendor was expected
+/// ([`::service_common::validation_message::expected_vendor`]) instead of only that the
+/// value was not a resource ARN. The expected vendor is this service's own namespace
+/// ([`ARN_SERVICE`]), which is also the one the member's modelled pattern fixes, and
+/// nothing of the submitted value is echoed.
+///
+/// Every other ground — a value that is no ARN at all, or an ARN of this vendor outside
+/// the member's length bounds, account, resource type or id alphabet — keeps the surface's
+/// bare sentence ([`INVALID_RESOURCE_ARN_MESSAGE`]): the vendor field of those values is
+/// the one this service serves, or is not there to name.
+///
+/// Which ARNs are of this vendor is `service_common::arn`'s reading, the one parse of an
+/// ARN's fields in this tree.
+pub fn invalid_resource_arn_message(candidate: Option<&str>) -> String {
+    match candidate.and_then(::service_common::arn::vendor) {
+        Some(vendor) if vendor != ARN_SERVICE => {
+            ::service_common::validation_message::expected_vendor(ARN_SERVICE)
+        }
+        _ => INVALID_RESOURCE_ARN_MESSAGE.to_string(),
+    }
+}
+
 /// AppSync's fixed, request-independent text for a `nextToken` a list operation cannot
 /// resume from, carried by `BadRequestException` (HTTP 400).
 pub const INVALID_PAGINATION_TOKEN_MESSAGE: &str = "Invalid pagination token given.";

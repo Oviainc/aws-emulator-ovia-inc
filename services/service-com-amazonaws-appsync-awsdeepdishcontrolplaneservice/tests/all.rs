@@ -107,6 +107,8 @@ mod state_roundtrip;
 mod api_key_version_and_tagging_refusals;
 #[path = "all/tag_resource.rs"]
 mod tag_resource;
+#[path = "all/tagging_arn_vendor_refusal.rs"]
+mod tagging_arn_vendor_refusal;
 #[path = "all/untag_resource.rs"]
 mod untag_resource;
 #[path = "all/flush_api_cache.rs"]

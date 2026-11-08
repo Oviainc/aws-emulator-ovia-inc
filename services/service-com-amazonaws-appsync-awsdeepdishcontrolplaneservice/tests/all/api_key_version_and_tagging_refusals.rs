@@ -26,7 +26,9 @@
 //! 5. the tagging surface refuses by RESOURCE — a well-formed ARN this account holds no
 //!    resource for is a 404 `NotFoundException` with the surface's fixed absent-resource
 //!    text, and a value that cannot be a resource ARN at all is a 400
-//!    `BadRequestException` with its fixed malformed-ARN text, on each of the three
+//!    `BadRequestException` with its malformed-ARN text — the bare sentence, or the one
+//!    naming the vendor that was expected when the value is an ARN of another vendor
+//!    (the rule the `tagging_arn_vendor_refusal` suite spans) — on each of the three
 //!    operations the one `/v1/tags/{resourceArn}` route carries.
 //!
 //! Every assertion goes through the router the production emulator mounts, so these
@@ -46,6 +48,7 @@ use crate::tag_resource::{
     list_tags, tag_map, tag_resource, RESERVED_TAG_KEY_REFUSAL, RESOURCE_NOT_FOUND,
     TAG_WRITE_STATUS,
 };
+use crate::tagging_arn_vendor_refusal::EXPECTED_VENDOR_REFUSAL;
 use crate::untag_resource::untag_resource;
 
 /// The fixed half of the text a 404 carries for an API key the addressed API does not
@@ -58,7 +61,10 @@ const API_KEY_NOT_FOUND_PREFIX: &str = "API key not found: ";
 /// versions it describes (`smithy_query(query="doc", shape="ApiKey")`).
 const UNSUPPORTED_KEY_VERSION: &str = "Unsupported API key version.";
 
-/// The fixed text a 400 carries for a `resourceArn` that is not a resource ARN at all.
+/// The fixed text a 400 carries for a `resourceArn` that is not a resource ARN at all,
+/// where the value names no other vendor than this service's own — the rows below that
+/// break a field other than the ARN's vendor. A value whose vendor field names another
+/// service takes the sentence that says so ([`EXPECTED_VENDOR_REFUSAL`]).
 const INVALID_RESOURCE_ARN: &str = "Invalid input resource arn";
 
 /// The API key versions the `ApiKey` shape's documentation describes, with the one whose
@@ -670,33 +676,52 @@ async fn the_tagging_surface_refuses_by_resource() {
     let too_long = format!(
         "arn:aws:appsync:{longest_region}x:{ACCOUNT}:apis/{ABSENT_API_ID}"
     );
-    let malformed: &[(&str, String)] = &[
-        ("one character under the minimum length", too_short),
-        ("one character over the maximum length", too_long),
+    // Each row carries the sentence its ground takes: a broken VENDOR field is the one
+    // the refusal diagnoses by name, every other broken field leaves the bare sentence.
+    let malformed: &[(&str, String, &str)] = &[
+        (
+            "one character under the minimum length",
+            too_short,
+            INVALID_RESOURCE_ARN,
+        ),
+        (
+            "one character over the maximum length",
+            too_long,
+            INVALID_RESOURCE_ARN,
+        ),
         (
             "another partition",
             format!("arn:xws:appsync:{REGION}:{ACCOUNT}:apis/{ABSENT_API_ID}"),
+            INVALID_RESOURCE_ARN,
         ),
         (
             "another service",
             format!("arn:aws:appsynx:{REGION}:{ACCOUNT}:apis/{ABSENT_API_ID}"),
+            EXPECTED_VENDOR_REFUSAL,
         ),
         (
             "an account that is not twelve digits",
             format!("arn:aws:appsync:{REGION}:00000000000a:apis/{ABSENT_API_ID}"),
+            INVALID_RESOURCE_ARN,
         ),
         (
             "another resource type",
             format!("arn:aws:appsync:{REGION}:{ACCOUNT}:apiz/{ABSENT_API_ID}"),
+            INVALID_RESOURCE_ARN,
         ),
         (
             "an id outside the id alphabet",
             format!("arn:aws:appsync:{REGION}:{ACCOUNT}:apis/{}!", &ABSENT_API_ID[..25]),
+            INVALID_RESOURCE_ARN,
         ),
-        ("no ARN at all", "not-an-arn".to_string()),
+        (
+            "no ARN at all",
+            "not-an-arn".to_string(),
+            INVALID_RESOURCE_ARN,
+        ),
     ];
 
-    for (case, candidate) in malformed {
+    for (case, candidate, expected) in malformed {
         for (operation, answer) in tagging_calls(&router, candidate).await {
             assert_eq!(
                 (
@@ -704,9 +729,9 @@ async fn the_tagging_surface_refuses_by_resource() {
                     answer.error_type.as_str(),
                     answer.message.as_str()
                 ),
-                (400, "BadRequestException", INVALID_RESOURCE_ARN),
+                (400, "BadRequestException", *expected),
                 "case {case:?} ({candidate}) on {operation}: expected 400 BadRequestException \
-                 {INVALID_RESOURCE_ARN:?}, got {answer:?}"
+                 {expected:?}, got {answer:?}"
             );
         }
     }
@@ -728,7 +753,7 @@ async fn the_tagging_surface_refuses_by_resource() {
 
 /// The three operations the one `/v1/tags/{resourceArn}` route carries, each answered
 /// for `candidate`, paired with the operation's name.
-async fn tagging_calls(
+pub(crate) async fn tagging_calls(
     router: &MultiServiceRouter,
     candidate: &str,
 ) -> Vec<(&'static str, Answer)> {

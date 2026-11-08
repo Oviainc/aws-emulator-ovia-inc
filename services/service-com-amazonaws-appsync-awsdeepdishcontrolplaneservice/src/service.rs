@@ -225,14 +225,31 @@ fn without_rejected_enum_values(violations: &[Violation]) -> Option<Refused> {
 /// shape.
 const RESOURCE_ARN_MEMBER: &str = "resourceArn";
 
+/// Whether this violation is the TAGGING surface's own `resourceArn`: the TOP-LEVEL
+/// member of that name, the one bound to the `/v1/tags/{resourceArn}` label and targeting
+/// `ResourceArn`, whose pattern admits only an ARN of this service's own vendor.
+///
+/// The path is compared whole, because another member of this model is also named
+/// `resourceArn` and is an ARN of ANOTHER vendor: `RdsDataApiConfig$resourceArn` — "the
+/// resource ARN of the RDS cluster", pattern `^arn:[a-z-]*:rds:…:cluster:…$`
+/// (`smithy_query(query="shape", shape="RdsDataApiConfig")`) — reaches this file on the
+/// nested path `rdsDataApiConfig.resourceArn`, and the vendor the tagging surface expects
+/// is not the vendor that member names.
+fn tagging_resource_arn(violation: &Violation) -> bool {
+    violation.path == RESOURCE_ARN_MEMBER
+}
+
 /// AppSync's own refusal for a `resourceArn` whose VALUE cannot be a resource ARN at all
 /// — outside the shape's length bounds or its pattern.
 ///
 /// The tagging operations model `BadRequestException` and no constraint-violation error,
 /// so the framework's generic report (`ValidationException`, with every broken clause
 /// recited) names a shape no operation of this service models and a client's error-type
-/// dispatch cannot match it. The service states the malformed ARN as one fixed sentence
-/// instead, which is why the rejected value is not echoed.
+/// dispatch cannot match it. The service states the malformed ARN as one sentence
+/// instead, which is why the rejected value is not echoed — and when the value IS an ARN,
+/// of a vendor this service does not serve, that sentence names the vendor it expected
+/// (`crate::state::invalid_resource_arn_message`), the one diagnosis that says which
+/// field of the ARN failed.
 ///
 /// `None` when no violation is of that member and kind, which leaves every other
 /// refusal to the wordings the rest of this file states.
@@ -248,9 +265,16 @@ fn resource_arn_refusal(violations: &[Violation]) -> Option<Refused> {
                         | ViolationKind::Pattern(_)
                 )
         })
-        .map(|_| Refused {
+        .map(|violation| Refused {
             code: BAD_REQUEST_CODE.to_string(),
-            message: crate::state::INVALID_RESOURCE_ARN_MESSAGE.to_string(),
+            // Only the tagging surface's own member is read as an ARN of THIS vendor;
+            // for any other member of that name the sentence stays the bare one.
+            message: crate::state::invalid_resource_arn_message(
+                violation
+                    .value
+                    .as_deref()
+                    .filter(|_| tagging_resource_arn(violation)),
+            ),
         })
 }
 
@@ -310,8 +334,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // reword it. AppSync states three of those classes itself:
         //
         // * a `resourceArn` whose value cannot be a resource ARN at all is its own
-        //   `BadRequestException` with the service's fixed sentence for a malformed ARN
-        //   (`resource_arn_refusal`), the only client error its operations model;
+        //   `BadRequestException` with the service's sentence for a malformed ARN —
+        //   naming the vendor it expected when the value is an ARN of another one
+        //   (`resource_arn_refusal`) — the only client error its operations model;
         // * a member the model rules out outright — absent though required, or
         //   outside its modelled `@range` — is its own `BadRequestException` naming
         //   that member, and its range when it has one (`member_refusal`); the
