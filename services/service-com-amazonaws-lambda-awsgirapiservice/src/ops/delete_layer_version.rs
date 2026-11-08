@@ -169,9 +169,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The version to delete is addressed by the layer name and the version number
-        // alone, so no request metadata takes part in it.
-        let _ = ctx;
+        // The version to delete is addressed by the layer name and the version number,
+        // in the Region the request was made in: a layer is a REGIONAL resource, so a
+        // layer of another Region is not this endpoint's to delete (see
+        // [`crate::state::layer_store`]).
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteLayerVersionErrorModeled::ServiceException(ServiceException {
                 r#type: None,
@@ -191,8 +192,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
+        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
-        if let Some(record) = store.layers.get_mut(&name) {
+        if let Some(record) = store.layer_mut(&region, &name) {
             // Only the version named goes. The layer's record stays even once it holds
             // no version at all, because `latest_version` is the highest number ever
             // published under this name and the next publish counts from it: a deleted

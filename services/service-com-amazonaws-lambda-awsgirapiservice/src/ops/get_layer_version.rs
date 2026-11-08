@@ -160,9 +160,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // "Returns information about a version of an Lambda layer": a pure report, so
-        // the answer depends on the stored record alone and on no request metadata —
-        // the ARNs it carries are the ones the layer was published with.
-        let _ = ctx;
+        // the answer depends on the stored record alone — the ARNs it carries are the
+        // ones the layer was published with. The one thing it takes from the request is
+        // the Region it was made in: a layer is a REGIONAL resource, so the layers this
+        // call can read are the ones published in that Region
+        // (see [`crate::state::layer_store`]).
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetLayerVersionErrorModeled::ServiceException(ServiceException {
                 r#type: None,
@@ -182,10 +184,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
+        let region = crate::state::request_region(ctx);
         let store = state.lock();
         let detail = store
-            .layers
-            .get(&name)
+            .layer(&region, &name)
             .and_then(|record| {
                 let version = record.versions.get(&input.version_number)?;
                 Some(record.version_detail(version))

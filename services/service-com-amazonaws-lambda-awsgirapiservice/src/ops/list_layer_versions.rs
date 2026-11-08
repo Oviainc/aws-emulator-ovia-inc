@@ -230,9 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // aren't listed", which is why the entries come from the versions the store still
         // holds rather than from the layer's version counter.
         let entries: Vec<LayerVersionsListItem> = store
-            .layers
-            .get(&name)
-            .filter(|record| record.region == region)
+            .layer(&region, &name)
             .map(|record| {
                 record
                     .versions

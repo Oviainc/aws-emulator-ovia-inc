@@ -223,7 +223,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  account past its total code size limit of {code_size_limit} bytes."
             )));
         }
-        if !store.layers.contains_key(&name) && store.layers.len() >= crate::state::MAX_LAYERS {
+        let key = crate::state::layer_key(&region, &name);
+        if !store.layers.contains_key(&key) && store.layers.len() >= crate::state::MAX_LAYERS {
             return Err(code_storage_exceeded(format!(
                 "Code storage limit exceeded: this account already holds the maximum of {} \
                  layers.",
@@ -231,12 +232,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
+        // A layer is a REGIONAL resource, so the record a publish adds a version to is
+        // the one this Region holds under the name: the same name in another Region is
+        // another layer, with version numbers of its own (see
+        // [`crate::state::layer_store`]).
         let record = store
             .layers
-            .entry(name.clone())
+            .entry(key)
             .or_insert_with(|| crate::state::LayerRecord {
                 arn: crate::state::layer_arn(&region, &name),
-                region,
+                region: region.clone(),
                 name: name.clone(),
                 latest_version: 0,
                 versions: ::std::collections::BTreeMap::new(),
@@ -287,8 +292,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Answered by reading the version back out of the store, so GetLayerVersion
         // reports exactly what this call persisted.
         let Some(published) = store
-            .layers
-            .get(&name)
+            .layer(&region, &name)
             .and_then(|record| Some((record, record.versions.get(&version_number)?)))
             .map(|(record, published)| record.version_detail(published))
         else {

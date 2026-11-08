@@ -725,10 +725,12 @@ async fn a_function_reports_the_layer_versions_it_was_created_with() {
 
     let first_archive = archive_bytes(512);
     let second_archive = archive_bytes(2_048);
-    for archive in [&first_archive, &second_archive] {
+    // Two DIFFERENT layers: a function's layer list may name at most one version of any
+    // one layer, so the row that pins the ORDER of the list names one version of each.
+    for (name, archive) in [("shared", &first_archive), ("helpers", &second_archive)] {
         let answer = publish_layer_version(
             &router,
-            "shared",
+            name,
             &json!({ "Content": { "ZipFile": zip_file(archive) } }),
         )
         .await;
@@ -741,7 +743,7 @@ async fn a_function_reports_the_layer_versions_it_was_created_with() {
         );
     }
     let first = layer_version_arn("shared", 1);
-    let second = layer_version_arn("shared", 2);
+    let second = layer_version_arn("helpers", 1);
     // `arn:<partition>:lambda:::awslayer:<name>` is the second form the model's
     // `LayerVersionArn` pattern admits: a layer Lambda provides, which belongs to no
     // account and whose archive this emulator holds none of.
@@ -1338,9 +1340,13 @@ async fn deleting_a_layer_version_a_function_refers_to_leaves_that_function_alon
     let router = router_on(&engine);
 
     let archives = [archive_bytes(512), archive_bytes(1_024)];
-    publish_each(&router, "referenced", &archives, 1).await;
+    // TWO layers, one version each: a function's layer list may name at most one version
+    // of any one layer, and what this test needs is a version the delete removes beside
+    // one it leaves alone.
+    publish_each(&router, "referenced", &archives[..1], 1).await;
+    publish_each(&router, "companion", &archives[1..], 1).await;
     let first = layer_version_arn("referenced", 1);
-    let second = layer_version_arn("referenced", 2);
+    let second = layer_version_arn("companion", 1);
     let expected_layers = json!([
         // The archives here are bytes this emulator cannot read as an archive, so the
         // expanded size of their contents is 0 (see `function_layer_unzipped_size`).

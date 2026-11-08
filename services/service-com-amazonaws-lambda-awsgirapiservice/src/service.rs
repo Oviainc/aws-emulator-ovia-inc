@@ -665,9 +665,12 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for Downloads<Eng> {
                     .get(name)
                     .and_then(|function| function.package_at_revision(revision_id))
                     .and_then(crate::state::held_package_bytes),
-                crate::state::DownloadTarget::LayerArchive { name, version } => store
-                    .layers
-                    .get(name)
+                crate::state::DownloadTarget::LayerArchive {
+                    region,
+                    name,
+                    version,
+                } => store
+                    .layer(region, name)
                     .and_then(|layer| layer.versions.get(version))
                     .and_then(|held| held.archive.zip_bytes.as_deref()),
             };

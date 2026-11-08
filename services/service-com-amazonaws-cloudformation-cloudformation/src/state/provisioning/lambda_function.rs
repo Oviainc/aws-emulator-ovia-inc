@@ -91,14 +91,15 @@ const LAST_UPDATE_STATUS_IN_PROGRESS: &str = "InProgress";
 /// those windows, and how many times it asks.
 ///
 /// The interval is short enough that a settled function is noticed about as soon as it
-/// settles, and the budget — a few times over the window AWS Lambda itself holds a
-/// modification open for, the span the other waits in this provisioning layer are sized
-/// against — long enough to cover it on a loaded machine. A wait that runs out is not a
-/// failure of its own: what fails then is the call that needed the function modifiable,
-/// reported as Lambda's own refusal of it, so a function genuinely stuck fails the resource
-/// rather than holding the deployment open.
-const SETTLE_CHECK_INTERVAL: Duration = Duration::from_millis(25);
-const SETTLE_CHECKS: usize = 80;
+/// settles, and the budget — 50 ms apart, 180 times, so nine seconds — is a few times over
+/// the window AWS Lambda itself holds a modification open for
+/// (`service_com_amazonaws_lambda_awsgirapiservice::state::UPDATE_DELAY`, the span the
+/// other waits in this provisioning layer are sized against), long enough to cover it on a
+/// loaded machine. A wait that runs out is not a failure of its own: what fails then is the
+/// call that needed the function modifiable, reported as Lambda's own refusal of it, so a
+/// function genuinely stuck fails the resource rather than holding the deployment open.
+const SETTLE_CHECK_INTERVAL: Duration = Duration::from_millis(50);
+const SETTLE_CHECKS: usize = 180;
 
 /// Every property `AWS::Lambda::Function` publishes. A declared property this list does not
 /// carry is REFUSED rather than dropped, so a function is never reported created with less

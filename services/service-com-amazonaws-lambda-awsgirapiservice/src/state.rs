@@ -434,10 +434,14 @@ pub const ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 ///
 /// An EMULATOR-CHOSEN span, for the same reason as [`ACTIVATION_DELAY`]: the real time
 /// to provision a new instance of the function is not in the model ("If your function
-/// connects to a VPC, this process can take a minute"). It is deliberately non-zero, so
-/// a caller that modifies the function again immediately still meets the refusal the
-/// same documentation describes ("During this time, you can't modify the function").
-pub const UPDATE_DELAY: Duration = Duration::from_millis(500);
+/// connects to a VPC, this process can take a minute"). It has to OUTLAST the call that
+/// opened it, because the window is what every client of this lifecycle reads: a caller
+/// that reads the function back, or modifies it again, as its very next call still finds
+/// [`LAST_UPDATE_STATUS_IN_PROGRESS`] and the refusal the same documentation describes
+/// ("During this time, you can't modify the function"). A deployment package may be
+/// megabytes, so that next call is issued seconds rather than milliseconds after the
+/// update was accepted, and the span is sized for it.
+pub const UPDATE_DELAY: Duration = Duration::from_secs(3);
 
 /// Lambda's sentence for a modification refused because an update of the function it
 /// names is still being applied — the window [`LAST_UPDATE_STATUS_IN_PROGRESS`] covers
@@ -2983,9 +2987,12 @@ pub struct ComAmazonawsLambdaAwsgirapiserviceState {
     /// Every capacity provider, keyed by its name — the `{CapacityProviderName}` path
     /// label the capacity-provider operations bind.
     pub capacity_providers: BTreeMap<String, CapacityProviderRecord>,
-    /// Every layer this emulator holds, keyed by layer name so `ListLayers` pages
-    /// through them in a stable order.
-    pub layers: BTreeMap<String, LayerRecord>,
+    /// Every layer this emulator holds, keyed by the REGION it was published into and
+    /// its layer name ([`layer_key`]) — a layer is a regional resource, so the same name
+    /// in two Regions is two layers — and ordered by that pair, so `ListLayers` pages
+    /// through one Region's layers in name order. Reach one through [`Self::layer`],
+    /// [`Self::layer_mut`] or [`Self::layers_in`] rather than by keying the map here.
+    pub layers: BTreeMap<LayerKey, LayerRecord>,
     /// Every event source mapping this emulator holds, keyed by its UUID so
     /// `ListEventSourceMappings` pages through them in a stable order.
     pub event_source_mappings: BTreeMap<String, EventSourceMappingRecord>,
@@ -3610,6 +3617,9 @@ pub enum LayerVersionReference {
     /// `arn:<partition>:lambda:<region>:<account>:layer:<name>:<version>` — a version
     /// published into an account, which this store holds.
     Published {
+        /// The Region the ARN names, which is the Region the version was published into:
+        /// a layer is a regional resource, so this is part of WHICH version is named.
+        region: String,
         /// The layer's bare name.
         name: String,
         /// The version number the ARN qualifies it with.
@@ -3633,6 +3643,7 @@ pub fn parse_layer_version_arn(value: &str) -> Option<LayerVersionReference> {
         (8, "layer") if is_layer_name(parts[6]) => {
             let version = parts[7].parse::<i64>().ok().filter(|version| *version > 0)?;
             Some(LayerVersionReference::Published {
+                region: parts[3].to_string(),
                 name: parts[6].to_string(),
                 version,
             })
@@ -3640,56 +3651,6 @@ pub fn parse_layer_version_arn(value: &str) -> Option<LayerVersionReference> {
         (7, "awslayer") if is_layer_name(parts[6]) => Some(LayerVersionReference::AwsManaged),
         _ => None,
     }
-}
-
-/// Resolve a function's `Layers` — "A list of function layers to add to the function's
-/// execution environment. Specify each layer by its ARN, including the version" —
-/// against the layer versions this store holds.
-///
-/// The error carries the message of the refusal: an entry that is not a layer version
-/// ARN, or one naming a version this account has published no layer for. A layer
-/// Lambda itself provides belongs to no account, so it is taken as named: this emulator
-/// holds no archive for it and therefore reports the `CodeSize` member's own default for
-/// it, exactly as it does for a deployment package whose bytes it does not hold.
-pub fn resolve_function_layers(
-    store: &ComAmazonawsLambdaAwsgirapiserviceState,
-    layers: &[String],
-) -> Result<Vec<FunctionLayer>, String> {
-    layers
-        .iter()
-        .map(|arn| match parse_layer_version_arn(arn) {
-            None => Err(format!(
-                "1 validation error detected: Value '{arn}' at 'layers' failed to satisfy \
-                 constraint: Member must be the ARN of a layer version, including the version"
-            )),
-            Some(LayerVersionReference::AwsManaged) => Ok(FunctionLayer {
-                arn: arn.clone(),
-                code_size: 0,
-                uncompressed_code_size: 0,
-                zip_bytes: None,
-            }),
-            Some(LayerVersionReference::Published { name, version }) => {
-                let published = store
-                    .layers
-                    .get(&name)
-                    .and_then(|layer| Some((layer, layer.versions.get(&version)?)))
-                    .ok_or_else(|| format!("Layer version {arn} does not exist."))?;
-                // The ARN and both sizes come out of the stored version, so nothing
-                // of the request is echoed back as a resolved layer.
-                Ok(FunctionLayer {
-                    arn: published.0.version_arn(version),
-                    code_size: published.1.code_size,
-                    uncompressed_code_size: published.1.unzipped_code_size(),
-                    zip_bytes: published
-                        .1
-                        .archive
-                        .zip_bytes
-                        .clone()
-                        .map(::std::sync::Arc::new),
-                })
-            }
-        })
-        .collect()
 }
 
 /// The region this request's ARNs carry: the one the caller signed for, from the SigV4
@@ -3739,27 +3700,39 @@ pub fn download_host(region: &str, bucket: &str) -> String {
     format!("awslambda-{region}-{bucket}.s3.{region}.amazonaws.com")
 }
 
-/// The bucket label of a download host this service publishes, or `None` when `host` is
-/// not one.
+/// The Region and the bucket label of a download host this service publishes, or `None`
+/// when `host` is not one.
 ///
 /// The host's first label names no emulated service, so the router cannot resolve a
 /// target from it: recognising it here is what routes a fetch of a URL this service
 /// HANDED OUT back to this service rather than to its `UnknownService` answer. Any
 /// userinfo and port are stripped first, because a `Host` header may carry them.
+///
+/// The Region is part of the answer because both published stores are PER-REGION (see
+/// [`download_host`]): a layer archive is held under the Region it was published into, so
+/// the object a URL names is not resolved by its key alone.
 #[must_use]
-pub fn download_bucket_of_host(host: &str) -> Option<&'static str> {
+pub fn download_region_and_bucket(host: &str) -> Option<(String, &'static str)> {
     let host = host.rsplit('@').next().unwrap_or(host);
     let host = host.split(':').next().unwrap_or(host);
     let rest = host.strip_prefix("awslambda-")?;
     [DOWNLOAD_BUCKET_TASKS, DOWNLOAD_BUCKET_LAYERS]
         .into_iter()
-        .find(|bucket| {
+        .find_map(|bucket| {
             rest.split_once(&format!("-{bucket}.s3."))
                 .and_then(|(region, tail)| {
                     Some((region.to_string(), tail.strip_suffix(".amazonaws.com")?))
                 })
-                .is_some_and(|(region, tail)| !region.is_empty() && tail == region)
+                .filter(|(region, tail)| !region.is_empty() && tail == region)
+                .map(|(region, _)| (region, bucket))
         })
+}
+
+/// The bucket label of a download host this service publishes, or `None` when `host` is
+/// not one; the Region half is [`download_region_and_bucket`]'s.
+#[must_use]
+pub fn download_bucket_of_host(host: &str) -> Option<&'static str> {
+    download_region_and_bucket(host).map(|(_, bucket)| bucket)
 }
 
 /// Whether `host` is one of the download hosts this service publishes.
@@ -3781,6 +3754,9 @@ pub enum DownloadTarget {
     },
     /// One layer version's archive.
     LayerArchive {
+        /// The Region the archive is held in, which the download host names: a layer is
+        /// a regional resource, so this is part of WHICH archive is named.
+        region: String,
         /// The bare layer name.
         name: String,
         /// The version number.
@@ -3796,7 +3772,7 @@ pub enum DownloadTarget {
 /// here and nothing else does.
 #[must_use]
 pub fn parse_download_target(host: &str, path: &str) -> Option<DownloadTarget> {
-    let bucket = download_bucket_of_host(host)?;
+    let (region, bucket) = download_region_and_bucket(host)?;
     let rest = path
         .strip_prefix(DOWNLOAD_PATH_PREFIX)?
         .strip_prefix('/')?;
@@ -3826,6 +3802,7 @@ pub fn parse_download_target(host: &str, path: &str) -> Option<DownloadTarget> {
         _ => {
             let (name, version) = key.rsplit_once('-')?;
             Some(DownloadTarget::LayerArchive {
+                region,
                 name: name.to_string(),
                 version: version.parse::<i64>().ok().filter(|version| *version > 0)?,
             })
@@ -4724,9 +4701,10 @@ pub fn resolve_layer_version<'a>(
 ) -> Result<ResolvedLayerVersion<'a>, ResolveFailure> {
     let name = layer_name_of(layer_name)?;
 
+    // A layer is a REGIONAL resource, so the record is the one published in the Region
+    // this request addressed; a layer of any other Region is not held here at all.
     let record = store
-        .layers
-        .get_mut(&name)
+        .layer_mut(region, &name)
         .ok_or_else(|| no_such_layer_version(region, &name, version_number))?;
     let arn = record.version_arn(version_number);
     let version = record
@@ -4746,9 +4724,9 @@ pub fn resolve_layer_version_ref<'a>(
 ) -> Result<ResolvedLayerVersionRef<'a>, ResolveFailure> {
     let name = layer_name_of(layer_name)?;
 
+    // Region-scoped for the same reason as [`resolve_layer_version`].
     let record = store
-        .layers
-        .get(&name)
+        .layer(region, &name)
         .ok_or_else(|| no_such_layer_version(region, &name, version_number))?;
     let arn = record.version_arn(version_number);
     let version = record
@@ -4757,6 +4735,12 @@ pub fn resolve_layer_version_ref<'a>(
         .ok_or_else(|| no_such_layer_version(region, &name, version_number))?;
     Ok(ResolvedLayerVersionRef { arn, version })
 }
+
+/// The REGION a layer belongs to: how this store is keyed by it, which layers a request
+/// can reach, and the rules a function's `Layers` list has to satisfy; see the module's
+/// own header.
+pub mod layer_store;
+pub use layer_store::*;
 
 #[cfg(test)]
 mod tests;

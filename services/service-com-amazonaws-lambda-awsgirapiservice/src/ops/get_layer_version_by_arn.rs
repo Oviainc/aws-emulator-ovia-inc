@@ -161,10 +161,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // "Returns information about a version of an Lambda layer": a pure report, so
-        // the answer depends on the stored record alone and on no request metadata —
-        // the ARNs it carries are the ones the layer was published with, not the value
-        // the request addressed the version by.
-        let _ = ctx;
+        // the answer depends on the stored record alone — the ARNs it carries are the
+        // ones the layer was published with, not the value the request addressed the
+        // version by. The one thing it takes from the request is the Region it was made
+        // in: a layer is a REGIONAL resource (see [`crate::state::layer_store`]).
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetLayerVersionByArnErrorModeled::ServiceException(ServiceException {
                 r#type: None,
@@ -177,8 +177,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // outside the two forms the model's `LayerVersionArn` pattern admits, so what
         // reaches here either names a published version or names a version number no
         // layer is ever assigned (versions count from 1 upwards), which no store holds.
-        let Some(crate::state::LayerVersionReference::Published { name, version }) =
-            crate::state::parse_layer_version_arn(&input.arn)
+        let Some(crate::state::LayerVersionReference::Published {
+            region: named_region,
+            name,
+            version,
+        }) = crate::state::parse_layer_version_arn(&input.arn)
         else {
             // The other admitted form, `arn:<partition>:lambda:::awslayer:<name>`, names
             // a layer Lambda itself provides: it belongs to no account, so this account
@@ -186,10 +189,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(no_such_layer_version());
         };
 
+        // The ARN names its own Region, and a layer version is held only in the Region it
+        // was published into: an ARN of another Region names no version this endpoint
+        // holds, exactly as a name nobody ever published does.
+        if named_region != crate::state::request_region(ctx) {
+            return Err(no_such_layer_version());
+        }
+
         let store = state.lock();
         let detail = store
-            .layers
-            .get(&name)
+            .layer(&named_region, &name)
             .and_then(|record| {
                 let held = record.versions.get(&version)?;
                 Some(record.version_detail(held))

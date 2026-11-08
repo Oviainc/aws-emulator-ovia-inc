@@ -149,6 +149,7 @@ pub(super) async fn delete(
     let Some(::service_com_amazonaws_lambda_awsgirapiservice::state::LayerVersionReference::Published {
         name,
         version,
+        ..
     }) = ::service_com_amazonaws_lambda_awsgirapiservice::state::parse_layer_version_arn(
         &resource.physical_resource_id,
     ) else {

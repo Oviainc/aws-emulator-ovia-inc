@@ -192,12 +192,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let architecture = input.compatible_architecture.as_deref();
 
         let store = state.lock();
-        // The store keys layers by name, so its own order is the order the entries are
-        // reported and paginated in.
+        // The store keys layers by Region and name, so one Region's layers come out in
+        // name order, which is the order the entries are reported and paginated in.
         let entries: Vec<LayersListItem> = store
-            .layers
-            .values()
-            .filter(|record| record.region == region)
+            .layers_in(&region)
             .filter_map(|record| {
                 // A layer whose every version has been deleted is a layer there is no
                 // latest version to show information about, so it is not listed at all.

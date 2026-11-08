@@ -447,12 +447,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "A list of function layers to add to the function's execution environment.
         // Specify each layer by its ARN, including the version." Each entry names a layer
-        // version `PublishLayerVersion` persisted, so the configuration holds what that
-        // record resolves to rather than what the request said.
+        // version `PublishLayerVersion` persisted IN THIS REGION, and no two of them name
+        // versions of one layer, so the configuration holds what those records resolve to
+        // rather than what the request said (see [`crate::state::layer_store`]).
         let layers = match input.layers.as_deref() {
-            Some(layers) => {
-                Some(crate::state::resolve_function_layers(&store, layers).map_err(invalid_parameter)?)
-            }
+            Some(layers) => Some(
+                crate::state::resolve_function_layers(&store, &region, layers)
+                    .map_err(invalid_parameter)?,
+            ),
             None => None,
         };
         // "Environment variables that are accessible from function code during

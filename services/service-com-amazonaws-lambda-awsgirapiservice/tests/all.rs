@@ -249,6 +249,8 @@ mod layer_archive_unzipped_size;
 mod layer_listing;
 #[path = "all/layer_listing_entry_members.rs"]
 mod layer_listing_entry_members;
+#[path = "all/layer_region_scope.rs"]
+mod layer_region_scope;
 #[path = "all/layer_version_by_arn.rs"]
 mod layer_version_by_arn;
 #[path = "all/layer_version_listing.rs"]
@@ -315,6 +317,8 @@ mod tag_resource_arn_constraint;
 mod untrusted_name_parsing;
 #[path = "all/update_function_configuration.rs"]
 mod update_function_configuration;
+#[path = "all/update_window_outlasts_its_call.rs"]
+mod update_window_outlasts_its_call;
 #[path = "all/version_delete_alias_reference.rs"]
 mod version_delete_alias_reference;
 #[path = "all/version_publishing.rs"]

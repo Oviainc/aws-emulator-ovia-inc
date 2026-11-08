@@ -543,8 +543,7 @@ async fn statements_accumulate_on_the_version_and_each_change_mints_a_revision()
     let held = engine
         .state::<ComAmazonawsLambdaAwsgirapiserviceState>()
         .lock()
-        .layers
-        .get("fan-out")
+        .layer(REGION, "fan-out")
         .map(|record| {
             record
                 .versions
