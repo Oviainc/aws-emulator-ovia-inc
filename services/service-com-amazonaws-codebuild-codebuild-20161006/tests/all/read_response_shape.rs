@@ -229,7 +229,11 @@ async fn an_unresolvable_identifier_lands_in_the_not_found_half() {
             json!({"ids": ["never-created:00000000-0000-8000-8000-000000000001"]}),
             "buildBatches",
             "buildBatchesNotFound",
-            json!(["never-created:00000000-0000-8000-8000-000000000001"]),
+            // A batch build is named by its ARN in every answer this service gives, so
+            // the not-found half names it that way too.
+            json!([expected_arn(
+                "build-batch/never-created:00000000-0000-8000-8000-000000000001"
+            )]),
         ),
         (
             "BatchGetReportGroups",

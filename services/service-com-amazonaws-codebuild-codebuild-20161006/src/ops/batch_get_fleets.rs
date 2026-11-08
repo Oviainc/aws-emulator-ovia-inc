@@ -136,6 +136,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
+        // `names` takes "the names or ARNs of the compute fleets", and a value that is
+        // neither is no fleet identifier at all: it is refused here, ahead of the
+        // registry lookup, rather than absorbed into an empty result a caller could not
+        // tell from "this account holds no such fleet". The rule itself is
+        // `crate::state::fleet_identifier_violation`.
+        if let Some(message) = input
+            .names
+            .iter()
+            .find_map(|identifier| crate::state::fleet_identifier_violation(identifier))
+        {
+            return Err(BatchGetFleetsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         // A read: it reports what CreateFleet stored, in the order the request named
         // the fleets, and splits the identifiers it holds no fleet for into
         // `fleetsNotFound`. The one write it makes is the transition the clock

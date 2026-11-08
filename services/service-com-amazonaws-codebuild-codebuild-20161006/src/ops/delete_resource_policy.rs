@@ -53,6 +53,8 @@
 //! ## Errors
 //!
 //! * `InvalidInputException` (HTTP 400) — The input value that was provided is not valid.
+//! * `ResourceNotFoundException` (HTTP 400) — widened in through `extra_errors` (see below):
+//!   the ARN whose policy this call deletes names a resource that may not exist.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -68,10 +70,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-codebuild-codebuild-201
 // here — hence the `DeleteResourcePolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.codebuild#DeleteResourcePolicy")]
+// `ResourceNotFoundException` is widened in through `extra_errors`: this operation does
+// not list it, but the SERVICE models the shape — and `GetResourcePolicy`, the read of
+// the same sub-resource, declares it — and the ARN a policy is deleted from names a
+// resource that may not exist, which is the boundary CodeBuild refuses the call at.
+#[smithy_macros::operation_error(
+    "com.amazonaws.codebuild#DeleteResourcePolicy",
+    extra_errors = ["ResourceNotFoundException"]
+)]
 #[derive(Debug)]
 pub enum DeleteResourcePolicyErrorModeled {
     InvalidInputException(InvalidInputException),
+    ResourceNotFoundException(ResourceNotFoundException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -128,10 +138,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     /// is not the ARN of a resource this service attaches a policy to is a malformed
     /// input.
     ///
-    /// An ARN of the right shape carrying no policy is NOT a refusal: this operation
-    /// models one error only — `InvalidInputException` — and has no not-found error to
-    /// answer with, so a delete of an attachment that is not there removes nothing and
-    /// answers the same empty body, which makes the call idempotent.
+    /// An ARN of the right shape naming a resource this account does not hold is
+    /// refused: a policy cannot be removed from a resource that is not there, and a
+    /// caller told the call worked would read it as the attachment being gone. An ARN
+    /// naming a resource that IS held but carries no policy is NOT a refusal — nothing
+    /// is attached, so there is nothing to remove and the same empty body is the honest
+    /// answer, which makes the call idempotent. The boundary is the RESOURCE's
+    /// existence, never the policy's.
     async fn handle(
         &self,
         input: Self::Input,
@@ -161,11 +174,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let removed = state
-            .lock()
-            .resource_policies
-            .remove(&input.resource_arn)
-            .is_some();
+        let mut guard = state.lock();
+        // The resource the policy is attached to has to be one this account holds — the
+        // same question `crate::ops::put_resource_policy` asks before it writes one, and
+        // the one boundary this delete is refused at.
+        if !guard.holds_policy_target(&input.resource_arn) {
+            drop(guard);
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::NotFound,
+                Some(&input.resource_arn),
+            );
+            return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::RESOURCE_ARN_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+        let removed = guard.resource_policies.remove(&input.resource_arn).is_some();
+        drop(guard);
         if removed {
             // Only a call that CHANGED the store writes a record, so the log reads as
             // the history of the attachments this account held.

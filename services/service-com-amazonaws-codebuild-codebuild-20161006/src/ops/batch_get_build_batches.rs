@@ -136,8 +136,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 "BatchGetBuildBatches (this engine carries no CodeBuild state)",
             ));
         };
-        let _ = ctx;
-
+        let region = crate::state::request_region(ctx.parts());
         let now = crate::state::now_millis();
         let mut guard = state.lock();
         let mut build_batches = Vec::new();
@@ -148,7 +147,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // owed at that instant whether or not anybody called.
             match guard.settled_build_batch(id, now) {
                 Some(stored) => build_batches.push(stored.build_batch.clone()),
-                None => not_found.push(id.clone()),
+                // A batch build is named by its ARN in every answer this service gives
+                // (`BuildBatch$arn`, and the `buildBatchArn` a build of the batch
+                // carries), so an identifier nothing resolved is reported in that same
+                // form: a caller diffing what it asked for against what came back is
+                // comparing ARNs. An identifier already given as an ARN is reported
+                // back as sent.
+                None if crate::state::is_arn(id) => not_found.push(id.clone()),
+                None => not_found.push(crate::state::build_batch_arn(&region, id)),
             }
         }
 

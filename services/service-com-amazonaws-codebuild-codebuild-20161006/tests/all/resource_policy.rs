@@ -16,8 +16,11 @@
 //! resource it is attached to. Sharing a resource is READ-ONLY sharing, so a document
 //! containing any action outside the read-only consumer set of the kind of resource the
 //! ARN names is refused with `InvalidInputException` and stores nothing.
-//! `DeleteResourcePolicy` removes the attachment, which unshares the resource, and
-//! models no not-found error, so removing an attachment that is not there is accepted.
+//! `DeleteResourcePolicy` removes the attachment, which unshares the resource, and is
+//! refused at the same boundary the write path is — the RESOURCE's existence — so an ARN
+//! naming a resource this account holds is accepted whether or not an attachment is
+//! keyed by it, while one naming no resource of this account is
+//! `ResourceNotFoundException`.
 //!
 //! The harness (`call`, `create_project`, `emulator`, `emulator_on`, `error_type`,
 //! `REGION`) is the one `project_build_lifecycle` already drives this service with, and
@@ -916,8 +919,9 @@ async fn delete(router: &MultiServiceRouter, case: &str, arn: &str) {
 }
 
 /// RULE: deleting the attachment unshares the resource — the document leaves the store
-/// and a read reports the absent policy — and the operation models no not-found error, so
-/// deleting an attachment that is not there is accepted and changes nothing.
+/// and a read reports the absent policy — and a resource this account holds takes the
+/// delete whether or not an attachment is keyed by it, so deleting one that is not there
+/// is accepted and changes nothing.
 #[tokio::test]
 async fn deleting_the_policy_unshares_the_resource_and_is_idempotent() {
     for kind in KINDS {
@@ -1043,13 +1047,14 @@ async fn deleting_a_policy_from_a_value_that_is_not_a_policy_target_is_refused()
     );
 }
 
-/// RULE: the delete path models no not-found error, so — unlike the write path, which
-/// refuses an ARN of the right shape this account holds no resource for with
-/// `ResourceNotFoundException` — every ARN of a resource a policy attaches to is
-/// accepted: the attachment keyed by it leaves the store if one is there, nothing is
+/// RULE: the boundary the delete path refuses at is the RESOURCE's existence, not the
+/// attachment's — an ARN of the right shape naming a resource this account does not hold
+/// is refused with `ResourceNotFoundException`, exactly as the write path refuses it,
+/// while an ARN naming a resource this account DOES hold is accepted whether or not an
+/// attachment is keyed by it: the attachment leaves the store if one is there, nothing is
 /// removed if none is, and no other ARN's attachment is touched.
 #[tokio::test]
-async fn deleting_a_policy_from_an_arn_carrying_no_attachment_is_accepted() {
+async fn deleting_a_policy_is_refused_for_an_absent_resource_and_accepted_without_one() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = emulator_on(Arc::clone(&engine));
 
@@ -1111,19 +1116,33 @@ async fn deleting_a_policy_from_an_arn_carrying_no_attachment_is_accepted() {
     ];
 
     for (case, arn, held) in rows {
-        if !held {
-            // The contrast that makes the rule a rule: the WRITE path refuses this very
-            // ARN as a missing resource, where the delete path below accepts it.
-            refusal(
-                &router,
-                case,
-                "PutResourcePolicy",
-                json!({"resourceArn": arn, "policy": sharing_policy(&arn, "grant")}),
-                "ResourceNotFoundException",
-            )
-            .await;
+        if held {
+            // A resource this account holds takes the delete even with nothing attached.
+            delete(&router, case, &arn).await;
+        } else {
+            // A resource this account does not hold is refused — the same answer, in the
+            // same words, the WRITE path gives for this very ARN.
+            for operation in ["PutResourcePolicy", "DeleteResourcePolicy"] {
+                let message = refusal(
+                    &router,
+                    case,
+                    operation,
+                    json!({"resourceArn": arn, "policy": sharing_policy(&arn, "grant")}),
+                    "ResourceNotFoundException",
+                )
+                .await;
+                assert_eq!(
+                    message, "Resource ARN does not exist",
+                    "case {case:?} on {operation}: expected CodeBuild's absent-resource \
+                     sentence, got {message:?}"
+                );
+                assert!(
+                    !message.contains(&arn),
+                    "case {case:?} on {operation}: the sentence must not echo the ARN, got \
+                     {message:?}"
+                );
+            }
         }
-        delete(&router, case, &arn).await;
         let message = refusal(
             &router,
             case,
@@ -1136,8 +1155,8 @@ async fn deleting_a_policy_from_an_arn_carrying_no_attachment_is_accepted() {
             message, "Resource ARN resource policy does not exist",
             "case {case:?}: the ARN still carries no policy, got {message:?}"
         );
-        // Every accepted delete of an ARN carrying nothing left the store exactly as it
-        // was: the two grants this account holds, and no third record.
+        // Every call above left the store exactly as it was: the two grants this account
+        // holds, and no third record.
         for (kind, shared_arn, document) in &shared {
             assert_eq!(
                 &get(&router, case, shared_arn).await,

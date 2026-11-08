@@ -225,9 +225,12 @@ async fn delete_build_batch_removes_a_finished_batch_and_refuses_one_still_runni
             .unwrap_or_default();
         let not_found = string_list(&after["buildBatchesNotFound"]);
         if gone {
+            // A batch nothing resolved is named in the ARN form the service names a
+            // batch by everywhere else, not by the bare id the request carried.
+            let first_arn = state::build_batch_arn(REGION, &first);
             assert!(
-                !reported.contains(&first) && not_found.contains(&first),
-                "case {target:?}: the deleted batch reads as not found, got {after}"
+                !reported.contains(&first) && not_found.contains(&first_arn),
+                "case {target:?}: the deleted batch reads as not found by its ARN, got {after}"
             );
         } else {
             assert!(
@@ -613,8 +616,8 @@ async fn the_builds_of_a_deleted_batch_build_are_deleted_with_it() {
         );
         assert_eq!(
             string_list(&batches["buildBatchesNotFound"]),
-            vec![batch_id.clone()],
-            "case {:?}: the deleted batch build reads as not found; got {batches}",
+            vec![state::build_batch_arn(REGION, &batch_id)],
+            "case {:?}: the deleted batch build reads as not found by its ARN; got {batches}",
             row.name
         );
     }

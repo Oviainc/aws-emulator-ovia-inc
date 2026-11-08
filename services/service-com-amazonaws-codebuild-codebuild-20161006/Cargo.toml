@@ -31,6 +31,19 @@ hex = { workspace = true }
 # principal — which `CreateProject` and `StartBuild` ask before storing a project or
 # starting a build that would RUN AS the role the request hands over.
 service-common = { path = "../common" }
+# `aws-sdk-s3`: a build uploads its output artifacts to the bucket those artifacts name,
+# so `StartBuild` and `StartBuildBatch` resolve that bucket against the service that owns
+# buckets (S3's `HeadBucket`). A LIBRARY: it opens no connection of its own here — the
+# client is built over the framework's in-process callback (its HTTP client and
+# credentials provider), so the call is dispatched inside this emulator and reaches no
+# host off it. `default-features = false` keeps the default TLS and connector stacks out.
+aws-sdk-s3 = { version = "1", default-features = false }
+# `yaml-rust2`: a project's buildspec is YAML, and the `batch` section of it is what
+# declares the builds a batch build fans out into; yaml-rust2 is the pure-Rust YAML 1.2
+# implementation the other services in this workspace read caller-supplied YAML with (a
+# DATA-FORMAT PARSER, not an execution substrate: no `unsafe`, no C, no build script).
+# The text it is handed is bounded first — see `crate::state`'s batchspec reading.
+yaml-rust2 = { version = "0.10", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -1,17 +1,14 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: codebuild.batch-get-fleets-invalid-arn-rejected codebuild.delete-resource-policy-absent-policy-rejected codebuild.list-command-executions-for-sandbox-absent-not-found codebuild.start-build-artifacts-override-rejected-without-a-location-and-no-artifacts-uploads-nothing codebuild.e2e-build-batch-lifecycle codebuild.start-build-batch-auto-generates-sub-builds codebuild.e2e-sandbox-command-execution-flow codebuild.report-group-trend-reflects-report-data codebuild.start-build-image-and-compute-overrides-apply-to-that-build-only
+Issue-Trace-Ids: codebuild.batch-get-fleets-invalid-arn-rejected codebuild.delete-resource-policy-absent-policy-rejected codebuild.list-command-executions-for-sandbox-absent-not-found codebuild.e2e-build-batch-lifecycle codebuild.start-build-batch-auto-generates-sub-builds codebuild.e2e-sandbox-command-execution-flow
 Issue-Shape-Id: com.amazonaws.codebuild#CodeBuild_20161006
 Issue-Key: codebuild.batch-get-fleets-invalid-arn-rejected|_error#3|AssertionError|raise AssertionError(
 Issue-Key: codebuild.delete-resource-policy-absent-policy-rejected|_client_error#12|AssertionError|raise AssertionError(f"expected the call to be rejected, but it succeeded: {result!r}")
 Issue-Key: codebuild.list-command-executions-for-sandbox-absent-not-found|_client_error#3|AssertionError|raise AssertionError(f"expected the call to be rejected, but it succeeded: {result!r}")
-Issue-Key: codebuild.start-build-artifacts-override-rejected-without-a-location-and-no-artifacts-uploads-nothing|_err#13|AssertionError|raise AssertionError(f"expected the call to be refused, but it succeeded: {result!r}")
 Issue-Key: codebuild.e2e-build-batch-lifecycle|run#19|AssertionError|assert batch_arn in after_delete["buildBatchesNotFound"], (
 Issue-Key: codebuild.start-build-batch-auto-generates-sub-builds|_poll_until#8|Timeout|time.sleep(interval_s)
 Issue-Key: codebuild|StartCommandExecution|InvalidInputException
-Issue-Key: codebuild.report-group-trend-reflects-report-data|run#12|AssertionError|assert build["buildStatus"] == "SUCCEEDED", f"build did not succeed: {build}"
-Issue-Key: codebuild.start-build-image-and-compute-overrides-apply-to-that-build-only|run#12|AssertionError|assert build["buildStatus"] == "SUCCEEDED", (
 Issue-Commit: 6bd726e14a5c3a202f9e89e1e854b8dfcc8d4492
 
 # CodeBuild accepts four refusals AWS rejects, and builds/batches/sandboxes never execute (8 causes)
@@ -23,6 +20,8 @@ StartBuild
 
 ## Description
 EIGHT net-new root causes in the codebuild crate (services/service-com-amazonaws-codebuild-codebuild-20161006): four operations ACCEPT input AWS refuses (causes 1-4), one batch read reports not-found identifiers in the wrong form (cause 5), and three execution paths never progress (causes 6-8). ALL EIGHT must be closed before this issue is resolved.
+
+> **Resolution note (filed when causes 1-7 were fixed).** Causes 1, 2, 3, 5, 6 and 7 are fixed, and so is cause 4 — both of its legs (an S3 artifacts override that names no bucket, and one naming a bucket that does not exist) are now refused, and no build is left behind. Cause 8, builds never executing, is NOT fixed and was SPLIT OUT so it is not recorded as working: its own report, carrying the three replay units that still fail on it (`codebuild.report-group-trend-reflects-report-data`, `codebuild.start-build-image-and-compute-overrides-apply-to-that-build-only`, and `codebuild.start-build-artifacts-override-rejected-without-a-location-and-no-artifacts-uploads-nothing`, whose refusal legs pass and whose last assertion needs a build that succeeds), is `issues/things-that-do-not-work/20261107T233000Z-codebuild-builds-never-execute-so-no-report-override-or-artifact-free-build-is-observable.md`. The keys and trace-ids of those three units were moved to that report; the six left here are the ones that pass.
 
 Angle-bracketed parts of every message below are interpolated from the request and from service state (fleet name, resource ARN, sandbox id, bucket name); the quoted text outside them is the fixed part.
 

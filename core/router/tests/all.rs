@@ -46,6 +46,8 @@ mod directory_data_access_cycle;
 mod kinesisvideo_discovered_data_plane;
 #[path = "all/codebuild_service_role_trust.rs"]
 mod codebuild_service_role_trust;
+#[path = "all/codebuild_artifacts_override_bucket.rs"]
+mod codebuild_artifacts_override_bucket;
 #[path = "all/cloudformation_ec2_cdk_vpc_estate.rs"]
 mod cloudformation_ec2_cdk_vpc_estate;
 #[path = "all/greengrass_deployment_iot_job.rs"]

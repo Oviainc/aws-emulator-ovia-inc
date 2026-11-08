@@ -145,6 +145,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
+        // `sandboxId` is typed only `NonEmptyString`, so the SHAPE of the identifier is
+        // this handler's rule: a value that is not a sandbox id (or the ARN carrying
+        // one) names no sandbox, so there is nothing to list and the request is refused
+        // ahead of the listing — which is what keeps it distinguishable from a
+        // well-formed id this account holds no sandbox for, whose answer is an empty
+        // listing below. The rule itself is
+        // `crate::state::sandbox_identifier_violation`.
+        if let Some(message) = crate::state::sandbox_identifier_violation(&input.sandbox_id) {
+            return Err(
+                ListCommandExecutionsForSandboxErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // `sandboxId` is documented as "A sandboxId or sandboxArn", so either form names
         // the same record — the rewrite every sandbox-addressing operation shares.
         let sandbox_id = crate::state::sandbox_store_id(&input.sandbox_id).to_string();

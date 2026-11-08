@@ -19,6 +19,10 @@ mod absent_resource_wording;
 mod batch_delete_builds;
 #[path = "all/batch_get_reports.rs"]
 mod batch_get_reports;
+#[path = "all/build_artifacts_destination.rs"]
+mod build_artifacts_destination;
+#[path = "all/build_batch_fan_out.rs"]
+mod build_batch_fan_out;
 #[path = "all/command_execution_lifecycle.rs"]
 mod command_execution_lifecycle;
 #[path = "all/delete_build_batch.rs"]
@@ -29,6 +33,8 @@ mod delete_fleet;
 mod delete_report_group;
 #[path = "all/fleet_lifecycle.rs"]
 mod fleet_lifecycle;
+#[path = "all/identifier_shape_refusals.rs"]
+mod identifier_shape_refusals;
 #[path = "all/input_constraint_wording.rs"]
 mod input_constraint_wording;
 #[path = "all/list_build_batches.rs"]

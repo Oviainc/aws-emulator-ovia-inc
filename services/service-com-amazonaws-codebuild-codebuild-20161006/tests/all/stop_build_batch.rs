@@ -12,10 +12,11 @@
 //! deletes cleanly.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_codebuild_codebuild_20161006::state;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::project_build_lifecycle::{
-    batch_enabled, call, create_project, emulator, error_type, PAST_THE_SETTLE_SPAN,
+    batch_enabled, call, create_project, emulator, error_type, PAST_THE_SETTLE_SPAN, REGION,
 };
 
 /// Start one batch build of `project` and hand back its id.
@@ -236,7 +237,7 @@ async fn a_stopped_batch_build_deletes_cleanly() {
     );
     assert_eq!(
         after["buildBatchesNotFound"],
-        json!([id.clone()]),
-        "the deleted batch build reads as not found, got {after}"
+        json!([state::build_batch_arn(REGION, &id)]),
+        "the deleted batch build reads as not found by its ARN, got {after}"
     );
 }

@@ -317,8 +317,8 @@ async fn an_enumerated_value_set_is_stated_in_ascending_order() {
 /// The rows span the shapes a value of neither form takes (no separator at all, an empty
 /// half on either side, a second half that is not a uuid, one a digit short of one, a
 /// bare project name) and both operations whose input is a `BuildIds` list. The build's
-/// own ARN form is NOT among them: nothing records CodeBuild refusing it, so it is
-/// admitted and answered on the records the account holds.
+/// own ARN form is NOT among them: it is the form this service names a build by, so it
+/// is admitted and resolves to the build it names.
 #[tokio::test]
 async fn a_malformed_build_id_is_refused_rather_than_reported_absent() {
     let router = emulator();
@@ -407,9 +407,10 @@ async fn a_malformed_build_id_is_refused_rather_than_reported_absent() {
         "a well-formed absent id belongs in buildsNotDeleted, got {deleted}"
     );
 
-    // The build's own ARN form is ADMITTED rather than refused — nothing records
-    // CodeBuild refusing it — and answered on the records the account holds: a reader
-    // keyed by build id holds nothing under an ARN, so it lands in the not-found half.
+    // The build's own ARN form is ADMITTED rather than refused, and it names the same
+    // build its id does: the id is the ARN's resource segment, and the ARN is the form
+    // this service names a build by wherever it reports one — including the builds a
+    // batch build publishes on its groups — so it resolves to that build.
     let arn_form = state::build_arn(REGION, &held);
     let (status, read) = call(&router, "BatchGetBuilds", json!({"ids": [&arn_form]})).await;
     assert_eq!(
@@ -417,8 +418,26 @@ async fn a_malformed_build_id_is_refused_rather_than_reported_absent() {
         "BatchGetBuilds for the ARN form: expected 200, got {status} with {read}"
     );
     assert_eq!(
+        read["builds"][0]["id"],
+        json!(held),
+        "the ARN form must resolve to the build it names, got {read}"
+    );
+    assert_eq!(
         read["buildsNotFound"],
-        json!([arn_form]),
-        "the ARN form must be answered on the records held, got {read}"
+        json!([]),
+        "the ARN of a held build is not missing, got {read}"
+    );
+
+    // The ARN of a build nobody started still lands in the not-found half, as sent.
+    let absent_arn = state::build_arn(REGION, &absent);
+    let (status, read) = call(&router, "BatchGetBuilds", json!({"ids": [&absent_arn]})).await;
+    assert_eq!(
+        status, 200,
+        "BatchGetBuilds for an absent ARN: expected 200, got {status} with {read}"
+    );
+    assert_eq!(
+        read["buildsNotFound"],
+        json!([absent_arn]),
+        "the ARN of a build nobody started is reported back as sent, got {read}"
     );
 }

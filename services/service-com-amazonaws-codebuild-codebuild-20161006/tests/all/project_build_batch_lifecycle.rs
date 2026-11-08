@@ -307,8 +307,8 @@ async fn the_project_to_build_batch_path_is_served_from_stored_state() {
     );
     assert_eq!(
         mixed["buildBatchesNotFound"],
-        json!([bogus]),
-        "BatchGetBuildBatches: unknown ids belong in buildBatchesNotFound, got {mixed}"
+        json!([state::build_batch_arn(REGION, bogus)]),
+        "BatchGetBuildBatches: unknown ids belong in buildBatchesNotFound, by ARN, got {mixed}"
     );
 
     // A build id is NOT a batch build id: the two resources are held apart.
@@ -325,7 +325,7 @@ async fn the_project_to_build_batch_path_is_served_from_stored_state() {
     .await;
     assert_eq!(
         as_batch["buildBatchesNotFound"],
-        json!([build_id]),
+        json!([state::build_batch_arn(REGION, &build_id)]),
         "a build id must not resolve as a batch build, got {as_batch}"
     );
 

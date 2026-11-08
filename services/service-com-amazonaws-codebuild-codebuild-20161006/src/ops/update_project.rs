@@ -297,6 +297,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The same discipline for the resulting ARTIFACTS: artifacts bound for a bucket
+        // have to name one (`crate::state::artifacts_location_violation`), so an update
+        // that would leave the project with a destination no build could upload to is
+        // refused and the project stays as it was. Applied to the primary artifacts and
+        // to each secondary entry alike, the way `CreateProject` applies it.
+        if let Some(message) = project
+            .artifacts
+            .iter()
+            .chain(project.secondary_artifacts.iter().flatten())
+            .find_map(crate::state::artifacts_location_violation)
+        {
+            drop(guard);
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&arn),
+            );
+            return Err(UpdateProjectErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         // The same discipline for the resulting batch build configuration: the window
         // `crate::state::build_batch_config_violation` describes holds wherever a
         // `ProjectBuildBatchConfig` is accepted, so an update that would leave the

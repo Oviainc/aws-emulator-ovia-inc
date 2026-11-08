@@ -172,8 +172,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // is one it holds no record of. A deleted build leaves both the build map
             // and its project's id index, so every later read — `BatchGetBuilds`,
             // `ListBuildsForProject`, and `ListBuilds` once its own stub issue is
-            // closed — stops reporting it.
-            if guard.remove_build(id) {
+            // closed — stops reporting it. The record is addressed by the build's own
+            // id, and an entry given as a build ARN names the same build
+            // (`crate::state::build_store_id`), the way `BatchGetBuilds` resolves one.
+            if guard.remove_build(crate::state::build_store_id(id)) {
                 deleted.push(id.to_string());
             } else {
                 not_deleted.push(BuildNotDeleted {

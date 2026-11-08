@@ -251,6 +251,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A build of this project UPLOADS its output artifacts to the destination the
+        // project declares, so artifacts bound for a bucket have to name one — the rule
+        // in `crate::state::artifacts_location_violation`, applied to the primary
+        // artifacts and to each secondary entry alike, and the same rule `StartBuild`
+        // applies to an override of them. Whether the bucket EXISTS is resolved when a
+        // build that would upload to it is started rather than here: a project may be
+        // stored before the bucket its builds will write to is created. Needs no state,
+        // so it is checked beside the rules above.
+        if let Some(message) = std::iter::once(&input.artifacts)
+            .chain(input.secondary_artifacts.iter().flatten())
+            .find_map(crate::state::artifacts_location_violation)
+        {
+            crate::state::audit(
+                Self::NAME,
+                ctx.parts(),
+                crate::state::AuditOutcome::ValidationRefused,
+                Some(&arn),
+            );
+            return Err(CreateProjectErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         // A batch build configuration states the wait the batch it configures is held
         // to, so a `timeoutInMins` outside the window AWS documents is refused wherever
         // one is accepted — here, `UpdateProject` and `StartBuildBatch`'s override —

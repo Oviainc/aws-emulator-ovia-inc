@@ -168,12 +168,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = guard.settled_sandbox(store_id, now) else {
             return Err(sandbox_not_found());
         };
-        // A command execution runs inside the sandbox's live session, so a sandbox
-        // that is still queued has no session to run it in yet and one that has ended
-        // (stopped by the caller, or timed out) no longer has one. Refused with the
-        // modelled client error naming the status, never by persisting an execution no
-        // session could ever pick up.
-        if !stored.is_running() {
+        // A command execution is SUBMITTED to a sandbox: the sandbox queues it and runs
+        // it in its session, so a sandbox that is still being provisioned takes one just
+        // as a live one does. What a sandbox cannot do is take a command after its
+        // session has ENDED — stopped by the caller, or timed out — because there is no
+        // session left for a command to be run in and none is ever coming. That, and
+        // only that, is the refusal: the status named in it is read off the stored
+        // record.
+        if stored.is_terminal() {
             let status = stored.sandbox.status.clone().unwrap_or_default();
             return Err(sandbox_not_running(&status));
         }
@@ -249,13 +251,12 @@ fn sandbox_not_found() -> StartCommandExecutionError {
     .into()
 }
 
-/// The modelled refusal for a sandbox whose session is not live: there is no session
-/// for a command to run in.
+/// The modelled refusal for a sandbox whose session has ended: there is no session for a
+/// command to be run in, and none is coming.
 ///
 /// CodeBuild states the rule in one fixed clause whose ONLY variable part is the status
 /// the sandbox is actually in, which is read off the stored record rather than written
-/// here — so the same sentence answers a sandbox still in the queue and one that has
-/// stopped, and nothing of the request (above all no identifier) reaches the wire.
+/// here — so nothing of the request (above all no identifier) reaches the wire.
 fn sandbox_not_running(status: &str) -> StartCommandExecutionError {
     StartCommandExecutionErrorModeled::InvalidInputException(InvalidInputException {
         message: Some(format!(

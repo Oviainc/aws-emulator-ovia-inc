@@ -43,6 +43,17 @@ use crate::ops::types::{
     SandboxSession, SandboxSessionPhase, SourceCredentialsInfo,
 };
 
+/// Where a build's output artifacts go, and whether that destination exists.
+mod artifacts;
+/// Which builds the `batch` section of a buildspec declares a batch build is made of.
+mod batchspec;
+/// The SHAPE of the identifiers the operations that take one as a plain string accept.
+mod identifiers;
+
+pub use artifacts::*;
+pub use batchspec::*;
+pub use identifiers::*;
+
 /// The ARN service segment for this service, as `emulator_arn`'s first argument
 /// (`arn:aws:codebuild:<region>:<account>:<resource>`). Taken from the model's
 /// `aws.api#service` `arnNamespace`.
@@ -491,18 +502,29 @@ pub const MAX_SANDBOX_CONNECTIONS: usize = MAX_SANDBOXES;
 pub const BUILD_NOT_EXECUTED_MESSAGE: &str = "this emulator does not run CodeBuild build \
     containers, so the build could not be provisioned and no buildspec was executed";
 
-/// Why an emulated batch build never reaches `SUCCEEDED`.
+/// Why a batch build whose specification named no build never reaches `SUCCEEDED`.
 ///
 /// A batch build's first act is `DOWNLOAD_BATCHSPEC`: CodeBuild fetches the
 /// project's source inside a build container and reads the batch section of its
-/// buildspec to learn which builds the batch is made of. Nothing in this
-/// emulator fetches a source or runs a container, so the batch specification is
-/// never read, no build of the batch exists, and the batch ends in CodeBuild's
-/// build-system failure status, `FAULT`, carrying this explanation as the
-/// failing phase's context.
+/// buildspec to learn which builds the batch is made of. A project that carries its
+/// buildspec inline hands that section over with no source to fetch, and the batch
+/// fans out into the builds it declares ([`batch_build_declarations`]); a batch whose
+/// specification reaches this emulator without one — a buildspec held in a source tree
+/// nothing here clones, or one that declares no `batch` section — has no build to start,
+/// so it ends in CodeBuild's build-system failure status, `FAULT`, carrying this
+/// explanation as the failing phase's context.
 pub const BATCH_SPEC_NOT_DOWNLOADED_MESSAGE: &str = "this emulator does not run CodeBuild \
     build containers, so the batch build specification could not be downloaded and no build \
     of the batch was started";
+
+/// Why a batch build that DID fan out never reaches `SUCCEEDED` either.
+///
+/// The batch started one build per identifier its specification declared, and each of
+/// those builds ends where every emulated build ends ([`BUILD_NOT_EXECUTED_MESSAGE`]),
+/// so the batch's `IN_PROGRESS` phase has no successful build to combine artifacts from
+/// and takes the same build-system failure status its builds did.
+pub const BATCH_BUILDS_NOT_EXECUTED_MESSAGE: &str = "this emulator does not run CodeBuild \
+    build containers, so none of the builds of this batch could be provisioned";
 
 /// The `statusCode` `DeleteBuildBatch` reports for a batch build it removed.
 ///
@@ -1931,11 +1953,58 @@ impl ComAmazonawsCodebuildCodebuild20161006State {
     }
 
     /// Read a batch build, first materialising the transition the clock already
-    /// owes it, under [`Self::settled_build`]'s rule.
+    /// owes it, under [`Self::settled_build`]'s rule — the batch's own, and the
+    /// transitions its builds have been owed since it started them, which is what the
+    /// summaries on its build groups report.
     pub fn settled_build_batch(&mut self, id: &str, now_millis: i64) -> Option<&StoredBuildBatch> {
+        let summarised = self.settled_group_build_statuses(id, now_millis);
         let stored = self.build_batches.get_mut(id)?;
         stored.settle(now_millis);
+        stored.refresh_group_summaries(&summarised);
         Some(stored)
+    }
+
+    /// The current `buildStatus` of each build one batch's groups name, keyed by that
+    /// build's ARN — each build first brought up to date with the transition the clock
+    /// already owes it ([`Self::settled_build`]).
+    ///
+    /// Read before the batch record is taken mutably, so one pass answers both: a
+    /// group's summary reports the build it names, and a build's status is the build
+    /// record's, never a second copy the batch keeps drifting from.
+    fn settled_group_build_statuses(
+        &mut self,
+        batch_id: &str,
+        now_millis: i64,
+    ) -> BTreeMap<String, String> {
+        let named: Vec<String> = self
+            .build_batches
+            .get(batch_id)
+            .and_then(|stored| stored.build_batch.build_groups.as_ref())
+            .map(|groups| {
+                groups
+                    .iter()
+                    .filter_map(|group| {
+                        group
+                            .current_build_summary
+                            .as_ref()
+                            .and_then(|summary| summary.arn.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut statuses = BTreeMap::new();
+        for arn in named {
+            let Some(build_id) = build_id_from_arn(&arn).map(str::to_string) else {
+                continue;
+            };
+            if let Some(status) = self
+                .settled_build(&build_id, now_millis)
+                .and_then(|stored| stored.build.build_status.clone())
+            {
+                statuses.insert(arn, status);
+            }
+        }
+        statuses
     }
 
     /// Every batch build id this account holds, OLDEST FIRST, keeping only those
@@ -2367,6 +2436,30 @@ impl StoredBuild {
 }
 
 impl StoredBuildBatch {
+    /// Report each build group's build with the status that build's own record now
+    /// carries, keyed by the ARN the group names it by
+    /// ([`ComAmazonawsCodebuildCodebuild20161006State::settled_group_build_statuses`]).
+    ///
+    /// A group's `currentBuildSummary` is a SUMMARY of the build it names, so it is
+    /// refreshed from that build rather than frozen at the instant the batch started it:
+    /// an ARN the statuses do not cover is left exactly as it was, so this is idempotent
+    /// and adds nothing the build records do not say.
+    pub fn refresh_group_summaries(&mut self, statuses: &BTreeMap<String, String>) {
+        for group in self.build_batch.build_groups.iter_mut().flatten() {
+            let Some(summary) = group.current_build_summary.as_mut() else {
+                continue;
+            };
+            if let Some(status) = summary
+                .arn
+                .as_deref()
+                .and_then(|arn| statuses.get(arn))
+                .cloned()
+            {
+                summary.build_status = Some(status);
+            }
+        }
+    }
+
     /// Materialise this batch build's terminal state once its due instant has
     /// passed, under [`StoredBuild::settle`]'s rule: idempotent, and purely a
     /// function of the stored instants.
@@ -2376,11 +2469,16 @@ impl StoredBuildBatch {
         }
         let start = self.start_millis;
         let due = self.settle_due_millis;
+        let fanned_out = self
+            .build_batch
+            .build_groups
+            .as_ref()
+            .is_some_and(|groups| !groups.is_empty());
         self.build_batch.build_batch_status = Some("FAULT".to_string());
         self.build_batch.current_phase = Some("FAILED".to_string());
         self.build_batch.complete = true;
         self.build_batch.end_time = Some(datetime(due));
-        self.build_batch.phases = Some(terminal_batch_phases(start, due));
+        self.build_batch.phases = Some(terminal_batch_phases(start, due, fanned_out));
     }
 }
 
@@ -3580,21 +3678,51 @@ pub fn in_progress_batch_phases(start_millis: i64) -> Vec<BuildBatchPhase> {
     ]
 }
 
-/// The phases of a batch build that has reached its terminal state: downloading
-/// the batch build specification is where an emulated batch stops, because
-/// nothing fetches the project's source (see
+/// The phases of a batch build that has reached its terminal state.
+///
+/// Where an emulated batch stops depends on whether its specification declared any
+/// build: a batch that fanned out got past `DOWNLOAD_BATCHSPEC` and stops in
+/// `IN_PROGRESS`, where its builds each faulted ([`BATCH_BUILDS_NOT_EXECUTED_MESSAGE`]),
+/// while one that declared nothing never got a specification to act on at all (see
 /// [`BATCH_SPEC_NOT_DOWNLOADED_MESSAGE`]).
-fn terminal_batch_phases(start_millis: i64, due_millis: i64) -> Vec<BuildBatchPhase> {
+fn terminal_batch_phases(
+    start_millis: i64,
+    due_millis: i64,
+    fanned_out: bool,
+) -> Vec<BuildBatchPhase> {
+    if !fanned_out {
+        return vec![
+            finished_batch_phase("SUBMITTED", "SUCCEEDED", start_millis, start_millis, None),
+            finished_batch_phase(
+                "DOWNLOAD_BATCHSPEC",
+                "FAULT",
+                start_millis,
+                due_millis,
+                Some(vec![PhaseContext {
+                    status_code: None,
+                    message: Some(BATCH_SPEC_NOT_DOWNLOADED_MESSAGE.to_string()),
+                }]),
+            ),
+            open_batch_phase("FAILED", due_millis),
+        ];
+    }
     vec![
         finished_batch_phase("SUBMITTED", "SUCCEEDED", start_millis, start_millis, None),
         finished_batch_phase(
             "DOWNLOAD_BATCHSPEC",
+            "SUCCEEDED",
+            start_millis,
+            start_millis,
+            None,
+        ),
+        finished_batch_phase(
+            "IN_PROGRESS",
             "FAULT",
             start_millis,
             due_millis,
             Some(vec![PhaseContext {
                 status_code: None,
-                message: Some(BATCH_SPEC_NOT_DOWNLOADED_MESSAGE.to_string()),
+                message: Some(BATCH_BUILDS_NOT_EXECUTED_MESSAGE.to_string()),
             }]),
         ),
         open_batch_phase("FAILED", due_millis),
@@ -4045,10 +4173,22 @@ pub const INVALID_BUILD_ID_MESSAGE: &str = "Invalid build ID provided";
 /// refuses as bad input ([`INVALID_BUILD_ID_MESSAGE`]) rather than reporting as a build
 /// it does not hold — a value that DOES address one, for a build nobody started, is the
 /// case that belongs in the not-found half of a batch read. The ARN form is admitted
-/// here rather than refused because nothing records CodeBuild refusing it, and a reader
-/// keyed by id reports it absent either way.
+/// here because it NAMES a build: a reader resolves it to the id it carries
+/// ([`build_store_id`]).
 pub fn addresses_a_build(value: &str) -> bool {
     project_name_from_resource_id(value).is_some() || build_id_from_arn(value).is_some()
+}
+
+/// The store key for one build a request names.
+///
+/// Every build-addressing member takes a build id — `<projectName>:<uuid>` — and a build
+/// is named by its ARN wherever this service reports one (`Build$arn`, and the
+/// `BuildGroup$currentBuildSummary` ARNs a batch build publishes), so the ARN of a build
+/// names the same record its id does: the id is the ARN's resource segment
+/// ([`build_id_from_arn`]). Only a value in ARN form is rewritten, so an id that merely
+/// looks like one is still looked up as it stands.
+pub fn build_store_id(entry: &str) -> &str {
+    build_id_from_arn(entry).unwrap_or(entry)
 }
 
 /// The service principal CodeBuild assumes a project's service role as, from the ARN

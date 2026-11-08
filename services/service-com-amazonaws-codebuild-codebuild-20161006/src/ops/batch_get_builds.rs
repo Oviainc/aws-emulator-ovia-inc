@@ -163,8 +163,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The only write a read makes: a build whose transition out of
             // `IN_PROGRESS` fell due before now is materialised here, because it was
             // owed at that instant whether or not anybody called.
-            match guard.settled_build(id, now) {
+            //
+            // The lookup is by the build's own id, which is what the store is keyed by:
+            // an entry given as a build ARN names the same build (`build_store_id`), so
+            // an ARN this service handed out — the form a batch build publishes the
+            // builds of its groups by — resolves to the build it names.
+            match guard.settled_build(crate::state::build_store_id(id), now) {
                 Some(stored) => builds.push(stored.build.clone()),
+                // Reported back exactly as the caller wrote it: the not-found half is
+                // the half of the request that did not resolve.
                 None => not_found.push(id.clone()),
             }
         }

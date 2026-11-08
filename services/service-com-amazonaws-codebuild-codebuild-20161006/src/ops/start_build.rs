@@ -293,6 +293,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A build UPLOADS its output artifacts to the destinations it is started with, so
+        // an artifacts override has to describe a destination a build could upload to:
+        // artifacts bound for a bucket must name one (the rule in
+        // `crate::state::artifacts_location_violation`), and the bucket they name must
+        // exist, which is asked of S3 itself. The rule is the same for the primary
+        // artifacts and for each entry of `secondaryArtifactsOverride` — they are the
+        // same shape, uploaded the same way — and both are checked BEFORE any state of
+        // this project is touched, so a refused request leaves no build behind: neither a
+        // build id nor a build number is spent on a build AWS never created.
+        //
+        // The OVERRIDE is what is resolved against S3, not the project's own artifacts:
+        // see the module docs of `crate::state`'s artifacts reading for why a stored
+        // project's destination is not re-resolved per build. The count is bounded by the
+        // model — one primary plus `ProjectArtifactsList`'s `@length(max: 12)` — so a
+        // request asks S3 at most thirteen times.
+        let overridden_artifacts: Vec<&ProjectArtifacts> = input
+            .artifacts_override
+            .as_ref()
+            .into_iter()
+            .chain(input.secondary_artifacts_override.iter().flatten())
+            .collect();
+        for artifacts in overridden_artifacts {
+            if let Some(message) = crate::state::artifacts_location_violation(artifacts) {
+                return Err(StartBuildErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(message.to_string()),
+                    },
+                )
+                .into());
+            }
+            if let Some(bucket) = crate::state::artifacts_bucket_of(artifacts) {
+                if crate::state::artifacts_bucket_is_absent(ctx, &region, bucket).await {
+                    return Err(StartBuildErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(crate::state::artifacts_bucket_not_found_message(bucket)),
+                        },
+                    )
+                    .into());
+                }
+            }
+        }
+
         // A build RUNS AS the role it is started with, so an override has to name a role
         // CodeBuild can assume: `serviceRoleOverride` is "The name of a service role for
         // this build that overrides the one specified in the build project", and a build

@@ -253,10 +253,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let fingerprint = crate::state::request_fingerprint(&format!("{input:?}"));
 
         // Refused BEFORE the state lock is taken, because the model puts no `@length`
-        // on `EnvironmentVariables`: the count is the caller's alone, and it is the
-        // one factor of the per-request work below that nothing else bounds. The
-        // ceiling is this emulator's own growth-site guard, not an AWS limit — see
-        // `crate::state::MAX_ENVIRONMENT_VARIABLES`.
+        // on `EnvironmentVariables`: the count is the caller's alone, and it is one of
+        // the two factors of the per-request work below that nothing else bounds (the
+        // other is the number of builds the batchspec declares, guarded the same way
+        // further down). The ceiling is this emulator's own growth-site guard, not an
+        // AWS limit — see `crate::state::MAX_ENVIRONMENT_VARIABLES`.
         let override_count = input
             .environment_variables_override
             .as_ref()
@@ -284,6 +285,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(crate::state::build_batch_config_violation)
         {
             return Err(invalid_input(message));
+        }
+
+        // A build of this batch UPLOADS its output artifacts to the destination the batch
+        // is started with, so an artifacts override has to describe one a build could
+        // upload to: the same pair of rules `crate::ops::start_build` applies to its own
+        // overrides — a bucket destination must name a bucket, and that bucket must
+        // exist — applied to the primary artifacts and to each secondary entry alike,
+        // before any state of this service is touched. The override is what is resolved
+        // against S3 rather than the project's own artifacts, for the reason the module
+        // docs of `crate::state`'s artifacts reading give.
+        let overridden_artifacts: Vec<&ProjectArtifacts> = input
+            .artifacts_override
+            .as_ref()
+            .into_iter()
+            .chain(input.secondary_artifacts_override.iter().flatten())
+            .collect();
+        for artifacts in overridden_artifacts {
+            if let Some(message) = crate::state::artifacts_location_violation(artifacts) {
+                return Err(invalid_input(message.to_string()));
+            }
+            if let Some(bucket) = crate::state::artifacts_bucket_of(artifacts) {
+                if crate::state::artifacts_bucket_is_absent(ctx, &region, bucket).await {
+                    return Err(invalid_input(
+                        crate::state::artifacts_bucket_not_found_message(bucket),
+                    ));
+                }
+            }
         }
 
         // READ PASS: take the shared lock only long enough to copy the project and
@@ -357,6 +385,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             project.environment.clone().unwrap_or_default(),
             &input,
         ));
+
+        // The builds this batch is made of, as the project's buildspec declares them.
+        // The buildspec read is the EFFECTIVE one — the project's, with this request's
+        // `buildspecOverride` applied — because that is the batchspec the batch runs
+        // with.
+        let declarations = crate::state::batch_build_declarations(
+            source.buildspec.as_deref().unwrap_or_default(),
+        );
+        // The second caller-controlled factor of the work below, guarded exactly as the
+        // environment-variable count above is and for the same reason: the batchspec is
+        // the caller's own text, every identifier it declares costs one build record,
+        // and nothing in the model bounds how many it may declare. Refused BEFORE the
+        // state lock is taken, so a batch past the ceiling neither holds the shared lock
+        // nor leaves a partial fan-out behind — a short group list would be a fan-out
+        // this emulator did not perform reported as success.
+        if declarations.len() > crate::state::MAX_BATCH_BUILD_GROUPS {
+            return Err(invalid_input(
+                crate::state::too_many_batch_build_groups_message(),
+            ));
+        }
 
         let mut build_batch = BuildBatch {
             // id, arn and buildBatchNumber are filled in by the WRITE PASS below: the
@@ -444,12 +492,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .clone()
                 .or(project.build_batch_config),
             // Which builds a batch is made of is declared by the `batch` section of
-            // the buildspec, which CodeBuild reads out of the project's source during
-            // `DOWNLOAD_BATCHSPEC`. Nothing in this emulator fetches a source or runs
-            // a build container, so no batch specification is ever read, no build of
-            // the batch is started, and the batch carries no build group — see
-            // `crate::state::BATCH_SPEC_NOT_DOWNLOADED_MESSAGE`, which is the context
-            // the failing phase reports once the batch's transition falls due.
+            // the buildspec, which CodeBuild reads out of the project's source in the
+            // batch's `DOWNLOAD_BATCHSPEC` phase. That declaration is read here
+            // (`crate::state::batch_build_declarations`) and the groups it names are
+            // published in the WRITE PASS below, each carrying the summary of the build
+            // this batch started for it.
             build_groups: None,
             debug_session_enabled: input.debug_session_enabled,
             // Produced by merging the reports of the builds in the batch, of which
@@ -493,15 +540,103 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         build_batch.build_batch_number = Some(build_batch_number);
         build_batch.id = Some(id.clone());
         build_batch.arn = Some(crate::state::build_batch_arn(&region, &id));
+
+        // The batch FANS OUT: one build per identifier the batchspec declared, started
+        // by the service itself with no further call, each a build of this project that
+        // `BatchGetBuilds` resolves on its own and that carries the batch's ARN back
+        // (`Build$buildBatchArn`). The groups are published on the batch
+        // (`BuildGroup$currentBuildSummary`), which is how a client finds the builds of
+        // a batch. Independent groups start together and a group waits one span per
+        // level of the dependency graph it sits under
+        // (`crate::state::declaration_levels`), so the batch itself finishes a span
+        // after its deepest level does.
+        //
+        // BOUNDED, which is what lets this run inside the critical section: the loop
+        // runs at most `MAX_BATCH_BUILD_GROUPS` times (a batchspec declaring more was
+        // refused above, before the lock), and each record it builds is a copy of a
+        // configuration whose own size is bounded — the batchspec is only read at all
+        // up to `crate::state`'s batchspec byte ceiling, so a buildspec larger than that
+        // declares nothing and fans out into no builds.
+        let levels = crate::state::declaration_levels(&declarations);
+        let mut build_groups: Vec<BuildGroup> = Vec::with_capacity(declarations.len());
+        let mut group_builds: Vec<(String, crate::state::StoredBuild)> =
+            Vec::with_capacity(declarations.len());
+        for (declaration, level) in declarations.iter().zip(levels.iter().copied()) {
+            let build_number = guard.allocate_build_number(&input.project_name);
+            let build_id = format!(
+                "{}:{}",
+                input.project_name,
+                crate::state::build_uuid(&input.project_name, build_number, now)
+            );
+            let build = group_build(
+                &build_batch,
+                declaration,
+                &build_id,
+                crate::state::build_arn(&region, &build_id),
+                build_number,
+                now,
+            );
+            build_groups.push(BuildGroup {
+                identifier: Some(declaration.identifier.clone()),
+                // Always stated, `[]` for a group that waits for nothing: a client
+                // reading the graph off the answer must find a list there.
+                depends_on: Some(declaration.depends_on.clone()),
+                ignore_failure: declaration.ignore_failure,
+                current_build_summary: Some(BuildSummary {
+                    arn: build.arn.clone(),
+                    requested_on: Some(crate::state::datetime(now)),
+                    build_status: build.build_status.clone(),
+                    // Resolved from the artifacts the build uploaded, of which an
+                    // unexecuted build uploads none.
+                    primary_artifact: None,
+                    secondary_artifacts: None,
+                }),
+                // No earlier attempt of this group has been retained: this batch has
+                // run each group exactly once.
+                prior_build_summary_list: Some(Vec::new()),
+            });
+            group_builds.push((
+                build_id,
+                crate::state::StoredBuild {
+                    build,
+                    start_millis: now,
+                    settle_due_millis: now
+                        + crate::state::BUILD_SETTLE_MILLIS
+                            * i64::try_from(level.saturating_add(1)).unwrap_or(1),
+                },
+            ));
+        }
+        // A batch that declared nothing carries no build group at all, rather than an
+        // empty one: there was no batchspec to fan out.
+        let deepest_level = levels.iter().copied().max().unwrap_or(0);
+        // How many spans the batch itself takes: one per level of its dependency graph,
+        // plus the one in which the batch combines what its deepest level produced. A
+        // batch that declared nothing fans out into nothing and takes the single span a
+        // build takes.
+        let batch_spans = if declarations.is_empty() {
+            1
+        } else {
+            deepest_level.saturating_add(2)
+        };
+        if !build_groups.is_empty() {
+            build_batch.build_groups = Some(build_groups);
+        }
+        for (build_id, stored) in group_builds {
+            guard.insert_build(build_id, stored);
+        }
+
         guard.insert_build_batch(
             id.clone(),
             crate::state::StoredBuildBatch {
                 build_batch: build_batch.clone(),
                 start_millis: now,
-                // The same chosen span a build's owed transition uses: the batch's
-                // move out of `IN_PROGRESS` falls due at this instant whether or not
-                // anybody calls again, and is never slept on.
-                settle_due_millis: now + crate::state::BUILD_SETTLE_MILLIS,
+                // The same chosen span a build's owed transition uses, once per level
+                // of the batch's dependency graph and once more for the batch's own
+                // completion: the batch's move out of `IN_PROGRESS` falls due at this
+                // instant whether or not anybody calls again, and is never slept on.
+                settle_due_millis: now
+                    + crate::state::BUILD_SETTLE_MILLIS
+                        * i64::try_from(batch_spans).unwrap_or(1),
             },
         );
         if let Some(key) = token_key {
@@ -563,8 +698,75 @@ fn resolve_idempotency_token(
         .map(|stored| stored.build_batch.clone()))
 }
 
+/// The build this batch starts for one declared build group.
+///
+/// A build of a batch runs with the configuration the BATCH resolved — the source,
+/// environment, artifacts, role, timeouts and key the batch itself reports — because
+/// those are the settings the project and this request settled for the whole batch; the
+/// group adds only what the batchspec declares for it, which is its own buildspec when
+/// it names one (`buildspec` in the batchspec, the per-build equivalent of
+/// `StartBuild`'s `buildspecOverride`). It is a build of the same project, with its own
+/// build number from that project's sequence, and it names the batch it belongs to
+/// through `buildBatchArn`.
+fn group_build(
+    build_batch: &BuildBatch,
+    declaration: &crate::state::BatchBuildDeclaration,
+    build_id: &str,
+    build_arn: String,
+    build_number: i64,
+    now: i64,
+) -> Build {
+    let mut source = build_batch.source.clone().unwrap_or_default();
+    if let Some(buildspec) = declaration.buildspec.clone() {
+        source.buildspec = Some(buildspec);
+    }
+    Build {
+        id: Some(build_id.to_string()),
+        arn: Some(build_arn),
+        build_number: Some(build_number),
+        start_time: Some(crate::state::datetime(now)),
+        end_time: None,
+        current_phase: Some("QUEUED".to_string()),
+        build_status: Some("IN_PROGRESS".to_string()),
+        source_version: build_batch.source_version.clone(),
+        // The commit the source version resolved to. Nothing clones a repository here,
+        // so there is no resolved revision to report.
+        resolved_source_version: None,
+        project_name: build_batch.project_name.clone(),
+        phases: Some(crate::state::in_progress_phases(now)),
+        source: Some(source),
+        secondary_sources: build_batch.secondary_sources.clone(),
+        secondary_source_versions: build_batch.secondary_source_versions.clone(),
+        artifacts: build_batch.artifacts.clone(),
+        secondary_artifacts: build_batch.secondary_artifacts.clone(),
+        cache: build_batch.cache.clone(),
+        environment: build_batch.environment.clone(),
+        service_role: build_batch.service_role.clone(),
+        logs: None,
+        timeout_in_minutes: build_batch.build_timeout_in_minutes,
+        queued_timeout_in_minutes: build_batch.queued_timeout_in_minutes,
+        build_complete: false,
+        initiator: build_batch.initiator.clone(),
+        vpc_config: build_batch.vpc_config.clone(),
+        // Allocated when a build container joins the project's VPC; no container is
+        // provisioned here.
+        network_interface: None,
+        encryption_key: build_batch.encryption_key.clone(),
+        // Exported by a buildspec's `env/exported-variables` while it runs, and reports
+        // and artifacts are produced by a running build.
+        exported_environment_variables: None,
+        report_arns: None,
+        file_system_locations: build_batch.file_system_locations.clone(),
+        debug_session: None,
+        // What makes this a build OF the batch: the batch it belongs to, by ARN.
+        build_batch_arn: build_batch.arn.clone(),
+        // Retries are per build and are asked for by `RetryBuild`; a batch's own
+        // retries are `RetryBuildBatch`.
+        auto_retry_config: None,
+    }
+}
+
 /// A refusal of the request itself, as this operation's one modelled error for a
-/// malformed input. The `message` is composed by the rule that refused it
 /// (`crate::state::build_batch_config_violation`,
 /// `crate::state::PROJECT_NOT_BATCH_ENABLED_MESSAGE`), so nothing of the request is
 /// quoted here.

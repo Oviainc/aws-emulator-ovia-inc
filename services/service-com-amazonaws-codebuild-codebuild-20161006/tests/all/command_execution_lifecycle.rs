@@ -9,11 +9,12 @@
 //! id, carrying the command and command type it was asked for together with that
 //! sandbox's id and ARN and the instant it was submitted, in flight and with no
 //! result yet — and persists it, so `BatchGetCommandExecutions` reports the same
-//! record back under that sandbox. A command execution acts on the sandbox's LIVE
-//! session, so a sandbox the account does not hold is refused with
-//! `ResourceNotFoundException` and one that is not running — still queued, or stopped
-//! — with `InvalidInputException` stating the status it is in, and in both cases nothing
-//! is persisted. Nothing in
+//! record back under that sandbox. A command execution is SUBMITTED to the sandbox and
+//! run in its session, so a sandbox the account does not hold is refused with
+//! `ResourceNotFoundException` and one whose session has ENDED — stopped, or timed out —
+//! with `InvalidInputException` stating the status it is in, and in both cases nothing
+//! is persisted; a sandbox that is still being provisioned takes the submission. Nothing
+//! in
 //! this emulator executes a sandbox command, so the transition the clock owes an
 //! execution ends it in `FAULT` with the reason as its error text and with no exit
 //! code and no output.
@@ -164,7 +165,7 @@ async fn start_sandbox(router: &MultiServiceRouter, project: &str) -> Value {
 /// [`state::SANDBOX_SETTLE_MILLIS`], then `RUNNING` until it is stopped or its
 /// `timeoutInMinutes` elapses); a test that is about the command execution says which
 /// of those states it wants here instead of racing that clock. The wire path itself is
-/// covered by [`a_sandbox_started_over_the_wire_runs_commands_only_while_it_is_live`].
+/// covered by [`a_sandbox_started_over_the_wire_runs_commands_until_its_session_ends`].
 fn seed_sandbox(
     engine: &engine::InMemoryEngine,
     project: &str,
@@ -513,9 +514,10 @@ async fn a_command_execution_settles_once_from_stored_state_and_never_changes_ag
 }
 
 /// RULE: a sandbox the account does not hold is refused with
-/// `ResourceNotFoundException`, a sandbox whose session is not live — still queued, or
-/// stopped — with `InvalidInputException` stating the status it is in, and a refused
-/// submission persists nothing.
+/// `ResourceNotFoundException`, a sandbox whose session has ENDED with
+/// `InvalidInputException` stating the status it is in, and a refused submission persists
+/// nothing. A sandbox still being provisioned is neither: it takes the submission, which
+/// is `a_queued_sandbox_takes_a_command_submission`'s subject.
 #[tokio::test]
 async fn start_command_execution_refuses_a_sandbox_it_cannot_run_a_command_in() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -525,12 +527,6 @@ async fn start_command_execution_refuses_a_sandbox_it_cannot_run_a_command_in() 
         "cmd-refuse",
         "cmd-refuse:0001",
         SeededSandbox::Running,
-    );
-    let (queued_id, _) = seed_sandbox(
-        &engine,
-        "cmd-refuse",
-        "cmd-refuse:queued",
-        SeededSandbox::Queued,
     );
     let (ended_id, ended_arn) = seed_sandbox(
         &engine,
@@ -574,11 +570,6 @@ async fn start_command_execution_refuses_a_sandbox_it_cannot_run_a_command_in() 
     // (case, the sandboxId asked for, the status the refusal must state)
     let not_live: Vec<(&str, String, &str)> = vec![
         (
-            "a sandbox still in the queue",
-            queued_id.clone(),
-            state::SANDBOX_STATUS_QUEUED,
-        ),
-        (
             "a sandbox that has been stopped, by id",
             ended_id.clone(),
             state::SANDBOX_STATUS_STOPPED,
@@ -620,33 +611,120 @@ async fn start_command_execution_refuses_a_sandbox_it_cannot_run_a_command_in() 
     );
 }
 
-/// RULE: over the wire, a command execution can be started exactly while the sandbox's
-/// session is live — not before the sandbox leaves the queue, and not after
-/// `StopSandbox` has ended it.
+/// RULE: a command execution is submitted to a sandbox whose session has not ended, so
+/// the whole of a sandbox's pre-terminal life takes one: the identifier may be the
+/// sandbox's id or its ARN, the sandbox may still be being provisioned or already live,
+/// and the submission is persisted and listed under that sandbox either way.
+///
+/// The rows differ along the two things that could decide the answer and must not — the
+/// form of the identifier, and how far along the sandbox's own clock is.
 #[tokio::test]
-async fn a_sandbox_started_over_the_wire_runs_commands_only_while_it_is_live() {
+async fn a_queued_sandbox_takes_a_command_submission() {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let router = emulator_on(Arc::clone(&engine));
+    let (queued_id, queued_arn) = seed_sandbox(
+        &engine,
+        "cmd-queued",
+        "cmd-queued:0001",
+        SeededSandbox::Queued,
+    );
+    let (running_id, running_arn) = seed_sandbox(
+        &engine,
+        "cmd-queued",
+        "cmd-queued:0002",
+        SeededSandbox::Running,
+    );
+
+    // (case, the sandboxId asked for, the sandbox the execution must belong to, the
+    // status that sandbox is in when the command is submitted)
+    let accepted: Vec<(&str, String, String, &str)> = vec![
+        (
+            "a sandbox still being provisioned, by id",
+            queued_id.clone(),
+            queued_id.clone(),
+            state::SANDBOX_STATUS_QUEUED,
+        ),
+        (
+            "a sandbox still being provisioned, by ARN",
+            queued_arn,
+            queued_id.clone(),
+            state::SANDBOX_STATUS_QUEUED,
+        ),
+        (
+            "a live sandbox, by id",
+            running_id.clone(),
+            running_id.clone(),
+            state::SANDBOX_STATUS_RUNNING,
+        ),
+        (
+            "a live sandbox, by ARN",
+            running_arn,
+            running_id.clone(),
+            state::SANDBOX_STATUS_RUNNING,
+        ),
+    ];
+
+    for (case, asked_for, owner, status_named) in accepted {
+        let (status, body) = call(
+            &router,
+            "StartCommandExecution",
+            json!({"sandboxId": asked_for, "command": format!("echo {case}")}),
+        )
+        .await;
+        assert_eq!(status, 200, "{case}: expected 200, got {status} with {body}");
+        let execution = body["commandExecution"].clone();
+        assert_eq!(
+            execution["sandboxId"],
+            json!(owner),
+            "{case}: the execution must belong to the sandbox it was submitted to, got \
+             {execution}"
+        );
+        // The sandbox it was submitted to is in the status this row is about: the
+        // submission is what is being tested, not a sandbox that settled underneath it.
+        let (_, sandboxes) = call(&router, "BatchGetSandboxes", json!({"ids": [owner.clone()]})).await;
+        assert_eq!(
+            sandboxes["sandboxes"][0]["status"],
+            json!(status_named),
+            "{case}: expected the sandbox to be {status_named}, got {sandboxes}"
+        );
+        // And it is listed under that sandbox, which is what a client polls.
+        let (_, listed) = call(
+            &router,
+            "ListCommandExecutionsForSandbox",
+            json!({"sandboxId": owner}),
+        )
+        .await;
+        let id = text(&execution, "id");
+        let reported: Vec<String> = listed["commandExecutions"]
+            .as_array()
+            .map(|executions| executions.iter().map(|one| text(one, "id")).collect())
+            .unwrap_or_default();
+        assert!(
+            reported.contains(&id),
+            "{case}: the submitted execution must be listed for its sandbox, got {listed}"
+        );
+    }
+}
+
+/// RULE: over the wire, a command execution can be started on a sandbox at any point
+/// before its session has ended — while it is still being provisioned and once it is
+/// live — and not after `StopSandbox` has ended it.
+#[tokio::test]
+async fn a_sandbox_started_over_the_wire_runs_commands_until_its_session_ends() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let router = emulator_on(Arc::clone(&engine));
     let sandbox = start_sandbox(&router, "cmd-wire").await;
     let sandbox_id = text(&sandbox, "id");
 
-    // A command needs a session to run in, and a queued sandbox has none yet.
-    let (status, body) = call(
-        &router,
-        "StartCommandExecution",
-        json!({"sandboxId": sandbox_id, "command": "echo queued"}),
-    )
-    .await;
+    // A sandbox that is still being provisioned takes the submission: the sandbox queues
+    // the command and runs it in the session it is bringing up.
+    let queued = start_command_execution(&router, &sandbox_id, "echo queued").await;
     assert_eq!(
-        status, 400,
-        "a sandbox still in the queue: expected 400, got {status} with {body}"
-    );
-    assert!(
-        error_type(&body).contains("InvalidInputException"),
-        "a sandbox still in the queue: expected InvalidInputException, got {body}"
+        queued["sandboxId"], sandbox_id.as_str(),
+        "a sandbox still in the queue: the execution belongs to it, got {queued}"
     );
 
-    // Once its provisioning span has elapsed the session is live and takes commands.
+    // Once its provisioning span has elapsed the session is live and takes commands too.
     tokio::time::sleep(PAST_THE_SANDBOX_SETTLE_SPAN).await;
     let execution = start_command_execution(&router, &sandbox_id, "echo live").await;
     let id = text(&execution, "id");
