@@ -17,15 +17,18 @@
 //!   names ("Workflow is currently running"). Both refusals are decided BEFORE anything
 //!   is minted or stored, so a refused start leaves the store exactly as it was.
 //!
-//! ## The matching itself cannot execute here
+//! ## The run itself
 //!
-//! A matching job resolves entities across the workflow's input sources and writes
-//! matched records to its output source; this emulator has no matching engine and no
-//! access to those locations. The control plane is real — the job is minted, tracked and
-//! readable — and the execution it cannot perform ends in the service's own modelled
-//! failure status (`FAILED`, carrying [`crate::state::JOB_NOT_EXECUTED_MESSAGE`] on the
-//! modelled `ErrorDetails`) rather than in a `SUCCEEDED` with record counts nothing
-//! computed.
+//! The job is ADMITTED first and then RUN: once the record holding the workflow's single
+//! run slot exists, the store's lock is released and the matching is performed —
+//! the records of each input source's AWS Glue table are read out of Amazon S3, resolved
+//! into match groups by the workflow's rules, and written as the output table under the
+//! job's `outputS3Path` ([`crate::state::matching_run`]). What that work reached is
+//! recorded against the job as its [`crate::state::JobOutcome`], and the clock decides
+//! only WHEN the job reports it. A run that could not read its input or write its output
+//! therefore ends `FAILED` carrying the reason on the modelled `ErrorDetails`, and a run
+//! that succeeded reports the `JobMetrics` it counted — never a status, a count or an
+//! error for work nothing performed.
 //!
 //! ## Shape of an operation
 //!
@@ -203,14 +206,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let started = crate::state::now_millis();
-        let mut store = state.lock();
 
-        // The workflow this job would run has to exist, and its stored output
-        // configuration is what the job reports as its own `outputSourceConfig`.
-        let output_source_config = {
+        // Everything the store decides about this start happens under ONE guard, in a
+        // scope that ends before the run below is awaited: the refusals, the job the
+        // start mints, and the plan of what that job's run reads and writes. No store
+        // guard is alive while anything outside this service is called.
+        let (job_id, plan) = {
+            let mut store = state.lock();
+
+            // The workflow this job would run has to exist, and its stored output
+            // configuration is what the job reports as its own `outputSourceConfig`.
             let workflow = store
                 .matching_workflows
                 .get(&input.workflow_name)
+                .cloned()
                 .ok_or_else(|| {
                     StartMatchingJobErrorModeled::ResourceNotFoundException(
                         ResourceNotFoundException {
@@ -221,60 +230,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         },
                     )
                 })?;
-            crate::state::job_output_source_config(workflow)
+            let output_source_config = crate::state::job_output_source_config(&workflow);
+
+            // Decided on the CURRENT status of that workflow's jobs, so the clock-owed
+            // transitions are materialised first: a job whose run is already over by now
+            // does not block the next start.
+            if store
+                .matching_jobs_of_mut(&input.workflow_name, started)
+                .any(|job| job.is_in_progress())
+            {
+                return Err(StartMatchingJobErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(
+                            crate::state::messages::START_MATCHING_JOB_ALREADY_RUNNING.to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+
+            // Age out this workflow's oldest finished jobs so the store stays bounded
+            // however many starts a caller issues, leaving room for the one being minted.
+            store.retain_newest_jobs(
+                &input.workflow_name,
+                crate::state::MAX_JOBS_PER_WORKFLOW.saturating_sub(1),
+            );
+
+            // A fresh random id, and never one the store already holds: `jobId` is the key
+            // every later read addresses the job by.
+            let mut job_id = crate::state::new_job_id();
+            while store.matching_jobs.contains_key(&job_id) {
+                job_id = crate::state::new_job_id();
+            }
+
+            let span =
+                i64::try_from(crate::state::JOB_STATUS_TRANSITION.as_millis()).unwrap_or(i64::MAX);
+            let record = crate::state::MatchingJob {
+                job_id: job_id.clone(),
+                workflow_name: input.workflow_name.clone(),
+                // A started job is QUEUED; the clock owes it every later status, and
+                // nothing here sleeps for them.
+                status: crate::state::job_status::QUEUED.to_string(),
+                start_time: started,
+                end_time: None,
+                error_message: None,
+                output_source_config,
+                next_transition_at: Some(started.saturating_add(span)),
+                // Filled in below, by the run this start performs.
+                outcome: None,
+            };
+            store.matching_jobs.insert(job_id.clone(), record);
+
+            // What that run reads, matches on and writes, resolved against the store
+            // under the same guard, so the run is planned from the workflow as it stood
+            // when the job was admitted.
+            let plan = crate::state::matching_run::plan(&store, &workflow, &job_id);
+            (job_id, plan)
         };
 
-        // Decided on the CURRENT status of that workflow's jobs, so the clock-owed
-        // transitions are materialised first: a job whose run is already over by now
-        // does not block the next start.
-        if store
-            .matching_jobs_of_mut(&input.workflow_name, started)
-            .any(|job| job.is_in_progress())
-        {
-            return Err(StartMatchingJobErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(
-                        crate::state::messages::START_MATCHING_JOB_ALREADY_RUNNING.to_string(),
-                    ),
-                },
-            )
-            .into());
+        // The run is PERFORMED here, before this call answers: the outcome is what the
+        // reading, the matching and the writing produced, so the terminal status the
+        // clock later reveals is backed by the output table this wrote. No store guard
+        // is held across these calls.
+        let result =
+            crate::state::matching_run::perform(&*self.engine, ctx, &region, &plan).await;
+
+        let mut store = state.lock();
+        // Recorded against the job the start minted. A `DeleteMatchingWorkflow` that
+        // landed while the run was reading took the job with it, and then there is
+        // nothing to record the outcome against.
+        let reached = result.outcome.status.clone();
+        if let Some(job) = store.matching_jobs.get_mut(&job_id) {
+            job.outcome = Some(result.outcome);
+            // A record the run resolved HAS been processed in this rule-based matching
+            // workflow, which is what `GetMatchId` reports a `matchId` for, so the
+            // workflow's match index carries what the run resolved beside the output
+            // table it wrote (see `crate::state::index_run_records`).
+            if !result.indexed.is_empty() {
+                store.index_run_records(&input.workflow_name, result.indexed);
+            }
         }
 
-        // Age out this workflow's oldest finished jobs so the store stays bounded
-        // however many starts a caller issues, leaving room for the one being minted.
-        store.retain_newest_jobs(
-            &input.workflow_name,
-            crate::state::MAX_JOBS_PER_WORKFLOW.saturating_sub(1),
+        // An access record for the write, naming the resource and the outcome only: no
+        // record of the input tables and no `matchId` is logged, because a record and
+        // the group it belongs to are customer data.
+        ::tracing::debug!(
+            operation = Self::NAME,
+            workflow_name = %input.workflow_name,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            job_id = %job_id,
+            reached = %reached,
+            "matching job started"
         );
 
-        // A fresh random id, and never one the store already holds: `jobId` is the key
-        // every later read addresses the job by.
-        let mut job_id = crate::state::new_job_id();
-        while store.matching_jobs.contains_key(&job_id) {
-            job_id = crate::state::new_job_id();
-        }
-
-        let span =
-            i64::try_from(crate::state::JOB_STATUS_TRANSITION.as_millis()).unwrap_or(i64::MAX);
-        let record = crate::state::MatchingJob {
-            job_id: job_id.clone(),
-            workflow_name: input.workflow_name,
-            // A started job is QUEUED; the clock owes it every later status, and
-            // nothing here sleeps for them.
-            status: crate::state::job_status::QUEUED.to_string(),
-            start_time: started,
-            end_time: None,
-            error_message: None,
-            output_source_config,
-            next_transition_at: Some(started.saturating_add(span)),
-        };
-        store.matching_jobs.insert(job_id.clone(), record);
-
-        // Answered from the STORED record, so this response and a later
-        // `GetMatchingJob` cannot disagree about which job was started.
+        // Answered from the STORED record where it still stands, so this response and a
+        // later `GetMatchingJob` cannot disagree about which job was started.
         Ok(StartMatchingJobOutput {
-            job_id: store.matching_jobs[&job_id].job_id.clone(),
+            job_id: store
+                .matching_jobs
+                .get(&job_id)
+                .map_or(job_id, |job| job.job_id.clone()),
         })
     }
 }

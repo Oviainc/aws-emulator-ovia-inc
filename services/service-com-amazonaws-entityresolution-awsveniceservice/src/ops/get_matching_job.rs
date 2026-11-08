@@ -14,12 +14,14 @@
 //! have seen had nobody polled at all — so polling neither advances a job nor changes
 //! what a later caller sees.
 //!
-//! ## What it does NOT claim
+//! ## What it reports for the run
 //!
-//! `metrics` is absent on every job: `JobMetrics` counts input records, records
-//! processed and `matchID`s generated, and this emulator runs no matching (see
-//! [`crate::state::JOB_NOT_EXECUTED_MESSAGE`]), so there is nothing to count. Reporting
-//! zeros — or any other number — would claim a run that never happened.
+//! `metrics` is what the job's RUN counted — "an object containing `inputRecords`,
+//! `totalRecordsProcessed`, `matchIDs`, and `recordsNotProcessed`" — so it is reported
+//! on a job whose run finished and counted them, and absent on a job that is still
+//! `QUEUED` or `RUNNING` and on one whose run could not read its input at all
+//! ([`crate::state::MatchingJob::reported_metrics`]). No count is invented for a run
+//! that produced none.
 //!
 //! ## Shape of an operation
 //!
@@ -228,8 +230,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             start_time: ::aws_smithy_types::DateTime::from_millis(job.start_time),
             // Set only once the status is terminal, which is where the record sets it.
             end_time: job.end_time.map(::aws_smithy_types::DateTime::from_millis),
-            // Nothing ran, so there is nothing to count: see the module docs.
-            metrics: None,
+            // What the RUN counted, once the job reports the terminal status that run
+            // produced.
+            metrics: job.reported_metrics(),
             error_details: job.error_message.clone().map(|error_message| ErrorDetails {
                 error_message: Some(error_message),
             }),

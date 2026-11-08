@@ -30,7 +30,10 @@
 //!
 //! Beside the control-plane resources this module owns the MATCHING JOBS a workflow
 //! has been run with ([`MatchingJob`]), and the clock-driven status lifecycle every
-//! reader of one materialises ([`MatchingJob::materialize_due`]).
+//! reader of one materialises ([`MatchingJob::materialize_due`]). WHEN a job reports
+//! its terminal status is owed to the clock; WHICH status it reports, with the record
+//! counts and the failure reason that go with it, is the [`JobOutcome`] of the run
+//! [`matching_run`] performed.
 //!
 //! The RESOURCE-BASED POLICIES ([`ResourcePolicy`]) are keyed by the ARN of the
 //! resource they are attached to, because one policy API covers all four resource
@@ -45,6 +48,14 @@
 /// it reads or writes anything.
 pub mod authorization;
 
+/// How the records of one run are resolved into match groups: the pure comparison a
+/// rule-based run performs, with nothing read or written.
+pub mod match_groups;
+
+/// What a matching job's RUN does: read the records of the workflow's input sources,
+/// resolve them into match groups and write the matched records to its output source.
+pub mod matching_run;
+
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
@@ -54,7 +65,8 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     IdMappingIncrementalRunConfig, IdMappingTechniques, IdMappingWorkflowInputSource,
     IdMappingWorkflowOutputSource, IdNamespaceIdMappingWorkflowProperties, IdNamespaceInputSource,
-    IncrementalRunConfig, InputSource, JobOutputSource, OutputSource, ProviderComponentSchema,
+    IncrementalRunConfig, InputSource, JobMetrics, JobOutputSource, OutputSource,
+    ProviderComponentSchema,
     ProviderEndpointConfiguration, ProviderIdNameSpaceConfiguration,
     ProviderIntermediateDataAccessConfiguration, ProviderMarketplaceConfiguration,
     ProviderSchemaAttribute, ResolutionTechniques, Rule, SchemaInputAttribute,
@@ -183,20 +195,27 @@ pub fn is_terminal_job_status(status: &str) -> bool {
 /// never zero.
 pub const JOB_STATUS_TRANSITION: Duration = Duration::from_millis(500);
 
-/// Why a matching job cannot reach `SUCCEEDED` in this emulator, reported on the
-/// modelled `ErrorDetails$errorMessage` of the `FAILED` job.
+/// Why a job whose run left no outcome behind is `FAILED`, reported on the modelled
+/// `ErrorDetails$errorMessage`.
 ///
-/// A matching job reads the workflow's input records out of its `inputSourceConfig`
-/// (an S3 or Glue location), resolves entities across them with Entity Resolution's
-/// matching engine, and writes matched records to `outputSourceConfig`. This emulator
-/// has no such engine and no access to those locations, so the job is accepted,
-/// tracked and readable, and the execution it cannot perform ends in the service's own
-/// modelled failure status (`FAILED`, carrying this reason) rather than in a
-/// `SUCCEEDED` with record counts nothing computed.
-pub const JOB_NOT_EXECUTED_MESSAGE: &str =
-    "Entity Resolution matching is not available in this emulator: no matching engine is \
-     attached, so the job could not read the workflow's input sources or write matched \
-     records to its output source.";
+/// The run itself is performed by the start that admitted the job
+/// ([`matching_run::perform`]) and its outcome is recorded against the job record, so a
+/// job without one is a run that never finished: the request performing it was dropped
+/// before it could record anything. The job is then failed once
+/// [`RUN_OUTCOME_GRACE`] has passed, rather than left in progress for ever holding its
+/// workflow's single run slot.
+pub const JOB_RUN_INCOMPLETE_MESSAGE: &str =
+    "The matching job's run did not complete, so no match output was produced and no \
+     records were counted.";
+
+/// How long past the instant a job's terminal status fell due the store waits for the
+/// run's outcome before failing the job with [`JOB_RUN_INCOMPLETE_MESSAGE`].
+///
+/// A CHOSEN span: the run is performed inside the `StartMatchingJob` call, which is
+/// itself bounded ([`matching_run`]), so an outcome is already recorded by the time
+/// that call answers. This covers only the case where that call never finished at all,
+/// and it is what keeps a job from holding its workflow's run slot for ever.
+pub const RUN_OUTCOME_GRACE: Duration = Duration::from_secs(30);
 
 /// How many jobs the store retains per matching workflow.
 ///
@@ -235,6 +254,52 @@ pub struct MatchingJob {
     pub output_source_config: Option<Vec<JobOutputSource>>,
     /// The instant the next status transition becomes due, while one is owed.
     pub next_transition_at: Option<i64>,
+    /// What this job's RUN produced — the terminal status the work reached, the records
+    /// it counted and the reason a failed run gives — or `None` while the run is still
+    /// in flight.
+    ///
+    /// The run is performed by the start that admitted the job, before that call
+    /// answers ([`matching_run::perform`]), and only the INSTANT the job reports its
+    /// terminal status is owed to the clock: WHICH status that is, is this outcome. A
+    /// job therefore never reports a status, a metric or an error for work nothing
+    /// performed.
+    pub outcome: Option<JobOutcome>,
+}
+
+/// What one run of a matching workflow produced: the terminal `JobStatus` the work
+/// reached, the `JobMetrics` it counted and the `ErrorDetails$errorMessage` a failed
+/// run gives.
+#[derive(Debug, Clone)]
+pub struct JobOutcome {
+    /// One of the [`TERMINAL_JOB_STATUSES`].
+    pub status: String,
+    /// Why the run failed; `None` on a run that succeeded.
+    pub error_message: Option<String>,
+    /// What the run counted; `None` on a run that counted nothing because it could not
+    /// read its input at all.
+    pub metrics: Option<JobMetrics>,
+}
+
+impl JobOutcome {
+    /// The outcome of a run that read its input sources, resolved every record and
+    /// wrote its output: `SUCCEEDED`, carrying what it counted.
+    pub fn succeeded(metrics: JobMetrics) -> Self {
+        Self {
+            status: job_status::SUCCEEDED.to_string(),
+            error_message: None,
+            metrics: Some(metrics),
+        }
+    }
+
+    /// The outcome of a run that could not be performed: `FAILED`, carrying `reason` as
+    /// the modelled `ErrorDetails$errorMessage`, and no metrics — nothing was counted.
+    pub fn failed(reason: String) -> Self {
+        Self {
+            status: job_status::FAILED.to_string(),
+            error_message: Some(reason),
+            metrics: None,
+        }
+    }
 }
 
 impl MatchingJob {
@@ -242,10 +307,10 @@ impl MatchingJob {
     /// milliseconds).
     ///
     /// The lifecycle is clock-driven, so each reader materialises it before answering
-    /// and nothing sleeps: `QUEUED` -> `RUNNING` -> `FAILED`, the last carrying
-    /// [`JOB_NOT_EXECUTED_MESSAGE`]. A transition that is not due yet is left alone,
-    /// and a terminal job is never touched again — so a read only ever writes what was
-    /// already owed at the same instant had nobody called.
+    /// and nothing sleeps: `QUEUED` -> `RUNNING` -> the terminal status of
+    /// [`Self::outcome`], i.e. of the work the start performed. A transition that is
+    /// not due yet is left alone, and a terminal job is never touched again — so a read
+    /// only ever writes what was already owed at the same instant had nobody called.
     pub fn materialize_due(&mut self, now: i64) {
         while let Some(due) = self.next_transition_at {
             if is_terminal_job_status(&self.status) {
@@ -263,14 +328,45 @@ impl MatchingJob {
                     self.next_transition_at = Some(due.saturating_add(span));
                 }
                 _ => {
-                    // `RUNNING`, the only other non-terminal `JobStatus`.
-                    self.status = job_status::FAILED.to_string();
-                    self.error_message = Some(JOB_NOT_EXECUTED_MESSAGE.to_string());
+                    // `RUNNING`, the only other non-terminal `JobStatus`. The status it
+                    // leaves for is the one the WORK reached, so a job with no outcome
+                    // yet is still running: nothing here invents a terminal status for
+                    // work that may still be in flight.
+                    let Some(outcome) = self.outcome.clone() else {
+                        let grace =
+                            i64::try_from(RUN_OUTCOME_GRACE.as_millis()).unwrap_or(i64::MAX);
+                        let abandoned = due.saturating_add(grace);
+                        if now < abandoned {
+                            return;
+                        }
+                        self.status = job_status::FAILED.to_string();
+                        self.error_message = Some(JOB_RUN_INCOMPLETE_MESSAGE.to_string());
+                        self.end_time = Some(abandoned);
+                        self.next_transition_at = None;
+                        return;
+                    };
+                    self.status = outcome.status;
+                    self.error_message = outcome.error_message;
                     self.end_time = Some(due);
                     self.next_transition_at = None;
                 }
             }
         }
+    }
+
+    /// The `JobMetrics` this job REPORTS: what its run counted, once the job has
+    /// reached the terminal status that run produced.
+    ///
+    /// A job that is still `QUEUED` or `RUNNING` reports none — the counts belong to a
+    /// finished run, and a job whose run could not read its input at all finished
+    /// without counting anything, so that job reports none either.
+    pub fn reported_metrics(&self) -> Option<JobMetrics> {
+        if !is_terminal_job_status(&self.status) {
+            return None;
+        }
+        self.outcome
+            .as_ref()
+            .and_then(|outcome| outcome.metrics.clone())
     }
 
     /// True while this job holds its workflow's single run slot: any status that is not
@@ -2035,7 +2131,7 @@ pub fn normalization_for_source(workflow: &MatchingWorkflow, input_source_arn: &
 ///
 /// A field the record omits holds its position as an empty value, so a record that
 /// omits one of a grouped key's fields does not compare equal to one that fills it.
-fn matching_key_value(
+pub(crate) fn matching_key_value(
     fields: &[String],
     attributes: &HashMap<String, String>,
     normalize: bool,
@@ -2579,7 +2675,7 @@ impl ComAmazonawsEntityresolutionAwsveniceserviceState {
     /// Hoisting the resolution out of the candidate scan is what keeps the comparison
     /// cost linear in the number of indexed records rather than multiplying the schema
     /// walk by it.
-    fn rule_fields(&self, workflow: &MatchingWorkflow, rule: &Rule) -> Vec<Vec<String>> {
+    pub(crate) fn rule_fields(&self, workflow: &MatchingWorkflow, rule: &Rule) -> Vec<Vec<String>> {
         rule.matching_keys
             .iter()
             .map(|key| self.matching_key_fields(workflow, key))
@@ -2593,7 +2689,7 @@ impl ComAmazonawsEntityresolutionAwsveniceserviceState {
     /// match according to this rule if all of the MatchingKeys match"
     /// (`smithy_query(query="shape",shape="Rule")`) — so a key the record says nothing
     /// about makes the whole rule inapplicable to it.
-    fn rule_values(
+    pub(crate) fn rule_values(
         fields: &[Vec<String>],
         attributes: &HashMap<String, String>,
         normalize: bool,
@@ -2704,6 +2800,41 @@ impl ComAmazonawsEntityresolutionAwsveniceserviceState {
                 indexed.contains_key(unique_id)
                     || indexed.len() < MAX_INDEXED_RECORDS_PER_WORKFLOW
             })
+    }
+
+    /// Record in `workflow_name`'s match index every record a finished run resolved,
+    /// and report how many were written.
+    ///
+    /// `GetMatchId` "returns the corresponding Match ID of a customer record if the
+    /// record has been processed in a rule-based matching workflow"
+    /// (`smithy_query(query="doc",shape="GetMatchId")`), and a matching job is how a
+    /// record gets processed in one — so what a run resolved is readable through that
+    /// operation, carrying the same `matchId` and `matchRule` its row of the output
+    /// table does.
+    ///
+    /// The run's records are MERGED into the index on the same terms `GenerateMatchId`
+    /// writes one: a `uniqueId` the workflow already holds is replaced, and a new one is
+    /// taken only while the workflow is below [`MAX_INDEXED_RECORDS_PER_WORKFLOW`] — so
+    /// a run neither discards what a real-time caller indexed nor grows the store past
+    /// the bound, however large the table it read. The OUTPUT TABLE is what carries the
+    /// whole run.
+    pub fn index_run_records(
+        &mut self,
+        workflow_name: &str,
+        records: Vec<IndexedRecord>,
+    ) -> usize {
+        let mut written = 0;
+        for record in records {
+            if !self.has_room_to_index(workflow_name, &record.unique_id) {
+                continue;
+            }
+            self.match_index
+                .entry(workflow_name.to_string())
+                .or_default()
+                .insert(record.unique_id.clone(), record);
+            written += 1;
+        }
+        written
     }
 
     /// Forget everything `workflow_name` had indexed.

@@ -16,9 +16,10 @@
 //!    `outputSourceConfig` derived from the workflow's own output configuration.
 //! 2. The job's status is CLOCK-DRIVEN and never regresses: it is `QUEUED` when the
 //!    caller reads it straight after starting it, then `RUNNING`, then the terminal
-//!    `FAILED` carrying `errorDetails` (this emulator runs no matching engine) and an
-//!    `endTime` that is set on no earlier status. Polling is a read: it does not move
-//!    the job, and two reads of a settled job are identical.
+//!    status its run reached, carrying `errorDetails` when that run produced nothing
+//!    (this suite mounts no AWS Glue Data Catalog, so no workflow here has an input
+//!    table to read) and an `endTime` that is set on no earlier status. Polling is a
+//!    read: it does not move the job, and two reads of a settled job are identical.
 //! 3. A workflow that does not exist is `ResourceNotFoundException` (404) on both
 //!    operations; so is a `jobId` the named workflow does not hold — including one that
 //!    belongs to another workflow.
@@ -50,7 +51,9 @@ use crate::schema_mapping_workflow_lifecycle::{
 /// The `JobStatus` values, in the order the lifecycle reaches them
 /// (`smithy_query(query="shape",shape="JobStatus")` gives the set
 /// `RUNNING | SUCCEEDED | FAILED | QUEUED`; the order below is this service's
-/// lifecycle, with `SUCCEEDED` unreachable here because no matching runs).
+/// lifecycle, with `SUCCEEDED` unreachable in THIS suite because it mounts no catalog
+/// for a run to read its input table from — the sibling [`crate::matching_run`] suite
+/// is the one that mounts the catalog and the object store and reaches `SUCCEEDED`).
 const LIFECYCLE: &[&str] = &["QUEUED", "RUNNING", "FAILED"];
 
 /// How long the whole lifecycle may take before the test gives up. The emulator's own
@@ -401,10 +404,10 @@ async fn start_matching_job_mints_a_job_get_matching_job_reads_it_back() {
             "case {label:?}: outputSourceConfig must be derived from the workflow, got {:?}",
             read.body
         );
-        // Nothing ran, so nothing is counted.
+        // Nothing ran yet: a job just started has counted nothing.
         assert!(
             read.body.get("metrics").is_none(),
-            "case {label:?}: a job this emulator never executed must report no metrics, got {:?}",
+            "case {label:?}: a job whose run has not finished must report no metrics, got {:?}",
             read.body
         );
 
