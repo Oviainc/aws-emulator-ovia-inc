@@ -1,0 +1,97 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: iam.sep-policy-composition-sourceip-condition-gates-real-call-denied-outside-cidr iam.sep-policy-composition-securetransport-condition-denied-when-policy-requires-plaintext iam.policy-arn-condition-scopes-delegated-attach-other-policy-denied
+Issue-Shape-Id: com.amazonaws.iam#AWSIdentityManagementV20100508
+Issue-Key: iam.sep-policy-composition-sourceip-condition-gates-real-call-denied-outside-cidr|_settle#27|AssertionError|raise AssertionError(
+Issue-Key: iam.sep-policy-composition-securetransport-condition-denied-when-policy-requires-plaintext|_settle#24|AssertionError|raise AssertionError(
+Issue-Key: iam.policy-arn-condition-scopes-delegated-attach-other-policy-denied|_until_allowed#24|AssertionError|raise AssertionError(f"{label}: expected ALLOWED, still {last!r} after {timeout_s}s")
+Issue-Commit: a5ed122d181173976052c81dab0291863966c94e
+
+# iam: the authorization gate publishes no request-context keys for the caller's address or transport (aws:SourceIp, aws:SecureTransport) and none for iam:PolicyARN, so conditioned grants are withheld and a condition-gated Deny applies to requests AWS allows (3 causes)
+
+> _Note: this issue was identified against the code base at commit `a5ed122d181173976052c81dab0291863966c94e`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+ListAccessKeys
+
+## Description
+Three net-new root causes in ONE component: the condition context the IAM authorization gate assembles for a REAL signed request. Cause count: 3 — a fixer must close all three before submitting. Each cause names its own failing checks.
+
+=== Cause 1 of 3: aws:SourceIp is never put in the request context, so an IpAddress-conditioned Allow never grants — not even for 0.0.0.0/0 ===
+Failing check: iam.sep-policy-composition-sourceip-condition-gates-real-call-denied-outside-cidr.
+AWS: aws:SourceIp carries the requester's source IP address and is in the context of every signed request, so an identity-based Allow conditioned on {"IpAddress": {"aws:SourceIp": <cidr>}} is satisfied exactly when the caller's address falls in <cidr>; 0.0.0.0/0 matches every address, so the call is ALLOWED. Smithy (com.amazonaws.iam#AWSIdentityManagementV20100508, awsQuery, version 2010-05-08): ListAccessKeys input UserName (existingUserNameType, @length 1..128, @pattern ^[\w+=,.@-]+$), Marker, MaxItems (@range 1..1000); output AccessKeyMetadata (@required), IsTruncated, Marker; modeled errors only NoSuchEntityException (awsQueryError NoSuchEntity, HTTP 404) and ServiceFailureException (ServiceFailure, HTTP 500). The authorization refusal is the service-common AccessDenied / HTTP 403, whose text is not modeled, so its wording is recorded behavior only: fixed text "User: " … " is not authorized to perform: " … " on resource: user " … " because no identity-based policy allows the " … " action", continued by the authorization-details trailer ". Go to <iam console authorization-details URL> for complete details, or call the GetRequestAuthorizationDetails API with the following authorization id: <authorization-id>"; the variable parts are the caller's ARN (from the signing key), the action (iam:ListAccessKeys, twice), the target user's friendly NAME as the request carried it, and the per-request authorization id/URL (never pinned — matched by shape).
+Emulator: with the grant narrowed to 192.0.2.0/24 the refusal is right, but after the SAME statement is rewritten to 0.0.0.0/0 the real signed ListAccessKeys stays AccessDenied for the whole 150 s settle window — 12 consecutive observations, all 'AccessDenied' — while SimulatePrincipalPolicy handed ContextEntries aws:SourceIp answers 'allowed' for the same stored document. The gate never learns the caller's address: services/service-com-amazonaws-iam-awsidentitymanagementv20100508/src/state/authorization.rs documents the context as assembled from four sources only (signing principal + its tags, the target's resource tags, the tags the request writes, the clock), PUBLISHED_ABSENT_KEYS declares only the organization and VPC-endpoint families, and the file's own comment states that a clause over any other key is "left UNDECIDED … fail-closed in both directions" — which withholds the grant and keeps the refusal.
+Why: a client that scopes administrative actions by source address (the most common IAM network guardrail) gets every such grant withheld: the principal can do nothing the IP-gated statement allows, from any address, so an IP-gated policy is indistinguishable from no policy at all and a parity test cannot tell a correctly-scoped emulator from one that denies everything. The simulator and the real call disagree, which is exactly the contradiction SimulatePrincipalPolicy exists to rule out.
+Fix: the IAM authorization gate's condition-context assembly (src/state/authorization.rs request_context) together with the request plumbing that must hand it the connection's peer address — populate and DECLARE aws:SourceIp so IpAddress/NotIpAddress clauses are decided instead of left undecided.
+Traces: iam.sep-policy-composition-sourceip-condition-gates-real-call-denied-outside-cidr (assertion "real ListAccessKeys once the CIDR is 0.0.0.0/0: wanted 'OK' 3x in a row within 150s"); code: src/state/authorization.rs module docs lines 58-89, PUBLISHED_ABSENT_KEYS lines 261-281.
+
+=== Cause 2 of 3: aws:SecureTransport is never derived from the transport, so the customary 'Allow unconditionally + Deny when aws:SecureTransport is false' pair refuses a TLS request ===
+Failing check: iam.sep-policy-composition-securetransport-condition-denied-when-policy-requires-plaintext.
+AWS: aws:SecureTransport is "true" when the request is sent over TLS and "false" otherwise, and it is in the context of every signed request. For the AWS-recommended TLS-enforcement idiom — one statement Allow <action> on <resource> with no condition, plus one statement Deny <action> on <resource> with Condition {"Bool": {"aws:SecureTransport": "false"}} — a request over HTTPS does not satisfy the Deny's condition, nothing else denies, and the Allow applies: the call SUCCEEDS (ListUserTags: HTTP 200 with Tags). Smithy: ListUserTags input UserName (existingUserNameType, @required, @length 1..128, @pattern ^[\w+=,.@-]+$), output Tags (@required, @length 0..50); modeled errors only NoSuchEntityException (NoSuchEntity, 404) and ServiceFailureException (ServiceFailure, 500) — AccessDenied/403 is service-common, so the refusal wording is recorded behavior only (same template as cause 1, with the action iam:ListUserTags and the resource description "user <UserName>").
+Emulator: the TLS call is refused AccessDenied for the full 150 s settle window — 12 consecutive 'AccessDenied' observations — even though the client's endpoint is https:// (the check asserts that before probing) and the only Deny in force is conditioned on aws:SecureTransport being false. The simulator agrees with AWS for both contexts ('allowed' for aws:SecureTransport=true, 'explicitDeny' for false), so the stored document is correct and the divergence is in the real call's context: aws:SecureTransport is undeclared in the gate, the Bool clause is therefore undecided, and the gate's fail-closed reading keeps the refusal — i.e. a Deny written for plaintext is applied to an encrypted request.
+Why: the standard way to require TLS locks the principal out of the action entirely. A client that adopts AWS's documented guardrail sees the guarded action fail for every caller on every transport; worse, the failure direction is the opposite of the security property under test, so a suite that checks "plaintext is denied, TLS is allowed" cannot observe the allow half at all.
+Fix: same component — src/state/authorization.rs request_context plus the HTTP layer that knows whether the request arrived over TLS: populate and DECLARE aws:SecureTransport from the actual transport so a Bool clause over it is decided (and a Deny conditioned on plaintext does not apply to a TLS request).
+Traces: iam.sep-policy-composition-securetransport-condition-denied-when-policy-requires-plaintext (assertion "real TLS ListUserTags under Allow + Deny-if-plaintext: wanted 'OK' 3x in a row within 150s").
+
+=== Cause 3 of 3: iam:PolicyARN is never put in the request context, so a delegation scoped by ArnEquals iam:PolicyARN grants nothing — even the policy it names ===
+Failing check: iam.policy-arn-condition-scopes-delegated-attach-other-policy-denied.
+NOT a new discovery but still unrun: open issue 20261031T121447Z-iam-the-iam-policyarn-condition-key-is-never.md describes this same cause and lists this check in its Issue-Trace-Ids, yet the replay report marks the check neither ALREADY FILED nor OWNED — that issue's replay key records a 60 s harness Timeout inside the check's _until_allowed helper, while the check now fails with a reached assertion ("attach the allowed policy: expected ALLOWED, still 'AccessDenied' after 60s"). It is restated here so the cause is not closed unrun; a fix that closes that issue closes this cause.
+AWS: iam:PolicyARN is the service-specific key AWS puts in the request context of the managed-policy attachment calls (AttachUserPolicy / DetachUserPolicy and their role and group peers), carrying that request's PolicyArn value. A delegate whose identity policy allows iam:AttachUserPolicy and iam:DetachUserPolicy on the target user's ARN under Condition {"ArnEquals": {"iam:PolicyARN": "<allowed-policy-arn>"}} is ALLOWED when the call names that ARN (HTTP 200, and ListAttachedUserPolicies then reports exactly that policy) and refused when it names any other. Smithy: AttachUserPolicy input UserName (userNameType, @required, @length 1..64, @pattern ^[\w+=,.@-]+$) and PolicyArn (arnType, @required, @length 20..2048); modeled errors InvalidInputException (InvalidInput, 400), LimitExceededException (LimitExceeded, 409), NoSuchEntityException (NoSuchEntity, 404), PolicyNotAttachableException (PolicyNotAttachable, 400), ServiceFailureException (500). The model enumerates no condition keys, so the key semantics are AWS-documented behavior; the refusal for the non-matching ARN is service-common AccessDenied/403 with the message whose fixed text is "User: " … " is not authorized to perform: " … " on resource: user " … " because no identity-based policy allows the " … " action" and whose variable parts are the delegate's ARN, the action asked for (iam:AttachUserPolicy or iam:DetachUserPolicy) and the target user's friendly name from the request.
+Emulator: the ALLOWED attach is refused too, stably — 'AccessDenied' for the check's whole 60 s allow window — so the delegation grants nothing. The handler hands the gate only (action, target ARN, display name) and never the request's PolicyArn, and iam:PolicyARN appears in neither request_context nor PUBLISHED_ABSENT_KEYS, so the ArnEquals clause is undecided and fail-closed.
+Why: iam:PolicyARN exists to express least-privilege delegated administration ("this delegate may attach only this managed policy"). Against the emulator the delegated path is dead rather than scoped, and because both the allowed and the denied ARN come back AccessDenied a client cannot tell a correctly-scoped account from a broken one.
+Fix: the managed-policy attachment handlers (src/ops/attach_user_policy.rs and the Detach/role/group peers) must pass the request's PolicyArn to the gate, and src/state/authorization.rs must publish and declare iam:PolicyARN so ArnEquals/ArnLike over it is decided.
+Traces: iam.policy-arn-condition-scopes-delegated-attach-other-policy-denied.
+
+All three causes sit in one place — the request-context assembly in services/service-com-amazonaws-iam-awsidentitymanagementv20100508/src/state/authorization.rs — and each needs a value the gate is not given today (the peer address, the transport, the request's PolicyArn). Related but NOT covering: open 20261029T192356Z-iam-9-net-new-authorization-and-policy-evaluation.md and open 20261102T091623Z-iam-10-net-new-refusal-message-conflict-precedence.md collect other IAM authorization causes and carry none of these three checks; fixed 20261106T201244Z-iam-3-net-new-root-causes-simulatecustompolicy-never.md fixed aws:SourceIp in the SIMULATOR's ContextEntries path only — the simulator legs of these checks now pass, the real signed call is what diverges, so this is not a reopen of it.
+
+## Evidence
+Suite simparity-behavioral-aws-v1, service group `iam` 342/456 (113 failed). These three checks are the only iam failures marked NEITHER "ALREADY FILED" NOR "OWNED by" in the replay report; every other iam failure was skipped under those marks.
+
+1) iam.sep-policy-composition-sourceip-condition-gates-real-call-denied-outside-cidr — verdict [mismatch]:
+  File "check_iam_sep_policy_composition_sourceip_condition_gates_real_call_denied_outside_cidr.py", line 204, in run
+  _settle(lambda: _outcome(lambda: as_user.list_access_keys(UserName=user)), "OK", ...)
+  AssertionError: real ListAccessKeys once the CIDR is 0.0.0.0/0: wanted 'OK' 3x in a row within 150s; last observations ['AccessDenied', 'AccessDenied', 'AccessDenied', 'AccessDenied', 'AccessDenied', 'AccessDenied', 'AccessDenied', 'AccessDenied', 'AccessDenied', 'AccessDenied', 'AccessDenied', 'AccessDenied']
+Expected (AWS): after PutUserPolicy rewrites the statement's condition to {"IpAddress": {"aws:SourceIp": "0.0.0.0/0"}}, the real signed ListAccessKeys succeeds (HTTP 200, AccessKeyMetadata). Earlier legs that PASS prove the rest of the path: the simulator says 'allowed' for an address inside the CIDR, 'implicitDeny' outside, 'implicitDeny' with aws:SourceIp named in MissingContextValues when no address is supplied; the real call under 192.0.2.0/24 is correctly AccessDenied with the documented message; and the positive control GetUser succeeds, so the key itself has propagated.
+Actual (emulator): AccessDenied on every one of the 12 probes over 150 s, i.e. the widened Allow never grants.
+
+2) iam.sep-policy-composition-securetransport-condition-denied-when-policy-requires-plaintext — verdict [mismatch]:
+  File "check_iam_sep_policy_composition_securetransport_condition_denied_when_policy_requires_plaintext.py", line 209, in run
+  _settle(lambda: _outcome(lambda: as_user.list_user_tags(UserName=user)), "OK", ...)
+  AssertionError: real TLS ListUserTags under Allow + Deny-if-plaintext: wanted 'OK' 3x in a row within 150s; last observations ['AccessDenied' x12]
+Expected (AWS): with the user's inline policy holding an unconditional Allow of iam:ListUserTags on the user plus a Deny of the same conditioned on {"Bool": {"aws:SecureTransport": "false"}}, the HTTPS call succeeds (200, Tags). The check asserts beforehand that the client endpoint starts with https://, and the simulator legs pass: 'allowed' for aws:SecureTransport=true and 'explicitDeny' for false against the same stored document.
+Actual (emulator): AccessDenied on all 12 probes — the plaintext-only Deny is applied to a TLS request.
+
+3) iam.policy-arn-condition-scopes-delegated-attach-other-policy-denied — verdict [mismatch]:
+  File "check_iam_policy_arn_condition_scopes_delegated_attach_other_policy_denied.py", line 62, in run
+  _until_allowed(lambda: me.attach_user_policy(UserName=target, PolicyArn=p_ok), ...)
+  AssertionError: attach the allowed policy: expected ALLOWED, still 'AccessDenied' after 60s
+Expected (AWS): the delegate's AttachUserPolicy naming the ARN its ArnEquals iam:PolicyARN condition allows returns HTTP 200 and ListAttachedUserPolicies(target) == [p_ok]; only the OTHER ARN is refused 403 AccessDenied. The delegate's control call GetUser on itself succeeds first, so the access key is live and the policy is in force.
+Actual (emulator): the allowed attach is AccessDenied for the full 60 s window, so no scoping is observable at all.
+
+Source evidence shared by all three: services/service-com-amazonaws-iam-awsidentitymanagementv20100508/src/state/authorization.rs — module docs lines 58-89 enumerate the ONLY four context sources (signing principal and its tags; target resource tags; tags the request writes; the clock) and state "A clause over any OTHER key is left undecided, which withholds a grant and keeps a refusal"; lines 261-281 PUBLISHED_ABSENT_KEYS lists only aws:PrincipalOrgID, aws:PrincipalOrgPaths, aws:SourceVpce, aws:SourceVpc, aws:VpcSourceIp, with the comment "a real signed request does carry aws:PrincipalArn, aws:RequestedRegion, aws:SecureTransport and their peers, and this gate must not decide a clause over them from their absence here" — confirming aws:SourceIp, aws:SecureTransport and iam:PolicyARN are neither populated nor decidable.
+
+## Steps to Reproduce
+Build and boot the emulator from this checkout and replay the three checks in trace_ids. Each also reproduces standalone against the iam endpoint:
+
+Cause 1 (aws:SourceIp):
+1. CreateUser(U); PutUserPolicy(U, 'control', Allow iam:GetUser on U's ARN).
+2. PutUserPolicy(U, 'ip-gated', Allow iam:ListAccessKeys on U's ARN with Condition {"IpAddress": {"aws:SourceIp": "192.0.2.0/24"}}).
+3. CreateAccessKey(U) and build an iam client signing with that key. GetUser(U) succeeds (control).
+4. ListAccessKeys(U) as U -> 403 AccessDenied (correct: the runner is outside TEST-NET-1).
+5. PutUserPolicy(U, 'ip-gated', same statement with "0.0.0.0/0").
+6. ListAccessKeys(U) as U, polling for up to 150 s. Expected: HTTP 200 with AccessKeyMetadata. Observed: 403 AccessDenied on every probe.
+
+Cause 2 (aws:SecureTransport):
+1. CreateUser(U); PutUserPolicy(U, 'control', Allow iam:GetUser on U's ARN).
+2. PutUserPolicy(U, 'tls', two statements: Allow iam:ListUserTags on U's ARN unconditionally, and Deny iam:ListUserTags on U's ARN with Condition {"Bool": {"aws:SecureTransport": "false"}}).
+3. CreateAccessKey(U); build an https:// iam client signing with that key; GetUser(U) succeeds.
+4. ListUserTags(U) as U over HTTPS, polling up to 150 s. Expected: HTTP 200 with Tags. Observed: 403 AccessDenied on every probe.
+5. For contrast, SimulatePrincipalPolicy(PolicySourceArn=U's ARN, ActionNames=['iam:ListUserTags'], ResourceArns=[U's ARN], ContextEntries aws:SecureTransport=true) answers 'allowed' — the stored document is right; only the real call's context is wrong.
+
+Cause 3 (iam:PolicyARN):
+1. CreateUser(TARGET); CreatePolicy(P_OK) and CreatePolicy(P_OTHER) (any valid document).
+2. CreateUser(DELEGATE); CreateAccessKey(DELEGATE); PutUserPolicy(DELEGATE, 'delegated', two statements: Allow iam:GetUser on DELEGATE's ARN; Allow [iam:AttachUserPolicy, iam:DetachUserPolicy] on TARGET's ARN with Condition {"ArnEquals": {"iam:PolicyARN": "<P_OK arn>"}}).
+3. As DELEGATE: AttachUserPolicy(UserName=TARGET, PolicyArn=<P_OK arn>). Expected HTTP 200 and ListAttachedUserPolicies(TARGET) == [P_OK]. Observed: 403 AccessDenied, repeatedly for 60 s.
+4. As DELEGATE: AttachUserPolicy(UserName=TARGET, PolicyArn=<P_OTHER arn>). Expected 403 AccessDenied with "User: <DELEGATE arn> is not authorized to perform: iam:AttachUserPolicy on resource: user TARGET because no identity-based policy allows the iam:AttachUserPolicy action", attachments unchanged.
+5. Repeat 3 and 4 for DetachUserPolicy after an admin attaches P_OTHER: the P_OK detach must be allowed, the P_OTHER detach refused with the same template naming iam:DetachUserPolicy.
