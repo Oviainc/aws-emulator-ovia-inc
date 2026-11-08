@@ -91,7 +91,7 @@ const ERROR_CASES: &[ErrorCase] = &[
         action: "ListStackSetOperations",
         members: &[],
         status: 400,
-        code: "MalformedInput",
+        code: "ValidationError",
     },
     ErrorCase {
         case: "handler refusal: a read naming no addressable stack",

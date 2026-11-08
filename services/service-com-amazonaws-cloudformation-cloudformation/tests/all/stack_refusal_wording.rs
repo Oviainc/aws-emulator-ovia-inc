@@ -7,10 +7,11 @@
 //! there" class with a different fixed template per operation — the name bare, single-quoted,
 //! square-bracketed, colon-prefixed, or introduced by "with id" — and the only variable part
 //! of any of them is what the request named; a refusal about a stack whose current STATUS
-//! does not admit the call is a fixed sentence about the call, carrying no part of this run's
-//! state; and an operation that addresses a record WITHIN a stack (a change set) resolves the
-//! stack FIRST, so a request naming a stack that is not addressable is refused about the
-//! stack rather than about the record.**
+//! does not admit the call names the operation that cannot be called and, where the service's
+//! sentence states it, the status the stack is in — never the stack itself; and an operation
+//! that addresses a record WITHIN a stack (a change set) resolves the stack FIRST, so a
+//! request naming a stack that is not addressable is refused about the stack rather than
+//! about the record.**
 //!
 //! The sentences are spelled out here rather than imported from the crate, because the
 //! sentence IS the requirement: a reworded message must fail this suite.
@@ -73,10 +74,19 @@ fn labelled(name: &str) -> String {
     format!("Stack: {name} does not exist")
 }
 
-/// The fixed sentence `ContinueUpdateRollback` answers for a stack whose status the
-/// continuation cannot be started from: it names the internal operation and nothing of the
-/// stack.
-const CANNOT_CONTINUE: &str = "RollbackUpdatedStack cannot be called from current stack status";
+/// The sentence `ContinueUpdateRollback` answers for a stack whose status the continuation
+/// cannot be started from.
+///
+/// Two of them, by which workflow refuses: a stack whose status belongs to the UPDATE family
+/// had an update, so the operation the caller named refuses and states that operation and the
+/// status the stack is in; a stack in any other status is refused by the internal rollback
+/// operation's own state gate, which names neither the stack nor its status.
+fn cannot_continue(in_status: &str) -> String {
+    if in_status.starts_with("UPDATE_") {
+        return format!("ContinueUpdateRollback cannot be called from stack with {in_status} status.");
+    }
+    "RollbackUpdatedStack cannot be called from current stack status".to_string()
+}
 
 /// The fixed sentence `RollbackStack` answers for a stack whose status a rollback cannot be
 /// started from: it states the statuses the call CAN be made from and nothing of the stack.
@@ -101,11 +111,6 @@ fn not_found_rows() -> Vec<NotFoundRow> {
         },
         NotFoundRow {
             action: "DescribeStackEvents",
-            extra: vec![],
-            template: with_id,
-        },
-        NotFoundRow {
-            action: "GetStackPolicy",
             extra: vec![],
             template: with_id,
         },
@@ -150,6 +155,13 @@ fn not_found_rows() -> Vec<NotFoundRow> {
             extra: vec![],
             template: bracketed,
         },
+        // A drift check of ONE resource resolves its stack first, and words the class the
+        // same way the stack-wide check does.
+        NotFoundRow {
+            action: "DetectStackResourceDrift",
+            extra: vec![member("LogicalResourceId", "Topic")],
+            template: bracketed,
+        },
         NotFoundRow {
             action: "RollbackStack",
             extra: vec![],
@@ -178,6 +190,24 @@ fn not_found_rows() -> Vec<NotFoundRow> {
         NotFoundRow {
             action: "SetStackPolicy",
             extra: vec![member("StackPolicyBody", POLICY)],
+            template: labelled,
+        },
+        // The colon-prefixed template's other operations: the stack-policy READ and the
+        // resumption of a rollback.
+        NotFoundRow {
+            action: "GetStackPolicy",
+            extra: vec![],
+            template: labelled,
+        },
+        NotFoundRow {
+            action: "ContinueUpdateRollback",
+            extra: vec![],
+            template: labelled,
+        },
+        // ...and the cancellation of an update, which resolves its stack the same way.
+        NotFoundRow {
+            action: "CancelUpdateStack",
+            extra: vec![],
             template: labelled,
         },
     ]
@@ -425,7 +455,7 @@ async fn a_drift_result_nothing_issued_is_refused_naming_the_id_the_request_sent
 }
 
 #[tokio::test]
-async fn a_status_gated_rollback_refusal_is_a_fixed_sentence() {
+async fn a_status_gated_rollback_refusal_names_only_the_status_it_was_refused_from() {
     let router = router();
     // A stack whose create is still in flight, and the same stack once that create has
     // completed and once an update has: three statuses, none of which either call can be made
@@ -468,9 +498,18 @@ async fn a_status_gated_rollback_refusal_is_a_fixed_sentence() {
             );
             wait_for_the_transition().await;
         }
+        // The status the stack is in when the calls below arrive, which is the one variable
+        // part of the continuation's refusal.
+        let (status, described) = describe_stack(&router, "wording-status").await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected the stack to be readable, got {status} {described}"
+        );
+        let in_status = xml_text(&described, "StackStatus").unwrap_or_default();
+        let cannot_continue = cannot_continue(&in_status);
 
         for (action, expected) in [
-            ("ContinueUpdateRollback", CANNOT_CONTINUE),
+            ("ContinueUpdateRollback", cannot_continue.as_str()),
             ("RollbackStack", CANNOT_ROLL_BACK),
         ] {
             let members = vec![member("StackName", "wording-status")];
@@ -493,8 +532,9 @@ async fn a_status_gated_rollback_refusal_is_a_fixed_sentence() {
         }
     }
 
-    // Nothing of this run's state is in either sentence: not the stack's id, and not the
-    // status it is really in — both of which a client reads with `DescribeStacks`.
+    // The status a call was refused FROM is the only part of this run's state either
+    // sentence carries: neither names the stack — not by id and not by the name the request
+    // sent — and the rollback's sentence names no status at all.
     let (status, described) = describe_stack(&router, "wording-status").await;
     assert_eq!(
         status, 200,
@@ -506,11 +546,18 @@ async fn a_status_gated_rollback_refusal_is_a_fixed_sentence() {
         "expected the refused calls to leave the stack where it was, got {reported:?}"
     );
     for (case, action, sentence) in &answered {
-        for leaked in [stack_id.as_str(), reported.as_str(), "wording-status"] {
+        for leaked in [stack_id.as_str(), "wording-status"] {
             assert!(
                 !sentence.contains(leaked),
-                "case {case:?} on {action}: expected the refusal to carry no per-run value, \
-                 got {leaked:?} in {sentence:?}"
+                "case {case:?} on {action}: expected the refusal to name no stack, got \
+                 {leaked:?} in {sentence:?}"
+            );
+        }
+        if *action == "RollbackStack" {
+            assert!(
+                !sentence.contains(reported.as_str()),
+                "case {case:?} on {action}: expected a sentence carrying no status at all, \
+                 got {reported:?} in {sentence:?}"
             );
         }
     }

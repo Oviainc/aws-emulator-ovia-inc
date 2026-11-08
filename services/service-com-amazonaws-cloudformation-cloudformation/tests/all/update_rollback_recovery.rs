@@ -38,7 +38,7 @@ use service_com_amazonaws_cloudformation_cloudformation::state::wait_conditions:
     DEFAULT_TIMEOUT, MAX_TIMEOUT,
 };
 use service_com_amazonaws_cloudformation_cloudformation::state::{
-    resource_status, status, CANNOT_CONTINUE_UPDATE_ROLLBACK,
+    cannot_continue_update_rollback, resource_status, status,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -277,8 +277,12 @@ async fn continuing_a_rollback_is_refused_unless_the_rollback_failed() {
     );
 
     // While the create is still in flight, and once it has completed: neither is a status a
-    // rollback can be continued from, and the stack is left exactly where it is.
-    for case in ["while the create is in progress", "after the create completed"] {
+    // rollback can be continued from, and the stack is left exactly where it is. The refusal
+    // names the status the stack is in, which is a different one in each of the two rows.
+    for (case, in_status) in [
+        ("while the create is in progress", status::CREATE_IN_PROGRESS),
+        ("after the create completed", status::CREATE_COMPLETE),
+    ] {
         let (http_status, body) = call(
             &router,
             "ContinueUpdateRollback",
@@ -289,10 +293,10 @@ async fn continuing_a_rollback_is_refused_unless_the_rollback_failed() {
             http_status, 400,
             "case {case:?}: expected the call to be refused with 400, got {http_status} {body}"
         );
+        let expected = cannot_continue_update_rollback(in_status);
         assert!(
-            body.contains(CANNOT_CONTINUE_UPDATE_ROLLBACK),
-            "case {case:?}: expected the refusal to be \
-             {CANNOT_CONTINUE_UPDATE_ROLLBACK:?}, got {body}"
+            body.contains(&expected),
+            "case {case:?}: expected the refusal to be {expected:?}, got {body}"
         );
         wait_for_the_transition().await;
     }

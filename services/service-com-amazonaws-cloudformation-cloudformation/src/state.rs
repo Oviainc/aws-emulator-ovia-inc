@@ -423,6 +423,13 @@ pub mod stack_tags;
 /// operation are stamped with.
 pub mod timeline;
 
+/// The constraints a stack IDENTIFIER a request names is held to, checked before any lookup
+/// ([`stack_identifier`]).
+pub mod stack_identifier;
+pub use stack_identifier::{
+    refuse_malformed_identifier, STACK_IDENTIFIER_PATTERN, STACK_NAME_OR_ID_PATH, STACK_NAME_PATH,
+};
+
 /// How long after the call that starts it a stack's terminal status becomes due.
 ///
 /// Chosen (CloudFormation's real stack operations take as long as the resources do, so
@@ -3108,8 +3115,14 @@ impl ComAmazonawsCloudformationCloudformationState {
     /// the EC2 InstanceId to DescribeStackResources to find which stack the instance
     /// belongs to and what other resources are part of the stack").
     ///
-    /// Searched over every stack of the request's Region, live or deleted, in creation
-    /// order: a deleted stack's resources stay addressable for as long as the stack does.
+    /// Searched over the LIVE stacks of the request's Region, in creation order: a physical
+    /// id names a resource that EXISTS, and a stack whose deletion has completed holds none
+    /// — its records say what it once deployed, which is what keeps the stack itself readable
+    /// by its id, but nothing of those resources is there to find a stack from. So a request
+    /// that can only name its stack through such a resource resolves nothing and is refused
+    /// ([`stack_for_physical_resource_does_not_exist`]), rather than reporting a deleted
+    /// resource as a live one.
+    ///
     /// The first stack carrying the id wins, and this emulator derives a generated physical
     /// id from the stack id, so two stacks collide only where their templates NAME the same
     /// resource.
@@ -3126,7 +3139,7 @@ impl ComAmazonawsCloudformationCloudformationState {
         }
         self.stacks
             .iter()
-            .filter(|stack| stack.region == region)
+            .filter(|stack| stack.region == region && stack.is_live())
             .find(|stack| {
                 stack.resources.iter().any(|deployed| {
                     deployed.resource.physical_resource_id == physical_resource_id
@@ -3946,11 +3959,34 @@ pub fn stack_cannot_be_rolled_back() -> String {
 /// The message CloudFormation answers when `ContinueUpdateRollback` names a stack whose
 /// current status is not one a rollback can be continued from.
 ///
-/// "A stack goes into the UPDATE_ROLLBACK_FAILED state when CloudFormation can't roll back
-/// all changes after a failed stack update": that is the one state the rollback can be
-/// continued from. Entirely fixed text, as [`stack_cannot_be_rolled_back`] is: it names the
-/// internal operation the call would resume and nothing of the stack it was made against.
-pub const CANNOT_CONTINUE_UPDATE_ROLLBACK: &str =
+/// TWO sentences, chosen by which workflow refuses the call. A stack whose status belongs to
+/// the UPDATE family ([`UPDATE_STATUS_PREFIX`]) — every one of them but the
+/// `UPDATE_ROLLBACK_FAILED` a continuation IS made from — had an update, so the operation the
+/// caller named is what refuses, and its sentence states that operation and the status the
+/// stack is in: the one variable part, read from the stack the request resolved. A stack in
+/// any other status never had an update to roll back at all, so the refusal comes from the
+/// internal rollback operation's own state gate ([`ROLLBACK_UPDATED_STACK_STATUS_GATE`]),
+/// which names that operation and no part of the stack.
+pub fn cannot_continue_update_rollback(status: &str) -> String {
+    if status.starts_with(UPDATE_STATUS_PREFIX) {
+        return format!("ContinueUpdateRollback cannot be called from stack with {status} status.");
+    }
+    ROLLBACK_UPDATED_STACK_STATUS_GATE.to_string()
+}
+
+/// What the statuses of the UPDATE family share: `StackStatus`'s update values all begin with
+/// it (`smithy_query(query="shape", shape="StackStatus")` gives `UPDATE_IN_PROGRESS`,
+/// `UPDATE_FAILED`, `UPDATE_COMPLETE`, `UPDATE_ROLLBACK_*`, …), which is what tells a stack
+/// that HAD an update from one that never did.
+pub const UPDATE_STATUS_PREFIX: &str = "UPDATE_";
+
+/// The fixed sentence the internal rollback operation's state gate answers: the call cannot be
+/// made from the status the stack is in, stated without naming the stack or that status.
+///
+/// It names `RollbackUpdatedStack`, the internal operation a continuation resumes, rather than
+/// the API operation the caller called — which is how CloudFormation words a gate of its own
+/// workflow rather than of the call.
+pub const ROLLBACK_UPDATED_STACK_STATUS_GATE: &str =
     "RollbackUpdatedStack cannot be called from current stack status";
 
 /// `Err(message)` for a request that names a change set by NAME without the stack it
@@ -4026,22 +4062,23 @@ pub mod failed_action {
 /// * `Stack with id <name> does not exist` — this function, the one most reads answer
 ///   (`DescribeStacks`, `DescribeStackEvents`, `DescribeStackResources`,
 ///   `DescribeStackResourceDrifts`, `ListStackResources`, `ListChangeSets`, `GetTemplate`,
-///   `GetTemplateSummary`, `GetStackPolicy`, `DescribeEvents`, `CreateChangeSet`,
-///   `CreateGeneratedTemplate`, `ContinueUpdateRollback`, `DetectStackResourceDrift`).
-/// * `Stack [<name>] does not exist` — [`changed_stack_does_not_exist`].
+///   `GetTemplateSummary`, `DescribeEvents`, `CreateChangeSet`, `CreateGeneratedTemplate`).
+/// * `Stack [<name>] does not exist` — [`changed_stack_does_not_exist`], which is also
+///   `DetectStackResourceDrift`'s.
 /// * `Stack '<name>' does not exist` — [`quoted_stack_does_not_exist`].
 /// * `Stack <name> does not exist` — [`bare_stack_does_not_exist`].
-/// * `Stack: <name> does not exist` — [`labelled_stack_does_not_exist`].
+/// * `Stack: <name> does not exist` — [`labelled_stack_does_not_exist`], which is also
+///   `GetStackPolicy`'s and `ContinueUpdateRollback`'s.
 pub fn stack_does_not_exist(name_or_id: &str) -> String {
     format!("Stack with id {name_or_id} does not exist")
 }
 
 /// The message CloudFormation answers for a stack that is not addressable with the named
 /// stack in SQUARE BRACKETS, which is this family's template for `UpdateStack`,
-/// `UpdateTerminationProtection`, `RollbackStack`, `DetectStackDrift` and the operations
-/// that address a change set within its stack (`DescribeChangeSet`,
-/// `DescribeChangeSetHooks`, `ExecuteChangeSet`) — see [`stack_does_not_exist`] for the
-/// family, of which this is one template among several.
+/// `UpdateTerminationProtection`, `RollbackStack`, `DetectStackDrift`,
+/// `DetectStackResourceDrift` and the operations that address a change set within its stack
+/// (`DescribeChangeSet`, `DescribeChangeSetHooks`, `ExecuteChangeSet`) — see
+/// [`stack_does_not_exist`] for the family, of which this is one template among several.
 ///
 /// The bracketed name is the message's only variable part.
 pub fn changed_stack_does_not_exist(name_or_id: &str) -> String {
@@ -4061,7 +4098,8 @@ pub fn bare_stack_does_not_exist(name_or_id: &str) -> String {
 }
 
 /// The same refusal with the named stack after a COLON, which is this family's template for
-/// `SetStackPolicy` ([`stack_does_not_exist`] documents the family).
+/// `SetStackPolicy`, `GetStackPolicy` and `ContinueUpdateRollback`
+/// ([`stack_does_not_exist`] documents the family).
 pub fn labelled_stack_does_not_exist(name_or_id: &str) -> String {
     format!("Stack: {name_or_id} does not exist")
 }

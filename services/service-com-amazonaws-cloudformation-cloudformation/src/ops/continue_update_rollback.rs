@@ -185,7 +185,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         // "ForceRollback and ResourcesToSkip are mutually exclusive. Specifying both in the
-        // same request returns a validation error."
+        // same request returns a validation error." The refusal is that documented sentence
+        // about the two members, with no part of the request in it.
         let force_rollback = input.force_rollback.unwrap_or(false);
         let named_to_skip = input
             .resources_to_skip
@@ -193,7 +194,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .is_some_and(|resources| !resources.is_empty());
         if force_rollback && named_to_skip {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                "You cannot specify both ForceRollback and ResourcesToSkip",
+                "ForceRollback and ResourcesToSkip are mutually exclusive",
             ));
         }
         // The rollback runs as the `RoleARN` it names, so a role CloudFormation cannot
@@ -220,18 +221,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|stack| stack.is_live())
             else {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::stack_does_not_exist(&input.stack_name),
+                    crate::state::labelled_stack_does_not_exist(&input.stack_name),
                 ));
             };
             // "A stack goes into the UPDATE_ROLLBACK_FAILED state when CloudFormation can't
             // roll back all changes after a failed stack update": that is the one state a
             // rollback can be continued from, so a stack in any other one is refused and
-            // left exactly where it is. The refusal is a FIXED sentence about the call: the
-            // stack's id and the status it is in are this run's own state, so neither is
-            // interpolated into it.
+            // left exactly where it is. The refusal names the status the stack IS in, which
+            // is read from the stack this request resolved.
             if previous.status != status::UPDATE_ROLLBACK_FAILED {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::CANNOT_CONTINUE_UPDATE_ROLLBACK,
+                    crate::state::cannot_continue_update_rollback(&previous.status),
                 ));
             }
             // "A client request token already exists": the token identifies ONE request, so
@@ -286,7 +286,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             let Some(stack) = store.resolve_mut(&request_region, &input.stack_name) else {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::stack_does_not_exist(&input.stack_name),
+                    crate::state::labelled_stack_does_not_exist(&input.stack_name),
                 ));
             };
             if let Some(role_arn) = &input.role_arn {

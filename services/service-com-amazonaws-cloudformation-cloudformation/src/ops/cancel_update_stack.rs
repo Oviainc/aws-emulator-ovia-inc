@@ -77,10 +77,9 @@ use crate::state::status;
 ///
 /// "You can cancel only stacks that are in the UPDATE_IN_PROGRESS state": that is the one
 /// state the call can be made from, since it is the only one with an update in flight to
-/// cancel. Entirely FIXED text, the same shape as the sibling refusal
-/// [`crate::state::CANNOT_CONTINUE_UPDATE_ROLLBACK`]: it names the operation that cannot be
-/// called and nothing of the stack it was called against — the stack's id and the status it
-/// is really in are this run's own state, and `DescribeStacks` is what reports them.
+/// cancel. Entirely FIXED text: it names the operation that cannot be called and nothing of
+/// the stack it was called against — the stack's id and the status it is really in are this
+/// run's own state, and `DescribeStacks` is what reports them.
 pub const CANNOT_CANCEL_UPDATE_STACK: &str =
     "CancelUpdateStack cannot be called from current stack status";
 
@@ -179,6 +178,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // CloudFormation checks the constraints on the stack identifier a request names
+        // BEFORE it resolves the stack, so an identifier no stack could carry is answered as
+        // the malformed request it is (`crate::state::stack_identifier`).
+        crate::state::refuse_malformed_identifier(
+            crate::state::STACK_NAME_PATH,
+            Some(&input.stack_name),
+        )?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no update to cancel, and nothing
             // was written.
@@ -209,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|stack| stack.is_live())
             else {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::changed_stack_does_not_exist(&input.stack_name),
+                    crate::state::labelled_stack_does_not_exist(&input.stack_name),
                 ));
             };
             // "You can cancel only stacks that are in the UPDATE_IN_PROGRESS state": a
@@ -243,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // signed for.
             let Some(stack) = store.resolve_mut(&request_region, &input.stack_name) else {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::changed_stack_does_not_exist(&input.stack_name),
+                    crate::state::labelled_stack_does_not_exist(&input.stack_name),
                 ));
             };
             // "All events initiated by a given stack operation are assigned the same client

@@ -159,6 +159,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::generated_template as generated;
 
+        // CloudFormation checks the constraints on the stack identifier a request names
+        // BEFORE it resolves the stack, so an identifier no stack could carry is answered as
+        // the malformed request it is (`crate::state::stack_identifier`). A request naming
+        // no base stack carries none.
+        crate::state::refuse_malformed_identifier(
+            crate::state::STACK_NAME_PATH,
+            input.stack_name.as_deref(),
+        )?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no store to record a generated
             // template in, so this answers 501 rather than an id nothing stands behind.

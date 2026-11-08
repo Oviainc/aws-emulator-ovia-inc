@@ -771,9 +771,10 @@ struct RefusalCase {
     case: &'static str,
     definitions: Vec<Definition>,
     mappings: Vec<Mapping>,
-    /// The wire error code the refusal carries: CloudFormation's own `ValidationError` for
-    /// what the service refuses, and the boundary validator's `MalformedInput` for a required
-    /// member the request does not carry at all.
+    /// The wire error code the refusal carries: CloudFormation's own `ValidationError`, which
+    /// is the one code its Query API publishes for a refused request — whether the service
+    /// refused it or the boundary validator did, for a required member the request does not
+    /// carry at all.
     code: &'static str,
     /// A fragment of the request the refusal must name, so the caller can fix it.
     names: &'static str,
@@ -793,7 +794,7 @@ async fn a_request_that_cannot_describe_a_refactor_is_refused() {
             case: "no stack definitions at all",
             definitions: Vec::new(),
             mappings: Vec::new(),
-            code: "MalformedInput",
+            code: "ValidationError",
             names: "stackDefinitions",
         },
         RefusalCase {

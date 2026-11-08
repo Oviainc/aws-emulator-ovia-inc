@@ -129,6 +129,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // CloudFormation checks the constraints on the stack identifier a request names
+        // BEFORE it resolves the stack, so an identifier no stack could carry is answered as
+        // the malformed request it is (`crate::state::stack_identifier`).
+        crate::state::refuse_malformed_identifier(
+            crate::state::STACK_NAME_PATH,
+            Some(&input.stack_name),
+        )?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no stack store to read.
             return Err(crate::scaffolded::Scaffolded::not_implemented(
@@ -149,7 +156,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|stack| stack.is_live())
             .ok_or_else(|| {
                 crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::stack_does_not_exist(&input.stack_name),
+                    crate::state::labelled_stack_does_not_exist(&input.stack_name),
                 )
             })?;
 

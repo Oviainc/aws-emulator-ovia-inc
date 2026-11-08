@@ -49,12 +49,14 @@
 //! routing failure, a transport failure and a pre-dispatch refusal. Everything else about
 //! those paths — status, `<Type>`, `<Code>`, `<Message>` — stays with the framework.
 //!
-//! `override_refusal` is taken for two classes as well: a refusal of the member that names a
+//! `override_refusal` is taken for three classes as well: a refusal of the member that names a
 //! PUBLIC EXTENSION BY ARN, which CloudFormation's registry parses itself, is stated as the
 //! registry states it rather than as a generic request-validation failure — see
-//! [`registry_refusal_of_a_public_extension_arn`] — and a value outside an enum whose value
+//! [`registry_refusal_of_a_public_extension_arn`] — a value outside an enum whose value
 //! set this service lists in its own order is stated in THAT order, see
-//! [`enum_value_set_in_the_services_own_order`].
+//! [`enum_value_set_in_the_services_own_order`], and every other refusal the framework
+//! describes carries the one CODE this service publishes for a refused request, see
+//! [`the_services_own_refusal_code`].
 //!
 //! `override_protocol` is taken for one rendering: a floating-point member is written as a
 //! double, with its fractional part, which is how CloudFormation's envelope writes one —
@@ -261,6 +263,26 @@ fn registry_refusal_of_a_public_extension_arn(violations: &[Violation]) -> Optio
     })
 }
 
+/// This service's CODE for a request the framework refused before any handler ran.
+///
+/// CloudFormation's Query API publishes exactly one code for a refused request —
+/// `ValidationError`, the code its own documentation names and the one an SDK's error class is
+/// keyed on ([`VALIDATION_REFUSAL_CODE`]) — and `MalformedInput`, which the framework's query
+/// renderer names for a body it could not READ (an absent required member reaches it that
+/// way, because absence is found while reading), is not a code CloudFormation answers at all.
+/// So every refusal the framework can describe structurally is stated under the one code,
+/// whichever layer found it.
+///
+/// Only the code is this service's: the MESSAGE is rebuilt through the framework's own
+/// envelope over the same violations, so an absent member and a value outside a declared
+/// bound keep the exact sentence they had.
+fn the_services_own_refusal_code(violations: &[Violation]) -> Option<Refused> {
+    Some(Refused {
+        code: VALIDATION_REFUSAL_CODE.to_string(),
+        message: aws_smithy_schema_server::envelope(violations)?,
+    })
+}
+
 /// The `com-amazonaws-cloudformation-cloudformation` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -462,16 +484,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
-        // service reword it. Returning `None` keeps the framework's default
-        // wording. Two classes are reworded here: a refusal of the member that names a
-        // PUBLIC EXTENSION BY ARN, which the registry parses itself (see
-        // [`registry_refusal_of_a_public_extension_arn`]), and a value outside an enum whose
+        // service reword it. Three classes are reworded here: a refusal of the member that
+        // names a PUBLIC EXTENSION BY ARN, which the registry parses itself (see
+        // [`registry_refusal_of_a_public_extension_arn`]), a value outside an enum whose
         // value set this service lists in its own order (see
-        // [`enum_value_set_in_the_services_own_order`]).
+        // [`enum_value_set_in_the_services_own_order`]), and — for every refusal neither of
+        // those restates — the CODE this service publishes for a refused request, with the
+        // framework's own sentence (see [`the_services_own_refusal_code`]).
         match refusal {
             Refusal::Invalid(violations) => {
                 registry_refusal_of_a_public_extension_arn(violations)
                     .or_else(|| enum_value_set_in_the_services_own_order(violations))
+                    .or_else(|| the_services_own_refusal_code(violations))
             }
             _ => None,
         }

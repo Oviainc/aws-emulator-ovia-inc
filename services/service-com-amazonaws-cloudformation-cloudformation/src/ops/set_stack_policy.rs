@@ -154,6 +154,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // CloudFormation checks the constraints on the stack identifier a request names
+        // BEFORE it resolves the stack, so an identifier no stack could carry is answered as
+        // the malformed request it is (`crate::state::stack_identifier`).
+        crate::state::refuse_malformed_identifier(
+            crate::state::STACK_NAME_PATH,
+            Some(&input.stack_name),
+        )?;
         // CloudFormation is Regional: the stack this call sets a policy on is the one of
         // that name in the Region the request is signed for.
         let region = crate::state::request_region(ctx.parts());

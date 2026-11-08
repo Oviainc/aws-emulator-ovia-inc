@@ -166,7 +166,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let region = crate::state::request_region(ctx.parts());
             let stack = store.resolve(&region, &input.stack_name).ok_or_else(|| {
                 crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::stack_does_not_exist(&input.stack_name),
+                    crate::state::changed_stack_does_not_exist(&input.stack_name),
                 )
             })?;
             // "The logical name of the resource for which to return drift information": one
@@ -224,9 +224,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `DescribeStackResourceDrifts` reports for the resource are the same record.
         let region = crate::state::request_region(ctx.parts());
         let stack = store.resolve(&region, &input.stack_name).ok_or_else(|| {
-            crate::scaffolded::Scaffolded::validation_error(crate::state::stack_does_not_exist(
-                &input.stack_name,
-            ))
+            crate::scaffolded::Scaffolded::validation_error(
+                crate::state::changed_stack_does_not_exist(&input.stack_name),
+            )
         })?;
         let reported_stack_id = stack.stack_id.clone();
         let deployed = stack

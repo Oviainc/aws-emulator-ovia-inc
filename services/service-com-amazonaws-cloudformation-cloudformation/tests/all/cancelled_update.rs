@@ -460,8 +460,8 @@ async fn an_update_can_be_cancelled_only_while_it_is_in_flight() {
         let message = xml_text(&body, "Message").unwrap_or_default();
         assert_eq!(
             message,
-            format!("Stack [{named}] does not exist"),
-            "case {named:?}: expected the square-bracketed not-found template, got {message:?}"
+            format!("Stack: {named} does not exist"),
+            "case {named:?}: expected the colon-prefixed not-found template, got {message:?}"
         );
     }
 }

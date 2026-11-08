@@ -84,13 +84,14 @@ use crate::state::{DeployedResource, StoredStack, MAX_DESCRIBED_STACK_RESOURCES}
 ///
 /// "You must specify either StackName or PhysicalResourceId, but not both. … A
 /// ValidationError is returned if you specify both StackName and PhysicalResourceId in
-/// the same request."
+/// the same request." Answered AFTER the stack the `StackName` names is resolved: a name
+/// nothing holds is refused about the stack, which is the earlier of the two refusals.
 const BOTH_SELECTORS: &str =
     "Cannot specify both StackName and PhysicalResourceId in the same request";
 
 /// The refusal for a request that names NEITHER: each member is "Required: Conditional"
 /// on the absence of the other, so a request with neither selects no stack at all.
-const NO_SELECTOR: &str = "Either StackName or PhysicalResourceId must be specified";
+const NO_SELECTOR: &str = "Either StackName or PhysicalResourceId must be specified.";
 
 /// One deployed resource as the modelled `StackResource` shape.
 ///
@@ -204,6 +205,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // CloudFormation checks the constraints on the stack identifier a request names
+        // BEFORE it resolves the stack, so an identifier no stack could carry is answered as
+        // the malformed request it is (`crate::state::stack_identifier`). A request that
+        // names its stack through a `PhysicalResourceId` instead carries no identifier here.
+        crate::state::refuse_malformed_identifier(
+            crate::state::STACK_NAME_PATH,
+            input.stack_name.as_deref(),
+        )?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no stack store to read, so this
             // answers 501 rather than an empty, truthful-looking list.
@@ -234,13 +243,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         // "You must specify either StackName or PhysicalResourceId, but not both": the two
         // members are the two ways of naming ONE stack, so neither of them names none and
-        // both of them name two.
+        // both of them name two. The stack a `StackName` names is RESOLVED FIRST, so a name
+        // nothing holds is answered as the stack that is not there whatever else the request
+        // carried — a caller whose name is wrong is told that before it is told about the
+        // combination.
         let stack = match (&input.stack_name, &input.physical_resource_id) {
-            (Some(_), Some(_)) => {
-                return Err(crate::scaffolded::Scaffolded::validation_error(
-                    BOTH_SELECTORS,
-                ))
-            }
             (None, None) => {
                 return Err(crate::scaffolded::Scaffolded::validation_error(NO_SELECTOR))
             }
@@ -248,11 +255,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the stack are returned" — by name for a running stack, by stack id for a
             // deleted one. A name that resolves to nothing is a `ValidationError`, as it
             // is on every other read of a stack.
-            (Some(name_or_id), None) => store.resolve(&region, name_or_id).ok_or_else(|| {
-                crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::stack_does_not_exist(name_or_id),
-                )
-            })?,
+            (Some(name_or_id), also_by_resource) => {
+                let stack = store.resolve(&region, name_or_id).ok_or_else(|| {
+                    crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::stack_does_not_exist(name_or_id),
+                    )
+                })?;
+                if also_by_resource.is_some() {
+                    // "A ValidationError is returned if you specify both StackName and
+                    // PhysicalResourceId in the same request."
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        BOTH_SELECTORS,
+                    ));
+                }
+                stack
+            }
             // "If PhysicalResourceId is specified, the associated resources of the stack
             // that the resource belongs to are returned."
             (None, Some(physical_resource_id)) => store
