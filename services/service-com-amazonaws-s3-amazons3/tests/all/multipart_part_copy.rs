@@ -63,7 +63,11 @@ async fn initiate(router: &MultiServiceRouter, name: &str, key: &str) -> String 
 
 /// `PUT /<bucket>/<key>?partNumber=<n>&uploadId=<id>&x-id=UploadPartCopy` carrying
 /// `x-amz-copy-source` — `UploadPartCopy`.
-async fn upload_part_copy(
+///
+/// `pub(crate)`: the suite that asserts what a copied part REPORTS
+/// ([`super::multipart_part_copy_reported_members`]) drives its copies through this one
+/// helper rather than spelling the same request a second way.
+pub(crate) async fn upload_part_copy(
     router: &MultiServiceRouter,
     name: &str,
     key: &str,

@@ -51,7 +51,11 @@ const BAD_DIGEST: &str = "BadDigest";
 
 /// Every `x-amz-checksum-*` response header the model binds, so a row that expects exactly
 /// ONE of them can assert that no other carries a value.
-const CHECKSUM_HEADERS: [&str; 10] = [
+///
+/// `pub(crate)`, like the four helpers below it: the part-copy suite
+/// ([`super::multipart_part_copy_reported_members`]) asserts the same per-part digests over
+/// the same algorithm space through these rather than deriving a second catalog of its own.
+pub(crate) const CHECKSUM_HEADERS: [&str; 10] = [
     "x-amz-checksum-crc32",
     "x-amz-checksum-crc32c",
     "x-amz-checksum-crc64nvme",
@@ -66,7 +70,7 @@ const CHECKSUM_HEADERS: [&str; 10] = [
 
 /// Every value `ChecksumAlgorithm` publishes, which is the whole space a part's digest can
 /// be computed under.
-const ALGORITHMS: [&str; 10] = [
+pub(crate) const ALGORITHMS: [&str; 10] = [
     "CRC32",
     "CRC32C",
     "CRC64NVME",
@@ -84,7 +88,7 @@ const ALGORITHMS: [&str; 10] = [
 /// the SHA-2 digests from `sha2`, `MD5` from `md-5` and the three `XXHASH` values from
 /// `xxhash-rust`, each big-endian for an integer-valued digest, which is what a Base64
 /// checksum value carries.
-fn digest(algorithm: &str, data: &[u8]) -> String {
+pub(crate) fn digest(algorithm: &str, data: &[u8]) -> String {
     let bytes: Vec<u8> = match algorithm {
         "CRC32" | "CRC32C" | "CRC64NVME" | "SHA1" => {
             let parsed: aws_smithy_checksums::ChecksumAlgorithm = algorithm
@@ -131,7 +135,7 @@ fn filler(len: usize, seed: u8) -> Vec<u8> {
 
 /// `POST /<bucket>/<key>?uploads` — `CreateMultipartUpload`, carrying the checksum headers
 /// a row names.
-async fn initiate(
+pub(crate) async fn initiate(
     router: &MultiServiceRouter,
     name: &str,
     key: &str,
@@ -172,7 +176,7 @@ async fn upload_part(
 
 /// `GET /<bucket>/<key>?uploadId=<id>&x-id=ListParts` — `ListParts`, the read-back of what
 /// the part writes recorded.
-async fn list_parts(
+pub(crate) async fn list_parts(
     router: &MultiServiceRouter,
     name: &str,
     key: &str,
@@ -229,7 +233,7 @@ async fn object_attributes(router: &MultiServiceRouter, name: &str, key: &str) -
 
 /// The text of the `<element>` inside the `<Part>` that reports `part_number`, or `None`
 /// when that part reports no such element.
-fn part_element(answer: &Answer, part_number: i32, element: &str) -> Option<String> {
+pub(crate) fn part_element(answer: &Answer, part_number: i32, element: &str) -> Option<String> {
     let body = text(answer);
     body.split("<Part>")
         .skip(1)

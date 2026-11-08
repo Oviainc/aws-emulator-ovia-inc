@@ -157,6 +157,8 @@ mod multipart_checksum_type;
 mod multipart_part_checksums;
 #[path = "all/multipart_part_copy.rs"]
 mod multipart_part_copy;
+#[path = "all/multipart_part_copy_reported_members.rs"]
+mod multipart_part_copy_reported_members;
 #[path = "all/multipart_part_upload.rs"]
 mod multipart_part_upload;
 #[path = "all/multipart_upload_abort.rs"]

@@ -70,7 +70,11 @@ const ENCRYPTION_HEADERS: &[&str] = &[
 
 /// A KMS key id in the ARN form `SSEKMSKeyId` documents ("you can specify the key ID, key
 /// alias, or the Amazon Resource Name (ARN) of the KMS key").
-const KEY_ARN: &str = "arn:aws:kms:us-east-1:000000000000:key/1234abcd-12ab-34cd-56ef-1234567890ab";
+///
+/// `pub(crate)`: the part-copy suite ([`super::multipart_part_copy_reported_members`]) names
+/// the same key through this one constant rather than spelling an ARN of its own.
+pub(crate) const KEY_ARN: &str =
+    "arn:aws:kms:us-east-1:000000000000:key/1234abcd-12ab-34cd-56ef-1234567890ab";
 
 /// The same key named by alias, which is the second documented form.
 const KEY_ALIAS: &str = "alias/aws/s3";
