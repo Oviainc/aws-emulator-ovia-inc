@@ -142,7 +142,8 @@ fn state_machine_arn(region: &str, name: &str) -> String {
     format!("arn:aws:states:{region}:{ACCOUNT}:stateMachine:{name}")
 }
 
-/// The ARN one execution of that machine carries, which is what a start answers with.
+/// The ARN one STANDARD execution of that machine carries, which is what a start of a
+/// STANDARD workflow answers with: the name identifies the run, so the ARN ends there.
 fn execution_arn(region: &str, machine: &str, execution: &str) -> String {
     format!("arn:aws:states:{region}:{ACCOUNT}:execution:{machine}:{execution}")
 }

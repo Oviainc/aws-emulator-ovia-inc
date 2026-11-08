@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes exactly the tag keys the request names from one application or stream
+//! group, leaving every other key the resource carries as it was. The operation is
+//! modelled `@idempotent`, so a key the resource does not carry is removed by doing
+//! nothing: repeating the same call answers the same success.
+//!
+//! Tags are metadata ABOUT a resource, not part of its configuration or status, so
+//! removing one does not move the resource's `LastUpdatedAt`, exactly as assigning
+//! one does not (see `tag_resource`).
+//!
+//! A successful tag removal has nothing to report back, and this API answers it with
+//! the status that means it: HTTP 204 with an empty body (see
+//! `UNTAG_RESOURCE_NO_CONTENT` below), the same framing its sibling `TagResource`
+//! and this service's `Delete*` operations use.
 //!
 //! ## Shape of an operation
 //!
@@ -81,6 +86,32 @@ use super::types::*;
 // `UntagResourceError` enum is never produced.
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-gameliftstreams-gameliftstreams.json");
 
+/// The wire framing of a successful `UntagResource`: NO CONTENT.
+///
+/// `UntagResourceResponse` declares no members at all, and this API answers a
+/// successful tag removal the way it answers its other bodiless writes — HTTP 204
+/// with an empty body — so the response is framed as an empty body rather than as
+/// an empty JSON object under the protocol's default success status. The model
+/// carries no response code of its own for this operation to say otherwise
+/// (`smithy_query(query="operation", operation="UntagResource")` reports its
+/// `@http` code as defaulted), so the status this service answers with is the one
+/// carried here and on `SUCCESS_STATUS` below.
+const UNTAG_RESOURCE_NO_CONTENT: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static("smithy.api#Unit", "smithy.api", "Unit"),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[],
+    )
+    .with_http(::aws_smithy_schema::traits::HttpTrait::new(
+        "DELETE",
+        "/tags/{ResourceArn}",
+        Some(204u16),
+    ));
+
+/// [`UNTAG_RESOURCE_NO_CONTENT`] as the operation's output schema.
+static UNTAG_RESOURCE_NO_CONTENT_SCHEMA: &::aws_smithy_schema::Schema =
+    &UNTAG_RESOURCE_NO_CONTENT;
+
 // The operation's MODELED errors. `#[operation_error]` accepts only variants the
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `UntagResourceError` alias below. An operation that models no errors
@@ -138,26 +169,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
-    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = UNTAG_RESOURCE_NO_CONTENT_SCHEMA;
+    const SUCCESS_STATUS: u16 = 204u16;
 
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: crate::state::with_internal_id(
+                        "the gameliftstreams emulator holds no state on this engine",
+                    ),
+                },
+            )
+            .into());
+        };
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        // A resource whose deletion the clock had already completed is gone before
+        // this call looks for it, so untagging cannot resurrect it.
+        state.materialize(now);
+
+        // `UntagResource` models no `ResourceNotFoundException`, so an ARN that names
+        // no taggable resource this store holds is refused with the modelled
+        // client-input error instead — the same refusal `TagResource` and
+        // `ListTagsForResource` make.
+        let Some(tags) = state.tags_of_mut(&input.resource_arn) else {
+            return Err(UntagResourceErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::with_internal_id(format!(
+                        "no Amazon GameLift Streams resource matches ResourceArn {}",
+                        input.resource_arn
+                    )),
+                },
+            )
+            .into());
+        };
+        // Remove exactly the keys named, under ONE lock, and leave every other key
+        // the resource carries. The operation is `@idempotent`: a key the resource
+        // does not carry is removed by removing nothing, so a repeat of the same
+        // call still succeeds.
+        for key in &input.tag_keys {
+            tags.remove(key);
+        }
+        Ok(UntagResourceOutput {})
     }
 }
