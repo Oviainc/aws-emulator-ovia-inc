@@ -474,6 +474,14 @@ impl<Eng: Send + Sync + 'static> FunctionUrlPlane<Eng> {
             client_context: None,
             tenant_id: None,
             request_id: request_id.to_string(),
+            // The X-Ray trace context this invocation runs with: the chain the client
+            // named on its own request, under the rule the function's `TracingConfig` mode
+            // gives (`crate::state::execution::trace_context`).
+            trace: crate::state::invocation_trace_context(
+                crate::state::supplied_trace_header(ctx).as_deref(),
+                &resolved_config.tracing_mode,
+                ::std::time::SystemTime::now(),
+            ),
             // Which kind of environment serves it is the admission's to decide, once this
             // store guard is released (`crate::state::execution_slot`).
             initialization_type: crate::state::execution_slot::INITIALIZATION_TYPE_ON_DEMAND,

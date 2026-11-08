@@ -459,6 +459,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             },
         };
+        // The tracing header the CALLER supplied, which is both what the recursive-loop
+        // guardrail names this request's chain by and what the run's own trace context
+        // continues (`crate::state::execution::trace_context`). Read once, off this
+        // request.
+        let supplied_trace = crate::state::supplied_trace_header(ctx);
         // The resource an INVOCATION addresses is a function AT a version, so the refusal
         // for a pair that resolves to nothing names that QUALIFIED resource — the ARN this
         // invocation resolved, built from the request by the one construction every
@@ -693,6 +698,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     client_context: client_context.clone(),
                     tenant_id: input.tenant_id.clone(),
                     request_id: crate::service::request_id_header::starting_invocation(),
+                    // The X-Ray trace context the queued invocation runs with: the chain
+                    // its CALLER named, read off this request's own tracing header, under
+                    // the rule the function's `TracingConfig` mode gives
+                    // (`crate::state::execution::trace_context`).
+                    trace: crate::state::invocation_trace_context(
+                        supplied_trace.as_deref(),
+                        &resolved_config.tracing_mode,
+                        now,
+                    ),
                     // A queued event is delivered off the response path, so no execution
                     // environment has been chosen for it at this point and none of the
                     // qualifier's provisioned ones is holding it: the delivery runs on an
@@ -803,6 +817,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // lines and carries in the error document of a handler that raised (see
             // `crate::service::request_id_header`).
             request_id: crate::service::request_id_header::starting_invocation(),
+            // The X-Ray trace context this invocation runs with, which the run reports to
+            // the handler in `_X_AMZN_TRACE_ID`: the chain this caller named, continued or
+            // started under the rule the function's `TracingConfig` mode gives
+            // (`crate::state::execution::trace_context`).
+            trace: crate::state::invocation_trace_context(
+                supplied_trace.as_deref(),
+                &resolved_config.tracing_mode,
+                now,
+            ),
             initialization_type: admitted.initialization_type,
             // The AWS SDK this runtime supplies the handler reaches the rest of this
             // emulator through the callback the framework handed THIS request, signing

@@ -17,6 +17,11 @@ aws-sdk-eventbridge = { version = "1", default-features = false }
 # `api_call_events`: a publication that could not be made is traced rather than failing the
 # call it belongs to, so that path needs the workspace's logging facade.
 tracing = { workspace = true }
+# `xray_segments`: the in-process X-Ray client a service REPORTS its own segments through —
+# the API Gateway stage that served a traced request, the Lambda invocation it reached — built
+# once here for every producer. Only the generated client is needed: the emulator supplies the
+# transport, so the SDK's own HTTPS stack is left out.
+aws-sdk-xray = { version = "1", default-features = false }
 # `kinesis_client`: the in-process Kinesis client a service DELIVERING a data record
 # writes through, built once here for the same reason. Only the generated client is
 # needed — the emulator supplies the transport, so the SDK's own HTTPS stack and runtime

@@ -140,6 +140,10 @@ pub(super) struct Pending {
     pub authorizer_arn: String,
     /// The event the function is handed; see the module docs.
     pub event: Value,
+    /// The X-Ray trace context this invocation carries — the header the stage propagates
+    /// onto every call it makes on this request's behalf ([`super::trace_context`]) — or
+    /// `None` where this request names no chain.
+    pub trace_header: Option<String>,
     /// Where the result is held on the stage, or `None` when the authorizer holds none at
     /// all: a TTL of zero holds nothing, which is what `authorizerResultTtlInSeconds` of 0
     /// means.
@@ -268,6 +272,27 @@ pub(super) async fn obtained(ctx: &OperationContext<'_>, pending: &Pending) -> O
         .function_name(function)
         .invocation_type(::aws_sdk_lambda::types::InvocationType::RequestResponse)
         .payload(::aws_sdk_lambda::primitives::Blob::new(payload))
+        .customize()
+        .mutate_request({
+            let trace = pending.trace_header.clone();
+            move |request| {
+                if let Some(trace) = trace.clone() {
+                    // `try_insert`, not the panicking `insert`, for the reason the sibling
+                    // insertion of this same header records ([`super::lambda_proxy`]): the
+                    // value may be the caller's own header text, carried on as written.
+                    if let Err(refused) = request
+                        .headers_mut()
+                        .try_insert(super::trace_context::TRACE_HEADER, trace)
+                    {
+                        ::tracing::warn!(
+                            error = %refused,
+                            "the tracing header this request named cannot travel on the wire, \
+                             so the authorizer's invocation carries none"
+                        );
+                    }
+                }
+            }
+        })
         .send();
     let within = waited_for();
     let answer = match ::tokio::time::timeout(within, invocation).await {

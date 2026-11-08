@@ -129,6 +129,10 @@ service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 # store, and `tests/all/stage_proxy_run_logs.rs` reads the delivery back through that
 # service's own `FilterLogEvents`, so it is mounted on that suite's engine too.
 service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
+# The segments a tracing stage and the invocation it made record live in the AWS X-Ray
+# emulator's store, and `tests/all/stage_trace_context.rs` reads them back through that
+# service's own `BatchGetTraces`, so it is mounted on that suite's engine too.
+service-com-amazonaws-xray-awsxray = { workspace = true }
 # The .zip deployment package such a function is created from, written in memory the way a
 # caller uploads one — the same reader/writer the Lambda crate's own invoke suites use.
 zip = { version = "9", default-features = false, features = ["deflate"] }

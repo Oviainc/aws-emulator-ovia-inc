@@ -248,6 +248,8 @@ pub mod execute_api_authorization;
 pub mod lambda_proxy;
 mod onward_endpoint;
 pub mod sigv4_authentication;
+/// The X-Ray trace context this stage propagates onto the call its integration makes.
+mod trace_context;
 
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -1279,6 +1281,11 @@ async fn serving<Eng: Send + Sync + 'static>(
     // the authorizer's function, which is made with no lock held ([`custom_authorizer`]) and
     // then handed back to the resolution, which decides the request with the result in hand.
     let mut decided: Option<CustomDecision> = None;
+    // The X-Ray trace context this REQUEST propagates, decided on the first pass and carried
+    // across the second: a request that reaches both an authorizer's function and the
+    // integration's must belong to ONE trace, so the chain, the decision and the stage's own
+    // span are decided once per request rather than once per pass ([`trace_context`]).
+    let mut carried_trace: Option<trace_context::Propagated> = None;
     let plan = loop {
         let planned = 'planned: {
             let store = state.lock();
@@ -1469,7 +1476,12 @@ async fn serving<Eng: Send + Sync + 'static>(
                     // function returns reaches the client as the bytes it names or as the
                     // base64 text it is ([`lambda_proxy`]).
                     binary_media_types: api.binary_media_types.clone(),
+                    // Whether this STAGE is tracing, which is the sampling decision the
+                    // call this stage makes onward carries when the caller took none
+                    // ([`trace_context`]).
+                    tracing_enabled: stage.tracing_enabled,
                 },
+                &mut carried_trace,
             );
 
             // What the METHOD's own authorization makes of the call. A `CUSTOM` authorizer
@@ -2666,6 +2678,13 @@ fn authorization_refusal<Eng: Send + Sync + 'static>(
                     authorizer_uri: authorizer.authorizer_uri.clone().unwrap_or_default(),
                     authorizer_arn: authorizer_arn(api, &authorizer.id),
                     event,
+                    // The trace context this stage propagates onto the authorizer's own
+                    // invocation: the SAME chain and decision the integration's call carries
+                    // ([`trace_context`]), decided once for this request when the method
+                    // request was built, under the stage's own span — an authorizer's function
+                    // is called by the stage itself rather than through the integration's
+                    // call out.
+                    trace_header: custom.call.trace.authorizer_header.clone(),
                     cache_key,
                     ttl: authorizer_result_ttl(authorizer),
                 }));
@@ -3203,20 +3222,33 @@ pub struct MethodRequest {
     /// What a PROXY integration's event carries about the call beyond what a template reads
     /// off it ([`lambda_proxy::ProxyInputs`]).
     proxy: lambda_proxy::ProxyInputs,
+    /// The X-Ray trace context this request propagates onto EVERY call this stage makes on
+    /// its behalf, and what the stage records about it ([`trace_context`]). Decided ONCE per
+    /// request, here, so an authorizer's function and the integration's belong to one trace.
+    trace: trace_context::Propagated,
 }
 
 impl MethodRequest {
     /// What a request off the wire declares and accepts, what its templates render
     /// against, and what a proxy integration's event names it by.
+    ///
+    /// `carried` is this REQUEST's trace context: decided here on the first pass of the
+    /// resolution and reused on the second, because a request whose `CUSTOM` authorizer has to
+    /// be asked is planned twice and both passes belong to one trace ([`trace_context`]).
     fn of_request(
         req: &RtRequest,
         inputs: TemplateInputs,
         proxy: lambda_proxy::ProxyInputs,
+        carried: &mut Option<trace_context::Propagated>,
     ) -> Self {
+        let trace = carried
+            .get_or_insert_with(|| trace_context::propagated(&proxy, SystemTime::now()))
+            .clone();
         Self {
             media_type: declared_media_type(req.headers().get("content-type")),
             accepted: first_media_type(req.headers().get("accept")),
             inputs,
+            trace,
             proxy,
         }
     }
@@ -3233,6 +3265,7 @@ impl MethodRequest {
             media_type: declared_media_type(content_type),
             accepted: first_media_type(accept),
             inputs,
+            trace: trace_context::propagated(&proxy, SystemTime::now()),
             proxy,
         }
     }

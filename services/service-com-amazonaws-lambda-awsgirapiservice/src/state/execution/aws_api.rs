@@ -322,6 +322,21 @@ pub const APIS: &[Api] = &[
         endpoint_prefix: "s3",
         protocol: Protocol::S3Rest,
     },
+    // `services/service-com-amazonaws-xray-awsxray/smithy-model/
+    // com-amazonaws-xray-awsxray.json`: restJson1, sigv4Name `xray`, endpointPrefix `xray`,
+    // sdkId `XRay`. Its requests are bound per operation out of that same model ([`XRAY`]).
+    //
+    // A TRACED function reports its own work to X-Ray: the segment documents an instrumented
+    // handler writes to the X-Ray daemon are submitted through `PutTraceSegments`
+    // ([`super::xray_daemon`]), and a handler using the X-Ray SDK directly calls the
+    // same operations, so a function that cannot reach this service cannot report a trace at
+    // all.
+    Api {
+        sdk_token: "xray",
+        signing_name: "xray",
+        endpoint_prefix: "xray",
+        protocol: Protocol::RestJson(&XRAY),
+    },
 ];
 
 /// The Smithy MODEL of each service a call may be made to, embedded from the crate that
@@ -368,6 +383,19 @@ pub(super) const SFN_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-sfn-awsstepfunctions/smithy-model/\
      com-amazonaws-sfn-awsstepfunctions.json"
 );
+pub(super) const XRAY_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-xray-awsxray/smithy-model/\
+     com-amazonaws-xray-awsxray.json"
+);
+
+/// AWS X-Ray's own model, which a call to it is bound by, embedded exactly as the API
+/// Gateway model below is and for the same reason: the wire facts of its operations are that
+/// model's, so this seam states none of them.
+static XRAY: super::rest_json::RestApi = super::rest_json::RestApi {
+    model: XRAY_MODEL,
+    namespace: "com.amazonaws.xray",
+    parsed: ::std::sync::OnceLock::new(),
+};
 
 /// Amazon API Gateway's own model, which a call to it is bound by.
 ///

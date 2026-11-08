@@ -26,6 +26,13 @@
 //!   own variables held in memory, the working directory is the task root the runtime
 //!   reports, randomness comes from the host's own generator, and every call that would
 //!   reach a host file, process or descriptor raises;
+//! * `socket` is one of those: no socket EXTENSION is registered — `_socket` and `_ssl` stay
+//!   off the allow-list above, so the standard library's own `socket` has nothing to be built
+//!   on and no guest code can create a host socket, resolve a name or open a connection. What
+//!   this runtime supplies on the import path instead ([`super::guest_http`], with the
+//!   datagram half of [`super::xray_daemon`]) opens nothing: its one reachable destination is
+//!   the in-process X-Ray daemon, whose datagrams travel over the SAME bounded AWS SDK seam
+//!   below, and every other destination raises the error a host with no route to it answers;
 //! * the only host functions the guest can call are the four on [`HOST_MODULE`]: the
 //!   invocation log, a sleep clamped to what is left of the run, the step hook below, and
 //!   ONE AWS SDK call into this same emulator ([`super::aws_api`], which decides which
@@ -1540,7 +1547,27 @@ mod tests {
             ("a host file descriptor", "__import__('os').open('/etc/hostname', 0)"),
             ("a host file removal", "__import__('os').remove('/etc/hostname')"),
             ("a fork", "__import__('os').fork()"),
-            ("a socket", "__import__('socket').socket()"),
+            // A socket EXISTS — a traced handler writes its segment documents to the X-Ray
+            // daemon through one ([`super::xray_daemon`]) — and the containment is that it
+            // reaches that daemon and nothing else: a connection to a host, and a datagram
+            // addressed at one, each have no route.
+            (
+                "a connection to a host",
+                "__import__('socket').socket().connect(('example.com', 80))",
+            ),
+            (
+                "a datagram to a host",
+                "__import__('socket').socket(2, 2).sendto(b'x', ('example.com', 80))",
+            ),
+            (
+                "a listening socket",
+                "__import__('socket').socket().bind(('0.0.0.0', 8080)) or \
+                 __import__('socket').socket().listen(1)",
+            ),
+            (
+                "a host name lookup",
+                "__import__('socket').gethostbyname('example.com')",
+            ),
             ("the host's posix", "__import__('posix').open('/etc/hostname', 0)"),
             ("a host file", "open('/etc/hostname').read()"),
             ("a host directory", "__import__('os').listdir('/')"),

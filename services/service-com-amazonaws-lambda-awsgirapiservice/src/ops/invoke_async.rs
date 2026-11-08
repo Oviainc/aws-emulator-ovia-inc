@@ -416,6 +416,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 client_context: None,
                 tenant_id: None,
                 request_id: request_id.clone(),
+                // The X-Ray trace context this invocation runs with: the chain the caller
+                // named, under the rule the function's `TracingConfig` mode gives
+                // (`crate::state::execution::trace_context`).
+                trace: crate::state::invocation_trace_context(
+                    crate::state::supplied_trace_header(ctx).as_deref(),
+                    &resolved_config.tracing_mode,
+                    now,
+                ),
                 // A queued event is delivered off the response path, on an environment
                 // Lambda initialises for that delivery (`crate::state::execution_slot`).
                 initialization_type: crate::state::execution_slot::INITIALIZATION_TYPE_ON_DEMAND,

@@ -350,28 +350,42 @@ async fn dispatch(
 /// Resolved before the frozen standard library and after the deployment package's own
 /// entries, so these are the `socket` and `http.client` a handler imports, and a package
 /// shipping its own still wins.
+///
+/// The socket module is [`SOCKET_SOURCE`] and the DATAGRAM half of it
+/// ([`super::xray_daemon::DATAGRAM_SOURCE`]) together: the names, the errors and the
+/// conversions a program reads off `socket` are the former's, and the sockets themselves are
+/// the latter's — so there is ONE `socket` a handler can import, whose only reachable
+/// destination is the in-process X-Ray daemon.
 #[must_use]
 pub fn runtime_stdlib_modules() -> Vec<PackageModule> {
     [
-        ("socket.py", SOCKET_SOURCE),
-        ("http/client.py", HTTP_CLIENT_SOURCE),
+        (
+            "socket.py",
+            format!(
+                "{SOCKET_SOURCE}{}",
+                super::xray_daemon::DATAGRAM_SOURCE
+            ),
+        ),
+        ("http/client.py", HTTP_CLIENT_SOURCE.to_string()),
     ]
     .into_iter()
     .map(|(path, source)| PackageModule {
         path: path.to_string(),
-        source: source.to_string(),
+        source,
     })
     .collect()
 }
 
-/// `socket`: the module a Python program reaches a socket through, with no socket in it.
+/// `socket`: the NAMES, errors and conversions a Python program reads off the module it
+/// reaches a socket through. The sockets themselves are the datagram half appended to this
+/// source ([`super::xray_daemon::DATAGRAM_SOURCE`]).
 ///
-/// A Lambda function in this emulator has no host network: there is no socket to open, no
-/// name to resolve and no address to connect to, so every call that would do one of those
-/// raises the error a Python program handles for it. The NAMES are all here — the address
-/// families, the socket types, the option levels, the errors and the default timeout — so a
-/// module that imports `socket` to name one of them imports cleanly, which is what the
-/// standard library's own HTTP, email and URL modules do.
+/// A Lambda function in this emulator has no host network: there is no name to resolve and no
+/// address to connect to, so every call that would do one of those raises the error a Python
+/// program handles for it, and the one address a datagram can reach is the in-process X-Ray
+/// daemon. The NAMES are all here — the address families, the socket types, the option levels,
+/// the errors and the default timeout — so a module that imports `socket` to name one of them
+/// imports cleanly, which is what the standard library's own HTTP, email and URL modules do.
 const SOCKET_SOURCE: &str = r#"
 """The socket interface of this runtime: no host socket is reachable from a function."""
 
@@ -423,10 +437,6 @@ def getdefaulttimeout():
 
 def setdefaulttimeout(timeout):
     return None
-
-
-def socket(*_arguments, **_keywords):
-    raise error(_UNREACHABLE)
 
 
 def socketpair(*_arguments, **_keywords):

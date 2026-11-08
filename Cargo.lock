@@ -1635,6 +1635,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-xray"
+version = "1.119.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d491f0874ebd05a703588737ec85d2fdc515be275dbc51985d121556c058355d"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sigv4"
 version = "1.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8085,6 +8110,7 @@ dependencies = [
  "service-com-amazonaws-lambda-awsgirapiservice",
  "service-com-amazonaws-sts-awssecuritytokenservicev20110615",
  "service-com-amazonaws-wafv2-awswaf-20190729",
+ "service-com-amazonaws-xray-awsxray",
  "service-common",
  "sha2 0.10.9",
  "tokio",
@@ -19046,6 +19072,7 @@ dependencies = [
  "aws-sdk-eventbridge",
  "aws-sdk-iam",
  "aws-sdk-kinesis",
+ "aws-sdk-xray",
  "aws-sigv4",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",

@@ -136,6 +136,16 @@ mod host_posix;
 pub mod environment_key;
 pub use environment_key::{durable_data_key_fault, environment_key_fault, EnvironmentKeyFault};
 
+/// The X-Ray trace context one invocation runs with, which the execution environment
+/// reports in `_X_AMZN_TRACE_ID`.
+pub mod trace_context;
+pub use trace_context::{invocation_trace_context, supplied_trace_header};
+use trace_context::report_segments;
+
+/// The X-Ray daemon a traced invocation reports its own work to, and the datagram surface a
+/// handler reaches it through.
+pub mod xray_daemon;
+
 /// The engine memory the runs of this process may hold TOGETHER, stated in the MB a
 /// function's `MemorySize` is stated in.
 ///
@@ -360,6 +370,10 @@ pub struct Invocation {
     pub tenant_id: Option<String>,
     /// This invocation's request id.
     pub request_id: String,
+    /// The X-Ray TRACE CONTEXT this invocation runs with, which the run reports in
+    /// `_X_AMZN_TRACE_ID` and records its own segments under ([`trace_context`]), or `None`
+    /// for an invocation that has none.
+    pub trace: Option<trace_context::InvocationTrace>,
     /// What the run reports as `AWS_LAMBDA_INITIALIZATION_TYPE`: which kind of execution
     /// environment is serving this invocation, as the admission that let it in decided
     /// ([`super::execution_slot`]).
@@ -653,6 +667,27 @@ pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnabl
     };
 
     let invoked = answered(finished, &request_id, &reported, budget, engine, started);
+    // What X-Ray records for this invocation, where the invocation is one it records: the
+    // two segments a Lambda invocation produces ([`trace_context`]), submitted through the
+    // same seam the handler's own datagrams are. Reporting a trace is NOT part of answering
+    // the invocation: a submission that could not be made is traced where the delivery of a
+    // run's log is, and the caller is answered either way.
+    if let (Some(aws), Some(recorded)) = (
+        reported.aws.as_ref(),
+        reported
+            .trace
+            .as_ref()
+            .and_then(|trace| trace.recorded.as_ref()),
+    ) {
+        let documents = trace_context::segment_documents(
+            recorded,
+            &reported.function_name,
+            started,
+            started + invoked.duration,
+            invoked.function_error.is_some(),
+        );
+        report_segments(aws, &reported.region, documents).await;
+    }
     // The log an invocation wrote is not part of its answer: Lambda delivers it to the
     // function's own log group, which is where a client reads it ([`log_delivery`]). The
     // delivery is made as the function's execution role and before this invocation is
@@ -1099,6 +1134,22 @@ fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap
     for (name, value) in reserved {
         environment.insert((*name).to_string(), value.clone());
     }
+    // "`_X_AMZN_TRACE_ID` – The X-Ray tracing header", which "changes with each
+    // invocation": the trace context of THIS invocation ([`trace_context`]). It is one of
+    // the variables the runtime sets and a function may not, so it overrides whatever the
+    // function's own environment holds under that name; an invocation with no trace context
+    // at all reports none, rather than a chain nobody named.
+    match &invocation.trace {
+        Some(trace) => {
+            environment.insert(
+                trace_context::TRACE_ID_VARIABLE.to_string(),
+                trace.header.clone(),
+            );
+        }
+        None => {
+            environment.remove(trace_context::TRACE_ID_VARIABLE);
+        }
+    }
     // The variables a managed runtime's own sandbox sets beside those, each at the value
     // AWS documents for it. These are NOT reserved: the function's own variable of the same
     // name is its value, so a function that sets its time zone or its module path runs with
@@ -1111,6 +1162,18 @@ fn runtime_environment(invocation: &Invocation, started: SystemTime) -> BTreeMap
             "/var/lang/lib:/lib64:/usr/lib64:/var/runtime:/var/runtime/lib:/var/task:\
              /var/task/lib:/opt/lib"
                 .to_string(),
+        ),
+        // The two X-Ray variables a managed runtime's environment names: where an
+        // instrumented handler sends its segment documents, and what a tracer does when it
+        // finds no trace context. The address is one a run's datagrams really reach — the
+        // daemon is served in process ([`xray_daemon`]).
+        (
+            xray_daemon::DAEMON_ADDRESS_VARIABLE,
+            xray_daemon::DAEMON_ADDRESS.to_string(),
+        ),
+        (
+            xray_daemon::CONTEXT_MISSING_VARIABLE,
+            xray_daemon::CONTEXT_MISSING_LOG_ERROR.to_string(),
         ),
     ];
     for (name, value) in defaults {
@@ -1234,6 +1297,7 @@ mod tests {
             client_context: None,
             tenant_id: None,
             request_id: "11111111-2222-3333-4444-555555555555".to_string(),
+            trace: None,
             initialization_type: crate::state::execution_slot::INITIALIZATION_TYPE_ON_DEMAND,
             aws: None,
             logs: None,

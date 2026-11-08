@@ -327,8 +327,9 @@ pub use recursion::{
 pub mod execution;
 pub use execution::{
     durable_data_key_fault, engine_for, environment_key_fault, function_sdk_access,
-    layer_archives, log_target, mint_request_id, run_invocation, runs_handler, AwsAccess,
-    Engine, EnvironmentKeyFault, Invocation, Invoked, LogTarget, Unrunnable,
+    invocation_trace_context, layer_archives, log_target, mint_request_id, run_invocation,
+    runs_handler, supplied_trace_header, AwsAccess, Engine, EnvironmentKeyFault, Invocation,
+    Invoked, LogTarget, Unrunnable,
 };
 
 /// How large a stored .zip archive is once EXPANDED — the second size Lambda reports for a
@@ -577,6 +578,12 @@ pub const DEFAULT_ARCHITECTURE: &str = "x86_64";
 /// (`Active | PassThrough`); `PassThrough` is the mode a function gets when the caller
 /// names no tracing configuration, because X-Ray then samples nothing of its own.
 pub const DEFAULT_TRACING_MODE: &str = "PassThrough";
+
+/// The other `TracingConfig` mode of that enum: "Set Mode to Active to sample and trace a
+/// subset of incoming requests with X-Ray" (`TracingConfig$Mode`), which is what makes an
+/// invocation of the function one X-Ray records a segment for — and so what decides the
+/// trace context the run reports ([`execution::trace_context`]).
+pub const TRACING_MODE_ACTIVE: &str = "Active";
 
 /// The `RecursiveLoop` configuration a function has before anyone sets one, which the
 /// model's own `RecursiveLoop` member documentation states twice — on

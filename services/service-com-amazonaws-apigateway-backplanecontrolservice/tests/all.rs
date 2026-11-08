@@ -36,6 +36,8 @@ mod proxy_event_repeated_names;
 // Declared here, at the head, for the reason the entry above records.
 #[path = "all/stage_proxy_run_logs.rs"]
 mod stage_proxy_run_logs;
+#[path = "all/stage_trace_context.rs"]
+mod stage_trace_context;
 #[path = "all/stage_web_acl_edge.rs"]
 mod stage_web_acl_edge;
 #[path = "all/stage_web_acl_association_report.rs"]

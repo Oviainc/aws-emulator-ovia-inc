@@ -529,6 +529,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // function returns is reported as the bytes it names or as the base64
                 // text it is — the same records the data plane reads it from.
                 binary_media_types: api.binary_media_types.clone(),
+                // A simulated call reached no stage, so there is no stage whose tracing
+                // setting could decide a sampling decision the caller did not take.
+                tracing_enabled: false,
             },
         );
         let performed = match with_stage_variables(&method, &simulated_variables) {

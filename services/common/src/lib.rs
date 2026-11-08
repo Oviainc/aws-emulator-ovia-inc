@@ -494,6 +494,9 @@ pub mod web_identity_tokens;
 /// The ONE reading of which media type a static file's extension names, for every data
 /// plane that serves deployed files.
 pub mod web_media_type;
+/// The ONE construction of the in-process X-Ray client a service REPORTS its own segments
+/// through, and the one submission of the documents it reports.
+pub mod xray_segments;
 /// The ONE reading of an AWS X-Ray trace id and tracing header, for every service that
 /// takes one as a caller-supplied string — so X-Ray and a service that merely carries a
 /// trace header cannot disagree about what counts as one.

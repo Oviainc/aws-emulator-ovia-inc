@@ -245,6 +245,11 @@ pub struct ProxyInputs {
     /// UTF-8-encoded text payloads" — which is what decides whether a base64 body the
     /// function returned is decoded to the bytes it names ([`proxy_response`]).
     pub binary_media_types: Vec<String>,
+    /// Whether the STAGE this call arrived at is tracing — `Stage$tracingEnabled`,
+    /// "specifies whether active tracing with X-ray is enabled for the Stage" — which is
+    /// the sampling decision the call this stage makes onward carries where the caller took
+    /// none ([`super::trace_context`]). `false` for a call that reached no stage.
+    pub tracing_enabled: bool,
 }
 
 /// Perform this call through the method's `AWS_PROXY` integration, or `None` when the
@@ -322,6 +327,58 @@ async fn served(
     call: &MethodRequest,
     within: Duration,
 ) -> Result<IntegratedResponse, UnservedIntegration> {
+    // The stage's own work begins here. The trace context it propagates onto the invocation
+    // was decided when the method request was built — ONCE for the request, so an
+    // authorizer's function and this integration's belong to one trace
+    // ([`super::trace_context`]).
+    let started = SystemTime::now();
+    let propagated = &call.trace;
+    let outcome = invoked(
+        ctx,
+        region,
+        function,
+        call,
+        within,
+        propagated.header.as_deref(),
+    )
+    .await;
+    // What the stage recorded about the request it served, submitted once the outcome is
+    // known — off the answer, so a submission that could not be made never changes what the
+    // client is served. A stage that is not tracing, and a request the sampling decision
+    // says is not recorded, record nothing at all.
+    let context = &call.inputs.context;
+    let served = super::trace_context::Served {
+        api_id: context.get("apiId").map(String::as_str).unwrap_or_default(),
+        stage: context.get("stage").map(String::as_str).unwrap_or_default(),
+        function_name: function,
+        status: match &outcome {
+            Ok(response) => Some(response.status),
+            // An integration this stage could not perform is answered through a gateway
+            // response of the api's own, whose status this layer does not resolve: the
+            // segment records the FAULT rather than a status nothing answered with.
+            Err(_unserved) => None,
+        },
+        started,
+        ended: SystemTime::now(),
+    };
+    if let Some(document) = super::trace_context::stage_segment(propagated, &call.proxy, &served) {
+        ::service_common::xray_segments::report_segments(ctx, region, vec![document]).await;
+    }
+    outcome
+}
+
+/// The invocation itself: the function's policy decides whether it is made, the run decides
+/// what it answered, and that answer IS the response.
+///
+/// `trace` is the tracing header the invocation carries, where this request names a chain.
+async fn invoked(
+    ctx: &OperationContext<'_>,
+    region: &str,
+    function: &str,
+    call: &MethodRequest,
+    within: Duration,
+    trace: Option<&str>,
+) -> Result<IntegratedResponse, UnservedIntegration> {
     let client = lambda_client(ctx, region);
     if let Some(reason) = unpermitted(&client, function, call).await {
         return Err(UnservedIntegration {
@@ -337,11 +394,33 @@ async fn served(
             .to_string(),
     })?;
     bounded(payload.len())?;
+    // The X-Ray trace context travels on the `X-Amzn-Trace-Id` header of the invocation,
+    // which is where the next hop reads its own trace context off.
+    let trace = trace.map(str::to_string);
     let invocation = client
         .invoke()
         .function_name(function)
         .invocation_type(::aws_sdk_lambda::types::InvocationType::RequestResponse)
         .payload(::aws_sdk_lambda::primitives::Blob::new(payload))
+        .customize()
+        .mutate_request(move |request| {
+            if let Some(trace) = trace.clone() {
+                // `try_insert`, not the panicking `insert`: the value is the CALLER's own
+                // header text where this stage records nothing and passes it on as written,
+                // so a byte the wire cannot carry in a header value must cost the request its
+                // trace context rather than its response.
+                if let Err(refused) = request
+                    .headers_mut()
+                    .try_insert(super::trace_context::TRACE_HEADER, trace)
+                {
+                    ::tracing::warn!(
+                        error = %refused,
+                        "the tracing header this request named cannot travel on the wire, so \
+                         the invocation carries none"
+                    );
+                }
+            }
+        })
         .send();
     let answer = match ::tokio::time::timeout(within, invocation).await {
         Ok(answer) => answer,
