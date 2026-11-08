@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExecuteFastReset
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExecuteFastReset`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExecuteFastReset::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Fast reset is a two-step system command, and this handler serves both steps from the
+//! fast-reset record in [`crate::state`]:
+//!
+//! * `initiateDatabaseReset` mints a fresh UUID token, stores it as the ONE token the
+//!   engine will accept, and returns it in `payload`.
+//! * `performDatabaseReset` empties the database, but only for a request presenting that
+//!   token: a missing `token` is refused with the modelled `MissingParameterException`
+//!   (HTTP 400), and any other value — a wrong token, a token already used, or any token
+//!   at all while no reset is outstanding — with `InvalidParameterException` (HTTP 400).
+//!   On a match the token is consumed, so one token empties the database once.
+//!
+//! The reset itself is what makes the second step more than bookkeeping: the data the
+//! engine holds goes, and every query it had accepted but not completed was asked about
+//! that data, so those records are marked cancelled and the Gremlin status family
+//! reports them that way afterwards.
 //!
 //! ## Shape of an operation
 //!
@@ -168,6 +175,16 @@ impl<Eng> ExecuteFastReset<Eng> {
     }
 }
 
+/// The `Action` value that mints a token, from the model's `Action` enum (the values
+/// [`ACTION_VALUES`] lists).
+const INITIATE_DATABASE_RESET: &str = "initiateDatabaseReset";
+
+/// The `Action` value that performs the reset the token authorises.
+const PERFORM_DATABASE_RESET: &str = "performDatabaseReset";
+
+/// The input member a `performDatabaseReset` has to carry, by its wire name.
+const TOKEN_MEMBER: &str = "token";
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ExecuteFastReset<Eng>
 {
@@ -185,18 +202,88 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExecuteFastReset` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExecuteFastResetErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExecuteFastReset"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            record_access(ctx, &input.action, "store-unavailable");
+            return Err(ExecuteFastResetErrorModeled::ServerShutdownException(
+                crate::state::store_unavailable_shutdown(),
+            )
+            .into());
+        };
+
+        let now = ::std::time::SystemTime::now();
+        match input.action.as_str() {
+            INITIATE_DATABASE_RESET => {
+                let token = crate::state::new_fast_reset_token();
+                state.lock().fast_reset.initiate(token.clone(), now);
+                record_access(ctx, &input.action, "token-issued");
+                Ok(ExecuteFastResetOutput {
+                    status: crate::state::FAST_RESET_ACCEPTED.to_string(),
+                    // `payload` carries the token the perform step must present, and this
+                    // is the action its documentation says it is returned by.
+                    payload: Some(FastResetToken { token: Some(token) }),
+                })
+            }
+            PERFORM_DATABASE_RESET => {
+                // `token` is optional on the input shape because the initiate step takes
+                // none; for THIS action it is the parameter the request must carry, and a
+                // member that arrived blank carries no token either.
+                let supplied = input.token.as_deref().unwrap_or_default();
+                if supplied.trim().is_empty() {
+                    record_access(ctx, &input.action, "missing-token");
+                    return Err(ExecuteFastResetErrorModeled::MissingParameterException(
+                        crate::state::missing_parameter(TOKEN_MEMBER),
+                    )
+                    .into());
+                }
+                if !state.lock().perform_fast_reset(supplied, now) {
+                    record_access(ctx, &input.action, "invalid-token");
+                    return Err(ExecuteFastResetErrorModeled::InvalidParameterException(
+                        crate::state::invalid_fast_reset_token(),
+                    )
+                    .into());
+                }
+                record_access(ctx, &input.action, "reset-performed");
+                Ok(ExecuteFastResetOutput {
+                    status: crate::state::FAST_RESET_ACCEPTED.to_string(),
+                    // "The payload is only returned by the initiateDatabaseReset action".
+                    payload: None,
+                })
+            }
+            // The boundary validator refuses a value outside the `Action` enum before this
+            // handler runs, so this arm is reached only if that set ever widens past the
+            // two steps above; it refuses rather than guessing which step was meant.
+            other => {
+                record_access(ctx, &input.action, "unsupported-action");
+                Err(ExecuteFastResetErrorModeled::IllegalArgumentException(
+                    crate::state::unsupported_action(other, ACTION_VALUES),
+                )
+                .into())
+            }
+        }
     }
+}
+
+/// Record one fast-reset command: what was asked (the method, the URI and the action),
+/// who asked (the access key the request presented), and how it ended — including every
+/// refusal, so a refused attempt to empty the database leaves a record too.
+///
+/// The token is deliberately absent from the record: it is what authorises emptying the
+/// database, and a log is a file. The action is rendered with `Debug`, which escapes
+/// control characters, so a value carrying CRLF cannot forge a second line, and no secret
+/// is recorded (the access key id is an identifier, never the signing key).
+fn record_access(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    action: &str,
+    outcome: &'static str,
+) {
+    let parts = ctx.parts();
+    ::tracing::info!(
+        operation = "ExecuteFastReset",
+        method = %parts.method,
+        uri = %parts.uri,
+        action = ?action,
+        akid = ?::emulator_server::extract_akid(&parts.headers),
+        outcome,
+        "neptunedata execute fast reset"
+    );
 }

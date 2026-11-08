@@ -2,9 +2,12 @@
 
 //! Engine state for the com-amazonaws-neptunedata-amazonneptunedataplane service.
 //!
-//! Two kinds of record live here, and every implemented operation computes its answer
+//! Three kinds of record live here, and every implemented operation computes its answer
 //! from them:
 //!
+//! * [`FastResetRecord`] — the fast-reset token the engine is willing to accept, and what
+//!   the resets it has performed left behind. `ExecuteFastReset` mints the token on
+//!   `initiateDatabaseReset` and consumes it on `performDatabaseReset`.
 //! * [`EngineStatusRecord`] — the one DB instance `GetEngineStatus` reports on. It is
 //!   built ONCE, when this state is first reached (the instant this emulator's engine
 //!   "started"), so every later read answers the same `startTime` instead of a fresh
@@ -27,8 +30,9 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::ops::types::{
-    FailureByQueryException, GremlinQueryStatus, InternalFailureException,
-    InvalidParameterException, QueryEvalStats,
+    FailureByQueryException, GremlinQueryStatus, IllegalArgumentException,
+    InternalFailureException, InvalidParameterException, MissingParameterException, QueryEvalStats,
+    ServerShutdownException,
 };
 
 /// `GetEngineStatusOutput$status` for an instance that is not experiencing problems:
@@ -72,6 +76,11 @@ pub const CLUSTER_QUERY_TIMEOUT_SETTING: &str = "clusterQueryTimeoutInMs";
 /// `CancelGremlinQueryOutput$status` for a cancellation the engine accepted. It reports
 /// the status of the cancellation request itself, not of the query.
 pub const CANCELLATION_ACCEPTED: &str = "200 OK";
+
+/// `ExecuteFastResetOutput$status` for a fast-reset command the engine accepted — the
+/// member reports "whether or not the fast reset rquest is accepted", and the system
+/// endpoint states that acceptance as the HTTP status line of the answer.
+pub const FAST_RESET_ACCEPTED: &str = "200 OK";
 
 /// The engine state `GetEngineStatus` reports: one record, built at state init.
 #[derive(Debug, Clone)]
@@ -285,6 +294,53 @@ impl GremlinQueryRecord {
     }
 }
 
+/// The fast-reset state of the database this engine serves.
+///
+/// Fast reset is a two-step command: `initiateDatabaseReset` mints the token, and only a
+/// `performDatabaseReset` presenting that token empties the database. The token lives
+/// here because it is what the two steps share: the engine, not the caller, decides which
+/// token authorises a reset.
+#[derive(Debug, Default, Clone)]
+pub struct FastResetRecord {
+    /// The token the latest initiate minted and no reset has consumed yet. `None` while no
+    /// reset is outstanding, which is what makes every perform refusable.
+    pub pending_token: Option<String>,
+    /// When that token was minted; `None` whenever [`Self::pending_token`] is.
+    pub token_issued_at: Option<SystemTime>,
+    /// How many resets this engine has performed.
+    pub resets_performed: u64,
+    /// When the latest reset was performed; `None` until one has been.
+    pub last_reset_at: Option<SystemTime>,
+}
+
+impl FastResetRecord {
+    /// Record `token` as the one token a reset may present.
+    ///
+    /// A second initiate supersedes the first: the store holds ONE outstanding token, so
+    /// the token the latest initiate handed back is the only one that can authorise a
+    /// reset.
+    pub fn initiate(&mut self, token: impl Into<String>, now: SystemTime) {
+        self.pending_token = Some(token.into());
+        self.token_issued_at = Some(now);
+    }
+
+    /// Whether `token` is the outstanding token. False when nothing is outstanding, so a
+    /// reset nobody initiated cannot be performed.
+    pub fn authorises(&self, token: &str) -> bool {
+        self.pending_token.as_deref() == Some(token)
+    }
+
+    /// Consume the outstanding token and record the reset it authorised. The token is
+    /// single use: performing the reset leaves nothing outstanding, so the same token
+    /// cannot empty the database twice.
+    fn consume(&mut self, now: SystemTime) {
+        self.pending_token = None;
+        self.token_issued_at = None;
+        self.resets_performed = self.resets_performed.saturating_add(1);
+        self.last_reset_at = Some(now);
+    }
+}
+
 /// Per-service state for com-amazonaws-neptunedata-amazonneptunedataplane. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsNeptunedataAmazonneptunedataplaneState {
@@ -294,6 +350,8 @@ pub struct ComAmazonawsNeptunedataAmazonneptunedataplaneState {
     /// Every Gremlin query the engine has accepted, keyed by query id. A `BTreeMap` is
     /// what gives `ListGremlinQueries` a stable order over the ids.
     pub gremlin_queries: BTreeMap<String, GremlinQueryRecord>,
+    /// The fast-reset token and reset history `ExecuteFastReset` reads and writes.
+    pub fast_reset: FastResetRecord,
 }
 
 impl ComAmazonawsNeptunedataAmazonneptunedataplaneState {
@@ -327,6 +385,24 @@ impl ComAmazonawsNeptunedataAmazonneptunedataplaneState {
             })
             .map(|query| query.status(now))
             .collect()
+    }
+
+    /// Perform the fast reset `token` authorises, and report whether it did.
+    ///
+    /// `false` means `token` is not the outstanding one — nothing was reset, so a wrong
+    /// token cannot empty the database. On a match the database is emptied: every query
+    /// the engine has accepted but not completed was asked about data the reset removes,
+    /// so it is marked cancelled exactly as a cancel marks one (the record is KEPT, so
+    /// the status family goes on reporting those ids), and the token is consumed.
+    pub fn perform_fast_reset(&mut self, token: &str, now: SystemTime) -> bool {
+        if !self.fast_reset.authorises(token) {
+            return false;
+        }
+        for query in self.gremlin_queries.values_mut() {
+            query.cancel(now);
+        }
+        self.fast_reset.consume(now);
+        true
     }
 }
 
@@ -369,6 +445,17 @@ pub fn new_request_id() -> String {
     format!("{tag:016x}-{sequence:016x}")
 }
 
+/// A fresh fast-reset token: the UUID `ExecuteFastReset`'s `initiateDatabaseReset` action
+/// hands back, which its own documentation describes as "a UUID token which you then
+/// include when calling ExecuteFastReset again with action set to performDatabaseReset".
+///
+/// Version 4, so the value is unpredictable and derived from nothing the caller sent: it
+/// is what authorises emptying the database, so a caller must not be able to guess the
+/// token of a reset somebody else initiated.
+pub fn new_fast_reset_token() -> String {
+    ::uuid::Uuid::new_v4().to_string()
+}
+
 /// At most this many characters of a request-supplied value are echoed back in an error
 /// message. Neptune names the offending value in its message, so echoing it is right, but
 /// the length is the caller's choice and the message is not the place to carry it whole.
@@ -388,6 +475,46 @@ fn echoed(value: &str) -> String {
 pub fn invalid_query_id(query_id: &str) -> InvalidParameterException {
     InvalidParameterException {
         detailed_message: format!("Supplied queryId {} is invalid", echoed(query_id)),
+        request_id: new_request_id(),
+        code: "400".to_string(),
+    }
+}
+
+/// The `MissingParameterException` payload for a parameter this request had to carry and
+/// did not. `member` is the modelled member's wire name, so the caller can fix the
+/// request from the message alone.
+pub fn missing_parameter(member: &str) -> MissingParameterException {
+    MissingParameterException {
+        detailed_message: format!("Request is missing mandatory parameter '{member}'"),
+        request_id: new_request_id(),
+        code: "400".to_string(),
+    }
+}
+
+/// The `InvalidParameterException` payload for a `token` that is not the one the
+/// outstanding `initiateDatabaseReset` minted — including the case where no reset is
+/// outstanding at all, and the case where the token has already been used.
+///
+/// The supplied value is deliberately NOT echoed: the token is what authorises emptying
+/// the database, so the message names the member that was wrong and nothing else.
+pub fn invalid_fast_reset_token() -> InvalidParameterException {
+    InvalidParameterException {
+        detailed_message: "Supplied token is invalid. Please initiate the database reset again."
+            .to_string(),
+        request_id: new_request_id(),
+        code: "400".to_string(),
+    }
+}
+
+/// The `IllegalArgumentException` payload for an `action` this service does not support,
+/// naming the value that was wrong and the values the member accepts.
+pub fn unsupported_action(action: &str, accepted: &[&str]) -> IllegalArgumentException {
+    IllegalArgumentException {
+        detailed_message: format!(
+            "Supplied action {} is invalid. Accepted actions: {}",
+            echoed(action),
+            accepted.join(", ")
+        ),
         request_id: new_request_id(),
         code: "400".to_string(),
     }
@@ -413,6 +540,16 @@ pub fn store_unavailable_failure() -> FailureByQueryException {
 /// instead.
 pub fn store_unavailable_internal() -> InternalFailureException {
     InternalFailureException {
+        detailed_message: STORE_UNAVAILABLE_MESSAGE.to_string(),
+        request_id: new_request_id(),
+        code: SERVER_ERROR_STATUS.to_string(),
+    }
+}
+
+/// The same server-side failure for an operation whose only modelled server error is
+/// `ServerShutdownException`.
+pub fn store_unavailable_shutdown() -> ServerShutdownException {
+    ServerShutdownException {
         detailed_message: STORE_UNAVAILABLE_MESSAGE.to_string(),
         request_id: new_request_id(),
         code: SERVER_ERROR_STATUS.to_string(),
