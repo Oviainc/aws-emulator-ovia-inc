@@ -10,13 +10,14 @@
 //!
 //! Two rules are pinned, each over a CLASS of rows rather than over one quota:
 //!
-//! * a quota that throttles ONE API operation of this service to so many requests per
-//!   second is described by the per-second sentence of that operation's own name, so the
-//!   text is DERIVED here from each row's `QuotaName` instead of being listed row by
-//!   row: however many such quotas the catalog publishes, each one's `Description` has
-//!   to be its own. The per-second wording is what tells a client a rate quota from a
-//!   count of the same size, and a row that borrows another quota's sentence (or a
-//!   paraphrase of its own) fails here;
+//! * a quota that throttles ONE API operation of this service — to so many requests per
+//!   second, or to so many in one burst — is described by that class's sentence around
+//!   the operation's own name, so the text is DERIVED here from each row's `QuotaName`
+//!   instead of being listed row by row: however many such quotas the catalog publishes,
+//!   each one's `Description` has to be its own. The wording is what tells a client a
+//!   rate quota from a count of the same size and a burst allowance from the sustained
+//!   rate beside it, and a row that borrows another quota's sentence (or a paraphrase of
+//!   its own) fails here;
 //! * such a quota is reached by the `QuotaCode` AWS publishes it under, through every
 //!   read path, and it sits on a page that is BOUNDED: the applied listing's unasked
 //!   page (`crate::state::APPLIED_QUOTA_PAGE_SIZE`) is followed by a `NextToken`
@@ -123,15 +124,15 @@ async fn an_api_rate_quota_describes_its_own_operation_per_second() {
 
         if let Some(api) = bursted_api(name) {
             burst_rows += 1;
-            // The burst allowance beside such a rate: its sentence is this catalog's
-            // own wording, so what is asserted is that it describes the burst of ITS
-            // operation rather than borrowing a neighbouring quota's text.
-            let described = described.unwrap_or_else(|| {
-                panic!("case {RATE_SERVICE}/{code} ({name:?}): a burst row publishes a Description")
-            });
-            assert!(
-                described.contains(api) && described.contains("burst"),
-                "case {RATE_SERVICE}/{code} ({name:?}): a burst row describes the burst of {api}, \
+            // The burst allowance beside such a rate: the sentence of ITS operation,
+            // naming the burst rather than the steady rate, so a paraphrase of it and a
+            // neighbouring quota's text both fail.
+            let expected =
+                format!("The maximum number of {api} API requests that can be sent in one burst.");
+            assert_eq!(
+                described,
+                Some(expected.as_str()),
+                "case {RATE_SERVICE}/{code} ({name:?}): expected the burst sentence {expected:?}, \
                  got {described:?}"
             );
             continue;

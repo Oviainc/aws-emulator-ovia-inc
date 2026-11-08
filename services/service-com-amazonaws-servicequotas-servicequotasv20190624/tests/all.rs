@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/api_rate_quota_rows.rs"]
 mod api_rate_quota_rows;
+#[path = "all/applied_catalog_published_rows.rs"]
+mod applied_catalog_published_rows;
 #[path = "all/applied_level_filter.rs"]
 mod applied_level_filter;
 #[path = "all/applied_quota_listing_pages.rs"]

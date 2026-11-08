@@ -146,7 +146,9 @@ const ROWS: &[Row] = &[
         service_code: "lambda",
         quota_code: Some("L-25EEC0A4"),
         quota_name: "Burst rate of ResumeMicrovm API requests",
-        description: Some("The maximum burst rate of ResumeMicrovm API requests."),
+        description: Some(
+            "The maximum number of ResumeMicrovm API requests that can be sent in one burst.",
+        ),
         unit: "None",
         value: 5.0,
         adjustable: true,

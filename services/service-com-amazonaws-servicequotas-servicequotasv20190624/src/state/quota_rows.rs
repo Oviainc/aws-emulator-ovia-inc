@@ -593,15 +593,17 @@ fn api_rate_description(api_name: &str) -> String {
     format!("The maximum number of {api_name} API requests per second.")
 }
 
-/// The `Description` of the BURST allowance beside such a rate.
+/// The `Description` Service Quotas publishes for the BURST allowance beside such a rate:
+/// how many of that operation's requests may arrive AT ONCE rather than the steady rate
+/// they may keep up.
 ///
-/// This one is this catalog's OWN wording, in the form AWS's rate descriptions take: the
-/// service's published text for a burst-rate quota is not among the data available here, so
-/// a later fidelity pass that gets it should replace this sentence. It names the burst
-/// rather than the per-second rate, since a burst quota caps how many requests may arrive
-/// at once rather than the steady rate they may keep up.
+/// SOURCE: the recorded applied-quota listing of `lambda`, which carries this exact
+/// sentence for the burst allowance of its `ResumeMicrovm` API. Like
+/// [`api_rate_description`] it is fixed text around the operation's own name, so every row
+/// of the class is described through this one function rather than by a sentence written
+/// out per row.
 fn api_burst_rate_description(api_name: &str) -> String {
-    format!("The maximum burst rate of {api_name} API requests.")
+    format!("The maximum number of {api_name} API requests that can be sent in one burst.")
 }
 
 /// One quota published as a COUNT of the resources of one plane in use: the plane's
@@ -1440,8 +1442,9 @@ pub(super) fn imagebuilder_quotas() -> Vec<QuotaRow> {
 /// guessing at.
 ///
 /// The rows are in the order the service reports them, which is the order a recorded
-/// listing of this service carries: the rate and MicroVM quotas AWS's own codes name
-/// first, then the function-shape quotas.
+/// listing of this service carries: the quotas AWS's own codes name — its API rates,
+/// its MicroVM quotas and its per-execution-environment throughput — first, then the
+/// function-shape quotas whose codes this catalog derives.
 pub(super) fn lambda_quotas() -> Vec<QuotaRow> {
     vec![
         // Most of the API request-rate quotas AWS publishes as not adjustable, each
@@ -1496,6 +1499,21 @@ pub(super) fn lambda_quotas() -> Vec<QuotaRow> {
             .code("L-B430C318")
             .fixed()
             .describe("The maximum execution duration of a MicroVM (in Hours)."),
+        // How much network bandwidth ONE execution environment may sustain, which AWS
+        // publishes in megabits per second and as adjustable: a throughput quota rather
+        // than a count, so it carries that unit and no rate window.
+        quota("Network bandwidth per execution environment", 625.0)
+            .code("L-14320ECE")
+            .unit("Megabits/Second")
+            .describe(
+                "The maximum sustained network bandwidth, in megabits per second, for a \
+                 Lambda function's execution environment that is not attached to a VPC.",
+            ),
+        // The rate of the API a client reads a durable execution's history through,
+        // which AWS publishes as adjustable and counted in plain requests.
+        quota("Rate of GetDurableExecutionHistory API requests", 15.0)
+            .code("L-BA29C22B")
+            .describe(&api_rate_description("GetDurableExecutionHistory")),
         // The published function-shape quotas. AWS's `QuotaCode`s for them are
         // NOT in this catalog: the codes it used to carry on these rows are
         // AWS's codes for other quotas of this service, so each row takes its
