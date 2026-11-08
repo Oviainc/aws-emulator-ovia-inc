@@ -175,7 +175,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetInstanceOutput {
             // The account that created the namespace the instance's service belongs to,
-            // which is the one account this emulator serves.
+            // which is the one account this emulator serves; the instance's own
+            // `CreatedByAccount` comes from its record.
             resource_owner: Some(crate::state::owning_account()),
             instance: Some(crate::state::instance_view(instance)),
         })

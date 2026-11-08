@@ -249,6 +249,10 @@ pub fn reconcile_cloud_map_instances<Eng: Send + Sync + 'static>(
                     // Nothing supplied a `CreatorRequestId`: this registration is Amazon
                     // ECS's own, not a client call being made idempotent.
                     creator_request_id: None,
+                    // The account that registered the instance, which the Cloud Map
+                    // instance reads report as `CreatedByAccount`: the account every
+                    // resource of this emulator belongs to, as that crate defines it.
+                    created_by_account: ::service_com_amazonaws_servicediscovery_route53autonaming_v20170314::state::owning_account(),
                     health_status: health_status.to_string(),
                     pending_health_status: None,
                 },

@@ -28,9 +28,9 @@ use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
 use crate::ops::types::{
-    DnsConfig, HealthCheckConfig, HealthCheckCustomConfig, HttpProperties, Instance, Namespace,
-    NamespaceProperties, NamespaceSummary, Operation, Service, ServiceAttributes, ServiceSummary,
-    Tag, SOA,
+    DnsConfig, HealthCheckConfig, HealthCheckCustomConfig, HttpProperties, Instance,
+    InstanceSummary, Namespace, NamespaceProperties, NamespaceSummary, Operation, Service,
+    ServiceAttributes, ServiceSummary, Tag, SOA,
 };
 
 /// The region an ARN carries when the request is unsigned, matching the region a
@@ -548,6 +548,10 @@ pub struct InstanceRecord {
     pub instance_id: String,
     pub attributes: HashMap<String, String>,
     pub creator_request_id: Option<String>,
+    /// `CreatedByAccount` — "the ID of the Amazon Web Services account that registered
+    /// the instance". Captured when the registration is stored, so a read reports who
+    /// registered this instance rather than who is reading it.
+    pub created_by_account: String,
     /// A `HealthStatus` value. An instance starts `UNKNOWN`: nothing has reported on
     /// it yet, neither the service's own health checker nor an
     /// `UpdateInstanceCustomHealthStatus` call.
@@ -1352,7 +1356,22 @@ pub fn instance_view(record: &InstanceRecord) -> Instance {
         id: record.instance_id.clone(),
         creator_request_id: record.creator_request_id.clone(),
         attributes: Some(record.attributes.clone()),
-        created_by_account: Some(owning_account()),
+        // The account that registered the instance, read from its record: it is stored
+        // when the registration is, rather than recomputed on the way out.
+        created_by_account: Some(record.created_by_account.clone()),
+    }
+}
+
+/// The modelled `InstanceSummary` for a stored instance — the same record
+/// [`instance_view`] renders, minus the member `InstanceSummary` does not carry
+/// (`CreatorRequestId`), so a listing and `GetInstance` can never disagree about an
+/// instance's attributes or its registering account.
+pub fn instance_summary_view(record: &InstanceRecord) -> InstanceSummary {
+    let instance = instance_view(record);
+    InstanceSummary {
+        id: Some(instance.id),
+        attributes: instance.attributes,
+        created_by_account: instance.created_by_account,
     }
 }
 

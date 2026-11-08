@@ -337,6 +337,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     instance_id: input.instance_id.clone(),
                     attributes,
                     creator_request_id: input.creator_request_id.clone(),
+                    // The account that registered the instance, which is what a later
+                    // read reports as `CreatedByAccount`.
+                    created_by_account: crate::state::owning_account(),
                     health_status: health_status.to_string(),
                     // Re-registering an instance replaces it, so a status a previous
                     // `UpdateInstanceCustomHealthStatus` call still owed is dropped

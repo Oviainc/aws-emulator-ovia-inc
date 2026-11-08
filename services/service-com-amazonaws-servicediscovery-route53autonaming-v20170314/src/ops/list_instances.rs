@@ -272,23 +272,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None
         };
 
+        // One projection for both instance read paths: `GetInstance` renders the same
+        // record, so a summary can never disagree with it about an instance's
+        // attributes or the account that registered it.
         let instances: Vec<InstanceSummary> = page
             .into_iter()
-            .map(|record| InstanceSummary {
-                id: Some(record.instance_id.clone()),
-                // Exactly the attribute map that was registered, as `GetInstance` and
-                // `DiscoverInstances` report it.
-                attributes: Some(record.attributes.clone()),
-                // The account that registered the instance, which is the one account
-                // this emulator serves — as `GetInstance` reports it.
-                created_by_account: Some(crate::state::owning_account()),
-            })
+            .map(crate::state::instance_summary_view)
             .collect();
 
         Ok(ListInstancesOutput {
             // `ResourceOwner` names the account that created the containing namespace,
             // which is the one account this emulator serves — the same account every
-            // other reader of this crate reports.
+            // other reader of this crate reports. It is a property of that namespace
+            // rather than of any instance, so it is reported whether or not this page
+            // holds one.
             resource_owner: Some(crate::state::owning_account()),
             instances: Some(instances),
             next_token,

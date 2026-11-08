@@ -1084,6 +1084,7 @@ async fn a_full_resource_store_is_refused_with_resource_limit_exceeded() {
                     instance_id,
                     attributes: std::collections::HashMap::new(),
                     creator_request_id: None,
+                    created_by_account: cloudmap::state::owning_account(),
                     health_status: cloudmap::state::HEALTH_STATUS_UNKNOWN.to_string(),
                     pending_health_status: None,
                 },

@@ -33,6 +33,8 @@ mod dns_config_defaults;
 mod instance_health_status;
 #[path = "all/instance_operations_missing_service.rs"]
 mod instance_operations_missing_service;
+#[path = "all/instance_ownership.rs"]
+mod instance_ownership;
 #[path = "all/list_instances.rs"]
 mod list_instances;
 #[path = "all/list_operations.rs"]
