@@ -357,3 +357,33 @@ pub fn reported_service(service_namespace: &str) -> Option<&'static ReportedServ
 pub fn unsupported_service_namespace(service_namespace: &str) -> String {
     format!("Service namepace {service_namespace} is either invalid or unsupported.")
 }
+
+/// Every namespace of `service_namespaces` that no service of [`REPORTED_SERVICES`] is
+/// published under, in the order the request named them.
+///
+/// `serviceNamespaceType`'s pattern (`^[\w-]*$`) admits any word, so a value that passes
+/// it still has to NAME a service: the namespaces are AWS's own published prefixes, and a
+/// value that is not one of them names no service whose access could be reported on. The
+/// comparison is the catalog's own ([`reported_service`]).
+pub fn unknown_service_namespaces<'a, I>(service_namespaces: I) -> Vec<&'a str>
+where
+    I: IntoIterator<Item = &'a str>,
+{
+    service_namespaces
+        .into_iter()
+        .filter(|service_namespace| reported_service(service_namespace).is_none())
+        .collect()
+}
+
+/// The message a call asked about service namespaces IAM publishes no service under is
+/// refused with: the fixed text `Invalid service namespace: ` followed by the rejected
+/// namespaces inside square brackets, separated by `, ` — every one of them, in the order
+/// the request named them, so a caller that mistyped two learns about both.
+///
+/// The one wording for it, so every member taking a LIST of namespaces to name the
+/// services it asks about describes an unusable namespace the same way (the reads taking a
+/// single `ServiceNamespace` to name the service they report ON state
+/// [`unsupported_service_namespace`] instead).
+pub fn invalid_service_namespaces(rejected: &[&str]) -> String {
+    format!("Invalid service namespace: [{}]", rejected.join(", "))
+}

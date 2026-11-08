@@ -189,9 +189,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // parameter" — a different refusal from an ARN naming a policy that is not
         // held. The form is checked through the one definition of the ARN grammar this
         // crate holds, the same one every operation taking a `PolicyArn` reads one with.
+        // A value this operation cannot read as an ARN at all is read by IAM's generic
+        // ARN parser, whose refusal states the reading it managed between two fixed
+        // halves and so quotes nothing of the value (`crate::state::ARN_UNPARSEABLE`);
+        // naming the value is the sentence of the operations that must decide a policy
+        // ARN's ATTACHABILITY (`PolicyNotAttachableException`), which this one does not.
         if !crate::state::is_arn(&input.policy_arn) {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::arn_not_valid(&input.policy_arn),
+                crate::state::ARN_UNPARSEABLE.to_string(),
             ));
         }
         if crate::state::parse_policy_arn(&input.policy_arn).is_none() {

@@ -23,6 +23,7 @@ pub mod account;
 pub mod authorization;
 pub mod credential_report;
 pub mod entity_path;
+pub mod entity_references;
 pub mod input_formats;
 pub mod member_forms;
 pub mod reported_services;
@@ -35,6 +36,7 @@ pub use managed_policy_catalog::*;
 pub use account::*;
 pub use credential_report::*;
 pub use entity_path::*;
+pub use entity_references::*;
 pub use input_formats::*;
 pub use member_forms::*;
 pub use reported_services::*;
@@ -2747,8 +2749,7 @@ const ARN_FIELDS: usize = 6;
 /// A value that is not an ARN never gets as far as naming a resource: it is refused as a
 /// value whose FORM is wrong for the member it was supplied for, with the error code IAM
 /// answers such a refusal with (`ValidationError`,
-/// [`crate::scaffolded::Scaffolded::validation_error`]) and the one sentence this crate
-/// words an unusable ARN with ([`arn_not_valid`]). An ARN that IS one, but names another
+/// [`crate::scaffolded::Scaffolded::validation_error`]). An ARN that IS one, but names another
 /// service, another resource type or a resource body IAM's own grammar does not admit,
 /// is read by the parser the member's operation uses ([`parse_policy_arn`],
 /// [`parse_entity_arn`]) and refused as the "invalid … value … supplied for an input
@@ -2765,10 +2766,14 @@ pub fn is_arn(value: &str) -> bool {
 /// use as one, with: the fixed text `ARN ` and ` is not valid.` around the value the
 /// request supplied.
 ///
-/// ONE wording for both layers of that reading ([`is_arn`]) and for every member taking a
-/// managed policy's ARN, so a caller matching IAM's text sees one sentence whichever
-/// operation it supplied the value to and whichever layer refused it; the layers differ
-/// in the error CODE, which is what a client branches on, not in the sentence.
+/// The sentence of the operations that must decide whether the ARN they are handed names
+/// an ATTACHABLE managed policy — the ones modelling `PolicyNotAttachableException`, which
+/// read the value themselves before anything else can be said about it — in BOTH layers of
+/// that reading ([`is_arn`]), so a caller matching IAM's text sees one sentence from them
+/// whichever layer refused the value; the layers differ in the error CODE, which is what a
+/// client branches on, not in the sentence. Every OTHER member taking an ARN hands a value
+/// it cannot read to IAM's generic ARN parser, whose refusal quotes nothing of it
+/// ([`ARN_UNPARSEABLE`]).
 pub fn arn_not_valid(value: &str) -> String {
     format!("ARN {value} is not valid.")
 }

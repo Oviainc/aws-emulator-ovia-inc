@@ -335,13 +335,54 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An ARN that is not a user's, a group's or a role's names no principal whose
         // policies could be read, which is an invalid input rather than a missing
-        // entity — the same refusal `GetContextKeysForPrincipalPolicy` answers.
+        // entity. A value standing for a SET of names is refused as such, the way every
+        // member that must name one thing reads one
+        // (`crate::state::names_no_single_entity`); anything else it cannot use is stated
+        // in the sentence the simulator words that refusal with, which names the value the
+        // request supplied (`crate::state::arn_not_provided_message`).
+        if crate::state::names_no_single_entity(&input.policy_source_arn) {
+            return Err(invalid_input(
+                crate::state::entity_arn_not_one_entity_message(&input.policy_source_arn),
+            ));
+        }
         if crate::state::parse_entity_arn(&input.policy_source_arn).is_none() {
-            return Err(invalid_input(format!(
-                "ARN {} is not valid: PolicySourceArn must be the ARN of an IAM user, \
-                 group or role",
-                input.policy_source_arn
+            return Err(invalid_input(crate::state::arn_not_provided_message(
+                &input.policy_source_arn,
             )));
+        }
+
+        // "The ARN of the IAM user, group, or role that you want to specify as the
+        // simulated caller of the API operations": a simulated caller is ONE identity
+        // too, so a value that names none is refused the same way before anything is
+        // decided — a wildcard where an entity ARN belongs would otherwise be simulated
+        // as a principal nothing can be, and answered a verdict.
+        if let Some(caller_arn) = input.caller_arn.as_deref() {
+            if crate::state::names_no_single_entity(caller_arn) {
+                return Err(invalid_input(
+                    crate::state::entity_arn_not_one_entity_message(caller_arn),
+                ));
+            }
+            if crate::state::parse_entity_arn(caller_arn).is_none() {
+                return Err(invalid_input(crate::state::arn_not_provided_message(
+                    caller_arn,
+                )));
+            }
+        }
+
+        // "An Amazon Web Services account ID that specifies the owner of any simulated
+        // resource that does not identify its owner in the resource ARN": an owner is ONE
+        // account, named by its bare id or by an ARN carrying it, so a value standing for
+        // a set of names names no owner — the same question the resources a supplied
+        // resource-based policy is attached to are read by
+        // (`crate::state::names_no_single_entity`).
+        if let Some(owner) = input
+            .resource_owner
+            .as_deref()
+            .filter(|owner| crate::state::names_no_single_entity(owner))
+        {
+            return Err(invalid_input(
+                crate::state::entity_arn_not_one_entity_message(owner),
+            ));
         }
 
         // "Syntactically invalid identifiers, such as malformed ARNs or wildcards in

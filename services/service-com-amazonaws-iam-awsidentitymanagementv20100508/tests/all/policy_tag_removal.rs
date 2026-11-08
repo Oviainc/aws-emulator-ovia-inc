@@ -317,7 +317,10 @@ async fn the_policy_is_addressed_by_its_own_arn() {
     // length, so each row is 20 characters or longer and still names no policy. The code
     // is the layer that took the form — `ValidationError` for a value that is not an ARN
     // at all, the modelled `InvalidInput` for an ARN naming another service or resource
-    // type — and both carry IAM's one sentence for an unusable ARN.
+    // type — and so is the sentence: this operation decides no ATTACHABILITY, so a value
+    // it cannot read as an ARN is stated by IAM's generic ARN parser, which quotes nothing
+    // of it, while an ARN that IS one is named in the refusal.
+    let unparseable = "Invalid ARN:  Could not be parsed!";
     for (case, arn, expected_code) in [
         (
             "a bare string of the right length",
@@ -360,10 +363,14 @@ async fn the_policy_is_addressed_by_its_own_arn() {
             expected_code,
             "case {case:?}: expected the code {expected_code}, got {body}"
         );
+        let expected_message = match expected_code {
+            "ValidationError" => unparseable.to_string(),
+            _ => format!("ARN {arn} is not valid."),
+        };
         assert_eq!(
             element(&body, "Message"),
-            format!("ARN {arn} is not valid."),
-            "case {case:?}: expected the refusal to name the value supplied, got {body}"
+            expected_message,
+            "case {case:?}: expected {expected_message:?}, got {body}"
         );
     }
 

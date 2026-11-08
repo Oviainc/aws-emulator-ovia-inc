@@ -217,16 +217,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An ARN that is not a user's, a group's or a role's names no principal whose
         // policies could be read, which is an invalid input rather than a missing
-        // entity.
-        if crate::state::parse_entity_arn(&input.policy_source_arn).is_none() {
+        // entity. A value standing for a SET of names is refused as such, the way every
+        // member that must name one thing reads one
+        // (`crate::state::names_no_single_entity`); anything else it cannot use carries
+        // the sentence the simulator words that refusal with, which names the value the
+        // request supplied — the same one `SimulatePrincipalPolicy` answers for the
+        // principal it reads policies for.
+        let principal_refusal = if crate::state::names_no_single_entity(&input.policy_source_arn) {
+            Some(crate::state::entity_arn_not_one_entity_message(
+                &input.policy_source_arn,
+            ))
+        } else if crate::state::parse_entity_arn(&input.policy_source_arn).is_none() {
+            Some(crate::state::arn_not_provided_message(
+                &input.policy_source_arn,
+            ))
+        } else {
+            None
+        };
+        if let Some(refusal) = principal_refusal {
             return Err(
                 GetContextKeysForPrincipalPolicyErrorModeled::InvalidInputException(
                     InvalidInputException {
-                        message: Some(format!(
-                            "ARN {} is not valid: PolicySourceArn must be the ARN of an IAM \
-                             user, group or role",
-                            input.policy_source_arn
-                        )),
+                        message: Some(refusal),
                     },
                 )
                 .into(),

@@ -303,6 +303,26 @@ pub fn request_defect(request: &SimulationInput<'_>) -> Option<String> {
         ));
     }
 
+    // "Each resource in the simulation is treated as if it had this policy attached"
+    // (`ResourcePolicy`): a simulation that supplies a resource-based policy decides it
+    // for the resources the request names, so each of them has to name ONE resource for
+    // that policy to be attached to. A resource set standing for every resource names
+    // none — whether the request spells the wildcard or leaves the member out, since
+    // "if this parameter is not provided, then the value defaults to * (all resources)"
+    // (`ResourceArns`) — and is refused by the reading every member that must name one
+    // thing shares (`super::names_no_single_entity`).
+    if request.resource_policy.is_some() {
+        let unattachable = request
+            .resource_arns
+            .iter()
+            .map(String::as_str)
+            .find(|named| super::names_no_single_entity(named))
+            .or_else(|| request.resource_arns.is_empty().then_some(ANY_RESOURCE));
+        if let Some(named) = unattachable {
+            return Some(super::entity_arn_not_one_entity_message(named));
+        }
+    }
+
     // The scenario a request declares is one of the ones the member publishes, and it is
     // run only once the resources that scenario needs are named — the enforcement the
     // member exists to ask for ([`SIMULATION_SCENARIOS`]).

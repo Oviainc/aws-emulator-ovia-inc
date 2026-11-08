@@ -23,6 +23,8 @@
 
 use smithy_server_runtime::MultiServiceRouter;
 
+use service_com_amazonaws_iam_awsidentitymanagementv20100508::state;
+
 use crate::user_lifecycle::{
     account_id, assert_access_denied_message, call, call_signed_by, element, error_code, router,
 };
@@ -595,9 +597,20 @@ async fn the_namespaces_are_reported_over_resumable_pages() {
     .await;
 
     for count in counts {
-        // Namespace names inside `serviceNamespaceType`'s `^[\w-]*$` and its 1..64
-        // length, distinct so an entry can be placed in the request's order.
-        let owned: Vec<String> = (0..count).map(|index| format!("svc-{index}")).collect();
+        // The first `count` service prefixes AWS publishes, which is what a request may
+        // ask about: a namespace has to name a service, so the request is built from the
+        // catalog this service reads them against rather than from invented words.
+        let owned: Vec<String> = state::REPORTED_SERVICES
+            .iter()
+            .take(count)
+            .map(|service| service.service_namespace.to_string())
+            .collect();
+        assert_eq!(
+            owned.len(),
+            count,
+            "case {count}: the catalog must publish at least {count} namespaces, got {}",
+            owned.len()
+        );
         let namespaces: Vec<&str> = owned.iter().map(String::as_str).collect();
 
         let (status, body) = granting(&router, &arn, &namespaces, None).await;

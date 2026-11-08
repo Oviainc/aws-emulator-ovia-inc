@@ -77,6 +77,8 @@ mod delegation_request_reads;
 mod delegation_request_updates;
 #[path = "all/entities_for_policy.rs"]
 mod entities_for_policy;
+#[path = "all/entity_reference_and_namespace_refusals.rs"]
+mod entity_reference_and_namespace_refusals;
 #[path = "all/enum_refusal_wording.rs"]
 mod enum_refusal_wording;
 #[path = "all/error_envelope_request_id.rs"]

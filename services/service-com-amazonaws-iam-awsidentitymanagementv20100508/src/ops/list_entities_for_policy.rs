@@ -194,12 +194,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `AttachRolePolicy` takes it (`crate::state::is_arn`): a value that is not an ARN
         // at all is refused with the code IAM answers a wrong FORM with, and an ARN naming
         // another service or resource type is the "invalid … value … supplied for an input
-        // parameter" this operation MODELS — one sentence for both
-        // (`crate::state::arn_not_valid`).
+        // parameter" this operation MODELS. The layers differ in the SENTENCE too: a
+        // value this operation cannot read as an ARN is read by IAM's generic ARN parser,
+        // whose refusal states the reading it managed between two fixed halves and so
+        // quotes nothing of the value (`crate::state::ARN_UNPARSEABLE`), while naming the
+        // value is the sentence of the operations that must decide a policy ARN's
+        // ATTACHABILITY (`PolicyNotAttachableException`), which this one does not.
         if crate::state::parse_policy_arn(&input.policy_arn).is_none() {
             if !crate::state::is_arn(&input.policy_arn) {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
-                    crate::state::arn_not_valid(&input.policy_arn),
+                    crate::state::ARN_UNPARSEABLE.to_string(),
                 ));
             }
             return Err(ListEntitiesForPolicyErrorModeled::InvalidInputException(

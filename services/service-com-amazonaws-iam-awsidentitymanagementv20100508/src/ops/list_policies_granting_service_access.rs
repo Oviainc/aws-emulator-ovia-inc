@@ -189,19 +189,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // An ARN that is not a user's, a group's or a role's names no identity whose
         // policies could be listed, which is an invalid input rather than a missing
-        // entity. The sentence is this operation's own fixed text for an `Arn` it cannot
-        // act on — `Invalid Entity Arn: ` and ` is not supported.` around the value the
-        // request supplied — not the one the other operations taking a principal ARN
-        // answer: IAM words that refusal per operation, and which sentence a caller sees
-        // is part of the wire contract of the operation it called.
-        if crate::state::parse_entity_arn(&input.arn).is_none() {
+        // entity. A value standing for a SET of names is refused as such, the way every
+        // member that must name one thing reads one
+        // (`crate::state::names_no_single_entity`); anything else carries this
+        // operation's own fixed text for an `Arn` it cannot act on — `Invalid Entity
+        // Arn: ` and ` is not supported.` around the value the request supplied
+        // (`crate::state::entity_arn_unsupported_message`) — not the one the simulator's
+        // members answer: IAM words that refusal per operation, and which sentence a
+        // caller sees is part of the wire contract of the operation it called.
+        let arn_refusal = if crate::state::names_no_single_entity(&input.arn) {
+            Some(crate::state::entity_arn_not_one_entity_message(&input.arn))
+        } else if crate::state::parse_entity_arn(&input.arn).is_none() {
+            Some(crate::state::entity_arn_unsupported_message(&input.arn))
+        } else {
+            None
+        };
+        if let Some(refusal) = arn_refusal {
             return Err(
                 ListPoliciesGrantingServiceAccessErrorModeled::InvalidInputException(
                     InvalidInputException {
-                        message: Some(format!(
-                            "Invalid Entity Arn: {} is not supported.",
-                            input.arn
-                        )),
+                        message: Some(refusal),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // "The service namespace for the Amazon Web Services services whose policies you
+        // want to list": a namespace has to NAME a service — `serviceNamespaceType`'s
+        // pattern admits any word, so the value is read against AWS's own published
+        // prefixes (`crate::state::REPORTED_SERVICES`). A namespace no service is
+        // published under is a value this operation cannot answer about, and answering it
+        // with an empty list would tell a caller that mistyped one that the identity has
+        // no policy granting it. Every rejected namespace is named, so the whole request
+        // is refused and nothing is reported.
+        let unknown = crate::state::unknown_service_namespaces(
+            input.service_namespaces.iter().map(String::as_str),
+        );
+        if !unknown.is_empty() {
+            return Err(
+                ListPoliciesGrantingServiceAccessErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(crate::state::invalid_service_namespaces(&unknown)),
                     },
                 )
                 .into(),
