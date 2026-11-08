@@ -173,12 +173,25 @@ pub fn span_nanos(span: Duration) -> i128 {
     i128::try_from(span.as_nanos()).unwrap_or(i128::MAX)
 }
 
+/// One instant as whole nanoseconds since the epoch, exactly — the unit this service does
+/// its instant arithmetic in, since a `DateTime` carries nanoseconds and an `f64` of
+/// current epoch seconds cannot represent them ([`instant_key`] orders instants for the
+/// same reason).
+///
+/// The difference of two of these is how LONG a range is, in the one unit a window length
+/// ([`span_nanos`]) is stated in, so a length and a range are compared without either
+/// being rounded to whole seconds.
+pub fn epoch_nanos(at: DateTime) -> i128 {
+    const NANOS_PER_SECOND: i128 = 1_000_000_000;
+    i128::from(at.secs()) * NANOS_PER_SECOND + i128::from(at.subsec_nanos())
+}
+
 /// `at` moved by `nanos` nanoseconds, exactly: a window length is an arbitrary ISO 8601
 /// duration, so a bound it completes keeps the sub-second part of both the instant and
 /// the span rather than rounding either to whole seconds.
 pub fn shifted(at: DateTime, nanos: i128) -> DateTime {
     const NANOS_PER_SECOND: i128 = 1_000_000_000;
-    let total = i128::from(at.secs()) * NANOS_PER_SECOND + i128::from(at.subsec_nanos()) + nanos;
+    let total = epoch_nanos(at) + nanos;
     // `div_euclid`/`rem_euclid` floor towards the past on both sides of the epoch, so the
     // remainder is always in `0..NANOS_PER_SECOND` and is always the in-range sub-second
     // part of the instant.
@@ -222,12 +235,11 @@ pub fn aggregation_window_start(at: DateTime, period_seconds: i64) -> DateTime {
 /// instant starts before it like any other. A span that is not positive names no window,
 /// so the instant is its own window start.
 pub fn aligned_window_start(at: DateTime, span: Duration) -> DateTime {
-    const NANOS_PER_SECOND: i128 = 1_000_000_000;
     let length = span_nanos(span);
     if length <= 0 {
         return at;
     }
-    let total = i128::from(at.secs()) * NANOS_PER_SECOND + i128::from(at.subsec_nanos());
+    let total = epoch_nanos(at);
     // Measured from the epoch, which is what "aligned to UTC" means for a window length,
     // and converted back into an instant by the one reader of that arithmetic.
     shifted(DateTime::from_secs(0), total.div_euclid(length) * length)

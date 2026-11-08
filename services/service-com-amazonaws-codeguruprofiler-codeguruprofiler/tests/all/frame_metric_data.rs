@@ -10,8 +10,9 @@
 //!   (one day, which `period`'s doc fixes) where the request leaves a side open — and a
 //!   period that is no interval, or longer than that maximum, is refused.
 //! * The time steps are the aggregation windows of the reported resolution, aligned to
-//!   UTC: one day at five-minute resolution is the 288 steps the `endTimes` doc names, and
-//!   a step whose window holds a profile the service has not aggregated yet is reported as
+//!   UTC, and a period holds exactly as many of them as its own length holds whole: one
+//!   day at five-minute resolution is the 288 steps the `endTimes` doc names, and a step
+//!   whose window holds a profile the service has not aggregated yet is reported as
 //!   an unprocessed instance instead, leaving a missing time step.
 //! * A frame metric's value for a step is the metric's own definition over the profiles
 //!   stored for that step: for `AggregatedRelativeTotalTime` ("Metric value aggregated for
@@ -61,8 +62,9 @@ const MAX_FRAME_METRICS: usize = 100;
 /// (`state::MAX_THREAD_STATES_PER_METRIC`), restated here for the same reason.
 const MAX_THREAD_STATES: usize = 32;
 
-/// An instant as the ISO 8601 form the modelled `date-time` members use.
-fn iso(at: i64) -> String {
+/// An instant as the ISO 8601 form the modelled `date-time` members use. `pub(crate)` so
+/// a sibling suite spells an instant the one way.
+pub(crate) fn iso(at: i64) -> String {
     DateTime::from_secs(at)
         .fmt(Format::DateTime)
         .unwrap_or_else(|error| panic!("unformattable instant {at}: {error}"))
@@ -126,7 +128,9 @@ fn reported_resolution(answer: &Answer) -> String {
 }
 
 /// The response's `endTimes`, as epoch seconds in the order they are reported.
-fn end_times(answer: &Answer) -> Vec<i64> {
+/// `pub(crate)` so a sibling suite about the steps of a series reads them through this one
+/// reducer rather than forking it.
+pub(crate) fn end_times(answer: &Answer) -> Vec<i64> {
     let json = answer.json();
     json.get("endTimes")
         .and_then(serde_json::Value::as_array)
@@ -169,10 +173,13 @@ fn unprocessed_end_times(answer: &Answer) -> BTreeMap<String, Vec<i64>> {
         .collect()
 }
 
-/// The `values` of the datum at `index`, and the `frameMetric` it is reported for.
+/// The `values` of the datum at `index`, and the `frameMetric` it is reported for. A
+/// position carrying NO value — a step the group holds no metric data for, which the
+/// series keeps a position for so it stays index-aligned with `endTimes` — reads back as
+/// `None`.
 /// `pub(crate)` so a sibling suite asserting what this operation reports for one stored
 /// profile reads a datum through this one reducer rather than forking it.
-pub(crate) fn datum(answer: &Answer, index: usize) -> (serde_json::Value, Vec<f64>) {
+pub(crate) fn datum(answer: &Answer, index: usize) -> (serde_json::Value, Vec<Option<f64>>) {
     let json = answer.json();
     let data = json
         .get("frameMetricData")
@@ -186,10 +193,13 @@ pub(crate) fn datum(answer: &Answer, index: usize) -> (serde_json::Value, Vec<f6
         .and_then(serde_json::Value::as_array)
         .unwrap_or_else(|| panic!("no values in datum {datum:?}"))
         .iter()
-        .map(|value| {
-            value
-                .as_f64()
-                .unwrap_or_else(|| panic!("a value that is no number: {value:?}"))
+        .map(|value| match value {
+            serde_json::Value::Null => None,
+            number => Some(
+                number
+                    .as_f64()
+                    .unwrap_or_else(|| panic!("a value that is neither a number nor null: {number:?}")),
+            ),
         })
         .collect();
     let metric = datum
@@ -197,6 +207,34 @@ pub(crate) fn datum(answer: &Answer, index: usize) -> (serde_json::Value, Vec<f6
         .cloned()
         .unwrap_or_else(|| panic!("no frameMetric in datum {datum:?}"));
     (metric, values)
+}
+
+/// Assert the series reports `expected` at `index`: a number, within [`TOLERANCE`], or no
+/// value at all for a step the group holds no metric data for.
+///
+/// `pub(crate)` so every suite asserting one reported value states the expectation the one
+/// way, whichever of the two it is.
+pub(crate) fn assert_value(
+    values: &[Option<f64>],
+    index: usize,
+    expected: Option<f64>,
+    label: &str,
+) {
+    let actual = values
+        .get(index)
+        .copied()
+        .unwrap_or_else(|| panic!("case {label:?}: no value {index} in {values:?}"));
+    match expected {
+        Some(expected) => assert!(
+            actual.is_some_and(|value| (value - expected).abs() < TOLERANCE),
+            "case {label:?}: expected {expected} at {index}, got {actual:?}"
+        ),
+        None => assert!(
+            actual.is_none(),
+            "case {label:?}: expected no value at {index} for a step with no metric data, \
+             got {actual:?}"
+        ),
+    }
 }
 
 /// How many datums the response reports.
@@ -291,7 +329,9 @@ struct ValueCase {
     body: Vec<u8>,
     frame_name: &'static str,
     thread_states: &'static [&'static str],
-    expected: f64,
+    /// The ratio the step must report, or `None` where the step holds no metric data for
+    /// the metric at all — which the series reports as NO value rather than as zero.
+    expected: Option<f64>,
 }
 
 /// One row of the ratio table stated as the CALL GRAPH a profile records rather than as
@@ -307,7 +347,10 @@ pub(crate) struct CallgraphCase {
     pub(crate) callgraph: serde_json::Value,
     pub(crate) frame_name: &'static str,
     pub(crate) thread_states: &'static [&'static str],
-    pub(crate) expected: f64,
+    /// The ratio the step must report, or `None` where the profile records no count at all
+    /// in the thread states the metric asks about: the metric is a ratio relative to those
+    /// counts, so there is no metric data for that step and the series reports no value.
+    pub(crate) expected: Option<f64>,
 }
 
 /// A submitted profile document: the call graph `callgraph` records, beside the `start`
@@ -336,6 +379,10 @@ fn document(callgraph: serde_json::Value) -> Vec<u8> {
 /// the frames are keyed or listed, how many thread states the metric asks about, whether
 /// the profile records a count in them at all, and whether the counts are whole,
 /// fractional or no count at all.
+///
+/// A row whose profile records NO count in the thread states the metric asks about expects
+/// no value: the metric is the frame's counts relative to those counts, so such a step
+/// holds no metric data at all and is reported with its position but no number.
 pub(crate) fn callgraph_cases() -> Vec<CallgraphCase> {
     vec![
         CallgraphCase {
@@ -343,7 +390,7 @@ pub(crate) fn callgraph_cases() -> Vec<CallgraphCase> {
             callgraph: serde_json::json!({ "A": { "RUNNABLE": 4 }, "B": { "RUNNABLE": 1 } }),
             frame_name: "A",
             thread_states: &["RUNNABLE"],
-            expected: 0.8,
+            expected: Some(0.8),
         },
         CallgraphCase {
             label: "a frame's time includes the frames it calls",
@@ -353,7 +400,7 @@ pub(crate) fn callgraph_cases() -> Vec<CallgraphCase> {
             }),
             frame_name: "A",
             thread_states: &["RUNNABLE"],
-            expected: 6.0 / 9.0,
+            expected: Some(6.0 / 9.0),
         },
         CallgraphCase {
             label: "the called frame of the same profile carries its own time",
@@ -363,7 +410,7 @@ pub(crate) fn callgraph_cases() -> Vec<CallgraphCase> {
             }),
             frame_name: "B",
             thread_states: &["RUNNABLE"],
-            expected: 2.0 / 9.0,
+            expected: Some(2.0 / 9.0),
         },
         CallgraphCase {
             label: "two thread states count together",
@@ -373,24 +420,24 @@ pub(crate) fn callgraph_cases() -> Vec<CallgraphCase> {
             }),
             frame_name: "A",
             thread_states: &["RUNNABLE", "BLOCKED"],
-            expected: 5.0 / 8.0,
+            expected: Some(5.0 / 8.0),
         },
         CallgraphCase {
-            label: "a thread state the profile never recorded counts nothing",
+            label: "a thread state the profile never recorded has no counts to be relative to",
             callgraph: serde_json::json!({
                 "A": { "RUNNABLE": 4, "BLOCKED": 1 },
                 "C": { "RUNNABLE": 3 }
             }),
             frame_name: "A",
             thread_states: &["TERMINATED"],
-            expected: 0.0,
+            expected: None,
         },
         CallgraphCase {
-            label: "a metric that asks about no thread state counts nothing",
+            label: "a metric that asks about no thread state has no counts to be relative to",
             callgraph: serde_json::json!({ "A": { "RUNNABLE": 4 }, "B": { "RUNNABLE": 1 } }),
             frame_name: "A",
             thread_states: &[],
-            expected: 0.0,
+            expected: None,
         },
         CallgraphCase {
             label: "every instance of the frame name is aggregated",
@@ -401,7 +448,7 @@ pub(crate) fn callgraph_cases() -> Vec<CallgraphCase> {
             }),
             frame_name: "A",
             thread_states: &["RUNNABLE"],
-            expected: 0.5,
+            expected: Some(0.5),
         },
         CallgraphCase {
             label: "a frame inside a frame of the same name counts its samples once",
@@ -411,21 +458,24 @@ pub(crate) fn callgraph_cases() -> Vec<CallgraphCase> {
             }),
             frame_name: "A",
             thread_states: &["RUNNABLE"],
-            expected: 0.5,
+            expected: Some(0.5),
         },
         CallgraphCase {
             label: "a frame name the profile does not hold",
             callgraph: serde_json::json!({ "A": { "RUNNABLE": 4 }, "B": { "RUNNABLE": 1 } }),
             frame_name: "NotInTheProfile",
             thread_states: &["RUNNABLE"],
-            expected: 0.0,
+            // The profile DOES record counts in the state the metric asks about, so the
+            // step holds metric data: none of it is under that frame name, which is the
+            // ratio zero rather than no value at all.
+            expected: Some(0.0),
         },
         CallgraphCase {
             label: "fractional counts",
             callgraph: serde_json::json!({ "A": { "RUNNABLE": 0.5 }, "B": { "RUNNABLE": 1.5 } }),
             frame_name: "A",
             thread_states: &["RUNNABLE"],
-            expected: 0.25,
+            expected: Some(0.25),
         },
         CallgraphCase {
             label: "frames listed rather than keyed sit in the enclosing frame",
@@ -435,7 +485,7 @@ pub(crate) fn callgraph_cases() -> Vec<CallgraphCase> {
             }),
             frame_name: "A",
             thread_states: &["RUNNABLE"],
-            expected: 0.75,
+            expected: Some(0.75),
         },
         CallgraphCase {
             label: "a negative number is no sample count",
@@ -445,7 +495,7 @@ pub(crate) fn callgraph_cases() -> Vec<CallgraphCase> {
             }),
             frame_name: "A",
             thread_states: &["RUNNABLE"],
-            expected: 0.5,
+            expected: Some(0.5),
         },
         CallgraphCase {
             label: "a count five frames down still belongs to the frame",
@@ -455,14 +505,14 @@ pub(crate) fn callgraph_cases() -> Vec<CallgraphCase> {
             }),
             frame_name: "A",
             thread_states: &["RUNNABLE"],
-            expected: 0.75,
+            expected: Some(0.75),
         },
         CallgraphCase {
             label: "a document that records no count at all",
             callgraph: serde_json::json!({ "A": {}, "B": {} }),
             frame_name: "A",
             thread_states: &["RUNNABLE"],
-            expected: 0.0,
+            expected: None,
         },
     ]
 }
@@ -487,7 +537,7 @@ fn value_cases() -> Vec<ValueCase> {
         body: b"this is not a profile document".to_vec(),
         frame_name: "A",
         thread_states: &["RUNNABLE"],
-        expected: 0.0,
+        expected: None,
     });
     cases
 }
@@ -554,12 +604,7 @@ async fn a_frame_metric_is_the_frames_counts_over_the_profiles_counts() {
             1,
             "case {label:?}: expected one value per reported step, got {values:?}"
         );
-        assert!(
-            (values[0] - case.expected).abs() < TOLERANCE,
-            "case {label:?}: expected {}, got {:?}",
-            case.expected,
-            values[0]
-        );
+        assert_value(&values, 0, case.expected, label);
     }
 }
 
@@ -686,15 +731,10 @@ async fn the_steps_are_the_aligned_windows_of_the_reported_resolution() {
             values.len(),
             times.len()
         );
+        assert_value(&values, 0, Some(0.8), label);
         assert!(
-            (values[0] - 0.8).abs() < TOLERANCE,
-            "case {label:?}: expected the stored profile's ratio in the first step, got {:?}",
-            values[0]
-        );
-        assert!(
-            values[1..].iter().all(|value| *value == 0.0),
-            "case {label:?}: a step holding no profile has no time in the frame, got {:?}",
-            values
+            values[1..].iter().all(|value| value.is_none()),
+            "case {label:?}: a step holding no profile has no metric data, got {values:?}"
         );
     }
 }
@@ -724,10 +764,12 @@ async fn a_step_whose_aggregation_is_not_due_is_an_unprocessed_instance() {
 
     // A period around the post, at the finest resolution, so the step holding it is one
     // of several.
+    let period_start = before - 2 * FIVE_MINUTES;
+    let period_end = after + 2 * FIVE_MINUTES;
     let query = format!(
         "?startTime={}&endTime={}&targetResolution=PT5M",
-        iso(before - 2 * FIVE_MINUTES),
-        iso(after + 2 * FIVE_MINUTES)
+        iso(period_start),
+        iso(period_end)
     );
     let metrics = [frame_metric("A", &["RUNNABLE"])];
     let answer = frame_metric_data(&harness, name, &query, &metrics).await;
@@ -739,15 +781,13 @@ async fn a_step_whose_aggregation_is_not_due_is_an_unprocessed_instance() {
         String::from_utf8_lossy(&answer.body)
     );
 
-    // Every aligned five-minute window the period overlaps, which is what the steps of
-    // the series are.
-    let first = (before - 2 * FIVE_MINUTES).div_euclid(FIVE_MINUTES) * FIVE_MINUTES;
-    let mut all_steps: Vec<i64> = Vec::new();
-    let mut step = first;
-    while step < after + 2 * FIVE_MINUTES {
-        all_steps.push(step + FIVE_MINUTES);
-        step += FIVE_MINUTES;
-    }
+    // The steps of the series: the aligned five-minute windows from the one holding the
+    // period's start, as many of them as the period itself holds whole — period ÷
+    // resolution, the count the `endTimes` doc states.
+    let first = period_start.div_euclid(FIVE_MINUTES) * FIVE_MINUTES;
+    let all_steps: Vec<i64> = (1..=(period_end - period_start) / FIVE_MINUTES)
+        .map(|step| first + step * FIVE_MINUTES)
+        .collect();
     // The receipt is somewhere in `[before, after]`, so the step holding it is the window
     // containing either instant — the same window unless the post straddled a boundary.
     let pending_candidates: Vec<i64> = [before, after]
@@ -800,8 +840,9 @@ async fn a_step_whose_aggregation_is_not_due_is_an_unprocessed_instance() {
         reported.len()
     );
     assert!(
-        values.iter().all(|value| *value == 0.0),
-        "a profile that is in no aggregated profile yet contributes no value, got {values:?}"
+        values.iter().all(|value| value.is_none()),
+        "a profile that is in no aggregated profile yet leaves its step with no metric \
+         data, got {values:?}"
     );
 
     // Once the aggregation that window owes has fallen due, the step it lands in is
@@ -826,11 +867,7 @@ async fn a_step_whose_aggregation_is_not_due_is_an_unprocessed_instance() {
         "every step of the period must be reported, got {served_steps:?}"
     );
     let (_, served_values) = datum(&served, 0);
-    let scored: Vec<f64> = served_values
-        .iter()
-        .copied()
-        .filter(|value| *value != 0.0)
-        .collect();
+    let scored: Vec<f64> = served_values.iter().flatten().copied().collect();
     assert_eq!(
         scored.len(),
         1,
@@ -1092,8 +1129,9 @@ async fn a_period_far_from_the_epoch_is_still_a_bounded_series() {
         );
         let (_, values) = datum(&answer, 0);
         assert!(
-            values.iter().all(|value| *value == 0.0),
-            "case {label:?}: the group holds no profile in that period, got {values:?}"
+            values.iter().all(|value| value.is_none()),
+            "case {label:?}: the group holds no profile in that period, so no step has \
+             metric data, got {values:?}"
         );
     }
 }
@@ -1411,15 +1449,15 @@ async fn a_request_the_operation_cannot_report_on_is_refused() {
         String::from_utf8_lossy(&answer.body)
     );
     let (_, values) = datum(&answer, 0);
-    assert_eq!(
-        values.first().copied(),
+    assert_value(
+        &values,
+        0,
         Some(1.0),
-        "case \"as many thread states as a frame metric may name\": the stored profile's one \
-         frame holds all of its counted time, got {values:?}"
+        "as many thread states as a frame metric may name",
     );
     assert!(
-        values[1..].iter().all(|value| *value == 0.0),
+        values[1..].iter().all(|value| value.is_none()),
         "case \"as many thread states as a frame metric may name\": a step holding no profile \
-         has no time in the frame, got {values:?}"
+         has no metric data, got {values:?}"
     );
 }

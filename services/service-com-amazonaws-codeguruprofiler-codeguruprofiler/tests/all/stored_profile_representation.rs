@@ -22,7 +22,7 @@ use aws_smithy_types::date_time::Format;
 use ion_rs::{Element, v1_0};
 
 use crate::frame_metric_data::{
-    TOLERANCE, callgraph_cases, datum, frame_metric, frame_metric_data, profile_of,
+    assert_value, callgraph_cases, datum, frame_metric, frame_metric_data, profile_of,
 };
 use crate::interval_validation::create_group;
 use crate::profile_times::place_receipts;
@@ -326,14 +326,15 @@ fn metric_window_start() -> i64 {
 }
 
 /// The values of the one-step series `name` reports for the metric on `frame_name` over
-/// `thread_states`, having checked the datum names the metric the request asked for.
+/// `thread_states`, having checked the datum names the metric the request asked for. A
+/// position carrying no value — a step with no metric data — reads back as `None`.
 async fn reported_series(
     harness: &Harness,
     name: &str,
     frame_name: &str,
     thread_states: &[&str],
     label: &str,
-) -> Vec<f64> {
+) -> Vec<Option<f64>> {
     let requested = frame_metric(frame_name, thread_states);
     let answer = frame_metric_data(
         harness,
@@ -414,12 +415,7 @@ async fn a_frame_metric_reads_a_stored_profile_by_the_same_rule() {
                 1,
                 "case {label:?}: expected one value per reported step, got {values:?}"
             );
-            assert!(
-                (values[0] - metric.expected).abs() < TOLERANCE,
-                "case {label:?}: expected {}, got {:?}",
-                metric.expected,
-                values[0]
-            );
+            assert_value(&values, 0, metric.expected, &label);
         }
     }
 }
@@ -483,10 +479,6 @@ async fn a_step_counts_every_stored_profile_whatever_it_was_announced_under() {
             1,
             "case {label:?}: expected one value per reported step, got {values:?}"
         );
-        assert!(
-            (values[0] - expected).abs() < TOLERANCE,
-            "case {label:?}: expected {expected}, got {:?}",
-            values[0]
-        );
+        assert_value(&values, 0, Some(expected), &label);
     }
 }

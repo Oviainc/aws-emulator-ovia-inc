@@ -33,6 +33,8 @@ mod findings_report_account_summary;
 mod findings_reports_listing;
 #[path = "all/frame_metric_data.rs"]
 mod frame_metric_data;
+#[path = "all/frame_metric_series_grid.rs"]
+mod frame_metric_series_grid;
 #[path = "all/get_profile_interval.rs"]
 mod get_profile_interval;
 #[path = "all/get_profile_latest_profile.rs"]

@@ -28,7 +28,7 @@ use aws_smithy_types::DateTime;
 use aws_smithy_types::date_time::Format;
 use ion_rs::{Element, v1_0};
 
-use crate::frame_metric_data::{TOLERANCE, datum, frame_metric, frame_metric_data};
+use crate::frame_metric_data::{TOLERANCE, assert_value, datum, frame_metric, frame_metric_data};
 use crate::interval_validation::create_group;
 use crate::profile_times::{place_profile, place_receipts};
 use crate::profiling_group_lifecycle::{Harness, element_of};
@@ -723,11 +723,11 @@ async fn the_served_combination_records_the_counts_a_frame_metric_reports() {
             1,
             "frame {frame}: expected one value per step, got {values:?}"
         );
-        assert!(
-            (values[0] - under / whole).abs() < TOLERANCE,
-            "frame {frame}: the metric reports {}, the served combination records {}",
-            values[0],
-            under / whole
+        assert_value(
+            &values,
+            0,
+            Some(under / whole),
+            &format!("frame {frame}"),
         );
     }
 }

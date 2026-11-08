@@ -94,10 +94,31 @@ profiler_schema_and_codec!(
     (M_VALUE, value, "value", 0, req, date_time),
 );
 
-#[smithy_macros::smithy(shape = "com.amazonaws.codeguruprofiler#FrameMetricDatum")]
+/// `FrameMetricDatum`. Hand-written because `values` carries NO VALUE at the position of a
+/// time step the group holds no metric data for: the list stays index-aligned with
+/// `endTimes`, so the position is kept and goes onto the wire as `null` rather than as a
+/// number — see `types/date_time_wire.rs`, whose `list_of_optional_double` member kind is
+/// what writes it.
 #[derive(Debug, Clone, Default)]
 pub struct FrameMetricDatum {
     pub frame_metric: FrameMetric,
-    pub values: Vec<f64>,
+    pub values: Vec<Option<f64>>,
 }
+
+profiler_schema_and_codec!(
+    FrameMetricDatum,
+    FRAME_METRIC_DATUM_SCHEMA,
+    "com.amazonaws.codeguruprofiler#FrameMetricDatum",
+    "com.amazonaws.codeguruprofiler",
+    "FrameMetricDatum",
+    (
+        M_FRAME_METRIC,
+        frame_metric,
+        "frameMetric",
+        0,
+        req,
+        struct_of(FrameMetric)
+    ),
+    (M_VALUES, values, "values", 1, req, list_of_optional_double),
+);
 

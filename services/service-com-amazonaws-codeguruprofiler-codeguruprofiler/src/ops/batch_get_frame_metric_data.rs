@@ -15,16 +15,19 @@
 //!   longer than that period, which `period`'s own doc fixes at one day.
 //! * The time steps are the aggregation windows of the reported resolution, aligned to
 //!   UTC the way every aggregated profile of this service is, so each step is exactly one
-//!   aggregated profile's window. A step whose window holds a posted profile the service
-//!   has not collected into an aggregated profile yet cannot be reported on, so it is
-//!   reported as an UNPROCESSED instance instead and leaves "a missing time step in the
-//!   list of end times", as `unprocessedEndTimes` documents.
+//!   aggregated profile's window, and the series holds as many of them as the period
+//!   itself holds whole — period ÷ resolution, the count `endTimes`' own doc fixes
+//!   ([`time_steps`]). A step whose window holds a posted profile the service has not
+//!   collected into an aggregated profile yet cannot be reported on, so it is reported as
+//!   an UNPROCESSED instance instead and leaves "a missing time step in the list of end
+//!   times", as `unprocessedEndTimes` documents.
 //! * A frame metric's value for a step is the metric's own definition applied to the
 //!   stored profiles of that step: for `AggregatedRelativeTotalTime`, whose model doc
 //!   reads "Metric value aggregated for all instances of a frame name in a profile
 //!   relative to the root frame", the sample counts recorded for every frame of that name
 //!   divided by the counts of the whole profile, both taken over the thread states the
-//!   metric asks about ([`tally`]).
+//!   metric asks about ([`tally`]). A step those counts are zero for is a step with no
+//!   metric data: it keeps its position in the series and carries no value at all.
 //!
 //! ## Shape of an operation
 //!
@@ -256,9 +259,16 @@ fn reported_resolution(
     }
 }
 
-/// The time steps of the series, as (step start, step END), ascending: the aggregation
-/// windows `resolution_seconds` long, aligned to UTC, that overlap the period
-/// `[start, end)`.
+/// The time steps of the series, as (step start, step END), ascending: the
+/// `resolution_seconds`-long aggregation windows, aligned to UTC, from the one holding the
+/// period's start — as many of them as the period's own LENGTH holds whole, and no more.
+///
+/// The count is what `endTimes`' own doc fixes: "List of instances, or time steps, in the
+/// time series. For example, if the period is one day (PT24H), and the resolution is five
+/// minutes (PT5M), then there are 288 endTimes in the list that are each five minutes
+/// apart" — period ÷ resolution (86400/300 = 288), so a period whose bounds are not
+/// themselves window-aligned carries no extra partial step at the tail, and a period
+/// shorter than one step holds no whole step at all.
 ///
 /// Alignment is what makes a step an aggregated profile's window — "Aggregated profiles
 /// are available with aggregation periods of 5 minutes, 1 hour, and 1 day, aligned to
@@ -276,17 +286,22 @@ fn time_steps(start: DateTime, end: DateTime, resolution_seconds: i64) -> Vec<(D
     // non-positive one would name no window to step by at all.
     let resolution_seconds = resolution_seconds.max(1);
     let step_seconds = u64::try_from(resolution_seconds).unwrap_or(1);
-    // One more than the whole steps the longest period holds, which is what an unaligned
-    // period of exactly that length needs.
-    let most_steps = usize::try_from(MAX_PERIOD.as_secs() / step_seconds)
+    let step_nanos = crate::state::span_nanos(Duration::from_secs(step_seconds));
+    // The whole steps the period holds: its length over the step length, measured in the
+    // one unit this service does instant arithmetic in, so a period carrying a sub-second
+    // part is divided exactly rather than rounded first.
+    let whole_steps = (crate::state::epoch_nanos(end) - crate::state::epoch_nanos(start))
+        .div_euclid(step_nanos)
+        .max(0);
+    let step_count = usize::try_from(whole_steps)
         .unwrap_or(usize::MAX)
-        .saturating_add(1);
+        // The whole steps the longest period this operation reports over holds, which
+        // every period it reports over fits inside.
+        .min(usize::try_from(MAX_PERIOD.as_secs() / step_seconds).unwrap_or(usize::MAX));
 
     let mut steps: Vec<(DateTime, DateTime)> = Vec::new();
     let mut step_start = crate::state::aggregation_window_start(start, resolution_seconds);
-    while crate::state::instant_key(step_start) < crate::state::instant_key(end)
-        && steps.len() < most_steps
-    {
+    while steps.len() < step_count {
         let Some(step_end) = step_start
             .secs()
             .checked_add(resolution_seconds)
@@ -412,8 +427,9 @@ fn sample_count(element: &Element) -> Option<f64> {
     (count >= 0.0).then_some(count)
 }
 
-/// The datum each requested frame metric is reported with: one value per PROCESSED step,
-/// in the order `processed` names the steps — or `None` when computing them would cost
+/// The datum each requested frame metric is reported with: one position per PROCESSED
+/// step, in the order `processed` names the steps, carrying the metric's value there or NO
+/// value where that step holds no metric data — or `None` when computing them would cost
 /// more than the work budget this service gives one series ([`MAX_TALLY_VISITS`]), which
 /// the whole computation shares, so the product of the metrics asked about and the values
 /// the stored documents hold is bounded rather than each factor alone.
@@ -460,15 +476,13 @@ fn frame_metric_data(
             values: processed
                 .iter()
                 .map(|step| {
-                    // The metric is "relative to the root frame", so a step whose
-                    // profiles record no count at all in the requested thread states
-                    // has no time to be relative to: nothing of it was spent in the
-                    // frame.
-                    if whole[*step] > 0.0 {
-                        named[*step] / whole[*step]
-                    } else {
-                        0.0
-                    }
+                    // The metric is a quotient "relative to the root frame", so a step
+                    // whose profiles record no count at all in the requested thread
+                    // states has no metric data to report a value from: the position is
+                    // kept, so the series stays index-aligned with the end times, and it
+                    // carries NO VALUE rather than a number that would read as a genuine
+                    // zero sample.
+                    (whole[*step] > 0.0).then(|| named[*step] / whole[*step])
                 })
                 .collect(),
         });

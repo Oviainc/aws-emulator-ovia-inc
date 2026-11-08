@@ -30,7 +30,7 @@ use aws_smithy_types::DateTime;
 use aws_smithy_types::date_time::Format;
 use ion_rs::v1_0;
 
-use crate::frame_metric_data::{TOLERANCE, datum, frame_metric, frame_metric_data};
+use crate::frame_metric_data::{TOLERANCE, assert_value, datum, frame_metric, frame_metric_data};
 use crate::interval_validation::create_group;
 use crate::profile_times::place_receipts;
 use crate::profiling_group_lifecycle::{Answer, Harness, element_of};
@@ -253,14 +253,15 @@ async fn group_holding(harness: &Harness, name: &str, callgraph: &str, label: &s
 }
 
 /// The one-step series `name` reports for the metric on `frame_name` over
-/// `thread_states`, having checked the datum names the metric the request asked for.
+/// `thread_states`, having checked the datum names the metric the request asked for. A
+/// position carrying no value — a step with no metric data — reads back as `None`.
 async fn reported_series(
     harness: &Harness,
     name: &str,
     frame_name: &str,
     thread_states: &[&str],
     label: &str,
-) -> Vec<f64> {
+) -> Vec<Option<f64>> {
     let requested = frame_metric(frame_name, thread_states);
     let answer = frame_metric_data(
         harness,
@@ -312,12 +313,7 @@ async fn a_sample_count_is_counted_at_the_magnitude_its_notation_states() {
             1,
             "case {label:?}: expected one value per reported step, got {values:?}"
         );
-        assert!(
-            (values[0] - case.expected).abs() < TOLERANCE,
-            "case {label:?}: expected {}, got {:?}",
-            case.expected,
-            values[0]
-        );
+        assert_value(&values, 0, Some(case.expected), label);
     }
 }
 
@@ -424,10 +420,6 @@ async fn counts_of_one_frame_add_up_at_any_magnitude() {
             1,
             "case {label:?}: expected one value per reported step, got {values:?}"
         );
-        assert!(
-            (values[0] - 1.0).abs() < TOLERANCE,
-            "case {label:?}: expected every count of the window under A, got {:?}",
-            values[0]
-        );
+        assert_value(&values, 0, Some(1.0), label);
     }
 }

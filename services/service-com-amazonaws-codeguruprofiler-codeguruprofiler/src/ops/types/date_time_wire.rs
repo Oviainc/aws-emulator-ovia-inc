@@ -33,6 +33,14 @@
 //! call the codegen omits, which [`profiler_member_schema!`] attaches for the `date_time`
 //! member kind.
 //!
+//! THE THIRD REASON: a member of a list can be ABSENT without the list losing its
+//! position. `BatchGetFrameMetricData` reports one position per time step and no value at
+//! a step it has no metric data for, so that position goes onto the wire as `null` while
+//! the list stays index-aligned with the end times it is read beside. The vendored
+//! codegen's list writers take a `Vec<T>` and always write a `T`, so the `values` of a
+//! `FrameMetricDatum` are a `Vec<Option<f64>>`, written by the `list_of_optional_double`
+//! member kind below.
+//!
 //! THE SECOND REASON a structure lands here: the vendored codegen forces a `@required`
 //! member to be a non-`Option` Rust field and ALWAYS writes it, while this service's
 //! recorded responses omit some `@required` members outright (`ListProfilingGroups`
@@ -90,6 +98,9 @@ macro_rules! profiler_shape_type {
     (list_of) => {
         ::aws_smithy_schema::ShapeType::List
     };
+    (list_of_optional_double) => {
+        ::aws_smithy_schema::ShapeType::List
+    };
     (map_of_string) => {
         ::aws_smithy_schema::ShapeType::Map
     };
@@ -106,7 +117,7 @@ macro_rules! profiler_shape_type {
 ///
 /// `$kind` is the member's shape kind — `string` (a `string` or an `enum` shape, both
 /// string-encoded), `integer`, `double`, `date_time`, `list_of_string`, `list_of(T)`,
-/// `map_of_string`, `map_of_list_of(T)` or `struct_of(T)`.
+/// `list_of_optional_double`, `map_of_string`, `map_of_list_of(T)` or `struct_of(T)`.
 macro_rules! profiler_member_schema {
     ($ns:literal, $local:literal, $wire:literal, $idx:literal, date_time) => {
         ::aws_smithy_schema::Schema::new_member(
@@ -148,6 +159,21 @@ macro_rules! profiler_write_member {
         $s.write_list($m, &|__sl| {
             for __it in $v.iter() {
                 __sl.write_string($m, __it.as_str())?;
+            }
+            Ok(())
+        })?;
+    };
+    ($s:ident, $m:expr, $v:expr, list_of_optional_double) => {
+        $s.write_list($m, &|__sl| {
+            for __it in $v.iter() {
+                match __it {
+                    ::std::option::Option::Some(__number) => {
+                        __sl.write_double($m, *__number)?;
+                    }
+                    // The position is kept and carries no value, which is what keeps the
+                    // list aligned with whatever it is read beside.
+                    ::std::option::Option::None => __sl.write_null($m)?,
+                }
             }
             Ok(())
         })?;
@@ -202,6 +228,19 @@ macro_rules! profiler_read_member {
         let mut __out: ::std::vec::Vec<::std::string::String> = ::std::vec::Vec::new();
         $d.read_list($m, &mut |__dl| {
             __out.push(__dl.read_string($m)?);
+            Ok(())
+        })?;
+        __out
+    }};
+    ($d:ident, $m:expr, list_of_optional_double) => {{
+        let mut __out: ::std::vec::Vec<::std::option::Option<f64>> = ::std::vec::Vec::new();
+        $d.read_list($m, &mut |__dl| {
+            if __dl.is_null() {
+                __dl.read_null()?;
+                __out.push(::std::option::Option::None);
+            } else {
+                __out.push(::std::option::Option::Some(__dl.read_double($m)?));
+            }
             Ok(())
         })?;
         __out
