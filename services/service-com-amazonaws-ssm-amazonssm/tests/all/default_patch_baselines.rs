@@ -135,6 +135,10 @@ async fn create(router: &MultiServiceRouter, region: &str, body: &Value) -> (u16
 
 /// A create of a baseline named `name` for `operating_system`, asserting it succeeded,
 /// and returning the `BaselineId` it minted.
+///
+/// The body names an approved patch, because a baseline has to approve something: a
+/// create that supplies neither `ApprovedPatches` nor `ApprovalRules` is refused (see
+/// `all/patch_baseline_approval_coverage.rs`).
 async fn create_ok(
     router: &MultiServiceRouter,
     case: &str,
@@ -149,6 +153,7 @@ async fn create_ok(
             "Name": name,
             "OperatingSystem": operating_system,
             "Description": format!("the baseline {case} registers"),
+            "ApprovedPatches": ["KB2124261"],
         }),
     )
     .await;
@@ -749,6 +754,7 @@ async fn a_create_is_idempotent_under_one_client_token() {
         "Name": "Token.Baseline",
         "OperatingSystem": operating_system,
         "Description": "the baseline a retry reports",
+        "ApprovedPatches": ["KB2124261"],
         "ClientToken": "0d8f2a1c-1111-2222-3333-444455556666",
     });
 

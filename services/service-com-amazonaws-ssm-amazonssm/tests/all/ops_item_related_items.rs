@@ -501,44 +501,143 @@ async fn associations_outside_the_documented_rules_are_refused() {
     );
 }
 
-/// A refusal of a type outside the documented sets names the member at fault, so a client
-/// learns which one to correct.
+/// One row of the type-refusal table: the value that is outside the documented set, the
+/// member OpsCenter reports as refused, and the member name its sentence words.
+struct TypeRefusal<'a> {
+    case: &'a str,
+    body: Value,
+    /// What `ParameterNames` must name — the member as the SERVICE reports it, which for a
+    /// related item's resource type is not the member name a request spells.
+    reported_member: &'a str,
+    /// The member the fixed sentence of this class names, in the lowerCamel spelling of
+    /// the wire member.
+    worded_member: &'a str,
+    /// The wire member whose value this row puts outside its documented set, so the
+    /// "carries nothing of the value submitted" assertion reads the offending value of
+    /// THIS row rather than always the resource type.
+    offending_member: &'a str,
+}
+
+/// A refusal of a type outside the documented sets is worded as OpsCenter words this class
+/// — the fixed sentence plus the frame the service appends, carrying nothing of the
+/// submitted value — and names the member the service reports as refused, so a client that
+/// matches the sentence or points the user at a field sees what AWS sends.
 #[tokio::test]
-async fn a_type_refusal_names_the_member_at_fault() {
+async fn a_type_refusal_is_worded_as_the_service_words_it() {
     let router = router();
     let ops_item_id = ops_item(&router, "an OpsItem for parameter names").await;
-    for (member, body) in [
-        (
-            "AssociationType",
-            json!({
+    // The rows span both members the rule covers and, for each, two values outside its
+    // documented set — so the sentence is shown to carry no part of the value submitted.
+    let cases = [
+        TypeRefusal {
+            case: "an association type OpsCenter does not make",
+            body: json!({
                 "OpsItemId": ops_item_id,
                 "AssociationType": "Mentions",
                 "ResourceType": "AWS::SSM::Document",
                 "ResourceUri": "arn:aws:ssm:us-west-2:111122223333:document/A",
             }),
-        ),
-        (
-            "ResourceType",
-            json!({
+            reported_member: "AssociationType",
+            worded_member: "associationType",
+            offending_member: "AssociationType",
+        },
+        TypeRefusal {
+            case: "an association type in the wrong case",
+            body: json!({
+                "OpsItemId": ops_item_id,
+                "AssociationType": "relatesto",
+                "ResourceType": "AWS::SSM::Document",
+                "ResourceUri": "arn:aws:ssm:us-west-2:111122223333:document/B",
+            }),
+            reported_member: "AssociationType",
+            worded_member: "associationType",
+            offending_member: "AssociationType",
+        },
+        TypeRefusal {
+            case: "a resource type OpsCenter does not relate",
+            body: json!({
                 "OpsItemId": ops_item_id,
                 "AssociationType": "RelatesTo",
                 "ResourceType": "AWS::EC2::Instance",
                 "ResourceUri": "arn:aws:ec2:us-west-2:111122223333:instance/i-0123",
             }),
-        ),
-    ] {
-        let (status, response) = associate(&router, &body).await;
+            reported_member: "AssociatedResourceType",
+            worded_member: "resourceType",
+            offending_member: "ResourceType",
+        },
+        TypeRefusal {
+            case: "a resource type that is not a type name at all",
+            body: json!({
+                "OpsItemId": ops_item_id,
+                "AssociationType": "RelatesTo",
+                "ResourceType": "/aws/cloudwatch/alarm",
+                "ResourceUri": "arn:aws:cloudwatch:us-west-2:111122223333:alarm/Latency",
+            }),
+            reported_member: "AssociatedResourceType",
+            worded_member: "resourceType",
+            offending_member: "ResourceType",
+        },
+    ];
+
+    for TypeRefusal {
+        case,
+        body,
+        reported_member,
+        worded_member,
+        offending_member,
+    } in &cases
+    {
+        let (status, response) = associate(&router, body).await;
         assert_eq!(
             status, 400,
-            "case {member}: must be refused with 400, got {status} {response}"
+            "case {case}: must be refused with 400, got {status} {response}"
+        );
+        assert_eq!(
+            error_code(&response),
+            "OpsItemInvalidParameterException",
+            "case {case}: expected OpsItemInvalidParameterException, got {response}"
         );
         assert_eq!(
             response["ParameterNames"]
                 .as_array()
                 .and_then(|names| names.first())
                 .and_then(Value::as_str),
-            Some(member),
-            "case {member}: the refusal must name the member at fault, got {response}"
+            Some(*reported_member),
+            "case {case}: the refusal must name {reported_member}, got {response}"
+        );
+
+        let message = response["Message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("case {case}: the refusal carries a Message, got {response}"))
+            .to_string();
+        let sentence = format!("The {worded_member} entered is not valid.");
+        let opening = " (Service: AmazonSSM; Status Code: 400; \
+                        Error Code: OpsItemInvalidParameterException; Request ID: ";
+        let closing = "; Proxy: null)";
+        let at = message
+            .find(opening)
+            .unwrap_or_else(|| panic!("case {case}: expected the clause {opening:?} in {message:?}"));
+        assert_eq!(
+            &message[..at],
+            sentence,
+            "case {case}: expected the sentence {sentence:?}, got {message:?}"
+        );
+        assert!(
+            message.ends_with(closing),
+            "case {case}: expected the Message to end with {closing:?}, got {message:?}"
+        );
+        let request_id = &message[at + opening.len()..message.len() - closing.len()];
+        assert!(
+            is_uuid(request_id),
+            "case {case}: the clause carries a request id, got {request_id:?} in {message:?}"
+        );
+        // The sentence carries nothing of the value submitted — read per row, so the
+        // assertion bites on the member THIS row put outside its set.
+        let submitted = body[*offending_member].as_str().unwrap_or_default();
+        assert!(
+            !message[..at].contains(submitted),
+            "case {case}: the sentence must not echo the submitted value {submitted:?}, got \
+             {message:?}"
         );
     }
 }

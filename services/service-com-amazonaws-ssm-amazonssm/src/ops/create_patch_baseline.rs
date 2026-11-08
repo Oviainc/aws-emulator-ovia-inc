@@ -7,10 +7,12 @@
 //! Everything the create supplies is persisted in the one store in
 //! [`crate::state::patch_baselines`], under the `BaselineId` this call mints, at the
 //! endpoint's own Region; the members a create leaves out are held at the defaults their
-//! own documentation states. A create carrying an idempotency token a baseline of this
-//! Region already holds reports THAT baseline rather than minting a second one, and is
-//! refused with `IdempotentParameterMismatch` when it supplies different members under
-//! the same token.
+//! own documentation states. A baseline has to approve something — an approved-patch list
+//! or an approval rule group, at least one of them non-empty — so a create that supplies
+//! neither is refused before anything is written. A create carrying an idempotency token a
+//! baseline of this Region already holds reports THAT baseline rather than minting a
+//! second one, and is refused with `IdempotentParameterMismatch` when it supplies
+//! different members under the same token.
 //!
 //! ## Shape of an operation
 //!
@@ -212,6 +214,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some("the patch baseline store is unavailable".to_string()),
             })
         })?;
+
+        // A baseline approves patches by naming them or by a rule that selects them, and
+        // the two cannot both be empty: the model makes each member optional on its own,
+        // so this cross-member rule is checked here — BEFORE anything is written, so a
+        // baseline that could approve nothing leaves no id and no record behind.
+        if let Some(why) = crate::state::patch_baselines::approval_coverage_rejection(
+            input.approved_patches.as_deref(),
+            input.approval_rules.as_ref(),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::validation(why));
+        }
 
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();

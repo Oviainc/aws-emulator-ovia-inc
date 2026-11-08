@@ -136,6 +136,31 @@ pub const IDEMPOTENT_PARAMETER_MISMATCH: &str = "The parameters don't match the 
 /// the same absent baseline are worded the same way.
 pub const PATCH_BASELINE_NOT_FOUND: &str = "Patch Baseline to be retrieved does not exist.";
 
+/// How Patch Manager words the refusal of a baseline that would approve no patch at all.
+///
+/// A baseline approves patches either by naming them (`ApprovedPatches`) or by a rule that
+/// selects them (`ApprovalRules`); the model makes each member optional on its own, so the
+/// rule is that the two cannot BOTH be empty, and the sentence is fixed text naming the
+/// two attributes rather than anything of the request.
+pub const APPROVAL_COVERAGE_REQUIRED: &str =
+    "Patch Baseline attribute: Approved Patches and Approval Rule, at least one must be non empty.";
+
+/// Why a patch baseline carrying `approved_patches` and `approval_rules` cannot be stored,
+/// or `None` when at least one of the two approves something.
+///
+/// An `ApprovalRules` whose own `PatchRules` list is empty selects no patch, so it is as
+/// empty as a missing one: what the rule asks for is a NON-EMPTY approved-patch list or a
+/// non-empty rule group. Every write of a baseline is held to it, so a baseline that could
+/// never approve a patch cannot be created nor updated into existence.
+pub fn approval_coverage_rejection(
+    approved_patches: Option<&[String]>,
+    approval_rules: Option<&PatchRuleGroup>,
+) -> Option<&'static str> {
+    let approves_by_name = approved_patches.is_some_and(|patches| !patches.is_empty());
+    let approves_by_rule = approval_rules.is_some_and(|rules| !rules.patch_rules.is_empty());
+    (!approves_by_name && !approves_by_rule).then_some(APPROVAL_COVERAGE_REQUIRED)
+}
+
 /// One patch baseline Systems Manager predefines: it exists in every account and Region
 /// without anybody creating it, and is the default for its operating system until a
 /// register says otherwise.

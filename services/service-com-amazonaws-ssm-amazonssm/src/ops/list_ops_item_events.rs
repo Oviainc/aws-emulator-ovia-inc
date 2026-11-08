@@ -8,12 +8,10 @@
 //! one store in [`crate::state::ops_item_events`]: "a list of all OpsItem events in the
 //! current Amazon Web Services Region and Amazon Web Services account", narrowed by the
 //! filters the request names. A filter's `OpsItemId` values are OpsItem ids, so they
-//! select the trails of those OpsItems; two filters narrow together. An id no OpsItem of
-//! the Region carries is the one refusal (`OpsItemNotFoundException`, which the model
-//! declares for this operation precisely because its filter values are OpsItem ids),
-//! because a filter value NAMES an OpsItem rather than describing one — so a request is
-//! served in full or refused, never served as if an id it named had been a criterion
-//! nothing met.
+//! select the trails of those OpsItems; two filters narrow together. A filter is a
+//! CRITERION rather than a resource to resolve: a value no event of the Region is about —
+//! including an OpsItem id nothing was ever created under — selects no event, so the
+//! listing is an empty page rather than a refusal.
 //!
 //! The trail is reported most recent first and paged by `MaxResults`, with the next page's
 //! first event id handed back as the `NextToken` — a cursor on the result rather than an
@@ -250,30 +248,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = request_region(ctx.parts());
         let store = state.lock();
 
-        // "The values for the filter, consisting of one or more OpsItem IDs"
-        // (`OpsItemEventFilter$Values`): a value NAMES an OpsItem, so an id this Region
-        // holds no OpsItem under names none whose trail could be read.
-        for filter in filters {
-            if filter
-                .values
-                .iter()
-                .any(|id| store.ops_item(&region, id).is_none())
-            {
-                return Err(ListOpsItemEventsErrorModeled::OpsItemNotFoundException(
-                    OpsItemNotFoundException {
-                        // The sentence `OpsItemNotFoundException`'s own documentation
-                        // states, which is what every read of this service answers for an
-                        // OpsItem id its Region holds none under.
-                        message: Some(
-                            "The specified OpsItem ID doesn't exist. Verify the ID and try again."
-                                .to_string(),
-                        ),
-                    },
-                )
-                .into());
-            }
-        }
-
+        // "You can limit the results to events associated with specific OpsItems by
+        // specifying a filter" (`ListOpsItemEvents`): a filter value is compared against
+        // the events this Region holds, and nothing about it is resolved as a resource — a
+        // value no event is about simply selects none of them.
+        //
         // Two filters narrow together: each is a criterion the event has to meet, and the
         // values of one filter are the alternatives that criterion accepts.
         let matching: Vec<&OpsItemEventRecord> = store

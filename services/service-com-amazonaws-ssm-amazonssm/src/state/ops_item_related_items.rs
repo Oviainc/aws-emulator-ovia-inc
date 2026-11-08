@@ -40,6 +40,34 @@ pub const ASSOCIATION_TYPES: &[&str] = &["IsParentOf", "RelatesTo"];
 /// an Incident Manager incident. AWS::SSM::Document: a Systems Manager (SSM) document").
 pub const RESOURCE_TYPES: &[&str] = &["AWS::SSMIncidents::IncidentRecord", "AWS::SSM::Document"];
 
+/// The wire code of the refusal of a value outside those sets, which is the modelled
+/// exception's own shape name (`com.amazonaws.ssm#OpsItemInvalidParameterException`), and
+/// so what the frame below names as its error code.
+pub const INVALID_PARAMETER_CODE: &str = "OpsItemInvalidParameterException";
+
+/// The HTTP status that refusal carries, which is the status the model declares for it
+/// (`OpsItemInvalidParameterException`, httpError 400), and so what the frame below names
+/// as its status.
+pub const INVALID_PARAMETER_STATUS: u16 = 400;
+
+/// The member OpsCenter reports as refused when the related item's resource type is not
+/// one it supports: the service names this member `AssociatedResourceType`, which is not
+/// the wire member name a request spells it under.
+pub const ASSOCIATED_RESOURCE_TYPE_MEMBER: &str = "AssociatedResourceType";
+
+/// How OpsCenter words the refusal of a value outside the set it supports for `member`:
+/// the one fixed sentence of that class, naming the member as a request spells it in
+/// lowerCamel and carrying nothing of the submitted value, followed by the frame this
+/// service appends to a refusal it worded itself ([`super::with_sdk_error_envelope`], whose
+/// only variable part is the serving response's own request id).
+pub fn not_valid_message(member: &str) -> String {
+    super::with_sdk_error_envelope(
+        &format!("The {member} entered is not valid."),
+        INVALID_PARAMETER_STATUS,
+        INVALID_PARAMETER_CODE,
+    )
+}
+
 /// The member an already-associated resource collided on, which is what Systems Manager
 /// names as at fault in `OpsItemRelatedItemAlreadyExistsException`'s message: the input
 /// member whose value is already a related item of the OpsItem.
@@ -112,30 +140,25 @@ pub fn related_item_page_size(max_results: Option<i32>) -> Result<usize, String>
 
 /// Why `association_type` is not an association type OpsCenter supports, or `None` when it
 /// is one of [`ASSOCIATION_TYPES`].
+///
+/// Worded the way OpsCenter words this class ([`not_valid_message`]) and naming the member
+/// the service reports, which for the association type is the member a request spells.
 pub fn association_type_rejection(association_type: &str) -> Option<ParameterRejection> {
     (!ASSOCIATION_TYPES.contains(&association_type)).then(|| {
-        ParameterRejection::new(
-            "AssociationType",
-            format!(
-                "AssociationType {association_type} isn't one of the association types OpsCenter \
-                 supports: {}",
-                ASSOCIATION_TYPES.join(", ")
-            ),
-        )
+        ParameterRejection::new("AssociationType", not_valid_message("associationType"))
     })
 }
 
 /// Why `resource_type` is not a resource type OpsCenter supports as a related item, or
 /// `None` when it is one of [`RESOURCE_TYPES`].
+///
+/// Worded as [`association_type_rejection`] is, and naming the member OpsCenter reports
+/// for a related item's resource type ([`ASSOCIATED_RESOURCE_TYPE_MEMBER`]).
 pub fn resource_type_rejection(resource_type: &str) -> Option<ParameterRejection> {
     (!RESOURCE_TYPES.contains(&resource_type)).then(|| {
         ParameterRejection::new(
-            "ResourceType",
-            format!(
-                "ResourceType {resource_type} isn't one of the resource types OpsCenter \
-                 supports: {}",
-                RESOURCE_TYPES.join(", ")
-            ),
+            ASSOCIATED_RESOURCE_TYPE_MEMBER,
+            not_valid_message("resourceType"),
         )
     })
 }

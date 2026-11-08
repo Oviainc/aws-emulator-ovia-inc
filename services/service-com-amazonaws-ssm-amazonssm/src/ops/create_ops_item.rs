@@ -328,20 +328,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             version: ops_items::FIRST_OPS_ITEM_VERSION,
         };
         let (ops_item_id, ops_item_arn) = (record.ops_item_id.clone(), record.arn());
-        let (status, version) = (record.status.clone(), record.version);
         store.insert_ops_item(record).map_err(limit_exceeded)?;
 
-        // A write to an OpsItem is an event of that OpsItem's trail, which is what
-        // `ListOpsItemEvents` reports: this create appends the first one, carrying what it
-        // persisted — the version the OpsItem is now at and the status it is now in.
-        store.record_ops_item_event(
-            &region,
-            &ops_item_id,
-            crate::state::ops_item_events::DETAIL_TYPE_CREATE,
-            crate::state::ops_item_events::written_detail(version, &status),
-            &created_by,
-            now,
-        );
+        // Opening an OpsItem records no entry in its event trail: what
+        // `ListOpsItemEvents` reports is the events OpsCenter itself recorded about an
+        // OpsItem, and the trail of one just created holds none — so nothing is appended
+        // here, and that listing reports an empty page until an event is recorded.
 
         Ok(CreateOpsItemOutput {
             ops_item_id: Some(ops_item_id),

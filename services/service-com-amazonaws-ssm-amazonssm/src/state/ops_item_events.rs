@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The event trail OpsCenter keeps for an OpsItem, and how a write to an OpsItem lands in
-//! it.
+//! The event trail OpsCenter keeps for an OpsItem, and how an event lands in it.
 //!
 //! `ListOpsItemEvents` "returns a list of all OpsItem events in the current Amazon Web
-//! Services Region and Amazon Web Services account", so the trail is a record of the
-//! WRITES this service made to its OpsItems: every call that creates or edits an OpsItem
-//! appends one event here ([`ComAmazonawsSsmAmazonssmState::record_ops_item_event`]), and
-//! the listing projects what those writes persisted ([`OpsItemEventRecord::to_summary`]).
-//! Nothing is invented at read time and a read appends nothing, so an account that has
-//! written no OpsItem has no events to list.
+//! Services Region and Amazon Web Services account", so the trail holds the events
+//! OpsCenter recorded about an OpsItem: an event enters it only through this module's one
+//! write path ([`ComAmazonawsSsmAmazonssmState::record_ops_item_event`]), and the listing
+//! projects what that write persisted ([`OpsItemEventRecord::to_summary`]). Nothing is
+//! invented at read time and a read appends nothing, so an OpsItem no event was recorded
+//! about — a just-opened one among them — has no events to list.
 //!
 //! An event is identified by a server-minted event id of the hyphenated UUID form
 //! ([`ComAmazonawsSsmAmazonssmState::mint_ops_item_event_id`]) and belongs to the Region
@@ -26,13 +25,8 @@ use crate::ops::types::{OpsItemEventSummary, OpsItemIdentity};
 /// events to Amazon EventBridge under.
 pub const OPS_ITEM_EVENT_SOURCE: &str = "aws.ssm";
 
-/// The `DetailType` of the event a create appends: the detail type Systems Manager names
-/// an OpsItem creation by.
-pub const DETAIL_TYPE_CREATE: &str = "OpsItem Create";
-
-/// The `DetailType` of the event an edit appends: the detail type Systems Manager names an
-/// OpsItem change by. Held here beside [`DETAIL_TYPE_CREATE`] so the one writer of the
-/// trail names both.
+/// The `DetailType` of the event an edit of an OpsItem records: the detail type Systems
+/// Manager names an OpsItem change by.
 pub const DETAIL_TYPE_UPDATE: &str = "OpsItem Update";
 
 /// The bounds the modelled `OpsItemEventMaxResults` carries (range 1..50).
@@ -139,7 +133,7 @@ pub struct OpsItemEventRecord {
     /// "The source of the OpsItem event" ([`OPS_ITEM_EVENT_SOURCE`]).
     pub source: String,
     /// "The type of information provided as a detail" — which write this event records
-    /// ([`DETAIL_TYPE_CREATE`], [`DETAIL_TYPE_UPDATE`]).
+    /// ([`DETAIL_TYPE_UPDATE`]).
     pub detail_type: String,
     /// "Specific information about the OpsItem event": the JSON document the writer built
     /// out of what it persisted ([`written_detail`]).
@@ -200,6 +194,12 @@ impl ComAmazonawsSsmAmazonssmState {
     /// caller reached it ([`Self::evict_ops_item_events_due`]): that OpsItem's trail keeps
     /// at most [`MAX_EVENTS_PER_OPS_ITEM`] events and the store at most
     /// [`MAX_OPS_ITEM_EVENTS`], the oldest dropped first.
+    ///
+    /// No handler of this crate reaches it yet, and that is not dead code: opening an
+    /// OpsItem records no event, and the write that does record one — an EDIT of an
+    /// OpsItem — is `UpdateOpsItem`, which still answers 501 under its own stub issue. The
+    /// trail is therefore empty until that write lands, and this is the path it appends
+    /// through.
     pub fn record_ops_item_event(
         &mut self,
         region: &str,
@@ -325,7 +325,7 @@ mod tests {
         let first = state.record_ops_item_event(
             "us-east-1",
             "oi-0123456789ab",
-            DETAIL_TYPE_CREATE,
+            DETAIL_TYPE_UPDATE,
             written_detail(1, "Open"),
             "arn:aws:sts::123456789012:assumed-role/tests/tests",
             at,
@@ -374,7 +374,7 @@ mod tests {
         state.record_ops_item_event(
             "us-east-1",
             "oi-ba9876543210",
-            DETAIL_TYPE_CREATE,
+            DETAIL_TYPE_UPDATE,
             written_detail(1, "Open"),
             "arn:aws:sts::123456789012:assumed-role/tests/tests",
             base,
