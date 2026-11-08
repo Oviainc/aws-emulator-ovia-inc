@@ -4,6 +4,12 @@
 //! Publishes metric data into this service's store. Implemented here — this is the
 //! ONLY file to touch for this operation.
 //!
+//! The datapoints this call stores are a metric UPDATE, so two things follow from the write
+//! without anybody calling CloudWatch again: every metric alarm over them is evaluated
+//! ([`crate::state::alarm_evaluation`]), and every running metric stream whose filters select
+//! them exports its records into its Amazon Data Firehose destination
+//! ([`crate::state::metric_stream_export`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -523,6 +529,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ingest.push((key, observations));
         }
 
+        // Which series and which periods this batch publishes into: what every running metric
+        // stream selecting them is owed a record for, taken before the batch is moved into the
+        // store below.
+        let published = crate::state::metric_stream_export::published_series(&ingest);
+
         // The lock is taken for the ingest only: an alarm evaluation takes it itself, and the
         // notifications it owes are delivered with it released.
         {
@@ -558,6 +569,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // watches is what makes its evaluation due.
             store.make_alarms_due(&written, now);
         }
+
+        // A metric stream "can automatically stream CloudWatch metrics to Amazon Web Services
+        // destinations" (`PutMetricStream`), so the metric update these datapoints are is
+        // exported to every running stream of this Region that selects them — the consumer
+        // downstream of the destination makes no CloudWatch call to see it.
+        crate::state::metric_stream_export::export_published(
+            &*self.engine,
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            &published,
+        )
+        .await;
 
         // These datapoints are what every metric alarm over them is evaluated from, so the
         // evaluations this write made due are materialised now and the action notifications

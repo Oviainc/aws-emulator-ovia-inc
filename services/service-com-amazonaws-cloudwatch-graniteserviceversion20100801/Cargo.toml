@@ -42,6 +42,12 @@ aws-sdk-sns = { version = "1", default-features = false }
 # on the instance the alarm watches (`state::alarm_actions::ec2_instance_actions`). Only the
 # generated client is needed — the emulator supplies the transport.
 aws-sdk-ec2 = { version = "1", default-features = false }
+# The AWS SDK for Amazon Data Firehose, driven over the same in-process callback: a running
+# metric stream exports its records into the delivery stream its `FirehoseArn` names with
+# `PutRecord` (`state::metric_stream_export`). Pinned to the release the other producers of
+# Firehose records in this workspace are pinned to, so one version of the client is locked.
+# Only the generated client is needed — the emulator supplies the transport.
+aws-sdk-firehose = { version = "=1.126.0", default-features = false }
 # GetMetricData's cursor carries a fixed-size digest of the request it was minted for, so a
 # token replayed against a different request is refused at constant token size.
 sha2 = { workspace = true }
@@ -84,6 +90,16 @@ service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 # action is an operation on an instance, so what it did is asserted on the instance EC2 itself
 # reports.
 service-com-amazonaws-ec2-amazonec2 = { workspace = true }
+# Amazon Data Firehose is mounted beside CloudWatch on one engine in the metric-stream
+# delivery suite, because a metric stream's destination is a Firehose delivery stream and the
+# exported records are asserted where a client sees them: in that stream's own destination.
+service-com-amazonaws-firehose-firehose-20150804 = { workspace = true }
+# Amazon S3 is mounted with it, because the Firehose destination the exported records land in
+# is an S3 bucket and that is where a consumer reads them.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The destination reads of that suite go through Amazon S3's own restXml wire, so its listings
+# are read with the same XML reader that service's tests use.
+quick-xml = "0.41"
 
 [lints]
 workspace = true

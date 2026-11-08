@@ -103,6 +103,10 @@ pub mod metric_query;
 /// store holds and drawn into the graph it answers with.
 pub mod metric_widget;
 
+/// The records a running metric stream exports into its Amazon Data Firehose destination for
+/// the metric updates this store takes.
+pub mod metric_stream_export;
+
 /// The usage telemetry this service publishes about its own API: the `CallCount` series every
 /// served call is counted into.
 pub mod usage;

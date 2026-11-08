@@ -4,6 +4,11 @@
 //! Creates or updates a metric stream in this service's store. Implemented here, and
 //! the ONLY file to touch for this operation.
 //!
+//! A stream this call leaves in the `running` state then EXPORTS the metric updates its
+//! filters select into the delivery stream its `FirehoseArn` names, which is
+//! [`crate::state::metric_stream_export`] rather than this file: the configuration is written
+//! here, and the records it arms are pushed from the call that publishes the datapoints.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
