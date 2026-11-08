@@ -5,22 +5,27 @@
 //! `AlgorithmSpecification` that does not name the training algorithm exactly once (the
 //! `AlgorithmName` reference is RESOLVED FIRST, so a request naming an algorithm this
 //! account does not hold is refused for that whatever else the spec carries) with a 400
-//! `ValidationException`, a `TrainingJobName` already in use with the modelled
-//! `ResourceInUse` and a request past the store's bound with the modelled
+//! `ValidationException`, a role SageMaker cannot assume or an input data source that names
+//! no object that role can list with the same class, a `TrainingJobName` already in use with
+//! the modelled `ResourceInUse` and a request past the store's bound with the modelled
 //! `ResourceLimitExceeded` — and stores it as `InProgress` together with the instant the
 //! clock owes its terminal status. The accepted request is kept as sent, but for the
 //! hyperparameters the service itself does not keep (see
 //! [`crate::state::retained_hyper_parameters`]). This is the ONLY file to touch for this
 //! operation.
 //!
-//! ## No training container ever runs here
+//! ## The accepted job is RUN, server-side
 //!
-//! The job's work is the container image the spec names, and this emulator has no
-//! container runtime, so the accepted job ends `Failed` with
-//! [`crate::state::NO_TRAINING_CONTAINER_RUNTIME_REASON`] rather than reporting a
-//! `Completed` nothing earned, a training duration nothing spent or metrics nothing
-//! measured. Everything around the run — admission, validation, the minted ARN, the
-//! replay through `DescribeTrainingJob`, the terminal status — is real.
+//! The run is this emulator's own ([`crate::state::run_training_job`]): it reads the
+//! training data the request's channels name out of Amazon S3 under the execution role,
+//! fits a model on those records, writes the model artifact under
+//! `OutputDataConfig.S3OutputPath` and measures the error it reports. It is performed HERE,
+//! before this handler answers, and its outcome is RECORDED on the stored job rather than
+//! revealed: the terminal status is owed by the clock, which
+//! [`crate::state::TrainingJob::settle_status`] materialises, so a caller that describes the
+//! job straight after creating it still observes `InProgress`. A run that could not read its
+//! data or write its artifact leaves the job's modelled `Failed` status with the reason
+//! naming that condition — never a `Completed` status for a run that produced nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -386,6 +391,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::execution_role_is_unassumable(ctx, &region, &input.role_arn).await {
             return Err(refuse(crate::state::could_not_assume_role(&input.role_arn)));
         }
+        // The job READS its channels as that role, so the input data sources are settled
+        // SYNCHRONOUSLY too: a location that answers no object the role may list backs no
+        // run of this job, so the create is refused for it and nothing is persisted. Awaited
+        // with no store guard held, like the role itself, and — for the same reason — only
+        // what was ANSWERED is refused.
+        //
+        // Weighed HERE, before the per-name and per-store rules below, for the same reason
+        // the role is: both are facts about the identity and the data this job would run
+        // with, settled before the store is locked at all. So a request that gets BOTH its
+        // data source and its name wrong is refused for the data source — what AWS orders
+        // these two refusals in is not recorded, and this keeps the whole admission in one
+        // readable order rather than splitting it across the store guard.
+        if let Some(refusal) = crate::state::absent_input_objects(ctx, &region, &input).await {
+            return Err(refuse(refusal));
+        }
         let arn = crate::state::resource_arn(&region, "training-job", &input.training_job_name);
         let now = ::std::time::SystemTime::now();
 
@@ -401,123 +421,194 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The algorithm is named EITHER by a registered `AlgorithmName` or by a
         // `TrainingImage`; the two are independent optional members the model cannot make
         // exclusive, so "exactly one" is this operation's own rule.
-        let mut store = state.lock();
+        //
+        // The store guard lives in a BLOCK of its own: the job's run is awaited below, and
+        // no state guard is ever held across an await.
+        {
+            let mut store = state.lock();
 
-        // The `AlgorithmName` reference is RESOLVED FIRST, before the exclusion is
-        // weighed: the service has to find the algorithm to know what the request asks
-        // for, so a name this account holds no algorithm under is refused for THAT — a
-        // request that also carries a `TrainingImage` included — rather than being
-        // classified as a conflict between two members. `AlgorithmName` is modelled
-        // `ArnOrName`, so either form resolves to the one stored record and the refusal
-        // reports the ARN it resolved to.
-        if let Some(named) = specification.algorithm_name.as_deref() {
-            let key = crate::state::name_from_arn_or_name(named);
-            if !store.algorithms.contains_key(key) {
-                let algorithm_arn = crate::state::resource_arn(&region, "algorithm", key);
-                return Err(refuse(crate::state::entity_does_not_exist(
-                    crate::state::ALGORITHM_ENTITY,
-                    &algorithm_arn,
-                )));
+            // The `AlgorithmName` reference is RESOLVED FIRST, before the exclusion is
+            // weighed: the service has to find the algorithm to know what the request asks
+            // for, so a name this account holds no algorithm under is refused for THAT — a
+            // request that also carries a `TrainingImage` included — rather than being
+            // classified as a conflict between two members. `AlgorithmName` is modelled
+            // `ArnOrName`, so either form resolves to the one stored record and the refusal
+            // reports the ARN it resolved to.
+            if let Some(named) = specification.algorithm_name.as_deref() {
+                let key = crate::state::name_from_arn_or_name(named);
+                if !store.algorithms.contains_key(key) {
+                    let algorithm_arn = crate::state::resource_arn(&region, "algorithm", key);
+                    return Err(refuse(crate::state::entity_does_not_exist(
+                        crate::state::ALGORITHM_ENTITY,
+                        &algorithm_arn,
+                    )));
+                }
             }
-        }
-        match (
-            specification.algorithm_name.is_some(),
-            specification.training_image.is_some(),
-        ) {
-            (true, true) => {
-                return Err(refuse(
-                    "AlgorithmSpecification may name only one of AlgorithmName and \
-                     TrainingImage.",
-                ));
+            match (
+                specification.algorithm_name.is_some(),
+                specification.training_image.is_some(),
+            ) {
+                (true, true) => {
+                    return Err(refuse(
+                        "AlgorithmSpecification may name only one of AlgorithmName and \
+                         TrainingImage.",
+                    ));
+                }
+                (false, false) => {
+                    return Err(refuse(
+                        "AlgorithmSpecification must name either AlgorithmName or \
+                         TrainingImage.",
+                    ));
+                }
+                _ => {}
             }
-            (false, false) => {
-                return Err(refuse(
-                    "AlgorithmSpecification must name either AlgorithmName or TrainingImage.",
-                ));
-            }
-            _ => {}
-        }
 
-        // `TrainingJobName`'s doc: "The name must be unique within an Amazon Web Services
-        // Region in an Amazon Web Services account." A name already in use is refused with
-        // the modelled `ResourceInUse`, never overwritten: otherwise the caller reads a 200
-        // for a job it did not create and loses the one it did. Checked before the store's
-        // bound, so the per-name rule answers the same whatever the store holds.
-        if store.training_jobs.contains_key(&input.training_job_name) {
-            return Err(CreateTrainingJobErrorModeled::ResourceInUse(ResourceInUse {
-                message: Some(format!(
-                    "Training job names must be unique within an Amazon Web Services \
-                     account and Region, and \"{}\" already exists.",
-                    input.training_job_name
-                )),
-            })
-            .into());
-        }
-        // The store is bounded, so a caller varying `TrainingJobName` cannot grow it
-        // without end. `ResourceLimitExceeded` is the limit failure this operation models.
-        // The bound is the emulator's OWN (`crate::state::MODEL_QUOTA`) rather than a
-        // published account quota, so the refusal states it in its own words instead of
-        // pointing at Service Quotas — the form every other store bound in this crate uses.
-        if !store.training_jobs_below_quota() {
-            return Err(CreateTrainingJobErrorModeled::ResourceLimitExceeded(
-                ResourceLimitExceeded {
+            // `TrainingJobName`'s doc: "The name must be unique within an Amazon Web
+            // Services Region in an Amazon Web Services account." A name already in use is
+            // refused with the modelled `ResourceInUse`, never overwritten: otherwise the
+            // caller reads a 200 for a job it did not create and loses the one it did.
+            // Checked before the store's bound, so the per-name rule answers the same
+            // whatever the store holds.
+            if store.training_jobs.contains_key(&input.training_job_name) {
+                return Err(CreateTrainingJobErrorModeled::ResourceInUse(ResourceInUse {
                     message: Some(format!(
-                        "The account-level service limit for training jobs is {}, with \
-                         current utilization of {} and a request delta of 1.",
-                        crate::state::TRAINING_JOB_QUOTA,
-                        store.training_jobs.len()
+                        "Training job names must be unique within an Amazon Web Services \
+                         account and Region, and \"{}\" already exists.",
+                        input.training_job_name
                     )),
+                })
+                .into());
+            }
+            // The store is bounded, so a caller varying `TrainingJobName` cannot grow it
+            // without end. `ResourceLimitExceeded` is the limit failure this operation
+            // models. The bound is the emulator's OWN (`crate::state::MODEL_QUOTA`) rather
+            // than a published account quota, so the refusal states it in its own words
+            // instead of pointing at Service Quotas — the form every other store bound in
+            // this crate uses.
+            if !store.training_jobs_below_quota() {
+                return Err(CreateTrainingJobErrorModeled::ResourceLimitExceeded(
+                    ResourceLimitExceeded {
+                        message: Some(format!(
+                            "The account-level service limit for training jobs is {}, with \
+                             current utilization of {} and a request delta of 1.",
+                            crate::state::TRAINING_JOB_QUOTA,
+                            store.training_jobs.len()
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // An empty-valued hyperparameter is not kept: the stored map holds only the
+            // entries a reader can tell from an absent key. See
+            // `crate::state::retained_hyper_parameters`.
+            input.hyper_parameters =
+                crate::state::retained_hyper_parameters(input.hyper_parameters);
+            // The service's own defaulting step, applied ONCE here so the record is the
+            // materialised job rather than the bare request.
+            materialise_job(&mut input);
+
+            store.training_jobs.insert(
+                input.training_job_name.clone(),
+                crate::state::TrainingJob {
+                    name: input.training_job_name.clone(),
+                    arn: arn.clone(),
+                    // AWS returns an accepted training job `InProgress` with nothing of its
+                    // work begun, so the move out of it is owed by the clock rather than
+                    // taken on this call.
+                    status: crate::state::TRAINING_STATUS_IN_PROGRESS.to_string(),
+                    secondary_status: Some(
+                        crate::state::TRAINING_SECONDARY_STATUS_STARTING.to_string(),
+                    ),
+                    creation_time: now,
+                    last_modified_time: now,
+                    training_end_time: None,
+                    // A warm pool is the cluster KEPT ALIVE after a run finishes
+                    // (`ResourceConfig$KeepAlivePeriodInSeconds`); no cluster is provisioned
+                    // for this job, so there is none to retain and no retained billable time
+                    // to report.
+                    warm_pool_status: None,
+                    training_plan_arn: input
+                        .resource_config
+                        .as_ref()
+                        .and_then(|config| config.training_plan_arn.clone()),
+                    failure_reason: None,
+                    // Filled in by the run below, once it has reported.
+                    run: None,
+                    training_start_time: None,
+                    model_artifacts: None,
+                    final_metrics: Vec::new(),
+                    ends_at: now + crate::state::TRAINING_JOB_ENDS_AFTER,
+                    // Set only on a training job a tuning job launched; a caller's own create
+                    // has no parent.
+                    tuning_job_arn: None,
+                    tags: input.tags.clone().unwrap_or_default(),
+                    request: input.clone(),
                 },
-            )
-            .into());
+            );
         }
 
-        // An empty-valued hyperparameter is not kept: the stored map holds only the
-        // entries a reader can tell from an absent key. See
-        // `crate::state::retained_hyper_parameters`.
-        input.hyper_parameters = crate::state::retained_hyper_parameters(input.hyper_parameters);
-        // The service's own defaulting step, applied ONCE here so the record is the
-        // materialised job rather than the bare request.
-        materialise_job(&mut input);
-
-        store.training_jobs.insert(
-            input.training_job_name.clone(),
-            crate::state::TrainingJob {
-                name: input.training_job_name.clone(),
-                arn: arn.clone(),
-                // AWS returns an accepted training job `InProgress` with nothing of its
-                // work begun, so the move out of it is owed by the clock rather than taken
-                // on this call.
-                status: crate::state::TRAINING_STATUS_IN_PROGRESS.to_string(),
-                secondary_status: Some(
-                    crate::state::TRAINING_SECONDARY_STATUS_STARTING.to_string(),
-                ),
-                creation_time: now,
-                last_modified_time: now,
-                training_end_time: None,
-                // A warm pool is the cluster KEPT ALIVE after a run finishes
-                // (`ResourceConfig$KeepAlivePeriodInSeconds`); no cluster is provisioned
-                // for this job, so there is none to retain and no retained billable time
-                // to report.
-                warm_pool_status: None,
-                training_plan_arn: input
-                    .resource_config
-                    .as_ref()
-                    .and_then(|config| config.training_plan_arn.clone()),
-                failure_reason: None,
-                ends_at: now + crate::state::TRAINING_JOB_ENDS_AFTER,
-                // Set only on a training job a tuning job launched; a caller's own create
-                // has no parent.
-                tuning_job_arn: None,
-                tags: input.tags.clone().unwrap_or_default(),
-                request: input,
-            },
-        );
-        drop(store);
+        // From here on the job exists, so whatever its run does — including this handler
+        // never getting to report it — is recorded against the record by the recorder's
+        // `Drop`. The outcome is RECORDED, not revealed: the terminal status is owed by the
+        // clock, which `TrainingJob::settle_status` materialises once the run has reported
+        // one and the span is over.
+        let mut recorder = RunOutcomeRecorder {
+            store: state.clone(),
+            job_name: input.training_job_name.clone(),
+            reported: false,
+        };
+        let outcome =
+            crate::state::run_training_job(ctx, &region, &input.training_job_name, &input).await;
+        recorder.report(outcome);
+        drop(recorder);
 
         crate::state::record_state_change(Self::NAME, &arn, ctx);
         Ok(CreateTrainingJobOutput {
             training_job_arn: arn,
         })
+    }
+}
+
+/// Records what the job's RUN reported onto the stored job, whatever happens to the request
+/// that started it.
+///
+/// The run belongs to the JOB, not to the create: once the record exists, the outcome has to
+/// reach it even if this handler is dropped mid-run (a cancelled request, a panic), because a
+/// job whose run never reported has no terminal status for the clock to materialise at all
+/// (`crate::state::TrainingJob::settle_status`) and would stay `InProgress` for the life of
+/// the process. A run nothing reported for is the server's own failure
+/// ([`crate::state::INTERNAL_FAILURE_REASON`]), written through this guard's `Drop` rather
+/// than by a line the unwinding path could skip.
+struct RunOutcomeRecorder {
+    store: ::engine::ServiceState<crate::state::ComAmazonawsSagemakerSagemakerState>,
+    job_name: String,
+    reported: bool,
+}
+
+impl RunOutcomeRecorder {
+    /// Write `outcome` onto the stored job, and remember that it has been written.
+    fn report(&mut self, outcome: crate::state::TrainingRunOutcome) {
+        self.reported = true;
+        self.record(outcome);
+    }
+
+    /// Write one outcome onto the stored job, at the instant it is reported, so the clock owes
+    /// the job's terminal status no earlier than the end of its own work.
+    fn record(&self, outcome: crate::state::TrainingRunOutcome) {
+        if let Some(job) = self.store.lock().training_jobs.get_mut(&self.job_name) {
+            job.record_run(outcome, ::std::time::SystemTime::now());
+        }
+    }
+}
+
+impl ::std::ops::Drop for RunOutcomeRecorder {
+    fn drop(&mut self) {
+        if self.reported {
+            return;
+        }
+        self.record(crate::state::TrainingRunOutcome::failed(
+            crate::state::INTERNAL_FAILURE_REASON,
+        ));
     }
 }

@@ -6,10 +6,12 @@
 //! clock already owes it, and refuses a name the account holds no job under with a 400
 //! `ValidationException`. This is the ONLY file to touch for this operation.
 //!
-//! Nothing ran the job's algorithm image (see `create_training_job.rs`), so the members
-//! that would report a run's own measurements — its start instant, its training and
-//! billable time, its final metrics, its secondary-status transitions and its rule
-//! evaluations — are absent rather than filled with values nothing produced.
+//! The members that report the job's own RUN — the object it wrote as
+//! `ModelArtifacts.S3ModelArtifacts`, its start instant, its training and billable time and
+//! the metrics it measured — are reported from the record the run wrote (see
+//! `create_training_job.rs` and [`crate::state::run_training_job`]); a run that has not
+//! reported yet has none of them. The debugger and profiler rule evaluations stay absent:
+//! no rule container is evaluated against the run.
 //!
 //! ## Shape of an operation
 //!
@@ -324,11 +326,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             labeling_job_arn: None,
             auto_ml_job_arn: None,
             model_artifacts: ModelArtifacts {
-                // The location a run WOULD write its artifacts to, derived from the
-                // output location the request named — not a claim that an object is there.
-                // Nothing started the image, which is what `FailureReason` says once the
-                // clock has settled the job.
-                s3_model_artifacts: job.model_artifacts_path(),
+                // The object the job's own RUN wrote, once it wrote one, and otherwise the
+                // location it writes to — which is where a job still running will put it.
+                s3_model_artifacts: job.reported_model_artifacts(),
             },
             training_job_status: job.status.clone(),
             // Required, and every stored job carries one; a record seeded without one
@@ -341,20 +341,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             creation_time: crate::state::timestamp(job.creation_time),
             last_modified_time: Some(crate::state::timestamp(job.last_modified_time)),
             training_end_time: job.training_end_time.map(crate::state::timestamp),
-            // Nothing started the algorithm image, so there is no instant the run began
-            // at, no time it spent and no metric it emitted. See
-            // `crate::state::NO_TRAINING_CONTAINER_RUNTIME_REASON`, which is the
-            // `FailureReason` above once the clock has settled the job.
-            training_start_time: None,
-            training_time_in_seconds: None,
-            billable_time_in_seconds: None,
+            // The instants the job's own run spans, and the whole seconds between them:
+            // set once the clock has settled the job, because the run is over by then.
+            // `BillableTimeInSeconds` is "the billable time in seconds" of that same run,
+            // and no cluster was kept alive beyond it.
+            training_start_time: job.training_start_time.map(crate::state::timestamp),
+            training_time_in_seconds: job.training_time_in_seconds(),
+            billable_time_in_seconds: job.training_time_in_seconds(),
             billable_token_count: None,
             // "A history of all of the secondary statuses that the training job has
             // transitioned through": the statuses this job has been in, with the instants
             // the record holds — so it says exactly what the job's own status and
             // `FailureReason` say.
             secondary_status_transitions: Some(job.secondary_status_transitions()),
-            final_metric_data_list: None,
+            // What the run MEASURED over the channels it read, once it reported it.
+            final_metric_data_list: (!job.final_metrics.is_empty())
+                .then(|| job.final_metrics.clone()),
             // A debugger or profiler rule is evaluated against a running job; none ran.
             debug_rule_evaluation_statuses: None,
             profiler_rule_evaluation_statuses: None,

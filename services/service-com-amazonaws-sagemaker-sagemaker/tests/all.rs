@@ -213,6 +213,8 @@ mod studio_app_lifecycle;
 mod training_job_admission;
 #[path = "all/training_job_constraint_admission.rs"]
 mod training_job_constraint_admission;
+#[path = "all/training_job_execution.rs"]
+mod training_job_execution;
 #[path = "all/training_job_hyperparameters.rs"]
 mod training_job_hyperparameters;
 #[path = "all/trial_component_association.rs"]

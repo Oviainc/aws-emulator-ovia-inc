@@ -84,6 +84,24 @@ pub fn execution_role_arn_is_invalid(role_arn: &str) -> String {
     )
 }
 
+/// How `CreateTrainingJob` words an input data source it found no object under: the S3 URL AS
+/// THE CALLER SENT IT, the Region the request addressed, the role it supplied and the bucket
+/// that role has to be allowed to list — the three things that can make the location answer
+/// nothing.
+///
+/// One sentence for one condition: whether the bucket is in another Region, holds nothing
+/// under that prefix, or is one the role may not list, what the caller is told is that the
+/// data source names no object.
+#[must_use]
+pub fn no_s3_objects_found(s3_url: &str, region: &str, role_arn: &str, bucket: &str) -> String {
+    format!(
+        "No S3 objects found under S3 URL \"{s3_url}\" given in input data source. Please \
+         ensure that the bucket exists in the selected region ({region}), that objects exist \
+         under that S3 prefix, and that the role \"{role_arn}\" has \"s3:ListBucket\" \
+         permissions on bucket \"{bucket}\"."
+    )
+}
+
 /// How a resource whose create was ACCEPTED with a role SageMaker cannot assume reports why
 /// it never became usable: the `FailureReason` it carries once the clock settles it into its
 /// modelled failed status, naming the role the request supplied.

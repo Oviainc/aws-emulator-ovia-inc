@@ -727,14 +727,20 @@ fn training_job_entity(job: &crate::state::TrainingJob) -> TrainingJob {
         training_job_arn: Some(job.arn.clone()),
         tuning_job_arn: job.tuning_job_arn.clone(),
         model_artifacts: Some(ModelArtifacts {
-            s3_model_artifacts: job.model_artifacts_path(),
+            s3_model_artifacts: job.reported_model_artifacts(),
         }),
         training_job_status: Some(job.status.clone()),
         secondary_status: job.secondary_status.clone(),
         failure_reason: job.failure_reason.clone(),
         creation_time: Some(crate::state::timestamp(job.creation_time)),
         last_modified_time: Some(crate::state::timestamp(job.last_modified_time)),
+        training_start_time: job.training_start_time.map(crate::state::timestamp),
         training_end_time: job.training_end_time.map(crate::state::timestamp),
+        training_time_in_seconds: job.training_time_in_seconds(),
+        billable_time_in_seconds: job.training_time_in_seconds(),
+        secondary_status_transitions: Some(job.secondary_status_transitions()),
+        final_metric_data_list: (!job.final_metrics.is_empty())
+            .then(|| job.final_metrics.clone()),
         warm_pool_status: job.warm_pool_status.clone(),
         hyper_parameters: request.hyper_parameters,
         algorithm_specification: request.algorithm_specification,
@@ -759,8 +765,8 @@ fn training_job_entity(job: &crate::state::TrainingJob) -> TrainingJob {
         model_package_config: request.model_package_config,
         tags: tag_list(&job.tags),
         // Every member left here is one nothing in this emulator holds a value for, for
-        // the reasons `DescribeTrainingJob` gives: no run started, so there is no start
-        // instant, no metric, no secondary-status transition and no debugger evaluation.
+        // the reasons `DescribeTrainingJob` gives: no labeling or AutoML job owns the
+        // record, and no debugger rule container is evaluated against the run.
         ..Default::default()
     }
 }

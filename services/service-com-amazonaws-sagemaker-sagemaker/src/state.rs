@@ -130,8 +130,8 @@ pub use job_config_schema::{
 /// Re-exported below, so a handler names them as `crate::state::…` like every other slice.
 pub mod admission;
 pub use admission::{
-    could_not_assume_role, execution_role_is_unassumable, vpc_placement_refusal,
-    SECURITY_GROUPS_NOT_SPECIFIED, SERVICE_PRINCIPAL,
+    could_not_assume_role, execution_role_is_unassumable, no_s3_objects_found,
+    vpc_placement_refusal, SECURITY_GROUPS_NOT_SPECIFIED, SERVICE_PRINCIPAL,
 };
 
 /// The cluster-policy slice of this state: HyperPod clusters and the cluster policies
@@ -985,6 +985,11 @@ pub mod custom_image;
 /// The job slices (training, processing and transform jobs): see `state/jobs.rs`.
 pub mod jobs;
 pub use jobs::*;
+
+/// The server-side RUN of an accepted training job — the training data it reads, the model
+/// it fits, the artifact it writes and the metrics it measures: see `state/training_run.rs`.
+pub mod training_run;
+pub use training_run::*;
 
 /// The lineage-action slice: see `state/lineage_action.rs`.
 pub mod lineage_action;

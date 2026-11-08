@@ -289,10 +289,16 @@ async fn an_accepted_training_job_reads_back_through_describe() {
     }
 }
 
-/// RULE: the move out of `InProgress` is owed by the CLOCK, and because no container
-/// runtime starts the algorithm image the job lands in the modelled failure status
-/// carrying the reason that says so — never `Completed`, and never with artifacts, metrics
-/// or a billable time for work nothing performed.
+/// RULE: the move out of `InProgress` is owed by the CLOCK, and the terminal status is the
+/// one the job's own RUN reported — so a job whose training data could not be read lands in
+/// the modelled failure status carrying the `ClientError:` reason that names the download leg
+/// it failed on, the channel and its location, never a `Completed` status with artifacts,
+/// metrics or a billable time for work that produced nothing.
+///
+/// This suite mounts SageMaker alone, so there is no Amazon S3 holding the channel's objects:
+/// what the run reads is therefore unreadable, which is exactly the condition asserted here.
+/// The COMPLETED path, with Amazon S3 and IAM mounted beside SageMaker, is
+/// `crate::training_job_execution`.
 #[tokio::test]
 async fn the_clock_settles_a_training_job_into_its_terminal_status() {
     let emulator = Emulator::new();
@@ -314,16 +320,33 @@ async fn the_clock_settles_a_training_job_into_its_terminal_status() {
             str_field(&settled, "SecondaryStatus"),
         ),
         ("Failed".to_string(), "Failed".to_string()),
-        "case settled: the terminal status of a job nothing ran, got {settled}"
+        "case settled: the terminal status of a job whose data could not be read, got \
+         {settled}"
+    );
+    let reason = settled
+        .get("FailureReason")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let expected_prefix = "ClientError: Data download failed:";
+    assert!(
+        reason.starts_with(expected_prefix)
+            && reason.contains("for channel train")
+            && reason.contains("s3://demo/train/"),
+        "case settled: the reason must start with {expected_prefix:?} and name the channel \
+         and its location, got {reason:?}"
     );
     assert_eq!(
-        settled.get("FailureReason").and_then(Value::as_str),
-        Some(service_com_amazonaws_sagemaker_sagemaker::state::NO_TRAINING_CONTAINER_RUNTIME_REASON),
-        "case settled: the reason the job failed, got {settled}"
+        settled
+            .get("ModelArtifacts")
+            .map(|artifacts| str_field(artifacts, "S3ModelArtifacts")),
+        Some(format!("s3://demo/output/{name}/output/model.tar.gz")),
+        "case settled: a failed run reports the location it would have written to, got \
+         {settled}"
     );
     assert!(
-        settled.get("TrainingEndTime").is_some() && settled.get("TrainingStartTime").is_none(),
-        "case settled: a job that ended without starting, got {settled}"
+        settled.get("FinalMetricDataList").is_none(),
+        "case settled: a failed run reports no metric it did not measure, got {settled}"
     );
 
     // The transition is the clock's, so a later read answers the same thing.

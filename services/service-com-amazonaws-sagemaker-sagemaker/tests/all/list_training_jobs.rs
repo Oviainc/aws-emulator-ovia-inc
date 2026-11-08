@@ -132,8 +132,13 @@ fn job(name: &str, status: &str, created: u64, modified: u64) -> TrainingJob {
         warm_pool_status: None,
         training_plan_arn: None,
         failure_reason: None,
-        // The listing reports neither, and a row seeded in a terminal status is already
-        // where the clock would leave it.
+        // A row seeded in a terminal status is already where the clock would leave it, so
+        // it carries no recorded run, and the listing reports neither it nor the artifact,
+        // the start instant and the metrics a run reports.
+        run: None,
+        training_start_time: None,
+        model_artifacts: None,
+        final_metrics: Vec::new(),
         ends_at: at(modified),
         tuning_job_arn: None,
         request: CreateTrainingJobInput::default(),

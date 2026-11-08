@@ -22,34 +22,34 @@ use super::*;
 pub const TRAINING_JOB_ENDS_AFTER: Duration = Duration::from_millis(400);
 
 /// `TrainingJobStatus`'s members this emulator moves a training job through (the modelled
-/// enum also carries `Completed`, `Stopping`, `Stopped` and `Deleting`, which this slice
-/// does not reach: `StopTrainingJob` and `DeleteTrainingJob` are still stubs). Named once
-/// here so no handler compares a bare string literal.
+/// enum also carries `Stopping`, `Stopped` and `Deleting`, which this slice does not reach:
+/// `StopTrainingJob` and `DeleteTrainingJob` are still stubs). Named once here so no handler
+/// compares a bare string literal.
 pub const TRAINING_STATUS_IN_PROGRESS: &str = "InProgress";
+/// See [`TRAINING_STATUS_IN_PROGRESS`]: the status of a job whose run finished.
+pub const TRAINING_STATUS_COMPLETED: &str = "Completed";
 /// See [`TRAINING_STATUS_IN_PROGRESS`].
 pub const TRAINING_STATUS_FAILED: &str = "Failed";
 
 /// The `SecondaryStatus` an accepted training job carries: the job has been accepted and
-/// no stage of its work has begun. Every other non-terminal member of that enum
-/// (`Downloading`, `Training`, `Uploading`, …) would name work this emulator does not run.
+/// no stage of its work has begun.
 pub const TRAINING_SECONDARY_STATUS_STARTING: &str = "Starting";
 /// See [`TRAINING_SECONDARY_STATUS_STARTING`]: the member that goes with
-/// [`TRAINING_STATUS_FAILED`] (`SecondaryStatus` spells it exactly as `TrainingJobStatus`
-/// does).
+/// [`TRAINING_STATUS_COMPLETED`] (`SecondaryStatus` spells it exactly as
+/// `TrainingJobStatus` does).
+pub const TRAINING_SECONDARY_STATUS_COMPLETED: &str = "Completed";
+/// See [`TRAINING_SECONDARY_STATUS_STARTING`]: the member that goes with
+/// [`TRAINING_STATUS_FAILED`].
 pub const TRAINING_SECONDARY_STATUS_FAILED: &str = "Failed";
 
-/// `FailureReason` of a training job whose algorithm image could not be run here.
+/// `FailureReason` of a training job whose run never reported at all — the request that
+/// started it did not get to the end of its own handler, so nothing is known about the work.
 ///
-/// A training job runs a container image (`AlgorithmSpecification$TrainingImage`, or the
-/// image an algorithm's `TrainingSpecification` names). This emulator has no container
-/// runtime, so the run the caller asked for ends in the modelled `Failed` state with this
-/// reason rather than reporting a `Completed` nothing earned, a training duration nothing
-/// spent or final metrics nothing measured. Within the modelled `FailureReason` length
-/// (0..1024). Everything around the run — accepting the job, validating it, minting its
-/// ARN, replaying it, reporting its terminal status — is real.
-pub const NO_TRAINING_CONTAINER_RUNTIME_REASON: &str =
-    "This emulator has no container runtime, so the training job's algorithm image was \
-     never started and no model artifacts were written to the output S3 location";
+/// The class AWS reports for a failure on its own side rather than in the caller's
+/// configuration, so a client classifies it as retryable. A run that DID report says what it
+/// found instead (see [`crate::state::training_run`]).
+pub const INTERNAL_FAILURE_REASON: &str =
+    "InternalServerError: We encountered an internal error. Please try again.";
 
 /// A training job created by `CreateTrainingJob`, as `DescribeTrainingJob` replays it and
 /// `ListTrainingJobs` summarises it.
@@ -89,6 +89,19 @@ pub struct TrainingJob {
     pub training_plan_arn: Option<String>,
     /// Why the job is in a terminal failure status, once it reached one.
     pub failure_reason: Option<String>,
+    /// What the job's RUN reported ([`crate::state::run_training_job`]), recorded by the
+    /// create that started it and revealed by the clock ([`Self::settle_status`]). `None`
+    /// while the run has not reported.
+    pub run: Option<crate::state::TrainingRunOutcome>,
+    /// "Indicates the time when the training job starts on training instances"
+    /// (`DescribeTrainingJob$TrainingStartTime`): set once the clock has settled the job,
+    /// because the run's own work begins after the job is accepted.
+    pub training_start_time: Option<SystemTime>,
+    /// The object the run wrote the model artifacts to, once it wrote one.
+    pub model_artifacts: Option<String>,
+    /// "The name, value, and date and time of a metric that was emitted" by the run, once
+    /// it reported any.
+    pub final_metrics: Vec<crate::ops::types::MetricData>,
     /// When the clock owes this job its move out of `InProgress`.
     pub ends_at: SystemTime,
     /// The hyperparameter tuning job that launched this training job, when one did
@@ -110,20 +123,77 @@ impl TrainingJob {
     ///
     /// This is the one write a reporting operation may make: the transition was due at
     /// `ends_at` whether or not anybody described the job, so the observer makes no
-    /// difference to the result. The terminal status is [`TRAINING_STATUS_FAILED`] with
-    /// [`NO_TRAINING_CONTAINER_RUNTIME_REASON`], for the reason that constant gives.
+    /// difference to the result. The terminal status is the one the job's own RUN reported
+    /// ([`Self::run`]) — `Completed` with the artifact it wrote and the metrics it measured,
+    /// or `Failed` with the condition that stopped it.
+    ///
+    /// A job whose run has NOT reported yet is not settled at all, whatever the clock says:
+    /// the terminal status IS the run's, so there is none to materialise until the run has
+    /// one, and [`Self::record_run`] pushes the due instant out to the moment it reports. So
+    /// no reader can turn a run that is still going into a failure, and a run slower than
+    /// [`TRAINING_JOB_ENDS_AFTER`] still settles into what it actually produced.
     ///
     /// Answers whether the transition happened on this call, so the caller can record it.
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
-        if self.status == TRAINING_STATUS_IN_PROGRESS && now >= self.ends_at {
-            self.status = TRAINING_STATUS_FAILED.to_string();
-            self.secondary_status = Some(TRAINING_SECONDARY_STATUS_FAILED.to_string());
-            self.failure_reason = Some(NO_TRAINING_CONTAINER_RUNTIME_REASON.to_string());
-            self.last_modified_time = self.ends_at;
-            self.training_end_time = Some(self.ends_at);
-            return true;
+        if self.status != TRAINING_STATUS_IN_PROGRESS || now < self.ends_at {
+            return false;
         }
-        false
+        match self.run.clone() {
+            Some(crate::state::TrainingRunOutcome::Completed {
+                model_artifacts,
+                final_metrics,
+            }) => {
+                self.status = TRAINING_STATUS_COMPLETED.to_string();
+                self.secondary_status = Some(TRAINING_SECONDARY_STATUS_COMPLETED.to_string());
+                self.model_artifacts = Some(model_artifacts);
+                self.final_metrics = final_metrics;
+            }
+            Some(crate::state::TrainingRunOutcome::Failed { reason }) => {
+                self.status = TRAINING_STATUS_FAILED.to_string();
+                self.secondary_status = Some(TRAINING_SECONDARY_STATUS_FAILED.to_string());
+                self.failure_reason = Some(reason);
+            }
+            // The run has not reported: nothing is owed until it does.
+            None => return false,
+        }
+        // The run's work begins once the job is accepted and is over by the instant the
+        // clock settles it, which is the span the describe reports.
+        self.training_start_time = Some(self.creation_time);
+        self.last_modified_time = self.ends_at;
+        self.training_end_time = Some(self.ends_at);
+        true
+    }
+
+    /// Record what the job's RUN reported, `at` the instant it reported.
+    ///
+    /// The clock owes the job its terminal status [`TRAINING_JOB_ENDS_AFTER`] after the create
+    /// — but it cannot owe it before the work is over, so a run that took longer than that
+    /// span pushes the due instant out to the moment it reported. The status the clock then
+    /// materialises is always the one the run produced.
+    pub fn record_run(&mut self, outcome: crate::state::TrainingRunOutcome, at: SystemTime) {
+        self.run = Some(outcome);
+        if at > self.ends_at {
+            self.ends_at = at;
+        }
+    }
+
+    /// "The training time in seconds" (`DescribeTrainingJob$TrainingTimeInSeconds`): the
+    /// span between the instant the run started and the instant it ended, rounded UP to the
+    /// whole seconds AWS reports, and `None` for a job that has not ended.
+    pub fn training_time_in_seconds(&self) -> Option<i32> {
+        let started = self.training_start_time?;
+        let ended = self.training_end_time?;
+        let span = ended.duration_since(started).unwrap_or(Duration::ZERO);
+        let seconds = span.as_secs() + u64::from(span.subsec_nanos() > 0);
+        i32::try_from(seconds).ok()
+    }
+
+    /// The object `ModelArtifacts$S3ModelArtifacts` reports: the one the run WROTE once it
+    /// has, and otherwise the location it would write to ([`Self::model_artifacts_path`]).
+    pub fn reported_model_artifacts(&self) -> String {
+        self.model_artifacts
+            .clone()
+            .unwrap_or_else(|| self.model_artifacts_path())
     }
 
     /// Where the job's model artifacts are written, from the output location the request
@@ -139,7 +209,11 @@ impl TrainingJob {
             .output_data_config
             .s3_output_path
             .trim_end_matches('/');
-        format!("{base}/{}/output/model.tar.gz", self.name)
+        format!(
+            "{base}/{}/output/{}",
+            self.name,
+            crate::state::MODEL_ARCHIVE_OBJECT
+        )
     }
 
     /// "Profiling status of a training job" (`ProfilingStatus`), which follows the
@@ -573,5 +647,142 @@ impl InferenceRecommendationsJob {
             return true;
         }
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A training job as `CreateTrainingJob` stores one, created at `created` and owed its
+    /// terminal status [`TRAINING_JOB_ENDS_AFTER`] later.
+    fn stored_job(created: SystemTime) -> TrainingJob {
+        TrainingJob {
+            name: "clock-probe".to_string(),
+            arn: "arn:aws:sagemaker:us-east-1:000000000000:training-job/clock-probe".to_string(),
+            status: TRAINING_STATUS_IN_PROGRESS.to_string(),
+            secondary_status: Some(TRAINING_SECONDARY_STATUS_STARTING.to_string()),
+            creation_time: created,
+            last_modified_time: created,
+            training_end_time: None,
+            warm_pool_status: None,
+            training_plan_arn: None,
+            failure_reason: None,
+            run: None,
+            training_start_time: None,
+            model_artifacts: None,
+            final_metrics: Vec::new(),
+            ends_at: created + TRAINING_JOB_ENDS_AFTER,
+            tuning_job_arn: None,
+            request: crate::ops::types::CreateTrainingJobInput::default(),
+            tags: Vec::new(),
+        }
+    }
+
+    /// RULE: the terminal status a reader materialises is the one the job's own RUN reported,
+    /// and a job whose run has not reported is not settled at all however late the read is —
+    /// so a run slower than the clock's span still settles into what it produced.
+    ///
+    /// The rows differ along WHEN the read happens and WHETHER the run has reported.
+    #[test]
+    fn a_job_is_settled_only_once_its_run_has_reported() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let past_due = created + TRAINING_JOB_ENDS_AFTER + Duration::from_millis(1);
+
+        // Rows: the case, whether the run has reported, when the read happens, and the status
+        // the read must leave behind.
+        let rows: [(&str, Option<&str>, SystemTime, &str); 4] = [
+            (
+                "read before the span is over, run not reported",
+                None,
+                created,
+                TRAINING_STATUS_IN_PROGRESS,
+            ),
+            (
+                "read past the span, run still going",
+                None,
+                past_due,
+                TRAINING_STATUS_IN_PROGRESS,
+            ),
+            (
+                "read past the span, the run completed",
+                Some(TRAINING_STATUS_COMPLETED),
+                past_due,
+                TRAINING_STATUS_COMPLETED,
+            ),
+            (
+                "read past the span, the run failed",
+                Some(TRAINING_STATUS_FAILED),
+                past_due,
+                TRAINING_STATUS_FAILED,
+            ),
+        ];
+
+        for (case, reported, read_at, expected) in rows {
+            let mut job = stored_job(created);
+            if let Some(outcome) = reported {
+                let outcome = if outcome == TRAINING_STATUS_COMPLETED {
+                    crate::state::TrainingRunOutcome::Completed {
+                        model_artifacts: "s3://bucket/clock-probe/output/model.tar.gz".to_string(),
+                        final_metrics: Vec::new(),
+                    }
+                } else {
+                    crate::state::TrainingRunOutcome::failed("ClientError: the probe's reason")
+                };
+                job.record_run(outcome, created);
+            }
+            let settled = job.settle_status(read_at);
+            assert_eq!(
+                (settled, job.status.as_str()),
+                (expected != TRAINING_STATUS_IN_PROGRESS, expected),
+                "case {case:?}: expected the status {expected}, got {:?}",
+                job.status
+            );
+            // A second read changes nothing: the transition is the clock's.
+            let again = job.settle_status(read_at);
+            assert!(
+                !again && job.status == expected,
+                "case {case:?}: a second read must answer the same thing, got {:?}",
+                job.status
+            );
+        }
+    }
+
+    /// RULE: the clock cannot owe a terminal status before the work is over — a run that
+    /// reports after the span pushes the due instant out to the moment it reported, and the
+    /// status it produced is then what a later read materialises.
+    #[test]
+    fn a_run_slower_than_the_span_pushes_the_due_instant_out() {
+        let created = SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let reported_at = created + TRAINING_JOB_ENDS_AFTER + Duration::from_secs(5);
+        let mut job = stored_job(created);
+        job.record_run(
+            crate::state::TrainingRunOutcome::Completed {
+                model_artifacts: "s3://bucket/clock-probe/output/model.tar.gz".to_string(),
+                final_metrics: Vec::new(),
+            },
+            reported_at,
+        );
+        assert_eq!(
+            job.ends_at, reported_at,
+            "expected the due instant to be the one the run reported at, got {:?}",
+            job.ends_at
+        );
+        assert!(
+            !job.settle_status(reported_at - Duration::from_millis(1)),
+            "a read before the run reported must settle nothing, got {:?}",
+            job.status
+        );
+        assert!(
+            job.settle_status(reported_at) && job.status == TRAINING_STATUS_COMPLETED,
+            "expected the completed status the run produced, got {:?}",
+            job.status
+        );
+        assert_eq!(
+            job.training_time_in_seconds(),
+            Some(6),
+            "expected the whole seconds between the start and the end of the run, got {:?}",
+            job.training_time_in_seconds()
+        );
     }
 }
