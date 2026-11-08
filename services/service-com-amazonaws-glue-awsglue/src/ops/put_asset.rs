@@ -205,6 +205,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // "The forms to set on the asset, keyed by form name": one put decides what every
+        // later read of this asset serialises — a read reports the forms as a map and as a
+        // list beside it — and what this handler spends resolving the form types the entries
+        // name, so a request past the ceiling one asset may hold
+        // ([`crate::state::MAX_ASSET_FORMS`]) is refused BEFORE any of it is walked. This
+        // emulator's own capacity ceiling, like the number of assets it will hold
+        // (`crate::state::MAX_ASSETS`) and the terms one asset may be associated with
+        // (`crate::state::MAX_ASSET_GLOSSARY_TERMS`), and refused the way those are: this
+        // operation models no limit error, so the closest client error it does model carries
+        // it, in a sentence worded like the association's own.
+        if input.forms.len() > crate::state::MAX_ASSET_FORMS {
+            return Err(PutAssetErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(format!(
+                        "An asset cannot hold more than {} forms",
+                        crate::state::MAX_ASSET_FORMS
+                    )),
+                    from_federation_source: None,
+                },
+            )
+            .into());
+        }
+
         // "Each entry specifies the form type and its JSON content": the form type an entry
         // names resolves against this store's form types, exactly as an asset type's form
         // reference does, so an entry naming a form type that was never registered is

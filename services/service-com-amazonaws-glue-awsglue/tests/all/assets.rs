@@ -25,7 +25,8 @@ use std::sync::Arc;
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_glue_awsglue::state::{
-    AssetEntry, ComAmazonawsGlueAwsglueState, MAX_ASSETS,
+    AssetEntry, ComAmazonawsGlueAwsglueState, CATALOG_RESOURCE_FORM_NAME,
+    CATALOG_RESOURCE_FORM_TYPE_ID, MAX_ASSETS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -95,6 +96,27 @@ fn instant(case: &str, body: &Value, member: &str) -> f64 {
 /// An identifier of exactly `length` characters that satisfies `AssetId`'s pattern.
 fn identifier_of_length(length: usize) -> String {
     "a".repeat(length)
+}
+
+/// The forms a `GetAsset` reports MINUS the catalog's own: the forms the asset's own puts
+/// stored, which is what a row's request names.
+///
+/// Every read of an asset reports the catalog's own form on it beside them
+/// ([`CATALOG_RESOURCE_FORM_NAME`]), which this asserts on each read it is used on, so a
+/// row comparing the stored forms against the request it sent does not restate it.
+fn stored_forms(case: &str, read: &Value) -> Value {
+    let mut forms = read
+        .get("Forms")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_else(|| panic!("case {case}: GetAsset must report Forms, got {read}"));
+    let catalog_form = forms.remove(CATALOG_RESOURCE_FORM_NAME);
+    assert_eq!(
+        catalog_form.as_ref(),
+        Some(&json!({ "FormTypeId": CATALOG_RESOURCE_FORM_TYPE_ID })),
+        "case {case}: every read must report the catalog's own form, got {read}"
+    );
+    Value::Object(forms)
 }
 
 // ---------------------------------------------------------------------------
@@ -265,14 +287,14 @@ async fn put_assets_are_read_back_from_the_store() {
                 read.get("Name"),
                 read.get("Description"),
                 read.get("AssetTypeId"),
-                read.get("Forms"),
+                &stored_forms(case, &read),
             ),
             (
                 request.get("Identifier"),
                 request.get("Name"),
                 request.get("Description"),
                 request.get("AssetTypeId"),
-                Some(sent_forms),
+                sent_forms,
             ),
             "case {case}: GetAsset must report the asset the put stored, got {read}"
         );
@@ -303,7 +325,7 @@ async fn put_assets_are_read_back_from_the_store() {
         let identifier = request["Identifier"].as_str().expect("the row has one");
         let read = get(&router, identifier).await;
         assert_eq!(
-            (read.get("Name"), read.get("Forms")),
+            (read.get("Name"), Some(&stored_forms(case, &read))),
             (request.get("Name"), request.get("Forms")),
             "case {case}: each asset keeps its own name and forms, got {read}"
         );
@@ -498,7 +520,7 @@ async fn a_put_under_a_stored_identifier_updates_that_asset() {
                 read.get("AssetTypeId"),
                 read.get("Name"),
                 read.get("Description"),
-                read.get("Forms"),
+                Some(&stored_forms(case, &read)),
             ),
             (
                 after.get("AssetTypeId"),
@@ -520,7 +542,7 @@ async fn a_put_under_a_stored_identifier_updates_that_asset() {
     // Nothing an update did reached the asset it did not name.
     let read = get(&router, "bystander").await;
     assert_eq!(
-        (read.get("Name"), read.get("Forms")),
+        (read.get("Name"), Some(&stored_forms("bystander", &read))),
         (bystander.get("Name"), bystander.get("Forms")),
         "case bystander: an update must change only the asset it names, got {read}"
     );
@@ -587,7 +609,10 @@ async fn a_put_retried_under_its_own_token_is_idempotent() {
              {answered}"
         );
         assert_eq!(
-            (read.get("Name").and_then(Value::as_str), read.get("Forms")),
+            (
+                read.get("Name").and_then(Value::as_str),
+                Some(&stored_forms(case, &read))
+            ),
             (Some(expected_name), Some(expected_forms)),
             "case {case}: expected the store to hold {expected_name:?}, got {read}"
         );
@@ -642,7 +667,7 @@ async fn a_put_retried_under_its_own_token_is_idempotent() {
     );
     let read = get(&router, "stale-retry").await;
     assert_eq!(
-        read.get("Forms"),
+        Some(&stored_forms("a retry whose form type is gone", &read)),
         created.get("Forms"),
         "case a retry whose form type is gone: the stored asset must be left as it was, got \
          {read}"
@@ -844,7 +869,7 @@ async fn a_put_naming_an_unregistered_asset_type_or_form_type_is_refused() {
     .await;
     let read = get(&router, "resolving").await;
     assert_eq!(
-        read.get("Forms"),
+        Some(&stored_forms("every reference resolves", &read)),
         served.get("Forms"),
         "case every reference resolves: expected the stored forms, got {read}"
     );

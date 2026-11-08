@@ -21,12 +21,68 @@ pub struct AssociateGlossaryTermsInput {
     pub client_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#AssociateGlossaryTermsResponse")]
+/// `AssociateGlossaryTerms`'s response: the four members the model declares, in the
+/// model's own member order, and the asset the association was addressed to appended last.
+///
+/// Member set and order from
+/// `smithy_query(query="operation", operation="AssociateGlossaryTerms")`, plus `Identifier`
+/// — a member the real service reports and the on-disk model omits, which is why the schema
+/// and the serializer come from `types/recorded_catalog_members.rs` rather than from the
+/// derive (see that module's note).
 #[derive(Debug, Clone, Default)]
 pub struct AssociateGlossaryTermsOutput {
     pub asset_identifier: Option<String>,
     pub iterable_form_name: Option<String>,
     pub item_identifier: Option<String>,
     pub glossary_terms: Option<Vec<String>>,
+    pub identifier: Option<String>,
 }
+
+glue_schema_and_serializer!(
+    AssociateGlossaryTermsOutput,
+    ASSOCIATE_GLOSSARY_TERMS_OUTPUT_SCHEMA,
+    "com.amazonaws.glue#AssociateGlossaryTermsResponse",
+    "com.amazonaws.glue",
+    "AssociateGlossaryTermsResponse",
+    (
+        M_ASSET_IDENTIFIER,
+        asset_identifier,
+        "AssetIdentifier",
+        0,
+        opt,
+        string
+    ),
+    (
+        M_ITERABLE_FORM_NAME,
+        iterable_form_name,
+        "IterableFormName",
+        1,
+        opt,
+        string
+    ),
+    (
+        M_ITEM_IDENTIFIER,
+        item_identifier,
+        "ItemIdentifier",
+        2,
+        opt,
+        string
+    ),
+    (
+        M_GLOSSARY_TERMS,
+        glossary_terms,
+        "GlossaryTerms",
+        3,
+        opt,
+        list_of_string
+    ),
+    (
+        M_IDENTIFIER,
+        identifier,
+        "Identifier",
+        4,
+        opt,
+        recorded("com.amazonaws.glue.recorded", string)
+    ),
+);
 

@@ -128,6 +128,16 @@ pub fn error_message(body: &Value) -> String {
         .to_string()
 }
 
+/// The `Id` a READ of the business-catalog asset type registered under `name` reports: the
+/// catalog-qualified form `glue_<accountId>::<name>`, where the put that registered it
+/// reports the bare `name`.
+///
+/// One copy, shared: every suite that reads an asset type back expects the same form, and
+/// both forms address the record.
+pub fn qualified_asset_type_id(name: &str) -> String {
+    format!("glue_{ACCOUNT_ID}::{name}")
+}
+
 /// The names in a `GetTables` `TableList`, in the order the service returned them.
 ///
 /// One copy, shared: every suite that pages over tables reads the list the same way.

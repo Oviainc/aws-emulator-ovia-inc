@@ -178,13 +178,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Every member comes from the store, so two reads of one term agree and a read
         // after an update reports what that update stored. The glossary the term belongs to
         // is reported as recorded, which is why deleting that glossary does not change what
-        // this read answers.
+        // this read answers. The two instants are the clock's, stamped when this term was
+        // created and when an update last changed it; a read only reports them.
         Ok(GetGlossaryTermOutput {
             id: Some(entry.id.clone()),
             glossary_id: Some(entry.glossary_id.clone()),
             name: Some(entry.name.clone()),
             short_description: entry.short_description.clone(),
             long_description: entry.long_description.clone(),
+            created_at: Some(crate::state::to_date_time(entry.created_at)),
+            updated_at: Some(crate::state::to_date_time(entry.updated_at)),
         })
     }
 }

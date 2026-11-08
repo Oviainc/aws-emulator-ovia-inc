@@ -183,9 +183,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Every member comes from the store, so two reads of one asset type agree and a
-        // read after an update reports the forms that update stored.
+        // read after an update reports the forms that update stored. The id is the
+        // record's identity in the catalog-qualified form a read reports it in
+        // (`crate::state::AssetTypeEntry::qualified_id`), which addresses this same record
+        // on every later call.
         Ok(GetAssetTypeOutput {
-            id: Some(entry.id.clone()),
+            id: Some(entry.qualified_id()),
             name: Some(entry.name.clone()),
             forms: Some(entry.forms_map()),
         })

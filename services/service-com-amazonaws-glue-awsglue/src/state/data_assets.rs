@@ -130,24 +130,46 @@ impl FormTypeEntry {
     }
 }
 
-/// How many asset type ids this process has minted. A nonce source for
-/// [`new_asset_type_id`], exactly as [`MINTED_DATABASE_IDS`] is for a database id.
-pub(super) static MINTED_ASSET_TYPE_IDS: AtomicU64 = AtomicU64::new(0);
+/// The prefix a catalog-qualified identifier opens with: the catalog the entity lives in
+/// is this emulator's own Data Catalog, which is named for the service and the account
+/// that holds it.
+///
+/// One half of [`catalog_qualified_id`]; see that function for the whole form.
+pub const CATALOG_QUALIFIER_PREFIX: &str = "glue_";
 
-/// A fresh `AssetTypeId`: the opaque identifier the Data Catalog assigns an asset type
-/// when `PutAssetType` first stores it under a name.
+/// What separates the catalog an entity lives in from the entity's own name inside it.
+pub const CATALOG_QUALIFIER_SEPARATOR: &str = "::";
+
+/// The catalog-qualified identifier of a business-catalog entity called `name`:
+/// `glue_<accountId>::<name>`, i.e. the catalog that holds it and its name within that
+/// catalog, which is the form a READ of such an entity reports its id in.
 ///
-/// 32 lowercase hexadecimal characters, i.e. 128 bits, the same shape a form type id has
-/// and inside `AssetTypeId`'s `length 1..256`. The bits come from [`mint_hex_id`], so two
-/// puts landing in the same nanosecond cannot be given the same id. It is minted ONCE,
-/// when the name is first stored, and kept on the [`AssetTypeEntry`] through every later
-/// update, so every read of that asset type reports the same id and two asset types never
-/// share one.
+/// Derived, not minted: every caller that knows the account and the name derives the same
+/// identifier, so two reads of one entity report one id and a cross-reference built from
+/// that id resolves ([`asset_type_name_from_qualified_id`] reads the name back out of it).
+/// The account is this emulator's own ([`::engine::emulator_account_id`]), the only account
+/// whose catalog it serves.
+pub fn catalog_qualified_id(name: &str) -> String {
+    format!(
+        "{CATALOG_QUALIFIER_PREFIX}{}{CATALOG_QUALIFIER_SEPARATOR}{name}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// The name inside the catalog that `identifier` names, when it is the catalog-qualified
+/// form [`catalog_qualified_id`] builds for the account this emulator serves, or `None`
+/// when it is not that form at all.
 ///
-/// This names a RESOURCE, not a credential: a credential would come from the credential
-/// store, never from here.
-pub fn new_asset_type_id() -> String {
-    mint_hex_id(&MINTED_ASSET_TYPE_IDS, CATALOG_ID_WORDS)
+/// This is what lets an entity be ADDRESSED by the identifier a read of it reported: the
+/// qualified id is not stored, so resolving one is reading the name back out of it.
+pub fn asset_type_name_from_qualified_id(identifier: &str) -> Option<&str> {
+    let qualifier = format!(
+        "{CATALOG_QUALIFIER_PREFIX}{}{CATALOG_QUALIFIER_SEPARATOR}",
+        ::engine::emulator_account_id()
+    );
+    identifier
+        .strip_prefix(&qualifier)
+        .filter(|name| !name.is_empty())
 }
 
 /// A stored asset type: the structure of an asset `PutAssetType` registers in the Data
@@ -155,13 +177,20 @@ pub fn new_asset_type_id() -> String {
 ///
 /// Every member of the modelled asset type is held here — its id, its name and its forms
 /// — and nothing else: the model gives an asset type no status, owner or timestamp. The
-/// name and the forms come from the request; the id is the one server-set member, minted
-/// by [`new_asset_type_id`] when the name is first stored.
+/// name and the forms come from the request, and the id is derived from the name (see
+/// [`Self::id`]).
 #[derive(Debug, Clone)]
 pub struct AssetTypeEntry {
-    /// `AssetTypeId`, minted by [`new_asset_type_id`] at the first put under this name and
-    /// unchanged by every later one, so a caller that kept the id from an earlier put can
-    /// still address the asset type after it has been updated.
+    /// `AssetTypeId` as the put that registers an asset type reports it: the NAME the
+    /// caller supplied.
+    ///
+    /// Not an opaque per-record id: "if an asset type with the given name already exists,
+    /// it is updated" makes the name the record's identity, and `AssetTypeName`'s
+    /// `length 1..128` sits inside `AssetTypeId`'s `length 1..256`, so every name is a
+    /// usable identifier — exactly as a form type's is ([`FormTypeEntry::id`]). A read of
+    /// the asset type reports the same identity in its catalog-qualified form
+    /// ([`Self::qualified_id`]), and both forms address this record
+    /// ([`ComAmazonawsGlueAwsglueState::asset_type_by_reference`]).
     pub id: String,
     /// The asset type's name, which is also its key in
     /// [`ComAmazonawsGlueAwsglueState::asset_types`].
@@ -179,13 +208,23 @@ pub struct AssetTypeEntry {
 
 impl AssetTypeEntry {
     /// The record a put stores for a name this store does not hold yet: the request's
-    /// name and form references, under a freshly minted id.
+    /// name and form references, under the identifier that name derives.
     pub fn new(name: String, forms: BTreeMap<String, String>) -> Self {
         Self {
-            id: new_asset_type_id(),
+            id: name.clone(),
             name,
             forms,
         }
+    }
+
+    /// This asset type's identity in the catalog-qualified form a READ of it reports:
+    /// `glue_<accountId>::<name>` ([`catalog_qualified_id`]).
+    ///
+    /// Derived from the name each time rather than stored, so it cannot drift from the
+    /// record's own name, and the catalog's own reference to the asset type — the `Type` a
+    /// read of an asset reports — is the same text.
+    pub fn qualified_id(&self) -> String {
+        catalog_qualified_id(&self.name)
     }
 
     /// This record's forms as the modelled `AssetTypeFormsMap`, which is what every
@@ -277,6 +316,18 @@ pub fn unassociable_glossary_term_message(identifier: &str) -> String {
     catalog_refusal_document(&format!("Glossary term not found: {identifier}"))
 }
 
+/// How many forms one asset may hold.
+///
+/// The same ceiling the model puts on the forms of an ASSET TYPE — "len 1..100" on
+/// `AssetTypeFormsMap` (`smithy_query shape=AssetTypeFormsMap`) — which is the structure an
+/// asset is an instance of. `AssetFormMap` carries no length of its own, so without this one
+/// put would decide how much every later read of that asset serialises: a read reports the
+/// forms TWICE, as the map and as the list beside it
+/// ([`AssetEntry::reported_forms_map`], [`AssetEntry::reported_form_list`]), so this bound is
+/// what keeps the answer to one small read proportional to it, and what bounds the walk a put
+/// spends resolving the form types its entries name.
+pub const MAX_ASSET_FORMS: usize = 100;
+
 /// A stored asset: one catalog entity `PutAsset` registers as an instance of an asset
 /// type, carrying that entity's metadata in forms keyed by form name.
 ///
@@ -306,7 +357,8 @@ pub struct AssetEntry {
     /// "The forms to set on the asset, keyed by form name", each entry the form type that
     /// defines the form's schema and the form's JSON content, stored exactly as the put
     /// sent them. A put SETS the whole map, so a form the latest put did not send is not
-    /// held. Ordered by form name, so two reads of one asset report its forms in one order.
+    /// held, and it never holds more than [`MAX_ASSET_FORMS`] entries. Ordered by form name,
+    /// so two reads of one asset report its forms in one order.
     pub forms: BTreeMap<String, AssetFormEntry>,
     /// "The timestamp at which the asset was created": the instant the put that first
     /// stored this identifier was served, kept by every later put under it so every read
@@ -368,17 +420,14 @@ impl AssetEntry {
     }
 
     /// This record's glossary terms as the modelled `GlossaryTermIdList`, which is what
-    /// every operation that reports an asset's associations answers with, or `None` when
-    /// the asset carries none.
+    /// every operation that reports an asset's associations answers with.
     ///
-    /// An asset with no association reports no list rather than an empty one: the modelled
-    /// list is "len 1..10", so an empty list is not a value this member can carry.
-    pub fn glossary_terms_list(&self) -> Option<Vec<String>> {
-        if self.glossary_terms.is_empty() {
-            None
-        } else {
-            Some(self.glossary_terms.clone())
-        }
+    /// Always a list, EMPTY for an asset no association has reached: the member is how a
+    /// client reads which terms an asset carries, so "none" is reported as the empty list
+    /// rather than by leaving the member out, which a client cannot tell from "not
+    /// reported".
+    pub fn glossary_terms_list(&self) -> Vec<String> {
+        self.glossary_terms.clone()
     }
 
     /// Merge `identifiers` into this asset's glossary term set, reporting the terms the
@@ -410,44 +459,213 @@ impl AssetEntry {
         Some(self.glossary_terms.clone())
     }
 
-    /// This record's forms as the modelled `AssetFormMap`, which is what every operation
-    /// that reports an asset's forms answers with.
+    /// This record's forms as the modelled `AssetFormMap`, with every form's content
+    /// EXACTLY as the put that stored it sent the text: what the put that accepted that
+    /// text answers with.
     pub fn forms_map(&self) -> HashMap<String, AssetFormEntry> {
         self.forms
             .iter()
             .map(|(form_name, form)| (form_name.clone(), form.clone()))
             .collect()
     }
+
+    /// This record's forms as a READ of the asset reports them: the stored forms, each
+    /// one's content rendered from the JSON document it carries
+    /// ([`compact_json_content`]), beside the catalog's own form on the asset
+    /// ([`CATALOG_RESOURCE_FORM_NAME`]).
+    ///
+    /// A read answers from the catalog's own record of the asset rather than from the text
+    /// one put supplied, which is why the content is the document and not the bytes: two
+    /// puts sending the same document with different spacing are the same asset, and a read
+    /// of either reports one content.
+    ///
+    /// A form this asset STORES under the catalog's form name wins: `AssetFormKey` carries
+    /// no pattern, so a put may name a form that way, and what a read reports for a form the
+    /// asset holds is always the form the asset holds — the catalog's own form is added only
+    /// where the asset has no form of that name, so no stored form is shadowed by it.
+    pub fn reported_forms_map(&self) -> HashMap<String, AssetFormEntry> {
+        let mut reported: HashMap<String, AssetFormEntry> = self.reported_forms().collect();
+        if let Some(catalog_form) = self.unshadowed_catalog_resource_form() {
+            reported.insert(CATALOG_RESOURCE_FORM_NAME.to_string(), catalog_form);
+        }
+        reported
+    }
+
+    /// Every form a read of the asset reports, as the LIST that read answers with beside
+    /// the map (`AssetForms`): one named entry per stored form, in form-name order, and the
+    /// catalog's own form on the asset LAST — the forms the asset carries first, then the
+    /// one the catalog put there.
+    ///
+    /// The same entries as [`Self::reported_forms_map`], so the two answers cannot disagree
+    /// about one form — a form stored under the catalog's own name included.
+    pub fn reported_form_list(&self) -> Vec<AssetFormRecord> {
+        self.reported_forms()
+            .chain(
+                self.unshadowed_catalog_resource_form()
+                    .map(|form| (CATALOG_RESOURCE_FORM_NAME.to_string(), form)),
+            )
+            .map(|(form_name, form)| AssetFormRecord {
+                form_name: Some(form_name),
+                form_type_id: form.form_type_id,
+                content: form.content,
+            })
+            .collect()
+    }
+
+    /// The catalog's own form on this asset when the asset itself holds no form under that
+    /// name, and `None` when it does: a stored form is never replaced by it.
+    fn unshadowed_catalog_resource_form(&self) -> Option<AssetFormEntry> {
+        if self.forms.contains_key(CATALOG_RESOURCE_FORM_NAME) {
+            return None;
+        }
+        Some(self.catalog_resource_form())
+    }
+
+    /// The stored forms as a read reports each of them: the form type the put named, and
+    /// the content rendered from the JSON document that put supplied. Ordered by form name,
+    /// so the list a read reports follows one order.
+    fn reported_forms(&self) -> impl Iterator<Item = (String, AssetFormEntry)> + '_ {
+        self.forms.iter().map(|(form_name, form)| {
+            (
+                form_name.clone(),
+                AssetFormEntry {
+                    form_type_id: form.form_type_id.clone(),
+                    content: form.content.as_deref().map(compact_json_content),
+                },
+            )
+        })
+    }
+
+    /// The catalog's own form on this asset, as every read of it reports it: the form type
+    /// the catalog names it with ([`CATALOG_RESOURCE_FORM_TYPE_ID`]).
+    ///
+    /// Recorded behaviour, not a record of this store: the form and its form type are what
+    /// the recorded reads of an asset carry (see [`CATALOG_RESOURCE_FORM_NAME`]), and no
+    /// operation of this surface writes or clears one.
+    ///
+    /// It carries NO content. The content of a form is a document, and this emulator holds
+    /// no document for this one, so it reports none rather than one of its own invention.
+    fn catalog_resource_form(&self) -> AssetFormEntry {
+        AssetFormEntry {
+            form_type_id: Some(CATALOG_RESOURCE_FORM_TYPE_ID.to_string()),
+            content: None,
+        }
+    }
+}
+
+/// The form name the catalog's OWN form on an asset carries: every read of an asset reports
+/// a form of this name beside the forms the asset holds, which is recorded behaviour of this
+/// surface (corpus `simparity-wire-aws-v1`, `glue-asset-crud-with-forms`) rather than
+/// anything the model declares or any write of this emulator produces.
+///
+/// Namespaced (`<namespace>::<name>`), which is what tells it apart from a form a client's
+/// put stored: `AssetFormKey` carries no pattern, while the form names a client addresses
+/// elsewhere in this surface do (`IterableFormName`'s
+/// `^[a-zA-Z][a-zA-Z0-9_]*(::[a-zA-Z][a-zA-Z0-9_]*)?$` admits the same two-part spelling).
+/// A put MAY still store a form under this name, and then that form is what a read reports
+/// ([`AssetEntry::reported_forms_map`]).
+pub const CATALOG_RESOURCE_FORM_NAME: &str = "catalog::Resource";
+
+/// The `FormTypeId` the catalog's own form on an asset names.
+///
+/// Recorded behaviour: this is the form type the recorded reads of an asset report that form
+/// under (corpus `simparity-wire-aws-v1`), and it is the `<name>` half of
+/// [`CATALOG_RESOURCE_FORM_NAME`] — the form's name carries the namespace, the form type is
+/// named inside it.
+///
+/// It is NOT a record of [`ComAmazonawsGlueAwsglueState::form_types`] (that namespace holds
+/// what `PutFormType` stores), so it is not addressable through the form type surface and
+/// cannot be referenced by a client's own form.
+pub const CATALOG_RESOURCE_FORM_TYPE_ID: &str = "Resource";
+
+/// `content` as a read of the form that carries it reports it: the same JSON document,
+/// rendered without the whitespace between its tokens.
+///
+/// A form's content is "the JSON content of the form, conforming to the schema of the
+/// specified form type" (`AssetFormEntry$Content`), so what the catalog holds for a form is
+/// that DOCUMENT: a read reports the document, which is the text with the whitespace
+/// between its tokens dropped. The scan that drops it is the shared one
+/// ([`::service_common::json_document::minified`]), which every service that stores a JSON
+/// document as an opaque string and reports it back uses — member order, string literals
+/// and number spellings are the document's own there, which is exactly what a form's
+/// content must keep.
+///
+/// Text that is not a JSON document at all is reported exactly as it was stored: the
+/// catalog has no document to render, so there is nothing to drop. That decision is this
+/// surface's own, which is why it is made here and not in the shared scan (whose pass is
+/// total over any text).
+pub fn compact_json_content(content: &str) -> String {
+    if serde_json::from_str::<serde_json::Value>(content).is_err() {
+        return content.to_string();
+    }
+    ::service_common::json_document::minified(content)
 }
 
 /// How many glossary ids this process has minted. A nonce source for
 /// [`new_glossary_id`], exactly as [`MINTED_DATABASE_IDS`] is for a database id.
 pub(super) static MINTED_GLOSSARY_IDS: AtomicU64 = AtomicU64::new(0);
 
-/// A fresh `GlossaryId`: the opaque identifier the Data Catalog assigns a business
-/// glossary when `CreateGlossary` stores it.
+/// A fresh `GlossaryId`: the identifier the Data Catalog assigns a business glossary when
+/// `CreateGlossary` stores it.
 ///
-/// 32 lowercase hexadecimal characters, i.e. 128 bits, which is the shape a
-/// catalog-assigned Data Catalog id has; `GlossaryId` carries no length or pattern
-/// constraint of its own. The bits come from [`mint_hex_id`], as a database id's do, so
-/// two creates landing in the same nanosecond cannot be given the same id. It is minted
-/// ONCE, at create, and kept on the [`GlossaryEntry`] through every later update — a
-/// rename included — so every read of that glossary reports the same id and two
-/// glossaries never share one.
+/// The identifier shape this surface's entities carry: [`CATALOG_ENTITY_ID_LENGTH`]
+/// lowercase base-36 characters, which `GlossaryId` — a string the model gives no length or
+/// pattern constraint — admits. The characters come from [`mint_base36_id`], so two creates
+/// landing in the same nanosecond cannot be given the same id. It is minted ONCE, at
+/// create, and kept on the [`GlossaryEntry`] through every later update — a rename included
+/// — so every read of that glossary reports the same id and two glossaries never share one.
 ///
 /// This names a RESOURCE, not a credential: a credential would come from the credential
 /// store, never from here.
 pub fn new_glossary_id() -> String {
-    mint_hex_id(&MINTED_GLOSSARY_IDS, CATALOG_ID_WORDS)
+    mint_base36_id(&MINTED_GLOSSARY_IDS, CATALOG_ENTITY_ID_LENGTH)
+}
+
+/// How many characters the identifier of a business-catalog entity — a glossary, a
+/// glossary term — carries: 14, the width of the identifiers this surface hands out. They
+/// are DRAWN rather than derived from the request, because nothing a caller submits
+/// identifies one of these entities: a glossary's name can be changed by an update, and a
+/// term's name is unique only inside its glossary.
+const CATALOG_ENTITY_ID_LENGTH: usize = 14;
+
+/// `length` characters of lowercase base-36 (the ten digits and the 26 lowercase letters):
+/// how this surface spells the identifier it draws for an entity, so every id it hands out
+/// reads the same way.
+///
+/// The bits of each draw come from [`id_draw`], the same one `mint_hex_id` renders in
+/// hexadecimal — one entropy rule for every id this crate mints, and only the alphabet and
+/// the width differ here.
+///
+/// This mints a RESOURCE id, not a credential: a credential would come from the credential
+/// store, never from here.
+fn mint_base36_id(minted: &AtomicU64, length: usize) -> String {
+    /// The alphabet of lowercase base-36, in ASCII order.
+    const DIGITS: &[u8; 36] = b"0123456789abcdefghijklmnopqrstuvwxyz";
+    /// How many base-36 digits one 64-bit draw is spent on: 36^12 is below 2^64, so each
+    /// of twelve digits taken from a draw is spread over the whole alphabet.
+    const DIGITS_PER_DRAW: usize = 12;
+
+    let sequence = minted.fetch_add(1, Ordering::Relaxed);
+    let mut id = String::with_capacity(length);
+    let mut draw = 0u64;
+    for position in 0..length {
+        if position % DIGITS_PER_DRAW == 0 {
+            draw = id_draw(sequence, position);
+        }
+        let digit = usize::try_from(draw % 36).unwrap_or(0);
+        id.push(char::from(DIGITS[digit]));
+        draw /= 36;
+    }
+    id
 }
 
 /// A stored business glossary: the container for glossary terms `CreateGlossary`
 /// registers.
 ///
 /// Every member of the modelled glossary is held here — its id, its name and its
-/// description — and nothing else: the model gives a glossary no status, owner or
-/// timestamp. The name and the description come from the request; the id is the one
-/// server-set member, minted by [`new_glossary_id`] when the glossary is stored.
+/// description — beside the two instants the SERVER stamps on it: the name and the
+/// description come from the request, the id is minted by [`new_glossary_id`] when the
+/// glossary is stored, and the two instants are the clock's.
 #[derive(Debug, Clone)]
 pub struct GlossaryEntry {
     /// `GlossaryId`, minted by [`new_glossary_id`] at create and unchanged afterwards, so
@@ -462,6 +680,12 @@ pub struct GlossaryEntry {
     /// is optional and the model gives it no default, so a glossary created without one
     /// reports none rather than an empty string.
     pub description: Option<String>,
+    /// The instant the create that stored this glossary was served, which every read of it
+    /// reports and no later write moves.
+    pub created_at: SystemTime,
+    /// The instant the latest update that CHANGED this glossary was served, which for a
+    /// glossary no update has changed is [`Self::created_at`].
+    pub updated_at: SystemTime,
     /// The `ClientToken` of the request that created this glossary, when it carried one.
     ///
     /// `CreateGlossaryRequest$ClientToken` is "a unique, case-sensitive identifier that
@@ -472,42 +696,60 @@ pub struct GlossaryEntry {
 
 impl GlossaryEntry {
     /// The record a create stores: the name and description it carried, under a freshly
-    /// minted id, beside the idempotency token a retry of that create is recognised by.
-    pub fn new(name: String, description: Option<String>, client_token: Option<String>) -> Self {
+    /// minted id, stamped with the instant `now` the create was served at, beside the
+    /// idempotency token a retry of that create is recognised by.
+    pub fn new(
+        name: String,
+        description: Option<String>,
+        client_token: Option<String>,
+        now: SystemTime,
+    ) -> Self {
         Self {
             id: new_glossary_id(),
             name,
             description,
+            created_at: now,
+            updated_at: now,
             client_token,
         }
     }
 
     /// The same, read off a `CreateGlossary` request: every member comes from the request
-    /// except the id, which the catalog assigns.
-    pub fn from_create_input(input: &CreateGlossaryInput) -> Self {
+    /// except the id, which the catalog assigns, and the instants, which are the clock's.
+    pub fn from_create_input(input: &CreateGlossaryInput, now: SystemTime) -> Self {
         Self::new(
             input.name.clone(),
             input.description.clone(),
             input.client_token.clone(),
+            now,
         )
     }
 
-    /// Apply an `UpdateGlossary` request to this record.
+    /// Apply an `UpdateGlossary` request to this record, as served at `now`.
     ///
     /// Every updatable member is optional on the request ("The updated name of the
     /// glossary", "The updated description of the glossary"), so the ones the request
     /// NAMES replace what is stored and the ones it omits are left where the last write
     /// that named them put them: an update naming one member changes that one alone.
     ///
-    /// [`Self::id`] is not a member of the request and so cannot move, and
-    /// [`Self::client_token`] keeps the CREATE's token, which is what a retry of that
-    /// create is recognised by and not something an update of the glossary restates.
-    pub fn apply_update(&mut self, input: &UpdateGlossaryInput) {
+    /// [`Self::updated_at`] moves to `now` when the request named a member and stays where
+    /// it is for one that named none: it reports when this glossary last CHANGED.
+    ///
+    /// [`Self::id`] and [`Self::created_at`] are no members of the request and so cannot
+    /// move, and [`Self::client_token`] keeps the CREATE's token, which is what a retry of
+    /// that create is recognised by and not something an update of the glossary restates.
+    pub fn apply_update(&mut self, input: &UpdateGlossaryInput, now: SystemTime) {
+        let mut changed = false;
         if let Some(name) = input.name.clone() {
             self.name = name;
+            changed = true;
         }
         if let Some(description) = input.description.clone() {
             self.description = Some(description);
+            changed = true;
+        }
+        if changed {
+            self.updated_at = now;
         }
     }
 }
@@ -516,30 +758,29 @@ impl GlossaryEntry {
 /// [`new_glossary_term_id`], exactly as [`MINTED_GLOSSARY_IDS`] is for a glossary id.
 pub(super) static MINTED_GLOSSARY_TERM_IDS: AtomicU64 = AtomicU64::new(0);
 
-/// A fresh `GlossaryTermId`: the opaque identifier the Data Catalog assigns a glossary term
-/// when `CreateGlossaryTerm` stores it.
+/// A fresh `GlossaryTermId`: the identifier the Data Catalog assigns a glossary term when
+/// `CreateGlossaryTerm` stores it.
 ///
 /// The same shape as a glossary id ([`new_glossary_id`]) and for the same reason:
-/// `GlossaryTermId` carries no length or pattern constraint of its own, and the bits come
-/// from [`mint_hex_id`], so two creates landing in the same nanosecond cannot be given the
-/// same id. It is minted ONCE, at create, and kept on the [`GlossaryTermEntry`] through
-/// every later update — a rename included — so every read of that term reports the same id
-/// and two terms never share one.
+/// `GlossaryTermId` carries no length or pattern constraint of its own, and the characters
+/// come from [`mint_base36_id`], so two creates landing in the same nanosecond cannot be
+/// given the same id. It is minted ONCE, at create, and kept on the [`GlossaryTermEntry`]
+/// through every later update — a rename included — so every read of that term reports the
+/// same id and two terms never share one.
 ///
 /// This names a RESOURCE, not a credential: a credential would come from the credential
 /// store, never from here.
 pub fn new_glossary_term_id() -> String {
-    mint_hex_id(&MINTED_GLOSSARY_TERM_IDS, CATALOG_ID_WORDS)
+    mint_base36_id(&MINTED_GLOSSARY_TERM_IDS, CATALOG_ENTITY_ID_LENGTH)
 }
 
 /// A stored glossary term: one business concept `CreateGlossaryTerm` registers within a
 /// glossary.
 ///
 /// Every member of the modelled term is held here — its id, the glossary it belongs to, its
-/// name and its two descriptions — and nothing else: the model gives a term no status,
-/// owner or timestamp. The glossary, the name and the descriptions come from the request;
-/// the id is the one server-set member, minted by [`new_glossary_term_id`] when the term is
-/// stored.
+/// name and its two descriptions — beside the two instants the SERVER stamps on it: the
+/// glossary, the name and the descriptions come from the request, the id is minted by
+/// [`new_glossary_term_id`] when the term is stored, and the two instants are the clock's.
 #[derive(Debug, Clone)]
 pub struct GlossaryTermEntry {
     /// `GlossaryTermId`, minted by [`new_glossary_term_id`] at create and unchanged
@@ -562,6 +803,12 @@ pub struct GlossaryTermEntry {
     /// "A long description of the glossary term", absent for the same reason as
     /// [`Self::short_description`].
     pub long_description: Option<String>,
+    /// The instant the create that stored this term was served, which every read of it
+    /// reports and no later write moves.
+    pub created_at: SystemTime,
+    /// The instant the latest update that CHANGED this term was served, which for a term no
+    /// update has changed is [`Self::created_at`].
+    pub updated_at: SystemTime,
     /// The `ClientToken` of the request that created this term, when it carried one.
     ///
     /// `CreateGlossaryTermRequest$ClientToken` is "a unique, case-sensitive identifier that
@@ -572,14 +819,15 @@ pub struct GlossaryTermEntry {
 
 impl GlossaryTermEntry {
     /// The record a create stores: the glossary, name and descriptions it carried, under a
-    /// freshly minted id, beside the idempotency token a retry of that create is recognised
-    /// by.
+    /// freshly minted id, stamped with the instant `now` the create was served at, beside
+    /// the idempotency token a retry of that create is recognised by.
     pub fn new(
         glossary_id: String,
         name: String,
         short_description: Option<String>,
         long_description: Option<String>,
         client_token: Option<String>,
+        now: SystemTime,
     ) -> Self {
         Self {
             id: new_glossary_term_id(),
@@ -587,19 +835,23 @@ impl GlossaryTermEntry {
             name,
             short_description,
             long_description,
+            created_at: now,
+            updated_at: now,
             client_token,
         }
     }
 
     /// The same, read off a `CreateGlossaryTerm` request: every member comes from the
-    /// request except the id, which the catalog assigns.
-    pub fn from_create_input(input: &CreateGlossaryTermInput) -> Self {
+    /// request except the id, which the catalog assigns, and the instants, which are the
+    /// clock's.
+    pub fn from_create_input(input: &CreateGlossaryTermInput, now: SystemTime) -> Self {
         Self::new(
             input.glossary_identifier.clone(),
             input.name.clone(),
             input.short_description.clone(),
             input.long_description.clone(),
             input.client_token.clone(),
+            now,
         )
     }
 }

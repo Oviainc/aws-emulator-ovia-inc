@@ -217,7 +217,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let entry = crate::state::GlossaryEntry::from_create_input(&input);
+        let entry = crate::state::GlossaryEntry::from_create_input(
+            &input,
+            ::std::time::SystemTime::now(),
+        );
         let stored = entry.clone();
         store.glossaries.insert(entry.id.clone(), entry);
         ::tracing::info!(

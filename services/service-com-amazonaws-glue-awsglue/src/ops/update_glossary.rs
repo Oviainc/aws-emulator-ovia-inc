@@ -214,7 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(entry) = store.glossary_mut(&input.identifier) else {
             return Err(missing());
         };
-        entry.apply_update(&input);
+        entry.apply_update(&input, ::std::time::SystemTime::now());
         let stored = entry.clone();
         ::tracing::info!(
             operation = "UpdateGlossary",

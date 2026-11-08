@@ -26,7 +26,7 @@ use service_com_amazonaws_glue_awsglue::state::{
 };
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{call, emulator, emulator_on, error_code, ok};
+use crate::wire::{call, emulator, emulator_on, error_code, ok, qualified_asset_type_id};
 
 /// The longest `Name` the model accepts: "len 1..128" on `AssetTypeName`
 /// (`smithy_query operation=PutAssetType`), whose pattern
@@ -231,16 +231,20 @@ async fn put_asset_types_are_read_back_from_the_store() {
                 read.get("Name").and_then(Value::as_str),
                 read.get("Forms")
             ),
-            (Some(id.as_str()), Some(name), Some(sent_forms)),
+            (
+                Some(qualified_asset_type_id(&id).as_str()),
+                Some(name),
+                Some(sent_forms)
+            ),
             "case {case}: GetAssetType must report the asset type the put stored, got {read}"
         );
 
-        // Reading it again reports the same identifier: the id is stored, not minted per
-        // read.
+        // Reading it again reports the same identifier: the id is the record's identity,
+        // not something minted per read.
         let again = get(&router, &id).await;
         assert_eq!(
             again.get("Id").and_then(Value::as_str),
-            Some(id.as_str()),
+            Some(qualified_asset_type_id(&id).as_str()),
             "case {case}: two reads of one asset type must report one identifier, got {again}"
         );
         // A client that put the asset type under a name addresses it by that name too,
@@ -398,7 +402,7 @@ async fn a_put_under_a_stored_name_updates_that_asset_type() {
         );
         assert_eq!(
             read.get("Id").and_then(Value::as_str),
-            Some(id.as_str()),
+            Some(qualified_asset_type_id(&id).as_str()),
             "case {case}: a read after the update must report the same identifier, got {read}"
         );
     }

@@ -17,7 +17,15 @@ pub struct GetGlossaryTermInput {
     pub identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#GetGlossaryTermResponse")]
+/// `GetGlossaryTerm`'s response: the five members the model declares, in the model's own
+/// member order, and the two instants the catalog stamps on a term appended last.
+///
+/// Member set and order from
+/// `smithy_query(query="operation", operation="GetGlossaryTerm")`, plus
+/// `CreatedAt`/`UpdatedAt` — members the real service reports and the on-disk model omits,
+/// which is why the schema and the serializer come from
+/// `types/recorded_catalog_members.rs` rather than from the derive (see that module's
+/// note).
 #[derive(Debug, Clone, Default)]
 pub struct GetGlossaryTermOutput {
     pub id: Option<String>,
@@ -25,5 +33,50 @@ pub struct GetGlossaryTermOutput {
     pub name: Option<String>,
     pub short_description: Option<String>,
     pub long_description: Option<String>,
+    pub created_at: Option<::aws_smithy_types::DateTime>,
+    pub updated_at: Option<::aws_smithy_types::DateTime>,
 }
+
+glue_schema_and_serializer!(
+    GetGlossaryTermOutput,
+    GET_GLOSSARY_TERM_OUTPUT_SCHEMA,
+    "com.amazonaws.glue#GetGlossaryTermResponse",
+    "com.amazonaws.glue",
+    "GetGlossaryTermResponse",
+    (M_ID, id, "Id", 0, opt, string),
+    (M_GLOSSARY_ID, glossary_id, "GlossaryId", 1, opt, string),
+    (M_NAME, name, "Name", 2, opt, string),
+    (
+        M_SHORT_DESCRIPTION,
+        short_description,
+        "ShortDescription",
+        3,
+        opt,
+        string
+    ),
+    (
+        M_LONG_DESCRIPTION,
+        long_description,
+        "LongDescription",
+        4,
+        opt,
+        string
+    ),
+    (
+        M_CREATED_AT,
+        created_at,
+        "CreatedAt",
+        5,
+        opt,
+        recorded("com.amazonaws.glue.recorded", timestamp)
+    ),
+    (
+        M_UPDATED_AT,
+        updated_at,
+        "UpdatedAt",
+        6,
+        opt,
+        recorded("com.amazonaws.glue.recorded", timestamp)
+    ),
+);
 

@@ -224,6 +224,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(ListGlossaryTermsOutput {
             items: Some(page),
             next_token,
+            // The page names the glossary it was listed under, echoed from the request
+            // that asked for it, so a client paging several glossaries can attribute a
+            // page to its glossary without holding the request beside it.
+            glossary_id: Some(input.glossary_identifier.clone()),
         })
     }
 }

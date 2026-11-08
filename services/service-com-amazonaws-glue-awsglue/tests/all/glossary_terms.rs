@@ -706,7 +706,12 @@ async fn a_create_past_the_glossary_term_ceiling_is_refused() {
     let glossary_id = {
         let state = engine.state::<ComAmazonawsGlueAwsglueState>();
         let mut store = state.lock();
-        let glossary = GlossaryEntry::new("SeededGlossary".to_string(), None, None);
+        let glossary = GlossaryEntry::new(
+            "SeededGlossary".to_string(),
+            None,
+            None,
+            std::time::SystemTime::now(),
+        );
         let glossary_id = glossary.id.clone();
         store.glossaries.insert(glossary_id.clone(), glossary);
         for index in 0..MAX_GLOSSARY_TERMS - 1 {
@@ -716,6 +721,7 @@ async fn a_create_past_the_glossary_term_ceiling_is_refused() {
                 None,
                 None,
                 None,
+                std::time::SystemTime::now(),
             );
             seeded_term_id = term.id.clone();
             store.glossary_terms.insert(term.id.clone(), term);

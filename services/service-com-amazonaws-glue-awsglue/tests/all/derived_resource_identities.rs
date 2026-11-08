@@ -19,7 +19,7 @@
 use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{emulator, ok, ACCOUNT_ID, REGION};
+use crate::wire::{emulator, ok, qualified_asset_type_id, ACCOUNT_ID, REGION};
 
 /// The longest `Name` an asset type accepts: "len 1..128" on `AssetTypeName`
 /// (`smithy_query operation=PutAssetType`), whose pattern
@@ -121,12 +121,14 @@ async fn an_asset_type_is_addressed_by_the_name_it_was_registered_under() {
         );
 
         // The identity is usable: the read of that identifier serves the record the put
-        // stored, which is what makes the Id an address rather than a label.
+        // stored, which is what makes the Id an address rather than a label. The read
+        // reports that identity in the catalog-qualified form, which addresses the same
+        // record.
         let read = ok(&router, "GetAssetType", &json!({ "Identifier": id })).await;
         assert_eq!(
             read.get("Id").and_then(Value::as_str),
-            Some(name.as_str()),
-            "case {case}: the read must report the same identifier, got {read}"
+            Some(qualified_asset_type_id(name).as_str()),
+            "case {case}: the read must report the same identity, qualified, got {read}"
         );
         assert_eq!(
             read.get("Forms"),

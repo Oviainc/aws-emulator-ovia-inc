@@ -192,9 +192,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every member comes from the store, so two reads of one asset agree and a read
         // after a put reports what that put stored, and a read after an association reports
-        // the terms that association merged onto the asset. The two surfaces another
-        // operation owns are reported as the record holds them: an asset no attachment or
-        // iterable form has been written to carries none.
+        // the terms that association merged onto the asset. Every collection the asset can
+        // carry is reported — EMPTY where the asset carries nothing — so a client can tell
+        // "none" from "not reported": the asset's forms as both the map and the list this
+        // read answers with (`crate::state::AssetEntry::reported_forms_map`,
+        // `reported_form_list`), its glossary terms, and the three collections no
+        // implemented operation writes yet. `PutAttachment` and the iterable-form writers
+        // are still scaffolds (`src/ops/put_attachment.rs`), and the catalog holds no
+        // metadata form for an asset at all, so those three are empty for every asset this
+        // store holds rather than absent from the answer.
         Ok(GetAssetOutput {
             id: entry.id.clone(),
             name: Some(entry.name.clone()),
@@ -202,10 +208,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: Some(crate::state::to_date_time(entry.created_at)),
             updated_at: Some(crate::state::to_date_time(entry.updated_at)),
             asset_type_id: entry.asset_type_id.clone(),
-            glossary_terms: entry.glossary_terms_list(),
-            forms: Some(entry.forms_map()),
-            attachments: None,
-            iterable_forms: None,
+            glossary_terms: Some(entry.glossary_terms_list()),
+            forms: Some(entry.reported_forms_map()),
+            attachments: Some(std::collections::HashMap::new()),
+            iterable_forms: Some(std::collections::HashMap::new()),
+            asset_forms: Some(entry.reported_form_list()),
+            metadata_forms: Some(Vec::new()),
+            // The asset type this asset is an instance of, by NAME — the asset type's own
+            // record resolved through the store, so the name this reports is the name that
+            // asset type's own read reports and cannot drift from it, whichever of the
+            // forms the put addressed the asset type by
+            // (`crate::state::ComAmazonawsGlueAwsglueState::asset_type_by_reference`). An
+            // asset type deleted since the put that stored this asset leaves the identifier
+            // that put supplied, which is all the catalog still holds for it.
+            r#type: Some(
+                store
+                    .asset_type_by_reference(&entry.asset_type_id)
+                    .map_or_else(
+                        || entry.asset_type_id.clone(),
+                        |asset_type| asset_type.name.clone(),
+                    ),
+            ),
         })
     }
 }

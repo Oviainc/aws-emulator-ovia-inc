@@ -291,6 +291,9 @@ async fn a_second_create_under_a_stored_name_is_refused() {
     )
     .await;
     let id = glossary_id("the stored glossary", &created);
+    // The whole record as the create left it, so the refusals below are compared against
+    // every member a read reports and not only the ones the create answers with.
+    let before = get(&router, &id).await;
 
     let clashing = [
         (
@@ -322,12 +325,24 @@ async fn a_second_create_under_a_stored_name_is_refused() {
         );
     }
 
-    // The refused creates left the stored glossary exactly as the first create wrote it.
+    // The refused creates left the stored glossary exactly as the first create wrote it:
+    // every member a read reports, the two instants included, and the three members the
+    // create itself answered with.
     let read = get(&router, &id).await;
     assert_eq!(
-        read, created,
-        "case the stored glossary: a refused create must change nothing; expected {created}, \
+        read, before,
+        "case the stored glossary: a refused create must change nothing; expected {before}, \
          got {read}"
+    );
+    assert_eq!(
+        (read.get("Id"), read.get("Name"), read.get("Description")),
+        (
+            created.get("Id"),
+            created.get("Name"),
+            created.get("Description")
+        ),
+        "case the stored glossary: the record must still be the one the create reported; \
+         expected {created}, got {read}"
     );
 
     // A name is matched as sent, so one that only resembles the stored name is free.
@@ -472,7 +487,12 @@ async fn a_create_past_the_glossary_ceiling_is_refused() {
         let state = engine.state::<ComAmazonawsGlueAwsglueState>();
         let mut store = state.lock();
         for index in 0..MAX_GLOSSARIES - 1 {
-            let entry = GlossaryEntry::new(format!("Seeded{index}"), None, None);
+            let entry = GlossaryEntry::new(
+                format!("Seeded{index}"),
+                None,
+                None,
+                std::time::SystemTime::now(),
+            );
             seeded_id = entry.id.clone();
             store.glossaries.insert(entry.id.clone(), entry);
         }

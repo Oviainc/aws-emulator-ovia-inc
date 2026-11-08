@@ -14,6 +14,13 @@
 //! here named after an operation would make that operation's own module name
 //! ambiguous inside `ops` (`E0659`).
 
+// The schema-and-serializer macros a response structure needs when the service reports a
+// member this crate's on-disk model does not declare — see that module's own note.
+// `#[macro_use]`, and declared FIRST, so the macros are in the textual scope of every
+// `_types` module below.
+#[macro_use]
+mod recorded_catalog_members;
+
 pub mod associate_glossary_terms_types;
 pub mod batch_create_partition_types;
 pub mod batch_delete_connection_types;

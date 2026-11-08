@@ -17,11 +17,47 @@ pub struct GetGlossaryInput {
     pub identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#GetGlossaryResponse")]
+/// `GetGlossary`'s response: the three members the model declares, in the model's own
+/// member order, and the two instants the catalog stamps on a glossary appended last.
+///
+/// Member set and order from
+/// `smithy_query(query="operation", operation="GetGlossary")`, plus `CreatedAt`/`UpdatedAt`
+/// — members the real service reports and the on-disk model omits, which is why the schema
+/// and the serializer come from `types/recorded_catalog_members.rs` rather than from the
+/// derive (see that module's note).
 #[derive(Debug, Clone, Default)]
 pub struct GetGlossaryOutput {
     pub id: Option<String>,
     pub name: Option<String>,
     pub description: Option<String>,
+    pub created_at: Option<::aws_smithy_types::DateTime>,
+    pub updated_at: Option<::aws_smithy_types::DateTime>,
 }
+
+glue_schema_and_serializer!(
+    GetGlossaryOutput,
+    GET_GLOSSARY_OUTPUT_SCHEMA,
+    "com.amazonaws.glue#GetGlossaryResponse",
+    "com.amazonaws.glue",
+    "GetGlossaryResponse",
+    (M_ID, id, "Id", 0, opt, string),
+    (M_NAME, name, "Name", 1, opt, string),
+    (M_DESCRIPTION, description, "Description", 2, opt, string),
+    (
+        M_CREATED_AT,
+        created_at,
+        "CreatedAt",
+        3,
+        opt,
+        recorded("com.amazonaws.glue.recorded", timestamp)
+    ),
+    (
+        M_UPDATED_AT,
+        updated_at,
+        "UpdatedAt",
+        4,
+        opt,
+        recorded("com.amazonaws.glue.recorded", timestamp)
+    ),
+);
 

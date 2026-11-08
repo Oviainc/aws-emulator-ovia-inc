@@ -24,7 +24,7 @@
 use serde_json::{json, Map, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::wire::{call, emulator, error_code, error_message, ok};
+use crate::wire::{call, emulator, error_code, error_message, ok, qualified_asset_type_id};
 
 /// The longest `Identifier` the model accepts: "len 1..1087" on `AssetId`
 /// (`smithy_query operation=DeleteAsset`), whose pattern `^[a-zA-Z0-9\-\:\/\.\_\*]+$` is
@@ -262,7 +262,7 @@ async fn deleting_an_asset_removes_only_the_one_it_names() {
         .await;
         assert_eq!(
             asset_type_read.get("Id").and_then(Value::as_str),
-            Some(asset_type_id.as_str()),
+            Some(qualified_asset_type_id(&asset_type_id).as_str()),
             "case {case}: the asset type must survive the asset's delete, got {asset_type_read}"
         );
         for term in terms {
@@ -289,8 +289,9 @@ async fn deleting_an_asset_removes_only_the_one_it_names() {
             Some(identifier.as_str()),
             "case {case}: a put after the delete must store the asset afresh, got {reborn}"
         );
-        assert!(
-            reborn.get("GlossaryTerms").is_none(),
+        assert_eq!(
+            reborn.get("GlossaryTerms").and_then(Value::as_array),
+            Some(&Vec::new()),
             "case {case}: a freshly stored asset carries no glossary term, got {reborn}"
         );
     }
@@ -369,7 +370,7 @@ async fn deleting_an_asset_the_store_does_not_hold_is_served() {
     .await;
     assert_eq!(
         kept_type.get("Id").and_then(Value::as_str),
-        Some(asset_type_id.as_str()),
+        Some(qualified_asset_type_id(&asset_type_id).as_str()),
         "case the stored asset type: an asset delete must not reach an asset type, got {kept_type}"
     );
 }
@@ -463,7 +464,7 @@ async fn deleting_an_asset_type_removes_only_the_one_it_names() {
         .await;
         assert_eq!(
             read_again.get("Id").and_then(Value::as_str),
-            Some(*name),
+            Some(qualified_asset_type_id(name).as_str()),
             "case {case}: the re-registered asset type must read back, got {read_again}"
         );
         delete_asset_type(&router, case, &reborn).await;
@@ -478,7 +479,7 @@ async fn deleting_an_asset_type_removes_only_the_one_it_names() {
     .await;
     assert_eq!(
         read.get("Id").and_then(Value::as_str),
-        Some(bystander.as_str()),
+        Some(qualified_asset_type_id(&bystander).as_str()),
         "case bystander: a delete must leave every other asset type in place, got {read}"
     );
 }
@@ -530,7 +531,7 @@ async fn deleting_an_asset_type_the_store_does_not_hold_is_served() {
         let read = ok(&router, "GetAssetType", &json!({ "Identifier": address })).await;
         assert_eq!(
             read.get("Id").and_then(Value::as_str),
-            Some(kept.as_str()),
+            Some(qualified_asset_type_id(&kept).as_str()),
             "case {address}: a delete that resolved to nothing must remove nothing, got {read}"
         );
     }

@@ -19,12 +19,38 @@ pub struct ListGlossaryTermsInput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#ListGlossaryTermsResponse")]
+/// `ListGlossaryTerms`'s response: the two members the model declares, in the model's own
+/// member order, and the glossary the page was listed under appended last.
+///
+/// Member set and order from
+/// `smithy_query(query="operation", operation="ListGlossaryTerms")`, plus `GlossaryId` — a
+/// member the real service reports and the on-disk model omits, which is why the schema and
+/// the serializer come from `types/recorded_catalog_members.rs` rather than from the derive
+/// (see that module's note).
 #[derive(Debug, Clone, Default)]
 pub struct ListGlossaryTermsOutput {
     pub items: Option<Vec<GlossaryTermItem>>,
     pub next_token: Option<String>,
+    pub glossary_id: Option<String>,
 }
+
+glue_schema_and_serializer!(
+    ListGlossaryTermsOutput,
+    LIST_GLOSSARY_TERMS_OUTPUT_SCHEMA,
+    "com.amazonaws.glue#ListGlossaryTermsResponse",
+    "com.amazonaws.glue",
+    "ListGlossaryTermsResponse",
+    (M_ITEMS, items, "Items", 0, opt, list_of_struct(GlossaryTermItem)),
+    (M_NEXT_TOKEN, next_token, "NextToken", 1, opt, string),
+    (
+        M_GLOSSARY_ID,
+        glossary_id,
+        "GlossaryId",
+        2,
+        opt,
+        recorded("com.amazonaws.glue.recorded", string)
+    ),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.glue#GlossaryTermItem")]
 #[derive(Debug, Clone, Default)]

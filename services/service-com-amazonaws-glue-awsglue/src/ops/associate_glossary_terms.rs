@@ -328,12 +328,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The association reports the asset it wrote to and the terms that asset carries
         // now, read off the record, so a later `GetAsset` of the same identifier reports
         // the same set. The two item members are echoed as the request sent them, which for
-        // an association to the asset itself is nothing at all.
+        // an association to the asset itself is nothing at all. The asset it was addressed
+        // to is reported under both names this surface carries it under, so a caller that
+        // reads either correlates the answer with the asset it just changed.
         Ok(AssociateGlossaryTermsOutput {
             asset_identifier: Some(input.asset_identifier.clone()),
             iterable_form_name: input.iterable_form_name.clone(),
             item_identifier: input.item_identifier.clone(),
             glossary_terms: Some(associated),
+            identifier: Some(input.asset_identifier.clone()),
         })
     }
 }

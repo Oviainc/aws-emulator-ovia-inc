@@ -302,7 +302,8 @@ use std::time::{Duration, SystemTime};
 use self::catalog_encryption::ObjectEncryption;
 
 use crate::ops::types::{
-    Action, AssetFormEntry, AssetTypeFormReference, CatalogImportStatus, CatalogInput,
+    Action, AssetFormEntry, AssetFormRecord, AssetTypeFormReference, CatalogImportStatus,
+    CatalogInput,
     CatalogProperties,
     CatalogPropertiesOutput,
     Classifier,
@@ -908,34 +909,46 @@ pub fn new_database_id() -> String {
 /// form type id alike — both are ids the catalog assigns a resource.
 const CATALOG_ID_WORDS: usize = 2;
 
-/// `words` 64-bit draws rendered as lowercase hexadecimal: the one place this crate mints
-/// an opaque id from, so every id-minting function below agrees on where the bits come
-/// from and how they are spelled.
+/// `words` 64-bit draws rendered as lowercase hexadecimal: how this crate spells an opaque
+/// id the catalog assigns, so every id-minting function below agrees on how it reads.
 ///
-/// The bits come from three sources: the OS-seeded randomness a `RandomState` draws, the
-/// system clock in nanoseconds, and `minted`, the caller's own count of how many ids it
-/// has handed out — so two ids minted in the same nanosecond cannot come from the same
-/// input. Each caller passes its OWN counter, so one kind of id running ahead cannot skew
-/// another's.
+/// The bits of each draw come from [`id_draw`], which is the ONE place the entropy rule
+/// lives.
 ///
 /// This mints a RESOURCE id, not a credential: a credential would come from the credential
 /// store, never from here.
 fn mint_hex_id(minted: &AtomicU64, words: usize) -> String {
-    use std::collections::hash_map::RandomState;
     use std::fmt::Write;
-    use std::hash::BuildHasher;
 
     let sequence = minted.fetch_add(1, Ordering::Relaxed);
+    let mut id = String::with_capacity(words * 16);
+    for word in 0..words {
+        // Writing into the pre-sized buffer; `write!` to a `String` cannot fail.
+        let _ = write!(id, "{:016x}", id_draw(sequence, word));
+    }
+    id
+}
+
+/// One 64-bit draw for the `index`-th word of the id `sequence` is minting: the ONE place
+/// this crate draws the bits of an id from, so two id shapes cannot disagree about where
+/// they come from.
+///
+/// The bits come from three sources: the OS-seeded randomness a `RandomState` draws, the
+/// system clock in nanoseconds, and `sequence`, the minting caller's own count of how many
+/// ids it has handed out — so two ids minted in the same nanosecond cannot come from the
+/// same input. Each caller passes its OWN counter, so one kind of id running ahead cannot
+/// skew another's.
+///
+/// This draws for a RESOURCE id, not for a credential: a credential would come from the
+/// credential store, never from here.
+pub(super) fn id_draw(sequence: u64, index: usize) -> u64 {
+    use std::collections::hash_map::RandomState;
+    use std::hash::BuildHasher;
+
     let nanos = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_nanos());
-    let mut id = String::with_capacity(words * 16);
-    for word in 0..words {
-        let draw = RandomState::new().hash_one((sequence, nanos, word));
-        // Writing into the pre-sized buffer; `write!` to a `String` cannot fail.
-        let _ = write!(id, "{draw:016x}");
-    }
-    id
+    RandomState::new().hash_one((sequence, nanos, index))
 }
 
 /// Per-service state for com-amazonaws-glue-awsglue. A handler reaches it through [`service_state`].
@@ -3007,16 +3020,19 @@ impl ComAmazonawsGlueAwsglueState {
     /// The stored asset type an `Identifier` targeting `AssetTypeId` names, or `None` when
     /// this store holds no such asset type.
     ///
-    /// An identifier carries an asset type's address as the CLIENT holds it, which is
-    /// either the `AssetTypeId` the catalog minted for it or the `AssetTypeName` it was
-    /// registered under, exactly as a form type reference does
-    /// ([`Self::form_type_by_reference`]): a client that put an asset type by name
-    /// addresses it by that name, and the catalog serves that read. The minted id is tried
-    /// first, so an identifier that could be read either way names the record it was
-    /// minted for.
+    /// An identifier carries an asset type's address as the CLIENT holds it, which is any
+    /// of the forms this surface hands one out in: the `AssetTypeName` it was registered
+    /// under, which is also the `Id` the put reports ([`AssetTypeEntry::id`]), and the
+    /// catalog-qualified form a READ of it reports ([`AssetTypeEntry::qualified_id`]). A
+    /// client that kept the identifier from either answer addresses the record with it, and
+    /// the catalog serves that read.
     pub fn asset_type_by_reference(&self, identifier: &str) -> Option<&AssetTypeEntry> {
         self.asset_type_by_id(identifier)
             .or_else(|| self.asset_types.get(identifier))
+            .or_else(|| {
+                asset_type_name_from_qualified_id(identifier)
+                    .and_then(|name| self.asset_types.get(name))
+            })
     }
 
     /// Remove the asset type an `Identifier` targeting `AssetTypeId` names, reporting the

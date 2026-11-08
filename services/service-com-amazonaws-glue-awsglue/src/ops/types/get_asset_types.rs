@@ -17,7 +17,14 @@ pub struct GetAssetInput {
     pub identifier: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.glue#GetAssetOutput")]
+/// `GetAsset`'s response: the ten members the model declares, in the model's own member
+/// order, and the three members the real service reports beside them appended last.
+///
+/// Member set and order from `smithy_query(query="operation", operation="GetAsset")`, plus
+/// `AssetForms`, `MetadataForms` and `Type` — members the real service reports and the
+/// on-disk model omits, which is why the schema and the serializer come from
+/// `types/recorded_catalog_members.rs` rather than from the derive (see that module's
+/// note).
 #[derive(Debug, Clone, Default)]
 pub struct GetAssetOutput {
     pub id: String,
@@ -30,7 +37,99 @@ pub struct GetAssetOutput {
     pub forms: Option<std::collections::HashMap<String, AssetFormEntry>>,
     pub attachments: Option<std::collections::HashMap<String, AssetFormEntry>>,
     pub iterable_forms: Option<std::collections::HashMap<String, IterableFormEntry>>,
+    pub asset_forms: Option<Vec<AssetFormRecord>>,
+    pub metadata_forms: Option<Vec<AssetFormRecord>>,
+    pub r#type: Option<String>,
 }
+
+glue_schema_and_serializer!(
+    GetAssetOutput,
+    GET_ASSET_OUTPUT_SCHEMA,
+    "com.amazonaws.glue#GetAssetOutput",
+    "com.amazonaws.glue",
+    "GetAssetOutput",
+    (M_ID, id, "Id", 0, req, string),
+    (M_NAME, name, "Name", 1, opt, string),
+    (M_DESCRIPTION, description, "Description", 2, opt, string),
+    (M_CREATED_AT, created_at, "CreatedAt", 3, opt, timestamp),
+    (M_UPDATED_AT, updated_at, "UpdatedAt", 4, opt, timestamp),
+    (M_ASSET_TYPE_ID, asset_type_id, "AssetTypeId", 5, req, string),
+    (
+        M_GLOSSARY_TERMS,
+        glossary_terms,
+        "GlossaryTerms",
+        6,
+        opt,
+        list_of_string
+    ),
+    (M_FORMS, forms, "Forms", 7, opt, map_of_struct(AssetFormEntry)),
+    (
+        M_ATTACHMENTS,
+        attachments,
+        "Attachments",
+        8,
+        opt,
+        map_of_struct(AssetFormEntry)
+    ),
+    (
+        M_ITERABLE_FORMS,
+        iterable_forms,
+        "IterableForms",
+        9,
+        opt,
+        map_of_struct(IterableFormEntry)
+    ),
+    (
+        M_ASSET_FORMS,
+        asset_forms,
+        "AssetForms",
+        10,
+        opt,
+        recorded("com.amazonaws.glue.recorded", list_of_struct(AssetFormRecord))
+    ),
+    (
+        M_METADATA_FORMS,
+        metadata_forms,
+        "MetadataForms",
+        11,
+        opt,
+        recorded("com.amazonaws.glue.recorded", list_of_struct(AssetFormRecord))
+    ),
+    (
+        M_TYPE,
+        r#type,
+        "Type",
+        12,
+        opt,
+        recorded("com.amazonaws.glue.recorded", string)
+    ),
+);
+
+/// One entry of the form LISTS a read of an asset reports (`AssetForms`,
+/// `MetadataForms`): the form's name beside the two members the modelled `AssetFormEntry`
+/// carries, so a client reading the list sees the same form the `Forms` map holds under
+/// that name.
+///
+/// Entirely unmodelled — the on-disk model declares no list of forms at all — so its
+/// members and its shape id sit in the recorded namespace (see
+/// `types/recorded_catalog_members.rs`).
+#[derive(Debug, Clone, Default)]
+pub struct AssetFormRecord {
+    pub form_name: Option<String>,
+    pub form_type_id: Option<String>,
+    pub content: Option<String>,
+}
+
+glue_schema_and_serializer!(
+    AssetFormRecord,
+    ASSET_FORM_RECORD_SCHEMA,
+    "com.amazonaws.glue.recorded#AssetFormRecord",
+    "com.amazonaws.glue.recorded",
+    "AssetFormRecord",
+    (M_FORM_NAME, form_name, "FormName", 0, opt, string),
+    (M_FORM_TYPE_ID, form_type_id, "FormTypeId", 1, opt, string),
+    (M_CONTENT, content, "Content", 2, opt, string),
+);
 
 #[smithy_macros::smithy(shape = "com.amazonaws.glue#IterableFormEntry")]
 #[derive(Debug, Clone, Default)]

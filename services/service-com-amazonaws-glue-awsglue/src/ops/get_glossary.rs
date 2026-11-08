@@ -171,11 +171,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // Every member comes from the store, so two reads of one glossary agree and a
-        // read after an update reports what that update stored.
+        // read after an update reports what that update stored — the two instants
+        // included: they are the clock's, stamped when this glossary was created and when
+        // an update last changed it, and a read only reports them.
         Ok(GetGlossaryOutput {
             id: Some(entry.id.clone()),
             name: Some(entry.name.clone()),
             description: entry.description.clone(),
+            created_at: Some(crate::state::to_date_time(entry.created_at)),
+            updated_at: Some(crate::state::to_date_time(entry.updated_at)),
         })
     }
 }

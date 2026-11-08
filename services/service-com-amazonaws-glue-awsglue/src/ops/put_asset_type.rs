@@ -243,14 +243,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // take an `Identifier` a client holds from a put — so the `Id` reported here
             // is that name, reconstructible by a caller that knows only what it submitted.
             // The form type a reference names does the same with its own `Id`
-            // ([`crate::state::FormTypeEntry`]). The record is built member for member
-            // here rather than through the entry's own constructor, which mints an opaque
-            // per-call id no caller can derive.
-            let fresh = crate::state::AssetTypeEntry {
-                id: input.name.clone(),
-                name: input.name.clone(),
-                forms,
-            };
+            // ([`crate::state::FormTypeEntry`]).
+            let fresh = crate::state::AssetTypeEntry::new(input.name.clone(), forms);
             store.asset_types.insert(input.name.clone(), fresh.clone());
             fresh
         };
@@ -262,7 +256,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
 
         // Every member comes from the record now in the store, so the put reports the
-        // asset type a later `GetAssetType` of the same id reports.
+        // asset type a later `GetAssetType` of the same id reports. The put reports the
+        // record's identity as the NAME it registered, which is what a caller carries into
+        // the read and the delete; that read reports the same identity in the
+        // catalog-qualified form (`crate::state::AssetTypeEntry::qualified_id`), and both
+        // forms address this record.
         Ok(PutAssetTypeOutput {
             id: Some(stored.id.clone()),
             name: Some(stored.name.clone()),
