@@ -229,10 +229,11 @@ pub enum ApiKeySecretProblem {
 /// Put `api_key` into the Secrets Manager secret a `MANAGED` provider's key lives
 /// in, and report that secret's ARN.
 ///
-/// The secret is created under [`managed_api_key_secret_name`]. That name is
-/// derived from the provider, so a secret already standing under it is THIS
-/// provider's secret and nothing else's: the key this create carries is put into
-/// it as a new version, and its ARN is the one reported.
+/// The secret is created under [`managed_api_key_secret_name`], carrying the key
+/// as the JSON document [`managed_api_key_secret_value`] builds; the store itself
+/// is the shared one every credential-provider plane of this crate uses
+/// ([`store_managed_secret`]), so the ARN reported is the one Secrets Manager
+/// answered with.
 ///
 /// Call it with NO state guard held — it awaits.
 pub async fn store_managed_api_key(
@@ -304,11 +305,8 @@ pub(crate) async fn store_managed_secret(
 /// name or its whole ARN, both of which that service resolves.
 ///
 /// Nothing is written: the secret is the caller's. The ARN reported is the one
-/// Secrets Manager answered with, never the string the request carried: a
-/// `secretId` that service holds no secret for is
-/// [`ApiKeySecretProblem::Absent`] and any other answer is
-/// [`ApiKeySecretProblem::Unavailable`], so a provider is never recorded against
-/// a secret nothing holds.
+/// Secrets Manager answered with, never the string the request carried, so a
+/// provider is never recorded against a secret nothing holds.
 ///
 /// Call it with NO state guard held — it awaits.
 pub async fn external_api_key_secret_arn(

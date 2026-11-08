@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchPutGatewayRateLimits
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchPutGatewayRateLimits`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchPutGatewayRateLimits::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the whole rate-limit set of the gateway the path names with the set the
+//! request submits, in [`crate::state`]: an entry carrying a `rateLimitId` an existing
+//! limit holds is upserted onto it (its creation instant kept, its status `UPDATING`),
+//! an entry carrying none is created under a minted id, and a limit the submitted set
+//! leaves out is gone — so the stored set is always exactly one submitted list and never
+//! a merge of two. The whole set is written under one guard, so a batch that is refused
+//! writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +164,153 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchPutGatewayRateLimits` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchPutGatewayRateLimitsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchPutGatewayRateLimits"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchPutGatewayRateLimitsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the gateway store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A gateway whose deletion the clock has already made due is gone before
+        // this call looks for it: the removal was owed at this instant whether or
+        // not anybody called.
+        store.expire_deleted_gateways_and_targets(now);
+
+        // A replayed request carrying the same `clientToken` writes nothing a
+        // second time, and answers with the gateway's set as it stands: this
+        // operation's own `clientToken` says "if this token matches a previous
+        // request, the service ignores the request, but doesn't return an error"
+        // — the request is ignored rather than its first answer replayed, which
+        // is what the create operations of this service promise instead.
+        if let Some((gateway_id, _)) =
+            store.replayed_gateway_result(Self::NAME, input.client_token.as_deref())
+        {
+            if let Some(gateway) = store.gateways.get(&gateway_id) {
+                return Ok(BatchPutGatewayRateLimitsOutput {
+                    rate_limits: gateway
+                        .rate_limits
+                        .values()
+                        .map(|record| record.detail(&gateway_id, now))
+                        .collect(),
+                });
+            }
+        }
+
+        // "If the operation fails, the service applies no changes": everything
+        // that can refuse this batch is decided before anything is written, so a
+        // refused call leaves the gateway's existing set exactly as it was.
+        if let Some(refusal) = crate::state::refusal_for_batch(&input.rate_limits) {
+            return Err(
+                BatchPutGatewayRateLimitsErrorModeled::ValidationException(refusal).into(),
+            );
+        }
+
+        let gateway = store.gateways.get(&input.gateway_identifier).ok_or_else(|| {
+            BatchPutGatewayRateLimitsErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
+            )
+        })?;
+        // A rate limit is enforced BY the gateway, so the gateway has to be ready
+        // to enforce it: while it is still in the transient status the clock owes
+        // a transition for, or on its way out in `DELETING`, it takes no rate
+        // limit, and the caller is told which status to wait out. The refusal is
+        // worded by the one helper every gateway operation this service refuses
+        // on status shares.
+        let status = gateway.status_at(now);
+        if status != crate::state::STATUS_READY {
+            return Err(BatchPutGatewayRateLimitsErrorModeled::ValidationException(
+                crate::state::gateway_status_conflict(Self::NAME, status),
+            )
+            .into());
+        }
+        // The set one gateway holds is bounded, so a caller cannot grow this
+        // process's memory without bound. `BatchPutLimitEntries` is itself
+        // `@length 1..50`, so the boundary walk has already refused a longer
+        // list: this keeps the ceiling the store's own rather than the request
+        // shape's.
+        if input.rate_limits.len() > crate::state::MAX_RATE_LIMITS_PER_GATEWAY {
+            return Err(
+                BatchPutGatewayRateLimitsErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "a gateway holds at most {} rate limits",
+                            crate::state::MAX_RATE_LIMITS_PER_GATEWAY
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let gateway_id = gateway.gateway_id.clone();
+        // The set this write replaces, read before the ids are minted: an upsert
+        // keeps the creation instant of the limit its id already names.
+        let replaced = gateway.rate_limits.clone();
+
+        // Each submitted entry under the id it is stored by: the caller's
+        // `rateLimitId` where they supplied one — "If provided, the service uses
+        // it for upsert matching against existing rate limits" — and otherwise
+        // one minted here, distinct from every id this same batch is taking.
+        let mut taken: ::std::collections::BTreeSet<String> = input
+            .rate_limits
+            .iter()
+            .filter_map(|entry| entry.rate_limit_id.clone())
+            .collect();
+        let mut submitted = Vec::with_capacity(input.rate_limits.len());
+        for entry in input.rate_limits {
+            let rate_limit_id = match entry.rate_limit_id.clone() {
+                Some(rate_limit_id) => rate_limit_id,
+                None => {
+                    let minted = store.mint_gateway_rate_limit_id(
+                        &gateway_id,
+                        &entry.dimension_keys.join("/"),
+                        &taken,
+                        now,
+                    );
+                    taken.insert(minted.clone());
+                    minted
+                }
+            };
+            submitted.push((rate_limit_id, entry));
+        }
+
+        let written: ::std::collections::BTreeMap<String, crate::state::GatewayRateLimitRecord> =
+            submitted
+                .iter()
+                .map(|(rate_limit_id, entry)| {
+                    (
+                        rate_limit_id.clone(),
+                        crate::state::GatewayRateLimitRecord::stored(
+                            rate_limit_id.clone(),
+                            entry.clone(),
+                            replaced.get(rate_limit_id),
+                            now,
+                        ),
+                    )
+                })
+                .collect();
+
+        // One assignment, under the one guard: the gateway's set becomes the
+        // submitted set, so no caller can observe a half-applied batch or a merge
+        // of two.
+        let gateway = store.gateways.get_mut(&gateway_id).ok_or_else(|| {
+            BatchPutGatewayRateLimitsErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
+            )
+        })?;
+        gateway.rate_limits = written;
+        gateway.updated_at = now;
+        // Reported in the order the request submitted them, so the caller reads
+        // the resulting set against the list it sent.
+        let rate_limits = submitted
+            .iter()
+            .filter_map(|(rate_limit_id, _)| gateway.rate_limits.get(rate_limit_id))
+            .map(|record| record.detail(&gateway_id, now))
+            .collect();
+        store.remember_gateway_client_token(Self::NAME, input.client_token, &gateway_id, None);
+
+        Ok(BatchPutGatewayRateLimitsOutput { rate_limits })
     }
 }

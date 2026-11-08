@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Mints a policy in the policy engine the path names and persists it in
+//! [`crate::state`], reporting it `CREATING` with the transition to `ACTIVE` owed by the
+//! clock ("This is an asynchronous operation. Use the GetPolicy operation to poll the
+//! status field"). An engine the path names and this account does not hold is refused
+//! the modelled `ResourceNotFoundException`: a policy is created only in an engine that
+//! exists to evaluate it.
 //!
 //! ## Shape of an operation
 //!
@@ -230,18 +228,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePolicy"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreatePolicyErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the policy store is unavailable".to_string()),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+
+        // A replayed request carrying the same `clientToken` answers with the
+        // policy that token first produced: "If you retry a request with the same
+        // client token, the service returns the same response without creating a
+        // duplicate policy."
+        if let Some((policy_engine_id, Some(policy_id))) =
+            store.replayed_policy_result(Self::NAME, input.client_token.as_deref())
+        {
+            if let Some(record) = store
+                .policy_engines
+                .get(&policy_engine_id)
+                .and_then(|engine| engine.policies.get(&policy_id))
+            {
+                return Ok(record.create_output(now));
+            }
+        }
+
+        // The policy is created IN the engine the path names, so an id no engine
+        // of this account holds is the modelled 404 rather than a policy stored
+        // where nothing can evaluate it.
+        let engine = store
+            .policy_engines
+            .get(&input.policy_engine_id)
+            .ok_or_else(|| {
+                CreatePolicyErrorModeled::ResourceNotFoundException(
+                    crate::state::policy_engine_not_found(&input.policy_engine_id),
+                )
+            })?;
+        let policy_engine_id = engine.policy_engine_id.clone();
+
+        // The policies one engine holds are bounded, so a caller looping on
+        // create meets the modelled quota instead of this process's memory limit.
+        if engine.policies.len() >= crate::state::MAX_POLICIES_PER_POLICY_ENGINE {
+            return Err(CreatePolicyErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "policy engine {policy_engine_id} already holds the maximum of {} policies",
+                        crate::state::MAX_POLICIES_PER_POLICY_ENGINE
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // "The customer-assigned immutable name for the policy. Must be unique
+        // within the account": a repeated name is a conflict rather than a second
+        // policy a caller reading by name could not tell apart.
+        if let Some((holding_engine, holding_policy)) = store.policy_named(&input.name) {
+            return Err(CreatePolicyErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "a policy named {} already exists in this account (policyId {holding_policy} \
+                     of policy engine {holding_engine})",
+                    input.name
+                )),
+            })
+            .into());
+        }
+
+        let policy_id = store.mint_policy_id(&policy_engine_id, &input.name, now);
+        let client_token = input.client_token.clone();
+        let record = crate::state::PolicyRecord::created(
+            &region,
+            policy_engine_id.clone(),
+            policy_id.clone(),
+            input,
+            now,
+        );
+        let output = record.create_output(now);
+
+        // The engine was resolved under this same guard, so it is still here;
+        // the lookup is nonetheless fallible rather than silent, because a
+        // success whose write went nowhere is worse than a server error.
+        let engine = store
+            .policy_engines
+            .get_mut(&policy_engine_id)
+            .ok_or_else(|| {
+                CreatePolicyErrorModeled::InternalServerException(InternalServerException {
+                    message: Some(format!(
+                        "policy engine {policy_engine_id} went away while the policy was created"
+                    )),
+                })
+            })?;
+        engine.updated_at = now;
+        engine.policies.insert(policy_id.clone(), record);
+        store.remember_policy_client_token(
+            Self::NAME,
+            client_token,
+            &policy_engine_id,
+            Some(&policy_id),
+        );
+
+        Ok(output)
     }
 }

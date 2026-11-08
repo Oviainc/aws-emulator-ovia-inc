@@ -809,6 +809,16 @@ pub struct GatewayRecord {
     /// Every target on this gateway, keyed by `targetId`. The key order is the
     /// deterministic list order a target listing pages over.
     pub targets: BTreeMap<String, GatewayTargetRecord>,
+    /// Every rate limit configured on this gateway, keyed by `rateLimitId`. The
+    /// key order is the deterministic list order a rate-limit listing pages
+    /// over.
+    ///
+    /// Here rather than in a map of its own for the same reason the targets are:
+    /// a rate limit is addressed only through the gateway it throttles
+    /// (`/gateways/{gatewayIdentifier}/rate-limits/{rateLimitId}`) and is gone
+    /// when the gateway is. Bounded by
+    /// [`MAX_RATE_LIMITS_PER_GATEWAY`](gateway_rate_limits::MAX_RATE_LIMITS_PER_GATEWAY).
+    pub rate_limits: BTreeMap<String, GatewayRateLimitRecord>,
 }
 
 impl GatewayRecord {
@@ -1754,6 +1764,12 @@ impl MemoryRecord {
     }
 }
 
+/// One gateway's rate limits: the record each is stored as, the clock-owed
+/// status it reports, the envelopes every operation that reports one renders,
+/// and the one check a submitted set has to pass. Re-exported, so a handler
+/// names `crate::state::…` for it exactly as it does for the gateway that holds
+/// the limits.
+pub mod gateway_rate_limits;
 /// What a requested memory strategy becomes before it is stored: the union
 /// member it was read off, the namespace list the rule gives it, its validated
 /// record expiry and the `MemoryStrategy` every operation that reports one
@@ -1765,6 +1781,9 @@ pub mod memory_strategies;
 /// authenticates with. Re-exported, so a handler names `crate::state::…` for it
 /// exactly as it does for the resources beside it.
 pub mod payment_credential_providers;
+/// The policy plane: the policy engine, the policies created in it, their ARNs
+/// and the refusals a missing one is reported with.
+pub mod policies;
 /// Every lookup and mutation the handlers drive this service's state struct through:
 /// the inherent methods of
 /// [`ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState`], which a
@@ -1775,6 +1794,10 @@ mod store;
 /// names `crate::state::…` for it exactly as it does for the resources the
 /// policy attaches to.
 mod resource_policies;
+/// Where the token vault's credential providers keep their credentials: the one
+/// store and the one resolution every provider plane shares, which live with the
+/// API key provider's own record.
+mod token_vault_secrets;
 /// The CloudWatch Logs group this service vends for an agent runtime: the name it is
 /// derived under and the create that provisions it. Re-exported, so a handler names
 /// `crate::state::…` for it exactly as it does for the object-storage and IAM
@@ -1791,9 +1814,11 @@ pub mod api_key_credential_providers;
 /// `crate::state::…` for it exactly as it does for the target record itself.
 pub mod gateway_target_synchronization;
 pub use api_key_credential_providers::*;
+pub use gateway_rate_limits::*;
 pub use gateway_target_synchronization::*;
 pub use memory_strategies::*;
 pub use payment_credential_providers::*;
+pub use policies::*;
 pub use resource_policies::*;
 pub use runtime_logs::*;
 
@@ -3061,6 +3086,11 @@ impl ConfigurationBundleRecord {
 /// [`MAX_CONFIGURATION_BUNDLES`] the configuration bundles (and with them their
 /// 1:1 name index), [`MAX_VERSIONS_PER_CONFIGURATION_BUNDLE`] the versions one
 /// bundle accumulates,
+/// [`MAX_RATE_LIMITS_PER_GATEWAY`](gateway_rate_limits::MAX_RATE_LIMITS_PER_GATEWAY)
+/// the rate limits one gateway holds,
+/// [`MAX_POLICY_ENGINES`](policies::MAX_POLICY_ENGINES) the policy engines and
+/// [`MAX_POLICIES_PER_POLICY_ENGINE`](policies::MAX_POLICIES_PER_POLICY_ENGINE)
+/// the policies one engine holds,
 /// [`MAX_PAYMENT_CREDENTIAL_PROVIDERS`] the payment credential providers and
 /// [`MAX_WORKLOAD_IDENTITIES`] the workload identities,
 /// [`MAX_API_KEY_CREDENTIAL_PROVIDERS`] the API key credential providers, the
@@ -3289,6 +3319,21 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// this holds the one instant [`SystemTools`] dates them from and never
     /// grows.
     pub system_tools: SystemTools,
+    /// Every policy engine, keyed by `policyEngineId` — the identifier every
+    /// policy-engine and policy route addresses it by, each holding the policies
+    /// created in it. The key order is the deterministic list order a policy
+    /// listing pages over.
+    pub policy_engines: BTreeMap<String, PolicyEngineRecord>,
+    /// `<operation>/<clientToken>` -> the (policy engine, policy) that token
+    /// first produced — `None` for an engine create, which produced no policy —
+    /// so a replayed `CreatePolicyEngine` / `CreatePolicy` answers with its first
+    /// result instead of minting a second resource. Separate from the maps above
+    /// because the record is validated against a different store; the key
+    /// carries the operation for the same reason as there.
+    policy_idempotency: BTreeMap<String, (String, Option<String>)>,
+    /// The keys of [`Self::policy_idempotency`] in the order they were first
+    /// recorded, so the oldest record is the one evicted at the ceiling.
+    policy_idempotency_order: VecDeque<String>,
     /// Bumped on every mint, so two runtimes created in the same instant with
     /// the same name still get distinct ids.
     mint_counter: u64,

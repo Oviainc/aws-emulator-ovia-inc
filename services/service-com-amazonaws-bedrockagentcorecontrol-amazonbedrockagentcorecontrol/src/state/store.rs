@@ -937,4 +937,140 @@ impl ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState {
         self.forget_configuration_bundle_client_tokens_for(&record.bundle_id);
         Some(record)
     }
+
+    /// Mint a `policyEngineId` for `name` that no stored engine holds: the name
+    /// + `-` + 10 lower-case alphanumerics, per `ResourceId`'s pattern
+    /// `^[A-Za-z][A-Za-z0-9_]*-[a-z0-9_]{10}$`.
+    ///
+    /// `PolicyEngineName` is `^[A-Za-z][A-Za-z0-9_]*$`, which is exactly the
+    /// stem that pattern asks for, so the name is carried into the id as it
+    /// stands rather than folded.
+    pub fn mint_policy_engine_id(&mut self, name: &str, at: SystemTime) -> String {
+        loop {
+            self.mint_counter = self.mint_counter.wrapping_add(1);
+            let candidate = format!("{name}-{}", suffix_for(name, self.mint_counter, at));
+            if !self.policy_engines.contains_key(&candidate) {
+                return candidate;
+            }
+        }
+    }
+
+    /// Mint a `policyId` no policy of the engine `policy_engine_id` holds, on the
+    /// same `ResourceId` pattern [`Self::mint_policy_engine_id`] mints an engine
+    /// id under — a policy carries its own name the same way.
+    pub fn mint_policy_id(
+        &mut self,
+        policy_engine_id: &str,
+        name: &str,
+        at: SystemTime,
+    ) -> String {
+        loop {
+            self.mint_counter = self.mint_counter.wrapping_add(1);
+            let candidate = format!(
+                "{name}-{}",
+                suffix_for(
+                    &format!("{policy_engine_id}/{name}"),
+                    self.mint_counter,
+                    at
+                )
+            );
+            let taken = self
+                .policy_engines
+                .get(policy_engine_id)
+                .is_some_and(|engine| engine.policies.contains_key(&candidate));
+            if !taken {
+                return candidate;
+            }
+        }
+    }
+
+    /// Mint a `rateLimitId` no rate limit of the gateway `gateway_id` holds: 10
+    /// alphanumerics, per `GatewayRateLimitId`'s pattern
+    /// `^[a-zA-Z0-9][a-zA-Z0-9\-_\.]{0,62}[a-zA-Z0-9]$`, which — unlike a
+    /// gateway id — carries no name, because a rate limit has none.
+    ///
+    /// `taken` says which ids the set being written already holds, so a batch
+    /// that mints several ids at once cannot mint one twice: the entries of that
+    /// batch are not in the store yet.
+    pub fn mint_gateway_rate_limit_id(
+        &mut self,
+        gateway_id: &str,
+        seed: &str,
+        taken: &BTreeSet<String>,
+        at: SystemTime,
+    ) -> String {
+        loop {
+            self.mint_counter = self.mint_counter.wrapping_add(1);
+            let candidate = suffix_for(&format!("{gateway_id}/{seed}"), self.mint_counter, at);
+            let held = taken.contains(&candidate)
+                || self
+                    .gateways
+                    .get(gateway_id)
+                    .is_some_and(|gateway| gateway.rate_limits.contains_key(&candidate));
+            if !held {
+                return candidate;
+            }
+        }
+    }
+
+    /// The (policy engine, policy) a previous request to `operation` carrying
+    /// this `clientToken` produced, if the record is still held and what it names
+    /// still exists.
+    pub fn replayed_policy_result(
+        &self,
+        operation: &str,
+        client_token: Option<&str>,
+    ) -> Option<(String, Option<String>)> {
+        let (policy_engine_id, policy_id) = self
+            .policy_idempotency
+            .get(&token_key(operation, client_token?))?;
+        let engine = self.policy_engines.get(policy_engine_id)?;
+        match policy_id {
+            None => Some((policy_engine_id.clone(), None)),
+            Some(policy_id) => engine
+                .policies
+                .contains_key(policy_id)
+                .then(|| (policy_engine_id.clone(), Some(policy_id.clone()))),
+        }
+    }
+
+    /// Record what a `clientToken` produced for `operation` in the policy plane,
+    /// evicting the oldest record once [`MAX_REMEMBERED_CLIENT_TOKENS`] are held.
+    /// An evicted token is indistinguishable from one whose idempotency window
+    /// has passed: the next request carrying it is served as a fresh one.
+    pub fn remember_policy_client_token(
+        &mut self,
+        operation: &str,
+        client_token: Option<String>,
+        policy_engine_id: &str,
+        policy_id: Option<&str>,
+    ) {
+        let Some(token) = client_token else {
+            return;
+        };
+        remember_token(
+            &mut self.policy_idempotency,
+            &mut self.policy_idempotency_order,
+            token_key(operation, &token),
+            (policy_engine_id.to_string(), policy_id.map(str::to_string)),
+        );
+    }
+
+    /// The (policy engine, policy) a policy named `name` is held under, if any
+    /// engine of this account holds one.
+    ///
+    /// A policy name is "the customer-assigned immutable name for the policy.
+    /// Must be unique within the account" (`smithy_query doc shape=CreatePolicy
+    /// member=name`), so the check spans every engine rather than the one the
+    /// request named. The engines and their policies are both bounded, so the
+    /// walk is too.
+    pub fn policy_named(&self, name: &str) -> Option<(&str, &str)> {
+        self.policy_engines.values().find_map(|engine| {
+            engine
+                .policies
+                .values()
+                .find(|policy| policy.name == name)
+                .map(|policy| (engine.policy_engine_id.as_str(), policy.policy_id.as_str()))
+        })
+    }
 }

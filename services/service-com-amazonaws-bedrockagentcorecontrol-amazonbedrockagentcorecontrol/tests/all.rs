@@ -47,6 +47,8 @@ mod gateway_listings;
 mod gateway_mcp_endpoint;
 #[path = "all/gateway_mutation.rs"]
 mod gateway_mutation;
+#[path = "all/gateway_rate_limit_batch.rs"]
+mod gateway_rate_limit_batch;
 #[path = "all/gateway_target_deletion.rs"]
 mod gateway_target_deletion;
 #[path = "all/gateway_target_listing.rs"]
@@ -77,6 +79,10 @@ mod memory_namespace_key_reference_wording;
 mod memory_read_reflects_last_mutation;
 #[path = "all/memory_update_and_read_projection.rs"]
 mod memory_update_and_read_projection;
+#[path = "all/payment_credential_provider.rs"]
+mod payment_credential_provider;
+#[path = "all/policy_plane.rs"]
+mod policy_plane;
 #[path = "all/payment_credential_provider_external_secret.rs"]
 mod payment_credential_provider_external_secret;
 #[path = "all/payment_credential_provider_lifecycle.rs"]
