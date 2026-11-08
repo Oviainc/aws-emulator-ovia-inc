@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetBrowserSession
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetBrowserSession`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports one browser session as [`crate::ops::start_browser_session`] persisted it,
+//! with the status the clock implies: `READY` while the session is inside the
+//! time-to-live its start asked for, `TERMINATED` from the instant that runs out. A
+//! session this emulator does not hold is a 404.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetBrowserSession::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `@readonly`: nothing is written here, not even the termination a time-to-live has
+//! already made due — that reading is a function of the stored record and the clock.
+//!
+//! Two members of the response are not reported, because nothing in this emulator backs
+//! them: `streams` (an automation stream is a WebSocket endpoint no process here
+//! serves) and `sessionReplayArtifact` (no session replay is recorded).
 //!
 //! ## Shape of an operation
 //!
@@ -198,18 +200,83 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetBrowserSession` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetBrowserSessionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetBrowserSession"))
+        // Request metadata is not read by this operation: every member it needs is
+        // bound into `input` by the centralized request walk.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetBrowserSessionErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the shared engine does not carry this service's state".to_string()),
+            })
+        })?;
+
+        // `@readonly`: this reports what is stored and writes nothing. The status is a
+        // function of the clock, so a termination the time-to-live already made due is
+        // reported without any write.
+        let now = ::std::time::SystemTime::now();
+        // A session is addressed BY its browser, and the path resolves outside-in: a
+        // browser this emulator does not hold is what the refusal names, before anything
+        // is looked for among its sessions. The resolution and both sentences live in
+        // `crate::state`; this operation only says which of its own modelled errors
+        // carries each.
+        if let Err(unavailable) =
+            crate::state::resolve_browser(&*self.engine, &input.browser_identifier)
+        {
+            return Err(match unavailable {
+                crate::state::BrowserUnavailable::NotFound(message) => {
+                    GetBrowserSessionErrorModeled::ResourceNotFoundException(
+                        ResourceNotFoundException {
+                            message: Some(message),
+                        },
+                    )
+                }
+                crate::state::BrowserUnavailable::StoreUnavailable(message) => {
+                    GetBrowserSessionErrorModeled::InternalServerException(
+                        InternalServerException {
+                            message: Some(message),
+                        },
+                    )
+                }
+            }
+            .into());
+        }
+        let store = state.lock();
+        let session = store
+            .browser_session(&input.browser_identifier, &input.session_id)
+            .ok_or_else(|| {
+                GetBrowserSessionErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        // The session is the resource addressed and the only one named:
+                        // the browser it was looked for on is not part of this message.
+                        message: Some(crate::state::resource_not_found_message(
+                            crate::state::NotFoundResource::Session,
+                            &input.session_id,
+                        )),
+                    },
+                )
+            })?;
+
+        Ok(GetBrowserSessionOutput {
+            browser_identifier: session.browser_identifier.clone(),
+            session_id: session.session_id.clone(),
+            name: session.name.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(session.created_at),
+            view_port: session.view_port.clone(),
+            extensions: session.extensions.clone(),
+            enterprise_policies: session.enterprise_policies.clone(),
+            profile_configuration: session.profile_configuration.clone(),
+            session_timeout_seconds: Some(session.session_timeout_seconds),
+            status: Some(session.status_as_of(now).to_string()),
+            // No process here serves a browser automation or live view stream, so this
+            // session has none to report.
+            streams: None,
+            proxy_configuration: session.proxy_configuration.clone(),
+            certificates: session.certificates.clone(),
+            filesystem_configurations: session.filesystem_configurations.clone(),
+            // Nothing records a session replay, so there is no artifact to name.
+            session_replay_artifact: None,
+            // The instant this session was last changed, which until a call changes it
+            // is the instant it was created.
+            last_updated_at: Some(::aws_smithy_types::DateTime::from(session.last_updated_at)),
+        })
     }
 }

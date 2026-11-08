@@ -76,6 +76,10 @@
 //! Each stop a `clientToken` replays is recorded too, bounded by
 //! [`MAX_STOP_TOKENS_PER_SESSION`].
 //!
+//! The BROWSER tools plane is its own concern and lives in [`browser`]: a browser holds
+//! the sessions `StartBrowserSession` started on it, read back by `GetBrowserSession`,
+//! bounded the same way as the code interpreter plane.
+//!
 //! The AgentCore A/B TESTING plane is a concern of its own, so it lives in
 //! [`ab_tests`]: the tests `CreateABTest` minted, what `ListABTests` reports from them,
 //! and the bound that plane grows under ([`MAX_AB_TESTS`]).
@@ -85,6 +89,11 @@ use std::time::{Duration, SystemTime};
 
 mod ab_tests;
 pub use ab_tests::*;
+
+/// The browser tools plane: [`BrowserStore`] and [`BrowserSessionRecord`], plus the
+/// lookups and the write path the browser session operations go through.
+mod browser;
+pub use browser::*;
 
 use crate::ops::types::{
     Branch, Certificate, Event, ExtractionConfig, IngestPayloadType, MemoryContent, MemoryRecord,
@@ -316,6 +325,12 @@ pub struct ComAmazonawsBedrockagentcoreAmazonbedrockagentcoreState {
     /// one is answered by the shared inventory ([`holds_code_interpreter`]) before any
     /// call that starts a session writes here.
     pub code_interpreters: HashMap<String, CodeInterpreterStore>,
+    /// Browsers this data plane has started a session on, keyed by the
+    /// `browserIdentifier` the caller named, for the same reason
+    /// [`Self::code_interpreters`] is keyed by its own identifier: the browser itself is
+    /// created through the CONTROL plane, a different service. Bounded by
+    /// [`MAX_BROWSERS`].
+    pub browsers: HashMap<String, BrowserStore>,
     /// Every workload access token this service issued and has not pruned.
     pub workload_access_tokens: IssuedWorkloadAccessTokens,
     /// The A/B tests `CreateABTest` created, keyed by the `abTestId` this emulator
@@ -1832,6 +1847,9 @@ pub enum NotFoundResource {
     Event,
     /// An evaluator, addressed by `evaluatorId`.
     Evaluator,
+    /// A browser, addressed by `browserIdentifier`: the tool the service provides or a
+    /// browser the control plane created.
+    Browser,
 }
 
 impl NotFoundResource {
@@ -1844,6 +1862,7 @@ impl NotFoundResource {
             Self::Session => "Session",
             Self::Event => "Event",
             Self::Evaluator => "Evaluator",
+            Self::Browser => "Browser",
         }
     }
 }
@@ -1906,17 +1925,26 @@ pub fn mint_memory_record_id(created_at: ::aws_smithy_types::DateTime, seq: u64)
     format!("mem-{millis:016x}{seq:024x}")
 }
 
-/// Mint a `CodeInterpreterSessionId`.
+/// Mint an id for a session shape whose pattern is `^[0-9a-zA-Z]{1,40}$` —
+/// alphanumerics only, so the id is the creation instant in epoch milliseconds followed
+/// by the engine-wide sequence, both in lowercase hex (26 characters), which keeps two
+/// sessions started in one millisecond apart.
 ///
-/// That shape's pattern is `^[0-9a-zA-Z]{1,40}$` — alphanumerics only, so the id is
-/// the creation instant in epoch milliseconds followed by the engine-wide sequence,
-/// both in lowercase hex (26 characters), which keeps two sessions started in one
-/// millisecond apart.
-pub fn mint_code_interpreter_session_id(seq: u64) -> String {
+/// The ONE home of that id form: `CodeInterpreterSessionId` and `BrowserSessionId`
+/// publish the identical pattern, so both tools planes mint through this rather than
+/// each spelling the form again ([`mint_code_interpreter_session_id`],
+/// [`mint_browser_session_id`]).
+pub fn mint_alphanumeric_session_id(seq: u64) -> String {
     let millis = std::time::SystemTime::now()
         .duration_since(std::time::SystemTime::UNIX_EPOCH)
         .map_or(0, |since| since.as_millis());
     format!("{millis:010x}{seq:016x}")
+}
+
+/// Mint a `CodeInterpreterSessionId`, in the form
+/// [`mint_alphanumeric_session_id`] states for that shape's pattern.
+pub fn mint_code_interpreter_session_id(seq: u64) -> String {
+    mint_alphanumeric_session_id(seq)
 }
 
 /// Encode an opaque `nextToken` for `kind` resuming at `offset`.

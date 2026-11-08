@@ -18,7 +18,11 @@ pub struct GetBrowserSessionInput {
     pub session_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcore#GetBrowserSessionResponse")]
+/// `GetBrowserSessionResponse`. Its schema and serializer come from
+/// [`super::date_time_wire`] rather than `#[smithy_macros::smithy(shape = ...)]`
+/// because `createdAt` and `lastUpdatedAt` target `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")`, and the derive does not put that trait on a member
+/// schema — see `types/date_time_wire.rs`.
 #[derive(Debug, Clone)]
 pub struct GetBrowserSessionOutput {
     pub browser_identifier: String,

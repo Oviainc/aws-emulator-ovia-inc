@@ -48,8 +48,8 @@ use ::aws_smithy_schema::traits::TimestampFormat;
 use ::aws_smithy_schema::{Schema, ShapeId, ShapeType};
 
 use super::{
-    GetCodeInterpreterSessionOutput, StartCodeInterpreterSessionOutput,
-    StopCodeInterpreterSessionOutput,
+    GetBrowserSessionOutput, GetCodeInterpreterSessionOutput, StartBrowserSessionOutput,
+    StartCodeInterpreterSessionOutput, StopCodeInterpreterSessionOutput,
 };
 
 /// The namespace every shape of this service lives in.
@@ -336,6 +336,365 @@ impl SerializableStruct for GetCodeInterpreterSessionOutput {
                 }
                 Ok(())
             })?;
+        }
+        Ok(())
+    }
+}
+
+impl StartBrowserSessionOutput {
+    pub const M_BROWSER_IDENTIFIER: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#StartBrowserSessionResponse$browserIdentifier",
+            NS,
+            "browserIdentifier",
+        ),
+        ShapeType::String,
+        "browserIdentifier",
+        0,
+    );
+
+    pub const M_SESSION_ID: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#StartBrowserSessionResponse$sessionId",
+            NS,
+            "sessionId",
+        ),
+        ShapeType::String,
+        "sessionId",
+        1,
+    );
+
+    /// Targets `DateTimestamp`, hence the format the derive cannot attach.
+    pub const M_CREATED_AT: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#StartBrowserSessionResponse$createdAt",
+            NS,
+            "createdAt",
+        ),
+        ShapeType::Timestamp,
+        "createdAt",
+        2,
+    )
+    .with_timestamp_format(TimestampFormat::DateTime);
+
+    pub const M_STREAMS: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#StartBrowserSessionResponse$streams",
+            NS,
+            "streams",
+        ),
+        ShapeType::Structure,
+        "streams",
+        3,
+    );
+
+    pub const SCHEMA: Schema = Schema::new_struct(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#StartBrowserSessionResponse",
+            NS,
+            "StartBrowserSessionResponse",
+        ),
+        ShapeType::Structure,
+        &[
+            &Self::M_BROWSER_IDENTIFIER,
+            &Self::M_SESSION_ID,
+            &Self::M_CREATED_AT,
+            &Self::M_STREAMS,
+        ],
+    );
+}
+
+pub static START_BROWSER_SESSION_OUTPUT_SCHEMA: &Schema = &StartBrowserSessionOutput::SCHEMA;
+
+impl SerializableStruct for StartBrowserSessionOutput {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&Self::M_BROWSER_IDENTIFIER, self.browser_identifier.as_str())?;
+        s.write_string(&Self::M_SESSION_ID, self.session_id.as_str())?;
+        s.write_timestamp(&Self::M_CREATED_AT, &self.created_at)?;
+        if let Some(streams) = self.streams.as_ref() {
+            s.write_struct(&Self::M_STREAMS, streams)?;
+        }
+        Ok(())
+    }
+}
+
+impl GetBrowserSessionOutput {
+    pub const M_BROWSER_IDENTIFIER: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#GetBrowserSessionResponse$browserIdentifier",
+            NS,
+            "browserIdentifier",
+        ),
+        ShapeType::String,
+        "browserIdentifier",
+        0,
+    );
+
+    pub const M_SESSION_ID: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#GetBrowserSessionResponse$sessionId",
+            NS,
+            "sessionId",
+        ),
+        ShapeType::String,
+        "sessionId",
+        1,
+    );
+
+    pub const M_NAME: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#GetBrowserSessionResponse$name",
+            NS,
+            "name",
+        ),
+        ShapeType::String,
+        "name",
+        2,
+    );
+
+    /// Targets `DateTimestamp`, hence the format the derive cannot attach.
+    pub const M_CREATED_AT: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#GetBrowserSessionResponse$createdAt",
+            NS,
+            "createdAt",
+        ),
+        ShapeType::Timestamp,
+        "createdAt",
+        3,
+    )
+    .with_timestamp_format(TimestampFormat::DateTime);
+
+    pub const M_VIEW_PORT: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#GetBrowserSessionResponse$viewPort",
+            NS,
+            "viewPort",
+        ),
+        ShapeType::Structure,
+        "viewPort",
+        4,
+    );
+
+    pub const M_EXTENSIONS: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#GetBrowserSessionResponse$extensions",
+            NS,
+            "extensions",
+        ),
+        ShapeType::List,
+        "extensions",
+        5,
+    );
+
+    pub const M_ENTERPRISE_POLICIES: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#GetBrowserSessionResponse$enterprisePolicies",
+            NS,
+            "enterprisePolicies",
+        ),
+        ShapeType::List,
+        "enterprisePolicies",
+        6,
+    );
+
+    pub const M_PROFILE_CONFIGURATION: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#GetBrowserSessionResponse$profileConfiguration",
+            NS,
+            "profileConfiguration",
+        ),
+        ShapeType::Structure,
+        "profileConfiguration",
+        7,
+    );
+
+    pub const M_SESSION_TIMEOUT_SECONDS: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#GetBrowserSessionResponse$sessionTimeoutSeconds",
+            NS,
+            "sessionTimeoutSeconds",
+        ),
+        ShapeType::Integer,
+        "sessionTimeoutSeconds",
+        8,
+    );
+
+    pub const M_STATUS: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#GetBrowserSessionResponse$status",
+            NS,
+            "status",
+        ),
+        ShapeType::String,
+        "status",
+        9,
+    );
+
+    pub const M_STREAMS: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#GetBrowserSessionResponse$streams",
+            NS,
+            "streams",
+        ),
+        ShapeType::Structure,
+        "streams",
+        10,
+    );
+
+    pub const M_PROXY_CONFIGURATION: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#GetBrowserSessionResponse$proxyConfiguration",
+            NS,
+            "proxyConfiguration",
+        ),
+        ShapeType::Structure,
+        "proxyConfiguration",
+        11,
+    );
+
+    pub const M_CERTIFICATES: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#GetBrowserSessionResponse$certificates",
+            NS,
+            "certificates",
+        ),
+        ShapeType::List,
+        "certificates",
+        12,
+    );
+
+    pub const M_FILESYSTEM_CONFIGURATIONS: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#GetBrowserSessionResponse$filesystemConfigurations",
+            NS,
+            "filesystemConfigurations",
+        ),
+        ShapeType::List,
+        "filesystemConfigurations",
+        13,
+    );
+
+    pub const M_SESSION_REPLAY_ARTIFACT: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#GetBrowserSessionResponse$sessionReplayArtifact",
+            NS,
+            "sessionReplayArtifact",
+        ),
+        ShapeType::String,
+        "sessionReplayArtifact",
+        14,
+    );
+
+    /// Targets `DateTimestamp`, hence the format the derive cannot attach.
+    pub const M_LAST_UPDATED_AT: Schema = Schema::new_member(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#GetBrowserSessionResponse$lastUpdatedAt",
+            NS,
+            "lastUpdatedAt",
+        ),
+        ShapeType::Timestamp,
+        "lastUpdatedAt",
+        15,
+    )
+    .with_timestamp_format(TimestampFormat::DateTime);
+
+    pub const SCHEMA: Schema = Schema::new_struct(
+        ShapeId::from_static(
+            "com.amazonaws.bedrockagentcore#GetBrowserSessionResponse",
+            NS,
+            "GetBrowserSessionResponse",
+        ),
+        ShapeType::Structure,
+        &[
+            &Self::M_BROWSER_IDENTIFIER,
+            &Self::M_SESSION_ID,
+            &Self::M_NAME,
+            &Self::M_CREATED_AT,
+            &Self::M_VIEW_PORT,
+            &Self::M_EXTENSIONS,
+            &Self::M_ENTERPRISE_POLICIES,
+            &Self::M_PROFILE_CONFIGURATION,
+            &Self::M_SESSION_TIMEOUT_SECONDS,
+            &Self::M_STATUS,
+            &Self::M_STREAMS,
+            &Self::M_PROXY_CONFIGURATION,
+            &Self::M_CERTIFICATES,
+            &Self::M_FILESYSTEM_CONFIGURATIONS,
+            &Self::M_SESSION_REPLAY_ARTIFACT,
+            &Self::M_LAST_UPDATED_AT,
+        ],
+    );
+}
+
+pub static GET_BROWSER_SESSION_OUTPUT_SCHEMA: &Schema = &GetBrowserSessionOutput::SCHEMA;
+
+impl SerializableStruct for GetBrowserSessionOutput {
+    fn serialize_members(&self, s: &mut dyn ShapeSerializer) -> Result<(), SerdeError> {
+        s.write_string(&Self::M_BROWSER_IDENTIFIER, self.browser_identifier.as_str())?;
+        s.write_string(&Self::M_SESSION_ID, self.session_id.as_str())?;
+        if let Some(name) = self.name.as_ref() {
+            s.write_string(&Self::M_NAME, name.as_str())?;
+        }
+        s.write_timestamp(&Self::M_CREATED_AT, &self.created_at)?;
+        if let Some(view_port) = self.view_port.as_ref() {
+            s.write_struct(&Self::M_VIEW_PORT, view_port)?;
+        }
+        if let Some(extensions) = self.extensions.as_ref() {
+            s.write_list(&Self::M_EXTENSIONS, &|list| {
+                for extension in extensions {
+                    list.write_struct(&super::BrowserExtension::SCHEMA, extension)?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(policies) = self.enterprise_policies.as_ref() {
+            s.write_list(&Self::M_ENTERPRISE_POLICIES, &|list| {
+                for policy in policies {
+                    list.write_struct(&super::BrowserEnterprisePolicy::SCHEMA, policy)?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(profile) = self.profile_configuration.as_ref() {
+            s.write_struct(&Self::M_PROFILE_CONFIGURATION, profile)?;
+        }
+        if let Some(timeout) = self.session_timeout_seconds {
+            s.write_integer(&Self::M_SESSION_TIMEOUT_SECONDS, timeout)?;
+        }
+        if let Some(status) = self.status.as_ref() {
+            s.write_string(&Self::M_STATUS, status.as_str())?;
+        }
+        if let Some(streams) = self.streams.as_ref() {
+            s.write_struct(&Self::M_STREAMS, streams)?;
+        }
+        if let Some(proxy) = self.proxy_configuration.as_ref() {
+            s.write_struct(&Self::M_PROXY_CONFIGURATION, proxy)?;
+        }
+        if let Some(certificates) = self.certificates.as_ref() {
+            s.write_list(&Self::M_CERTIFICATES, &|list| {
+                for certificate in certificates {
+                    list.write_struct(&super::Certificate::SCHEMA, certificate)?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(configurations) = self.filesystem_configurations.as_ref() {
+            s.write_list(&Self::M_FILESYSTEM_CONFIGURATIONS, &|list| {
+                for configuration in configurations {
+                    list.write_struct(
+                        &super::ToolsFileSystemConfiguration::SCHEMA,
+                        configuration,
+                    )?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(artifact) = self.session_replay_artifact.as_ref() {
+            s.write_string(&Self::M_SESSION_REPLAY_ARTIFACT, artifact.as_str())?;
+        }
+        if let Some(last_updated_at) = self.last_updated_at.as_ref() {
+            s.write_timestamp(&Self::M_LAST_UPDATED_AT, last_updated_at)?;
         }
         Ok(())
     }

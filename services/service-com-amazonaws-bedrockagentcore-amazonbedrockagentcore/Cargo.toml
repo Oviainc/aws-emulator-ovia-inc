@@ -46,6 +46,11 @@ tracing = { workspace = true }
 # reviewed here. One version is pinned for the whole workspace, so the binary carries
 # a single QuickJS.
 rquickjs = "0.14"
+# The AgentCore CONTROL plane, whose store owns the browsers a browser session is
+# started on: `StartBrowserSession` names one it did not create, so the data plane
+# resolves the `browserIdentifier` against the component that owns it rather than
+# taking a session's existence on trust (src/state/browser.rs).
+service-com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

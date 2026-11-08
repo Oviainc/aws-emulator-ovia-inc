@@ -40,13 +40,15 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
-use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
-};
+use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
 use crate::ops::invoke_code_interpreter::InvokeCodeInterpreter;
 use service_common::event_stream::EventStreamRoute;
+
+/// The WORDS this service states a boundary refusal with — its own concern, kept out of
+/// the seams below.
+mod validation;
 
 /// The host-style endpoint this service is addressed by:
 /// `bedrock-agentcore.<region>.amazonaws.com`.
@@ -69,16 +71,6 @@ const CODE_INTERPRETERS_SEGMENT: &str = "code-interpreters";
 const TOOLS_SEGMENT: &str = "tools";
 /// See [`CODE_INTERPRETERS_SEGMENT`].
 const INVOKE_SEGMENT: &str = "invoke";
-
-/// Whether `violation` is a violated numeric `@range` bound, which is the one class this
-/// service states WITHOUT the value that violated it: such a refusal names the member
-/// path and the bound only.
-fn is_numeric_range(violation: &Violation) -> bool {
-    matches!(
-        violation.kind,
-        ViolationKind::MinValue(_) | ViolationKind::MaxValue(_)
-    )
-}
 
 /// The `com-amazonaws-bedrockagentcore-amazonbedrockagentcore` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -181,21 +173,10 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // reword it.
         //
         // This service states a violated numeric `@range` bound WITHOUT the value that
-        // violated it: the message names the member path and the bound only, inside the
-        // AWS validation envelope. The code stays the modelled `ValidationException`
-        // (HTTP 400) — what the framework would have answered — so only the wording
-        // changes, and only for a refusal that carries such a bound: a refusal of any
-        // other class keeps the framework's own wording, which this service has no
-        // recorded wording to replace it with.
-        match refusal {
-            Refusal::Invalid(violations) if violations.iter().any(is_numeric_range) => {
-                service_common::validation_message::aws_validation_refusal_withholding_violations(
-                    refusal,
-                    is_numeric_range,
-                )
-            }
-            _ => None,
-        }
+        // violated it, and keeps the framework's own wording for every other class —
+        // the one choice a service makes here, which [`validation`] owns so the
+        // sentence and the classes it covers live in one place.
+        validation::refused(refusal)
     }
 
     fn override_routing_error(

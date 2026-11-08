@@ -17,6 +17,8 @@ mod ab_test_lifecycle;
 mod ab_test_support;
 #[path = "all/ab_tests.rs"]
 mod ab_tests;
+#[path = "all/browser_sessions.rs"]
+mod browser_sessions;
 #[path = "all/code_interpreter_sessions.rs"]
 mod code_interpreter_sessions;
 #[path = "all/code_interpreter_tools.rs"]

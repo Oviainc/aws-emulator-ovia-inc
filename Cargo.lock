@@ -8723,6 +8723,7 @@ dependencies = [
  "percent-encoding",
  "rquickjs",
  "serde_json",
+ "service-com-amazonaws-bedrockagentcorecontrol-amazonbedrockagentcorecontrol",
  "service-common",
  "sha2 0.10.9",
  "tokio",
