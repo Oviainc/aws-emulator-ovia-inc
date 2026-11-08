@@ -391,6 +391,32 @@ pub(super) fn watched_series_set(alarm: &MetricAlarm) -> Vec<(MetricKey, Option<
         .collect()
 }
 
+/// The identity of the ONE time series an alarm's evaluation GRADES, or `None` for an alarm
+/// whose configuration names no series of its own.
+///
+/// Both forms a configuration identifies that series in resolve here, and they resolve to the
+/// same identity the evaluation reads the store by: the alarm's own metric members
+/// ([`watched_series`]), and the `MetricStat` of the one query of a `Metrics` array the
+/// evaluation watches ([`watched_query`], [`super::metric_query::query_series_key`]). An alarm
+/// graded on an expression computed from several series, or on a query of another language,
+/// names no single series: the thing it grades is computed rather than stored.
+#[must_use]
+pub(crate) fn graded_series_key(alarm: &MetricAlarm) -> Option<MetricKey> {
+    match alarm.metrics.as_deref() {
+        Some(queries) => super::metric_query::query_series_key(
+            watched_query(queries, alarm.threshold_metric_id.as_deref())?
+                .metric_stat
+                .as_ref()?,
+        ),
+        None => {
+            let key = watched_series(alarm);
+            // "a metric is uniquely defined by a name, a namespace, and zero or more
+            // dimensions", so members missing either half name no series at all.
+            (!key.namespace.is_empty() && !key.metric_name.is_empty()).then_some(key)
+        }
+    }
+}
+
 /// The width of the windows an alarm's query ARRAY is graded in.
 ///
 /// "The granularity, in seconds, of the returned data points" (`MetricDataQuery$Period`) when

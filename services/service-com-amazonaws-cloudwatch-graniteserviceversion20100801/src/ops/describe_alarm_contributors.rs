@@ -233,19 +233,32 @@ fn contributors_of(alarm: &MetricAlarm) -> Vec<AlarmContributor> {
     if alarm.state_value.as_deref() != Some(crate::state::ALARM_STATE_ALARM) {
         return Vec::new();
     }
+    // WHICH series the alarm evaluates is read from the same resolution the evaluation itself
+    // reads it by, so the contributor describes the series that is graded whichever form the
+    // configuration identified it in — the alarm's own metric members, or the `MetricStat` of
+    // the query of its `Metrics` array the evaluation watches. An alarm whose graded value is
+    // COMPUTED rather than stored still has a contributor: what is in `ALARM` is the one value
+    // the alarm evaluates, so the contributor is reported and the identity this store can name
+    // for it is the alarm's own — unlike a composite or log alarm above, which evaluates no
+    // value of this kind at all and so has no contributor to report.
+    let series = crate::state::alarm_evaluation::graded_series_key(alarm);
     vec![AlarmContributor {
-        contributor_id: contributor_id(alarm),
+        contributor_id: contributor_id(alarm, series.as_ref()),
         // "A map of attributes that describe the contributor, such as metric dimensions and other
         // identifying characteristics." (`AlarmContributor$ContributorAttributes`) — the
-        // dimensions of the series, as the write that configured the alarm named them, and
-        // nothing this service made up: a series with no dimensions is described by no attribute.
-        contributor_attributes: alarm
-            .dimensions
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .map(|dimension| (dimension.name.clone(), dimension.value.clone()))
-            .collect(),
+        // dimensions of that series, as the write that configured the alarm named them, and
+        // nothing this service made up: a series with no dimensions is described by no attribute,
+        // and so is an alarm graded on a computed series that has no identity of its own.
+        contributor_attributes: series
+            .as_ref()
+            .map(|series| {
+                series
+                    .dimensions
+                    .iter()
+                    .map(|(name, value)| (name.clone(), value.clone()))
+                    .collect()
+            })
+            .unwrap_or_default(),
         // Why that series is in `ALARM`, and when it got there: the alarm's own evaluated reason
         // and transition instant, since the series IS what the alarm evaluates.
         state_reason: alarm.state_reason.clone().unwrap_or_default(),
@@ -265,21 +278,25 @@ const CONTRIBUTOR_ID_LEN: usize = 16;
 /// normalised dimension set), cut to the modelled length. Derived, so it is stable across reads
 /// and the same contributor keeps the same id for the life of the alarm, and distinct, so two
 /// series are two contributors.
-fn contributor_id(alarm: &MetricAlarm) -> String {
+///
+/// Each part is digested under its own LENGTH rather than under a separator, because a dimension
+/// name or value may carry any character a separator could be: two series whose parts differ can
+/// never be digested from the same bytes.
+fn contributor_id(alarm: &MetricAlarm, series: Option<&crate::state::MetricKey>) -> String {
     let mut identity = String::new();
-    for part in [
-        alarm.alarm_name.as_deref().unwrap_or_default(),
-        alarm.namespace.as_deref().unwrap_or_default(),
-        alarm.metric_name.as_deref().unwrap_or_default(),
-    ] {
-        identity.push_str(part);
-        identity.push('\n');
-    }
-    for (name, value) in crate::state::dimension_set(alarm.dimensions.as_deref()) {
-        identity.push_str(&name);
-        identity.push('=');
-        identity.push_str(&value);
-        identity.push('\n');
+    let mut part = |text: &str| {
+        identity.push_str(&text.len().to_string());
+        identity.push(':');
+        identity.push_str(text);
+    };
+    part(alarm.alarm_name.as_deref().unwrap_or_default());
+    if let Some(series) = series {
+        part(&series.namespace);
+        part(&series.metric_name);
+        for (name, value) in &series.dimensions {
+            part(name);
+            part(value);
+        }
     }
     let digest = ::hex::encode(<::sha2::Sha256 as ::sha2::Digest>::digest(
         identity.as_bytes(),

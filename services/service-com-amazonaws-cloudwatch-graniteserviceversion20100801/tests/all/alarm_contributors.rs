@@ -301,3 +301,280 @@ async fn a_contributor_read_refuses_a_name_no_alarm_carries_and_a_token_it_did_n
          got {answered}"
     );
 }
+
+/// The members that replace the single-metric form with the `Metrics` array `queries`.
+///
+/// "If you use the Metrics parameter, you cannot include the Namespace, MetricName, Dimensions,
+/// Period, Unit, Statistic, or ExtendedStatistic parameters of PutMetricAlarm in the same
+/// operation" (`smithy_query(query="doc",shape="PutMetricAlarmInput",member="Metrics")`), so every
+/// one of them is dropped from the base request.
+fn metrics_patch(queries: Value) -> Value {
+    json!({
+        "Namespace": null,
+        "MetricName": null,
+        "Statistic": null,
+        "Period": null,
+        "Metrics": queries,
+    })
+}
+
+/// One `MetricStat` query of a `Metrics` array, retrieving `Custom/Alarms Latency` under
+/// `dimensions`.
+fn metric_query(id: &str, dimensions: &[(&str, &str)], returns_data: bool) -> Value {
+    let mut metric = json!({"Namespace": "Custom/Alarms", "MetricName": "Latency"});
+    if !dimensions.is_empty() {
+        metric["Dimensions"] = Value::Array(
+            dimensions
+                .iter()
+                .map(|(name, value)| json!({"Name": name, "Value": value}))
+                .collect(),
+        );
+    }
+    json!({
+        "Id": id,
+        "MetricStat": {"Metric": metric, "Period": 60, "Stat": "Average"},
+        "ReturnData": returns_data,
+    })
+}
+
+/// The dimensions `dimensions` describe a contributor by: the attribute map a reported
+/// contributor must carry.
+fn attributes(dimensions: &[(&str, &str)]) -> Value {
+    Value::Object(
+        dimensions
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), Value::from(*value)))
+            .collect(),
+    )
+}
+
+#[tokio::test]
+async fn a_contributor_describes_the_series_the_alarm_grades_whichever_form_names_it() {
+    let router = build_router();
+
+    // (case, the members merged over the static-threshold base request, the attributes the
+    //  contributor must be described by).
+    //
+    // Rows differ along the FORM the configuration identifies the graded series in — the alarm's
+    // own metric members, a `Metrics` array whose watched query is a metric, a `Metrics` array
+    // whose watched query is an expression computed from one, and a query of another language —
+    // and along how many dimensions that series carries.
+    let cases: Vec<(&str, Value, Value)> = vec![
+        (
+            "the alarm's own members, undimensioned",
+            json!({}),
+            attributes(&[]),
+        ),
+        (
+            "the alarm's own members, dimensioned",
+            json!({"Dimensions": [
+                {"Name": "Service", "Value": "api"},
+                {"Name": "Stage", "Value": "prod"},
+            ]}),
+            attributes(&[("Service", "api"), ("Stage", "prod")]),
+        ),
+        (
+            "a query array whose watched query is an undimensioned metric",
+            metrics_patch(json!([metric_query("watched", &[], true)])),
+            attributes(&[]),
+        ),
+        (
+            "a query array whose watched query is a dimensioned metric",
+            metrics_patch(json!([metric_query(
+                "watched",
+                &[("Service", "api"), ("Stage", "prod")],
+                true
+            )])),
+            attributes(&[("Service", "api"), ("Stage", "prod")]),
+        ),
+        (
+            "a query array whose watched query is an expression over a metric",
+            metrics_patch(json!([
+                metric_query("fed", &[("Service", "api")], false),
+                {"Id": "watched", "Expression": "fed * 2", "ReturnData": true},
+            ])),
+            // The graded value is computed rather than stored, so it is no series of this store
+            // and carries no dimensions of its own.
+            attributes(&[]),
+        ),
+        (
+            // "If this is an alarm based on an anomaly detection model, make this value match the
+            // ID of the ANOMALY_DETECTION_BAND function" (`PutMetricAlarmInput$ThresholdMetricId`)
+            // — the band is what the graded value is compared AGAINST, so the metric is still the
+            // series the alarm grades.
+            "a query array whose threshold is a band drawn from the watched metric",
+            merged(
+                metrics_patch(json!([
+                    metric_query("watched", &[("Service", "api")], true),
+                    {"Id": "band", "Expression": "ANOMALY_DETECTION_BAND(watched, 2)"},
+                ])),
+                &json!({
+                    "Threshold": null,
+                    "ThresholdMetricId": "band",
+                    "ComparisonOperator": "GreaterThanUpperThreshold",
+                }),
+            ),
+            attributes(&[("Service", "api")]),
+        ),
+        (
+            // "The PromQL query that the alarm evaluates" (`AlarmPromQLCriteria$Query`): such an
+            // alarm names no metric of this store at all.
+            "a query of another language the alarm evaluates",
+            json!({
+                "Namespace": null,
+                "MetricName": null,
+                "Statistic": null,
+                "Period": null,
+                "EvaluationPeriods": null,
+                "Threshold": null,
+                "ComparisonOperator": null,
+                "EvaluationCriteria": {"PromQLCriteria": {"Query": "avg_over_time(latency[5m])"}},
+                "EvaluationInterval": 60,
+            }),
+            attributes(&[]),
+        ),
+    ];
+
+    for (index, (case, patch, expected)) in cases.iter().enumerate() {
+        let name = format!("graded-series-alarm-{index}");
+        ok(
+            &router,
+            "PutMetricAlarm",
+            &merged(metric_alarm_request(&name), patch),
+        )
+        .await;
+        force_state(&router, &name, "ALARM").await;
+
+        let (reported, answered) = contributors(&router, &name).await;
+        assert_eq!(
+            reported.len(),
+            1,
+            "case {case:?}: the alarm grades one series, so it owes one contributor, \
+             got {answered}"
+        );
+        let contributor = reported.first().cloned().unwrap_or_default();
+        assert_eq!(
+            contributor.get("ContributorAttributes"),
+            Some(expected),
+            "case {case:?}: expected the graded series' dimensions {expected}, got {contributor}"
+        );
+        let id = text(&contributor, "ContributorId").unwrap_or_default();
+        assert!(
+            (1..=16).contains(&id.chars().count()),
+            "case {case:?}: expected an id of 1 to 16 characters, got {id:?}"
+        );
+    }
+
+    // The identifier names the SERIES the alarm grades: a write that moves the alarm onto another
+    // series renames its contributor, while one that changes nothing about the series does not.
+    let moved = "re-pointed-alarm";
+    ok(
+        &router,
+        "PutMetricAlarm",
+        &merged(
+            metric_alarm_request(moved),
+            &json!({"Dimensions": [{"Name": "Service", "Value": "api"}]}),
+        ),
+    )
+    .await;
+    force_state(&router, moved, "ALARM").await;
+    let (reported, _) = contributors(&router, moved).await;
+    let before = reported
+        .first()
+        .and_then(|entry| text(entry, "ContributorId"));
+
+    // (case, the members the re-write carries, whether the contributor keeps the id it had)
+    let rewrites: Vec<(&str, Value, bool)> = vec![
+        (
+            "a write that only changes the description",
+            json!({
+                "Dimensions": [{"Name": "Service", "Value": "api"}],
+                "AlarmDescription": "the same series, described",
+            }),
+            true,
+        ),
+        (
+            "a write that moves the alarm onto another dimension value",
+            json!({"Dimensions": [{"Name": "Service", "Value": "worker"}]}),
+            false,
+        ),
+        (
+            "a write that moves the alarm onto another metric",
+            json!({
+                "MetricName": "Errors",
+                "Dimensions": [{"Name": "Service", "Value": "api"}],
+            }),
+            false,
+        ),
+    ];
+    for (case, patch, keeps) in rewrites {
+        ok(
+            &router,
+            "PutMetricAlarm",
+            &merged(metric_alarm_request(moved), &patch),
+        )
+        .await;
+        force_state(&router, moved, "ALARM").await;
+        let (reported, answered) = contributors(&router, moved).await;
+        let after = reported
+            .first()
+            .and_then(|entry| text(entry, "ContributorId"));
+        assert!(
+            after.is_some(),
+            "case {case:?}: the alarm in ALARM still owes its contributor, got {answered}"
+        );
+        assert_eq!(
+            after == before,
+            keeps,
+            "case {case:?}: expected the contributor id to be kept = {keeps}, \
+             got {after:?} against {before:?}"
+        );
+    }
+
+    // Dimension sets that differ only in where a punctuation character falls are different
+    // series, so they are different contributors: "Dimension names must contain only ASCII
+    // characters, must include at least one non-whitespace character, and cannot start with a
+    // colon" and dimension values are ASCII too (`Dimension$Name`, `Dimension$Value`), so a
+    // name or a value may carry whatever character a joined identity would separate on. Every
+    // row is written under ONE alarm name, so the only thing that differs is the series.
+    let ambiguous = "ambiguous-dimensions-alarm";
+    let sets: Vec<(&str, Value)> = vec![
+        ("the punctuation inside the dimension name", json!([{"Name": "a=b", "Value": "c"}])),
+        ("the punctuation inside the dimension value", json!([{"Name": "a", "Value": "b=c"}])),
+        (
+            "each half as its own dimension",
+            json!([{"Name": "a", "Value": "b"}, {"Name": "b", "Value": "c"}]),
+        ),
+        ("one dimension of the same characters", json!([{"Name": "ab", "Value": "c"}])),
+    ];
+    let mut ambiguous_ids: Vec<(&str, String)> = vec![];
+    for (case, dimensions) in sets {
+        ok(
+            &router,
+            "PutMetricAlarm",
+            &merged(
+                metric_alarm_request(ambiguous),
+                &json!({"Dimensions": dimensions}),
+            ),
+        )
+        .await;
+        force_state(&router, ambiguous, "ALARM").await;
+        let (reported, answered) = contributors(&router, ambiguous).await;
+        let id = reported
+            .first()
+            .and_then(|entry| text(entry, "ContributorId"));
+        assert!(
+            id.is_some(),
+            "case {case:?}: the alarm in ALARM owes its contributor, got {answered}"
+        );
+        ambiguous_ids.push((case, id.unwrap_or_default()));
+    }
+    let distinct: std::collections::BTreeSet<&String> =
+        ambiguous_ids.iter().map(|(_, id)| id).collect();
+    assert_eq!(
+        distinct.len(),
+        ambiguous_ids.len(),
+        "two dimension sets that identify different series must identify different \
+         contributors, got {ambiguous_ids:?}"
+    );
+}
