@@ -143,16 +143,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         drop(store);
 
         if !deleted {
-            // An ARN the account holds no monitor under is the one 404 this operation
-            // models, whether it never named a monitor or named one an earlier delete
-            // already removed.
-            let monitor_arn = input.monitor_arn;
+            // An ARN the account holds no monitor under is the one unknown-monitor refusal
+            // this operation models, whether it never named a monitor or named one an
+            // earlier delete already removed. The monitor is this call's own resource, so
+            // the shared refusal names its id under `resourceId`.
             return Err(DeleteAnomalyMonitorErrorModeled::UnknownMonitorException(
-                UnknownMonitorException {
-                    message: Some(format!(
-                        "The cost anomaly monitor {monitor_arn} does not exist for the account."
-                    )),
-                },
+                crate::state::unknown_monitor(
+                    crate::state::MONITOR_ID_AS_RESOURCE,
+                    &input.monitor_arn,
+                ),
             )
             .into());
         }

@@ -174,16 +174,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         // A subscription alerts on monitors, so every ARN it names has to be a monitor the
-        // account holds — that is the one 404 this operation models.
+        // account holds — that is the one unknown-monitor refusal this operation models.
+        // The monitor is a resource this request REFERENCES rather than the one the call
+        // is about, so the shared refusal names its id under `monitorId`.
         for monitor_arn in &subscription.monitor_arn_list {
             if !store.anomaly_monitors.contains_key(monitor_arn) {
                 return Err(CreateAnomalySubscriptionErrorModeled::UnknownMonitorException(
-                    UnknownMonitorException {
-                        message: Some(format!(
-                            "The cost anomaly monitor {monitor_arn} does not exist for the \
-                             account."
-                        )),
-                    },
+                    crate::state::unknown_monitor(
+                        crate::state::MONITOR_ID_AS_MONITOR,
+                        monitor_arn,
+                    ),
                 )
                 .into());
             }

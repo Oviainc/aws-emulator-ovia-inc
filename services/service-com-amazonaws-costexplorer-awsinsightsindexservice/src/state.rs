@@ -46,6 +46,7 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     AnomalyMonitor, CostCategory, CostCategoryProcessingStatus, CostCategoryReference,
     CostCategoryRule, CostCategorySplitChargeRule, Expression, ResourceTag,
+    UnknownMonitorException,
 };
 
 /// How long a definition's Cost Explorer component reports `PROCESSING` before it
@@ -625,6 +626,59 @@ pub fn validate_anomaly_monitor(monitor: &AnomalyMonitor) -> Result<(), String> 
         // modelled enum.
         other => Err(format!(
             "MonitorType {other} is not a monitor type this service can create"
+        )),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Unknown-monitor refusals
+// ---------------------------------------------------------------------------
+
+/// The fixed half of the sentence Cost Explorer refuses an unresolvable monitor reference
+/// with. The only variable part is the monitor id, which [`unknown_monitor`] appends.
+const NO_MONITOR_PRESENT: &str = "No monitor present with";
+
+/// The member word an operation whose own SUBJECT is the monitor names the id under: the
+/// monitor is the resource the call was made against (`DeleteAnomalyMonitor`,
+/// `UpdateAnomalyMonitor`).
+pub const MONITOR_ID_AS_RESOURCE: &str = "resourceId";
+
+/// The member word an operation that REFERENCES a monitor from another resource names the
+/// id under: the monitor is something the request points at rather than the resource the
+/// call is about (the anomaly SUBSCRIPTION operations, whose `MonitorArnList` names the
+/// monitors a subscription alerts on).
+pub const MONITOR_ID_AS_MONITOR: &str = "monitorId";
+
+/// The bare monitor id a monitor ARN carries: the last segment of its resource portion,
+/// which is what an unknown-monitor refusal names rather than the whole ARN.
+///
+/// A value carrying no `/` at all is its own id — the ARN members are plain strings
+/// (`GenericString`, pattern `^[\S\s]*$`), so a caller can send one, and it is then the
+/// only id the request holds.
+pub fn monitor_id(monitor_arn: &str) -> &str {
+    match monitor_arn.rsplit_once('/') {
+        Some((_, id)) => id,
+        None => monitor_arn,
+    }
+}
+
+/// The refusal every operation that resolves a monitor ARN against
+/// [`anomaly_monitors`](ComAmazonawsCostexplorerAwsinsightsindexserviceState::anomaly_monitors)
+/// answers with when the account holds no monitor under it.
+///
+/// One helper, so no two operations can drift apart on the wording: the modelled
+/// `UnknownMonitorException` carrying Cost Explorer's own fixed sentence over the monitor
+/// ID the request named, under the `member` word the refusing operation uses — one of
+/// [`MONITOR_ID_AS_RESOURCE`] or [`MONITOR_ID_AS_MONITOR`]. The whole ARN is NOT echoed:
+/// the service names the id component alone.
+///
+/// The status the refusal is served at is the service's, not the shape's modelled
+/// default; `crate::scaffolded` holds that one rule for every operation at once.
+pub fn unknown_monitor(member: &str, monitor_arn: &str) -> UnknownMonitorException {
+    UnknownMonitorException {
+        message: Some(format!(
+            "{NO_MONITOR_PRESENT} {member}: {}",
+            monitor_id(monitor_arn)
         )),
     }
 }

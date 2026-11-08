@@ -177,13 +177,43 @@ impl SerializableStruct for ValidationException {
     }
 }
 
+/// The wire error code of the refusal every operation that resolves a monitor reference
+/// answers with, taken from the generated shape rather than retyped
+/// (`smithy_query(query="shape", shape="UnknownMonitorException")`: errorKind client,
+/// `@httpError 404`).
+const UNKNOWN_MONITOR_EXCEPTION: &str = crate::ops::types::UnknownMonitorException::shape_name();
+
+/// The status THIS service serializes the modelled error `shape_name` at, given the
+/// `modelled` status its own `@httpError` declares.
+///
+/// Cost Explorer answers a request naming a cost anomaly monitor the account does not
+/// hold with HTTP **400**, not the 404 `UnknownMonitorException` carries: recorded wire
+/// behaviour, with the body's `__type` and message exactly the ones the refusing
+/// operation builds — so the error identity stays the model's and only the status is the
+/// service's. The difference is observable: a 404 from a JSON-protocol endpoint reads to
+/// SDK retry middleware and HTTP proxies as a missing route rather than as a dangling
+/// resource reference the caller must fix.
+///
+/// It is a per-SERVICE rule, applied here — the one place every operation's error is
+/// serialized through — rather than in each handler, so an operation that raises this
+/// error later cannot answer a different status for the same condition. Every other
+/// modelled error keeps the status its own `@httpError` declares.
+fn served_status(shape_name: &str, modelled: u16) -> u16 {
+    if shape_name == UNKNOWN_MONITOR_EXCEPTION {
+        400
+    } else {
+        modelled
+    }
+}
+
 /// An operation's error channel: either the synthetic scaffold signal, or one of the
 /// operation's own modeled errors.
 #[derive(Debug)]
 pub enum Scaffolded<E> {
     /// The operation is generated but has no implementation. Renders as HTTP 501.
     NotImplemented(NotImplemented),
-    /// A modeled error the operation declares. Renders with the model's own status.
+    /// A modeled error the operation declares. Renders with the status this service
+    /// serves that error at — see [`served_status`].
     Modeled(E),
     /// The request was refused as invalid. Renders as HTTP 400 with the error code
     /// `ValidationException`.
@@ -282,10 +312,13 @@ impl<E: OperationError> OperationError for Scaffolded<E> {
     ///
     /// Keep it 501 and not a 5xx server fault: SDK retry classifiers treat those as
     /// retryable, so a client would retry an operation that can never succeed.
+    ///
+    /// A modeled error takes the status THIS SERVICE serves it at ([`served_status`]),
+    /// which is the model's `@httpError` for every error but the unknown-monitor refusal.
     fn http_status(&self) -> u16 {
         match self {
             Self::NotImplemented(_) => 501,
-            Self::Modeled(e) => e.http_status(),
+            Self::Modeled(e) => served_status(e.shape_name(), e.http_status()),
             Self::ValidationException(_) => 400,
         }
     }

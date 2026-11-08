@@ -253,9 +253,13 @@ async fn a_deleted_monitor_is_dropped_from_the_subscriptions_that_alerted_on_it(
     }
 }
 
-/// RULE: an ARN the account holds no cost anomaly monitor under is refused 404
+/// RULE: an ARN the account holds no cost anomaly monitor under is refused
 /// `UnknownMonitorException` — including one an earlier delete already removed, so the
 /// delete is not idempotent — and the refusal leaves the registry untouched.
+///
+/// The status and the sentence that refusal carries are asserted in
+/// [`crate::unknown_monitor_references`]; this suite is about what a refused delete leaves
+/// behind.
 ///
 /// The table spans the ways a `MonitorArn` the input's modelled constraints admit (length
 /// 0..1024, pattern `^[\S\s]*$`, from `smithy_query(query="operation",
@@ -301,8 +305,8 @@ async fn a_delete_of_a_monitor_the_account_does_not_hold_is_refused() {
             .await;
         assert_eq!(
             (status, error_code(&answered).as_str()),
-            (404, "UnknownMonitorException"),
-            "case {label:?}: expected a 404 UnknownMonitorException, got {status}: {answered}"
+            (400, "UnknownMonitorException"),
+            "case {label:?}: expected a 400 UnknownMonitorException, got {status}: {answered}"
         );
     }
 

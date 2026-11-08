@@ -581,51 +581,21 @@ async fn monitors_are_filtered_by_arn_and_paged_by_max_results() {
 }
 
 /// RULE: the two members `GetAnomalyMonitors` can be asked wrongly about are each refused
-/// with the failure the model declares for it — an ARN the account holds no monitor for
-/// is 404 `UnknownMonitorException`, a cursor this service never issued is 400
+/// with the failure the model declares for it — a cursor this service never issued is 400
 /// `InvalidNextTokenException`, and a page size below one is a 400 `ValidationException`.
+///
+/// `MonitorArnList` is not one of them: it is a filter, so an ARN the account holds no
+/// monitor under is selected out rather than refused — asserted in
+/// [`crate::unknown_monitor_references`].
 #[tokio::test]
-async fn a_read_of_what_the_account_does_not_hold_is_refused() {
+async fn a_read_asked_wrongly_is_refused() {
     let emulator = Emulator::start();
-    let created = emulator
+    emulator
         .ok(
             "CreateAnomalyMonitor",
             &managed_body("the-only-monitor", "SERVICE", None),
         )
         .await;
-    let known = arn_of(&created);
-
-    let unknown = [
-        (
-            "an ARN of the right shape naming no monitor",
-            format!(
-                "arn:aws:ce::{}:anomalymonitor/00000000-0000-8000-8000-000000000000",
-                engine::emulator_account_id()
-            ),
-        ),
-        ("an ARN of another service's resource", {
-            engine::emulator_arn("ce", "", "costcategory/not-a-monitor")
-        }),
-        ("a value that is not an ARN at all", "monitor-1".to_string()),
-    ];
-    for (label, arn) in &unknown {
-        // Alone, and beside an ARN the account does hold: one unknown ARN refuses the
-        // whole read either way.
-        for (shape, list) in [
-            ("on its own", vec![arn.clone()]),
-            ("beside a known ARN", vec![known.clone(), arn.clone()]),
-        ] {
-            let (status, answered) = emulator
-                .call("GetAnomalyMonitors", &json!({"MonitorArnList": list}))
-                .await;
-            assert_eq!(
-                (status, error_code(&answered).as_str()),
-                (404, "UnknownMonitorException"),
-                "case {label:?} ({shape}): expected a 404 UnknownMonitorException, got \
-                 {status}: {answered}"
-            );
-        }
-    }
 
     for (label, token) in [
         ("a cursor that is not hex", "not-a-token"),

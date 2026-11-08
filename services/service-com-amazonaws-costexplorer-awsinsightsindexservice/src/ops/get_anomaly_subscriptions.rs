@@ -182,28 +182,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let monitor_filter = input.monitor_arn.as_deref();
 
         let store = state.lock();
-        if let Some(arns) = filter {
-            // The filter names resources, so an ARN the account holds no subscription for
-            // is a 404 rather than a page that silently omits it.
-            for arn in arns {
-                if !store.anomaly_subscriptions.contains_key(arn) {
-                    return Err(
-                        GetAnomalySubscriptionsErrorModeled::UnknownSubscriptionException(
-                            UnknownSubscriptionException {
-                                message: Some(format!(
-                                    "The cost anomaly subscription {arn} does not exist for \
-                                     the account."
-                                )),
-                            },
-                        )
-                        .into(),
-                    );
-                }
-            }
-        }
-
         // The page walk, the cursor and the ARN order are the ones every paginated read
-        // in this service shares.
+        // in this service shares. Both filters SELECT — neither asserts existence — so an
+        // ARN the account holds no subscription under, like a monitor ARN nothing alerts
+        // on, contributes no element and the read still answers with the (possibly empty)
+        // required list.
         let page = crate::state::page(
             &store.anomaly_subscriptions,
             resume_at.as_ref(),

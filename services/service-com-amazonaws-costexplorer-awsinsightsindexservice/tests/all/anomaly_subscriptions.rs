@@ -553,8 +553,9 @@ async fn a_subscription_whose_members_contradict_each_other_is_refused() {
 }
 
 /// RULE: a subscription may only alert on monitors the account holds, so a create naming
-/// an ARN no monitor is registered under is refused 404 `UnknownMonitorException` and
-/// nothing is persisted.
+/// an ARN no monitor is registered under is refused `UnknownMonitorException` and nothing
+/// is persisted. The status and the sentence that refusal carries are asserted in
+/// [`crate::unknown_monitor_references`].
 #[tokio::test]
 async fn a_subscription_on_a_monitor_the_account_does_not_hold_is_refused() {
     let emulator = Emulator::start();
@@ -596,8 +597,8 @@ async fn a_subscription_on_a_monitor_the_account_does_not_hold_is_refused() {
                 .await;
             assert_eq!(
                 (status, error_code(&answered).as_str()),
-                (404, "UnknownMonitorException"),
-                "case {label:?} ({shape}): expected a 404 UnknownMonitorException, got \
+                (400, "UnknownMonitorException"),
+                "case {label:?} ({shape}): expected a 400 UnknownMonitorException, got \
                  {status}: {answered}"
             );
         }
@@ -851,15 +852,18 @@ async fn subscriptions_are_filtered_by_arn_and_monitor_and_paged_by_max_results(
 }
 
 /// RULE: the two members `GetAnomalySubscriptions` can be asked wrongly about are each
-/// refused with the failure the model declares for it — an ARN the account holds no
-/// subscription for is 404 `UnknownSubscriptionException`, a cursor this service never
-/// issued is 400 `InvalidNextTokenException`, and a page size below one is a 400
+/// refused with the failure the model declares for it — a cursor this service never issued
+/// is 400 `InvalidNextTokenException`, and a page size below one is a 400
 /// `ValidationException`.
+///
+/// `SubscriptionArnList` is not one of them: it is a filter, so an ARN the account holds no
+/// subscription under is selected out rather than refused — asserted in
+/// [`crate::unknown_monitor_references`].
 #[tokio::test]
-async fn a_read_of_a_subscription_the_account_does_not_hold_is_refused() {
+async fn a_read_asked_wrongly_is_refused() {
     let emulator = Emulator::start();
     let monitors = vec![create_monitor(&emulator, "read-refusal-monitor").await];
-    let created = emulator
+    emulator
         .ok(
             "CreateAnomalySubscription",
             &subscription_body(
@@ -871,44 +875,6 @@ async fn a_read_of_a_subscription_the_account_does_not_hold_is_refused() {
             ),
         )
         .await;
-    let known = arn_of(&created);
-
-    let unknown = [
-        (
-            "an ARN of the right shape naming no subscription",
-            format!(
-                "arn:aws:ce::{}:anomalysubscription/00000000-0000-8000-8000-000000000000",
-                engine::emulator_account_id()
-            ),
-        ),
-        (
-            "an ARN of another of this service's resources",
-            engine::emulator_arn("ce", "", "anomalymonitor/not-a-subscription"),
-        ),
-        (
-            "a value that is not an ARN at all",
-            "subscription-1".to_string(),
-        ),
-    ];
-    for (label, arn) in &unknown {
-        for (shape, list) in [
-            ("on its own", vec![arn.clone()]),
-            ("beside a known ARN", vec![known.clone(), arn.clone()]),
-        ] {
-            let (status, answered) = emulator
-                .call(
-                    "GetAnomalySubscriptions",
-                    &json!({"SubscriptionArnList": list}),
-                )
-                .await;
-            assert_eq!(
-                (status, error_code(&answered).as_str()),
-                (404, "UnknownSubscriptionException"),
-                "case {label:?} ({shape}): expected a 404 UnknownSubscriptionException, got \
-                 {status}: {answered}"
-            );
-        }
-    }
 
     for (label, token) in [
         ("a cursor that is not hex", "not-a-token"),

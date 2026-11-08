@@ -30,3 +30,5 @@ mod granularity_refusal;
 mod harness;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/unknown_monitor_references.rs"]
+mod unknown_monitor_references;
