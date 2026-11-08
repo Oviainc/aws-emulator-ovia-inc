@@ -1117,3 +1117,8 @@ mod cloudformation_declared_log_group_takes_its_function_logs;
 mod cloudformation_ec2_instance_rollback;
 // stops this target from compiling; the duplicate lines are removed here and ONE declaration
 // of each stands. `eks_control_plane_logs` is the same case and is declared above too.
+// Several suites that stood in this appended tail are each ALREADY declared in the sorted
+// head above, where their own entry records why they were placed there. Two concurrent
+// changes appending the same entry is a redefinition — and, for one file reached under two
+// names, a duplicate module — either of which stops this target from compiling; the
+// duplicate tail lines are removed and the first declaration of each stands.

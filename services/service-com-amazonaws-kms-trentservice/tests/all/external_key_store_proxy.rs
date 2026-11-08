@@ -35,14 +35,16 @@ use super::harness::{call, error_code, error_message, ok_in, router_with_engine,
 /// The whole `message` KMS answers when it cannot reach the external key store proxy a
 /// request describes: fixed text for the class, into which no endpoint, API path or key
 /// store name is interpolated. Written out here so the assertion is about AWS's sentence
-/// rather than about the one the handler holds.
-const UNREACHABLE_MESSAGE: &str = "AWS KMS cannot communicate with the external key store \
+/// rather than about the one the handler holds. Shared with
+/// [`super::external_key_store_create_probe`], which asserts the same sentence about what
+/// the rest of the family then sees.
+pub(crate) const UNREACHABLE_MESSAGE: &str = "AWS KMS cannot communicate with the external key store \
      proxy. This might be a transient network issue. If you see this error repeatedly, \
      verify that your external key store proxy is active and is connected to the network, \
      and that its endpoint URI is correct in your external key store.";
 
 /// The Region a row is signed for when the row is about regional scoping.
-const OTHER_REGION: &str = "eu-west-2";
+pub(crate) const OTHER_REGION: &str = "eu-west-2";
 
 /// An `XksProxyAuthenticationCredential` access key id: 20..30 characters of
 /// `^[A-Z2-7]+$` (`smithy_query(query="shape",shape="XksProxyAuthenticationCredentialType")`).
@@ -62,8 +64,14 @@ struct Row {
 
 /// A `CreateCustomKeyStore` request for an external key store, with the proxy members a
 /// request of that type must carry
-/// (`smithy_query(query="doc",shape="CreateCustomKeyStore")`).
-fn external_request(name: &str, connectivity: &str, uri_endpoint: &str, uri_path: &str) -> Value {
+/// (`smithy_query(query="doc",shape="CreateCustomKeyStore")`). The ONE builder both this
+/// suite and [`super::external_key_store_create_probe`] write their rows with.
+pub(crate) fn external_request(
+    name: &str,
+    connectivity: &str,
+    uri_endpoint: &str,
+    uri_path: &str,
+) -> Value {
     json!({
         "CustomKeyStoreName": name,
         "CustomKeyStoreType": "EXTERNAL_KEY_STORE",

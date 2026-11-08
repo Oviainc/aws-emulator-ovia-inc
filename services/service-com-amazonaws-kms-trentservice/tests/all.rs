@@ -51,6 +51,8 @@ mod encryption_context_conditions;
 mod encryption_context_validation;
 #[path = "all/error_semantics.rs"]
 mod error_semantics;
+#[path = "all/external_key_store_create_probe.rs"]
+mod external_key_store_create_probe;
 #[path = "all/external_key_store_proxy.rs"]
 mod external_key_store_proxy;
 #[path = "all/get_key_policy_reads.rs"]
