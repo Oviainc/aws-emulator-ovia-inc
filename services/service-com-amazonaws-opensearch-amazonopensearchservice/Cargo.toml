@@ -42,6 +42,26 @@ service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice 
 # (action, resource), so this service and every other one handed the same document
 # decide alike. Declared as a path dependency, the way the other consumers do.
 service-common = { path = "../common" }
+# The percent-decoding of a query parameter a data-plane request carries
+# (`service::domain_rest`): a query string holds its values escaped, and the maintained
+# crate is what states that grammar rather than a hand-rolled decoder here.
+percent-encoding = "2.3"
+# The Amazon S3 object store, which holds the dictionary file a package's content is
+# imported from: `CreatePackage` names an S3 bucket and key, and the content of that
+# object is what an index's analysis settings read through `analyzers/<PackageID>`
+# (`state::analysis`). Read from the store S3 itself writes, the way the IAM and Cognito
+# stores above are read.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+# UAX#29 word segmentation: the word boundaries the engine's standard tokenizer splits
+# text on (`state::analysis`), rather than a hand-written scanner here.
+unicode-segmentation = "1"
+# Snowball stemming, so a language analyzer and a `stemmer`/`snowball` token filter fold
+# a term's inflected forms together the way the engine's own stemmer does.
+rust-stemmers = "1.2"
+# The published per-language stop-word lists, so a language analyzer and a `stop` filter
+# that names no list of its own drop the function words they are documented to drop
+# without a list hand-maintained here.
+stop-words = "0.8"
 # The AWS SDK for EC2, driven over the in-process callback
 # (`OperationContext::callback`): the VPC and the Availability Zones a VPC endpoint
 # reports are DERIVED from its subnets, and a subnet is EC2's resource, so

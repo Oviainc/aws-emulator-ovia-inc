@@ -86,7 +86,11 @@ pub(crate) async fn describe_endpoints(emulator: &Emulator, ids: &[&str]) -> Ans
 
 /// `ListVpcEndpoints`: `GET /2021-01-01/opensearch/vpcEndpoints`, optionally resumed
 /// from a page token.
-async fn list_endpoints(emulator: &Emulator, token: Option<&str>) -> Answer {
+///
+/// `pub(crate)` for the same reason as [`create_endpoint`]: the sibling suite for the
+/// statuses an endpoint rests in polls BOTH read paths through this crate's one copy of
+/// each.
+pub(crate) async fn list_endpoints(emulator: &Emulator, token: Option<&str>) -> Answer {
     let uri = match token {
         None => format!("{PREFIX}/opensearch/vpcEndpoints"),
         Some(token) => format!("{PREFIX}/opensearch/vpcEndpoints?nextToken={token}"),

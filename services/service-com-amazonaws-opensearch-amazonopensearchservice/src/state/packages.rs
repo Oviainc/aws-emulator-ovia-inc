@@ -96,6 +96,15 @@ pub struct PackageVersionRecord {
     /// `PackageVersionHistory$PackageConfiguration`: the configuration stored with
     /// this version of the content, absent where the import carried none.
     pub configuration: Option<PackageConfiguration>,
+    /// The CONTENT this version of the package imported, as text — the bytes of the
+    /// Amazon S3 object the import named, where this emulator could read them as text.
+    ///
+    /// A dictionary package's content IS a text file, and what it holds is what an
+    /// index's analysis settings read through the package's mount point
+    /// ([`crate::state::analysis::package_files`]), so the import keeps it. `None` for a
+    /// version whose object the account holds none of, or whose bytes are not text: a
+    /// file this process never read contributes no entries, rather than an empty one.
+    pub content: Option<String>,
 }
 
 impl PackageVersionRecord {
@@ -244,6 +253,7 @@ impl Package {
         commit_message: Option<String>,
         configuration: Option<PackageConfiguration>,
         created_at: SystemTime,
+        content: Option<String>,
     ) {
         let version = self.versions.last().map_or(FIRST_PACKAGE_VERSION, |latest| {
             latest.version.saturating_add(1)
@@ -253,7 +263,22 @@ impl Package {
             commit_message,
             created_at,
             configuration,
+            content,
         });
+    }
+
+    /// The content the version `package_version` names imported, where this emulator read
+    /// it.
+    ///
+    /// Addressed by version because that is what an association pins: a domain reads the
+    /// content of the version its association put there, not whatever the package has
+    /// imported since.
+    pub fn content_at(&self, package_version: &str) -> Option<&str> {
+        self.versions
+            .iter()
+            .find(|version| version.version.to_string() == package_version)?
+            .content
+            .as_deref()
     }
 
     /// This record as `PackageDetails` — the shape `CreatePackage` answers with and
@@ -289,6 +314,52 @@ impl Package {
             package_vending_options: self.vending_options.clone(),
             package_encryption_options: self.encryption_options.clone(),
         }
+    }
+}
+
+/// How much of an imported object's bytes one package version keeps.
+///
+/// The emulator's OWN bound on what a create or an import copies into this process: the
+/// content is read to be READ BACK by an index's analysis chain, and a dictionary file is
+/// a word list, so a package keeps up to this much of the object and the content past it
+/// is not imported. Nothing here is a published service quota.
+pub const MAX_PACKAGE_CONTENT_BYTES: usize = 1 << 20;
+
+/// The content the Amazon S3 location `source` names, as text, read from the store Amazon
+/// S3 itself holds.
+///
+/// `CreatePackage` and `UpdatePackage` "import" the package's content from an S3 bucket and
+/// key, and the content of a TXT-DICTIONARY package is what an index's analysis settings
+/// read through the package's mount point — so the import reads the OBJECT, from the
+/// service that owns it, rather than inventing content for the package.
+///
+/// `None` wherever nothing can be read: no S3 store on this engine, no such bucket or key,
+/// or bytes that are not text. A package whose content could not be read keeps none, which
+/// is what [`Package::content_at`] reports and what a filter reading its file is told.
+///
+/// Reads ONLY, and reads ANOTHER service's store, so it is called before this service's
+/// own store is locked: no call holds two service stores at once.
+pub fn imported_content<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    source: &PackageSource,
+) -> Option<String> {
+    let (bucket, key) = (source.s3_bucket_name.as_ref()?, source.s3_key.as_ref()?);
+    let objects = ::service_com_amazonaws_s3_amazons3::state::service_state(engine)?;
+    let store = objects.lock();
+    let body = &store.bucket(bucket)?.object(key)?.body;
+    let read = body.len().min(MAX_PACKAGE_CONTENT_BYTES);
+    let prefix = body.get(..read)?;
+    match ::std::str::from_utf8(prefix) {
+        Ok(text) => Some(text.to_owned()),
+        // A cut at the byte bound can fall inside a character, which is the ONE error that
+        // says nothing about the content: everything before it was read, so that is what
+        // the package keeps. Bytes that are not text at all leave the package with no
+        // content rather than with a prefix of something this emulator cannot read.
+        Err(invalid) if invalid.error_len().is_none() && read < body.len() => {
+            let valid = prefix.get(..invalid.valid_up_to())?;
+            ::std::str::from_utf8(valid).ok().map(str::to_owned)
+        }
+        Err(_) => None,
     }
 }
 

@@ -72,11 +72,12 @@
 //! The REST surface served is the one this emulator can answer out of persisted state:
 //! the cluster banner and health, the cluster's nodes and its own settings, an index's
 //! create/read/delete, a document write, read and delete, a count and a search over a
-//! bounded query vocabulary ([`selector`]), index templates, ingest pipelines (declared,
-//! simulated and applied to a write that names one), the index-management plugin's policy
-//! API, and the security plugin's role and role-mapping API. A path outside it is answered
-//! the way the engine answers a path no handler is registered for, rather than with an
-//! invented body.
+//! bounded query vocabulary ([`selector`]) whose `match` is evaluated over the terms the
+//! field's own analysis chain produces, the tokens a text produces through that chain
+//! ([`analyze`]), index templates, ingest pipelines (declared, simulated and applied to a
+//! write that names one), the index-management plugin's policy API, and the security
+//! plugin's role and role-mapping API. A path outside it is answered the way the engine
+//! answers a path no handler is registered for, rather than with an invented body.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::SystemTime;
@@ -102,6 +103,9 @@ const DATA_PLANE_SEGMENT: &str = state::ARN_NAMESPACE;
 /// The ingest pipeline engine: what a pipeline's processors are and what they do to a
 /// document, read once and used by both the write path and the simulate API.
 mod pipeline;
+
+/// The analyze API: the tokens a text produces through the chain a request resolves.
+mod analyze;
 
 /// The most bytes one data-plane request body is read as JSON.
 ///
@@ -130,6 +134,55 @@ const MAX_RESULT_WINDOW: usize = 10_000;
 /// How far a `bool` query may nest before the engine refuses it — its own
 /// `indices.query.bool.max_nested_depth` default.
 const MAX_BOOL_NESTING: usize = 20;
+
+/// How many clauses of one query may ask an ANALYZED question — the engine's own
+/// `indices.query.bool.max_clause_count` default, which bounds a query's BREADTH the way
+/// [`MAX_BOOL_NESTING`] bounds its depth: each such clause has a chain resolved for it per
+/// index the request names, so without it the work one request causes would be sized by the
+/// body it sent.
+const MAX_QUERY_CLAUSES: usize = 1_024;
+
+/// How much of a DOCUMENT's text one search may analyze, over the whole scan: its bytes,
+/// plus [`ANALYSIS_OVERHEAD`] for each analysis.
+///
+/// The emulator's OWN bound on the TIME one request can occupy, and on the PRODUCT the
+/// per-factor caps leave open: a search analyzes each document's own text once per analyzed
+/// clause, so its work is the documents it visits times the clauses it carries times the
+/// text each holds at those fields. Counting the text rather than the analyses is what ties
+/// the budget to the work itself — tokenizing, stemming and expanding all cost the length of
+/// what they run over — and the per-analysis floor is what keeps a scan of very many tiny
+/// values bounded too. The budget is charged AND checked at each analysis
+/// ([`Terms::document`]), so no analysis past it is performed, whatever one document's pass
+/// carries; the scan that reached it is then refused rather than reporting part of a scan as
+/// the whole. The data plane serves a request on the calling task while it holds this
+/// service's store, so the span this bounds is one no other caller can be made to wait past.
+const MAX_ANALYZED_BYTES: usize = 8 * 1024 * 1024;
+
+/// What one analysis costs against [`MAX_ANALYZED_BYTES`] beside the text's own length, so
+/// an analysis of nothing still costs something.
+const ANALYSIS_OVERHEAD: usize = 64;
+
+/// How many distinct analysis chains one search may build for ONE index.
+///
+/// The emulator's own bound on what resolving a query's chains COSTS: a chain materialises
+/// the whole dictionary its filters read (bounded per dictionary by
+/// [`state::analysis::MAX_DICTIONARY_ENTRIES`]), so without it a query whose clauses named
+/// a distinct analyzer each — as many as [`MAX_QUERY_CLAUSES`] admits — would choose how
+/// many copies of a dictionary this process holds at once. With it the memory one request's
+/// resolution costs is the product of two constants; past it the search is refused rather
+/// than building another chain.
+const MAX_CHAINS_PER_INDEX: usize = 32;
+
+/// The engine's error type for a query past that ceiling.
+const TOO_MANY_CLAUSES: &str = "too_many_clauses";
+
+/// How many terms ONE `terms` or `ids` clause may name — the engine's own
+/// `index.max_terms_count` default.
+///
+/// Every term of such a clause is compared against every document the scan reaches, so this
+/// is what keeps one clause's own breadth from sizing the work; past it the query is
+/// refused, as the engine refuses it.
+const MAX_TERMS_COUNT: usize = 65_536;
 
 /// The most shards and replica copies one index's settings may ask for, as the engine's
 /// own `index.number_of_shards` limit (`cluster.max_shards_per_node` times a node) bounds
@@ -442,6 +495,10 @@ pub fn serve<Eng: Send + Sync + 'static>(
     };
     let now = SystemTime::now();
     let mut store = state.lock();
+    // The dictionary files this domain's packages mount, resolved out of the store before
+    // the domain this request addresses is borrowed: the content belongs to the PACKAGES
+    // the account holds, which sit beside the domain.
+    let files = analysis_files(&mut store, &resolved.domain_name, &request, now);
     // The remote half of a cross-cluster search: resolved out of the store before the
     // domain this request addresses is borrowed, since the indexes it reads belong to
     // ANOTHER domain of the same store.
@@ -458,7 +515,46 @@ pub fn serve<Eng: Send + Sync + 'static>(
             "blocked by: [SERVICE_UNAVAILABLE/1/state not recovered / initialized]",
         );
     }
-    serve_resolved(domain, &request, now, &across)
+    serve_resolved(domain, &request, now, &across, &files)
+}
+
+/// The dictionary files the packages IN PLACE on the domain mount, for a request whose
+/// answer the analysis chain decides; no file at all for every other request, which reads
+/// none.
+///
+/// Which requests those are is the ANSWER's own business: the analyze API reports what a
+/// chain produces, and a search or a count evaluates a `match` over the terms a field's
+/// chain produces. Everything else is answered without opening a dictionary, so nothing is
+/// read for it.
+///
+/// The clock's owed moves on the packages and on this domain's associations are
+/// materialised first, exactly as a read of those records would have — so a package whose
+/// copy has landed, and an association whose move has, are in place here.
+fn analysis_files(
+    store: &mut Store,
+    domain_name: &str,
+    request: &Request<'_>,
+    now: SystemTime,
+) -> state::analysis::PackageFiles {
+    if !reads_analysis(request) {
+        return state::analysis::PackageFiles::default();
+    }
+    store.settle_packages(now);
+    if let Some(domain) = store.settled_mut(domain_name, now) {
+        domain.settle_package_associations(now);
+    }
+    match store.domains.get(domain_name) {
+        Some(domain) => state::analysis::package_files(&store.packages, domain),
+        None => state::analysis::PackageFiles::default(),
+    }
+}
+
+/// Whether what `request` is answered with depends on an index's analysis chain.
+fn reads_analysis(request: &Request<'_>) -> bool {
+    matches!(
+        request.segments().as_slice(),
+        ["_analyze"] | [_, "_analyze"] | [_, "_search" | "_count"]
+    )
 }
 
 /// The documents the remote clusters of a cross-cluster search hold for the patterns
@@ -586,12 +682,23 @@ impl Request<'_> {
         self.path.split('/').filter(|part| !part.is_empty()).collect()
     }
 
-    /// The value the query string gives `name`, or `None`.
-    fn parameter(&self, name: &str) -> Option<&str> {
-        self.query.split('&').find_map(|pair| {
+    /// The value the query string gives `name`, PERCENT-DECODED, or `None`.
+    ///
+    /// A query string carries its values percent-encoded, so what the caller named is what
+    /// the escapes stand for and not the escapes themselves — a text to analyze, a status
+    /// to wait for, a pipeline id. The decoding is `percent-encoding`'s, so this states no
+    /// grammar of its own; a value whose escapes do not decode as UTF-8 is answered as it
+    /// arrived, which is the most that can be said about it.
+    fn parameter(&self, name: &str) -> Option<String> {
+        let raw = self.query.split('&').find_map(|pair| {
             let (key, value) = pair.split_once('=')?;
             (key == name).then_some(value)
-        })
+        })?;
+        Some(
+            ::percent_encoding::percent_decode_str(raw)
+                .decode_utf8()
+                .map_or_else(|_| raw.to_string(), ::std::borrow::Cow::into_owned),
+        )
     }
 
     /// The request body as the JSON object the handler expects, `None` for an empty body.
@@ -631,11 +738,16 @@ impl Request<'_> {
 
 /// Answer the request against the domain it resolved to, and the remote clusters a
 /// cross-cluster search named ([`cross_cluster`]).
+///
+/// `files` are the dictionary files the domain's packages mount ([`analysis_files`]), which
+/// is what the routes whose answer an analysis chain decides read their stop words and
+/// synonyms from.
 fn serve_resolved(
     domain: &mut Domain,
     request: &Request<'_>,
     now: SystemTime,
     across: &CrossCluster,
+    files: &state::analysis::PackageFiles,
 ) -> RtResponse {
     // IAM first, as AWS takes it: the resource is the domain path the request addresses.
     let resource = format!("{}/{}", domain.arn, request.path.trim_start_matches('/'));
@@ -710,6 +822,11 @@ fn serve_resolved(
         ["_plugins", "_security", "api", "rolesmapping", name] => {
             security_role_mapping(domain, request, name)
         }
+        // The tokens a text produces, for the whole cluster and for one index's own
+        // analysis settings. Both arms come before the single- and two-segment arms below,
+        // so neither reserved name is read as an index.
+        ["_analyze"] => analyze::analyze_request(domain, request, None, files),
+        [index, "_analyze"] => analyze::analyze_request(domain, request, Some(index), files),
         // A refresh with no index named is the whole cluster's, and this arm comes before
         // the single-segment one below so the reserved name is never read as an index.
         ["_refresh"] => match request.method {
@@ -728,13 +845,13 @@ fn serve_resolved(
         }
         [index, "_count"] => match request.method {
             "GET" | "POST" => guarded(domain, request, fgac::ACTION_COUNT, |domain| {
-                count(domain, request, index, across)
+                count(domain, request, index, across, files)
             }),
             _ => wrong_method(request, "GET, POST"),
         },
         [index, "_search"] => match request.method {
             "GET" | "POST" => guarded(domain, request, fgac::ACTION_SEARCH, |domain| {
-                search(domain, request, index, across)
+                search(domain, request, index, across, files)
             }),
             _ => wrong_method(request, "GET, POST"),
         },
@@ -761,7 +878,7 @@ enum Creates {
 /// What `op_type` asks of a `_doc` write: `create` is the one value that forbids a
 /// replacement, and every other (including none) leaves the write an upsert.
 fn requested_op_type(request: &Request<'_>) -> Creates {
-    match request.parameter("op_type") {
+    match request.parameter("op_type").as_deref() {
         Some("create") => Creates::Only,
         _ => Creates::Upsert,
     }
@@ -912,6 +1029,7 @@ fn cluster_health(
     let status = if unassigned > 0 { "yellow" } else { "green" };
     let timed_out = request
         .parameter("wait_for_status")
+        .as_deref()
         .and_then(health_rank)
         .is_some_and(|wanted| health_rank(status).is_some_and(|reached| reached > wanted));
     let percent = if total == 0 {
@@ -1220,7 +1338,7 @@ fn flatten_settings(
 /// has rather than displacing the other: both settings the cluster holds are reported, which
 /// is what a client reading its own configuration back needs.
 fn reported_settings(held: &BTreeMap<String, String>, request: &Request<'_>) -> Value {
-    let flat = request.parameter("flat_settings") == Some("true");
+    let flat = request.parameter("flat_settings").as_deref() == Some("true");
     let mut reported = Map::new();
     for (name, value) in held {
         let segments: Vec<&str> = name.split('.').collect();
@@ -1910,7 +2028,7 @@ fn document_write(
     // refuses the write rather than storing the document unprocessed.
     let processed = match request.parameter("pipeline") {
         None => None,
-        Some(id) => match processed_source(domain, request, id) {
+        Some(id) => match processed_source(domain, request, &id) {
             Ok(processed) => Some(processed),
             Err(refusal) => return *refusal,
         },
@@ -2053,9 +2171,10 @@ fn count(
     request: &Request<'_>,
     index_name: &str,
     across: &CrossCluster,
+    files: &state::analysis::PackageFiles,
 ) -> RtResponse {
     // No hit is reported by a count, so none is materialised for it.
-    let (total, _) = match selected_documents(domain, request, index_name, 0, 0, across) {
+    let (total, _) = match selected_documents(domain, request, index_name, 0, 0, across, files) {
         Ok(selected) => selected,
         Err(refusal) => return *refusal,
     };
@@ -2072,6 +2191,7 @@ fn search(
     request: &Request<'_>,
     index_name: &str,
     across: &CrossCluster,
+    files: &state::analysis::PackageFiles,
 ) -> RtResponse {
     let body = match request.json() {
         Ok(body) => body.unwrap_or_else(|| json!({})),
@@ -2099,10 +2219,11 @@ fn search(
             ),
         );
     }
-    let (total, hits) = match selected_documents(domain, request, index_name, from, size, across) {
-        Ok(selected) => selected,
-        Err(refusal) => return *refusal,
-    };
+    let (total, hits) =
+        match selected_documents(domain, request, index_name, from, size, across, files) {
+            Ok(selected) => selected,
+            Err(refusal) => return *refusal,
+        };
     let hits: Vec<Value> = hits
         .into_iter()
         .map(|(index, id, source)| {
@@ -2153,6 +2274,7 @@ fn selected_documents(
     from: usize,
     size: usize,
     across: &CrossCluster,
+    files: &state::analysis::PackageFiles,
 ) -> Result<Selected, Box<RtResponse>> {
     let body = request.json()?.unwrap_or_else(|| json!({}));
     let select = selector(body.get("query"), 0)?;
@@ -2206,46 +2328,277 @@ fn selected_documents(
         }
         named.insert(pattern);
     }
+    // A query's BREADTH is bounded as its depth is: past the engine's own clause ceiling
+    // the query is refused rather than evaluated clause by clause against every document,
+    // so the work one request causes is bounded by this constant and not by the size of its
+    // body. EVERY leaf clause counts, analyzed or not: each is re-evaluated per document.
+    let clauses = select.clauses();
+    if clauses > MAX_QUERY_CLAUSES {
+        return Err(Box::new(error(
+            400,
+            TOO_MANY_CLAUSES,
+            &format!("maxClauseCount is set to {MAX_QUERY_CLAUSES}"),
+        )));
+    }
+    // The clauses a `match` asks an ANALYZED question with — the field each names and the
+    // text it asks about — so each index resolves its chains and analyzes each query text
+    // ONCE, before its documents are scanned, rather than per document.
+    let mut analyzed = BTreeSet::new();
+    select.analyzed_clauses(&mut analyzed);
+    let mut scan = Scan {
+        from,
+        size,
+        visited: 0,
+        total: 0,
+        page: Vec::new(),
+    };
+    // The analysis budget the WHOLE scan shares, held here rather than on the per-index
+    // chains so the indexes a request names cannot each spend it over again.
+    let budget = ::std::cell::Cell::new(0_usize);
     // This domain's own documents first, then every remote cluster's, each in index then
     // id order — so one query over a local and a remote index reports a stable sequence.
-    let local = named
-        .into_iter()
-        .filter_map(|name| domain.indexes.get(name))
-        .flat_map(|index| {
-            index.documents.values().map(move |document| {
-                (
-                    index.index_name.as_str(),
-                    document.id.as_str(),
-                    &document.source,
-                )
-            })
-        });
-    let searched = remote
+    // Each index's documents are judged by THAT index's own analysis chain, which is what
+    // its own settings and mappings compose.
+    for name in named {
+        let Some(index) = domain.indexes.get(name) else {
+            continue;
+        };
+        let terms = Terms::of(Some(&index.schema), files, &analyzed, &budget)?;
+        for document in index.documents.values() {
+            scan.consider(
+                &select,
+                &index.index_name,
+                &document.id,
+                &document.source,
+                &terms,
+            )?;
+        }
+    }
+    // A remote cluster's documents come with no mappings this domain holds, so their text
+    // is analyzed with the default chain — which is what an index with no analysis settings
+    // of its own uses.
+    let remote_terms = Terms::of(None, files, &analyzed, &budget)?;
+    for (index_name, id, source) in remote
         .into_iter()
         .filter_map(|pattern| across.resolved.get(pattern))
         .flatten()
-        .map(|(index, id, source)| (index.as_str(), id.as_str(), source));
-    let mut visited = 0_usize;
-    let mut total = 0_usize;
-    let mut page = Vec::new();
-    for (index_name, id, source) in local.chain(searched) {
-        visited = visited.saturating_add(1);
-        if visited > MAX_DOCUMENTS_VISITED {
+    {
+        scan.consider(&select, index_name, id, source, &remote_terms)?;
+    }
+    Ok((scan.total, scan.page))
+}
+
+/// One scan of the selected indexes: how many documents matched, and the page the request
+/// asked for.
+///
+/// Only the page is MATERIALISED, so what one request allocates is bounded by the `size` it
+/// asked for; the documents visited are bounded by [`MAX_DOCUMENTS_VISITED`] over the whole
+/// scan, local and remote together, and the document text ANALYZED by
+/// [`MAX_ANALYZED_BYTES`] — which is what bounds the product of the two factors a search
+/// multiplies, the documents it scans and the analyzed clauses it carries.
+struct Scan {
+    from: usize,
+    size: usize,
+    visited: usize,
+    total: usize,
+    page: Vec<(String, String, Value)>,
+}
+
+impl Scan {
+    /// Count one document, and keep it where it is on the page the request asked for.
+    fn consider(
+        &mut self,
+        select: &Selector,
+        index_name: &str,
+        id: &str,
+        source: &Value,
+        terms: &Terms,
+    ) -> Result<(), Box<RtResponse>> {
+        self.visited = self.visited.saturating_add(1);
+        if self.visited > MAX_DOCUMENTS_VISITED {
             return Err(Box::new(error(
                 400,
                 ingest::ILLEGAL_ARGUMENT_EXCEPTION,
                 &format!("a request may visit at most {MAX_DOCUMENTS_VISITED} documents"),
             )));
         }
-        if !select.matches(id, source) {
-            continue;
+        let selected = select.matches(id, source, terms);
+        // The budget the scan's analyses share is CHARGED and CHECKED where each analysis
+        // happens ([`Terms::document`]), so nothing past it is ever analyzed; this is where
+        // a scan that reached it is refused, rather than answering from a document pass
+        // that stopped halfway through its clauses.
+        if terms.analyzed() > MAX_ANALYZED_BYTES {
+            return Err(Box::new(error(
+                400,
+                ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+                &format!(
+                    "a request may analyze at most {MAX_ANALYZED_BYTES} bytes of document \
+                     text"
+                ),
+            )));
         }
-        if total >= from && page.len() < size {
-            page.push((index_name.to_string(), id.to_string(), source.clone()));
+        if !selected {
+            return Ok(());
         }
-        total = total.saturating_add(1);
+        if self.total >= self.from && self.page.len() < self.size {
+            self.page
+                .push((index_name.to_string(), id.to_string(), source.clone()));
+        }
+        self.total = self.total.saturating_add(1);
+        Ok(())
     }
-    Ok((total, page))
+}
+
+/// How the index being scanned turns a field's text into TERMS — the chain a `match` clause
+/// on that field is evaluated over, for the query's text and the document's alike.
+///
+/// Resolved once per index, and each CHAIN built once per index whatever the clauses: a field
+/// names its analyzer, and many fields commonly name one analyzer, so what is kept per field
+/// is that NAME and the chains are held beside them under it. That is what keeps the work of
+/// one request the number of clauses it carries rather than their product with the
+/// dictionaries those chains read — a chain carries its whole stop-word or synonym set.
+///
+/// The QUERY's own text is analyzed here too, once per clause, since a clause asks the same
+/// question of every document; only a DOCUMENT's text is analyzed as the scan reaches it,
+/// and each such analysis is charged against the budget the WHOLE scan shares
+/// ([`MAX_ANALYZED_BYTES`]), which is why that budget is borrowed from the scan rather than
+/// held per index.
+///
+/// The two chains a mapping may name are kept apart: the one a query's text goes through and
+/// the one the field's own text went through. A field the index holds its values WHOLE for (a
+/// keyword, a number, a date) has no entry, because a `match` on such a field is not analyzed
+/// at all. An analyzer the index names that this engine cannot BUILD is not replaced by
+/// another chain: the request is refused with what could not be built, exactly as the
+/// analyze API refuses it.
+struct Terms<'a> {
+    /// The field -> the name of the chain the DOCUMENT's text went through.
+    indexing: BTreeMap<String, String>,
+    /// The chains those names stand for, each built once.
+    chains: BTreeMap<String, state::analysis::Analyzer>,
+    /// The field -> the text each clause asks about -> the terms that text produces
+    /// through the chain a QUERY's text goes through for that field.
+    queries: BTreeMap<String, BTreeMap<String, Vec<String>>>,
+    /// How much of the scan's analysis budget has been spent on document text
+    /// ([`MAX_ANALYZED_BYTES`]) — the scan's own counter, shared by every index it reaches.
+    spent: &'a ::std::cell::Cell<usize>,
+}
+
+impl<'a> Terms<'a> {
+    /// The chains the index whose schema is `schema` resolves for `clauses`, and the terms
+    /// each clause's own text produces through them.
+    ///
+    /// Refused past [`MAX_CHAINS_PER_INDEX`] distinct chains: each carries its own
+    /// dictionary, so that bound is what keeps the memory one query's resolution costs a
+    /// product of constants rather than a number the query chooses. Refused too for a chain
+    /// this engine cannot build — a tokenizer or filter nothing registers, or a
+    /// configuration it cannot run — since answering from another chain's terms would be
+    /// answering a question the caller did not ask.
+    fn of(
+        schema: Option<&::aws_smithy_types::Document>,
+        files: &state::analysis::PackageFiles,
+        clauses: &BTreeSet<(String, String)>,
+        spent: &'a ::std::cell::Cell<usize>,
+    ) -> Result<Self, Box<RtResponse>> {
+        let analysis = schema
+            .map(state::analysis::IndexAnalysis::of)
+            .unwrap_or_default();
+        let mut searching: BTreeMap<String, String> = BTreeMap::new();
+        let mut indexing = BTreeMap::new();
+        let mut chains: BTreeMap<String, state::analysis::Analyzer> = BTreeMap::new();
+        let mut queries: BTreeMap<String, BTreeMap<String, Vec<String>>> = BTreeMap::new();
+        for (field, text) in clauses {
+            if analysis.holds_whole_values(field) {
+                continue;
+            }
+            for (search, into) in [(true, &mut searching), (false, &mut indexing)] {
+                let named = match analysis.field_analyzer_name(field, search) {
+                    Ok(named) => named,
+                    // A field the mappings do not map is analyzed by the index's own
+                    // default chain, exactly as the text field a write would dynamically
+                    // map is.
+                    Err(state::analysis::Unresolved::Field(_)) => {
+                        state::analysis::DEFAULT_ANALYZER.to_string()
+                    }
+                    Err(unresolved) => return Err(unresolved_chain(&unresolved)),
+                };
+                if !chains.contains_key(&named) {
+                    if chains.len() >= MAX_CHAINS_PER_INDEX {
+                        return Err(Box::new(error(
+                            400,
+                            ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+                            &format!(
+                                "a request may analyze through at most \
+                                 {MAX_CHAINS_PER_INDEX} analyzers of one index"
+                            ),
+                        )));
+                    }
+                    let chain = analysis
+                        .analyzer(&named, files)
+                        .map_err(|unresolved| unresolved_chain(&unresolved))?;
+                    chains.insert(named.clone(), chain);
+                }
+                into.insert(field.clone(), named);
+            }
+            if let Some(chain) = searching.get(field).and_then(|named| chains.get(named)) {
+                queries
+                    .entry(field.clone())
+                    .or_default()
+                    .insert(text.clone(), chain.terms(text));
+            }
+        }
+        Ok(Self {
+            indexing,
+            chains,
+            queries,
+            spent,
+        })
+    }
+
+    /// The terms the QUERY's text produces for `field`, analyzed once when this index's
+    /// chains were resolved; `None` where that field holds its values whole.
+    fn query(&self, field: &str, text: &str) -> Option<&[String]> {
+        self.queries.get(field)?.get(text).map(Vec::as_slice)
+    }
+
+    /// The terms a DOCUMENT's text produces for `field`, or `None` where that field holds
+    /// its values whole.
+    ///
+    /// The scan's analysis budget is charged AND CHECKED here, where the work is done: an
+    /// analysis that would take the scan past [`MAX_ANALYZED_BYTES`] is not performed at
+    /// all, and the scan is marked exhausted so [`Scan::consider`] refuses the request
+    /// instead of answering from a document pass that stopped halfway. Nothing past the
+    /// budget is analyzed, however many clauses one document's pass carries.
+    fn document(&self, field: &str, text: &str) -> Option<Vec<String>> {
+        let chain = self.chains.get(self.indexing.get(field)?)?;
+        let cost = ANALYSIS_OVERHEAD.saturating_add(text.len());
+        let spent = self.spent.get().saturating_add(cost);
+        if spent > MAX_ANALYZED_BYTES {
+            self.spent.set(spent);
+            return Some(Vec::new());
+        }
+        self.spent.set(spent);
+        Some(chain.terms(text))
+    }
+
+    /// How much of this scan's budget the document text analyzed so far has cost.
+    fn analyzed(&self) -> usize {
+        self.spent.get()
+    }
+}
+
+/// The refusal a chain this engine cannot build earns: the engine's illegal-argument
+/// failure, stating what it could not find or could not run.
+///
+/// The SAME sentence the analyze API answers, through the same rendering
+/// ([`state::analysis::Unresolved::message`]), so a search and an analyze cannot word one
+/// condition differently. Worded as an index's — a search always resolves a chain against
+/// the index whose documents it reads.
+fn unresolved_chain(unresolved: &state::analysis::Unresolved) -> Box<RtResponse> {
+    Box::new(error(
+        400,
+        ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+        &unresolved.message(false),
+    ))
 }
 
 /// Which documents a query selects.
@@ -2262,6 +2615,13 @@ enum Selector {
     /// spelling are the same value — which is how a `keyword` term and a `match` on a
     /// numeric field both behave.
     Equals { field: String, values: Vec<String> },
+    /// A field's text, ANALYZED, shares a term with this text analyzed the same way: what a
+    /// `match` asks, and what a `match_phrase` asks of the terms in order (`phrase`).
+    Analyzed {
+        field: String,
+        text: String,
+        phrase: bool,
+    },
     /// The document's id is one of these.
     Ids(Vec<String>),
     /// Every one of these selects the document.
@@ -2273,17 +2633,79 @@ enum Selector {
 }
 
 impl Selector {
-    /// Whether this selector selects the document `id`/`source`.
-    fn matches(&self, id: &str, source: &Value) -> bool {
+    /// Whether this selector selects the document `id`/`source`, as the index's own
+    /// analysis chain turns that document's text into terms (`terms`).
+    fn matches(&self, id: &str, source: &Value, terms: &Terms) -> bool {
         match self {
             Self::All => true,
             Self::Equals { field, values } => field_values(source, field)
                 .iter()
                 .any(|held| values.iter().any(|wanted| wanted == held)),
+            Self::Analyzed {
+                field,
+                text,
+                phrase,
+            } => {
+                // A field the index holds its values WHOLE for is not analyzed, so the
+                // clause is the equality a `term` on it would be.
+                let Some(wanted) = terms.query(field, text) else {
+                    return field_values(source, field).contains(text);
+                };
+                if wanted.is_empty() {
+                    // Every term of the query was dropped by the chain — a text of nothing
+                    // but stop words — so there is no term left for a document to carry.
+                    return false;
+                }
+                field_values(source, field).iter().any(|held| {
+                    let held = terms.document(field, held).unwrap_or_default();
+                    if *phrase {
+                        held.windows(wanted.len()).any(|run| run == wanted)
+                    } else {
+                        wanted.iter().any(|term| held.contains(term))
+                    }
+                })
+            }
             Self::Ids(ids) => ids.iter().any(|wanted| wanted == id),
-            Self::All_(clauses) => clauses.iter().all(|clause| clause.matches(id, source)),
-            Self::None_(clauses) => !clauses.iter().any(|clause| clause.matches(id, source)),
-            Self::Any(clauses) => clauses.iter().any(|clause| clause.matches(id, source)),
+            Self::All_(clauses) => clauses
+                .iter()
+                .all(|clause| clause.matches(id, source, terms)),
+            Self::None_(clauses) => !clauses
+                .iter()
+                .any(|clause| clause.matches(id, source, terms)),
+            Self::Any(clauses) => clauses
+                .iter()
+                .any(|clause| clause.matches(id, source, terms)),
+        }
+    }
+
+    /// Collect the clauses this selector asks an ANALYZED question with — the field each
+    /// names and the text it asks about — so each index resolves its chains and analyzes
+    /// each of those texts once before its documents are scanned.
+    fn analyzed_clauses(&self, into: &mut BTreeSet<(String, String)>) {
+        match self {
+            Self::Analyzed { field, text, .. } => {
+                into.insert((field.clone(), text.clone()));
+            }
+            Self::All_(clauses) | Self::None_(clauses) | Self::Any(clauses) => {
+                for clause in clauses {
+                    clause.analyzed_clauses(into);
+                }
+            }
+            Self::All | Self::Equals { .. } | Self::Ids(_) => {}
+        }
+    }
+
+    /// How many LEAF clauses this selector is: every one of them is asked of every document
+    /// the scan reaches, so this is the breadth [`MAX_QUERY_CLAUSES`] bounds — a `bool`
+    /// composition counts the clauses under it rather than itself.
+    fn clauses(&self) -> usize {
+        match self {
+            Self::All => 0,
+            Self::Equals { .. } | Self::Analyzed { .. } | Self::Ids(_) => 1,
+            Self::All_(clauses) | Self::None_(clauses) | Self::Any(clauses) => clauses
+                .iter()
+                .map(Self::clauses)
+                .fold(0_usize, usize::saturating_add),
         }
     }
 }
@@ -2342,7 +2764,10 @@ fn selector(query: Option<&Value>, depth: usize) -> Result<Selector, Box<RtRespo
     };
     match name.as_str() {
         "match_all" => Ok(Selector::All),
-        "term" | "match" | "match_phrase" => {
+        // A `term` asks for the field's value exactly as it is stored; a `match` and a
+        // `match_phrase` ask the question of the TERMS the field's analyzer produces, which
+        // is what makes an index's own analysis settings decide what a query finds.
+        "term" => {
             let (field, wanted) = single_field(value)?;
             let wanted = wanted
                 .get("value")
@@ -2354,21 +2779,68 @@ fn selector(query: Option<&Value>, depth: usize) -> Result<Selector, Box<RtRespo
                 values: vec![scalar_text(&wanted)],
             })
         }
+        "match" | "match_phrase" => {
+            let (field, wanted) = single_field(value)?;
+            let wanted = wanted
+                .get("query")
+                .or_else(|| wanted.get("value"))
+                .unwrap_or(&wanted)
+                .clone();
+            Ok(Selector::Analyzed {
+                field,
+                text: scalar_text(&wanted),
+                phrase: name == "match_phrase",
+            })
+        }
         "terms" => {
             let (field, wanted) = single_field(value)?;
             let values = match wanted {
-                Value::Array(elements) => elements.iter().map(scalar_text).collect(),
+                Value::Array(elements) => {
+                    // The engine's own ceiling on how many terms ONE such clause may name,
+                    // past which it refuses the query rather than materialising the array
+                    // and comparing every one of them against every document.
+                    if elements.len() > MAX_TERMS_COUNT {
+                        return Err(Box::new(error(
+                            400,
+                            ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+                            &format!(
+                                "The number of terms [{}] used in the Terms Query request \
+                                 has exceeded the allowed maximum of [{MAX_TERMS_COUNT}]. \
+                                 This maximum can be set by changing the \
+                                 [index.max_terms_count] index level setting.",
+                                elements.len()
+                            ),
+                        )));
+                    }
+                    elements.iter().map(scalar_text).collect()
+                }
                 other => vec![scalar_text(&other)],
             };
             Ok(Selector::Equals { field, values })
         }
-        "ids" => Ok(Selector::Ids(
-            value
-                .get("values")
-                .and_then(Value::as_array)
-                .map(|values| values.iter().map(scalar_text).collect())
-                .unwrap_or_default(),
-        )),
+        "ids" => {
+            let listed = value.get("values").and_then(Value::as_array);
+            // An `ids` clause names its ids one by one and every one of them is compared
+            // against every document the scan reaches, so it is bounded the same way — by
+            // the same count, stated as the emulator's own bound, since the engine words no
+            // ceiling of its own for this clause.
+            if listed.is_some_and(|values| values.len() > MAX_TERMS_COUNT) {
+                return Err(Box::new(error(
+                    400,
+                    ingest::ILLEGAL_ARGUMENT_EXCEPTION,
+                    &format!(
+                        "an ids clause may name at most {MAX_TERMS_COUNT} ids, and this one \
+                         names {}",
+                        listed.map_or(0, Vec::len)
+                    ),
+                )));
+            }
+            Ok(Selector::Ids(
+                listed
+                    .map(|values| values.iter().map(scalar_text).collect())
+                    .unwrap_or_default(),
+            ))
+        }
         "bool" => {
             let clauses = |name: &str| -> Result<Vec<Selector>, Box<RtResponse>> {
                 let listed = match value.get(name) {
@@ -2964,7 +3436,21 @@ mod tests {
             let select = selector(Some(query), 0)
                 .map_err(|_| ())
                 .unwrap_or_else(|()| panic!("case {case:?}: expected the query to be read"));
-            let matched = select.matches("one", &source);
+            // No index schema and no mounted file: the fields a `match` names are analyzed
+            // by the default chain, which is what an index with no analysis settings of
+            // its own uses.
+            let mut analyzed = BTreeSet::new();
+            select.analyzed_clauses(&mut analyzed);
+            let budget = ::std::cell::Cell::new(0_usize);
+            let terms = Terms::of(
+                None,
+                &state::analysis::PackageFiles::default(),
+                &analyzed,
+                &budget,
+            )
+            .map_err(|_| ())
+            .unwrap_or_else(|()| panic!("case {case:?}: expected the chains to resolve"));
+            let matched = select.matches("one", &source, &terms);
             assert_eq!(
                 matched, *expected,
                 "case {case:?}: expected {expected}, got {matched}"

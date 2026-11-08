@@ -69,6 +69,19 @@ async fn associate(emulator: &Emulator, body: Value) -> Answer {
         .await
 }
 
+/// The Amazon S3 bucket every package of this suite imports its content from, and the
+/// key one package's content sits at.
+///
+/// Named here rather than inside the create below because a suite about what a package's
+/// CONTENT does ([`super::domain_analysis`]) puts the object there first: the create
+/// imports the object this names, so the two have to name one location.
+pub(crate) const PACKAGE_BUCKET: &str = "my-package-bucket";
+
+/// The key the package `name`'s content is imported from. See [`PACKAGE_BUCKET`].
+pub(crate) fn package_key(name: &str) -> String {
+    format!("packages/{name}")
+}
+
 /// `CreatePackage` for `name` with type `package_type`, answering with the
 /// `PackageID` it minted.
 pub(crate) async fn create_package(emulator: &Emulator, name: &str, package_type: &str) -> String {
@@ -81,8 +94,8 @@ pub(crate) async fn create_package(emulator: &Emulator, name: &str, package_type
                 "PackageName": name,
                 "PackageType": package_type,
                 "PackageSource": {
-                    "S3BucketName": "my-package-bucket",
-                    "S3Key": format!("packages/{name}"),
+                    "S3BucketName": PACKAGE_BUCKET,
+                    "S3Key": package_key(name),
                 },
             })),
         )

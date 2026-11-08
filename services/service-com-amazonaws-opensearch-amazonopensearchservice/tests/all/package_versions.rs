@@ -743,7 +743,7 @@ async fn a_packages_version_history_is_bounded() {
             .expect("the created package is in the store");
         let now = SystemTime::now();
         while package.versions.len() < PACKAGE_VERSION_QUOTA - 1 {
-            package.add_version(None, None, now);
+            package.add_version(None, None, now, None);
         }
     }
 

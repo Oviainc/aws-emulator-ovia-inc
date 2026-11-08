@@ -352,7 +352,7 @@ impl VpcEndpointRecord {
         self.owed = Some(OwedStatus {
             status: VPC_ENDPOINT_STATUS_ACTIVE.to_string(),
             message: None,
-            due: now + PROVISIONING,
+            due: now + VPC_ENDPOINT_CHANGE,
         });
     }
 

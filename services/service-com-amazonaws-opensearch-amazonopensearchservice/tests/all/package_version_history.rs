@@ -300,6 +300,8 @@ fn seed_versions(emulator: &Emulator, package_id: &str, versions: &[Seeded]) {
             commit_message: version.commit_message.clone(),
             created_at: SystemTime::UNIX_EPOCH + SEED_EPOCH + Duration::from_secs(version.offset),
             configuration: version.configured.then(|| seeded_configuration(number)),
+            // The seeded version records a history entry, not content to analyze.
+            content: None,
         });
         package.version = number;
     }

@@ -41,8 +41,9 @@ pub(crate) const DEFAULT_ACCESS_KEY_ID: &str = "AKIAIOSFODNN7EXAMPLE";
 
 /// Long enough for the LONGEST span this emulator owes a clock move (the 3 s work on
 /// a domain takes — its provisioning, a configuration change, an engine version
-/// upgrade or a service software deployment; every other span of this service is
-/// shorter) to have fallen due, so the next read materialises the settled record.
+/// upgrade or a service software deployment — and the 3 s a change to a service-managed
+/// VPC endpoint takes; every other span of this service is shorter) to have fallen due,
+/// so the next read materialises the settled record.
 pub(crate) const SETTLE_WAIT: Duration = Duration::from_millis(3_300);
 
 /// The HTTP status this service's RECORDED wire answer carries a missing-resource

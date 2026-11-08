@@ -42,8 +42,13 @@ const PREFIX: &str = "/2021-01-01";
 
 /// Long enough for the span the clock owes a VPC endpoint's create or update to have
 /// fallen due, so the endpoint is idle again and the next change is served.
+///
+/// That span is the one the endpoint's own lifecycle states
+/// (`state::VPC_ENDPOINT_CHANGE`), not this service's generic provisioning span: the
+/// statuses an endpoint rests in while a change is in flight are sized for a client's own
+/// poll, so they outlast the shorter one.
 fn settle_wait() -> Duration {
-    service_com_amazonaws_opensearch_amazonopensearchservice::state::PROVISIONING
+    service_com_amazonaws_opensearch_amazonopensearchservice::state::VPC_ENDPOINT_CHANGE
         + Duration::from_millis(250)
 }
 

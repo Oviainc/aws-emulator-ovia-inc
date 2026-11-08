@@ -76,6 +76,10 @@ pub const ACTION_REFRESH: &str = "indices:admin/refresh";
 /// The action a count asks for.
 pub const ACTION_COUNT: &str = "indices:data/read/count";
 
+/// The action reporting how a text is analyzed asks for — the index-administration action
+/// the engine's own analyze API is registered under.
+pub const ACTION_ANALYZE: &str = "indices:admin/analyze";
+
 /// The action a read of one document by its id asks for.
 pub const ACTION_GET_DOCUMENT: &str = "indices:data/read/get";
 

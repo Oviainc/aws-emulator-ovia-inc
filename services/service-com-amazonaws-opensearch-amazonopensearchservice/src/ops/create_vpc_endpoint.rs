@@ -97,7 +97,8 @@ use super::types::*;
 use crate::state::vpc_network::{placed_vpc_options, resolve_subnets, subnets_span_two_vpcs};
 use crate::state::{
     request_region, subnets_in_two_vpcs, vpc_endpoint_domain_unavailable, vpc_endpoint_host,
-    OwedStatus, VpcEndpointRecord, PROVISIONING, VPC_ENDPOINT_QUOTA, VPC_ENDPOINT_STATUS_ACTIVE,
+    OwedStatus, VpcEndpointRecord, VPC_ENDPOINT_CHANGE, VPC_ENDPOINT_QUOTA,
+    VPC_ENDPOINT_STATUS_ACTIVE,
     VPC_ENDPOINT_STATUS_CREATING,
 };
 
@@ -276,12 +277,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vpc_options: placed_vpc_options(input.vpc_options, &placements),
             // The endpoint is not up the instant the call returns: it is being
             // provisioned, and the clock owes it the status that provisioning leaves it
-            // in once the span has passed.
+            // in once the span has passed — a span sized so a client polling the
+            // endpoint observes the transient status ([`crate::state::VPC_ENDPOINT_CHANGE`]).
             status: VPC_ENDPOINT_STATUS_CREATING.to_string(),
             owed: Some(OwedStatus {
                 status: VPC_ENDPOINT_STATUS_ACTIVE.to_string(),
                 message: None,
-                due: now + PROVISIONING,
+                due: now + VPC_ENDPOINT_CHANGE,
             }),
             endpoint: vpc_endpoint_host(&domain_name, &suffix, &region),
             client_token: input.client_token,

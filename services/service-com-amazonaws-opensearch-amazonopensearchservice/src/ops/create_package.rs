@@ -176,6 +176,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
 
+        // The content this create imports lives in ANOTHER service's store, so it is read
+        // before this one is locked: no call holds two service stores at once. What it
+        // reads is the object the request named, and nothing is read for a location this
+        // account holds no object at.
+        let content = crate::state::imported_content(&*self.engine, &input.package_source);
+
         // `EngineVersion` is "the version of the Amazon OpenSearch Service engine for
         // which is compatible with the package", and it "can only be specified for
         // package type ZIP-PLUGIN": a package of any other type has no engine to be
@@ -275,7 +281,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // package's content, so the version history a later read reports begins with
         // it. A create carries no commit message — `CreatePackageRequest` declares no
         // such member — so that version has none.
-        package.add_version(None, configuration, now);
+        package.add_version(None, configuration, now, content);
 
         // Answered from the STORED record, through the projection every read path
         // reports a package with.

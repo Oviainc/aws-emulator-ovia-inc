@@ -174,6 +174,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
 
+        // The content this import copies lives in ANOTHER service's store, so it is read
+        // before this one is locked: no call holds two service stores at once.
+        let content = crate::state::imported_content(&*self.engine, &input.package_source);
+
         let mut store = state.lock();
 
         // The record this call changes is first brought to the status the clock already
@@ -244,7 +248,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `GetPackageVersionHistory` reports — and the configuration the package holds
         // for that version.
         let configuration = package.configuration.clone();
-        package.add_version(input.commit_message, configuration, now);
+        package.add_version(input.commit_message, configuration, now, content);
 
         // The new content is not in place the instant this call returns: it is being
         // copied out of the Amazon S3 location the request named, and the clock owes

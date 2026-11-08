@@ -85,6 +85,8 @@ mod direct_query_data_source_updates;
 mod direct_query_data_sources;
 #[path = "all/domain_activity_gates.rs"]
 mod domain_activity_gates;
+#[path = "all/domain_analysis.rs"]
+mod domain_analysis;
 #[path = "all/domain_auto_tunes.rs"]
 mod domain_auto_tunes;
 #[path = "all/domain_batch_describe.rs"]
@@ -241,6 +243,8 @@ mod vpc_access_endpoints;
 mod vpc_endpoint_access;
 #[path = "all/vpc_endpoint_access_revocation.rs"]
 mod vpc_endpoint_access_revocation;
+#[path = "all/vpc_endpoint_transient_statuses.rs"]
+mod vpc_endpoint_transient_statuses;
 #[path = "all/vpc_endpoint_updates.rs"]
 mod vpc_endpoint_updates;
 #[path = "all/vpc_endpoints.rs"]

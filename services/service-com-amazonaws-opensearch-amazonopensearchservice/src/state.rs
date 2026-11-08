@@ -97,6 +97,9 @@ pub mod vpc_network;
 /// Which analyzer an index's field mappings may name, and the refusal of one nothing
 /// configures.
 mod analyzers;
+/// The analysis chain a domain's cluster runs text through: the tokenizer and filters an
+/// index's settings compose, and the dictionary files an associated package mounts for them.
+pub mod analysis;
 /// An index of a domain, the schema it carries and the settings around it.
 mod indexes;
 /// A package of this account and its association with a domain.
@@ -612,6 +615,21 @@ pub const DOMAIN_WORK: Duration = Duration::from_secs(3);
 /// thread, or after building a second client — must still find that change in flight
 /// and be refused rather than overtaking it. OpenSearch Service takes minutes.
 pub const PACKAGE_ASSOCIATION_CHANGE: Duration = Duration::from_millis(750);
+
+/// How long a change to one service-managed VPC endpoint takes before the clock owes
+/// its outcome: the endpoint stays `CREATING` for this long after a create, and
+/// `UPDATING` for this long after a change to its subnets or security groups, before it
+/// owes the status that work leaves it in.
+///
+/// Longer than [`PROVISIONING`], because those two statuses are what a client WAITS FOR:
+/// the service leaves an endpoint in one of them while the work is in flight, and a
+/// client told so polls the endpoint until it sees it. A poll written for a service that
+/// takes minutes samples seconds apart, so a span of a few hundred milliseconds is one
+/// such a poll steps straight over — it reads `ACTIVE` on its first sample and never
+/// observes the transient status at all, or waits for a status it has already missed.
+/// The span is therefore sized for a client's own pace rather than for the emulator's,
+/// the same reasoning [`DOMAIN_WORK`] states for work on a domain. AWS takes minutes.
+pub const VPC_ENDPOINT_CHANGE: Duration = Duration::from_secs(3);
 
 /// The service software release a domain runs when it is created.
 ///
