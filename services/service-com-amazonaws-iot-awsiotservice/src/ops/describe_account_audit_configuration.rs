@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAccountAuditConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAccountAuditConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAccountAuditConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the account's Device Defender audit configuration: the role the audit runs
+//! under, every audit check with whether it is enabled, and every notification target
+//! type with where its notifications go. All three come from the one record
+//! `UpdateAccountAuditConfiguration` writes ([`crate::state::AccountAuditConfiguration`]),
+//! so the reader hands back what the last writer stored.
+//!
+//! A PURE READ: the record is cloned out from under the lock and nothing is written, so a
+//! later caller sees what this one saw. An account that has never configured auditing
+//! still has a configuration — every check disabled, no target enabled, no role — which is
+//! why this never has to create the record it reports.
 //!
 //! ## Shape of an operation
 //!
@@ -141,18 +143,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAccountAuditConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAccountAuditConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAccountAuditConfiguration"))
+        // `DescribeAccountAuditConfigurationRequest` is an empty structure and the audit
+        // configuration is account-wide, so neither the request nor its metadata selects
+        // what is reported.
+        let _ = (&input, ctx);
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAccountAuditConfigurationErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+        })?;
+
+        // A pure read: the record is cloned out from under the lock and the store is left
+        // exactly as it was, so a later caller sees what this one saw.
+        let configuration = state.lock().audit_configuration.clone();
+
+        Ok(DescribeAccountAuditConfigurationOutput {
+            audit_notification_target_configurations: Some(
+                configuration.notification_target_configurations(),
+            ),
+            audit_check_configurations: Some(configuration.check_configurations()),
+            // `None` until an update supplies one: that is what an account which has
+            // never configured auditing reports.
+            role_arn: configuration.role_arn,
+        })
     }
 }

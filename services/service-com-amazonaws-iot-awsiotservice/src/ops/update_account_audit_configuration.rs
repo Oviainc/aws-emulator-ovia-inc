@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateAccountAuditConfiguration
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateAccountAuditConfiguration`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateAccountAuditConfiguration::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Configures the account's Device Defender audit settings: the role the audit runs
+//! under, which audit checks are enabled, and where audit notifications are sent. The
+//! three members are optional and each is merged key by key into the one record
+//! `DescribeAccountAuditConfiguration` reports
+//! ([`crate::state::AccountAuditConfiguration`]), so a member the request omits leaves
+//! what the account had.
+//!
+//! Every rule is checked before anything is written, so a refused request leaves the
+//! stored configuration exactly as it was.
 //!
 //! ## Shape of an operation
 //!
@@ -113,6 +114,19 @@ impl From<UpdateAccountAuditConfigurationErrorModeled> for UpdateAccountAuditCon
     }
 }
 
+/// Refuse this request as invalid, with the operation's modelled
+/// `InvalidRequestException` ("The request is not valid", HTTP 400).
+///
+/// The message names the member and the rule it broke, so the caller can fix the
+/// request from the text alone; the rules themselves live with the record the write
+/// applies to ([`crate::state::AuditConfigurationRefusal`]).
+fn invalid_request(message: String) -> UpdateAccountAuditConfigurationError {
+    UpdateAccountAuditConfigurationErrorModeled::InvalidRequestException(InvalidRequestException {
+        message: Some(message),
+    })
+    .into()
+}
+
 /// The `UpdateAccountAuditConfiguration` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -149,18 +163,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateAccountAuditConfiguration` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateAccountAuditConfigurationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateAccountAuditConfiguration"))
+        // The audit configuration is account-wide, so no request metadata selects what
+        // is written.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateAccountAuditConfigurationErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+        })?;
+
+        {
+            let mut store = state.lock();
+            store
+                .audit_configuration
+                .apply_update(
+                    input.role_arn,
+                    input.audit_check_configurations,
+                    input.audit_notification_target_configurations,
+                )
+                .map_err(|refusal| invalid_request(refusal.message()))?;
+        }
+
+        // `UpdateAccountAuditConfigurationResponse` models no members, so a successful
+        // update is an empty 200 and what it persisted is read back through
+        // `DescribeAccountAuditConfiguration`.
+        Ok(UpdateAccountAuditConfigurationOutput {})
     }
 }

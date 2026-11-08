@@ -91,6 +91,14 @@
 //! `/role-aliases/{roleAlias}`. One record carries everything a reader hands back, so
 //! `DescribeRoleAlias` after `CreateRoleAlias` reports the created alias
 //! member-for-member (see [`role_aliases`]).
+//!
+//! It also holds the account's DEVICE DEFENDER AUDIT CONFIGURATION — one record, not a
+//! map, because `DescribeAccountAuditConfiguration` and
+//! `UpdateAccountAuditConfiguration` name no resource: there is one audit configuration
+//! per account. An account that has never updated it still has one (no audit check
+//! enabled, no notification target enabled, no role), which is why the field has a
+//! default and the reader never has to create what it reports (see
+//! [`audit_configuration`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
@@ -854,6 +862,19 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// A caller grows this store, so it is bounded: [`MAX_ROLE_ALIASES`] is the
     /// ceiling `CreateRoleAlias` refuses past.
     pub role_aliases: BTreeMap<String, RegisteredRoleAlias>,
+    /// The account's DEVICE DEFENDER AUDIT CONFIGURATION — one record, not a map,
+    /// because `DescribeAccountAuditConfiguration` /
+    /// `UpdateAccountAuditConfiguration` name no resource: there is one audit
+    /// configuration per account.
+    ///
+    /// It is a plain field and not an `Option`, for the reason
+    /// [`ComAmazonawsIotAwsiotserviceState::indexing_configuration`] is: an account
+    /// that has never updated it still HAS a configuration — every audit check
+    /// disabled, no notification target enabled and no role — so the read never has to
+    /// create the record it reports. See [`AccountAuditConfiguration`], which also
+    /// records why the record is bounded by its own catalogs: one entry per audit check
+    /// and one per modelled notification type, whatever a caller sends.
+    pub audit_configuration: AccountAuditConfiguration,
 }
 
 impl ComAmazonawsIotAwsiotserviceState {
@@ -2723,6 +2744,16 @@ pub mod role_aliases;
 pub use role_aliases::{
     missing_role_alias_message, role_alias_arn, RegisteredRoleAlias,
     DEFAULT_CREDENTIAL_DURATION_SECONDS, MAX_ROLE_ALIASES, MAX_ROLE_ALIAS_TAGS,
+};
+
+// What the account's DEVICE DEFENDER AUDIT CONFIGURATION is — the checks it holds a
+// setting for, where its notifications go, and what every reader of it reports — lives
+// in `state/audit_configuration.rs`, beside the store accessor for the same reason the
+// rules engine does. Its names are re-exported here so a handler reaches them as
+// `crate::state::<name>`.
+pub mod audit_configuration;
+pub use audit_configuration::{
+    is_audit_check, AccountAuditConfiguration, AuditConfigurationRefusal, AUDIT_CHECK_NAMES,
 };
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
