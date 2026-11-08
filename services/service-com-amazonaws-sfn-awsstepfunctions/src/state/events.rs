@@ -49,11 +49,18 @@
 //! transitions nobody asks for are materialised by [`drive`]: one task per store that
 //! waits for the next due instant, settles, and publishes what the settling produced.
 //!
+//! "What the settling produced" is EVERYTHING those transitions owe another service, not
+//! the bus alone: the same settle also queues what the execution publishes about itself
+//! ([`super::observability`]), so one hand-over ([`hand_over`]) writes both. Nothing an
+//! execution owes may therefore wait for a client to call this service again — which is
+//! the only record there is of a workflow whose own reporting APIs do not serve it.
+//!
 //! The queue is BOUNDED ([`MAX_PENDING_EVENTS`], oldest dropped first) because every
 //! transition appends to it, and the record of what has been published is pruned to the
 //! executions the store still holds, so neither grows with the number of calls served.
 
 use std::collections::{BTreeMap, VecDeque};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use ::serde_json::{Map, Value};
@@ -404,8 +411,10 @@ fn text(value: Option<&str>) -> Value {
     value.map_or(Value::Null, |value| Value::String(value.to_string()))
 }
 
-/// Publish every status change this store has queued onto the account's default
-/// EventBridge bus, and keep the clock running for the transitions nobody will ask for.
+/// Publish everything the transitions this store has materialised owe: every status
+/// change queued onto the account's default EventBridge bus, every observation queued
+/// for CloudWatch and CloudWatch Logs, and the clock that keeps doing both for the
+/// transitions nobody will ask for.
 ///
 /// Called with NO lock held, by every operation that can move an execution's status:
 /// each batch of changes is taken out in one critical section, so nothing is published
@@ -416,18 +425,36 @@ fn text(value: Option<&str>) -> Value {
 /// operation is told — an emulator with no EventBridge mounted has nowhere to publish —
 /// so a failure is logged and the operation's own result stands.
 pub async fn publish<Eng: Send + Sync + 'static>(
-    engine: &Eng,
+    engine: &Arc<Eng>,
     callback: &smithy_server_runtime::EmbeddedEmulator,
 ) {
-    let Some(state) = super::service_state(engine) else {
+    let Some(state) = super::service_state(&**engine) else {
         return;
     };
-    drain(&state, callback).await;
-    drive(&state, callback);
+    hand_over(engine, &state, callback).await;
+    drive(engine, &state, callback);
 }
 
-/// Publish what is queued, and answer how many changes went out — which is what tells
-/// the clock whether this store is still moving.
+/// Hand over everything the transitions this store has materialised owe another
+/// service, and answer how much went out — which is what tells the clock whether this
+/// store is still moving.
+///
+/// The two hand-overs belong together because ONE settle produces both: the status
+/// changes queued for the account's event bus, and the observations queued for the
+/// stores CloudWatch and CloudWatch Logs answer from
+/// ([`super::observability::publish`]). Called with no lock held, by a request and by
+/// the clock alike, so a transition owes the same writes whoever materialised it.
+async fn hand_over<Eng: Send + Sync + 'static>(
+    engine: &Arc<Eng>,
+    state: &::engine::ServiceState<ComAmazonawsSfnAwsstepfunctionsState>,
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+) -> usize {
+    let changes = drain(state, callback).await;
+    changes + super::observability::publish(&**engine)
+}
+
+/// Publish what is queued onto the account's event bus, and answer how many changes went
+/// out.
 async fn drain(
     state: &::engine::ServiceState<ComAmazonawsSfnAwsstepfunctionsState>,
     callback: &smithy_server_runtime::EmbeddedEmulator,
@@ -563,7 +590,8 @@ fn entry(change: &StatusChange) -> Value {
 /// running; a second call while one runs starts nothing. With no async runtime to spawn
 /// onto there is no clock: the transitions are then materialised and published by the
 /// next operation instead, as they always were.
-fn drive(
+fn drive<Eng: Send + Sync + 'static>(
+    engine: &Arc<Eng>,
     state: &::engine::ServiceState<ComAmazonawsSfnAwsstepfunctionsState>,
     callback: &smithy_server_runtime::EmbeddedEmulator,
 ) {
@@ -574,6 +602,9 @@ fn drive(
         return;
     };
     let driven = ::engine::ServiceState::clone(state);
+    // The same engine the request itself would have published through, so the clock
+    // reaches the stores the owning services' own readers answer from.
+    let engine = Arc::clone(engine);
     // The same handle into this same emulator the request itself would have published
     // through, owned by the task rather than borrowed from the request that started it.
     let callback = callback.clone();
@@ -593,7 +624,7 @@ fn drive(
             // a due transition from costing a CPU-bound spin, and it hands the runtime
             // back between wake-ups.
             ::tokio::time::sleep(wait(next_due, idle_shift)).await;
-            let published = drain(&driven, &callback).await;
+            let published = hand_over(&engine, &driven, &callback).await;
             idle_shift = match published {
                 0 => (idle_shift + 1).min(MAX_IDLE_SHIFT),
                 _ => 0,

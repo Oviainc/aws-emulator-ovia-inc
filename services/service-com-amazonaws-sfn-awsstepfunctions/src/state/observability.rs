@@ -34,11 +34,14 @@
 //!
 //! An observation is QUEUED on this service's own store at the instant the thing it
 //! measures happens — an execution admitted, an outcome the clock made due — and
-//! PUBLISHED by the call that queued it, once that call has released the store
-//! ([`publish`]). The queue is what keeps the two stores from being locked at once and
-//! what lets the work that produces an observation stay a pure store transition; it is
-//! bounded ([`MAX_PENDING_OBSERVATIONS`]), so a deployment with no CloudWatch mounted
-//! cannot grow it without end.
+//! PUBLISHED once the call that queued it has released the store ([`publish`]). An
+//! outcome the CLOCK made due is queued by no call at all, so the clock that
+//! materialised it hands it over itself ([`super::events`]): nothing an execution
+//! publishes waits for a client to call this service again, which for a workflow whose
+//! own reporting APIs do not serve it would be never. The queue is what keeps the two
+//! stores from being locked at once and what lets the work that produces an observation
+//! stay a pure store transition; it is bounded ([`MAX_PENDING_OBSERVATIONS`]), so a
+//! deployment with no CloudWatch mounted cannot grow it without end.
 
 use ::std::collections::BTreeMap;
 use ::std::time::{SystemTime, UNIX_EPOCH};
@@ -273,24 +276,31 @@ pub fn log_group_of(configuration: &crate::ops::types::LoggingConfiguration) -> 
     (!name.is_empty()).then_some((region, name))
 }
 
-/// The IAM actions a state machine's own role must hold for its logging
-/// configuration to deliver anything.
+/// The IAM actions that give a state machine's own role ACCESS to the log destination
+/// its logging configuration names.
 ///
-/// Step Functions does not write a vended log as the caller: it sets a DELIVERY up
-/// and writes the events as the state machine's role, so the role is what needs the
+/// Step Functions does not write a vended log as the caller: it sets a DELIVERY up and
+/// writes the events as the state machine's role, so the role is what needs the
 /// CloudWatch Logs permissions the service's logging guidance publishes — creating the
-/// delivery, and putting the events. A role that holds neither cannot deliver one
-/// event, which is why the control plane decides it when the configuration is given
-/// rather than letting a state machine that can never log be reported as healthy.
+/// delivery, and putting the events. A role whose documents allow it NONE of them has
+/// no access to that destination at all and cannot deliver one event, which is what the
+/// control plane refuses when the configuration is given rather than letting a state
+/// machine that can never log be reported as healthy.
+///
+/// A role allowed ANY of them HAS access, and is served: the refused call's own sentence
+/// is about the role's access to the destination, the recorded creates show one whose
+/// role's documents carry the event-writing grant alone being served, and this service
+/// reads only the identity-based documents it can see — so a create the service serves
+/// is not refused here on a document that grants part of a published policy.
 pub const LOG_DELIVERY_ACTIONS: &[&str] = &["logs:CreateLogDelivery", "logs:PutLogEvents"];
 
 /// The resource those actions are taken on: the log destination the configuration
 /// names, which is what the refusal is about.
 ///
-/// It is the qualified log group ARN the destination carries, so a policy that grants
-/// the delivery actions on every resource and one that grants them on the group the
-/// configuration names both authorize the delivery, while a policy that grants neither
-/// authorizes nothing.
+/// It is the qualified log group ARN the destination carries, so a policy that grants a
+/// delivery action on every resource and one that grants it on the group the
+/// configuration names both give the role access to the destination, while a policy
+/// that grants neither gives it none.
 fn log_delivery_resource(
     configuration: &crate::ops::types::LoggingConfiguration,
 ) -> Option<String> {
@@ -313,15 +323,19 @@ fn log_delivery_resource(
 pub const LOG_DESTINATION_ACCESS_DENIED: &str =
     "The state machine IAM Role is not authorized to access the Log Destination";
 
-/// Whether the role `role_arn` may NOT deliver the events `configuration` asks for, so
-/// the call that named them both is refused ([`LOG_DESTINATION_ACCESS_DENIED`]).
+/// Whether the role `role_arn` has NO access to the log destination `configuration`
+/// names, so the call that named them both is refused
+/// ([`LOG_DESTINATION_ACCESS_DENIED`]).
 ///
 /// A configuration that delivers nothing — one whose level is `OFF`, or that names no
 /// log group — needs no permission at all, so nothing is decided for it. Everything
 /// else is the one reading of what a state machine's role may do
-/// ([`super::task_authorization::role_is_denied`]), which shows a refusal only where
-/// the account really holds that role and the documents it holds for it withhold the
-/// delivery actions.
+/// ([`super::task_authorization::role_is_denied`]), asked for EACH delivery action in
+/// turn: the refusal stands only where that reading withholds every one of them, which
+/// is the role having no access to the destination at all ([`LOG_DELIVERY_ACTIONS`]).
+/// That reading shows a refusal only where the account really holds the role and the
+/// documents it holds for it withhold the action, so a role the account does not hold —
+/// and an engine with no IAM store — refuses nothing.
 ///
 /// Call it with no store of this service locked: it takes IAM's own.
 #[must_use]
@@ -337,7 +351,14 @@ pub fn log_destination_denied<Eng: Send + Sync + 'static>(
     let Some(resource) = log_delivery_resource(configuration) else {
         return false;
     };
-    super::task_authorization::role_is_denied(engine, role_arn, LOG_DELIVERY_ACTIONS, &resource)
+    LOG_DELIVERY_ACTIONS.iter().all(|action| {
+        super::task_authorization::role_is_denied(
+            engine,
+            role_arn,
+            ::std::slice::from_ref(action),
+            &resource,
+        )
+    })
 }
 
 /// The stream one execution's events are delivered to.
@@ -790,25 +811,30 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
 }
 
 /// Publish everything this service's store has queued: the metric datapoints into
-/// CloudWatch's own store, and the history events into CloudWatch Logs'.
+/// CloudWatch's own store, and the history events into CloudWatch Logs'. Answers how
+/// many observations were handed over, which is what tells the clock that drives this
+/// store's owed transitions whether it is still moving
+/// ([`super::events`]).
 ///
 /// Call it with NO store of this service locked — it takes this service's guard to
 /// drain the queue, and then the owning service's to write — so the two are never held
 /// at once. An engine carrying neither store has nowhere to publish to, so the
 /// observations are dropped rather than kept for a reader that cannot exist.
-pub fn publish<Eng: Send + Sync + 'static>(engine: &Eng) {
+pub fn publish<Eng: Send + Sync + 'static>(engine: &Eng) -> usize {
     let Some(state) = super::service_state(engine) else {
-        return;
+        return 0;
     };
     let pending = {
         let mut store = state.lock();
         store.take_observations()
     };
     if pending.is_empty() {
-        return;
+        return 0;
     }
+    let handed = pending.datapoints.len() + pending.deliveries.len();
     publish_datapoints(engine, &pending.datapoints);
     deliver_events(engine, &pending.deliveries);
+    handed
 }
 
 /// Append every datapoint to the CloudWatch store of the SAME engine — the store

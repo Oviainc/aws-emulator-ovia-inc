@@ -108,7 +108,11 @@ fn without_payload(details: &Value) -> Value {
 
 /// Every event the group `name` holds, as the parsed JSON message of each, in the order
 /// CloudWatch Logs reports them.
-async fn delivered(observed: &Observed, case: &str, name: &str) -> Vec<Value> {
+///
+/// `pub(crate)`, not private: `tests/all.rs` is this binary's crate root, so a sibling
+/// suite that waits for a delivery to land reads the group through this one reader
+/// rather than carrying a second copy of it.
+pub(crate) async fn delivered(observed: &Observed, case: &str, name: &str) -> Vec<Value> {
     let found = observed
         .logs("FilterLogEvents", &json!({ "logGroupName": name }))
         .await;

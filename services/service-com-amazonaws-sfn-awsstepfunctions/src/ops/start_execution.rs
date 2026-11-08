@@ -387,20 +387,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 Some(name) => name,
                 None => store.fresh_execution_name(),
             };
+            let standard = target.sm_type != crate::state::STATE_MACHINE_TYPE_EXPRESS;
             // The execution ARN is built in the state machine's OWN region, so the
-            // two ARNs always agree however the request was signed.
-            let execution_arn = crate::state::execution_arn(
-                &crate::state::arn_region(&target.state_machine_arn),
-                &target.name,
-                &execution_name,
-            );
+            // two ARNs always agree however the request was signed. Its FORM is the
+            // workflow type's: an EXPRESS execution is named by the `express` ARN
+            // carrying the run's own id ([`crate::state::EXPRESS_EXECUTION_RESOURCE`]),
+            // which is what identifies one run of a workflow whose names "can be
+            // reused immediately" (`StartExecution$name`) — the same ARN a
+            // synchronous start of the same workflow type mints — while a STANDARD
+            // execution, whose name identifies it for 90 days, is named by the
+            // `execution` ARN its name determines.
+            let region = crate::state::arn_region(&target.state_machine_arn);
+            let execution_arn = if standard {
+                crate::state::execution_arn(&region, &target.name, &execution_name)
+            } else {
+                let execution_id = store.fresh_execution_id();
+                crate::state::express_execution_arn(
+                    &region,
+                    &target.name,
+                    &execution_name,
+                    &execution_id,
+                )
+            };
             // An execution the store already holds under that ARN is decided HERE,
             // before the definition is interpreted: a `Task` state's integration is
             // a call to another service, and the repeat of an idempotent start must
             // not make it a second time. The same decision is re-made with the
             // admitting lock held below, because the name could be taken while the
-            // walk runs.
-            let standard = target.sm_type != crate::state::STATE_MACHINE_TYPE_EXPRESS;
+            // walk runs. An EXPRESS start holds no such ARN at all — the id just
+            // minted is this run's alone — which is what makes a reused name another
+            // run rather than a refusal.
             if let Some(already) =
                 store.started_already(&execution_arn, standard, &execution_input)
             {
@@ -592,15 +608,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ExecutionAlreadyExists error." It "isn't idempotent for EXPRESS
             // workflows".
             //
-            // An execution record is keyed by its own ARN, which its name determines,
-            // so a name already in use names a STORED execution either way. For
-            // STANDARD the documented same-name-and-input hit answers the first
-            // response; for EXPRESS there is no such hit, and serving a second run
-            // under a reused name needs the Express execution ARN's own unique id,
-            // which this model does not describe — so rather than overwrite the stored
-            // execution, the reused name is refused with this operation's modelled
-            // error. The ONE reading of that is `state::started_already`, asked again
-            // here because the name could have been taken while the walk ran.
+            // An execution record is keyed by its own ARN. For STANDARD that ARN is
+            // determined by the name, so a name already in use names a STORED
+            // execution and the documented same-name-and-input hit answers the first
+            // response; for EXPRESS the ARN carries the run's own id, so a reused name
+            // — which that workflow type allows "immediately" — is another run under
+            // another ARN and overwrites nothing. The ONE reading of that is
+            // `state::started_already`, asked again here because the name could have
+            // been taken while the walk ran.
             let standard = machine_type != crate::state::STATE_MACHINE_TYPE_EXPRESS;
             if let Some(already) = store.started_already(&arn, standard, &execution_input) {
                 return already_started(already, &arn);
@@ -670,18 +685,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 arn.clone(),
             );
         }
-        // What this start — and every outcome the settle above materialised —
-        // published about itself: the `AWS/States` series the executions are counted
-        // in, and the history events a logging configuration delivers.
-        crate::state::observability::publish(&*self.engine);
-
-        // The execution is now RUNNING, which is a status it has MOVED INTO: Step
-        // Functions publishes one event per execution status change onto the account's
-        // default event bus, so the change this call made goes out before it answers —
-        // and the clock this starts is what publishes the terminal status the walk's
-        // outcome is owed at. Published with no store of this service locked, as every
-        // other call this operation makes is.
-        crate::state::events::publish(&*self.engine, ctx.callback()).await;
+        // The execution is now RUNNING, which is a status it has MOVED INTO, and this
+        // start — like every outcome the settles above materialised — publishes what it
+        // owes about itself: the status change onto the account's default event bus, the
+        // `AWS/States` series the executions are counted in and the history events a
+        // logging configuration delivers, all handed over by the ONE seam
+        // ([`crate::state::events::publish`]) that also starts the clock publishing what
+        // the walk's outcome will owe when it falls due. Published with no store of this
+        // service locked, as every other call this operation makes is.
+        crate::state::events::publish(&self.engine, ctx.callback()).await;
 
         Ok(StartExecutionOutput {
             execution_arn: arn,

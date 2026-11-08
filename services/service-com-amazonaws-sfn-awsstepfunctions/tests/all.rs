@@ -191,5 +191,7 @@ mod unresolved_path_cause;
 mod unserved_request_refusals;
 #[path = "all/update_state_machine_alias_effects.rs"]
 mod update_state_machine_alias_effects;
+#[path = "all/vended_log_delivery_clock.rs"]
+mod vended_log_delivery_clock;
 #[path = "all/vended_log_event_members.rs"]
 mod vended_log_event_members;

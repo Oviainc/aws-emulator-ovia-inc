@@ -86,6 +86,20 @@ fn log_delivery_policy() -> Value {
     })
 }
 
+/// A policy that grants ONE of the delivery actions and nothing else of CloudWatch
+/// Logs: a role that can put the events but was never given the delivery calls, which
+/// is the narrowest grant that is still access to the destination.
+fn event_writing_policy() -> Value {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": ["logs:CreateLogStream", "logs:PutLogEvents"],
+            "Resource": "*",
+        }]
+    })
+}
+
 /// A policy that grants something of ANOTHER service and nothing of CloudWatch Logs,
 /// which is the least-privilege role a client's negative path uses.
 fn unrelated_policy() -> Value {
@@ -188,6 +202,16 @@ fn log_rows() -> Vec<LogRow> {
         LogRow {
             case: "a role carrying the published log-delivery policy",
             policy: log_delivery_policy,
+            configuration: |group| logging(observability::LOG_LEVEL_ALL, group),
+            served: true,
+        },
+        LogRow {
+            // The boundary of the rule: the refusal is the role having NO access to the
+            // destination, so a role allowed one of the delivery actions on it is
+            // served — this service reads only the documents it can see, and a create
+            // AWS serves is not refused on a partial grant.
+            case: "a role allowed only the event-writing action on the destination",
+            policy: event_writing_policy,
             configuration: |group| logging(observability::LOG_LEVEL_ALL, group),
             served: true,
         },

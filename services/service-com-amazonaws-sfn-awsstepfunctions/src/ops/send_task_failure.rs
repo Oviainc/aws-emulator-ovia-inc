@@ -541,7 +541,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The continuation may have failed the execution, which is a status change this
         // service publishes onto the account's default event bus, carrying the error
         // and cause the failure reached.
-        crate::state::events::publish(&*self.engine, ctx.callback()).await;
+        crate::state::events::publish(&self.engine, ctx.callback()).await;
         Ok(SendTaskFailureOutput {})
     }
 }

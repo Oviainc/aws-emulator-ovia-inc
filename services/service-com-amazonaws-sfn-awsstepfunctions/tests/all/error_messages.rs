@@ -106,9 +106,8 @@ fn execution_arn(state_machine: &str, execution: &str) -> String {
 async fn a_client_error_names_its_condition_and_the_request_value() {
     let emulator = Emulator::new();
 
-    // A state machine with one running execution, an EXPRESS state machine with
-    // one of its own, and a state machine that has been deleted: between them
-    // these reach every existence error this service raises.
+    // A state machine with one running execution, and a state machine that has been
+    // deleted: between them these reach every existence error this service raises.
     let standard = create_machine(&emulator, "msg-standard", HELLO_DEFINITION).await;
     let started = emulator
         .ok(
@@ -117,26 +116,6 @@ async fn a_client_error_names_its_condition_and_the_request_value() {
         )
         .await;
     let execution = string(&started, "executionArn");
-
-    let express = emulator
-        .ok(
-            "CreateStateMachine",
-            &json!({
-                "name": "msg-express",
-                "definition": HELLO_DEFINITION,
-                "roleArn": ROLE_ARN,
-                "type": "EXPRESS",
-            }),
-        )
-        .await;
-    let express = string(&express, "stateMachineArn");
-    let express_started = emulator
-        .ok(
-            "StartExecution",
-            &json!({ "stateMachineArn": express, "name": "msg-express-exec" }),
-        )
-        .await;
-    let express_execution = string(&express_started, "executionArn");
 
     let deleted = create_machine(&emulator, "msg-deleted", HELLO_DEFINITION).await;
     emulator
@@ -163,13 +142,6 @@ async fn a_client_error_names_its_condition_and_the_request_value() {
             json!({ "stateMachineArn": standard, "name": "msg-exec", "input": "{\"a\":2}" }),
             "ExecutionAlreadyExists",
             format!("Execution Already Exists: '{execution}'"),
-        ),
-        (
-            "StartExecution reusing an EXPRESS execution's name",
-            "StartExecution",
-            json!({ "stateMachineArn": express, "name": "msg-express-exec" }),
-            "ExecutionAlreadyExists",
-            format!("Execution Already Exists: '{express_execution}'"),
         ),
         (
             "DescribeStateMachine on a deleted state machine",
@@ -212,13 +184,6 @@ async fn a_client_error_names_its_condition_and_the_request_value() {
             json!({ "executionArn": absent_execution }),
             "ExecutionDoesNotExist",
             format!("Execution Does Not Exist: '{absent_execution}'"),
-        ),
-        (
-            "DescribeExecution on an EXPRESS execution it does not report",
-            "DescribeExecution",
-            json!({ "executionArn": express_execution }),
-            "ExecutionDoesNotExist",
-            format!("Execution Does Not Exist: '{express_execution}'"),
         ),
         // The reported value is not always an ARN: `InvalidName` reports the
         // name the caller sent, through the same template. (`InvalidArn`'s own

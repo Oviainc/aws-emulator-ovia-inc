@@ -758,7 +758,9 @@ async fn refuses_an_execution_arn_no_record_answers_for() {
     let live = start_execution(&emulator, &machine, "live", "{}").await;
 
     // An EXPRESS workflow's execution: "this API action is not supported by EXPRESS
-    // state machines", and no Map Run dispatched it, so there is nothing to report.
+    // state machines", and an EXPRESS execution is named by the `express` ARN its run
+    // carries its own id in — a resource type no execution-ARN member of this service
+    // accepts — so the ARN is refused before any record is looked up.
     let express = emulator
         .ok(
             "CreateStateMachine",
@@ -827,7 +829,7 @@ async fn refuses_an_execution_arn_no_record_answers_for() {
         (
             "an EXPRESS workflow's execution",
             express_execution.as_str(),
-            "ExecutionDoesNotExist",
+            "InvalidArn",
         ),
         (
             "an execution whose state machine was deleted",

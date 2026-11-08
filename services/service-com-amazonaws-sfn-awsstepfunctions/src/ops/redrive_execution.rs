@@ -508,7 +508,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // accounting this attempt reached: that status change is published onto the
         // account's default event bus, and the clock this starts publishes the re-run's
         // own terminal status when it falls due.
-        crate::state::events::publish(&*self.engine, ctx.callback()).await;
+        crate::state::events::publish(&self.engine, ctx.callback()).await;
         Ok(RedriveExecutionOutput {
             redrive_date: crate::state::to_date_time(redrive_date),
         })

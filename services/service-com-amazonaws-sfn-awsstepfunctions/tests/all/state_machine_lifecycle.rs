@@ -2129,11 +2129,14 @@ async fn express_executions_are_refused_by_the_operations_that_exclude_them() {
 
     let cases: Vec<(&str, &str, Value, u16, &str)> = vec![
         (
+            // An EXPRESS execution is named by the `express` ARN its run carries its
+            // own id in, a resource type no execution-ARN member of this service
+            // accepts, so the ARN is refused before any record is looked up.
             "DescribeExecution does not report EXPRESS executions",
             "DescribeExecution",
             json!({ "executionArn": execution }),
             400,
-            "ExecutionDoesNotExist",
+            "InvalidArn",
         ),
         (
             "ListExecutions is not supported by EXPRESS state machines",
@@ -2159,20 +2162,28 @@ async fn express_executions_are_refused_by_the_operations_that_exclude_them() {
         );
     }
 
-    // "StartExecution isn't idempotent for EXPRESS workflows": there is no same-name
-    // hit, and this emulator keys an execution by its ARN, so a reused name is
-    // refused rather than overwriting the stored execution.
-    let (status, code) = emulator
-        .err(
+    // "StartExecution isn't idempotent for EXPRESS workflows", and "for EXPRESS
+    // workflows, execution names can be reused immediately" (`StartExecution$name`):
+    // the reused name starts ANOTHER run, which the id its own ARN carries tells apart
+    // from the first rather than overwriting it.
+    let again = emulator
+        .ok(
             "StartExecution",
             &json!({ "stateMachineArn": machine, "name": "quick" }),
         )
         .await;
-    assert_eq!(
-        (status, code.as_str()),
-        (400, "ExecutionAlreadyExists"),
-        "an EXPRESS start under a name in use must not overwrite it, got {status} {code}"
+    let second = string(&again, "executionArn");
+    assert_ne!(
+        second, execution,
+        "an EXPRESS start under a name in use must be a run of its own, got {second:?}"
     );
+    for arn in [&execution, &second] {
+        assert!(
+            arn.contains(":express:fast:quick:"),
+            "an EXPRESS execution ARN names the express resource, the state machine, the name \
+             and the run's own id, got {arn:?}"
+        );
+    }
 }
 
 /// A state machine name is scoped per region: the same name signed for two regions

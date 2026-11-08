@@ -309,5 +309,5 @@ async fn resolve<Eng: Send + Sync + 'static>(
     // The job's outcome may have carried the execution to its terminal status, which
     // is a status change this service publishes onto the account's default event bus.
     // Published with no store of this service locked.
-    super::events::publish(&**engine, callback).await;
+    super::events::publish(engine, callback).await;
 }

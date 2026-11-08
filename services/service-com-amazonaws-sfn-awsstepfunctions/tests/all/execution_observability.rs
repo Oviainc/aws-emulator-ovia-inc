@@ -41,7 +41,7 @@ use crate::state_machine_lifecycle::{
 };
 
 /// A definition that fails at once, so a row can observe a FAILED execution.
-const FAILING_DEFINITION: &str = r#"{"StartAt":"Nope","States":{"Nope":{"Type":"Fail","Error":"Boom","Cause":"the row fails on purpose"}}}"#;
+pub(crate) const FAILING_DEFINITION: &str = r#"{"StartAt":"Nope","States":{"Nope":{"Type":"Fail","Error":"Boom","Cause":"the row fails on purpose"}}}"#;
 
 /// A definition that waits long enough to still be RUNNING when a stop arrives.
 const WAITING_DEFINITION: &str =
@@ -77,7 +77,7 @@ impl Observed {
     }
 
     /// Call one Step Functions operation and return `(status, body)`.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         self.dispatch("states", "AWSStepFunctions", "1.0", operation, body)
             .await
     }
@@ -171,7 +171,7 @@ impl Observed {
 }
 
 /// The qualified ARN of the log group `name`, which is the form `logGroupArn` takes.
-fn log_group_arn(name: &str) -> String {
+pub(crate) fn log_group_arn(name: &str) -> String {
     format!("arn:aws:logs:{REGION}:{ACCOUNT}:log-group:{name}:*")
 }
 
@@ -439,6 +439,8 @@ async fn a_logging_level_selects_the_events_delivered() {
             vec!["ExecutionStarted", "FailStateEntered", "ExecutionFailed"],
         ),
         (
+            // A `Fail` state IS the failure, so entering it is an event of that tier;
+            // the ordinary progress around it is not.
             "ERROR logs the failures alone",
             Some(observability::LOG_LEVEL_ERROR),
             vec!["FailStateEntered", "ExecutionFailed"],

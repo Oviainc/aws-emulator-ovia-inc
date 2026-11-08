@@ -279,13 +279,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The execution has moved into `ABORTED`, carrying the error and cause this
-        // call named: the status change is published onto the account's default event
-        // bus, with no store of this service locked.
-        crate::state::events::publish(&*self.engine, ctx.callback()).await;
-        // What the stop published about this execution: the series an aborted
-        // execution is counted in, and the history events its logging configuration
-        // delivers. The store guard was released with the block above.
-        crate::state::observability::publish(&*self.engine);
+        // call named: the status change goes onto the account's default event bus, and
+        // beside it what the stop published about this execution — the series an aborted
+        // execution is counted in and the history events its logging configuration
+        // delivers — handed over by the ONE seam that publishes both. The store guard
+        // was released with the block above.
+        crate::state::events::publish(&self.engine, ctx.callback()).await;
 
         Ok(StopExecutionOutput {
             stop_date: crate::state::to_date_time(stopped.stop_date),

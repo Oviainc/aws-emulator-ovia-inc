@@ -323,7 +323,12 @@ async fn redrive_refuses_what_the_projection_reports_as_not_redrivable() {
         "stateMachineArn",
     );
     let express_execution = start_execution(&emulator, &express, "run", "{}").await;
-    let unknown = format!("{express_execution}-missing");
+    // An execution ARN of the STANDARD machine that nothing started: this row is about
+    // a record that is ABSENT, so the ARN is the form a STANDARD execution carries.
+    let unknown = format!(
+        "{}:nothing-started",
+        standard.replacen(":stateMachine:", ":execution:", 1)
+    );
     let bad_shape = [
         (
             "an execution ARN no execution is stored under",
@@ -344,10 +349,13 @@ async fn redrive_refuses_what_the_projection_reports_as_not_redrivable() {
             "InvalidArn",
         ),
         (
+            // An EXPRESS execution is named by the `express` ARN its run carries its
+            // own id in, a resource type no execution-ARN member accepts, so the ARN
+            // is refused before any record is looked up.
             "an execution of an EXPRESS state machine",
             express_execution,
             400,
-            "ValidationException",
+            "InvalidArn",
         ),
     ];
     for (case, arn, expected_status, expected_code) in bad_shape {

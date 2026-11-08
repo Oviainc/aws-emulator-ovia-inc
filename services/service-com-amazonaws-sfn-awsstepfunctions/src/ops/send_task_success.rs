@@ -528,7 +528,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is a status change this service publishes onto the account's default event
         // bus; the clock this starts publishes one the continuation left owed to a
         // later instant.
-        crate::state::events::publish(&*self.engine, ctx.callback()).await;
+        crate::state::events::publish(&self.engine, ctx.callback()).await;
         Ok(SendTaskSuccessOutput {})
     }
 }
