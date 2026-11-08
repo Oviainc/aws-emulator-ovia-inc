@@ -354,11 +354,11 @@ fn refusal_rows() -> Vec<RefusalRow> {
             operation: "GetItem",
             body: json!({"TableName": TABLE, "Key": {"pk": {"S": "p1"}, "sk": {"S": "a"}},
                          "AttributesToGet": ["note", "note"]}),
-            // The refusal names the member the request stated its projection THROUGH,
-            // which for a request carrying no `ProjectionExpression` is the legacy list.
-            message: "Invalid AttributesToGet: Two document paths overlap with each \
-                      other; must remove or rewrite one of these paths; path one: [note], \
-                      path two: [note]"
+            // The legacy member is a list of attribute NAMES rather than of document
+            // paths, so a name it lists twice is a duplicate VALUE in that list, named
+            // by the refusal.
+            message: "One or more parameter values were invalid: Duplicate value in \
+                      attribute name: note"
                 .to_string(),
         },
         RefusalRow {

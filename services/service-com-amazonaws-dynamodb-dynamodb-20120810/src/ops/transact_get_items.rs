@@ -218,6 +218,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut projections: Vec<Option<Vec<crate::state::DocumentPath>>> =
             Vec::with_capacity(input.transact_items.len());
         for item in &input.transact_items {
+            // The projection first: a projection this service cannot apply is the defect
+            // the element is refused for, whatever else it also got wrong.
+            let read = crate::state::requested_projection(
+                PROJECTION_EXPRESSION,
+                item.get.projection_expression.as_deref(),
+                None,
+                item.get.expression_attribute_names.as_ref(),
+            )
+            .map_err(lift)?;
             // Every token this element DEFINES must be one its projection uses, and the
             // refusal is the ELEMENT's, so it is stated on its own.
             crate::state::Substitutions::new(item.get.expression_attribute_names.as_ref(), None)
@@ -226,15 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     item.get.projection_expression.as_deref(),
                 )])
                 .map_err(lift)?;
-            projections.push(
-                crate::state::requested_projection(
-                    PROJECTION_EXPRESSION,
-                    item.get.projection_expression.as_deref(),
-                    None,
-                    item.get.expression_attribute_names.as_ref(),
-                )
-                .map_err(lift)?,
-            );
+            projections.push(read);
         }
 
         // WHO this request speaks for, resolved before this service's store is locked

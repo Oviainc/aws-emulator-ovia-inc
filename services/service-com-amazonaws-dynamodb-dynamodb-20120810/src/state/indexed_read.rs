@@ -178,10 +178,13 @@ pub fn resolve_selection(
             None => Selection::AllAttributes,
         }),
         // "SPECIFIC_ATTRIBUTES - Returns only the attributes listed in
-        // ProjectionExpression": there are none to return when the request listed none.
+        // ProjectionExpression": there are none to return when the request listed none,
+        // and the refusal names BOTH members a projection can be listed in, because the
+        // request listed it in neither.
         Some("SPECIFIC_ATTRIBUTES") => requested.map(Selection::Specific).ok_or_else(|| {
             super::refused(format!(
-                "Must specify the {PROJECTION_MEMBER} when choosing to get SPECIFIC_ATTRIBUTES"
+                "Must specify the {LEGACY_PROJECTION_MEMBER} or {PROJECTION_MEMBER} when \
+                 choosing to get SPECIFIC_ATTRIBUTES"
             ))
         }),
         // "If you use the ProjectionExpression parameter, then the value for Select can
@@ -251,16 +254,40 @@ pub fn requested_projection(
             member,
             projection_expression_paths(member, expression, Substitutions::new(names, None))?,
         ),
-        (None, Some(names)) => (
-            LEGACY_PROJECTION_MEMBER,
-            names
-                .iter()
-                .map(|name| DocumentPath::attribute_named(name))
-                .collect(),
-        ),
+        (None, Some(names)) => {
+            // The member is "an array of attributes to retrieve", a list of attribute
+            // NAMES: a name it lists twice is a duplicate value in that list, refused
+            // over the repeated name rather than read as two paths addressing one
+            // location ([`duplicate_attribute_name`]).
+            let mut stated: BTreeSet<&str> = BTreeSet::new();
+            for name in names {
+                if !stated.insert(name.as_str()) {
+                    return Err(duplicate_attribute_name(name));
+                }
+            }
+            (
+                LEGACY_PROJECTION_MEMBER,
+                names
+                    .iter()
+                    .map(|name| DocumentPath::attribute_named(name))
+                    .collect(),
+            )
+        }
         (None, None) => return Ok(None),
     };
     projected_paths(stated, paths).map(Some)
+}
+
+/// How a legacy `AttributesToGet` that lists one attribute name twice is refused.
+///
+/// That member is a list of attribute NAMES rather than of document paths, so listing
+/// one name twice is a duplicate VALUE in the list — stated as the parameter-value
+/// sentence over the repeated name, and not as the overlapping-paths refusal a
+/// `ProjectionExpression` naming one location twice earns.
+fn duplicate_attribute_name(name: &str) -> RequestError {
+    RequestError::Validation(format!(
+        "One or more parameter values were invalid: Duplicate value in attribute name: {name}"
+    ))
 }
 
 /// The member a request states its projection through one generation back:
@@ -295,6 +322,79 @@ pub fn needs_unprojected(
     needed
         .iter()
         .any(|name| !index.projects(table_key_schema, name))
+}
+
+/// The attributes one read's PROJECTION names that a GLOBAL secondary index does not
+/// project — [`unprojected_projection_refusal`] reports them, and an empty list is a
+/// projection the index can answer on its own.
+///
+/// "If you query or scan a global secondary index, you can only request attributes that
+/// are projected into the index. Global secondary index queries cannot fetch attributes
+/// from the parent table" (`Query$Select`, which `Scan$Select` repeats): what a read
+/// REQUESTS is what it reports, so a projection naming an attribute the index does not
+/// hold cannot be served from the index at all, and a path that reaches INSIDE an
+/// attribute requests that attribute — the top-level name the path starts at.
+///
+/// A read of EVERY attribute names no attribute in particular — it is refused where the
+/// index is resolved ([`all_attributes_unprojected`]) — and a LOCAL secondary index
+/// fetches what it does not project from the parent table instead
+/// ([`needs_unprojected`]), so neither contributes here.
+pub fn unprojected_projection_attributes(
+    index: &SecondaryIndex<'_>,
+    table_key_schema: &[KeySchemaElement],
+    selection: &Selection,
+) -> Vec<String> {
+    let Selection::Specific(paths) = selection else {
+        return Vec::new();
+    };
+    if !index.global || index.projects_all() {
+        return Vec::new();
+    }
+    let named: BTreeSet<String> = paths
+        .iter()
+        .map(|path| path.attribute().to_string())
+        .collect();
+    named
+        .into_iter()
+        .filter(|name| !index.projects(table_key_schema, name))
+        .collect()
+}
+
+/// How a projection a global secondary index cannot answer is refused: the index the
+/// request named and the attributes it does not project, in name order.
+pub fn unprojected_projection_refusal(index_name: &str, attributes: &[String]) -> RequestError {
+    RequestError::Validation(format!(
+        "One or more parameter values were invalid: Global secondary index {index_name} does \
+         not project [{}]",
+        attributes.join(", ")
+    ))
+}
+
+/// The attributes one QUERY's filter names that the secondary index it reads does not
+/// project, refused through the sentence this service states that refusal with
+/// ([`super::unprojected_filter_refusal`]).
+///
+/// A filter is judged against what the read SEES, and a query pointed at a secondary
+/// index sees that index's entries: a predicate on an attribute the index does not hold
+/// could never be decided from them, so the query is refused rather than answered with
+/// the page that predicate would match. The parent table is no answer to it — a global
+/// index read "cannot fetch attributes from the parent table" (`Query$Select`) at all,
+/// and the fetch a local index does is for the attributes a read REPORTS, not for the
+/// ones its filter reads. A SCAN of the same index is not refused: it evaluates the
+/// predicate against the entry, which simply matches nothing.
+pub fn unprojected_read_filter_attributes(
+    index: &SecondaryIndex<'_>,
+    table_key_schema: &[KeySchemaElement],
+    filter_attributes: &BTreeSet<String>,
+) -> Vec<String> {
+    if index.projects_all() {
+        return Vec::new();
+    }
+    filter_attributes
+        .iter()
+        .filter(|name| !index.projects(table_key_schema, name))
+        .cloned()
+        .collect()
 }
 
 /// One row a read evaluated: the stored item, and the entry the index it was read

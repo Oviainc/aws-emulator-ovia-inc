@@ -542,6 +542,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  Primary key attribute: {key}"
             )));
         }
+        // "If you query or scan a global secondary index, you can only request
+        // attributes that are projected into the index. Global secondary index queries
+        // cannot fetch attributes from the parent table" (`Query$Select`): a query of a
+        // global index cannot report a projection naming an attribute the index does not
+        // hold, and a query of EITHER index kind cannot decide a filter predicate over
+        // one, so it is refused rather than answered from a narrowed or wrong page
+        // ([`crate::state::unprojected_projection_attributes`],
+        // [`crate::state::unprojected_read_filter_attributes`]).
+        if let Some(index) = index.as_ref() {
+            let projection = crate::state::unprojected_projection_attributes(
+                index,
+                &table.key_schema,
+                &selection,
+            );
+            if !projection.is_empty() {
+                return Err(lift(crate::state::unprojected_projection_refusal(
+                    index.name,
+                    &projection,
+                )));
+            }
+            let filtered = crate::state::unprojected_read_filter_attributes(
+                index,
+                &table.key_schema,
+                &filter_attributes,
+            );
+            if !filtered.is_empty() {
+                return Err(lift(crate::state::unprojected_filter_refusal(
+                    index.name,
+                    &filtered,
+                )));
+            }
+        }
         // "If any of the requested attributes are not projected into the local
         // secondary index, DynamoDB fetches each of these attributes from the parent
         // table" (`Query$Select`) — which is what makes that read cost what the whole
@@ -821,6 +853,16 @@ impl KeyCondition {
         schema: &[KeySchemaElement],
         comparisons: Vec<Comparison>,
     ) -> Result<Self, crate::state::RequestError> {
+        // A key condition binds its comparisons to the key attributes of the schema it
+        // reads — "You must provide the name of the partition key attribute and a single
+        // value for that attribute ... Optionally, you can provide a sort key attribute"
+        // (`Query$KeyConditionExpression`) — so a condition stating more comparisons
+        // than that schema declares key attributes cannot bind, whichever attributes
+        // they name. Counted first, because that is a fact of the condition's SHAPE
+        // rather than of which element any one comparison stood in for.
+        if comparisons.len() > schema.len() {
+            return Err(too_many_query_conditions(comparisons.len(), schema.len()));
+        }
         // "HASH - partition key ... RANGE - sort key" (`KeySchemaElement$KeyType`): the
         // one partition key the condition must cover, and the sort key it may.
         let partition_name = schema
@@ -1306,6 +1348,20 @@ const NON_KEY_CONDITION_OPERATORS: [&str; 7] = [
 fn missed_key_schema_element(element: &str) -> crate::state::RequestError {
     crate::state::RequestError::Validation(format!(
         "Query condition missed key schema element: {element}"
+    ))
+}
+
+/// The refusal for a key condition stating more comparisons than the schema it reads has
+/// key attributes to bind them to: AWS states both counts — the comparisons the request
+/// wrote and the key attributes the schema declares — and nothing of which comparison
+/// was the one too many.
+fn too_many_query_conditions(
+    conditions: usize,
+    key_attributes: usize,
+) -> crate::state::RequestError {
+    crate::state::RequestError::Validation(format!(
+        "The number of query conditions ({conditions}) exceeds the number of key attributes \
+         defined in the schema ({key_attributes})"
     ))
 }
 

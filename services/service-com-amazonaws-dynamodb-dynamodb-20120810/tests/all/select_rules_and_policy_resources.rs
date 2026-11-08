@@ -143,7 +143,8 @@ async fn select_and_a_projection_are_held_to_each_other_in_the_words_aws_uses() 
             "a query of specific attributes with nothing listed",
             "Query",
             json!({"Select": "SPECIFIC_ATTRIBUTES"}),
-            "Must specify the ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES"
+            "Must specify the AttributesToGet or ProjectionExpression when choosing to get \
+             SPECIFIC_ATTRIBUTES"
                 .to_string(),
         ),
         (
@@ -164,7 +165,8 @@ async fn select_and_a_projection_are_held_to_each_other_in_the_words_aws_uses() 
             "a scan of specific attributes with nothing listed",
             "Scan",
             json!({"Select": "SPECIFIC_ATTRIBUTES"}),
-            "Must specify the ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES"
+            "Must specify the AttributesToGet or ProjectionExpression when choosing to get \
+             SPECIFIC_ATTRIBUTES"
                 .to_string(),
         ),
         (

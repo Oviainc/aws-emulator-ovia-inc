@@ -491,6 +491,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &selection,
         )
         .map_err(lift)?;
+        // "If you query or scan a global secondary index, you can only request
+        // attributes that are projected into the index" (`Scan$Select`): a scan whose
+        // projection names an attribute the index does not hold cannot be served from
+        // the index, so it is refused rather than answered with a narrowed item. Its
+        // FILTER is judged against the entry the index holds, so an attribute only the
+        // filter names simply matches nothing
+        // ([`crate::state::unprojected_projection_attributes`]).
+        if let Some(index) = index.as_ref() {
+            let unprojected = crate::state::unprojected_projection_attributes(
+                index,
+                &table.key_schema,
+                &selection,
+            );
+            if !unprojected.is_empty() {
+                return Err(lift(crate::state::unprojected_projection_refusal(
+                    index.name,
+                    &unprojected,
+                )));
+            }
+        }
         // "If any of the requested attributes are not projected into the local secondary
         // index, DynamoDB fetches each of these attributes from the parent table"
         // (`Scan$Select`) — which is also what makes that read cost more, since what it

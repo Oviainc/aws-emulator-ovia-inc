@@ -270,6 +270,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut projections: std::collections::HashMap<&String, Vec<crate::state::DocumentPath>> =
             std::collections::HashMap::new();
         for (table_name, keys) in &addressed {
+            // The projection first: a projection this service cannot apply is the defect
+            // the entry is refused for, whatever else it also got wrong.
+            let read = crate::state::requested_projection(
+                PROJECTION_EXPRESSION,
+                keys.projection_expression.as_deref(),
+                keys.attributes_to_get.as_deref(),
+                keys.expression_attribute_names.as_ref(),
+            )
+            .map_err(lift)?;
             // Every token one table's entry DEFINES must be one its projection uses, and
             // the refusal is that ENTRY's, so it is stated on its own.
             crate::state::Substitutions::new(keys.expression_attribute_names.as_ref(), None)
@@ -278,14 +287,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     keys.projection_expression.as_deref(),
                 )])
                 .map_err(lift)?;
-            if let Some(projected) = crate::state::requested_projection(
-                PROJECTION_EXPRESSION,
-                keys.projection_expression.as_deref(),
-                keys.attributes_to_get.as_deref(),
-                keys.expression_attribute_names.as_ref(),
-            )
-            .map_err(lift)?
-            {
+            if let Some(projected) = read {
                 projections.insert(table_name, projected);
             }
         }

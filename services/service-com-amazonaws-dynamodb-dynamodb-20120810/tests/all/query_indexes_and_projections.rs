@@ -865,8 +865,8 @@ fn refusal_cases() -> Vec<RefusalCase> {
                 }),
                 &json!({"Select": "SPECIFIC_ATTRIBUTES"}),
             ),
-            message: "1 validation error detected: Must specify the ProjectionExpression \
-                      when choosing to get SPECIFIC_ATTRIBUTES"
+            message: "1 validation error detected: Must specify the AttributesToGet or \
+                      ProjectionExpression when choosing to get SPECIFIC_ATTRIBUTES"
                 .to_string(),
         },
         RefusalCase {

@@ -2183,64 +2183,13 @@ impl UpdateOutcome {
     /// the whole stored list. A path that addresses nothing in `item` contributes
     /// nothing, which is what a `SET` past the end of a list leaves behind: the element
     /// is appended, so the index the expression named holds nothing afterwards.
+    ///
+    /// Reported by the one reporter this service projects document paths with
+    /// ([`crate::state::project_paths`]), so two changed paths that step through the
+    /// same container — the same map entry or the same list index — are reported under
+    /// one entry for it here exactly as they are for a `ProjectionExpression`.
     fn projected_paths(&self, item: &Item) -> Item {
-        let mut reported = Item::new();
-        // In DOCUMENT-PATH order, so the report does not depend on the order the
-        // clauses happened to be written in: two changed indexes of one list are
-        // reported in index order.
-        let mut paths: Vec<&DocumentPath> = self.changed.iter().collect();
-        paths.sort_by(|one, two| one.0.cmp(&two.0));
-        for path in paths {
-            let Some(value) = path.get(item) else { continue };
-            let Some((PathStep::Attribute(name), rest)) = path.0.split_first() else {
-                continue;
-            };
-            let built = path_skeleton(rest, value.clone());
-            match reported.get_mut(name) {
-                Some(slot) => merge_reported(slot, built),
-                None => {
-                    reported.insert(name.clone(), built);
-                }
-            }
-        }
-        reported
-    }
-}
-
-/// `value`, wrapped in one container per remaining path step: a map entry for an
-/// attribute step and a one-element list for an index step. An empty step list is the
-/// value itself, which is what a path naming one top-level attribute reports.
-pub(crate) fn path_skeleton(steps: &[PathStep], value: AttributeValue) -> AttributeValue {
-    match steps.split_first() {
-        None => value,
-        Some((PathStep::Attribute(name), rest)) => {
-            let mut entries = HashMap::new();
-            entries.insert(name.clone(), path_skeleton(rest, value));
-            AttributeValue::M(entries)
-        }
-        Some((PathStep::Index(_), rest)) => AttributeValue::L(vec![path_skeleton(rest, value)]),
-    }
-}
-
-/// Fold one path's reported skeleton into another's under the same attribute: two
-/// changed paths of one update may step through the same containers.
-pub(crate) fn merge_reported(into: &mut AttributeValue, other: AttributeValue) {
-    match (into, other) {
-        (AttributeValue::M(mine), AttributeValue::M(theirs)) => {
-            for (name, value) in theirs {
-                match mine.get_mut(&name) {
-                    Some(slot) => merge_reported(slot, value),
-                    None => {
-                        mine.insert(name, value);
-                    }
-                }
-            }
-        }
-        (AttributeValue::L(mine), AttributeValue::L(theirs)) => mine.extend(theirs),
-        // Two paths that write the same location are refused before this point
-        // (`ParsedUpdate::from_actions`), so the only way one value replaces another
-        // here is a container that is not one: the later value is what the item holds.
-        (slot, other) => *slot = other,
+        crate::state::project_paths(item, &self.changed)
     }
 }
 

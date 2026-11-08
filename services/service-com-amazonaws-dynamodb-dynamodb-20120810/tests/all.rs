@@ -69,6 +69,8 @@ mod index_and_projection_reads;
 mod index_capacity_and_item_collections;
 #[path = "all/index_key_types_and_range_refusals.rs"]
 mod index_key_types_and_range_refusals;
+#[path = "all/index_projection_and_path_reports.rs"]
+mod index_projection_and_path_reports;
 #[path = "all/index_write_capacity_changes.rs"]
 mod index_write_capacity_changes;
 #[path = "all/item_write_expressions.rs"]

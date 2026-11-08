@@ -237,6 +237,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )],
         )
         .map_err(lift)?;
+        // What this read REPORTS of the item it finds, settled before the store is
+        // reached: the member is VALIDATED whether or not the key holds an item, because
+        // whether the projection is one this service's language accepts — a bare
+        // reserved word, an undefined `#name`, a syntax error, two paths that overlap —
+        // is a fact of the request. Read by the one reader every read of this service
+        // reads it with, which also refuses a request that states the projection through
+        // both members ([`crate::state::requested_projection`]).
+        //
+        // BEFORE the unused-substitution check below: a projection this service cannot
+        // apply is the defect the request is refused for, whatever else it also got
+        // wrong.
+        let projected = crate::state::requested_projection(
+            PROJECTION_EXPRESSION,
+            input.projection_expression.as_deref(),
+            input.attributes_to_get.as_deref(),
+            input.expression_attribute_names.as_ref(),
+        )
+        .map_err(lift)?;
         // Every token the request DEFINES must be one an expression uses: an
         // `ExpressionAttributeNames` entry no projection references makes the whole
         // request invalid.
@@ -246,20 +264,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.projection_expression.as_deref(),
             )])
             .map_err(lift)?;
-        // What this read REPORTS of the item it finds, settled before the store is
-        // reached: the member is VALIDATED whether or not the key holds an item, because
-        // whether the projection is one this service's language accepts — a bare
-        // reserved word, an undefined `#name`, a syntax error, two paths that overlap —
-        // is a fact of the request. Read by the one reader every read of this service
-        // reads it with, which also refuses a request that states the projection through
-        // both members ([`crate::state::requested_projection`]).
-        let projected = crate::state::requested_projection(
-            PROJECTION_EXPRESSION,
-            input.projection_expression.as_deref(),
-            input.attributes_to_get.as_deref(),
-            input.expression_attribute_names.as_ref(),
-        )
-        .map_err(lift)?;
 
         // WHO this request speaks for, resolved before this service's store is locked:
         // the table's resource policy and the caller's own identity-based policies decide
