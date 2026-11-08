@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetMember
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetMember`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetMember::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the association `CreateMember` recorded in [`crate::state`] for the
+//! account id the request addresses, in the region it was signed for.
 //!
 //! ## Shape of an operation
 //!
@@ -175,18 +169,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetMember` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetMemberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetMember"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(GetMemberErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the Macie member store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        let state = store.lock();
+        if state.session(&region).is_none() {
+            return Err(GetMemberErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::MACIE_NOT_ENABLED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // An account id this administrator has no association for is not a
+        // missing resource but a request about an account that is none of this
+        // account's business, which is what the service says.
+        let Some(member) = state.member(&region, &input.id) else {
+            return Err(GetMemberErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(NOT_AN_ASSOCIATED_MEMBER_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        Ok(GetMemberOutput {
+            account_id: Some(member.account_id.clone()),
+            administrator_account_id: Some(member.administrator_account_id.clone()),
+            arn: Some(member.arn.clone()),
+            email: Some(member.email.clone()),
+            invited_at: member.invited_at.map(crate::state::to_date_time),
+            // Deprecated, and "retained only for backward compatibility": the
+            // administrator account id under its former name.
+            master_account_id: Some(member.administrator_account_id.clone()),
+            relationship_status: Some(member.relationship_status.clone()),
+            tags: member.tags_output(),
+            updated_at: Some(crate::state::to_date_time(member.updated_at)),
+        })
     }
 }
+
+/// How the service refuses a read of an account it holds no association for.
+/// The whole sentence is fixed text — it interpolates no request value.
+const NOT_AN_ASSOCIATED_MEMBER_MESSAGE: &str =
+    "The request is rejected because the given account ID is not an associated member of \
+     the current account.";

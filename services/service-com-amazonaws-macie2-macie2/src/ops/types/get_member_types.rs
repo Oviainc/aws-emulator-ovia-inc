@@ -17,7 +17,12 @@ pub struct GetMemberInput {
     pub id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.macie2#GetMemberResponse")]
+// `GetMemberOutput`'s schema and codec are written out by hand rather than
+// derived with `#[smithy_macros::smithy(shape = ...)]`, because `invitedAt` and
+// `updatedAt` target `__timestampIso8601` and the derive drops that shape's
+// `@timestampFormat("date-time")`. See `super::date_time_wire` for the whole
+// reason and for when to delete this block; everything else below mirrors the
+// derive exactly.
 #[derive(Debug, Clone, Default)]
 pub struct GetMemberOutput {
     pub account_id: Option<String>,
@@ -30,4 +35,171 @@ pub struct GetMemberOutput {
     pub tags: Option<std::collections::HashMap<String, String>>,
     pub updated_at: Option<::aws_smithy_types::DateTime>,
 }
+
+impl GetMemberOutput {
+    pub const M_ACCOUNT_ID: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#GetMemberResponse$accountId",
+        "accountId",
+        ::aws_smithy_schema::ShapeType::String,
+        0,
+    );
+    pub const M_ADMINISTRATOR_ACCOUNT_ID: ::aws_smithy_schema::Schema =
+        super::date_time_wire::member(
+            "com.amazonaws.macie2#GetMemberResponse$administratorAccountId",
+            "administratorAccountId",
+            ::aws_smithy_schema::ShapeType::String,
+            1,
+        );
+    pub const M_ARN: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#GetMemberResponse$arn",
+        "arn",
+        ::aws_smithy_schema::ShapeType::String,
+        2,
+    );
+    pub const M_EMAIL: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#GetMemberResponse$email",
+        "email",
+        ::aws_smithy_schema::ShapeType::String,
+        3,
+    );
+    /// `@timestampFormat("date-time")`, from the `__timestampIso8601` shape it
+    /// targets. THE reason this schema is hand-written.
+    pub const M_INVITED_AT: ::aws_smithy_schema::Schema = super::date_time_wire::date_time_member(
+        "com.amazonaws.macie2#GetMemberResponse$invitedAt",
+        "invitedAt",
+        4,
+    );
+    pub const M_MASTER_ACCOUNT_ID: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#GetMemberResponse$masterAccountId",
+        "masterAccountId",
+        ::aws_smithy_schema::ShapeType::String,
+        5,
+    );
+    /// Targets the `RelationshipStatus` enum, which is string-encoded on the
+    /// wire — the derive classifies an enum member as a string too.
+    pub const M_RELATIONSHIP_STATUS: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#GetMemberResponse$relationshipStatus",
+        "relationshipStatus",
+        ::aws_smithy_schema::ShapeType::String,
+        6,
+    );
+    pub const M_TAGS: ::aws_smithy_schema::Schema = super::date_time_wire::member(
+        "com.amazonaws.macie2#GetMemberResponse$tags",
+        "tags",
+        ::aws_smithy_schema::ShapeType::Map,
+        7,
+    );
+    /// `@timestampFormat("date-time")`, as `invitedAt` above.
+    pub const M_UPDATED_AT: ::aws_smithy_schema::Schema = super::date_time_wire::date_time_member(
+        "com.amazonaws.macie2#GetMemberResponse$updatedAt",
+        "updatedAt",
+        8,
+    );
+
+    pub const SCHEMA: ::aws_smithy_schema::Schema = ::aws_smithy_schema::Schema::new_struct(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.macie2#GetMemberResponse",
+            "com.amazonaws.macie2",
+            "GetMemberResponse",
+        ),
+        ::aws_smithy_schema::ShapeType::Structure,
+        &[
+            &Self::M_ACCOUNT_ID,
+            &Self::M_ADMINISTRATOR_ACCOUNT_ID,
+            &Self::M_ARN,
+            &Self::M_EMAIL,
+            &Self::M_INVITED_AT,
+            &Self::M_MASTER_ACCOUNT_ID,
+            &Self::M_RELATIONSHIP_STATUS,
+            &Self::M_TAGS,
+            &Self::M_UPDATED_AT,
+        ],
+    );
+}
+
+pub static GET_MEMBER_OUTPUT_SCHEMA: &::aws_smithy_schema::Schema = &GetMemberOutput::SCHEMA;
+
+impl ::aws_smithy_schema::serde::SerializableStruct for GetMemberOutput {
+    fn serialize_members(
+        &self,
+        s: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        // Every member is optional, so each is written only when present — the
+        // derive's `is_option` split.
+        if let Some(value) = self.account_id.as_ref() {
+            s.write_string(&Self::M_ACCOUNT_ID, value.as_str())?;
+        }
+        if let Some(value) = self.administrator_account_id.as_ref() {
+            s.write_string(&Self::M_ADMINISTRATOR_ACCOUNT_ID, value.as_str())?;
+        }
+        if let Some(value) = self.arn.as_ref() {
+            s.write_string(&Self::M_ARN, value.as_str())?;
+        }
+        if let Some(value) = self.email.as_ref() {
+            s.write_string(&Self::M_EMAIL, value.as_str())?;
+        }
+        if let Some(value) = self.invited_at.as_ref() {
+            s.write_timestamp(&Self::M_INVITED_AT, value)?;
+        }
+        if let Some(value) = self.master_account_id.as_ref() {
+            s.write_string(&Self::M_MASTER_ACCOUNT_ID, value.as_str())?;
+        }
+        if let Some(value) = self.relationship_status.as_ref() {
+            s.write_string(&Self::M_RELATIONSHIP_STATUS, value.as_str())?;
+        }
+        if let Some(value) = self.tags.as_ref() {
+            s.write_map(&Self::M_TAGS, &|sm| {
+                for (key, tag) in value.iter() {
+                    sm.write_string(&Self::M_TAGS, key.as_str())?;
+                    sm.write_string(&Self::M_TAGS, tag.as_str())?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Some(value) = self.updated_at.as_ref() {
+            s.write_timestamp(&Self::M_UPDATED_AT, value)?;
+        }
+        Ok(())
+    }
+}
+
+impl ::aws_smithy_schema_server::DeserializableStruct for GetMemberOutput {
+    fn deserialize(
+        d: &mut dyn ::aws_smithy_schema::serde::ShapeDeserializer,
+    ) -> ::std::result::Result<Self, ::aws_smithy_schema::serde::SerdeError> {
+        let mut out = Self::default();
+        d.read_struct(&Self::SCHEMA, &mut |member, d| {
+            match member.member_index() {
+                Some(0) => out.account_id = Some(d.read_string(&Self::M_ACCOUNT_ID)?),
+                Some(1) => {
+                    out.administrator_account_id =
+                        Some(d.read_string(&Self::M_ADMINISTRATOR_ACCOUNT_ID)?);
+                }
+                Some(2) => out.arn = Some(d.read_string(&Self::M_ARN)?),
+                Some(3) => out.email = Some(d.read_string(&Self::M_EMAIL)?),
+                Some(4) => out.invited_at = Some(d.read_timestamp(&Self::M_INVITED_AT)?),
+                Some(5) => {
+                    out.master_account_id = Some(d.read_string(&Self::M_MASTER_ACCOUNT_ID)?);
+                }
+                Some(6) => {
+                    out.relationship_status = Some(d.read_string(&Self::M_RELATIONSHIP_STATUS)?);
+                }
+                Some(7) => {
+                    let mut tags: std::collections::HashMap<String, String> =
+                        std::collections::HashMap::new();
+                    d.read_map(&Self::M_TAGS, &mut |key, dm| {
+                        tags.insert(key, dm.read_string(&Self::M_TAGS)?);
+                        Ok(())
+                    })?;
+                    out.tags = Some(tags);
+                }
+                Some(8) => out.updated_at = Some(d.read_timestamp(&Self::M_UPDATED_AT)?),
+                _ => {}
+            }
+            Ok(())
+        })?;
+        Ok(out)
+    }
+}
+
 

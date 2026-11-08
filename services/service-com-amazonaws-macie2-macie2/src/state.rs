@@ -16,6 +16,10 @@
 //! `GetFindingsPublicationConfiguration` projects it). Nothing a handler answers
 //! with is computed from the request
 //! alone: every member of every response is read back out of here.
+//!
+//! The member plane lives here too: the accounts `CreateMember` associates with
+//! this administrator account, which `GetMember` projects and `ListMembers`
+//! enumerates.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -35,6 +39,13 @@ pub const ARN_SERVICE: &str = "macie2";
 /// (`^arn:(aws|aws-cn|aws-us-gov):macie2:…:allow-list\/[a-z0-9]{22}$`), with
 /// this resource's own type in place of `allow-list`.
 pub const CUSTOM_DATA_IDENTIFIER_RESOURCE_TYPE: &str = "custom-data-identifier";
+
+/// The resource-type segment of a member account's ARN, read from the same
+/// Macie ARN grammar as [`CUSTOM_DATA_IDENTIFIER_RESOURCE_TYPE`] with this
+/// resource's own type in place of `allow-list`. A member is addressed by the
+/// account id it carries (`GetMember$id` is an account id), so that is the
+/// resource portion after this segment.
+pub const MEMBER_RESOURCE_TYPE: &str = "member";
 
 /// Width of a Macie resource id. The model pins `CreateAllowListResponse$id` at
 /// `^[a-z0-9]{22}$`, which is the shape every Macie resource id takes; the
@@ -168,11 +179,41 @@ pub const DEFAULT_PAGE_SIZE: usize = 50;
 /// AWS rule.
 pub const MAX_PAGE_SIZE: usize = 200;
 
+/// The most members one `ListMembers` response carries, which is also the page
+/// size a request naming no `maxResults` gets: that operation's `maxResults`
+/// carries a modelled range of 1 to 25, so 25 is the page the service itself
+/// bounds this read to.
+pub const MAX_MEMBER_PAGE_SIZE: usize = 25;
+
+/// How a paginated read refuses a `nextToken` it did not issue. A token is this
+/// service's own opaque encoding of a page cursor, so one it did not hand out
+/// names no page.
+pub const FOREIGN_PAGE_TOKEN_MESSAGE: &str =
+    "The nextToken is not a token that this service issued.";
+
 /// The most custom data identifiers one emulator process stores, across every
 /// region. The EMULATOR's own memory bound, not an AWS quota: without it any
 /// caller could grow one process's heap without limit. A create past it answers
 /// the `ServiceQuotaExceededException` the operation models.
 pub const MAX_CUSTOM_DATA_IDENTIFIERS: usize = 10_000;
+
+/// The most member accounts one emulator process associates, across every
+/// region. The EMULATOR's own memory bound, on the same footing as
+/// [`MAX_CUSTOM_DATA_IDENTIFIERS`]: a create past it answers the
+/// `ServiceQuotaExceededException` the operation models.
+pub const MAX_MEMBERS: usize = 10_000;
+
+/// The `RelationshipStatus` a member account carries the moment `CreateMember`
+/// associates it: the association exists and no membership invitation has been
+/// sent for it yet. An entry of the modelled `RelationshipStatus` enum.
+pub const MEMBER_CREATED_RELATIONSHIP_STATUS: &str = "Created";
+
+/// The `RelationshipStatus` values under which an account is no longer a
+/// current member of its administrator account — the administrator ended the
+/// relationship (`Removed`) or the account itself did (`Resigned`). Entries of
+/// the modelled `RelationshipStatus` enum, and what a `ListMembers` that does
+/// not ask for all accounts leaves out.
+pub const ENDED_RELATIONSHIP_STATUSES: [&str; 2] = ["Removed", "Resigned"];
 
 /// How many regions one emulator process keeps Macie state for. The region a
 /// request addresses comes off the wire, so the NUMBER of per-region records is
@@ -328,6 +369,60 @@ fn non_empty<T: Clone>(values: &[T]) -> Option<Vec<T>> {
     }
 }
 
+/// An account associated with this Macie administrator account, in one region.
+///
+/// Every member of `GetMemberResponse` and of the modelled `Member` structure is
+/// a field here or projected from one.
+#[derive(Debug, Clone)]
+pub struct Member {
+    /// The associated account's id, which is also how a read addresses it
+    /// (`GetMember$id`) and the resource portion of [`Self::arn`].
+    pub account_id: String,
+    /// The email address the association was created with.
+    pub email: String,
+    pub arn: String,
+    /// The region the `CreateMember` that associated this account addressed.
+    /// Macie is a regional service, so an association is only visible to a
+    /// request naming that region — which is also the region in its ARN.
+    pub region: String,
+    /// The account that administers this member, which is the account the
+    /// create was made by.
+    pub administrator_account_id: String,
+    /// `RelationshipStatus` as the wire words it.
+    pub relationship_status: String,
+    /// Tags in a `BTreeMap` so a read reports them in a stable order.
+    pub tags: BTreeMap<String, String>,
+    /// When a membership invitation was last sent to the account, which is
+    /// `None` until one is: the member's doc states "This value is null if a
+    /// Macie membership invitation hasn't been sent to the account."
+    pub invited_at: Option<SystemTime>,
+    /// When the status of this relationship most recently changed, which
+    /// `updatedAt` reports.
+    pub updated_at: SystemTime,
+}
+
+impl Member {
+    /// Whether this account is a CURRENT member of its administrator account,
+    /// which is what a `ListMembers` reports unless it asks for all accounts.
+    pub fn is_current_association(&self) -> bool {
+        !ENDED_RELATIONSHIP_STATUSES.contains(&self.relationship_status.as_str())
+    }
+
+    /// This member's `tags`, as a read reports them: the modelled `TagMap` is a
+    /// hash map, and absent rather than empty when it carries none.
+    pub fn tags_output(&self) -> Option<std::collections::HashMap<String, String>> {
+        if self.tags.is_empty() {
+            return None;
+        }
+        Some(
+            self.tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        )
+    }
+}
+
 /// Per-service state for com-amazonaws-macie2-macie2. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
 pub struct ComAmazonawsMacie2Macie2State {
@@ -349,6 +444,11 @@ pub struct ComAmazonawsMacie2Macie2State {
     /// Custom data identifiers keyed by id, so an id-addressed read is
     /// O(log n) and an enumeration is in a stable total order.
     pub custom_data_identifiers: BTreeMap<String, CustomDataIdentifier>,
+    /// The accounts associated with this administrator account, keyed by the
+    /// region the association was made in and the member's account id — the
+    /// same account may be a member in two regions, and each association is its
+    /// own record.
+    pub members: BTreeMap<(String, String), Member>,
     /// [`idempotency_key`] -> the resource the call carrying that client token
     /// produced: the region for `EnableMacie`, the minted id for
     /// `CreateCustomDataIdentifier`. This is what makes a retry replay the
@@ -431,8 +531,33 @@ impl ComAmazonawsMacie2Macie2State {
         self.findings_publication.remove(region);
         self.custom_data_identifiers
             .retain(|_, identifier| identifier.region != region);
+        self.members.retain(|_, member| member.region != region);
         let prefix = region_key_prefix(region);
         self.idempotency.retain(|key, _| !key.starts_with(&prefix));
+    }
+
+    /// The account `account_id` associated in `region`, or `None` when no
+    /// association of that region names it — which is what an account
+    /// associated only in another region answers too.
+    pub fn member(&self, region: &str, account_id: &str) -> Option<&Member> {
+        self.members
+            .get(&(region.to_string(), account_id.to_string()))
+    }
+
+    /// The same record, for a write.
+    pub fn member_mut(&mut self, region: &str, account_id: &str) -> Option<&mut Member> {
+        self.members
+            .get_mut(&(region.to_string(), account_id.to_string()))
+    }
+
+    /// The accounts associated in `region`, in account-id order — the order the
+    /// store holds them in, so the total order a page boundary rests on is
+    /// stable.
+    pub fn members_of<'a>(&'a self, region: &'a str) -> impl Iterator<Item = &'a Member> {
+        self.members
+            .iter()
+            .filter(move |((member_region, _), _)| member_region == region)
+            .map(|(_, member)| member)
     }
 
     /// The next identifier seed, handed out exactly once. Call it once per id a
@@ -511,6 +636,38 @@ pub fn custom_data_identifier_arn(region: &str, id: &str) -> String {
         ARN_SERVICE,
         region,
         &format!("{CUSTOM_DATA_IDENTIFIER_RESOURCE_TYPE}/{id}"),
+    )
+}
+
+/// Render a page cursor — the record a page ended on — as the opaque
+/// `nextToken` the next request replays. A `nextToken` is modelled as a bare
+/// string, so the cursor is rendered in hex: an alphabet that survives any
+/// transport and that no client can mistake for a value it may construct
+/// itself.
+pub fn encode_page_token(cursor: &str) -> String {
+    ::hex::encode(cursor)
+}
+
+/// Read a cursor back out of a `nextToken`. `None` when the token is not one
+/// this service issued.
+pub fn decode_page_token(token: &str) -> Option<String> {
+    String::from_utf8(::hex::decode(token).ok()?).ok()
+}
+
+/// How the service refuses a call addressing a custom data identifier the
+/// addressed region's registry does not hold. The fixed text is the service's;
+/// the only variable part is the id the request named.
+pub fn custom_data_identifier_not_found_message(id: &str) -> String {
+    format!("Custom Data Identifier not found for id: {id}")
+}
+
+/// Mint the ARN of an associated member account:
+/// `arn:aws:macie2:<region>:<account>:member/<memberAccountId>`.
+pub fn member_arn(region: &str, account_id: &str) -> String {
+    ::engine::emulator_arn(
+        ARN_SERVICE,
+        region,
+        &format!("{MEMBER_RESOURCE_TYPE}/{account_id}"),
     )
 }
 

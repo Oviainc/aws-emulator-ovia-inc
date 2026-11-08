@@ -121,6 +121,11 @@ pub(crate) fn error_code(body: &serde_json::Value) -> String {
         .to_string()
 }
 
+/// `message` as the restJson1 error envelope carries it.
+pub(crate) fn error_message(body: &serde_json::Value) -> &str {
+    body["message"].as_str().unwrap_or_default()
+}
+
 /// Enable Macie in `region`, requiring the documented 200.
 pub(crate) async fn enable_in(router: &MultiServiceRouter, region: &str, body: &str) {
     let (status, reply) = call_in(router, region, "POST", "/macie", body).await;

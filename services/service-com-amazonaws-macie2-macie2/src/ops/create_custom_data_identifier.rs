@@ -204,10 +204,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
 
         // Every documented bound is checked BEFORE the store is touched, so a
-        // refused request leaves nothing behind. The `regex` itself is stored
-        // as sent and never compiled: a pattern an untrusted caller chose is
-        // not something to hand a matching engine on the request path.
-        if let Some(message) = documented_violation(&input) {
+        // refused request leaves nothing behind. The `regex` is syntax checked
+        // in the same pass: the service will not hold an identifier whose
+        // pattern it could never run, and the check COMPILES the pattern
+        // without ever matching caller data with it.
+        if let Some(message) =
+            documented_violation(&input).or_else(|| pattern_violation(&input.regex))
+        {
             return Err(CreateCustomDataIdentifierErrorModeled::ValidationException(
                 ValidationException {
                     message: Some(message),
@@ -394,6 +397,33 @@ fn documented_violation(input: &CreateCustomDataIdentifierInput) -> Option<Strin
     }
 
     None
+}
+
+/// How the service refuses a `regex` it will not run. The whole sentence is
+/// fixed text: it interpolates neither the pattern nor any other request value.
+const UNSUPPORTED_PATTERN_MESSAGE: &str = "Unsafe regex, keywords, or ignoreWords.";
+
+/// The byte budget one compiled pattern may occupy. Compiling a pattern that
+/// came off the wire is caller-driven work, so it is bounded twice: by
+/// [`crate::state::MAX_REGEX_CHARS`] on the input and by this limit on the
+/// program built from it, past which `regex` answers an error instead of
+/// growing the heap.
+const PATTERN_PROGRAM_BYTES: usize = 1 << 20;
+
+/// The refusal `regex` earns when it is not a pattern this service can run, or
+/// `None` when it is one.
+///
+/// The syntax is decided by the `regex` crate rather than by a hand-written
+/// reader of the pattern language: it parses the whole expression, refuses what
+/// it cannot represent, and matches in time linear in the subject, so no
+/// pattern a caller sends can make matching blow up later.
+fn pattern_violation(pattern: &str) -> Option<String> {
+    ::regex::RegexBuilder::new(pattern)
+        .size_limit(PATTERN_PROGRAM_BYTES)
+        .dfa_size_limit(PATTERN_PROGRAM_BYTES)
+        .build()
+        .err()
+        .map(|_| UNSUPPORTED_PATTERN_MESSAGE.to_string())
 }
 
 /// The documented rule for `severityLevels`: as many as three entries, one for

@@ -202,9 +202,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(identifier) = state.identifier(&region, &input.id) else {
             return Err(GetCustomDataIdentifierErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: Some(format!(
-                        "The request failed because the custom data identifier {} doesn't exist.",
-                        input.id
+                    message: Some(crate::state::custom_data_identifier_not_found_message(
+                        &input.id,
                     )),
                 },
             )

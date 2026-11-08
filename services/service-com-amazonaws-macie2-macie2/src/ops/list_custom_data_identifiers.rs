@@ -184,8 +184,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(ListCustomDataIdentifiersErrorModeled::ValidationException(
                         ValidationException {
                             message: Some(
-                                "The nextToken is not a token that this service issued."
-                                    .to_string(),
+                                crate::state::FOREIGN_PAGE_TOKEN_MESSAGE.to_string(),
                             ),
                         },
                     )
@@ -246,18 +245,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// Render the page cursor — the id the previous page ended on — as the opaque
-/// `nextToken` the next request replays. `nextToken` is modelled as a bare
-/// string, so the cursor is rendered in hex: an alphabet that survives any
-/// transport and that no client can mistake for a value it may construct
-/// itself.
+/// `nextToken` the next request replays, through the encoding every paginated
+/// read of this service shares ([`crate::state::encode_page_token`]).
 fn encode_next_token(id: &str) -> String {
-    hex::encode(id)
+    crate::state::encode_page_token(id)
 }
 
 /// Read a cursor back out of a `nextToken`. `None` when the token is not one
 /// this operation issued.
 fn decode_next_token(token: &str) -> Option<String> {
-    String::from_utf8(hex::decode(token).ok()?).ok()
+    crate::state::decode_page_token(token)
 }
 
 #[cfg(test)]

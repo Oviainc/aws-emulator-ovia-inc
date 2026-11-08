@@ -24,6 +24,9 @@ tracing = { workspace = true }
 # Hex, to render the opaque ListCustomDataIdentifiers nextToken from the page
 # cursor and to read it back.
 hex = { workspace = true }
+# Regular expressions, to decide whether a custom data identifier's `regex`
+# member is a pattern this service can run before it is stored.
+regex = "1.13"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

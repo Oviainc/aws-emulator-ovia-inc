@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateMember
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateMember`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateMember::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Associates an account with this Macie administrator account: the association
+//! is recorded in [`crate::state`] under the region the request addressed, so
+//! `GetMember` reads back exactly what was stored.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +154,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateMember` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateMemberErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateMember"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateMemberErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the Macie member store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        // An association belongs to one region: the region the create addressed,
+        // which is also the region in the member's ARN.
+        let region = crate::state::request_region(ctx);
+        let administrator = ::engine::emulator_account_id();
+        let now = ::std::time::SystemTime::now();
+
+        let mut state = store.lock();
+
+        // Macie has to be enabled in the region before any of its resources can
+        // be read or written, as every other operation of this service requires.
+        if state.session(&region).is_none() {
+            return Err(CreateMemberErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::MACIE_NOT_ENABLED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The caller is the administrator account, so naming it as the account
+        // to associate asks for a membership of itself. Refused BEFORE anything
+        // is stored, so the rejected call leaves nothing behind.
+        if input.account.account_id == administrator {
+            return Err(CreateMemberErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(SELF_MEMBERSHIP_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        let tags: ::std::collections::BTreeMap<String, String> = input
+            .tags
+            .clone()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
+        // Associating an account that is already a member states the details of
+        // that same association again, so the stored record is updated rather
+        // than doubled and its ARN — which the account id determines — is
+        // answered again.
+        if let Some(member) = state.member_mut(&region, &input.account.account_id) {
+            member.email = input.account.email.clone();
+            member.tags = tags;
+            member.updated_at = now;
+            return Ok(CreateMemberOutput {
+                arn: Some(member.arn.clone()),
+            });
+        }
+
+        // The EMULATOR's own bound on the member registry, reported through the
+        // quota error this operation models: without it a caller could grow one
+        // process's heap without limit.
+        if state.members.len() >= crate::state::MAX_MEMBERS {
+            return Err(CreateMemberErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(format!(
+                        "This emulator holds the maximum of {} member accounts. \
+                         Remove a member account before associating another.",
+                        crate::state::MAX_MEMBERS
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let member = crate::state::Member {
+            arn: crate::state::member_arn(&region, &input.account.account_id),
+            account_id: input.account.account_id.clone(),
+            email: input.account.email.clone(),
+            region: region.clone(),
+            administrator_account_id: administrator.to_string(),
+            relationship_status: crate::state::MEMBER_CREATED_RELATIONSHIP_STATUS.to_string(),
+            tags,
+            // This operation associates the account; `CreateInvitations` is what
+            // sends it a membership invitation, so none has been sent yet.
+            invited_at: None,
+            updated_at: now,
+        };
+        let arn = member.arn.clone();
+        state
+            .members
+            .insert((region, input.account.account_id.clone()), member);
+
+        Ok(CreateMemberOutput { arn: Some(arn) })
     }
 }
+
+/// How the service refuses an attempt to associate the CALLER'S OWN account:
+/// the caller is the administrator account, and an account cannot administer
+/// itself. The whole sentence is fixed text — it interpolates no request value.
+const SELF_MEMBERSHIP_MESSAGE: &str =
+    "The request is rejected because an account cannot become a member of itself.";
+

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMembers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMembers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMembers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the accounts `CreateMember` associated with this administrator
+//! account in the region the request addresses, a page at a time.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +158,105 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMembers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMembersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMembers"))
+        let Some(store) = crate::state::service_state(&*self.engine) else {
+            return Err(ListMembersErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the Macie member store is unavailable on this engine".to_string(),
+                    ),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx);
+
+        let state = store.lock();
+        if state.session(&region).is_none() {
+            return Err(ListMembersErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(crate::state::MACIE_NOT_ENABLED_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // A `nextToken` is this service's own opaque encoding of the cursor, so
+        // one it did not issue names no page and is refused rather than silently
+        // read as "start again".
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => match crate::state::decode_page_token(token) {
+                Some(cursor) => Some(cursor),
+                None => {
+                    return Err(ListMembersErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(crate::state::FOREIGN_PAGE_TOKEN_MESSAGE.to_string()),
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => None,
+        };
+
+        // `maxResults` carries a modelled range of 1 to 25, so the boundary
+        // validator has already refused anything outside it; a request naming
+        // none takes the page that range caps this read at.
+        let page_size = match input.max_results {
+            Some(requested) if requested > 0 => usize::try_from(requested)
+                .unwrap_or(crate::state::MAX_MEMBER_PAGE_SIZE)
+                .min(crate::state::MAX_MEMBER_PAGE_SIZE),
+            _ => crate::state::MAX_MEMBER_PAGE_SIZE,
+        };
+
+        // "By default, the response includes only current member accounts. To
+        // include all accounts, set this value to false."
+        let only_associated = input
+            .only_associated
+            .as_deref()
+            .is_none_or(|requested| !requested.eq_ignore_ascii_case("false"));
+
+        let accounts: Vec<&str> = state
+            .members_of(&region)
+            .filter(|member| !only_associated || member.is_current_association())
+            .map(|member| member.account_id.as_str())
+            .collect();
+        let start = match resume_after.as_deref() {
+            Some(cursor) => accounts.partition_point(|account| *account <= cursor),
+            None => 0,
+        };
+        let end = start.saturating_add(page_size).min(accounts.len());
+        let page = accounts.get(start..end).unwrap_or_default();
+
+        let members: Vec<Member> = page
+            .iter()
+            .filter_map(|account| state.member(&region, account))
+            .map(|member| Member {
+                account_id: Some(member.account_id.clone()),
+                administrator_account_id: Some(member.administrator_account_id.clone()),
+                arn: Some(member.arn.clone()),
+                email: Some(member.email.clone()),
+                invited_at: member.invited_at.map(crate::state::to_date_time),
+                // Deprecated, and "retained only for backward compatibility":
+                // the administrator account id under its former name.
+                master_account_id: Some(member.administrator_account_id.clone()),
+                relationship_status: Some(member.relationship_status.clone()),
+                tags: member.tags_output(),
+                updated_at: Some(crate::state::to_date_time(member.updated_at)),
+            })
+            .collect();
+
+        // A token only when accounts remain after this page, so a caller stops
+        // paging exactly when the enumeration is exhausted.
+        let next_token = (end < accounts.len())
+            .then(|| {
+                page.last()
+                    .map(|account| crate::state::encode_page_token(account))
+            })
+            .flatten();
+
+        Ok(ListMembersOutput {
+            members: Some(members),
+            next_token,
+        })
     }
 }
