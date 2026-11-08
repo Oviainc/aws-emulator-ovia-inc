@@ -831,7 +831,14 @@ async fn an_identifier_that_names_no_live_stack_is_refused_with_validation_error
         ),
     ];
     for (case, identifier) in cases {
-        for action in ["DescribeStacks", "GetTemplate", "DescribeStackEvents"] {
+        // The reads of the stack's own record and of its template introduce the name with
+        // "with id"; the read of its EVENT LOG brackets it instead — the template belongs to
+        // the operation (`stack_not_found_wording.rs` holds the bracketed side in depth).
+        for (action, expected) in [
+            ("DescribeStacks", format!("Stack with id {identifier} does not exist")),
+            ("GetTemplate", format!("Stack with id {identifier} does not exist")),
+            ("DescribeStackEvents", format!("Stack [{identifier}] does not exist")),
+        ] {
             let (status, body) =
                 call(&router, action, &[member("StackName", &identifier)]).await;
             assert_eq!(
@@ -845,7 +852,7 @@ async fn an_identifier_that_names_no_live_stack_is_refused_with_validation_error
             );
             assert_eq!(
                 xml_text(&body, "Message").as_deref(),
-                Some(format!("Stack with id {identifier} does not exist").as_str()),
+                Some(expected.as_str()),
                 "case {case:?}: {action} must name the stack it could not find, got {body}"
             );
         }

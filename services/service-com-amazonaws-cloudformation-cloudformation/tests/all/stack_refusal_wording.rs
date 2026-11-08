@@ -103,19 +103,20 @@ struct NotFoundRow {
 
 fn not_found_rows() -> Vec<NotFoundRow> {
     vec![
-        // The reads that word the class with "with id".
+        // The reads that word the class with "with id": a stack's own record, its
+        // resources, its template.
         NotFoundRow {
             action: "DescribeStacks",
             extra: vec![],
             template: with_id,
         },
         NotFoundRow {
-            action: "DescribeStackEvents",
+            action: "DescribeStackResources",
             extra: vec![],
             template: with_id,
         },
         NotFoundRow {
-            action: "ListChangeSets",
+            action: "ListStackResources",
             extra: vec![],
             template: with_id,
         },
@@ -124,9 +125,36 @@ fn not_found_rows() -> Vec<NotFoundRow> {
             extra: vec![],
             template: with_id,
         },
-        // The change-set-addressed lookups: the STACK is resolved first, so each is refused
+        // The reads of a stack's LOGS — its event stream and its drift results — which word
+        // the class with the square brackets instead.
+        NotFoundRow {
+            action: "DescribeStackEvents",
+            extra: vec![],
+            template: bracketed,
+        },
+        NotFoundRow {
+            action: "DescribeStackResourceDrifts",
+            extra: vec![],
+            template: bracketed,
+        },
+        // The change-set operations: the STACK is resolved first, so each is refused
         // about the stack rather than answered the change-set-not-found of a lookup that
-        // never had a stack to look inside.
+        // never had a stack to look inside — and the creation of an UPDATE change set, which
+        // plans against a stack that has to exist, is refused the same way.
+        NotFoundRow {
+            action: "ListChangeSets",
+            extra: vec![],
+            template: bracketed,
+        },
+        NotFoundRow {
+            action: "CreateChangeSet",
+            extra: vec![
+                member("ChangeSetName", "any-set"),
+                member("ChangeSetType", "UPDATE"),
+                member("TemplateBody", TEMPLATE),
+            ],
+            template: bracketed,
+        },
         NotFoundRow {
             action: "DescribeChangeSetHooks",
             extra: vec![member("ChangeSetName", "any-set")],

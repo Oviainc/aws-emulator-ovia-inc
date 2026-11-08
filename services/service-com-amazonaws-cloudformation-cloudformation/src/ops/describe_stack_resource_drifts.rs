@@ -199,9 +199,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it is on every other read of a stack.
         let region = crate::state::request_region(ctx.parts());
         let stack = store.resolve(&region, &input.stack_name).ok_or_else(|| {
-            crate::scaffolded::Scaffolded::validation_error(crate::state::stack_does_not_exist(
-                &input.stack_name,
-            ))
+            crate::scaffolded::Scaffolded::validation_error(
+                crate::state::changed_stack_does_not_exist(&input.stack_name),
+            )
         })?;
 
         // "The resource drift status values to use as filters for the resource drift

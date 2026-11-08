@@ -4059,12 +4059,13 @@ pub mod failed_action {
 /// kept apart here, one function per template, and an operation is moved between them only
 /// on evidence of what it really answers. The forms this service has evidence for:
 ///
-/// * `Stack with id <name> does not exist` — this function, the one most reads answer
-///   (`DescribeStacks`, `DescribeStackEvents`, `DescribeStackResources`,
-///   `DescribeStackResourceDrifts`, `ListStackResources`, `ListChangeSets`, `GetTemplate`,
-///   `GetTemplateSummary`, `DescribeEvents`, `CreateChangeSet`, `CreateGeneratedTemplate`).
+/// * `Stack with id <name> does not exist` — this function, the one the reads of a stack's
+///   own record and of its resources answer (`DescribeStacks`, `DescribeStackResources`,
+///   `ListStackResources`, `GetTemplate`, `GetTemplateSummary`, `DescribeEvents`,
+///   `CreateGeneratedTemplate`).
 /// * `Stack [<name>] does not exist` — [`changed_stack_does_not_exist`], which is also
-///   `DetectStackResourceDrift`'s.
+///   `DetectStackResourceDrift`'s, the whole change-set family's and the one the reads of a
+///   stack's event and drift LOGS answer.
 /// * `Stack '<name>' does not exist` — [`quoted_stack_does_not_exist`].
 /// * `Stack <name> does not exist` — [`bare_stack_does_not_exist`].
 /// * `Stack: <name> does not exist` — [`labelled_stack_does_not_exist`], which is also
@@ -4076,9 +4077,11 @@ pub fn stack_does_not_exist(name_or_id: &str) -> String {
 /// The message CloudFormation answers for a stack that is not addressable with the named
 /// stack in SQUARE BRACKETS, which is this family's template for `UpdateStack`,
 /// `UpdateTerminationProtection`, `RollbackStack`, `DetectStackDrift`,
-/// `DetectStackResourceDrift` and the operations that address a change set within its stack
-/// (`DescribeChangeSet`, `DescribeChangeSetHooks`, `ExecuteChangeSet`) — see
-/// [`stack_does_not_exist`] for the family, of which this is one template among several.
+/// `DetectStackResourceDrift`, the operations that address a stack's CHANGE SETS
+/// (`CreateChangeSet`, `ListChangeSets`, `DescribeChangeSet`, `DescribeChangeSetHooks`,
+/// `ExecuteChangeSet`) and the reads of a stack's event and drift LOGS
+/// (`DescribeStackEvents`, `DescribeStackResourceDrifts`) — see [`stack_does_not_exist`] for
+/// the family, of which this is one template among several.
 ///
 /// The bracketed name is the message's only variable part.
 pub fn changed_stack_does_not_exist(name_or_id: &str) -> String {

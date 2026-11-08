@@ -201,9 +201,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A stack name or id names a stack only in the Region the request was signed for.
         let region = crate::state::request_region(ctx.parts());
         let stack = store.resolve(&region, &input.stack_name).ok_or_else(|| {
-            crate::scaffolded::Scaffolded::validation_error(crate::state::stack_does_not_exist(
-                &input.stack_name,
-            ))
+            crate::scaffolded::Scaffolded::validation_error(
+                crate::state::changed_stack_does_not_exist(&input.stack_name),
+            )
         })?;
         // The stack the token this read hands out is scoped to: its stack id, which names
         // the one stack whose event stream is being paged whichever way the request named

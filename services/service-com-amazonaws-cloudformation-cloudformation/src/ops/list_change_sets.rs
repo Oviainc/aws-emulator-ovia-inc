@@ -188,9 +188,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stack names it (by name while it is running, by stack id either way), and a
         // `StackName` that resolves to nothing is a `ValidationError`, not an empty list.
         let stack = store.resolve(&region, &input.stack_name).ok_or_else(|| {
-            crate::scaffolded::Scaffolded::validation_error(crate::state::stack_does_not_exist(
-                &input.stack_name,
-            ))
+            crate::scaffolded::Scaffolded::validation_error(
+                crate::state::changed_stack_does_not_exist(&input.stack_name),
+            )
         })?;
         // "Returns the ID and status of each ACTIVE change set for a stack": the change
         // sets this store still holds for that stack, in creation order — one a request

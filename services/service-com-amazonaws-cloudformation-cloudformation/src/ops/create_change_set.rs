@@ -715,7 +715,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if !creates_the_stack {
                     // An UPDATE change set compares against a stack that exists.
                     return Err(crate::scaffolded::Scaffolded::validation_error(
-                        crate::state::stack_does_not_exist(&input.stack_name),
+                        crate::state::changed_stack_does_not_exist(&input.stack_name),
                     ));
                 }
                 None

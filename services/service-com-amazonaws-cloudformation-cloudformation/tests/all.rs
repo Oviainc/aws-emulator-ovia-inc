@@ -335,6 +335,8 @@ mod stack_identifier_refusals;
 mod stack_input_contracts;
 #[path = "all/stack_lifecycle.rs"]
 mod stack_lifecycle;
+#[path = "all/stack_not_found_wording.rs"]
+mod stack_not_found_wording;
 #[path = "all/stack_output_resolution.rs"]
 mod stack_output_resolution;
 #[path = "all/stack_own_subnets_db_subnet_group.rs"]

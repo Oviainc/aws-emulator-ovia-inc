@@ -718,7 +718,10 @@ async fn a_stack_the_region_does_not_carry_is_refused() {
             status, 400,
             "case {case:?}: expected a refusal, got {status} with {body}"
         );
-        for fragment in ["ValidationError", &format!("Stack with id {stack} does not exist")] {
+        for fragment in [
+            "ValidationError",
+            &format!("Stack [{stack}] does not exist"),
+        ] {
             assert!(
                 body.contains(fragment),
                 "case {case:?}: expected {fragment:?} in the refusal, got {body}"
