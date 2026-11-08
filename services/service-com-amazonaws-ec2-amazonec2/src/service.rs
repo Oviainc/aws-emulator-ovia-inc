@@ -848,6 +848,13 @@ fn authorization_refusal<Eng: Send + Sync + 'static>(
 /// [`crate::ops::create_vpc_encryption_control::vpc_encryption_controls::vpc_encryption_control_mode_refusal_message`]
 /// words, which is also what that operation's own backstop answers with.
 ///
+/// A value outside the `InstanceType` catalog is the fourth, and the one every member of this
+/// model that names the type an instance is PLACED as carries: EC2 answers its own
+/// `InvalidParameterValue` naming the value and the member that refused it
+/// ([`crate::state::instance_type_refusal_message`]), keyed on that catalog the same way — so
+/// a launch, a Spot Instance request, a Spot Fleet pool and a launch template's own data are
+/// each refused an unpublished type identically.
+///
 /// A `MaxResults` below the smallest page the operation publishes is the other refusal this
 /// service states: EC2 answers its own code and sentence for it, naming the value and the
 /// bound ([`crate::state::max_results_refusal`]). It is keyed on the member the constraint
@@ -900,6 +907,26 @@ fn ec2_value_refusal(violation: &aws_smithy_schema_server::Violation) -> Option<
                 message:
                     crate::ops::create_vpc_encryption_control::vpc_encryption_controls::
                         vpc_encryption_control_mode_refusal_message(),
+            })
+        }
+        ViolationKind::EnumValue(allowed)
+            if crate::state::is_instance_type_catalog(allowed) =>
+        {
+            // An instance type outside the catalog the model publishes is EC2's own
+            // `InvalidParameterValue` rather than a validation clause, in the sentence EC2
+            // words for that parameter type ([`crate::state::instance_type_refusal_message`]).
+            // Keyed on the catalog, so every member of this model that names the type an
+            // instance is placed as — a launch's own, a Spot Instance request's and a Spot
+            // Fleet pool's launch specification, a launch template's data — is refused in the
+            // same words. The value it names is already elided to the framework's
+            // `MAX_ECHOED_VALUE`, so echoing it cannot amplify a request into an arbitrarily
+            // long response — and the catalog itself is NOT stated back, which is what makes
+            // this sentence EC2's rather than the framework's clause.
+            Some(Refused {
+                code: crate::state::INVALID_PARAMETER_VALUE.to_string(),
+                message: crate::state::instance_type_refusal_message(
+                    violation.value.as_deref().unwrap_or_default(),
+                ),
             })
         }
         ViolationKind::MinValue(minimum)

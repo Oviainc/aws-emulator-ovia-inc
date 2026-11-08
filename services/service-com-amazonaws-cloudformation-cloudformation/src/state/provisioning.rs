@@ -204,6 +204,9 @@ mod cognito_identity_pool;
 /// own NAME lives here, beside the arm that provisions it, and more than one module answers
 /// about that type ([`super::resource_inventory`]).
 pub(super) mod dynamodb_table;
+/// `AWS::EC2::Instance`: the instance a stack declares, launched in Amazon EC2 itself
+/// ([`ec2_instance`]).
+mod ec2_instance;
 mod ec2_vpc_network;
 mod iam_policy;
 /// `AWS::IoT::Authorizer`: the custom authorizer a stack declares, created in AWS IoT
@@ -662,6 +665,10 @@ pub(super) enum Owner {
     /// VPC, and the Elastic IP address. Which of them it is travels with the owner, so the
     /// algorithm resolves the type once and every call below is about that same resource.
     Ec2VpcNetwork(ec2_vpc_network::Kind),
+    /// `AWS::EC2::Instance`, whose arms are [`ec2_instance`]'s: the instance Amazon EC2
+    /// launches for the resource, which is a resource of that service's own rather than part
+    /// of the VPC network above.
+    Ec2Instance,
     /// One of the two Amazon Cognito Identity types [`cognito_identity_pool`] creates: the
     /// identity pool, and the role attachment that binds the pool's IAM roles to it. Which
     /// of them it is travels with the owner, as for the Amazon EC2 types above.
@@ -715,6 +722,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if let Some(kind) = ec2_vpc_network::kind_of(resource_type) {
         return Some(Owner::Ec2VpcNetwork(kind));
+    }
+    if resource_type == ec2_instance::EC2_INSTANCE {
+        return Some(Owner::Ec2Instance);
     }
     if let Some(kind) = cognito_identity_pool::kind_of(resource_type) {
         return Some(Owner::CognitoIdentityPool(kind));
@@ -780,6 +790,9 @@ impl Owner {
             }
             Self::Ec2VpcNetwork(kind) => {
                 ec2_vpc_network::create(ctx, region, kind, resource, propagated).await
+            }
+            Self::Ec2Instance => {
+                ec2_instance::create(ctx, region, resource, propagated).await
             }
             Self::CognitoIdentityPool(kind) => {
                 cognito_identity_pool::create(ctx, region, kind, resource, propagated).await
@@ -870,6 +883,12 @@ impl Owner {
             Self::Ec2VpcNetwork(kind) => {
                 ec2_vpc_network::readiness(ctx, region, kind, physical_resource_id).await
             }
+            // `RunInstances` answers the instance `pending`, in which nothing runs on it, so
+            // this arm waits for Amazon EC2 to report it `running`
+            // ([`ec2_instance::readiness`]).
+            Self::Ec2Instance => {
+                ec2_instance::readiness(ctx, region, physical_resource_id).await
+            }
             // A pool exists, and its role configuration is in force, from the moment the
             // owning service's own call answers.
             Self::CognitoIdentityPool(_) => Ok(cognito_identity_pool::ready()),
@@ -929,6 +948,12 @@ impl Owner {
             // address and allocation id, an attachment nothing at all), and the create
             // answered it, so there is nothing to read once the resource is up.
             Self::Ec2VpcNetwork(_) => Ok(BTreeMap::new()),
+            // An INSTANCE is the one Amazon EC2 type here with more to read once it is up:
+            // its addresses and DNS names are not assigned until it is running
+            // ([`ec2_instance::ready_attributes`]).
+            Self::Ec2Instance => {
+                ec2_instance::ready_attributes(ctx, region, physical_resource_id).await
+            }
             // A pool's `Name` is the one its own create answered with, and a role attachment
             // publishes no attribute this emulator computes, so there is nothing left to
             // read once either resource is up.
@@ -990,6 +1015,11 @@ impl Owner {
             // ([`ec2_vpc_network::removal`]).
             Self::Ec2VpcNetwork(kind) => {
                 ec2_vpc_network::removal(ctx, region, kind, physical_resource_id).await
+            }
+            // `TerminateInstances` moves the instance into `shutting-down`, so this arm waits
+            // for Amazon EC2 to report it `terminated` ([`ec2_instance::removal`]).
+            Self::Ec2Instance => {
+                ec2_instance::removal(ctx, region, physical_resource_id).await
             }
             // `DeleteIdentityPool` takes the pool away as it answers, and the call that
             // clears a pool's roles leaves nothing behind either.
@@ -1075,6 +1105,11 @@ impl Owner {
             // does not serve yet — so a changed declaration is reported as not applied
             // rather than as a success that dropped the caller's change.
             Self::Ec2VpcNetwork(_) => Ok(None),
+            // An instance's own properties are either part of the launch that made it or
+            // settings a `ModifyInstanceAttribute` would change, which this emulator does not
+            // serve — so a changed declaration is reported as not applied rather than as a
+            // success that dropped the caller's change.
+            Self::Ec2Instance => Ok(None),
             Self::CognitoIdentityPool(kind) => {
                 cognito_identity_pool::update(ctx, region, kind, resource, declared).await
             }
@@ -1154,7 +1189,7 @@ impl Owner {
             // The tags of an Amazon EC2 resource that already exists are reconciled by no arm
             // here yet — as for every other type of that service ([`Provisioner::retag`]'s
             // own default) — so nothing is asked about them.
-            Self::Ec2VpcNetwork(_) => Ok(()),
+            Self::Ec2VpcNetwork(_) | Self::Ec2Instance => Ok(()),
             // A pool's tags are replaced by its own update call, which carries the
             // declaration's whole configuration, so nothing is asked about them here.
             Self::CognitoIdentityPool(_) => Ok(()),
@@ -1235,6 +1270,10 @@ impl Owner {
             Self::Ec2VpcNetwork(kind) => {
                 ec2_vpc_network::delete(ctx, region, kind, resource).await
             }
+            // Nor of an INSTANCE: `CreateImage` and `CreateSnapshot` are calls of their own
+            // that this teardown does not make, so a `Snapshot` deletion policy on one
+            // terminates the instance with no image or snapshot invented for it.
+            Self::Ec2Instance => ec2_instance::delete(ctx, region, resource).await,
             // Amazon Cognito Identity takes no snapshot of a pool on the way out: there is no
             // such call, so a `Snapshot` deletion policy on either type deletes the resource
             // with no snapshot invented for it.
@@ -1315,8 +1354,10 @@ impl Owner {
             }
             // These types report no configuration of their own to compare either: every
             // property each one has is part of its identity or of the call that made it, so
-            // there is no member a later read could find changed.
-            Self::Ec2VpcNetwork(_) => Ok(None),
+            // there is no member a later read could find changed. An INSTANCE's are the same
+            // case here: the launch is what set every one of them, and no call this emulator
+            // serves can change one on the instance that exists.
+            Self::Ec2VpcNetwork(_) | Self::Ec2Instance => Ok(None),
             Self::CognitoIdentityPool(kind) => {
                 cognito_identity_pool::actual_configuration(ctx, region, kind, resource).await
             }
@@ -1358,7 +1399,7 @@ impl Owner {
             // Amazon CloudWatch Logs's and AWS IoT's do the same.
             Self::LogsResource(_) | Self::IotAuthorizer => message.to_string(),
             // Amazon EC2's does the same.
-            Self::Ec2VpcNetwork(_) => message.to_string(),
+            Self::Ec2VpcNetwork(_) | Self::Ec2Instance => message.to_string(),
             // Amazon Cognito Identity's does the same.
             Self::CognitoIdentityPool(_) => message.to_string(),
             // The nested-stack provider reports what CloudFormation answered as it came: the
@@ -4266,6 +4307,23 @@ const FORM_VALUE: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPHA
     .remove(b'.')
     .remove(b'~');
 
+/// The text one ENTITY REFERENCE stands for, as the reader hands it over.
+///
+/// The XML reader BREAKS a text run at a reference and reports `&amp;`, `&lt;`, `&gt;`,
+/// `&quot;` and `&apos;` as events of their own, so a reader that handles only text events
+/// drops the character every one of them escapes — and an answering service's own message
+/// quoting a value (`Invalid value 'x' for …`) reaches the wire with two of them. Resolved by
+/// the parser's own escaping rules rather than by a table here; a reference that stands for
+/// nothing is read as no text at all, which is what it contributes.
+fn referenced_text(reference: &::quick_xml::events::BytesRef<'_>) -> String {
+    let Ok(name) = reference.decode() else {
+        return String::new();
+    };
+    ::quick_xml::escape::unescape(&format!("&{name};"))
+        .map(::std::borrow::Cow::into_owned)
+        .unwrap_or_default()
+}
+
 /// The text of the first `<tag>` element of an XML document, with its entities decoded, or
 /// `None` where the document carries no such element.
 ///
@@ -4291,6 +4349,9 @@ pub(super) fn xml_element(document: &str, tag: &str) -> Option<String> {
             }
             Ok(Event::Text(found)) if inside => {
                 text.push_str(&found.xml10_content().unwrap_or_default());
+            }
+            Ok(Event::GeneralRef(reference)) if inside => {
+                text.push_str(&referenced_text(&reference));
             }
             Ok(Event::End(end)) if inside && end.local_name().as_ref() == tag.as_bytes() => {
                 return Some(text);
@@ -4327,6 +4388,11 @@ pub(super) fn xml_elements(document: &str, tag: &str) -> Vec<String> {
             Ok(Event::Text(text)) => {
                 if let Some(held) = reading.as_mut() {
                     held.push_str(&text.xml10_content().unwrap_or_default());
+                }
+            }
+            Ok(Event::GeneralRef(reference)) => {
+                if let Some(held) = reading.as_mut() {
+                    held.push_str(&referenced_text(&reference));
                 }
             }
             Ok(Event::End(end)) if end.local_name().as_ref() == tag.as_bytes() => {
@@ -4388,6 +4454,17 @@ pub(super) fn xml_entry_map(document: &str, parent: &str) -> ::serde_json::Map<S
             },
             Ok(Event::Text(found)) if reading.is_some() => {
                 let text = found.xml10_content().unwrap_or_default();
+                let held = match reading {
+                    Some(KEY) => key.as_mut(),
+                    Some(VALUE) => value.as_mut(),
+                    _ => None,
+                };
+                if let Some(held) = held {
+                    held.push_str(&text);
+                }
+            }
+            Ok(Event::GeneralRef(reference)) if reading.is_some() => {
+                let text = referenced_text(&reference);
                 let held = match reading {
                     Some(KEY) => key.as_mut(),
                     Some(VALUE) => value.as_mut(),
@@ -4462,6 +4539,9 @@ pub(super) fn xml_scalar_children(
             }
             Ok(Event::Text(found)) if inside && depth == 1 => {
                 text.push_str(&found.xml10_content().unwrap_or_default());
+            }
+            Ok(Event::GeneralRef(reference)) if inside && depth == 1 => {
+                text.push_str(&referenced_text(&reference));
             }
             Ok(Event::Empty(empty)) if inside && depth == 0 => {
                 let name = String::from_utf8_lossy(empty.local_name().as_ref()).into_owned();

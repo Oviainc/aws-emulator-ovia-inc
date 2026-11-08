@@ -1064,9 +1064,9 @@ async fn a_create_that_cannot_be_served_is_refused_and_stores_nothing() {
         ),
         (
             // `ReservationFleetInstanceSpecification$InstanceType` targets the modelled
-            // `InstanceType` enum, so the boundary validator refuses a value outside that
-            // catalog BEFORE this handler runs — the status, and the boundary's own code,
-            // are what this operation promises for it.
+            // `InstanceType` enum, so a value outside that catalog is refused BEFORE this
+            // handler runs — with the code and sentence EC2 words for that parameter type,
+            // which `crate::service`'s refusal override states for the whole service.
             "an instance type EC2 does not offer",
             [
                 vec![param("TotalTargetCapacity", "4")],
@@ -1077,7 +1077,7 @@ async fn a_create_that_cannot_be_served_is_refused_and_stores_nothing() {
                 ]),
             ]
             .concat(),
-            "ValidationError",
+            "InvalidParameterValue",
         ),
         (
             // `$InstancePlatform` targets the modelled

@@ -39,6 +39,11 @@ use service_com_amazonaws_cloudformation_cloudformation::state::{
 /// about, so a row says what the declaration IS rather than what it is called.
 const GATE: &str = "Gate";
 
+/// How many reads a row that signals a SETTLED create gives the create to settle in: a stack
+/// is owed its terminal status by the clock and by the services that own its resources, and a
+/// read is what asks them.
+const SETTLE_ATTEMPTS: usize = 20;
+
 /// The Region no stack of this suite lives in: a stack name resolves only in the Region the
 /// request is signed for.
 const OTHER_REGION: &str = "us-west-2";
@@ -74,7 +79,14 @@ fn template(declared: Declared, marker: &str) -> String {
         }),
         Declared::CreationPolicy => json!({
             "Type": "AWS::EC2::Instance",
-            "Properties": {"ImageId": "ami-0123456789abcdef0", "InstanceType": marker},
+            "Properties": {
+                "ImageId": "ami-0123456789abcdef0",
+                // A published instance type: the stack LAUNCHES this instance in Amazon EC2,
+                // which refuses a type it does not publish — so the row's own marker goes in
+                // a tag, which is a declared property an update can change just as freely.
+                "InstanceType": "t3.micro",
+                "Tags": [{"Key": "Marker", "Value": marker}]
+            },
             "CreationPolicy": {"ResourceSignal": {"Count": 1, "Timeout": "PT5M"}}
         }),
         Declared::UpdatePolicy => json!({
@@ -286,6 +298,20 @@ async fn a_signal_nothing_waits_on_is_accepted_and_changes_nothing() {
         }
         if !row.while_creating {
             wait_for_the_transition().await;
+            // A SETTLED create is a status a READ reports: a stack reaches its terminal
+            // status once the services that own its resources report them ready, which only
+            // a read asks them about — so the create is polled to that status the way a
+            // client does before the row sends the signal nothing is waiting for.
+            for _ in 0..SETTLE_ATTEMPTS {
+                let (_, described) = describe_stack(&router, &addressed).await;
+                if !xml_text(&described, "StackStatus")
+                    .unwrap_or_default()
+                    .ends_with("_IN_PROGRESS")
+                {
+                    break;
+                }
+                wait_for_the_transition().await;
+            }
         }
 
         let unique_id = "i-0123456789abcdef0";

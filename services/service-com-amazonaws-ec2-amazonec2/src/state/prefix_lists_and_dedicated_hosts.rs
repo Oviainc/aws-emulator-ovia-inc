@@ -886,6 +886,36 @@ pub fn instance_family_of(instance_type: &str) -> &str {
         .map_or(instance_type, |(family, _size)| family)
 }
 
+/// Is `allowed` the `InstanceType` catalog — the value set the model declares for every
+/// member that names the type an instance is placed as?
+///
+/// The boundary's constraint walk reports a refused enum value as the value set it failed
+/// rather than as the shape that declared it, so the catalog IS how that type is recognised
+/// ([`is_caller_role_catalog`] records the rule in full). Keyed to the TYPE's catalog and not
+/// to the operation carrying it, so a launch, a Spot Instance request, a Spot Fleet pool and a
+/// launch template's own data are each refused an unpublished type in the same words.
+///
+/// Compared as a SET rather than member by member in order: this catalog is the largest in the
+/// model, and [`offered_instance_types`] reports it sorted while the walk reports it in the
+/// model's own declaration order — two orders of one value set.
+pub fn is_instance_type_catalog(allowed: &[String]) -> bool {
+    let catalog: ::std::collections::BTreeSet<&str> =
+        offered_instance_types().iter().copied().collect();
+    allowed.len() == catalog.len()
+        && allowed
+            .iter()
+            .all(|held| catalog.contains(held.as_str()))
+}
+
+/// How EC2 states an instance type the catalog does not hold: HTTP 400
+/// `InvalidParameterValue` with the submitted value — "Invalid value '`<value>`' for
+/// InstanceType." EC2 does not state a modelled refusal as the generic validation clause; it
+/// names the member that refused the value, and the only part built from the request is the
+/// value echoed back.
+pub fn instance_type_refusal_message(value: &str) -> String {
+    format!("Invalid value '{}' for InstanceType.", echoed_resource_id(value))
+}
+
 /// Whether the model declares `instance_type` at all: it is a value of the `InstanceType`
 /// enum, the catalog [`offered_instance_types`] reports.
 pub fn instance_type_is_modelled(instance_type: &str) -> bool {

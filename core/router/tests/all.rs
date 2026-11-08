@@ -999,9 +999,6 @@ mod sns_lambda_cdk_subscription_delivery;
 // and the log group the invocation that path makes writes its run to.
 #[path = "all/apigateway_proxy_lambda_ddb_pipeline.rs"]
 mod apigateway_proxy_lambda_ddb_pipeline;
-// Declared here, in this same head region, for the reason the entry above records: what a
-// deployed `AWS_IAM` method makes of the credential its request presents, on a router that
-// verifies request signatures.
 // EVERY suite in this file is declared EXACTLY ONCE: a second `mod` for one file is a
 // redefinition (and `clippy::duplicate_mod`), which stops this target compiling. Two
 // regions here are documented as where a concurrently landing suite adds its line, so the
@@ -1067,8 +1064,6 @@ mod all_rs_declares_each_suite_once;
 // target from compiling.
 // `bedrock_agentcore_data_plane_parent_resources` is NOT re-declared here either: it stands
 // in the sorted head, and one `mod` per file is what this target compiles with.
-#[path = "all/cloudformation_wafv2_protection_stack.rs"]
-mod cloudformation_wafv2_protection_stack;
 // Declared here, in the appended tail, for the reason the entries above record: the sorted
 // `e…` span is a region concurrently landing suites add their line to.
 // `cloudformation_asset_bucket_publishing_role` — are each ALREADY declared above, in the
@@ -1114,3 +1109,11 @@ mod sns_lambda_invoke_permission_revocation;
 // the stack published, and the records the function pointed at it leaves in it.
 #[path = "all/cloudformation_declared_log_group_takes_its_function_logs.rs"]
 mod cloudformation_declared_log_group_takes_its_function_logs;
+// appended tail and the sorted `c…` span are both regions concurrently landing suites add
+// Declared in the appended tail, which is where every new suite inserts its lines: what a
+// stack publishes for the `Fn::GetAtt` attributes of an `AWS::EC2::Instance` it launched —
+// the values Amazon EC2 itself reports for that instance.
+#[path = "all/cloudformation_ec2_instance_rollback.rs"]
+mod cloudformation_ec2_instance_rollback;
+// stops this target from compiling; the duplicate lines are removed here and ONE declaration
+// of each stands. `eks_control_plane_logs` is the same case and is declared above too.

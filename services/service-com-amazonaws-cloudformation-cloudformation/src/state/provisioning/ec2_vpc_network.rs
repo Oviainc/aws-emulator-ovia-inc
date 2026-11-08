@@ -67,6 +67,12 @@
 //! Each create carries only members of the call it is made with: a declared property this
 //! module does not apply is REFUSED ([`refuse_unmapped_properties`]), so a resource is never
 //! reported created with less than its declaration asked for.
+//!
+//! The ec2Query DECLARATION READERS below ([`scalar`], [`list`], [`required`],
+//! [`refuse_unmapped_properties`]) and the one call that tags a resource that exists
+//! ([`tag_resource`]) are about this SERVICE's wire rather than about these types, so the
+//! sibling module that provisions `AWS::EC2::Instance` ([`super::ec2_instance`]) is built from
+//! them too rather than from a second copy of them.
 
 use std::collections::BTreeMap;
 
@@ -94,8 +100,8 @@ pub(super) const EC2_NAT_GATEWAY: &str = "AWS::EC2::NatGateway";
 /// Amazon EC2's signing name and the API version a request names beside the action, from its
 /// model (`sigv4Name: ec2`, `version: 2016-11-15`) — the same pair the VPC and subnet arms of
 /// [`super::super::provisioner`] call that service with.
-const EC2_SIGNING_NAME: &str = "ec2";
-const EC2_API_VERSION: &str = "2016-11-15";
+pub(super) const EC2_SIGNING_NAME: &str = "ec2";
+pub(super) const EC2_API_VERSION: &str = "2016-11-15";
 
 /// The suffix of every Amazon EC2 error code that says the resource a request named is not
 /// there (`InvalidRouteTableID.NotFound`, `InvalidAssociationID.NotFound`,
@@ -104,7 +110,7 @@ const EC2_API_VERSION: &str = "2016-11-15";
 /// that service is already in.
 ///
 /// Judged on the CODE, never on a message, which carries the request's own name.
-const NOT_FOUND_SUFFIX: &str = ".NotFound";
+pub(super) const NOT_FOUND_SUFFIX: &str = ".NotFound";
 
 /// Amazon EC2's code for a detach of a gateway and a VPC that are not attached to each other
 /// (`Gateway.NotAttached`).
@@ -1175,7 +1181,7 @@ async fn nat_gateway_state(
 /// entries in and then to that set's first `<item>`'s own direct children, so a member of the
 /// same name nested deeper cannot be mistaken for it. Every read through this names ONE id, so
 /// the set holds one entry.
-fn set_entry(document: &str, set: &str, member: &str) -> Option<String> {
+pub(super) fn set_entry(document: &str, set: &str, member: &str) -> Option<String> {
     let entries = document
         .find(&format!("<{set}>"))
         .map(|start| &document[start..])?;
@@ -1207,7 +1213,7 @@ fn answered_element(document: &str, member: &str) -> Result<String, Refusal> {
 /// `aws:cloudformation:*` keys, and `CreateTags` is the request EC2 admits them from. Nothing
 /// is called for a resource with no tags at all, and a type that is not taggable never
 /// reaches here.
-async fn tag_resource(
+pub(super) async fn tag_resource(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     resource_id: &str,
@@ -1272,7 +1278,7 @@ fn reported(document: &str, parent: &str, member: &str) -> Result<String, Refusa
 /// The value of the declared property `property`, as the text an `ec2Query` parameter carries:
 /// a string as written, and a boolean or a number in its own JSON spelling (`true`, `3`),
 /// which is what that protocol's parameters are.
-fn scalar(resource: &StoredResource, property: &str) -> Option<String> {
+pub(super) fn scalar(resource: &StoredResource, property: &str) -> Option<String> {
     let value = resource.properties.get(property)?;
     if value.is_null() {
         return None;
@@ -1286,7 +1292,7 @@ fn scalar(resource: &StoredResource, property: &str) -> Option<String> {
 
 /// The entries of the declared LIST property `property`, each as that parameter's text. A
 /// property that is not a list carries one entry, which is the one value it is.
-fn list(resource: &StoredResource, property: &str) -> Vec<String> {
+pub(super) fn list(resource: &StoredResource, property: &str) -> Vec<String> {
     match resource.properties.get(property) {
         None | Some(Value::Null) => Vec::new(),
         Some(Value::Array(entries)) => entries
@@ -1308,7 +1314,7 @@ fn json_text(value: &Value) -> String {
 ///
 /// A declaration that states none is REFUSED rather than sent without it, so the resource is
 /// never reported created somewhere the template did not ask for.
-fn required(resource: &StoredResource, property: &str) -> Result<String, Refusal> {
+pub(super) fn required(resource: &StoredResource, property: &str) -> Result<String, Refusal> {
     scalar(resource, property).ok_or_else(|| Refusal {
         code: "InvalidRequest".to_string(),
         message: format!(
@@ -1320,7 +1326,7 @@ fn required(resource: &StoredResource, property: &str) -> Result<String, Refusal
 
 /// The refusal for a declared property this module does not apply, naming which property it
 /// was.
-fn refuse_unmapped_properties(
+pub(super) fn refuse_unmapped_properties(
     resource: &StoredResource,
     published: &[&str],
 ) -> Result<(), Refusal> {

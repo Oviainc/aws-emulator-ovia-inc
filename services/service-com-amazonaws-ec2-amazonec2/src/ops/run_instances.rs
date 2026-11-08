@@ -23,6 +23,12 @@
 //! DIRECTLY is held to the issued-id form; a parameter the account can see no image under is
 //! `InvalidAMIID.NotFound`.
 //!
+//! An `InstanceType` outside the catalog the model publishes as that member's enum is refused
+//! at the BOUNDARY, before this handler runs, with the code and sentence EC2 words for the
+//! parameter type (`crate::service`'s refusal override, keyed on that catalog). What this
+//! handler asks about an instance type is therefore only WHERE a published one is offered,
+//! which is per Availability Zone.
+//!
 //! A repeat of the same request under one `ClientToken` returns the reservation that
 //! token already minted instead of launching again. A `LaunchTemplate` is answered
 //! with a 501: it names a resource no implemented operation creates, so there is

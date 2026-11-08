@@ -963,6 +963,24 @@ pub(super) fn return_values(
             let id = ec2_network_identity("vol", "VolumeId", name, &mut attributes);
             (id, attributes)
         }
+        // An INSTANCE, whose identity Amazon EC2 assigns the same way again — "Ref returns the
+        // ID of the instance", the `i-` + 17 hexadecimal form — and whose published
+        // `Fn::GetAtt` attributes are NONE of them that id: they are the zone the instance was
+        // placed in and its four addresses and DNS names, every one of which only Amazon EC2
+        // can produce. Each therefore starts EMPTY, which is both what a reference to a
+        // resource that does not exist yet can resolve to and what AWS answers for an address
+        // an instance was never assigned; the launch's own answer and the read that follows the
+        // instance coming up are what fill them (`crate::state::provisioning`'s instance
+        // provider).
+        EC2_INSTANCE => {
+            for attribute in published_attribute_names(EC2_INSTANCE) {
+                attributes.insert((*attribute).to_string(), String::new());
+            }
+            (
+                generated_service_id("i", name, EC2_ID_HEX_DIGITS),
+                attributes,
+            )
+        }
         // "Ref returns the Amazon Resource Name (ARN)"; Fn::GetAtt: Name. A service ARN
         // carries the CLUSTER that hosts it (`service/<cluster>/<name>`), which the
         // declaration names by short name or by cluster ARN and which defaults to the
@@ -1545,6 +1563,17 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         EC2_VPN_GATEWAY => &["VPNGatewayId"],
         EC2_NETWORK_ACL | EC2_NETWORK_INTERFACE | EC2_VPC_ENDPOINT => &["Id"],
         EC2_VOLUME => &["VolumeId"],
+        // Source: `AWS::EC2::Instance`'s own "Return values" section — the zone the instance
+        // was placed in, its private DNS name and IPv4 address, and its public ones. "Ref
+        // returns the ID of the instance", which is the resource's physical id rather than one
+        // of these attributes.
+        EC2_INSTANCE => &[
+            "AvailabilityZone",
+            "PrivateDnsName",
+            "PrivateIp",
+            "PublicDnsName",
+            "PublicIp",
+        ],
         ECS_SERVICE => &["Name"],
         ELB_LISTENER => &["ListenerArn"],
         ELB_LISTENER_RULE => &["IsDefault", "RuleArn"],
@@ -1788,6 +1817,11 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // `vol-` id, and "Ref returns the volume ID", so the identifier in force is the one
         // that service answered.
         || resource_type == EC2_VOLUME
+        // An INSTANCE is a fifth: `RunInstances` takes no identifier either — the declaration
+        // states the AMI, the instance type and where the instance goes — Amazon EC2 assigns
+        // the `i-` id, and "Ref returns the ID of the instance", so the identifier in force is
+        // the one that service answered the launch with.
+        || resource_type == EC2_INSTANCE
         // An Amazon SES receipt rule is one more, for the same reason read from the other
         // side: "Ref returns the receipt rule name", and a declaration states that name
         // inside the type's `Rule` property rather than through a name property of its own,
@@ -3129,6 +3163,14 @@ pub const EC2_EIP: &str = "AWS::EC2::EIP";
 /// [`identity_is_service_assigned`] names the type because the identifier in force is the
 /// one that service answered its create with.
 pub const EC2_VOLUME: &str = "AWS::EC2::Volume";
+
+/// `AWS::EC2::Instance`: an Amazon EC2 instance. Its identity is read the same way again —
+/// `RunInstances` takes no name, Amazon EC2 assigns the `i-…` identifier and "Ref returns the
+/// ID of the instance" — so a declaration of one carries an identifier of that form rather
+/// than a generated name, and [`identity_is_service_assigned`] names the type because the
+/// identifier in force is the one that service answered the launch with
+/// (`crate::state::provisioning`'s instance provider).
+pub const EC2_INSTANCE: &str = "AWS::EC2::Instance";
 
 /// The identifier Amazon EC2 assigns a declared resource of one of the VPC-network types
 /// above: `<prefix>-` plus [`EC2_ID_HEX_DIGITS`] lowercase hexadecimal characters, derived

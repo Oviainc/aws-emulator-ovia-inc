@@ -232,10 +232,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // type" — and a repeat of one — leave EC2 the same choice as naming it once.
         let requested_types = input.instance_types.as_deref().unwrap_or_default();
         for instance_type in requested_types {
-            if !crate::state::offered_instance_types().contains(&instance_type.as_str()) {
-                return Err(crate::state::invalid_parameter_value(format!(
-                    "Invalid value '{instance_type}' for InstanceType"
-                )));
+            if !crate::state::instance_type_is_modelled(instance_type) {
+                return Err(crate::state::invalid_parameter_value(
+                    crate::state::instance_type_refusal_message(instance_type),
+                ));
             }
         }
         let distinct_types: std::collections::BTreeSet<&str> =

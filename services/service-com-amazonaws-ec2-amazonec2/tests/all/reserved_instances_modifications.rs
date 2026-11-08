@@ -72,10 +72,15 @@ fn past_the_transition() -> Duration {
 }
 
 /// The error code the boundary validator answers BEFORE a handler runs, for a value
-/// outside a modelled enum: the two catalogs a target configuration names
-/// (`ReservedInstancesConfiguration$Scope`'s `scope` and `$InstanceType`'s `InstanceType`)
-/// are therefore enforced by the model itself, not by this operation.
+/// outside a modelled enum this service states no wording of its own for: the `scope`
+/// catalog `ReservedInstancesConfiguration$Scope` names is therefore enforced by the model
+/// itself, not by this operation.
 const BOUNDARY_VALIDATION_ERROR: &str = "ValidationError";
+
+/// The code EC2 answers for a value outside the `InstanceType` catalog, which
+/// `$InstanceType` names: that refusal is the boundary's too, but the service states EC2's own
+/// code and sentence for that parameter type rather than the validation clause.
+const INSTANCE_TYPE_REFUSAL: &str = "InvalidParameterValue";
 
 /// One Reserved Instance to seed: its instance type, its Availability Zone (`None` for a
 /// Regional-scope purchase) and how many reservations it holds.
@@ -1111,7 +1116,7 @@ async fn a_target_configuration_this_service_cannot_read_is_refused() {
                 ("AvailabilityZone", "us-east-1b"),
                 ("InstanceType", "t3.enormous"),
             ],
-            BOUNDARY_VALIDATION_ERROR,
+            INSTANCE_TYPE_REFUSAL,
         ),
     ];
 

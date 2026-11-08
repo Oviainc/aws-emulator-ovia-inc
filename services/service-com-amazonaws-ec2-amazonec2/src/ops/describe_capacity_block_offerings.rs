@@ -215,9 +215,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // offered rather than a subset being invented here.
         if let Some(instance_type) = input.instance_type.as_deref() {
             if !instance_type_is_modelled(instance_type) {
-                return Err(Scaffolded::invalid_parameter_value(format!(
-                    "Invalid value '{instance_type}' for InstanceType"
-                )));
+                return Err(Scaffolded::invalid_parameter_value(
+                    crate::state::instance_type_refusal_message(instance_type),
+                ));
             }
         }
 

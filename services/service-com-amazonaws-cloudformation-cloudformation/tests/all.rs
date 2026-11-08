@@ -51,6 +51,8 @@ mod change_set_preview;
 mod change_set_recreation;
 #[path = "all/client_request_tokens.rs"]
 mod client_request_tokens;
+#[path = "all/cloudformation_ec2_instance_rollback.rs"]
+mod cloudformation_ec2_instance_rollback;
 #[path = "all/cognito_resource_types.rs"]
 mod cognito_resource_types;
 #[path = "all/cognito_user_pool_return_values.rs"]

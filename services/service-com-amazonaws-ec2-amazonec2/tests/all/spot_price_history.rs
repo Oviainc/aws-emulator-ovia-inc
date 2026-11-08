@@ -1128,13 +1128,13 @@ async fn a_parameter_outside_what_the_service_serves_is_refused() {
         (
             "an instance type the model does not declare",
             indexed("InstanceType", &["m5.enormous"]),
-            "ValidationError",
+            "InvalidParameterValue",
             "m5.enormous".to_string(),
         ),
         (
             "an instance family rather than a type",
             indexed("InstanceType", &["m5"]),
-            "ValidationError",
+            "InvalidParameterValue",
             "m5".to_string(),
         ),
         (
