@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateLaunchTemplateVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateLaunchTemplateVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a new version of a launch template the account already holds, numbered one past
+//! the template's latest version, and reports the stored version. The ONLY file to touch for
+//! this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateLaunchTemplateVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A WRITE: it stores one version and moves the template's `LatestVersionNumber`. The
+//! template's DEFAULT version is left where it is — a new version is not the default one
+//! until something makes it so.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +166,276 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateLaunchTemplateVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateLaunchTemplateVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            launch_template_limit_exceeded, launch_template_version_payload_bytes,
+            require_service_state, resolve_launch_template_id, resolve_launch_template_version,
+            LaunchTemplateVersionSpec, MAX_CLIENT_TOKEN_CHARS, MAX_LAUNCH_TEMPLATE_VERSIONS,
+            MAX_STORED_BYTES, MAX_USER_DATA_BYTES,
+        };
+
+        // Nothing here depends on the Region: a launch template carries no Region member,
+        // and the principal `CreatedBy` reports is an IAM ARN, which is global.
+        let _ = ctx;
+
+        // Documented on `ClientToken`: "Constraint: Maximum 128 ASCII characters." The model
+        // declares no `@length`, and the token is retained as a key of the idempotency map,
+        // so the handler is the only place the bound can exist.
+        if let Some(token) = input.client_token.as_deref() {
+            if token.chars().count() > MAX_CLIENT_TOKEN_CHARS || !token.is_ascii() {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "ClientToken accepts at most {MAX_CLIENT_TOKEN_CHARS} ASCII characters"
+                )));
+            }
+        }
+        // AWS documents a 16 KB limit on instance user data, and this is the user data every
+        // instance launched from this version will get. The model declares no `@length` on
+        // it, and the version retains it, so it is bounded here.
+        if input
+            .launch_template_data
+            .user_data
+            .as_ref()
+            .is_some_and(|user_data| user_data.len() > MAX_USER_DATA_BYTES)
+        {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "User data accepts at most {MAX_USER_DATA_BYTES} bytes"
+            )));
+        }
+
+        let state = require_service_state(&*self.engine)?;
+        let mut store = state.lock();
+
+        // "You must specify an existing launch template, either by name or ID"
+        // (`CreateLaunchTemplateVersion`), resolved by the one reader every operation that
+        // names a template by either key shares — so naming both, naming neither, a
+        // malformed id and an id or name the account does not hold are all refused the same
+        // way here as there.
+        let launch_template_id = resolve_launch_template_id(
+            &store,
+            input.launch_template_id.as_deref(),
+            input.launch_template_name.as_deref(),
+        )?;
+
+        // Idempotency: one ClientToken names the one version it created OF THE TEMPLATE it
+        // named, so a repeat of the same request answers with that version instead of
+        // creating a second one, and the same token against another template is a request
+        // about that template rather than a replay of this one. Looked up here and answered
+        // below the DryRun check, because a replay stores nothing and so clears the ceilings
+        // a fresh create has to.
+        let replayed = input.client_token.as_deref().and_then(|token| {
+            store
+                .launch_template_version_client_tokens
+                .get(&(launch_template_id.clone(), token.to_string()))
+                .copied()
+        });
+
+        // "If you specify this parameter, the new version inherits the launch parameters
+        // from the source version … If you omit this parameter, the new version contains
+        // only the launch parameters that you specify for the new version"
+        // (`SourceVersion`). The source has to be a version the template holds, so an alias
+        // or a number it cannot answer is refused before anything is stored.
+        let record = store.launch_templates.get(&launch_template_id).ok_or_else(|| {
+            Scaffolded::internal_error(format!(
+                "launch template '{launch_template_id}' is not stored"
+            ))
+        })?;
+        let data = match input.source_version.as_deref() {
+            None => input.launch_template_data.clone(),
+            Some(source_version) => {
+                let number = resolve_launch_template_version(record, source_version)?;
+                let source = record.versions.get(&number).ok_or_else(|| {
+                    Scaffolded::internal_error(format!(
+                        "launch template version '{number}' is not stored"
+                    ))
+                })?;
+                inherited_launch_template_data(&source.data, &input.launch_template_data)
+            }
+        };
+
+        // "You must specify at least one parameter for the launch template data"
+        // (`smithy_query(query="shape",shape="RequestLaunchTemplateData")`). The member is
+        // `clientOptional`, so the boundary validator lets an empty one through, and an empty
+        // version would store a version that launches nothing. It is the version as it would
+        // be STORED that must carry a parameter, so a request that specifies none but
+        // inherits from a source version is a version of that source's parameters.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateLaunchTemplateVersion"))
+        // The shape carries dozens of members, so emptiness is decided by comparing the data
+        // with a default one rather than by naming each member — which also means a member
+        // the model gains later counts without this check being revisited. The rendering is
+        // used for this comparison only; it is never reported or logged, because `UserData`
+        // is `@sensitive`.
+        if format!("{data:?}") == format!("{:?}", RequestLaunchTemplateData::default()) {
+            return Err(Scaffolded::missing_parameter(
+                "The request must contain at least one parameter for LaunchTemplateData",
+            ));
+        }
+
+        let versions_held = record.versions.len();
+        let spec = LaunchTemplateVersionSpec {
+            // The emulator serves one account, whose root principal is the only one that can
+            // have created anything in it.
+            created_by: ::engine::emulator_arn("iam", "", "root"),
+            create_time: ::std::time::SystemTime::now(),
+            version_description: input.version_description.clone(),
+            data,
+        };
+        let payload_bytes = launch_template_version_payload_bytes(&spec);
+
+        // Every remaining check is READ-ONLY, and a replay clears them all by storing
+        // nothing.
+        if replayed.is_none() {
+            // "The Systems Manager parameter will resolve to an AMI ID on launch"
+            // (`RequestLaunchTemplateData$ImageId`) — and EC2 resolves it HERE, when the
+            // version is created, so a version that could never launch is refused where the
+            // caller can still correct the value. The one reader both template writers share.
+            store.require_resolvable_image_alias(spec.data.image_id.as_deref())?;
+            if versions_held >= MAX_LAUNCH_TEMPLATE_VERSIONS {
+                return Err(launch_template_limit_exceeded(format!(
+                    "Launch template '{launch_template_id}' holds \
+                     {MAX_LAUNCH_TEMPLATE_VERSIONS} versions, which is the most it may hold"
+                )));
+            }
+            if store.would_exceed_stored_bytes(payload_bytes) {
+                return Err(launch_template_limit_exceeded(format!(
+                    "This emulator holds {} of at most {MAX_STORED_BYTES} bytes of \
+                     caller-supplied data, so it cannot store {payload_bytes} more",
+                    store.stored_bytes()
+                )));
+            }
+        }
+
+        // DryRun sits AFTER every parameter has been validated and every read-only check
+        // made, and BEFORE the first write: the flag asks whether the request WOULD have
+        // succeeded, so one that would have been refused is refused with that reason instead,
+        // and one that would have succeeded leaves state untouched.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let version_number = match replayed {
+            Some(version_number) => version_number,
+            None => {
+                let version_number = store
+                    .insert_launch_template_version(&launch_template_id, spec)
+                    .ok_or_else(|| {
+                        Scaffolded::internal_error(format!(
+                            "launch template '{launch_template_id}' is not stored"
+                        ))
+                    })?;
+                if let Some(token) = input.client_token.clone() {
+                    store
+                        .launch_template_version_client_tokens
+                        .insert((launch_template_id.clone(), token), version_number);
+                }
+                version_number
+            }
+        };
+
+        // The response is the STORED version, read back out of the store through the crate's
+        // one projection of one, so this call and `DescribeLaunchTemplateVersions` report the
+        // same version.
+        let record = store.launch_templates.get(&launch_template_id).ok_or_else(|| {
+            Scaffolded::internal_error(format!(
+                "launch template '{launch_template_id}' is not stored"
+            ))
+        })?;
+        let version = record.versions.get(&version_number).ok_or_else(|| {
+            Scaffolded::internal_error(format!(
+                "launch template version '{version_number}' was not stored"
+            ))
+        })?;
+        Ok(CreateLaunchTemplateVersionOutput {
+            launch_template_version: Some(
+                crate::ops::describe_launch_template_versions::launch_template_version_view(
+                    record, version,
+                ),
+            ),
+            // "If the new version of the launch template contains parameters or parameter
+            // combinations that are not valid, an error code and an error message are
+            // returned for each issue that's found"
+            // (`CreateLaunchTemplateVersionResult$Warning`). Every parameter this handler
+            // checks is refused outright rather than warned about, so a stored version has no
+            // findings to report.
+            warning: None,
+        })
+    }
+}
+
+/// The launch parameters of a new version that names a `SourceVersion`: the source version's
+/// parameters, with every parameter the request specified overwriting the inherited one.
+///
+/// "If you specify this parameter, the new version inherits the launch parameters from the
+/// source version. If you specify additional launch parameters for the new version, they
+/// overwrite any corresponding launch parameters inherited from the source version"
+/// (`CreateLaunchTemplateVersionRequest$SourceVersion`) — so the unit of overwriting is the
+/// PARAMETER: a parameter the request carries replaces the source's whole value for it
+/// rather than being merged into it, and one it leaves out is inherited as stored.
+fn inherited_launch_template_data(
+    source: &RequestLaunchTemplateData,
+    specified: &RequestLaunchTemplateData,
+) -> RequestLaunchTemplateData {
+    // Every member of the shape, each taken from the request when the request carries it:
+    // `smithy_query(query="shape",shape="RequestLaunchTemplateData")` lists them, and a
+    // member the model gains later keeps its default here until it is added, so nothing is
+    // silently inherited WRONG.
+    let source = source.clone();
+    let specified = specified.clone();
+    RequestLaunchTemplateData {
+        kernel_id: specified.kernel_id.or(source.kernel_id),
+        ebs_optimized: specified.ebs_optimized.or(source.ebs_optimized),
+        iam_instance_profile: specified.iam_instance_profile.or(source.iam_instance_profile),
+        block_device_mappings: specified
+            .block_device_mappings
+            .or(source.block_device_mappings),
+        network_interfaces: specified.network_interfaces.or(source.network_interfaces),
+        image_id: specified.image_id.or(source.image_id),
+        instance_type: specified.instance_type.or(source.instance_type),
+        key_name: specified.key_name.or(source.key_name),
+        monitoring: specified.monitoring.or(source.monitoring),
+        placement: specified.placement.or(source.placement),
+        ram_disk_id: specified.ram_disk_id.or(source.ram_disk_id),
+        disable_api_termination: specified
+            .disable_api_termination
+            .or(source.disable_api_termination),
+        instance_initiated_shutdown_behavior: specified
+            .instance_initiated_shutdown_behavior
+            .or(source.instance_initiated_shutdown_behavior),
+        user_data: specified.user_data.or(source.user_data),
+        tag_specifications: specified.tag_specifications.or(source.tag_specifications),
+        elastic_gpu_specifications: specified
+            .elastic_gpu_specifications
+            .or(source.elastic_gpu_specifications),
+        elastic_inference_accelerators: specified
+            .elastic_inference_accelerators
+            .or(source.elastic_inference_accelerators),
+        security_group_ids: specified.security_group_ids.or(source.security_group_ids),
+        security_groups: specified.security_groups.or(source.security_groups),
+        instance_market_options: specified
+            .instance_market_options
+            .or(source.instance_market_options),
+        credit_specification: specified.credit_specification.or(source.credit_specification),
+        cpu_options: specified.cpu_options.or(source.cpu_options),
+        capacity_reservation_specification: specified
+            .capacity_reservation_specification
+            .or(source.capacity_reservation_specification),
+        license_specifications: specified
+            .license_specifications
+            .or(source.license_specifications),
+        hibernation_options: specified.hibernation_options.or(source.hibernation_options),
+        metadata_options: specified.metadata_options.or(source.metadata_options),
+        enclave_options: specified.enclave_options.or(source.enclave_options),
+        instance_requirements: specified
+            .instance_requirements
+            .or(source.instance_requirements),
+        private_dns_name_options: specified
+            .private_dns_name_options
+            .or(source.private_dns_name_options),
+        maintenance_options: specified.maintenance_options.or(source.maintenance_options),
+        disable_api_stop: specified.disable_api_stop.or(source.disable_api_stop),
+        operator: specified.operator.or(source.operator),
+        network_performance_options: specified
+            .network_performance_options
+            .or(source.network_performance_options),
+        secondary_interfaces: specified.secondary_interfaces.or(source.secondary_interfaces),
     }
 }

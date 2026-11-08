@@ -1466,9 +1466,10 @@ async fn ids_filters_and_pages_narrow_the_report() {
         );
     }
 
-    // A filter name the operation does not document is refused rather than read as "no
-    // results".
-    let (status, body) = describe(&router, &filters(&[("tag:Name", &["fleet-two"])])).await;
+    // A filter name that is neither one this operation documents nor one of the tag filter
+    // family every describe of a taggable resource answers is refused rather than read as
+    // "no results".
+    let (status, body) = describe(&router, &filters(&[("fleet-name", &["fleet-two"])])).await;
     assert_eq!(
         status, 400,
         "case \"an undocumented filter\": expected HTTP 400, got {status} with body {body}"

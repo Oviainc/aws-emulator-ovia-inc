@@ -320,37 +320,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// ```
 ///
 /// That list's last entry is "`tags` - The tags assigned to the Capacity Block", which EC2
-/// renders as the two tag filters every other describe of this service spells out:
-/// `tag:<key>` for one key's values, and `tag-key` for the keys themselves. `tag:<key>` is
-/// the one name with a variable part, so it is matched by prefix rather than listed here.
-/// Every entry must be answered by [`filter_values`].
-const CAPACITY_BLOCK_FILTERS: [&str; 8] = [
+/// renders as the tag filter family every describe of a taggable resource answers — resolved
+/// by the crate's one resolver ([`crate::state::is_tag_filter_name`]) rather than listed
+/// here, `tag:<key>` carrying the key it selects on in its own name. Every entry below must
+/// be answered by [`filter_values`].
+const CAPACITY_BLOCK_FILTERS: [&str; 7] = [
     "availability-zone",
     "capacity-block-id",
     "create-date",
     "end-date",
     "start-date",
     "state",
-    "tag-key",
     "ultraserver-type",
 ];
-
-/// The prefix of the tag filter: the tag key is part of the filter NAME, and the values it
-/// selects on are the filter's values.
-const TAG_FILTER_PREFIX: &str = "tag:";
 
 /// The name [`filter_values`] answers for the filter the request called `name`, or `None`
 /// when this operation documents no such filter.
 ///
-/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact — and a
-/// `tag:` prefix with no key names no tag, so it is as undocumented as any other
-/// misspelling. The `tag:<key>` family keeps its whole name, the key being part of what it
-/// selects on.
+/// "Filter names are case-sensitive" (`Filter$Name`), so every comparison is exact — and the
+/// tag filter family is resolved by the crate's one resolver, where a `tag:` prefix with no
+/// key names no tag and so is as undocumented as any other misspelling. A family name keeps
+/// its whole spelling, the key of a `tag:<key>` being part of what it selects on.
 fn canonical_filter_name(name: &str) -> Option<&str> {
-    if name
-        .strip_prefix(TAG_FILTER_PREFIX)
-        .is_some_and(|key| !key.is_empty())
-    {
+    if crate::state::is_tag_filter_name(name) {
         return Some(name);
     }
     CAPACITY_BLOCK_FILTERS.contains(&name).then_some(name)
@@ -365,14 +357,12 @@ fn canonical_filter_name(name: &str) -> Option<&str> {
 fn filter_values<'a>(block: &'a CapacityBlock, name: &str) -> Vec<::std::borrow::Cow<'a, str>> {
     use ::std::borrow::Cow;
 
-    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
-        return block
-            .tags
-            .iter()
-            .flatten()
-            .filter(|tag| tag.key.as_deref() == Some(key))
-            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
-            .collect();
+    // The tag filter family, read off the block's own `tagSet` by the crate's one resolver so
+    // every describe that answers it reads a tag list the same way.
+    if let Some(values) =
+        crate::state::tag_filter_values(name, block.tags.as_deref().unwrap_or_default())
+    {
+        return values;
     }
 
     let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
@@ -385,12 +375,6 @@ fn filter_values<'a>(block: &'a CapacityBlock, name: &str) -> Vec<::std::borrow:
         "end-date" => crate::state::filter_timestamp_values(block.end_date),
         "start-date" => crate::state::filter_timestamp_values(block.start_date),
         "state" => text(block.state.as_deref()),
-        "tag-key" => block
-            .tags
-            .iter()
-            .flatten()
-            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
-            .collect(),
         "ultraserver-type" => text(block.ultraserver_type.as_deref()),
         // Unreachable: `canonical_filter_name` has already refused every other name. An
         // undefined name compares against nothing, so it could never widen a result even if

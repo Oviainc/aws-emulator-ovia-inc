@@ -1448,6 +1448,52 @@ impl ComAmazonawsEc2Amazonec2State {
         launch_template_id
     }
 
+    /// Store a new version of the launch template `launch_template_id` names, and answer the
+    /// version number it was given — `None` when the account holds no such template.
+    ///
+    /// Everything the service itself owns is derived here rather than taken from the caller:
+    /// "launch template versions are numbered in the order in which they are created"
+    /// (`CreateLaunchTemplateVersion`), so the number is the template's latest plus one, and
+    /// storing it is what moves `LaunchTemplate$LatestVersionNumber`. The template's DEFAULT
+    /// version is left where it is: a new version is not the default one until something
+    /// makes it so. The bytes the version retains are counted into the store's budget here as
+    /// well, on the record a delete of the template gives back in one piece.
+    pub fn insert_launch_template_version(
+        &mut self,
+        launch_template_id: &str,
+        spec: LaunchTemplateVersionSpec,
+    ) -> Option<i64> {
+        let payload_bytes = launch_template_version_payload_bytes(&spec);
+        let record = self.launch_templates.get_mut(launch_template_id)?;
+        // The version AFTER every version the template holds, so a number is never reused
+        // even if the latest version has since been deleted — and a record holding no version
+        // at all is numbered from [`FIRST_LAUNCH_TEMPLATE_VERSION`], the number the first
+        // version of a template carries.
+        let version_number = record
+            .versions
+            .keys()
+            .next_back()
+            .copied()
+            .max(record.template.latest_version_number)
+            .unwrap_or(FIRST_LAUNCH_TEMPLATE_VERSION - 1)
+            .saturating_add(1);
+        record.versions.insert(
+            version_number,
+            LaunchTemplateVersionRecord {
+                version_number,
+                version_description: spec.version_description,
+                create_time: spec.create_time,
+                created_by: spec.created_by,
+                default_version: record.template.default_version_number == Some(version_number),
+                data: spec.data,
+            },
+        );
+        record.template.latest_version_number = Some(version_number);
+        record.payload_bytes = record.payload_bytes.saturating_add(payload_bytes);
+        self.add_stored_bytes(payload_bytes);
+        Some(version_number)
+    }
+
     /// The id of the launch template this account holds under `name`, if it holds one.
     ///
     /// A scan of the store, which [`MAX_LAUNCH_TEMPLATES`] bounds; a name names at most one
@@ -1474,6 +1520,8 @@ impl ComAmazonawsEc2Amazonec2State {
         let record = self.launch_templates.remove(launch_template_id)?;
         self.launch_template_client_tokens
             .retain(|_, minted| minted != launch_template_id);
+        self.launch_template_version_client_tokens
+            .retain(|(minted, _), _| minted != launch_template_id);
         self.release_stored_bytes(record.payload_bytes);
         Some(record)
     }
@@ -2587,6 +2635,35 @@ pub fn launch_template_payload_bytes(spec: &LaunchTemplateSpec) -> usize {
         + spec.version_description.as_ref().map_or(0, String::len)
         + tag_list_bytes(&spec.tags)
         + format!("{:?}", spec.data).len()
+}
+
+/// One new version of a stored launch template as a writer asks for it: the members a
+/// creator chooses. The version NUMBER is not among them — it is minted by
+/// [`ComAmazonawsEc2Amazonec2State::insert_launch_template_version`], because "you can't
+/// specify, change, or replace the numbering of launch template versions"
+/// (`CreateLaunchTemplateVersion`).
+#[derive(Debug, Clone)]
+pub struct LaunchTemplateVersionSpec {
+    /// The principal that created the version, as `LaunchTemplateVersion$CreatedBy` reports
+    /// it.
+    pub created_by: String,
+    /// When it was created.
+    pub create_time: SystemTime,
+    /// The description the caller gave the version, if it gave one.
+    pub version_description: Option<String>,
+    /// The version's launch parameters, exactly as the request carried them.
+    pub data: RequestLaunchTemplateData,
+}
+
+/// The caller-chosen bytes one stored launch template VERSION retains.
+///
+/// The same measure [`launch_template_payload_bytes`] takes of a template's first version,
+/// for the versions created after it: the `Debug` rendering visits every member of the whole
+/// `RequestLaunchTemplateData` and its length grows with all of them, which is the measure
+/// the store's byte ceiling needs. It is used to decide whether the version fits, never
+/// reported to anyone.
+pub fn launch_template_version_payload_bytes(spec: &LaunchTemplateVersionSpec) -> usize {
+    spec.version_description.as_ref().map_or(0, String::len) + format!("{:?}", spec.data).len()
 }
 
 /// Whether `id` is a well-formed launch template id.

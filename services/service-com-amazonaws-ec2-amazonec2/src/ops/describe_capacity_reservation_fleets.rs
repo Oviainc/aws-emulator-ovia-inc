@@ -146,7 +146,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             capacity_reservation_fleet_id_is_well_formed, decode_page_token, encode_page_token,
             invalid_capacity_reservation_fleet_id_malformed,
             invalid_capacity_reservation_fleet_id_not_found, invalid_pagination_token_for,
-            require_service_state, CompiledFilter, MatchBudget, MAX_FILTERS,
+            is_tag_filter_name, require_service_state, CompiledFilter, MatchBudget, MAX_FILTERS,
             MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES, MAX_RESOURCE_IDS,
         };
 
@@ -192,7 +192,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
         for filter in filters {
             let name = filter.name.as_deref().unwrap_or_default();
-            if !CAPACITY_RESERVATION_FLEET_FILTERS.contains(&name) {
+            if !is_tag_filter_name(name) && !CAPACITY_RESERVATION_FLEET_FILTERS.contains(&name) {
                 return Err(Scaffolded::invalid_parameter_value(format!(
                     "The filter '{name}' is invalid"
                 )));
@@ -341,9 +341,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// smithy_query(query="doc",shape="DescribeCapacityReservationFleetsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
 /// ```
 ///
-/// That list is exactly these four — this operation documents NO tag filter, unlike the
-/// describes that do, so `tag:<key>` is as undocumented here as any other misspelling. Every
-/// entry must be answered by [`filter_values`].
+/// That list is exactly these four. The member enumerates no tag filter, but a Fleet carries
+/// tags (`CapacityReservationFleet$Tags`, `tagSet`) and EC2 answers the `tag:<key>` /
+/// `tag-key` / `tag-value` family on every describe of a resource that does, so those names
+/// are resolved by the crate's one resolver ([`crate::state::is_tag_filter_name`]) rather
+/// than listed here, the key of a `tag:<key>` being part of what it selects on. Every entry
+/// must be answered by [`filter_values`].
 const CAPACITY_RESERVATION_FLEET_FILTERS: [&str; 4] = [
     "allocation-strategy",
     "instance-match-criteria",
@@ -361,12 +364,20 @@ const MAX_FLEETS_PER_PAGE: usize = 100;
 ///
 /// A filter naming an attribute this Fleet does not carry compares against NO values, so it
 /// selects nothing — the same answer AWS gives for any member a resource has not got.
-/// `name` is one of [`CAPACITY_RESERVATION_FLEET_FILTERS`].
+/// `name` is one of [`CAPACITY_RESERVATION_FLEET_FILTERS`] or a tag filter.
 fn filter_values<'a>(
     fleet: &'a CapacityReservationFleet,
     name: &str,
 ) -> Vec<::std::borrow::Cow<'a, str>> {
     use ::std::borrow::Cow;
+
+    // The tag filter family, read off the Fleet's own `tagSet` by the crate's one resolver so
+    // every describe that answers it reads a tag list the same way.
+    if let Some(values) =
+        crate::state::tag_filter_values(name, fleet.tags.as_deref().unwrap_or_default())
+    {
+        return values;
+    }
 
     let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
         value.map(Cow::Borrowed).into_iter().collect()

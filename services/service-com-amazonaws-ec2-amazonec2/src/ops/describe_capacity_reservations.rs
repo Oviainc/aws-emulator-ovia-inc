@@ -155,7 +155,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             availability_zones_in_region, capacity_reservation_is_in_region, decode_page_token,
-            encode_page_token, invalid_pagination_token_for, request_region,
+            encode_page_token, invalid_pagination_token_for, is_tag_filter_name, request_region,
             require_capacity_reservation_in_region, require_service_state, CompiledFilter,
             MatchBudget, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES,
             MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE, MAX_RESOURCE_IDS,
@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
         for filter in filters {
             let name = filter.name.as_deref().unwrap_or_default();
-            if !CAPACITY_RESERVATION_FILTERS.contains(&name) {
+            if !is_tag_filter_name(name) && !CAPACITY_RESERVATION_FILTERS.contains(&name) {
                 return Err(Scaffolded::invalid_parameter_value(format!(
                     "The filter '{name}' is invalid"
                 )));
@@ -345,9 +345,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// smithy_query(query="doc",shape="DescribeCapacityReservationsRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
 /// ```
 ///
-/// That list is the whole set — unlike several other describes of this service, it names no
-/// tag filter — and every entry must be answered by [`filter_values`]. "Filter names are
-/// case-sensitive" (`Filter$Name`), so every comparison against it is exact.
+/// That list is the whole set the member enumerates. It names no tag filter, but a
+/// reservation carries tags (`CapacityReservation$Tags`, `tagSet`) and EC2 answers the
+/// `tag:<key>` / `tag-key` / `tag-value` family on every describe of a resource that does, so
+/// those names are resolved by the crate's one resolver
+/// ([`crate::state::is_tag_filter_name`]) rather than listed here, the key of a `tag:<key>`
+/// being part of what it selects on. Every other entry must be answered by
+/// [`filter_values`]. "Filter names are case-sensitive" (`Filter$Name`), so every comparison
+/// against it is exact.
 const CAPACITY_RESERVATION_FILTERS: [&str; 12] = [
     "availability-zone",
     "end-date",
@@ -367,12 +372,21 @@ const CAPACITY_RESERVATION_FILTERS: [&str; 12] = [
 ///
 /// A filter naming an attribute this reservation does not carry compares against NO values,
 /// so it selects nothing — which is the answer for `outpost-arn` on a reservation that was
-/// not created on an Outpost. `name` is one of [`CAPACITY_RESERVATION_FILTERS`].
+/// not created on an Outpost. `name` is one of [`CAPACITY_RESERVATION_FILTERS`] or a tag
+/// filter.
 fn filter_values<'a>(
     reservation: &'a CapacityReservation,
     name: &str,
 ) -> Vec<::std::borrow::Cow<'a, str>> {
     use ::std::borrow::Cow;
+
+    // The tag filter family, read off the reservation's own `tagSet` by the crate's one
+    // resolver so every describe that answers it reads a tag list the same way.
+    if let Some(values) =
+        crate::state::tag_filter_values(name, reservation.tags.as_deref().unwrap_or_default())
+    {
+        return values;
+    }
 
     let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
         value.map(Cow::Borrowed).into_iter().collect()

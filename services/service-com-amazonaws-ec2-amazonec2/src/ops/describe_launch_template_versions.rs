@@ -517,9 +517,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        // Page in (launch template id, version number) order, which the cursor below names
-        // a position in: the one order every page of one request is cut in, whichever
-        // templates it spans.
+        // Page in (launch template id, version number newest first) order, which the cursor
+        // below names a position in: the one order every page of one request is cut in,
+        // whichever templates it spans.
         selected.sort_by_key(page_cursor);
         let from = match start_at.as_deref() {
             None => 0,
@@ -614,13 +614,18 @@ fn version_bound(
 }
 
 /// The position of `view` in the one order a page of this operation is cut in: its
-/// template's id, then its version number — zero-padded, so the text order the cursor is
-/// compared in is the numeric order of the versions.
+/// template's id, then its version number NEWEST FIRST — the order AWS reports a template's
+/// versions in, version 2 ahead of version 1.
+///
+/// A version's position is its number's DISTANCE from the largest number a version can
+/// carry, zero-padded, so the text order the cursor is compared in is the descending numeric
+/// order of the versions: a page's token then names the next version of the SAME order the
+/// page was cut in, whichever templates the request spans.
 fn page_cursor(view: &LaunchTemplateVersion) -> String {
     format!(
         "{}#{:020}",
         view.launch_template_id.as_deref().unwrap_or_default(),
-        view.version_number.unwrap_or_default()
+        i64::MAX.saturating_sub(view.version_number.unwrap_or_default())
     )
 }
 
@@ -756,7 +761,11 @@ pub use crate::state::{SSM_IMAGE_ALIAS_PREFIX, ssm_image_alias_parameter};
 /// disagree about which version is the default one. `Operator` is the template's: "the
 /// entity that manages the launch template" is a fact of the template, and every version of
 /// it is managed by the same entity.
-fn launch_template_version_view(
+///
+/// The crate's ONE projection of a stored version, so the operation that CREATES a version
+/// (`crate::ops::create_launch_template_version`) reports exactly what this report reads
+/// back for it.
+pub(crate) fn launch_template_version_view(
     record: &crate::state::LaunchTemplateRecord,
     version: &crate::state::LaunchTemplateVersionRecord,
 ) -> LaunchTemplateVersion {
@@ -771,7 +780,15 @@ fn launch_template_version_view(
             record.template.default_version_number == Some(version.version_number),
         ),
         launch_template_data: Some(response_launch_template_data(&version.data)),
-        operator: record.template.operator.clone(),
+        // "The entity that manages the launch template" is a fact of the template, and
+        // `OperatorResponse$Managed` is "if true, the resource is managed by a service
+        // provider" — so a template no provider manages is reported as managed BY NOBODY
+        // rather than with the member left out, there being nothing unknown about it.
+        operator: Some(record.template.operator.clone().unwrap_or(OperatorResponse {
+            managed: Some(false),
+            principal: None,
+            hidden_by_default: None,
+        })),
     }
 }
 

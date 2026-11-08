@@ -845,12 +845,11 @@ mod describe_launch_template_versions {
     //! (number or the `$Latest`/`$Default` alias), by version range, by the documented filters
     //! and by page. Each table row is a distinct input along what that generalises over.
     //!
-    //! `CreateLaunchTemplateVersion` is still a scaffold stub
-    //! (`issues/things-that-do-not-work/…-ec2-createlaunchtemplateversion-stub.md`), so a
-    //! template with MORE than one version cannot be built through the API yet: the suites
-    //! below seed the extra versions into the store that
-    //! [`ec2::state::ComAmazonawsEc2Amazonec2State::launch_templates`] holds, which is the same
-    //! record `CreateLaunchTemplate` writes and this operation reads.
+    //! `CreateLaunchTemplateVersion` creates the versions after the first, so the suites below
+    //! that need a template with MANY versions seed the extra ones into the store that
+    //! [`ec2::state::ComAmazonawsEc2Amazonec2State::launch_templates`] holds — the same record
+    //! both template writers write and this operation reads — which is also how a version with
+    //! a chosen create time or a since-withdrawn image alias is put there.
 
     use std::time::{Duration, SystemTime};
 
@@ -1177,19 +1176,19 @@ mod describe_launch_template_versions {
         let versions = |values: &[&str]| indexed("LaunchTemplateVersion", values);
 
         let rows: Vec<SelectionRow> = vec![
-            ("no version named: every version", Vec::new(), vec![1, 2, 3, 4, 5]),
+            ("no version named: every version", Vec::new(), vec![5, 4, 3, 2, 1]),
             ("the $Latest alias", versions(&["$Latest"]), vec![5]),
             ("the $Default alias", versions(&["$Default"]), vec![3]),
             (
                 "both aliases in one request",
                 versions(&["$Latest", "$Default"]),
-                vec![3, 5],
+                vec![5, 3],
             ),
             ("one number", versions(&["2"]), vec![2]),
             (
-                "numbers out of order are reported in order",
+                "numbers out of order are reported newest first",
                 versions(&["4", "2"]),
-                vec![2, 4],
+                vec![4, 2],
             ),
             (
                 "a number repeated names one version",
@@ -1199,18 +1198,18 @@ mod describe_launch_template_versions {
             (
                 "a number and an alias",
                 versions(&["1", "$Latest"]),
-                vec![1, 5],
+                vec![5, 1],
             ),
             // "The version number AFTER WHICH to describe launch template versions"
             // (`MinVersion`) against "the version number UP TO WHICH to describe launch
             // template versions" (`MaxVersion`): the lower edge is exclusive and the upper
             // edge inclusive, so a bound pair names the half-open range after Min through Max.
-            ("MinVersion alone", vec![p("MinVersion", "3")], vec![4, 5]),
-            ("MaxVersion alone", vec![p("MaxVersion", "2")], vec![1, 2]),
+            ("MinVersion alone", vec![p("MinVersion", "3")], vec![5, 4]),
+            ("MaxVersion alone", vec![p("MaxVersion", "2")], vec![2, 1]),
             (
                 "both bounds",
                 vec![p("MinVersion", "2"), p("MaxVersion", "4")],
-                vec![3, 4],
+                vec![4, 3],
             ),
             (
                 "a bound past the versions held",
@@ -1220,17 +1219,17 @@ mod describe_launch_template_versions {
             (
                 "the first version is reported only when MinVersion is below it",
                 vec![p("MinVersion", "0"), p("MaxVersion", "5")],
-                vec![1, 2, 3, 4, 5],
+                vec![5, 4, 3, 2, 1],
             ),
             (
                 "MinVersion names the last version left out",
                 vec![p("MinVersion", "1"), p("MaxVersion", "5")],
-                vec![2, 3, 4, 5],
+                vec![5, 4, 3, 2],
             ),
             (
                 "MaxVersion names the last version reported",
                 vec![p("MaxVersion", "5")],
-                vec![1, 2, 3, 4, 5],
+                vec![5, 4, 3, 2, 1],
             ),
             (
                 "named versions outside the bound are left out",
@@ -1433,7 +1432,7 @@ mod describe_launch_template_versions {
         let reported = reported_versions(&body);
         assert_eq!(
             reported,
-            vec![1, 2, 3, 4, 5],
+            vec![5, 4, 3, 2, 1],
             "after the dry runs: expected the five versions, got {reported:?}"
         );
     }
@@ -1599,8 +1598,8 @@ mod describe_launch_template_versions {
             2,
         );
 
-        // Paged in (template id, version number) order, and the ids are minted in creation
-        // order, so the expected rows are written in that order.
+        // Paged in (template id, version number newest first) order, and the ids are minted
+        // in creation order, so the expected rows are written in that order.
         let rows: Vec<AccountRow> = vec![
             (
                 "the latest version of every template",
@@ -1617,10 +1616,10 @@ mod describe_launch_template_versions {
                 vec!["$Latest", "$Default"],
                 vec![
                     (first.clone(), 1),
-                    (second.clone(), 1),
                     (second.clone(), 2),
-                    (third.clone(), 2),
+                    (second.clone(), 1),
                     (third.clone(), 3),
+                    (third.clone(), 2),
                 ],
             ),
         ];
@@ -1844,12 +1843,12 @@ mod describe_launch_template_versions {
             ("iam-instance-profile", vec![profile_arn], vec![1]),
             ("iam-instance-profile", vec!["*web-tier"], vec![1]),
             ("image-id", vec!["ami-00000000000000001"], vec![1]),
-            ("image-id", vec!["ami-*"], vec![1, 2]),
-            ("image-id", vec!["ami-0000000000000000?"], vec![1, 2]),
+            ("image-id", vec!["ami-*"], vec![2, 1]),
+            ("image-id", vec!["ami-0000000000000000?"], vec![2, 1]),
             ("image-id", vec!["ami-00000000000000003"], Vec::new()),
             ("instance-type", vec!["t3.micro"], vec![1]),
             // Several values of one filter are joined with OR.
-            ("instance-type", vec!["t3.micro", "t3.small"], vec![1, 2]),
+            ("instance-type", vec!["t3.micro", "t3.small"], vec![2, 1]),
             ("is-default-version", vec!["true"], vec![1]),
             ("is-default-version", vec!["false"], vec![2]),
             ("kernel-id", vec!["aki-00000000000000001"], vec![1]),
@@ -1947,7 +1946,7 @@ mod describe_launch_template_versions {
         let (router, engine) = crate::ec2_query::emulator();
         let launch_template_id =
             template_with_five_versions(&router, &engine, "paging.five").await;
-        let all: Vec<i64> = vec![1, 2, 3, 4, 5];
+        let all: Vec<i64> = vec![5, 4, 3, 2, 1];
 
         for page_size in 1..=6 {
             let case = format!("MaxResults={page_size}");

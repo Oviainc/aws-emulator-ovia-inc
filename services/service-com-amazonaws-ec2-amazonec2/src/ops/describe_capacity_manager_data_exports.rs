@@ -98,7 +98,7 @@ use std::collections::BTreeSet;
 
 use crate::state::{
     CompiledFilter, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES, MAX_FILTER_VALUE_BYTES,
-    MAX_PAGE_SIZE, MAX_RESOURCE_IDS, MatchBudget, TAG_FILTER_PREFIX,
+    MAX_PAGE_SIZE, MAX_RESOURCE_IDS, MatchBudget,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -389,8 +389,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// (`smithy_query(query="doc",shape="DescribeCapacityManagerDataExportsRequest",member="Filters")`)
 /// — so the names are EC2's own convention for a resource that publishes none: each member of
 /// the described shape (`CapacityManagerDataExportResponse`) under its kebab-cased name,
-/// which covers the three the member names, plus the [`TAG_FILTER_PREFIX`] and
-/// [`TAG_KEY_FILTER`] pair every EC2 describe answers. Every entry must be answered by
+/// which covers the three the member names, beside the tag filter family every EC2 describe
+/// of a taggable resource answers, which the crate's one resolver
+/// ([`crate::state::is_tag_filter_name`]) accepts and reads. Every entry must be answered by
 /// [`filter_values`].
 const CAPACITY_MANAGER_DATA_EXPORT_FILTERS: [&str; 10] = [
     "capacity-manager-data-export-id",
@@ -405,17 +406,12 @@ const CAPACITY_MANAGER_DATA_EXPORT_FILTERS: [&str; 10] = [
     "schedule",
 ];
 
-/// The tag filter whose values are the KEYS a configuration carries, rather than one key's
-/// value.
-const TAG_KEY_FILTER: &str = "tag-key";
-
 /// Is `name` a filter this operation answers? "Filter names are case-sensitive"
-/// (`Filter$Name`), so the comparison is exact — and a `tag:` prefix with no key names no
-/// tag, so it is as undocumented as any other misspelling.
+/// (`Filter$Name`), so the comparison is exact — and the tag filter family is resolved by the
+/// crate's one resolver, where a `tag:` prefix with no key names no tag and so is as
+/// undocumented as any other misspelling.
 fn is_documented_filter(name: &str) -> bool {
-    name.strip_prefix(TAG_FILTER_PREFIX)
-        .is_some_and(|key| !key.is_empty())
-        || name == TAG_KEY_FILTER
+    crate::state::is_tag_filter_name(name)
         || CAPACITY_MANAGER_DATA_EXPORT_FILTERS.contains(&name)
 }
 
@@ -429,14 +425,12 @@ fn filter_values<'a>(
     export: &'a CapacityManagerDataExportResponse,
     name: &str,
 ) -> Vec<Cow<'a, str>> {
-    if let Some(key) = name.strip_prefix(TAG_FILTER_PREFIX) {
-        return export
-            .tags
-            .iter()
-            .flatten()
-            .filter(|tag| tag.key.as_deref() == Some(key))
-            .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
-            .collect();
+    // The tag filter family, read off the configuration's own `tagSet` by the crate's one
+    // resolver so every describe that answers it reads a tag list the same way.
+    if let Some(values) =
+        crate::state::tag_filter_values(name, export.tags.as_deref().unwrap_or_default())
+    {
+        return values;
     }
 
     let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
@@ -455,12 +449,6 @@ fn filter_values<'a>(
         "s3-bucket-name" => text(export.s3_bucket_name.as_deref()),
         "s3-bucket-prefix" => text(export.s3_bucket_prefix.as_deref()),
         "schedule" => text(export.schedule.as_deref()),
-        TAG_KEY_FILTER => export
-            .tags
-            .iter()
-            .flatten()
-            .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
-            .collect(),
         // Unreachable: `is_documented_filter` has already refused every other name. An
         // undefined name compares against nothing, so it could never widen a result even if
         // that check were bypassed.

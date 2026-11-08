@@ -691,6 +691,68 @@ pub fn filter_timestamp_values(
         .collect()
 }
 
+/// The tag filter whose values are the KEYS a resource carries, rather than one key's
+/// value: "`tag-key` - The key of a tag assigned to the … Use this filter to find all …
+/// that have a tag with a specific key, regardless of the tag value"
+/// (`smithy_query(query="doc",shape="DescribeInstanceEventWindowsRequest",member="Filters")`,
+/// which spells the whole family out).
+pub const TAG_KEY_FILTER: &str = "tag-key";
+
+/// The tag filter whose values are the VALUES a resource carries, whatever key they are
+/// under: "`tag-value` - The value of a tag assigned to the … regardless of the tag key"
+/// (same member).
+pub const TAG_VALUE_FILTER: &str = "tag-value";
+
+/// Is `name` one of the tag filter family — `tag:<key>`, [`TAG_KEY_FILTER`] or
+/// [`TAG_VALUE_FILTER`]?
+///
+/// The family every EC2 describe over a resource that carries tags answers, whether or not
+/// that operation's own `Filters` member enumerates it, so it is resolved in ONE place and
+/// not re-spelled per describe. "Filter names are case-sensitive" (`Filter$Name`), so the
+/// comparison is exact — and a `tag:` prefix with no key names no tag, so it is as
+/// undocumented as any other misspelling.
+pub fn is_tag_filter_name(name: &str) -> bool {
+    name.strip_prefix(TAG_FILTER_PREFIX)
+        .is_some_and(|key| !key.is_empty())
+        || name == TAG_KEY_FILTER
+        || name == TAG_VALUE_FILTER
+}
+
+/// The values a tag filter named `name` compares against `tags`, or `None` when `name` is
+/// not a tag filter at all.
+///
+/// The counterpart of [`is_tag_filter_name`] for [`matches_every_filter`]'s `values_of`: a
+/// describe asks this first and falls through to its own members when the answer is `None`,
+/// so the family is read off a resource's tag list the same way wherever it is answered. A
+/// resource carrying no tag of the key the name names compares against NO values, so it
+/// selects nothing — the same answer EC2 gives for any attribute a resource has not got.
+pub fn tag_filter_values<'a>(name: &str, tags: &'a [Tag]) -> Option<Vec<Cow<'a, str>>> {
+    if let Some(key) = name
+        .strip_prefix(TAG_FILTER_PREFIX)
+        .filter(|key| !key.is_empty())
+    {
+        return Some(
+            tags.iter()
+                .filter(|tag| tag.key.as_deref() == Some(key))
+                .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+                .collect(),
+        );
+    }
+    match name {
+        TAG_KEY_FILTER => Some(
+            tags.iter()
+                .filter_map(|tag| tag.key.as_deref().map(Cow::Borrowed))
+                .collect(),
+        ),
+        TAG_VALUE_FILTER => Some(
+            tags.iter()
+                .filter_map(|tag| tag.value.as_deref().map(Cow::Borrowed))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 /// Refuse a request member's value the way EC2 does: HTTP 400 `InvalidParameterValue`,
 /// with a message naming the value at fault.
 pub fn invalid_parameter_value<E>(message: impl Into<String>) -> crate::scaffolded::Scaffolded<E> {

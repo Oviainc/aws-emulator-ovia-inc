@@ -908,6 +908,14 @@ pub const LAUNCH_TEMPLATE_LIMIT_EXCEEDED: &str = "LaunchTemplateLimitExceeded";
 /// many times a caller creates one.
 pub const MAX_LAUNCH_TEMPLATES: usize = 5_000;
 
+/// The most versions one launch template may hold in this emulator.
+///
+/// CHOSEN, not an AWS-documented quota: the store keeps every version's whole
+/// `RequestLaunchTemplateData`, so without a per-template ceiling one template could grow
+/// without bound. It is what `CreateLaunchTemplateVersion` refuses past with
+/// [`LAUNCH_TEMPLATE_LIMIT_EXCEEDED`], beside the store's own byte budget.
+pub const MAX_LAUNCH_TEMPLATE_VERSIONS: usize = 1_000;
+
 /// The fewest characters a launch template name may carry: the `@length` minimum of the
 /// modelled `LaunchTemplateName`
 /// (`smithy_query(query="shape",shape="LaunchTemplateName")`), which is the type every
@@ -2009,6 +2017,12 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// one. Cleared for a template a delete removes, so the token cannot name a template
     /// that is gone.
     pub launch_template_client_tokens: HashMap<String, String>,
+    /// A `CreateLaunchTemplateVersion` `ClientToken` and the version number it minted, keyed
+    /// by the launch template the create named, so a repeat of the same request answers with
+    /// that version instead of creating a second one — and a token reused against ANOTHER
+    /// template never answers with this one's version. Cleared with the template a delete
+    /// removes, so the token cannot name a version that is gone.
+    pub launch_template_version_client_tokens: HashMap<(String, String), i64>,
     /// Monotonic source of generated resource-id suffixes, so an id is unique within a
     /// run and deterministic across runs.
     pub id_counter: u64,
@@ -3268,6 +3282,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             security_group_vpc_associations: BTreeMap::new(),
             launch_templates: BTreeMap::new(),
             launch_template_client_tokens: HashMap::new(),
+            launch_template_version_client_tokens: HashMap::new(),
             id_counter: 0,
             volumes: BTreeMap::new(),
             volume_client_tokens: HashMap::new(),

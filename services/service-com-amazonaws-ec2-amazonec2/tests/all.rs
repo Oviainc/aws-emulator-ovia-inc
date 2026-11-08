@@ -1617,6 +1617,16 @@ mod account_wide_read_authorization;
 // reported it, and every sibling left as resolvable as it was. Declared beside
 #[path = "all/delete_launch_template_resolution.rs"]
 mod delete_launch_template_resolution;
+// The tag filter family on the describes of a taggable resource: `tag:<key>`, `tag-key` and
+// `tag-value` over the tags a Capacity Reservation and a Capacity Reservation Fleet really
+// hold, and the names outside the documented set and the family that are still refused.
+#[path = "all/capacity_reservation_tag_filters.rs"]
+mod capacity_reservation_tag_filters;
+// `CreateLaunchTemplateVersion`: the versions after the first, what a `SourceVersion`
+// inherits, and the versions one `DescribeLaunchTemplateVersions` then reports, newest
+// first.
+#[path = "all/launch_template_versions.rs"]
+mod launch_template_versions;
 // What `DescribeAccountAttributes` reports about the ACCOUNT: every attribute the operation
 // documents with the value the account holds for it, `default-vpc` asserted against the VPC
 // the same Region's `DescribeVpcs` reports, the narrowing `AttributeNames` does, and the
