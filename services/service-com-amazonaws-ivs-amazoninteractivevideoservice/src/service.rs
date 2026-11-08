@@ -92,19 +92,33 @@
 //! because `override_operation` answers `None` for a key it does not hold and the
 //! generated table serves it unchanged.
 //!
+//! A sixth seam, `override_protocol`, is one this service DOES take: the codec every
+//! modelled response is rendered through. It is the model's own `restJson1` in every
+//! respect but one — every channel object this service serves carries the
+//! failover-slate configuration ARN the wire response carries and this model revision
+//! declares on neither channel shape. See [`channel_projection`] for that rule; it is
+//! applied here, at the one place every response of this service passes through, rather
+//! than per operation, because no handler can reach the rendering of its own output and
+//! no generated shape can carry a member its model does not declare.
+//!
 //! The model-derived half of this service — its identity, wire protocol, routing
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+mod channel_projection;
+
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema::serde::SerdeError;
-use aws_smithy_schema_server::constraints;
+use aws_smithy_schema::Schema;
+use aws_smithy_schema_server::{constraints, ProtocolError, ServerProtocol};
 use smithy_server_runtime::{
     http, BoxFuture, DeserializableStruct, ErasedOperation, Operation, OperationContext,
     OperationRoutingTable, Refusal, Refused, ServerHttpProtocol, Service, Violation,
 };
 use std::sync::Arc;
+
+use channel_projection::ChannelProjection;
 
 /// The wire error code for a request this service refuses as invalid: the shape
 /// `com.amazonaws.ivs#ValidationException`, which every operation of this service lists.
@@ -675,6 +689,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         self.stated_refusals.get(key)
     }
 
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own protocol, with the channel projection below applied to every
+        // modelled response. Implemented on the service itself, so the protocol it
+        // delegates to is the generated entry's own and there is no second routing table
+        // to drift from the model.
+        Some(self)
+    }
+
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
         // `StatedEnvelope` states a constraint refusal itself, from the operation that
         // was refused, so this seam is only reached for a refusal NO operation owns —
@@ -713,5 +735,95 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+}
+
+/// The protocol this service answers modelled requests in: the model's own, with the one
+/// wire projection [`channel_projection`] states.
+///
+/// Implemented on the service itself because the model-derived protocol it delegates to is
+/// owned by the generated entry and reached by reference (`self.entry.protocol()`), and
+/// [`Service::override_protocol`] hands back a borrow of `&self` — so there is one
+/// protocol instance, the generated one, and no second routing table to drift from the
+/// model.
+impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
+    type Request = RtRequest;
+    type Response = RtResponse;
+
+    fn protocol_id(&self) -> &aws_smithy_schema::ShapeId {
+        self.entry.protocol().protocol_id()
+    }
+
+    fn routing_key<'a>(&self, request: &'a RtRequest) -> Result<&'a str, ProtocolError> {
+        self.entry.protocol().routing_key(request)
+    }
+
+    fn deserialize_input<'a>(
+        &self,
+        request: &'a RtRequest,
+        input_schema: &Schema,
+    ) -> Result<Box<dyn aws_smithy_schema::serde::ShapeDeserializer + 'a>, ProtocolError> {
+        // The REQUEST side is the framework's own: the projection is about what a channel
+        // object REPORTS, and no input member of this model carries it.
+        self.entry
+            .protocol()
+            .deserialize_input(request, input_schema)
+    }
+
+    fn serialize_output(
+        &self,
+        output: &dyn aws_smithy_schema::serde::SerializableStruct,
+        output_schema: &Schema,
+        operation_name: &str,
+        success_status: u16,
+    ) -> Result<RtResponse, ProtocolError> {
+        // The status, the headers and every modelled member stay the framework's: only a
+        // channel object gains the configuration ARN its shape does not declare, from the
+        // record the handler already returned.
+        self.entry.protocol().serialize_output(
+            &ChannelProjection::new(output),
+            output_schema,
+            operation_name,
+            success_status,
+        )
+    }
+
+    fn serialize_error(
+        &self,
+        error: &dyn aws_smithy_schema::serde::SerializableStruct,
+        error_schema: &Schema,
+        error_code: &str,
+        http_status: u16,
+    ) -> Result<RtResponse, ProtocolError> {
+        // No error shape of this model carries a channel, so a failure is rendered exactly
+        // as the framework renders it.
+        self.entry
+            .protocol()
+            .serialize_error(error, error_schema, error_code, http_status)
+    }
+
+    fn serialize_event_stream_message(
+        &self,
+        event_type: &str,
+        is_exception: bool,
+        event: &dyn aws_smithy_schema::serde::SerializableStruct,
+        event_schema: &Schema,
+    ) -> Result<RtResponse, ProtocolError> {
+        self.entry.protocol().serialize_event_stream_message(
+            event_type,
+            is_exception,
+            event,
+            event_schema,
+        )
+    }
+}
+
+/// `ServerProtocol` requires `Debug`; the generated entry is not `Debug`, so this names
+/// the protocol being served rather than the service's internals.
+impl<Eng: Send + Sync + 'static> std::fmt::Debug for EmulatedService<Eng> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmulatedService")
+            .field("protocol", self.entry.protocol().protocol_id())
+            .finish()
     }
 }

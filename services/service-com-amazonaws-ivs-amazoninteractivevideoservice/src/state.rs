@@ -716,6 +716,26 @@ const MULTITRACK_POLICY_DEFAULT: &str = "ALLOW";
 /// so the default caps nothing the channel type itself admits.
 const MULTITRACK_MAXIMUM_RESOLUTION_DEFAULT: &str = "FULL_HD";
 
+/// The failover-slate configuration ARN a channel projection reports.
+///
+/// A channel's optional configuration ARNs are reported as a PRESENT key holding the
+/// empty string while nothing is configured, never as an absent member — the rule the
+/// model writes out for each one it declares ("Default: \"\" (empty string, recording is
+/// disabled)" on `Channel$recordingConfigurationArn`, the same sentence on
+/// `playbackRestrictionPolicyArn`), and the way every handler here persists them
+/// (`Some(input.recording_configuration_arn.unwrap_or_default())`). A client decides
+/// "is this configured?" by comparing the value with the empty string, so an absent key
+/// is a different answer from "nothing is configured".
+///
+/// The failover slate is one of those ARNs on the wire and the one this model revision
+/// does not declare on `Channel` or `ChannelSummary`
+/// (`smithy_query(query="shape",shape="Channel,ChannelSummary")`), so it has no field on
+/// the stored record and no input member to set it: every channel this store holds has
+/// no failover slate, and this is the value that reports it. It is read by the channel
+/// wire projection in `crate::service`, which is where a member no shape declares can be
+/// written at all.
+pub const CHANNEL_FAILOVER_SLATE_CONFIGURATION_ARN: &str = "";
+
 /// Refuse a channel whose `containerFormat` and multitrack configuration cannot
 /// hold together, returning the message to put on a `ValidationException`.
 ///

@@ -21,6 +21,8 @@ mod ad_configuration_list;
 mod batch_get_channel;
 #[path = "all/batch_get_stream_key.rs"]
 mod batch_get_stream_key;
+#[path = "all/channel_configuration_arns.rs"]
+mod channel_configuration_arns;
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
 #[path = "all/default_sub_structures.rs"]
