@@ -17,6 +17,12 @@
 //! what a live stack's deployed template resolved against one ([`StoredStack::imports`]).
 //! So an export becomes pinned the moment an importing deployment completes and is free
 //! again the moment the last importing stack goes.
+//!
+//! The same index decides the other rule about an export name: "export names must be unique
+//! within a Region", so a deployment that would publish a name another live stack already
+//! publishes is FAILED ([`StoredStack::conflicting_export`]) rather than carried out — again
+//! a `StackStatusReason` and not a refusal of the request, because the operation is accepted
+//! and it is the deployment that cannot be carried through.
 
 use std::collections::BTreeMap;
 
@@ -84,6 +90,30 @@ pub struct ImportingStack {
     pub stack_name: String,
 }
 
+/// One live stack that PUBLISHES an exported output value: how this service addresses it
+/// (`stack_id`, so a deployment can tell its own export apart from another stack's) and the
+/// name the failure reports it by.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportingStack {
+    pub stack_id: String,
+    pub stack_name: String,
+}
+
+/// The `StackStatusReason` of a deployment that would publish an export name another live
+/// stack of the Region already publishes: the name, and the stack that holds it.
+///
+/// "Export names must be unique within a Region" per account, so the second stack to declare
+/// one cannot be deployed: CloudFormation fails that operation rather than publishing two
+/// values under one name, where an `Fn::ImportValue` would resolve to whichever stack got
+/// there first. Fixed text around two variable parts — the export name the template declares
+/// and the name of the stack already publishing it, both taken from this store.
+pub fn already_exported_reason(export_name: &str, exporting_stack_name: &str) -> String {
+    format!(
+        "Export with name {export_name} is already exported by stack \
+         {exporting_stack_name}."
+    )
+}
+
 /// The exported output values one stack publishes, keyed by export name: an output of this
 /// stack that declares an `Export` name and carries a value.
 ///
@@ -126,6 +156,30 @@ impl ComAmazonawsCloudformationCloudformationState {
         }
         importers
     }
+
+    /// Which live stack of one Region publishes each exported output value, keyed by export
+    /// name.
+    ///
+    /// The other side of [`Self::importers_by_export`], and the index the uniqueness of an
+    /// export name is decided against ([`StoredStack::conflicting_export`]): an export is
+    /// what a live stack's output declares an `Export` name for, so a name enters this index
+    /// when the publishing deployment completes and leaves it when that stack goes. In
+    /// creation order, so the stack a failure names is the one that published the name
+    /// first.
+    pub fn exporting_stacks(&self, region: &str) -> BTreeMap<String, ExportingStack> {
+        let mut publishers: BTreeMap<String, ExportingStack> = BTreeMap::new();
+        for stack in self.live_stacks(region) {
+            for export_name in published(&stack.outputs).into_keys() {
+                publishers
+                    .entry(export_name)
+                    .or_insert_with(|| ExportingStack {
+                        stack_id: stack.stack_id.clone(),
+                        stack_name: stack.stack_name.clone(),
+                    });
+            }
+        }
+        publishers
+    }
 }
 
 impl StoredStack {
@@ -164,5 +218,37 @@ impl StoredStack {
             }
         }
         None
+    }
+
+    /// The export the DEPLOYMENT IN FLIGHT would publish under a name another live stack of
+    /// the Region already publishes, as the reason that failure carries, or `None` when every
+    /// name it declares is free.
+    ///
+    /// "Export names must be unique within a Region": the value an `Fn::ImportValue`
+    /// resolves is the one the publishing stack holds, so two stacks publishing one name is
+    /// a state CloudFormation does not let a deployment reach — it fails the operation
+    /// instead, with its OWN diagnostic ([`already_exported_reason`]) rather than a resource's
+    /// refusal, because no resource is what went wrong.
+    ///
+    /// A name only THIS stack publishes is no conflict — a re-deploy of the same template
+    /// republishes its own exports — and neither is one published by a stack that is no
+    /// longer live, since a deleted stack publishes nothing.
+    ///
+    /// `publishers` is [`ComAmazonawsCloudformationCloudformationState::exporting_stacks`]
+    /// for this stack's Region, read before the stack was resolved for writing. One name is
+    /// reported, the first in export-name order, which is the one index this service keeps
+    /// them in.
+    pub fn conflicting_export(
+        &self,
+        publishers: &BTreeMap<String, ExportingStack>,
+    ) -> Option<String> {
+        let deployment = self.pending_deployment.as_ref()?;
+        published(&deployment.outputs)
+            .into_keys()
+            .find_map(|export_name| {
+                let holder = publishers.get(&export_name)?;
+                (holder.stack_id != self.stack_id)
+                    .then(|| already_exported_reason(&export_name, &holder.stack_name))
+            })
     }
 }

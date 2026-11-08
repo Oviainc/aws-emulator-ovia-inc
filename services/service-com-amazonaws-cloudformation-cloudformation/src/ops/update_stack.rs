@@ -1327,6 +1327,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         {
             let mut store = state.lock();
+            // Which live stack of this Region already publishes each exported output value,
+            // read BEFORE the stack is resolved for writing: "export names must be unique
+            // within a Region", so a name another stack holds is one this update cannot
+            // publish ([`crate::state::StoredStack::conflicting_export`]).
+            let publishers = store.exporting_stacks(&request_region);
             let Some(stack) = store.resolve_mut(&request_region, &stack_id) else {
                 return Ok(output);
             };
@@ -1346,7 +1351,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // out. The plan says WHAT such a rollback has to put back, which for an update
             // that changed nothing anywhere is nothing at all.
             stack.hold_rollback_plan(Some(owed));
-            if let Some(failure) = materialised.failure {
+            // An update whose resources were all changed can still be one CloudFormation
+            // cannot carry through: the exports it would publish are installed when the
+            // update completes, so an export name another live stack of the Region already
+            // publishes fails it here rather than at the request, which was perfectly valid.
+            let failure = materialised
+                .failure
+                .or_else(|| stack.conflicting_export(&publishers));
+            if let Some(failure) = failure {
                 // The deployment could not be carried out: the update does not reach
                 // UPDATE_COMPLETE, and the stack reports what failed
                 // ([`crate::state::provisioning::Materialised::failure`]) — the summary of

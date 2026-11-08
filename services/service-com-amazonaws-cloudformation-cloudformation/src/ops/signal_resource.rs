@@ -283,6 +283,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // on to the terminal status its own clock already owes.
                         (stack.stack_id.clone(), None)
                     } else {
+                        // The resource the signal failed does not reach the completion the
+                        // walk had planned for it: the event above IS its terminal event, so
+                        // the planned one is rewritten to this failure and retired — nothing
+                        // reports, or goes on reporting, a completion the resource never
+                        // reached
+                        // ([`crate::state::StoredStack::fail_reported_resource_event`]).
+                        stack.fail_reported_resource_event(
+                            &input.logical_resource_id,
+                            resource_status,
+                            &signal_received(&input.status, &input.unique_id),
+                        );
                         // "A failure signal causes CloudFormation to immediately fail the
                         // stack creation or update": the operation does not reach the
                         // terminal status it was headed for, and the stack's reason is the

@@ -20,6 +20,8 @@
 //! * a `Ref`, an `Fn::GetAtt` or an `Fn::Sub` variable naming something the template does
 //!   not declare, in either the `Resources` or the `Outputs` section;
 //! * a `Condition` naming a condition the template does not declare;
+//! * a `DependsOn` naming a logical id the `Resources` section does not declare, in either
+//!   spelling the attribute takes;
 //! * an `Fn::FindInMap` whose lookup the `Mappings` section does not carry — unless the
 //!   lookup names a `DefaultValue`;
 //! * a dependency CYCLE among the declared resources.
@@ -165,6 +167,26 @@ fn refused() -> Vec<Refused> {
             case: "an Fn::If naming a condition the template does not declare",
             template: r#"{"Resources":{"Topic":{"Type":"AWS::SNS::Topic"}},"Outputs":{"X":{"Value":{"Fn::If":["NoSuchCondition","yes","no"]}}}}"#,
             message: "Condition NoSuchCondition is not defined.",
+        },
+        Refused {
+            // "DependsOn: String | List of String": the attribute names RESOURCES, so a
+            // name no resource is declared under is the same unresolved dependency of the
+            // `Resources` section a `Ref` to an undeclared name is.
+            case: "a DependsOn naming a logical id the template does not declare",
+            template: r#"{"Resources":{"Bad":{"Type":"AWS::CloudFormation::WaitConditionHandle","DependsOn":"DoesNotExist"}}}"#,
+            message: "Unresolved resource dependencies [DoesNotExist] in the Resources block",
+        },
+        Refused {
+            case: "a DependsOn LIST one of whose entries the template does not declare",
+            template: r#"{"Resources":{"Topic":{"Type":"AWS::SNS::Topic"},"Bad":{"Type":"AWS::CloudFormation::WaitConditionHandle","DependsOn":["Topic","Ghost"]}}}"#,
+            message: "Unresolved resource dependencies [Ghost] in the Resources block",
+        },
+        Refused {
+            // A name the template DOES declare, but as a parameter: `DependsOn` states a
+            // creation order over resources, and a parameter is not one of them.
+            case: "a DependsOn naming a parameter instead of a resource",
+            template: r#"{"Parameters":{"Stage":{"Type":"String","Default":"prod"}},"Resources":{"Topic":{"Type":"AWS::SNS::Topic","DependsOn":"Stage"}}}"#,
+            message: "Unresolved resource dependencies [Stage] in the Resources block",
         },
         Refused {
             case: "an Fn::FindInMap whose map the Mappings section does not carry",
@@ -391,6 +413,15 @@ fn accepted() -> Vec<Accepted> {
             stack_name: "acyclic",
             template: r#"{"Resources":{"First":{"Type":"AWS::SNS::Topic","Properties":{"TopicName":"first-topic"}},"Second":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Ref":"First"}}},"Third":{"Type":"AWS::SSM::Parameter","Properties":{"Type":"String","Value":{"Ref":"Second"}},"DependsOn":"Second"}},"Outputs":{"V":{"Value":{"Fn::GetAtt":["First","TopicName"]}}}}"#,
             output: ("V", "first-topic"),
+        },
+        Accepted {
+            // The other spelling of the attribute, over TWO declared resources: a
+            // `DependsOn` every entry of which names a declared resource states an order
+            // the template can be deployed in.
+            case: "a DependsOn list naming two resources the template declares",
+            stack_name: "depends-on-list",
+            template: r#"{"Resources":{"First":{"Type":"AWS::SNS::Topic","Properties":{"TopicName":"ordered-topic"}},"Second":{"Type":"AWS::SSM::Parameter","Properties":{"Name":"ordered-probe","Type":"String","Value":"v"}},"Last":{"Type":"AWS::CloudFormation::WaitConditionHandle","DependsOn":["First","Second"]}},"Outputs":{"V":{"Value":{"Fn::GetAtt":["Second","Name"]}}}}"#,
+            output: ("V", "ordered-probe"),
         },
         Accepted {
             case: "a condition the template declares, gating an output",

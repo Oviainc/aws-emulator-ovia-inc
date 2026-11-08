@@ -33,6 +33,9 @@
 //!   instance that read it, as is an `Fn::Sub` whose dotted `${Name.Attribute}` reference
 //!   names no resource attribute at all ([`substitution_attribute_refusal`], which the
 //!   operations that only SUMMARISE a template are held to as well);
+//! * a `DependsOn` naming a logical id the `Resources` section does not declare is an
+//!   unresolved dependency too — the creation order it asks for cannot be resolved, and that
+//!   is decided from the document before anything is provisioned;
 //! * an `Fn::FindInMap` whose keys the `Mappings` section does not carry resolves to
 //!   nothing — unless the lookup names a `DefaultValue` to fall back to;
 //! * and a dependency CYCLE among the declared resources is refused, since no creation
@@ -514,8 +517,8 @@ const IF_PARAMETERS: &str = "Template error: every Fn::If object requires three 
 // ---------------------------------------------------------------------------
 
 /// `Some(message)` when a section of the deployed document names something the template
-/// does not declare: a `Ref` or an `Fn::GetAtt` naming no parameter and no resource, or a
-/// `Condition` naming no declared condition.
+/// does not declare: a `Ref` or an `Fn::GetAtt` naming no parameter and no resource, a
+/// `Condition` naming no declared condition, or a `DependsOn` naming no declared resource.
 ///
 /// The section is named in the refusal, because that is where the author has to look.
 ///
@@ -557,10 +560,50 @@ fn unresolved_refusal(template: &Template) -> Option<String> {
             }
         }
     }
-    sections(template).find_map(|(section, node)| {
-        unresolved_in(&node, section, &declared, 0)
+    sections(template)
+        .find_map(|(section, node)| unresolved_in(&node, section, &declared, 0))
+        // A `DependsOn` names RESOURCES of the same template — "with the DependsOn
+        // attribute you can specify that the creation of a specific resource follows
+        // another" — and it is read off the resource's own attributes rather than out of an
+        // expression, so the walk above cannot see it. A name the template declares no
+        // resource under is the same unresolved dependency of the `Resources` section a
+        // `Ref` to an undeclared name is: the order it asks for cannot be resolved, so the
+        // template is refused rather than deployed.
+        .or_else(|| dangling_depends_on(template, &resources))
+}
+
+/// `Some(name)` for the first `DependsOn` entry anywhere in `template` naming no declared
+/// resource.
+///
+/// Both spellings the attribute takes are read — "DependsOn: String | List of String" — and
+/// an attribute that is neither (which CloudFormation refuses for its own form) names no
+/// resource here. A declaration that depends on itself is as unresolvable as one that names
+/// nothing, but it IS a declared resource, so it is the cycle rule that refuses it
+/// ([`cycle_refusal`]) and not this one.
+fn dangling_depends_on(template: &Template, resources: &BTreeSet<&str>) -> Option<String> {
+    template.resources.iter().find_map(|resource| {
+        depends_on_names(&resource.declaration)
+            .into_iter()
+            .find(|name| !resources.contains(name.as_str()))
+            .map(|name| unresolved_dependency_in(&name, RESOURCES))
     })
 }
+
+/// The logical ids one resource declaration's `DependsOn` names, in the order it names them.
+fn depends_on_names(declaration: &Value) -> Vec<String> {
+    match declaration.get(DEPENDS_ON) {
+        Some(Value::String(name)) => vec![name.clone()],
+        Some(Value::Array(names)) => names
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::to_owned)
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The resource attribute that states a creation order of the author's own.
+const DEPENDS_ON: &str = "DependsOn";
 
 /// The names a template declares, which is what every reference in it has to name.
 struct Declared<'a> {

@@ -820,6 +820,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the previous template in force and is reported as `UPDATE_FAILED`.
         let unwind = {
             let mut store = state.lock();
+            // Which live stack of this Region already publishes each exported output value,
+            // read BEFORE the stack is resolved for writing: "export names must be unique
+            // within a Region", so a name another stack holds is one this execution cannot
+            // publish ([`crate::state::StoredStack::conflicting_export`]).
+            let publishers = store.exporting_stacks(&request_region);
             match store.resolve_mut(&request_region, &stack_id) {
                 None => None,
                 Some(stack) => {
@@ -853,7 +858,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // an UPDATE one updates a stack that already exists, and the two end and
                     // roll back differently.
                     let creating = stack.status == status::CREATE_IN_PROGRESS;
-                    match materialised.failure {
+                    // A deployment whose resources were all made can still be one
+                    // CloudFormation cannot carry through: the exports it would publish are
+                    // installed when the operation completes, so an export name another live
+                    // stack of the Region already publishes fails it here.
+                    let failure = materialised
+                        .failure
+                        .or_else(|| stack.conflicting_export(&publishers));
+                    match failure {
                         None => {
                             // The execution got through its calls to the owning services and
                             // is not over: a wait condition it is held at, or a resource one

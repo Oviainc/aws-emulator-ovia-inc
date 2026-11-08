@@ -958,6 +958,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // into.
         let unwind = {
             let mut store = state.lock();
+            // Which live stack of this Region already publishes each exported output value,
+            // read BEFORE the stack is resolved for writing: "export names must be unique
+            // within a Region", so a name another stack holds is one this create cannot
+            // publish ([`crate::state::StoredStack::conflicting_export`]).
+            let publishers = store.exporting_stacks(&region);
             // Unreachable unless the stack was deleted while its resources were being
             // created: there is then nothing left to record them on.
             let Some(stack) = store.resolve_mut(&region, &stack_id) else {
@@ -972,7 +977,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // event stream is what the deployment did, in the order it did it.
             stack.schedule_resource_events(&materialised.transitions);
             stack.record_materialised_resources(materialised.resources);
-            match materialised.failure {
+            // A deployment whose resources were all created can still be one CloudFormation
+            // cannot carry through: the exports it would publish are installed when the
+            // create completes, so an export name another live stack of the Region already
+            // publishes fails it HERE — after the walk, with what the create made in place —
+            // rather than at the request, which was perfectly valid.
+            let failure = materialised
+                .failure
+                .or_else(|| stack.conflicting_export(&publishers));
+            match failure {
                 None => None,
                 Some(failure) => {
                     // The deployment could not be carried out: the stack never reaches

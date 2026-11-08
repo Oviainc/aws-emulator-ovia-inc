@@ -185,6 +185,8 @@ mod in_flight_resource_status;
 mod initiating_resource_events;
 #[path = "all/in_place_resource_updates.rs"]
 mod in_place_resource_updates;
+#[path = "all/kept_failed_create.rs"]
+mod kept_failed_create;
 #[path = "all/lambda_layer_version_reference.rs"]
 mod lambda_layer_version_reference;
 #[path = "all/lambda_permission_stack_updates.rs"]
@@ -449,6 +451,8 @@ mod type_registrations;
 mod type_testing;
 #[path = "all/unimported_exports.rs"]
 mod unimported_exports;
+#[path = "all/unique_export_names.rs"]
+mod unique_export_names;
 #[path = "all/unprovisioned_resources.rs"]
 mod unprovisioned_resources;
 #[path = "all/unrecognized_resource_types.rs"]

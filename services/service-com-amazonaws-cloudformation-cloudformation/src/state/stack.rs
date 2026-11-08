@@ -1991,6 +1991,35 @@ impl StoredStack {
         status: &str,
         reason: &str,
     ) {
+        self.rewrite_planned_resource_event(logical_id, status, reason, Reported::NotYet);
+    }
+
+    /// [`Self::fail_planned_resource_event`] for a failure the CALLER has already put in the
+    /// event log: the planned completion is rewritten to that failure and RETIRED, so the
+    /// resource is reported — and installed — as having failed, and the log carries the one
+    /// event the caller wrote rather than that event and a completion after it.
+    ///
+    /// This is the shape a client's own FAILURE signal has: "a failure signal causes
+    /// CloudFormation to immediately fail the stack creation or update"
+    /// (`SignalResource`), and the signal that did it is what the resource's event reports
+    /// ([`crate::ops::signal_resource`]).
+    pub fn fail_reported_resource_event(
+        &mut self,
+        logical_id: &str,
+        status: &str,
+        reason: &str,
+    ) {
+        self.rewrite_planned_resource_event(logical_id, status, reason, Reported::Already);
+    }
+
+    /// The one writer of both rewrites above.
+    fn rewrite_planned_resource_event(
+        &mut self,
+        logical_id: &str,
+        status: &str,
+        reason: &str,
+        reported: Reported,
+    ) {
         let Some(walk) = self.resource_timeline.as_mut() else {
             return;
         };
@@ -2006,9 +2035,20 @@ impl StoredStack {
             {
                 event.status = status.to_string();
                 event.reason = Some(reason.to_string());
+                event.recorded = reported == Reported::Already;
             }
         }
     }
+}
+
+/// Whether the failure a planned event is rewritten to is already in the stack's event log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Reported {
+    /// The rewritten event is the one that will report it, when the walk reaches it.
+    NotYet,
+    /// The caller has already recorded it, so the rewritten event is retired rather than
+    /// reported a second time.
+    Already,
 }
 
 // ---------------------------------------------------------------------------
@@ -2763,6 +2803,15 @@ impl StoredStack {
         reason: String,
         report: FailureReport,
     ) {
+        // A CREATE whose failed state the stack RESTS in goes on reporting the resources it
+        // had made ([`Self::keep_failed_resources`]), and what the walk left each of them in
+        // is read off that walk — BEFORE the flush below retires it.
+        let creating = self.status == status::CREATE_IN_PROGRESS;
+        let walked = if creating && report == FailureReport::Rested {
+            self.walked_transitions()
+        } else {
+            Vec::new()
+        };
         self.flush_resource_timeline(now);
         let pending = self.pending.take();
         // An operation that failed waits for nothing: whatever it was waiting at, it is
@@ -2774,6 +2823,14 @@ impl StoredStack {
         let operation_id = pending.as_ref().and_then(|p| p.operation_id.clone());
         // The attempt FAILED at this instant, whatever its failure then owes.
         self.conclude_operation(operation_id.as_deref(), failed_status, now);
+        // A create that failed is not a create that did nothing: where the failed state
+        // STAYS — the caller asked for it to be kept, or nothing follows the failure — the
+        // resources the create had already made go on being reported, each in the status
+        // the walk left it. A create whose rollback begins at this instant installs nothing,
+        // because that rollback removes what it had made.
+        if creating && report == FailureReport::Rested {
+            self.keep_failed_resources(&walked, now);
+        }
         if report == FailureReport::Superseded {
             return;
         }
@@ -2829,6 +2886,36 @@ impl StoredStack {
             .collect();
         self.resources = installed;
         self.reevaluate_outputs();
+    }
+
+    /// The transitions the walk in flight planned for the resources it ACTED ON, oldest
+    /// first — the same records that walk was built from
+    /// ([`Self::schedule_resource_events`]), read back so a failure that has no transitions
+    /// of its own to hand still knows what the walk left each resource in.
+    ///
+    /// A failure the CLOCK materialises (a resource-signal wait that ran out, a resource an
+    /// owning service never got ready) is recorded with the store locked and no walk's answer
+    /// beside it, while the handler that drove the walk has those answers in hand. Both leave
+    /// the stack in the same state, so both install the kept resources from the same records:
+    /// this walk is the one place that still says which resources the operation got to and
+    /// what became of each.
+    fn walked_transitions(&self) -> Vec<provisioning::ResourceTransition> {
+        let Some(walk) = self.resource_timeline.as_ref() else {
+            return Vec::new();
+        };
+        walk.steps
+            .iter()
+            .flat_map(|step| {
+                step.events.iter().map(|event| provisioning::ResourceTransition {
+                    logical_id: step.logical_id.clone(),
+                    resource_type: step.resource_type.clone(),
+                    physical_resource_id: event.physical_resource_id.clone(),
+                    status: event.status.clone(),
+                    reason: event.reason.clone(),
+                    resource_properties: event.resource_properties.clone(),
+                })
+            })
+            .collect()
     }
 
     /// Open the ROLLBACK a failed create owes: the stack moves to `ROLLBACK_IN_PROGRESS`
