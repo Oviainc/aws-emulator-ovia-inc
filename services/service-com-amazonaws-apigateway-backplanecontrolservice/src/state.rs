@@ -1945,42 +1945,40 @@ type SdkTypeRow = (
 
 /// The SDK types API Gateway can generate a client SDK for.
 ///
-/// Hand-written because this service's model declares no shape enumerating them. The ids
-/// and their order are `GetSdkRequest$sdkType`'s own documentation
-/// (`smithy_query(query="doc", shape="GetSdkRequest", member="sdkType")`: "The language
-/// for the generated SDK. Currently `java`, `javascript`, `android`, `objectivec` (for
-/// iOS), `swift` (for iOS), and `ruby` are supported").
+/// Hand-written because this service's model declares no shape enumerating them and places
+/// no constraint on their prose: the catalog is REFERENCE DATA the service authors, so what
+/// belongs in it is exactly the generators API Gateway offers today, each spelled with the
+/// service's own published text — a console, a CLI or a generator front-end renders these
+/// strings to a user verbatim and enumerates the ids to decide which SDKs it may ask
+/// `GetSdk` for, so an entry the service does not publish advertises a generator that does
+/// not exist and a paraphrased sentence is user-visible drift.
 ///
-/// Each entry is the GENERATOR the id names, as API Gateway publishes it: the
-/// `friendlyName` is the label a developer picks the generator by, the `description` names
-/// the language it generates a client for ("<language> SDK generator for API Gateway
-/// APIs"), and the configuration properties are the keys a `GetSdk` `parameters` entry
-/// carries for that generator — named exactly as the generator reads them, since a
-/// property name a client cannot set configures nothing.
+/// The set is the two generators the service publishes, `java` and `ruby`, in that order.
+/// `GetSdkRequest$sdkType`'s documentation (`smithy_query(query="doc",
+/// shape="GetSdkRequest", member="sdkType")`: "The language for the generated SDK.
+/// Currently `java`, `javascript`, `android`, `objectivec` (for iOS), `swift` (for iOS),
+/// and `ruby` are supported") also names `javascript`, `android`, `objectivec` and `swift`,
+/// but the catalog the service answers with holds neither of those four: that model prose
+/// is older than the catalog, and the catalog — not the prose — is what a client
+/// enumerates, so those ids resolve to nothing here, exactly as `GetSdkType` refuses any
+/// other id the catalog does not hold.
 ///
-/// The `android`, `objectivec` and `swift` generators take the parameters
-/// `GetSdkRequest$parameters` documents by name (`smithy_query(query="doc",
-/// shape="GetSdkRequest", member="parameters")`: "For `sdkType` of `objectivec` or
-/// `swift`, a parameter named `classPrefix` is required. For `sdkType` of `android`,
-/// parameters named `groupId`, `artifactId`, `artifactVersion`, and `invokerPackage` are
-/// required."); the `java` and `ruby` generators are configured by the dotted property
-/// names those generators publish (`service.name`, `java.*`, `ruby.*`), of which only the
-/// service name and the Java package name have no default and so are `required`. Those
-/// dotted names SUPERSEDE the `serviceName`/`javaPackageName` the same model sentence
-/// names for `java`: what the service answers for the `java` generator is what it
-/// publishes, and the model's prose for it is older than the generator. The `javascript`
-/// generator takes no configuration at all.
+/// Each entry is the GENERATOR the id names: the `friendlyName` is the label a developer
+/// picks the generator by, the `description` names the language it generates a client for,
+/// and the configuration properties are the keys a `GetSdk` `parameters` entry carries for
+/// that generator — the dotted names those generators publish (`service.name`, `java.*`,
+/// `ruby.*`), of which only the service name and the Java package name have no default and
+/// so are `required`. Those dotted names SUPERSEDE the `serviceName`/`javaPackageName`
+/// `GetSdkRequest$parameters` names for `java`, for the same reason: what the service
+/// answers for a generator is what that generator publishes.
 ///
-/// What is the SERVICE's published wording and what is still this emulator's: the ids and
-/// their order, every configuration property's NAME and `required` flag, each property's
-/// label, and the `friendlyName` and `description` of the `java` and `ruby` generators are
-/// the service's. The remaining prose — the sentence on a property that states a default,
-/// and the `friendlyName`/`description` of the `javascript`, `android`, `objectivec` and
-/// `swift` generators — is this emulator's own wording for the generator and the property
-/// the names above DO fix, so a client that keys off a sentence rather than off a name is
-/// reading prose the real service words differently.
+/// Every string below is the service's published text, including each property's
+/// `description` — the sentence that states a property's default is the service's own
+/// wording of it, not a paraphrase of the default.
 ///
 /// Nothing here is per account or per request, so the whole collection is this constant.
+/// `tests/all/sdk_types.rs` pins it entry for entry over the wire, so a re-worded string or
+/// an added id fails there rather than reaching a client.
 const SDK_TYPES: &[SdkTypeRow] = &[
     (
         "java",
@@ -2002,25 +2000,25 @@ const SDK_TYPES: &[SdkTypeRow] = &[
             (
                 "java.build-system",
                 "Java Build System",
-                "Build system to setup for project; Allowed values are maven and gradle; Default is maven",
+                "Build system to setup for project; Currently supported: maven, gradle",
                 false,
             ),
             (
                 "java.group-id",
                 "Java Group Id",
-                "groupId of your Maven project; Default is the package name",
+                "Group id for your Maven or Gradle project. Defaults to package name",
                 false,
             ),
             (
                 "java.artifact-id",
                 "Java Artifact Id",
-                "artifactId of your Maven project; Default is the service name",
+                "Artifact Id for your Maven project or project name for your Gradle project. Defaults to service name",
                 false,
             ),
             (
                 "java.artifact-version",
                 "Java Artifact Version",
-                "Version of your Maven project; Default is 1.0-SNAPSHOT",
+                "Version of your Maven or Gradle project. Defaults to 1.0-SNAPSHOT",
                 false,
             ),
             (
@@ -2032,65 +2030,6 @@ const SDK_TYPES: &[SdkTypeRow] = &[
         ],
     ),
     (
-        "javascript",
-        "JavaScript SDK",
-        "JavaScript SDK generator for API Gateway APIs",
-        &[],
-    ),
-    (
-        "android",
-        "Android SDK",
-        "Android SDK generator for API Gateway APIs",
-        &[
-            (
-                "groupId",
-                "Group ID",
-                "groupId of the generated SDK's Maven artifact",
-                true,
-            ),
-            (
-                "artifactId",
-                "Artifact ID",
-                "artifactId of the generated SDK's Maven artifact",
-                true,
-            ),
-            (
-                "artifactVersion",
-                "Artifact Version",
-                "Version of the generated SDK's Maven artifact",
-                true,
-            ),
-            (
-                "invokerPackage",
-                "Invoker Package",
-                "Name of the package the generated SDK's invoker classes are declared in",
-                true,
-            ),
-        ],
-    ),
-    (
-        "objectivec",
-        "iOS (Objective-C) SDK",
-        "Objective-C SDK generator for API Gateway APIs",
-        &[(
-            "classPrefix",
-            "Class Prefix",
-            "Prefix for the generated classes",
-            true,
-        )],
-    ),
-    (
-        "swift",
-        "iOS (Swift) SDK",
-        "Swift SDK generator for API Gateway APIs",
-        &[(
-            "classPrefix",
-            "Class Prefix",
-            "Prefix for the generated classes",
-            true,
-        )],
-    ),
-    (
         "ruby",
         "Ruby",
         "Ruby SDK generator for API Gateway APIs",
@@ -2098,19 +2037,19 @@ const SDK_TYPES: &[SdkTypeRow] = &[
             (
                 "service.name",
                 "Service Name",
-                "Name of the service which is used to derive the name of the Ruby client class",
+                "Name of the service which is used to derive the name for your client",
                 true,
             ),
             (
                 "ruby.gem-name",
                 "Ruby Gem Name",
-                "Name of the Ruby gem; Default is the service name",
+                "Name of the Ruby gem your code will be generated under",
                 false,
             ),
             (
                 "ruby.gem-version",
                 "Ruby Gem Version",
-                "Version of the Ruby gem; Default is 1.0.0",
+                "Version number for your service gem. Defaults to 1.0.0",
                 false,
             ),
         ],

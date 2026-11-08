@@ -9,19 +9,18 @@
 //!
 //! The tests assert RULES over sets of inputs rather than one recorded call:
 //!
-//! * the collection is the service's published catalog, so EVERY entry is listed, in the
-//!   catalog's order, and every entry reads back member for member through the single
-//!   reader — the rows span the whole catalog, including the types the issue cited none
-//!   of (`swift`, `android`), a type with several configuration properties, a type with
-//!   one and a type with none; each row pins the id, the order, every configuration
-//!   property's name and whether it is required, and the `friendlyName`/`description` of
-//!   the two generators whose published prose is known, while the remaining entries'
-//!   prose is asserted by its FORM;
+//! * the collection is the service's published catalog of generators, so EVERY entry it
+//!   publishes is listed, in the catalog's order, with the service's own text for the
+//!   entry and for every configuration property, and nothing else is listed — the rows
+//!   span both generators, every property of each (those the issue cited none of
+//!   included), a property with a default stated in its prose and one without, and a
+//!   required as well as an optional property;
+//! * every published entry reads back member for member through the single reader, and an
+//!   id the catalog does not publish — including the retired generators an older model
+//!   sentence still names — is the modelled 404;
 //! * a page is the slice `position` and `limit` name, over page sizes across the
 //!   documented `1..=500` range, each published bound and one past each, and over every
-//!   cursor the sequence holds;
-//! * an id the catalog does not hold is the modelled 404, over the ways an id can miss
-//!   the catalog, and a cursor the sequence does not hold is the modelled 400;
+//!   cursor the sequence holds; a cursor the sequence does not hold is the modelled 400;
 //! * both reads are reporting operations: repeating them changes nothing a later caller
 //!   sees.
 
@@ -29,78 +28,119 @@ use serde_json::Value;
 
 use crate::rest_api_lifecycle::{assert_failure, page_items, string_member, Answer, Gateway};
 
-/// One expected catalog entry: its id, the `friendlyName` and `description` the service's
-/// own published values fix (`None` where the entry's prose is this emulator's wording,
-/// which a row asserts the FORM of rather than restating the implementation's literal) and
-/// the `(name, required)` configuration properties it reports, in order.
+/// One expected configuration property of a catalog entry:
+/// `(name, friendlyName, description, required)`.
+type PropertyRow = (&'static str, &'static str, &'static str, bool);
+
+/// One expected catalog entry: `(id, friendlyName, description, configurationProperties)`.
 type CatalogRow = (
     &'static str,
-    Option<&'static str>,
-    Option<&'static str>,
-    &'static [(&'static str, bool)],
+    &'static str,
+    &'static str,
+    &'static [PropertyRow],
 );
 
-/// The form every entry's description takes: it names the language the generator generates
-/// a client for, which is what the two entries whose description is fixed above spell in
-/// full.
-const DESCRIPTION_FORM: &str = "SDK generator for API Gateway APIs";
-
-/// The SDK types API Gateway can generate a client SDK for, written out here rather than
-/// read from the service, so this test checks the catalog instead of restating it.
+/// The SDK types API Gateway publishes a generator for, written out here rather than read
+/// from the service, so this test checks the catalog instead of restating it.
 ///
-/// Source: this service's model, which declares no shape enumerating the types but
-/// documents them on the operation that consumes an id —
-/// `smithy_query(query="doc", shape="GetSdkRequest", member="sdkType")` ("Currently
-/// `java`, `javascript`, `android`, `objectivec` (for iOS), `swift` (for iOS), and
-/// `ruby` are supported"), which fixes the ids and the order, and
-/// `smithy_query(query="doc", shape="GetSdkRequest", member="parameters")`, which names
-/// the parameters the `android`, `objectivec` and `swift` generators REQUIRE ("For
-/// `sdkType` of `objectivec` or `swift`, a parameter named `classPrefix` is required. For
-/// `sdkType` of `android`, parameters named `groupId`, `artifactId`, `artifactVersion`,
-/// and `invokerPackage` are required."). The `java` and `ruby` generators are configured
-/// by the dotted property names API Gateway publishes for them — the names a client sets
-/// in `GetSdk`'s `parameters`, of which only the service name and the Java package name
-/// have no default.
+/// Source: the catalog is reference data the service authors — this service's model
+/// declares no shape enumerating the types and constrains neither the set nor the prose
+/// (`smithy_query(query="shape", shape="SdkType,SdkTypes")`: `SdkType` is
+/// id/friendlyName/description/configurationProperties with no constraint trait, and
+/// `SdkTypes` is a plain list) — so what is pinned below is the service's own published
+/// text for the two generators it offers, down to each property's description, which a
+/// console or generator front-end renders to a user verbatim.
+///
+/// `GetSdkRequest$sdkType`'s documentation (`smithy_query(query="doc",
+/// shape="GetSdkRequest", member="sdkType")`: "Currently `java`, `javascript`, `android`,
+/// `objectivec` (for iOS), `swift` (for iOS), and `ruby` are supported") names four more
+/// ids, but the catalog holds none of them: that sentence is older than the catalog, and
+/// those ids are asserted below to resolve to nothing (see [`RETIRED_SDK_TYPE_IDS`]).
+///
+/// The implementation's counterpart is `SDK_TYPES` in `src/state.rs`. This table is written
+/// out independently of it ON PURPOSE: a published string re-worded on one side has to be
+/// re-worded here too, which is the check. Keep the two in step.
 const CATALOG: &[CatalogRow] = &[
     (
         "java",
-        Some("Java SDK"),
-        Some("Java SDK generator for API Gateway APIs"),
+        "Java SDK",
+        "Java SDK generator for API Gateway APIs",
         &[
-            ("service.name", true),
-            ("java.package-name", true),
-            ("java.build-system", false),
-            ("java.group-id", false),
-            ("java.artifact-id", false),
-            ("java.artifact-version", false),
-            ("java.license-text", false),
+            (
+                "service.name",
+                "Service Name",
+                "Name of the service which is used to derive the Java interface name for your client",
+                true,
+            ),
+            (
+                "java.package-name",
+                "Java Package Name",
+                "Name of the Java package your code will be generated under",
+                true,
+            ),
+            (
+                "java.build-system",
+                "Java Build System",
+                "Build system to setup for project; Currently supported: maven, gradle",
+                false,
+            ),
+            (
+                "java.group-id",
+                "Java Group Id",
+                "Group id for your Maven or Gradle project. Defaults to package name",
+                false,
+            ),
+            (
+                "java.artifact-id",
+                "Java Artifact Id",
+                "Artifact Id for your Maven project or project name for your Gradle project. Defaults to service name",
+                false,
+            ),
+            (
+                "java.artifact-version",
+                "Java Artifact Version",
+                "Version of your Maven or Gradle project. Defaults to 1.0-SNAPSHOT",
+                false,
+            ),
+            (
+                "java.license-text",
+                "Source Code License Text",
+                "Customer provided license to inject into source file headers",
+                false,
+            ),
         ],
     ),
-    ("javascript", None, None, &[]),
-    (
-        "android",
-        None,
-        None,
-        &[
-            ("groupId", true),
-            ("artifactId", true),
-            ("artifactVersion", true),
-            ("invokerPackage", true),
-        ],
-    ),
-    ("objectivec", None, None, &[("classPrefix", true)]),
-    ("swift", None, None, &[("classPrefix", true)]),
     (
         "ruby",
-        Some("Ruby"),
-        Some("Ruby SDK generator for API Gateway APIs"),
+        "Ruby",
+        "Ruby SDK generator for API Gateway APIs",
         &[
-            ("service.name", true),
-            ("ruby.gem-name", false),
-            ("ruby.gem-version", false),
+            (
+                "service.name",
+                "Service Name",
+                "Name of the service which is used to derive the name for your client",
+                true,
+            ),
+            (
+                "ruby.gem-name",
+                "Ruby Gem Name",
+                "Name of the Ruby gem your code will be generated under",
+                false,
+            ),
+            (
+                "ruby.gem-version",
+                "Ruby Gem Version",
+                "Version number for your service gem. Defaults to 1.0.0",
+                false,
+            ),
         ],
     ),
 ];
+
+/// The generator ids an older `GetSdkRequest$sdkType` sentence still names and the catalog
+/// does not publish: the service offers no generator under them, so neither read resolves
+/// one.
+const RETIRED_SDK_TYPE_IDS: &[&str] = &["javascript", "android", "objectivec", "swift"];
 
 /// Every catalog id, in the catalog's order: the sequence a page is cut out of.
 fn catalog_ids() -> Vec<&'static str> {
@@ -138,48 +178,37 @@ fn assert_catalog_entry(entry: &Value, expected: &CatalogRow, case: &str) {
         Some(*id),
         "case {case}: expected the id {id:?}, got {entry:?}"
     );
-    // An entry is the GENERATOR its id names: the friendly name is the label the
-    // generator is picked by, and the description names the language it generates a client
-    // for. Where the service's own published value is known it is pinned; where it is not,
-    // what is asserted is the FORM — a label that says something, and a description of the
-    // published shape — rather than the implementation's own sentence.
-    let reported_friendly_name = entry["friendlyName"].as_str().unwrap_or_default();
-    match friendly_name {
-        Some(expected) => assert_eq!(
-            reported_friendly_name, *expected,
-            "case {case}: expected the friendly name {expected:?}, got {entry:?}"
-        ),
-        None => assert!(
-            !reported_friendly_name.is_empty(),
-            "case {case}: expected a non-empty friendly name, got {entry:?}"
-        ),
-    }
-    let reported_description = entry["description"].as_str().unwrap_or_default();
-    match description {
-        Some(expected) => assert_eq!(
-            reported_description, *expected,
-            "case {case}: expected the description {expected:?}, got {entry:?}"
-        ),
-        None => assert!(
-            reported_description.ends_with(DESCRIPTION_FORM)
-                && reported_description.len() > DESCRIPTION_FORM.len(),
-            "case {case}: expected a description naming the language and ending \
-             {DESCRIPTION_FORM:?}, got {reported_description:?}"
-        ),
-    }
+    // An entry is the GENERATOR its id names, spelled as the service publishes it: the
+    // friendly name is the label the generator is picked by and the description names the
+    // language it generates a client for. Both are rendered to a user verbatim, so both
+    // are pinned rather than matched by form.
+    assert_eq!(
+        entry["friendlyName"].as_str(),
+        Some(*friendly_name),
+        "case {case}: expected the friendly name {friendly_name:?}, got {entry:?}"
+    );
+    assert_eq!(
+        entry["description"].as_str(),
+        Some(*description),
+        "case {case}: expected the description {description:?}, got {entry:?}"
+    );
 
-    // `configurationProperties` is always reported, and empty for a type the
-    // documentation names no parameter for.
+    // `configurationProperties` is always reported: it says what a `GetSdk` call may set
+    // for this generator, each property with the service's own label and sentence.
     let reported = entry["configurationProperties"]
         .as_array()
-        .unwrap_or_else(|| panic!("case {case}: expected a configurationProperties array, got {entry:?}"));
+        .unwrap_or_else(|| {
+            panic!("case {case}: expected a configurationProperties array, got {entry:?}")
+        });
     assert_eq!(
         reported.len(),
         properties.len(),
         "case {case}: expected {} configuration properties, got {reported:?}",
         properties.len()
     );
-    for (property, (name, required)) in reported.iter().zip(properties.iter()) {
+    for (property, (name, property_friendly_name, property_description, required)) in
+        reported.iter().zip(properties.iter())
+    {
         assert_eq!(
             property["name"].as_str(),
             Some(*name),
@@ -190,15 +219,17 @@ fn assert_catalog_entry(entry: &Value, expected: &CatalogRow, case: &str) {
             Some(*required),
             "case {case}: expected required={required} on {name:?}, got {property:?}"
         );
-        let property_friendly_name = property["friendlyName"].as_str().unwrap_or_default();
-        assert!(
-            !property_friendly_name.is_empty(),
-            "case {case}: expected a friendly name on {name:?}, got {property:?}"
+        assert_eq!(
+            property["friendlyName"].as_str(),
+            Some(*property_friendly_name),
+            "case {case}: expected the friendly name {property_friendly_name:?} on {name:?}, \
+             got {property:?}"
         );
-        let property_description = property["description"].as_str().unwrap_or_default();
-        assert!(
-            !property_description.is_empty(),
-            "case {case}: expected a description on {name:?}, got {property:?}"
+        assert_eq!(
+            property["description"].as_str(),
+            Some(*property_description),
+            "case {case}: expected the description {property_description:?} on {name:?}, \
+             got {property:?}"
         );
     }
 }
@@ -271,7 +302,8 @@ async fn a_page_of_sdk_types_is_the_slice_the_position_and_limit_name() {
     // includes no cursor at all and the last id.
     let limits = [0, 1, 2, 3, 6, 7, 25, 500, 501, 10_000];
     for limit in limits {
-        let effective = usize::try_from(limit.clamp(1, 500)).expect("the clamped limit is positive");
+        let effective =
+            usize::try_from(limit.clamp(1, 500)).expect("the clamped limit is positive");
         for (index, cursor) in std::iter::once(None)
             .chain(ids.iter().map(|id| Some(*id)))
             .enumerate()
@@ -279,12 +311,7 @@ async fn a_page_of_sdk_types_is_the_slice_the_position_and_limit_name() {
             // No cursor starts at the first id; a cursor is the id of the last entry
             // already handed out, so its page resumes AFTER that entry.
             let start = index;
-            let expected: Vec<&str> = ids
-                .iter()
-                .skip(start)
-                .take(effective)
-                .copied()
-                .collect();
+            let expected: Vec<&str> = ids.iter().skip(start).take(effective).copied().collect();
             let query = match cursor {
                 None => format!("limit={limit}"),
                 Some(id) => format!("limit={limit}&position={id}"),
@@ -345,18 +372,23 @@ async fn a_page_of_sdk_types_is_the_slice_the_position_and_limit_name() {
 async fn an_id_the_catalog_does_not_hold_is_a_not_found_and_an_unknown_cursor_is_a_bad_request() {
     let gateway = Gateway::new();
 
-    // The ways an id can miss the catalog: a declared id in the wrong case, one with a
-    // trailing character, a plausible other spelling of a declared id, a language the
-    // service does not generate, and an id shaped like one of this service's minted
-    // resource ids.
-    let unknown = [
-        "JAVA",
-        "java-",
-        "ios-swift",
-        "typescript",
-        "zzzzzzzzzz",
-        "objective-c",
-    ];
+    // The ways an id can miss the catalog: a generator the service no longer publishes
+    // (every retired id), a published id in the wrong case, one with a trailing
+    // character, a plausible other spelling of a published id, a language the service
+    // never generated, and an id shaped like one of this service's minted resource ids.
+    let unknown: Vec<&str> = RETIRED_SDK_TYPE_IDS
+        .iter()
+        .copied()
+        .chain([
+            "JAVA",
+            "java-",
+            "ios-swift",
+            "typescript",
+            "zzzzzzzzzz",
+            "objective-c",
+            "Ruby",
+        ])
+        .collect();
     for id in unknown {
         let case = format!("GetSdkType({id})");
         let answer = get_sdk_type(&gateway, id).await;
@@ -371,10 +403,22 @@ async fn an_id_the_catalog_does_not_hold_is_a_not_found_and_an_unknown_cursor_is
         );
     }
 
+    // A retired generator is not listed either: a client enumerating the catalog to
+    // decide which SDKs it may request sees only the generators the service publishes.
+    let listed = get_sdk_types(&gateway, "limit=500").await;
+    let listed_now = listed_ids(&listed.body, "GetSdkTypes(limit=500)");
+    for id in RETIRED_SDK_TYPE_IDS {
+        assert!(
+            !listed_now.iter().any(|listed_id| listed_id == id),
+            "case GetSdkTypes(limit=500): expected no entry for the retired {id:?}, got \
+             {listed_now:?}"
+        );
+    }
+
     // A cursor naming nothing in the sequence is a bad request, not an empty page — in
-    // the ways a cursor can miss: an unknown word, a declared id in the wrong case, and a
-    // declared id with a trailing character.
-    for cursor in ["nosuchcursor", "JAVA", "java-"] {
+    // the ways a cursor can miss: an unknown word, a published id in the wrong case, a
+    // published id with a trailing character, and a retired generator's id.
+    for cursor in ["nosuchcursor", "JAVA", "java-", "javascript"] {
         let query = format!("position={cursor}");
         assert_failure(
             &get_sdk_types(&gateway, &query).await,
