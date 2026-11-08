@@ -16,14 +16,21 @@
 //! that was not stored, and a second claim on either side of an attachment or an
 //! association is refused rather than added beside the one that holds.
 //!
+//! The same rule covers a VPC's path to an Amazon Web Services service that is reached
+//! WITHOUT the internet: a gateway `CreateVpcEndpoint` stores the endpoint and the one route
+//! it is reached through in every route table it names, so the table a subnet is explicitly
+//! associated with reports that route beside the local one — which is what a client reads
+//! when it asks `DescribeRouteTables` which table its subnet uses.
+//!
 //! Every table row is a distinct input along what that rule generalises over — the
 //! destination block's value, size and address family, how many host bits the request set,
-//! the tag count, how many subnets an association covers, and which side of a pair a
-//! request collides with — so any one recorded call is one row among many rather than the
-//! specification.
+//! the tag count, how many subnets an association covers, which side of a pair a
+//! request collides with, the endpoint service a gateway endpoint is created for, how many
+//! tables it names, how many endpoints one table is named by, and the order the estate is
+//! built in — so any one recorded call is one row among many rather than the specification.
 
 use super::ec2_query::{element, elements, error_code, error_message, filters};
-use super::wire::{param, Param};
+use super::wire::{child, child_text, document, param, set_items, Param};
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every call here is signed for.
@@ -1327,5 +1334,578 @@ async fn a_gateway_endpoint_refuses_a_route_table_outside_its_own_vpc() {
     assert!(
         element(&read, "vpcEndpointId").is_none(),
         "expected no endpoint after every refusal, got {read}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The private estate: a subnet's own route table, read through its association
+// ---------------------------------------------------------------------------
+
+/// One route of a route table, narrowed to the members the estate tests assert on.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReportedRoute {
+    destination_cidr_block: Option<String>,
+    destination_prefix_list_id: Option<String>,
+    gateway_id: Option<String>,
+    origin: Option<String>,
+    state: Option<String>,
+}
+
+/// One association of a route table, narrowed the same way.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReportedAssociation {
+    route_table_association_id: Option<String>,
+    subnet_id: Option<String>,
+    main: Option<String>,
+    state: Option<String>,
+}
+
+/// One route table a `DescribeRouteTables` reported, with its routes and associations.
+#[derive(Debug, Default)]
+struct ReportedTable {
+    route_table_id: String,
+    vpc_id: Option<String>,
+    routes: Vec<ReportedRoute>,
+    associations: Vec<ReportedAssociation>,
+}
+
+/// Every route table a `DescribeRouteTables` body reports, read through the document so a
+/// `<state>` of a route is never confused with one of an association: the `<routeTableSet>`
+/// entries, each with its `<routeSet>` and `<associationSet>` entries
+/// (`RouteTable$Routes`/`$Associations`, xmlName `routeSet`/`associationSet`).
+fn reported_tables(case: &str, body: &str) -> Vec<ReportedTable> {
+    let parsed = document(case, body);
+    let Some(set) = parsed
+        .descendants()
+        .find(|node| node.is_element() && node.tag_name().name() == "routeTableSet")
+    else {
+        return Vec::new();
+    };
+    set.children()
+        .filter(roxmltree::Node::is_element)
+        .map(|item| ReportedTable {
+            route_table_id: child_text(item, "routeTableId").unwrap_or_default(),
+            vpc_id: child_text(item, "vpcId"),
+            routes: set_items(item, "routeSet")
+                .into_iter()
+                .map(|route| ReportedRoute {
+                    destination_cidr_block: child_text(route, "destinationCidrBlock"),
+                    destination_prefix_list_id: child_text(route, "destinationPrefixListId"),
+                    gateway_id: child_text(route, "gatewayId"),
+                    origin: child_text(route, "origin"),
+                    state: child_text(route, "state"),
+                })
+                .collect(),
+            associations: set_items(item, "associationSet")
+                .into_iter()
+                .map(|association| ReportedAssociation {
+                    route_table_association_id: child_text(
+                        association,
+                        "routeTableAssociationId",
+                    ),
+                    subnet_id: child_text(association, "subnetId"),
+                    main: child_text(association, "main"),
+                    state: child(association, "associationState")
+                        .and_then(|state| child_text(state, "state")),
+                })
+                .collect(),
+        })
+        .collect()
+}
+
+/// The route tables `DescribeRouteTables` reports for the subnet `subnet_id`, selected the
+/// way a client asks which table a subnet uses: the documented `association.subnet-id`
+/// filter ("The ID of the subnet involved in the association", `DescribeRouteTables$Filters`).
+async fn tables_of_subnet(
+    case: &str,
+    router: &MultiServiceRouter,
+    subnet_id: &str,
+) -> Vec<ReportedTable> {
+    let body = ok(
+        case,
+        router,
+        "DescribeRouteTables",
+        &filters(&[("association.subnet-id", &[subnet_id])]),
+    )
+    .await;
+    reported_tables(case, &body)
+}
+
+/// The routes of `table` split into the ones inside the VPC (target `local`, the route every
+/// table comes with) and the ones OUT of it (every other target).
+fn local_and_outbound(table: &ReportedTable) -> (Vec<&ReportedRoute>, Vec<&ReportedRoute>) {
+    table
+        .routes
+        .iter()
+        .partition(|route| route.gateway_id.as_deref() == Some("local"))
+}
+
+/// The id of the prefix list this Region publishes for the endpoint service `service_name`,
+/// read back through `DescribePrefixLists`' own `prefix-list-name` filter rather than derived
+/// here: the route a gateway endpoint adds has THAT list as its destination.
+async fn published_prefix_list_id(
+    case: &str,
+    router: &MultiServiceRouter,
+    service_name: &str,
+) -> String {
+    let body = ok(
+        case,
+        router,
+        "DescribePrefixLists",
+        &filters(&[("prefix-list-name", &[service_name])]),
+    )
+    .await;
+    let published = elements(&body, "prefixListId");
+    assert_eq!(
+        published.len(),
+        1,
+        "case {case:?}: expected one prefix list published for {service_name}, got {body}"
+    );
+    published[0].clone()
+}
+
+/// A gateway endpoint of `vpc_id` to `service_name`, created for `route_tables`, as its id.
+async fn create_gateway_endpoint(
+    case: &str,
+    router: &MultiServiceRouter,
+    vpc_id: &str,
+    service_name: &str,
+    route_tables: &[String],
+) -> String {
+    let mut params = vec![
+        param("VpcId", vpc_id),
+        param("ServiceName", service_name),
+        param("VpcEndpointType", "Gateway"),
+    ];
+    for (index, route_table_id) in route_tables.iter().enumerate() {
+        params.push(param(&format!("RouteTableId.{}", index + 1), route_table_id));
+    }
+    let body = ok(case, router, "CreateVpcEndpoint", &params).await;
+    member(case, &body, "vpcEndpointId")
+}
+
+/// Associate `subnet_id` with `route_table_id`, as the association's id.
+async fn associate(
+    case: &str,
+    router: &MultiServiceRouter,
+    route_table_id: &str,
+    subnet_id: &str,
+) -> String {
+    let body = ok(
+        case,
+        router,
+        "AssociateRouteTable",
+        &[
+            param("RouteTableId", route_table_id),
+            param("SubnetId", subnet_id),
+        ],
+    )
+    .await;
+    member(case, &body, "associationId")
+}
+
+/// A `/24` inside the `/16` block `vpc_cidr`, numbered by `index` — one subnet block per
+/// subnet a row of the estate table asks for. A row whose block is not a `/16` of four
+/// octets panics here rather than yielding a block of some other network.
+fn subnet_block(vpc_cidr: &str, index: usize) -> String {
+    let network = vpc_cidr
+        .strip_suffix("/16")
+        .unwrap_or_else(|| panic!("the row's VPC block {vpc_cidr:?} must be a /16"));
+    let mut octets = network.split('.');
+    let first = octets
+        .next()
+        .unwrap_or_else(|| panic!("the row's VPC block {vpc_cidr:?} must carry four octets"));
+    let second = octets
+        .next()
+        .unwrap_or_else(|| panic!("the row's VPC block {vpc_cidr:?} must carry four octets"));
+    format!("{first}.{second}.{}.0/24", index + 1)
+}
+
+/// A VPC endpoint as `DescribeVpcEndpoints` reports it, narrowed to the members the estate
+/// tests read it back by.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ReportedEndpoint {
+    vpc_endpoint_type: Option<String>,
+    state: Option<String>,
+    vpc_id: Option<String>,
+    route_table_ids: Vec<String>,
+}
+
+/// The endpoint a row of the estate table reads back through `DescribeVpcEndpoints`.
+async fn described_endpoint(
+    case: &str,
+    router: &MultiServiceRouter,
+    endpoint_id: &str,
+) -> ReportedEndpoint {
+    let body = ok(
+        case,
+        router,
+        "DescribeVpcEndpoints",
+        &[param("VpcEndpointId.1", endpoint_id)],
+    )
+    .await;
+    let parsed = document(case, &body);
+    let endpoint = parsed
+        .descendants()
+        .find(|node| node.is_element() && child(*node, "vpcEndpointId").is_some())
+        .unwrap_or_else(|| panic!("case {case:?}: no endpoint in {body}"));
+    ReportedEndpoint {
+        vpc_endpoint_type: child_text(endpoint, "vpcEndpointType"),
+        state: child_text(endpoint, "state"),
+        vpc_id: child_text(endpoint, "vpcId"),
+        route_table_ids: set_items(endpoint, "routeTableIdSet")
+            .into_iter()
+            .map(|item| item.text().unwrap_or_default().to_string())
+            .collect(),
+    }
+}
+
+/// One row of the private-estate table: a VPC, the endpoint service the gateway endpoint is
+/// created for, how many subnets are explicitly associated with the table that endpoint
+/// names, and whether the endpoint is created BEFORE those associations or after them.
+struct EstateRow {
+    case: &'static str,
+    vpc_cidr: &'static str,
+    service: &'static str,
+    associated: usize,
+    endpoint_first: bool,
+}
+
+/// The rule a client reading its private estate depends on: a gateway endpoint's route —
+/// "a destination of the prefix list for the service and a target of the gateway endpoint"
+/// (Amazon Web Services PrivateLink User Guide, "Gateway endpoints") — is a route OF every
+/// route table the endpoint names, so the table a subnet is EXPLICITLY associated with
+/// reports, beside the local route the table came with, exactly one route out of the VPC per
+/// gateway endpoint named for that table, and a table no endpoint named reports none. The
+/// read is the one a client makes: `DescribeRouteTables` narrowed by `association.subnet-id`,
+/// which selects on explicit associations only ("A subnet ID is not returned for an implicit
+/// association", `RouteTableAssociation$SubnetId`), so a subnet left on its VPC's main table
+/// is selected by no such filter.
+///
+/// The rows differ along what the rule generalises over: the endpoint service (the two a
+/// Region publishes a gateway-endpoint prefix list for, read out of `DescribePrefixLists`),
+/// how many subnets share the endpoint's table, and the ORDER the estate is built in — the
+/// route is the endpoint's either way, so associating a subnet after the endpoint exists
+/// reports the same table as associating it before.
+#[tokio::test]
+async fn a_subnets_own_table_reports_the_gateway_endpoint_as_its_route_out_of_the_vpc() {
+    let router = emulator();
+    let rows = [
+        EstateRow {
+            case: "s3, one subnet, the endpoint created after the association",
+            vpc_cidr: "10.100.0.0/16",
+            service: "s3",
+            associated: 1,
+            endpoint_first: false,
+        },
+        EstateRow {
+            case: "dynamodb, two subnets, the endpoint created before the associations",
+            vpc_cidr: "10.101.0.0/16",
+            service: "dynamodb",
+            associated: 2,
+            endpoint_first: true,
+        },
+        EstateRow {
+            case: "s3, three subnets, the endpoint created before the associations",
+            vpc_cidr: "10.102.0.0/16",
+            service: "s3",
+            associated: 3,
+            endpoint_first: true,
+        },
+        EstateRow {
+            case: "dynamodb, one subnet, the endpoint created after the association",
+            vpc_cidr: "10.103.0.0/16",
+            service: "dynamodb",
+            associated: 1,
+            endpoint_first: false,
+        },
+    ];
+
+    for row in rows {
+        let case = row.case;
+        let service_name = format!("com.amazonaws.{REGION}.{}", row.service);
+        let vpc_id = create_vpc(case, &router, row.vpc_cidr).await;
+        // The table the endpoint is reached through, a second table of the same VPC that no
+        // endpoint names, and the subnets of each — plus one subnet left on the VPC's main
+        // table, which no explicit association covers.
+        let endpoint_table = create_route_table(case, &router, &vpc_id).await;
+        let other_table = create_route_table(case, &router, &vpc_id).await;
+        let mut endpoint_subnets = Vec::new();
+        for index in 0..row.associated {
+            endpoint_subnets
+                .push(create_subnet(case, &router, &vpc_id, &subnet_block(row.vpc_cidr, index)).await);
+        }
+        let other_subnet =
+            create_subnet(case, &router, &vpc_id, &subnet_block(row.vpc_cidr, row.associated)).await;
+        let unassociated_subnet = create_subnet(
+            case,
+            &router,
+            &vpc_id,
+            &subnet_block(row.vpc_cidr, row.associated + 1),
+        )
+        .await;
+
+        let tables_for_endpoint = vec![endpoint_table.clone()];
+        let endpoint_id = if row.endpoint_first {
+            let endpoint_id =
+                create_gateway_endpoint(case, &router, &vpc_id, &service_name, &tables_for_endpoint)
+                    .await;
+            for subnet_id in &endpoint_subnets {
+                associate(case, &router, &endpoint_table, subnet_id).await;
+            }
+            endpoint_id
+        } else {
+            for subnet_id in &endpoint_subnets {
+                associate(case, &router, &endpoint_table, subnet_id).await;
+            }
+            create_gateway_endpoint(case, &router, &vpc_id, &service_name, &tables_for_endpoint)
+                .await
+        };
+        associate(case, &router, &other_table, &other_subnet).await;
+
+        let prefix_list_id = published_prefix_list_id(case, &router, &service_name).await;
+
+        // Every subnet on the endpoint's table reads back that one table, with the endpoint's
+        // route as its only route out of the VPC.
+        for subnet_id in &endpoint_subnets {
+            let reported = tables_of_subnet(case, &router, subnet_id).await;
+            let ids: Vec<&str> = reported
+                .iter()
+                .map(|table| table.route_table_id.as_str())
+                .collect();
+            assert_eq!(
+                ids,
+                vec![endpoint_table.as_str()],
+                "case {case:?}: expected {subnet_id} to read back only {endpoint_table}, got \
+                 {ids:?} from {reported:?}"
+            );
+            let table = &reported[0];
+            assert_eq!(
+                table.vpc_id.as_deref(),
+                Some(vpc_id.as_str()),
+                "case {case:?}: expected the table reported for {vpc_id}, got {table:?}"
+            );
+            let association = table
+                .associations
+                .iter()
+                .find(|association| association.subnet_id.as_deref() == Some(subnet_id.as_str()))
+                .unwrap_or_else(|| {
+                    panic!("case {case:?}: no association for {subnet_id} on {table:?}")
+                });
+            assert_eq!(
+                association.main.as_deref(),
+                Some("false"),
+                "case {case:?}: expected the association explicit rather than the main one, got \
+                 {association:?}"
+            );
+            assert_eq!(
+                association.state.as_deref(),
+                Some("associated"),
+                "case {case:?}: expected the association reported associated, got {association:?}"
+            );
+            assert!(
+                association
+                    .route_table_association_id
+                    .as_deref()
+                    .is_some_and(|id| is_long_id("rtbassoc", id)),
+                "case {case:?}: expected an rtbassoc-… association id, got {association:?}"
+            );
+
+            let (local, outbound) = local_and_outbound(table);
+            assert_eq!(
+                local.len(),
+                1,
+                "case {case:?}: expected the one local route of {vpc_cidr}, got {local:?}",
+                vpc_cidr = row.vpc_cidr
+            );
+            assert_eq!(
+                local[0].destination_cidr_block.as_deref(),
+                Some(row.vpc_cidr),
+                "case {case:?}: expected the local route for the VPC's block, got {:?}",
+                local[0]
+            );
+            assert_eq!(
+                outbound.len(),
+                1,
+                "case {case:?}: expected exactly one route out of the VPC, got {outbound:?}"
+            );
+            let route = outbound[0];
+            assert_eq!(
+                route.destination_prefix_list_id.as_deref(),
+                Some(prefix_list_id.as_str()),
+                "case {case:?}: expected the route's destination to be {service_name}'s published \
+                 prefix list {prefix_list_id}, got {route:?}"
+            );
+            assert_eq!(
+                route.destination_cidr_block, None,
+                "case {case:?}: expected a prefix-list route to carry no CIDR destination, got \
+                 {route:?}"
+            );
+            assert_eq!(
+                route.gateway_id.as_deref(),
+                Some(endpoint_id.as_str()),
+                "case {case:?}: expected the route's target to be {endpoint_id}, got {route:?}"
+            );
+            assert_eq!(
+                route.origin.as_deref(),
+                Some("CreateRoute"),
+                "case {case:?}: expected the endpoint's route reported as added to the table, got \
+                 {route:?}"
+            );
+            assert_eq!(
+                route.state.as_deref(),
+                Some("active"),
+                "case {case:?}: expected the endpoint's route active, got {route:?}"
+            );
+        }
+
+        // The subnet on the table no endpoint named has a table of its own, and no route out.
+        let reported = tables_of_subnet(case, &router, &other_subnet).await;
+        let ids: Vec<&str> = reported
+            .iter()
+            .map(|table| table.route_table_id.as_str())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![other_table.as_str()],
+            "case {case:?}: expected {other_subnet} to read back only {other_table}, got {ids:?}"
+        );
+        let (_, outbound) = local_and_outbound(&reported[0]);
+        assert!(
+            outbound.is_empty(),
+            "case {case:?}: expected no route out of the VPC on {other_table}, got {outbound:?}"
+        );
+
+        // The subnet nobody associated is on its VPC's main table, whose association carries
+        // no subnet id, so the association filter selects nothing for it.
+        let reported = tables_of_subnet(case, &router, &unassociated_subnet).await;
+        assert!(
+            reported.is_empty(),
+            "case {case:?}: expected no explicit association for {unassociated_subnet}, got \
+             {reported:?}"
+        );
+
+        // The endpoint itself reads back as the gateway endpoint of that VPC, for that table.
+        let read_back = described_endpoint(case, &router, &endpoint_id).await;
+        assert_eq!(
+            read_back,
+            ReportedEndpoint {
+                vpc_endpoint_type: Some("Gateway".to_string()),
+                state: Some("available".to_string()),
+                vpc_id: Some(vpc_id.clone()),
+                route_table_ids: vec![endpoint_table.clone()],
+            },
+            "case {case:?}: expected the endpoint read back as the available Gateway endpoint of \
+             {vpc_id} for {endpoint_table}, got {read_back:?}"
+        );
+    }
+}
+
+/// The same rule over the COUNT of endpoints on ONE table: a table named by several gateway
+/// endpoints carries one route out of the VPC per endpoint, each to that endpoint's own
+/// service prefix list, and "when you delete a gateway endpoint, we delete the endpoint routes
+/// in the route tables for the endpoint" (`DeleteVpcEndpoints`) leaves exactly the routes of
+/// the endpoints that remain — read, as a client reads it, through the subnet's association.
+#[tokio::test]
+async fn a_subnets_table_reports_one_route_out_per_gateway_endpoint_it_is_named_by() {
+    let router = emulator();
+    let case = "two gateway endpoints on one table";
+    let vpc_cidr = "10.104.0.0/16";
+    let vpc_id = create_vpc(case, &router, vpc_cidr).await;
+    let route_table_id = create_route_table(case, &router, &vpc_id).await;
+    let subnet_id = create_subnet(case, &router, &vpc_id, &subnet_block(vpc_cidr, 0)).await;
+    associate(case, &router, &route_table_id, &subnet_id).await;
+
+    // The services this Region publishes a gateway-endpoint prefix list for
+    // (`DescribePrefixLists`, read back below), one endpoint each.
+    let services = ["s3", "dynamodb"];
+    let mut endpoints = Vec::new();
+    for service in services {
+        let service_name = format!("com.amazonaws.{REGION}.{service}");
+        let endpoint_id = create_gateway_endpoint(
+            case,
+            &router,
+            &vpc_id,
+            &service_name,
+            std::slice::from_ref(&route_table_id),
+        )
+        .await;
+        let prefix_list_id = published_prefix_list_id(case, &router, &service_name).await;
+        endpoints.push((endpoint_id, prefix_list_id));
+
+        // After each create the subnet's table carries one route out per endpoint so far.
+        let reported = tables_of_subnet(case, &router, &subnet_id).await;
+        assert_eq!(
+            reported.len(),
+            1,
+            "case {case:?}: expected the subnet's one table, got {reported:?}"
+        );
+        let (_, outbound) = local_and_outbound(&reported[0]);
+        let mut pairs: Vec<(Option<&str>, Option<&str>)> = outbound
+            .iter()
+            .map(|route| {
+                (
+                    route.destination_prefix_list_id.as_deref(),
+                    route.gateway_id.as_deref(),
+                )
+            })
+            .collect();
+        pairs.sort();
+        let mut expected: Vec<(Option<&str>, Option<&str>)> = endpoints
+            .iter()
+            .map(|(endpoint_id, prefix_list_id)| {
+                (Some(prefix_list_id.as_str()), Some(endpoint_id.as_str()))
+            })
+            .collect();
+        expected.sort();
+        assert_eq!(
+            pairs, expected,
+            "case {case:?}: expected one route out of the VPC per endpoint named for the table, \
+             got {outbound:?}"
+        );
+    }
+
+    // Deleting the first endpoint takes its route and only its route.
+    let (deleted_endpoint, deleted_prefix_list) = endpoints.remove(0);
+    let body = ok(
+        case,
+        &router,
+        "DeleteVpcEndpoints",
+        &[param("VpcEndpointId.1", &deleted_endpoint)],
+    )
+    .await;
+    assert!(
+        elements(&body, "code").is_empty(),
+        "case {case:?}: expected the delete to report nothing unsuccessful, got {body}"
+    );
+    let reported = tables_of_subnet(case, &router, &subnet_id).await;
+    let (_, outbound) = local_and_outbound(&reported[0]);
+    let mut remaining: Vec<(Option<&str>, Option<&str>)> = outbound
+        .iter()
+        .map(|route| {
+            (
+                route.destination_prefix_list_id.as_deref(),
+                route.gateway_id.as_deref(),
+            )
+        })
+        .collect();
+    remaining.sort();
+    let mut expected: Vec<(Option<&str>, Option<&str>)> = endpoints
+        .iter()
+        .map(|(endpoint_id, prefix_list_id)| {
+            (Some(prefix_list_id.as_str()), Some(endpoint_id.as_str()))
+        })
+        .collect();
+    expected.sort();
+    assert_eq!(
+        remaining, expected,
+        "case {case:?}: expected only the routes of the endpoints that remain, got {outbound:?}"
+    );
+    assert!(
+        !remaining.contains(&(
+            Some(deleted_prefix_list.as_str()),
+            Some(deleted_endpoint.as_str())
+        )),
+        "case {case:?}: expected the deleted endpoint's route gone, got {outbound:?}"
     );
 }

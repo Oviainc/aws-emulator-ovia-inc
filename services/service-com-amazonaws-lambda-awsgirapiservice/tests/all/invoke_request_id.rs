@@ -544,7 +544,10 @@ async fn a_failed_runs_error_document_names_the_invocation_the_answer_names() {
     for (case, source, error_type, bound) in cases {
         let name = "probe-raise-request-id";
         create_function(&router, name, source, "python3.12").await;
-        let answered = invoke(&router, name, &[("x-amz-log-type", "Tail")]).await;
+        // Through [`invoke_run`], as the row above does: a run this suite's handlers cannot
+        // ask for — one the HOST stopped for memory another suite of this target holds — is
+        // no answer to what this row asked, so it is re-driven rather than skipped.
+        let answered = invoke_run(&router, name, &[("x-amz-log-type", "Tail")]).await;
         if is_host_bound(answered.status, &answered.text()) {
             delete_function(&router, case, name).await;
             continue;
