@@ -98,7 +98,15 @@ const FORCE_SSL_DEFAULT_FROM_MAJOR_VERSION: u32 = 15;
 /// Whether a PostgreSQL instance running `engine_version` forces TLS by default; see
 /// [`FORCE_SSL_DEFAULT_FROM_MAJOR_VERSION`]. A version this cannot read is treated as a
 /// current one, which is the default a new instance gets.
-fn postgres_forces_ssl_by_default(engine_version: &str) -> bool {
+///
+/// The one place that rule lives: the login gate above reads it for an INSTANCE's engine
+/// version, and the published record the parameter catalog reports for a DB parameter
+/// group FAMILY — the parameter's default AND its apply type, both of which moved at this
+/// release — is the same rule over that family's version
+/// (`crate::state::published_spec_for_family`), so for RDS for PostgreSQL, whose default
+/// this release moved, what a describe reports for `rds.force_ssl` and what a session on
+/// such an instance is held to cannot disagree.
+pub(crate) fn postgres_forces_ssl_by_default(engine_version: &str) -> bool {
     engine_version
         .split('.')
         .next()

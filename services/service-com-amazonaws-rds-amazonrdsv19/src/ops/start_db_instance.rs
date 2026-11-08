@@ -297,6 +297,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The DB subnet group the instance reports is that GROUP's own record, resolved
+        // here — before the instance record is taken mutably below — so the answer carries
+        // the group as it reads now (`instance_to_wire` is the same answer).
+        let db_subnet_group = store
+            .db_instances
+            .get(&key)
+            .and_then(|record| store.db_subnet_group_of(record));
         let record = store
             .db_instances
             .get_mut(&key)
@@ -314,7 +321,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // again, which is what `pg_postmaster_start_time()` reports on the data plane.
         record.engine_started_at = crate::state::now_as_wire_timestamp();
         let instance_arn = record.arn();
-        let db_instance = record.to_wire();
+        let db_instance = record.to_wire(db_subnet_group.as_ref());
         // The start happened, so the region's event log records it.
         store.record_event(
             &region,

@@ -302,13 +302,17 @@ const PUBLISHED: [Published; 9] = [
         true,
     ),
     (
+        // Both halves of this parameter's published record moved at PostgreSQL 15 — the
+        // engine applies a change to it without a restart from that release, and RDS for
+        // PostgreSQL publishes its default as 1 — so a family of that engine past the bound
+        // reports dynamic and 1; Aurora PostgreSQL keeps its own published default.
         "RDS for PostgreSQL in a Multi-AZ DB cluster runs the same engine",
         "postgres16",
         "rds.force_ssl",
-        APPLY_TYPE_STATIC,
+        APPLY_TYPE_DYNAMIC,
         "boolean",
         "0,1",
-        "0",
+        "1",
         true,
     ),
     (

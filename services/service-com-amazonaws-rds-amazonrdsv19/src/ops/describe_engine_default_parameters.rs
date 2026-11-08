@@ -197,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|spec| {
                 (
                     spec.name.to_string(),
-                    crate::state::engine_default_parameter_to_wire(spec),
+                    crate::state::engine_default_parameter_to_wire(&family, spec),
                 )
             })
             .collect();
@@ -274,7 +274,7 @@ pub(crate) fn engine_default_parameters(
     // Oracle and SQL Server engines as their non-custom counterparts.
     Some(match engine {
         _ if engine.ends_with("mysql") || engine == "mariadb" => MYSQL_PARAMETERS,
-        _ if engine.ends_with("postgresql") || engine == "postgres" => POSTGRES_PARAMETERS,
+        _ if is_postgres_engine(engine) => POSTGRES_PARAMETERS,
         _ if engine.contains("oracle") => ORACLE_PARAMETERS,
         _ if engine.contains("sqlserver") => SQLSERVER_PARAMETERS,
         // Amazon DocumentDB's catalog is the SHARED one (the cluster-parameter-group
@@ -332,6 +332,36 @@ pub(crate) fn family_engine(family: &str) -> Option<&'static str> {
         })
         .max_by_key(|engine| engine.len())
         .copied()
+}
+
+/// Whether `engine` RUNS the PostgreSQL engine: Amazon RDS for PostgreSQL itself, and the
+/// engines that run the same PostgreSQL releases under another name
+/// (`aurora-postgresql`).
+///
+/// One predicate, read wherever that answer decides which published record applies: which
+/// parameter catalog a family's engine publishes (this operation's and the cluster-level
+/// one's), the compiled default its engine runs with, and the record a family reports for a
+/// parameter the engine moved between versions
+/// (`crate::state::published_spec_for_family`) — so the catalog selection and the record
+/// resolution cannot disagree about what a PostgreSQL family is.
+pub(crate) fn is_postgres_engine(engine: &str) -> bool {
+    engine == crate::state::POSTGRES_ENGINE
+        || engine.ends_with(crate::state::POSTGRES_COMPATIBLE_ENGINE_SUFFIX)
+}
+
+/// The version part of the DB parameter group family `family`, or `None` when it names no
+/// family or names one without a version.
+///
+/// A family is an engine followed by that engine's version ([`family_engine`] carries that
+/// reading), so the version is what is left once the engine name — and the hyphen the
+/// Oracle, SQL Server and Db2 families write before it — is taken off the front. It is read
+/// for the parameters whose published record moves with the engine version
+/// (`crate::state::published_spec_for_family`).
+pub(crate) fn family_version(family: &str) -> Option<&str> {
+    let engine = family_engine(family)?;
+    let version = family.get(engine.len()..)?;
+    let version = version.strip_prefix('-').unwrap_or(version);
+    (!version.is_empty()).then_some(version)
 }
 
 /// The engines whose DB parameter group family is the engine name ITSELF, carrying no
@@ -879,6 +909,36 @@ pub(crate) const POSTGRES_PARAMETERS: &[crate::state::ClusterParameterSpec] = &[
         true,
         "",
         "Sets the maximum number of parallel processes per executor node.",
+    ),
+    // The parameters Amazon RDS ADDS to the PostgreSQL engine carry its own `rds.`
+    // namespace, and a DB parameter group of an RDS for PostgreSQL family publishes them
+    // beside the engine's own: a client reads them to tell whether the instance it created
+    // demands TLS and whether logical decoding is on.
+    parameter(
+        "rds.force_ssl",
+        // Both halves of this parameter's published record MOVED at PostgreSQL 15 — from
+        // that release the engine applies a change to it without a restart ("beginning with
+        // RDS for PostgreSQL 15, rds.force_ssl is a dynamic parameter") and RDS publishes
+        // its default as 1 — so the record a family reports is resolved for that family
+        // (`crate::state::published_spec_for_family`) and these two columns carry the
+        // EARLIER of each: the apply type and the default of the versions before 15.
+        crate::state::APPLY_TYPE_STATIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Requires client connections to the DB instance to use TLS.",
+    ),
+    parameter(
+        "rds.logical_replication",
+        crate::state::APPLY_TYPE_STATIC,
+        "boolean",
+        "0,1",
+        "0",
+        true,
+        "",
+        "Enables logical decoding, which a logical replication slot needs.",
     ),
     parameter(
         "shared_buffers",

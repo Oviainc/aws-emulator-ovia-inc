@@ -130,13 +130,53 @@ fn declared(entry: &Reported) -> Declared {
     )
 }
 
-/// The declared record `spec` publishes, as an engine default is reported.
-fn published(spec: &ClusterParameterSpec) -> Declared {
+/// The record the FAMILY publishes for `spec`: the catalogue's own columns, except for a
+/// parameter whose published record moved between engine versions, which is the record that
+/// family's version carries.
+///
+/// The one such parameter in the catalogues below is PostgreSQL's `rds.force_ssl`: from
+/// PostgreSQL 15 the engine applies a change to it without a restart (`dynamic`) and RDS for
+/// PostgreSQL publishes its default as 1, where the versions before it publish `static` and 0
+/// (the Amazon RDS User Guide's RDS for PostgreSQL parameter table). The rule is written out
+/// HERE as literals rather than read from the crate, so a drift in it fails this test; the
+/// rows of `postgres_rds_namespace_parameters` beside it pin the same values family by family.
+fn published_record(family: &str, spec: &ClusterParameterSpec) -> (&'static str, &'static str) {
+    // Only a PostgreSQL-compatible family: the SQL Server catalogue carries a parameter of
+    // this name too, and that engine's record does not move.
+    let postgres = family
+        .strip_prefix("postgres")
+        .or_else(|| family.strip_prefix("aurora-postgresql"));
+    let Some(version) = postgres.filter(|_| spec.name == "rds.force_ssl") else {
+        return (spec.apply_type, spec.default_value);
+    };
+    let major = version
+        .split('.')
+        .next()
+        .and_then(|major| major.parse::<u32>().ok());
+    match major {
+        // The default that moved is RDS for PostgreSQL's own; another PostgreSQL-compatible
+        // engine keeps the catalogue's.
+        Some(major) if major >= 15 => (
+            APPLY_TYPE_DYNAMIC,
+            if family.starts_with("postgres") {
+                "1"
+            } else {
+                spec.default_value
+            },
+        ),
+        Some(_) => (APPLY_TYPE_STATIC, spec.default_value),
+        None => (spec.apply_type, spec.default_value),
+    }
+}
+
+/// The declared record `spec` publishes FOR `family`, as an engine default is reported.
+fn published(family: &str, spec: &ClusterParameterSpec) -> Declared {
+    let (apply_type, default_value) = published_record(family, spec);
     (
-        Some(spec.apply_type.to_string()),
+        Some(apply_type.to_string()),
         Some(spec.data_type.to_string()),
         Some(spec.allowed_values.to_string()),
-        Some(spec.default_value.to_string()),
+        Some(default_value.to_string()),
         Some(spec.is_modifiable.to_string()),
         Some(PARAMETER_SOURCE_ENGINE_DEFAULT.to_string()),
     )
@@ -202,7 +242,7 @@ async fn a_new_groups_parameter_report_publishes_each_parameters_declared_record
             let entry = entry_for(&case, &parameters, spec.name);
             assert_eq!(
                 declared(entry),
-                published(spec),
+                published(family, spec),
                 "case {case:?}: expected the declared record the family publishes, got \
                  {entry:?}"
             );

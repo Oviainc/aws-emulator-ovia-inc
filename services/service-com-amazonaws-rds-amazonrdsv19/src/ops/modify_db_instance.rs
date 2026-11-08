@@ -973,7 +973,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.pending_status = Some(crate::state::PendingStatus::in_a_moment("available"));
         }
 
-        let db_instance = record.to_wire();
+        let db_instance = store.instance_to_wire(&record);
         let dbi_resource_id = record.dbi_resource_id.clone();
         let monitoring = ::service_common::db_data_sources::MonitoringConfiguration {
             performance_insights_enabled: record.performance_insights_enabled,

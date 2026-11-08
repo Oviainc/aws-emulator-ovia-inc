@@ -216,6 +216,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The DB subnet group the instance reports is that GROUP's own record, resolved
+        // here — before the instance record is taken mutably below — so the answer carries
+        // the group as it reads now (`instance_to_wire` is the same answer).
+        let db_subnet_group = store
+            .db_instances
+            .get(&key)
+            .and_then(|record| store.db_subnet_group_of(record));
         let record = store
             .db_instances
             .get_mut(&key)
@@ -230,7 +237,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // puts a parameter change that was waiting for a reboot into force.
         record.engine_started_at = crate::state::now_as_wire_timestamp();
         let instance_arn = record.arn();
-        let db_instance = record.to_wire();
+        let db_instance = record.to_wire(db_subnet_group.as_ref());
         // "Rebooting a DB instance restarts the database engine service": the sessions
         // the engine held do not survive the restart, and whatever they had not committed
         // is rolled back with them. The endpoint stays bound — a reboot does not move the

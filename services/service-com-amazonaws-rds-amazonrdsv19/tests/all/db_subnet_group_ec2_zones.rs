@@ -48,14 +48,18 @@ const VPC_CIDR: &str = "10.52.0.0/16";
 /// One emulator over one shared engine: Amazon RDS the way the router mounts it in
 /// production, PLUS Amazon EC2, the service that owns subnets. The EC2 client comes with it,
 /// over the router's in-process callback.
-struct Account {
-    router: MultiServiceRouter,
+///
+/// `pub(crate)` so a sibling suite over the same fact — what a DB INSTANCE reports about
+/// the group it was created in — drives one network through the same seam rather than
+/// standing up a second copy of it.
+pub(crate) struct Account {
+    pub(crate) router: MultiServiceRouter,
     ec2: ::aws_sdk_ec2::Client,
 }
 
 impl Account {
     /// Both services on one engine, with an EC2 client over the router's own callback.
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signatures are not the subject of these tests; the requests still carry the SigV4
@@ -143,7 +147,7 @@ impl Account {
 
     /// The Availability Zone EC2 reports for `subnet_id`: what every assertion below is
     /// made against, read from the owner of subnets rather than computed here.
-    async fn zone_of(&self, subnet_id: &str) -> String {
+    pub(crate) async fn zone_of(&self, subnet_id: &str) -> String {
         self.ec2
             .describe_subnets()
             .subnet_ids(subnet_id)
@@ -159,7 +163,7 @@ impl Account {
     }
 
     /// `CreateDBSubnetGroup` over `subnets`.
-    async fn create_group(&self, name: &str, subnets: &[String]) -> (u16, String) {
+    pub(crate) async fn create_group(&self, name: &str, subnets: &[String]) -> (u16, String) {
         let mut params: Vec<(String, String)> = vec![
             ("DBSubnetGroupName".to_string(), name.to_string()),
             (
@@ -172,7 +176,7 @@ impl Account {
     }
 
     /// `ModifyDBSubnetGroup` leaving the group holding exactly `subnets`.
-    async fn modify_group(&self, name: &str, subnets: &[String]) -> (u16, String) {
+    pub(crate) async fn modify_group(&self, name: &str, subnets: &[String]) -> (u16, String) {
         let mut params: Vec<(String, String)> =
             vec![("DBSubnetGroupName".to_string(), name.to_string())];
         params.extend(subnet_members(subnets));
@@ -180,7 +184,7 @@ impl Account {
     }
 
     /// `DescribeDBSubnetGroups` for one group.
-    async fn describe_group(&self, name: &str) -> (u16, String) {
+    pub(crate) async fn describe_group(&self, name: &str) -> (u16, String) {
         call_in(
             &self.router,
             REGION,
@@ -192,7 +196,7 @@ impl Account {
 }
 
 /// The `SubnetIds.SubnetIdentifier.<n>` members for `subnets`, in the order given.
-fn subnet_members(subnets: &[String]) -> Vec<(String, String)> {
+pub(crate) fn subnet_members(subnets: &[String]) -> Vec<(String, String)> {
     subnets
         .iter()
         .enumerate()
@@ -207,20 +211,20 @@ fn subnet_members(subnets: &[String]) -> Vec<(String, String)> {
 
 /// The network one case runs against: two subnets in the Region's first zone and one in its
 /// second, every id minted by EC2.
-struct Network {
-    account: Account,
+pub(crate) struct Network {
+    pub(crate) account: Account,
     /// The Region's zones, as EC2 reports them.
     zones: Vec<String>,
     /// The VPC EC2 minted this network's subnets in.
     vpc: String,
     /// Two subnets of the FIRST zone, so a list can name two subnets and cover one zone.
-    first_zone: [String; 2],
+    pub(crate) first_zone: [String; 2],
     /// One subnet of the SECOND zone.
-    second_zone: String,
+    pub(crate) second_zone: String,
 }
 
 impl Network {
-    async fn build() -> Self {
+    pub(crate) async fn build() -> Self {
         let account = Account::new();
         let zones = account.zones().await;
         let vpc = account.create_vpc(VPC_CIDR).await;
@@ -245,7 +249,7 @@ impl Network {
     }
 
     /// The zone EC2 reports for each of `subnets`, in the order given.
-    async fn zones_of(&self, subnets: &[String]) -> Vec<String> {
+    pub(crate) async fn zones_of(&self, subnets: &[String]) -> Vec<String> {
         let mut reported = Vec::with_capacity(subnets.len());
         for subnet in subnets {
             reported.push(self.account.zone_of(subnet).await);
@@ -256,7 +260,13 @@ impl Network {
 
 /// Assert one `DBSubnetGroup` envelope reports each of `subnets` with the zone `zones` says
 /// EC2 holds it in, in the order the group names them.
-fn assert_reported_zones(case: &str, label: &str, group: &str, subnets: &[String], zones: &[String]) {
+pub(crate) fn assert_reported_zones(
+    case: &str,
+    label: &str,
+    group: &str,
+    subnets: &[String],
+    zones: &[String],
+) {
     let reported = subtrees(group, "Subnet");
     assert_eq!(
         reported.len(),

@@ -63,6 +63,8 @@ mod db_instance_envelope;
 mod db_instance_read_replicas;
 #[path = "all/db_instance_stop.rs"]
 mod db_instance_stop;
+#[path = "all/db_instance_subnet_group_projection.rs"]
+mod db_instance_subnet_group_projection;
 #[path = "all/db_instances.rs"]
 mod db_instances;
 #[path = "all/db_major_engine_versions.rs"]
@@ -209,6 +211,8 @@ mod orderable_db_instance_options;
 mod parameter_group_and_snapshot_copies;
 #[path = "all/parameter_refusal_codes.rs"]
 mod parameter_refusal_codes;
+#[path = "all/postgres_rds_namespace_parameters.rs"]
+mod postgres_rds_namespace_parameters;
 #[path = "all/published_catalog_creates.rs"]
 mod published_catalog_creates;
 #[path = "all/query_catalog_reads.rs"]

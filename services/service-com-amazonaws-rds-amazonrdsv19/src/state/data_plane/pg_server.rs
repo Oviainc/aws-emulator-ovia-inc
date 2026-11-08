@@ -155,7 +155,11 @@ const SOURCE_DEFAULT: &str = "default";
 /// to nothing.
 fn engine_compiled_default(family: &str, name: &str) -> Option<&'static str> {
     let family = family.to_ascii_lowercase();
-    let postgres = family.starts_with("postgres") || family.starts_with("aurora-postgresql");
+    // Which engine the family's own name says it runs — the one predicate the catalogs are
+    // selected by (`describe_engine_default_parameters::is_postgres_engine`).
+    let engine = crate::ops::describe_engine_default_parameters::family_engine(&family);
+    let postgres = engine
+        .is_some_and(crate::ops::describe_engine_default_parameters::is_postgres_engine);
     let mysql = family.contains("mysql") || family.starts_with("mariadb");
     match name {
         "max_connections" if postgres => Some("100"),
@@ -165,9 +169,10 @@ fn engine_compiled_default(family: &str, name: &str) -> Option<&'static str> {
     }
 }
 
-/// The value a parameter's published default stands for: the published value itself, or the
-/// engine's compiled default where the published one is a formula
-/// ([`engine_compiled_default`]).
+/// The value a parameter's published default stands for: the default column of the record
+/// the FAMILY publishes (already resolved by the caller through
+/// [`crate::state::published_spec_for_family`]), or the engine's compiled default where the
+/// published one is a formula ([`engine_compiled_default`]).
 fn resolved_default(family: &str, spec: &ClusterParameterSpec) -> String {
     if spec.default_value.contains('{') || spec.default_value.contains('(') {
         if let Some(compiled) = engine_compiled_default(family, spec.name) {
@@ -221,6 +226,10 @@ pub fn running_parameters(
 ) -> Vec<RunningParameter> {
     let mut parameters: Vec<RunningParameter> = Vec::new();
     for spec in catalog.unwrap_or_default() {
+        // The record the FAMILY publishes for this parameter, which for one the engine moved
+        // between versions is the one this family's version carries: the engine runs, and
+        // reports, what its own release publishes.
+        let spec = &crate::state::published_spec_for_family(family, spec);
         let default = resolved_default(family, spec);
         let setting = group.and_then(|group| group.get(spec.name));
         let pending = setting.is_some_and(|setting| {

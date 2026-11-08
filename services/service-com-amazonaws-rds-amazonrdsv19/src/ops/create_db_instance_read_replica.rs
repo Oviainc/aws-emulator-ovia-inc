@@ -895,7 +895,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the one lock, so no read can see one without the other.
         source.attach_read_replica(&identifier);
 
-        let db_instance = record.to_wire();
+        let db_instance = store.instance_to_wire(&record);
         let instance_arn = record.arn();
         let dbi_resource_id = record.dbi_resource_id.clone();
         let engine = record.engine.clone();

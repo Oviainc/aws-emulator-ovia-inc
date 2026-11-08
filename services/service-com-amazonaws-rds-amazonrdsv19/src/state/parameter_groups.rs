@@ -192,7 +192,9 @@ impl DbClusterParameterGroupRecord {
         let spec = crate::ops::describe_engine_default_cluster_parameters::cluster_parameter_spec(
             &self.family,
             name,
-        );
+        )
+        .map(|spec| published_spec_for_family(&self.family, spec));
+        let spec = spec.as_ref();
         Parameter {
             parameter_name: Some(name.to_string()),
             parameter_value: setting.map(|setting| setting.value.clone()),
@@ -304,11 +306,14 @@ impl DbParameterGroupRecord {
 
     /// The parameter `name` as the modelled `Parameter`: the value and apply method the
     /// caller set, plus the metadata this group's family publishes for it when it publishes
-    /// any — the instance-level counterpart of
+    /// any ([`published_spec_for_family`], so a record the engine moved between versions is
+    /// this family's) — the instance-level counterpart of
     /// [`DbClusterParameterGroupRecord::parameter_to_wire`].
     pub fn parameter_to_wire(&self, name: &str) -> Parameter {
         let setting = self.parameters.get(name);
-        let spec = published_db_parameter(&self.family, name);
+        let spec = published_db_parameter(&self.family, name)
+            .map(|spec| published_spec_for_family(&self.family, spec));
+        let spec = spec.as_ref();
         Parameter {
             parameter_name: Some(name.to_string()),
             parameter_value: setting.map(|setting| setting.value.clone()),
@@ -407,21 +412,30 @@ pub fn validate_cluster_parameter_setting(
 }
 
 /// The apply method a change to a DB (instance) parameter gets when the caller asks for
-/// none: the one the parameter's own apply type implies; see
+/// none: the one the parameter's own apply type implies, as its family publishes it
+/// ([`published_spec_for_family`]); see
 /// [`service_common::rds_cluster_parameters::default_apply_method`] for the documented rule.
 pub fn db_parameter_default_apply_method(family: &str, name: &str) -> &'static str {
-    default_apply_method_for(published_db_parameter(family, name))
+    let spec = published_db_parameter(family, name)
+        .map(|spec| published_spec_for_family(family, spec));
+    default_apply_method_for(spec.as_ref())
 }
 
 /// A parameter the engine publishes for a family, as the modelled `Parameter` with its
 /// default value and `Source` [`PARAMETER_SOURCE_ENGINE_DEFAULT`]: what a describe reports
 /// when the caller asks for the engine's own parameters rather than a group's.
 ///
+/// `family` is the DB parameter group family the report is ABOUT, which is what the
+/// published record is resolved for ([`published_spec_for_family`]): one catalog serves
+/// every family of an engine, and a record the engine moved between versions is the one
+/// that family's version carries.
+///
 /// `MinimumEngineVersion` is reported only where the catalog publishes the version the
 /// parameter was introduced in; an entry that names none reports none rather than a guessed
 /// version, since "the earliest engine version to which the parameter can apply" is a fact
 /// about the engine's release history and not something this front door can derive.
-pub fn engine_default_parameter_to_wire(spec: &ClusterParameterSpec) -> Parameter {
+pub fn engine_default_parameter_to_wire(family: &str, spec: &ClusterParameterSpec) -> Parameter {
+    let spec = published_spec_for_family(family, spec);
     Parameter {
         parameter_name: Some(spec.name.to_string()),
         parameter_value: Some(spec.default_value.to_string()),
@@ -458,6 +472,68 @@ pub fn cluster_engine_default_parameter_to_wire(
         ),
         minimum_engine_version: (!spec.minimum_engine_version.is_empty())
             .then(|| minimum_engine_version_in_family(family, spec)),
-        ..engine_default_parameter_to_wire(spec)
+        ..engine_default_parameter_to_wire(family, spec)
     }
 }
+
+/// The whole published record of `spec` FOR the family `family`: the catalog's own columns,
+/// except for a parameter whose published record MOVED with the engine version, which reads
+/// as that family's own version carries it.
+///
+/// `rds.force_ssl` is such a parameter, and both halves of its record moved at the SAME
+/// release: from PostgreSQL 15 Amazon RDS turns it on by default ("the default is 1 for RDS
+/// for PostgreSQL 15 and higher") and the engine applies a change to it without a restart
+/// ("beginning with RDS for PostgreSQL 15, rds.force_ssl is a dynamic parameter"). So both
+/// read the ONE place that states that version
+/// ([`crate::state::data_plane::postgres_forces_ssl_by_default`]), which is also what decides
+/// whether a session on an RDS for PostgreSQL instance of that family may be in the clear —
+/// the value a describe reports for that engine, the apply type a change to it is held to,
+/// and what such an instance holds a session to are one answer.
+///
+/// The apply type is the PostgreSQL ENGINE's, so every PostgreSQL-compatible family whose
+/// version says so reports it dynamic; the DEFAULT that moved is RDS for PostgreSQL's own, so
+/// another PostgreSQL-compatible engine keeps the catalog's default (Amazon Aurora PostgreSQL
+/// publishes 0, and what its own cluster endpoint holds a session to is that service slice's
+/// own rule rather than this one). A family whose version cannot be read, and every other
+/// engine that carries a parameter of this name, report the catalog record unchanged.
+pub fn published_spec_for_family(family: &str, spec: &ClusterParameterSpec) -> ClusterParameterSpec {
+    let mut resolved = *spec;
+    if spec.name != POSTGRES_FORCE_SSL_PARAMETER {
+        return resolved;
+    }
+    let Some(engine) = crate::ops::describe_engine_default_parameters::family_engine(family) else {
+        return resolved;
+    };
+    if !crate::ops::describe_engine_default_parameters::is_postgres_engine(engine) {
+        return resolved;
+    }
+    let Some(version) = crate::ops::describe_engine_default_parameters::family_version(family)
+    else {
+        return resolved;
+    };
+    let from_fifteen = crate::state::data_plane::postgres_forces_ssl_by_default(version);
+    resolved.apply_type = if from_fifteen {
+        APPLY_TYPE_DYNAMIC
+    } else {
+        APPLY_TYPE_STATIC
+    };
+    if engine == POSTGRES_ENGINE {
+        resolved.default_value = if from_fifteen { "1" } else { "0" };
+    }
+    resolved
+}
+
+/// The parameter RDS for PostgreSQL carries the TLS requirement of, which both the
+/// published catalog above and the engine's login gate are about.
+pub const POSTGRES_FORCE_SSL_PARAMETER: &str = "rds.force_ssl";
+
+/// The `Engine` value of Amazon RDS for PostgreSQL, as `CreateDBInstance$Engine` publishes
+/// it and as a DB parameter group family of that engine is named after
+/// (`postgres17`) — the engine whose own published defaults
+/// [`published_spec_for_family`] resolves.
+pub const POSTGRES_ENGINE: &str = "postgres";
+
+/// What the `Engine` value of every OTHER PostgreSQL-compatible engine ends with
+/// (`aurora-postgresql`) — the engines that run the same PostgreSQL releases, and so carry
+/// the apply type those releases give a parameter.
+pub const POSTGRES_COMPATIBLE_ENGINE_SUFFIX: &str = "postgresql";

@@ -270,7 +270,7 @@ fn published_defaults(
         .map(|spec| {
             (
                 spec.name.to_string(),
-                crate::state::engine_default_parameter_to_wire(spec),
+                crate::state::engine_default_parameter_to_wire(&group.family, spec),
             )
         })
         .collect()

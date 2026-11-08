@@ -246,7 +246,9 @@ fn cluster_engine_default_parameters(
     // MySQL's), and so do the PostgreSQL-compatible ones.
     Ok(match engine {
         _ if engine.ends_with("mysql") => MYSQL_CLUSTER_PARAMETERS,
-        _ if engine.ends_with("postgresql") || engine == "postgres" => POSTGRES_CLUSTER_PARAMETERS,
+        _ if super::describe_engine_default_parameters::is_postgres_engine(engine) => {
+            POSTGRES_CLUSTER_PARAMETERS
+        }
         // Amazon DocumentDB keeps every parameter in a DB CLUSTER parameter group, so its
         // catalog is the SHARED one the cluster-parameter-group operations of this front door
         // already validate values against (`crate::state::published_parameters`), reported

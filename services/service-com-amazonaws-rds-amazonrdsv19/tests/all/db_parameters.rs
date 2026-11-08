@@ -639,7 +639,16 @@ async fn an_absent_apply_method_follows_the_parameters_apply_type() {
     for spec in catalog.iter().filter(|spec| spec.is_modifiable) {
         let (admitted, _) = admitted_and_refused(spec);
         let value = &admitted[0];
-        let implied = if spec.apply_type == APPLY_TYPE_DYNAMIC {
+        // The apply type this FAMILY publishes. `rds.force_ssl` is the one entry whose apply
+        // type moved with the engine: the PostgreSQL release at 15 applies a change to it
+        // without a restart, and this family is past that bound, whatever earlier value the
+        // catalogue's own column carries.
+        let apply_type = if spec.name == "rds.force_ssl" {
+            APPLY_TYPE_DYNAMIC
+        } else {
+            spec.apply_type
+        };
+        let implied = if apply_type == APPLY_TYPE_DYNAMIC {
             APPLY_METHOD_IMMEDIATE
         } else {
             APPLY_METHOD_PENDING_REBOOT
@@ -649,7 +658,7 @@ async fn an_absent_apply_method_follows_the_parameters_apply_type() {
             (Some(APPLY_METHOD_PENDING_REBOOT), APPLY_METHOD_PENDING_REBOOT),
             (None, implied),
         ] {
-            let case = format!("{} ({}) asked for {asked:?}", spec.name, spec.apply_type);
+            let case = format!("{} ({apply_type}) asked for {asked:?}", spec.name);
             expect_ok(
                 &case,
                 modify(&router, &group, &[(spec.name, value, asked)]).await,

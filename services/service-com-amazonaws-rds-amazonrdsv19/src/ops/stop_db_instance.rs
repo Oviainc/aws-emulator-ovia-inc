@@ -360,6 +360,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // which is also why `InvalidDBCapacityReservationStateFault` is unreachable here.
         let _ = input.detach_from_db_capacity_reservation;
 
+        // The DB subnet group the instance reports is that GROUP's own record, resolved
+        // here — before the instance record is taken mutably below — so the answer carries
+        // the group as it reads now (`instance_to_wire` is the same answer).
+        let db_subnet_group = store
+            .db_instances
+            .get(&key)
+            .and_then(|record| store.db_subnet_group_of(record));
         let record = store
             .db_instances
             .get_mut(&key)
@@ -374,7 +381,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             DB_INSTANCE_STATUS_STOPPED,
         ));
         let instance_arn = record.arn();
-        let db_instance = record.to_wire();
+        let db_instance = record.to_wire(db_subnet_group.as_ref());
         // The database engine is shutting down, so the sessions it held end here and
         // whatever they had not committed is rolled back with them. The endpoint stays
         // bound, because the instance keeps it: a stopped instance refuses a login rather

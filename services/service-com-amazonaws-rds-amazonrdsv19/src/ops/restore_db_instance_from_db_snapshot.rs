@@ -927,7 +927,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         let mut store = state.lock();
 
-        let db_instance = record.to_wire();
+        let db_instance = store.instance_to_wire(&record);
         let dbi_resource_id = record.dbi_resource_id.clone();
         let instance_arn = record.arn();
         let engine = record.engine.clone();

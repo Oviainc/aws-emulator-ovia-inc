@@ -438,8 +438,8 @@ fn instance_roles_used(store: &Store, region: &str) -> i64 {
         .into_iter()
         .map(|record| {
             count(
-                record
-                    .to_wire()
+                store
+                    .instance_to_wire(record)
                     .associated_roles
                     .map_or(0, |roles| roles.len()),
             )
@@ -515,8 +515,8 @@ fn read_replicas_used(store: &Store, region: &str) -> i64 {
         .into_iter()
         .map(|record| {
             count(
-                record
-                    .to_wire()
+                store
+                    .instance_to_wire(record)
                     .read_replica_db_instance_identifiers
                     .map_or(0, |replicas| replicas.len()),
             )

@@ -944,6 +944,28 @@ impl ComAmazonawsRdsAmazonrdsv19State {
         record.to_wire(&self.cluster_membership(record))
     }
 
+    /// Project a stored DB instance onto the modelled `DBInstance` output shape, with the
+    /// nested `DBSubnetGroup` read from the DB subnet group record the instance's own
+    /// `DBSubnetGroupName` resolves to ([`Self::db_subnet_group_of`]).
+    ///
+    /// The one way a handler projects an instance — the instance-level counterpart of
+    /// [`Self::cluster_to_wire`] — so every operation that reports a DB instance reports
+    /// the same group for it, and a group `ModifyDBSubnetGroup` changes is reported as it
+    /// is now rather than as it was when the instance was created.
+    pub fn instance_to_wire(&self, record: &DbInstanceRecord) -> DBInstance {
+        record.to_wire(self.db_subnet_group_of(record).as_ref())
+    }
+
+    /// The DB subnet group `record` was created in, as this store holds it, or `None` for an
+    /// instance that names none and for a name this store no longer resolves.
+    ///
+    /// Taken by VALUE so a handler that holds the instance record mutably can still read the
+    /// group it reports: it is resolved before the record is taken, and
+    /// [`Self::instance_to_wire`] is the same answer for a record held immutably.
+    pub fn db_subnet_group_of(&self, record: &DbInstanceRecord) -> Option<DbSubnetGroupRecord> {
+        self.resolve_db_subnet_group(&record.region, record.db_subnet_group_name.as_deref()?)
+    }
+
     /// The DB instances stored in `region`, in identifier order.
     ///
     /// An ordered range rather than a scan of the whole map, so the work is bounded by

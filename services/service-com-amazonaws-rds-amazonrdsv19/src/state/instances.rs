@@ -318,12 +318,20 @@ impl DbInstanceRecord {
     ///
     /// Every member RDS reports for a DB instance it holds is projected here, from the
     /// stored record or from the documented default the record was created with; the
-    /// nested `Endpoint`, `DBSubnetGroup`, `CertificateDetails`, `PendingModifiedValues`
-    /// and membership lists are projected from the same record, so no two of them can
-    /// disagree. A member whose value this service has no state for at all is left out
-    /// rather than invented — a list it does have state for is reported EMPTY, which is
-    /// what RDS reports for an instance that has none of those associations.
-    pub fn to_wire(&self) -> DBInstance {
+    /// nested `Endpoint`, `CertificateDetails`, `PendingModifiedValues` and membership
+    /// lists are projected from the same record, so no two of them can disagree. A member
+    /// whose value this service has no state for at all is left out rather than invented —
+    /// a list it does have state for is reported EMPTY, which is what RDS reports for an
+    /// instance that has none of those associations.
+    ///
+    /// `db_subnet_group` is the DB SUBNET GROUP record the instance's own
+    /// `DBSubnetGroupName` resolves to, which the store looks up for this projection
+    /// ([`ComAmazonawsRdsAmazonrdsv19State::instance_to_wire`], the one way a handler
+    /// reaches it): a nested resource of another record is reported FROM that record, so
+    /// the group an instance reports and the one `DescribeDBSubnetGroups` reports are one
+    /// answer. `None` where the instance names a group this store no longer resolves, which
+    /// reports no group at all rather than a name with nothing behind it.
+    pub fn to_wire(&self, db_subnet_group: Option<&DbSubnetGroupRecord>) -> DBInstance {
         DBInstance {
             db_instance_identifier: Some(self.identifier.clone()),
             db_instance_class: Some(self.db_instance_class.clone()),
@@ -386,16 +394,14 @@ impl DbInstanceRecord {
                     .collect(),
             ),
             availability_zone: Some(self.availability_zone.clone()),
-            // Only the name and the status of the subnet group: its VPC, its subnets
-            // and its description are properties of a DB subnet group record, which
-            // only `CreateDBSubnetGroup` mints — still a stub, and its VPC and subnets
-            // are EC2 resources this emulator's EC2 service does not mint either. A
-            // made-up VPC or subnet id would name a network nothing can be reached on.
-            db_subnet_group: self.db_subnet_group_name.clone().map(|name| DBSubnetGroup {
-                db_subnet_group_name: Some(name),
-                subnet_group_status: Some("Complete".to_string()),
-                ..DBSubnetGroup::default()
-            }),
+            // The DB subnet group the instance was created in, as the GROUP's own record
+            // reports it: its description, its VPC, its status and its `Subnets` — each
+            // subnet with the Availability Zone the service that owns subnets answered
+            // with — are properties of that record, and a client reads them here to tell
+            // which subnets and zones the instance can be placed in. Projected through
+            // the group's one projection, so this copy cannot drift from what
+            // `DescribeDBSubnetGroups` reports for the same group.
+            db_subnet_group: db_subnet_group.map(DbSubnetGroupRecord::to_wire),
             preferred_maintenance_window: self.preferred_maintenance_window.clone(),
             // Every change `ModifyDBInstance` accepts is applied to the stored record
             // at once, so no change is ever pending: the element is reported EMPTY,

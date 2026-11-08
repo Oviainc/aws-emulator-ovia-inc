@@ -199,7 +199,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let matching: Vec<(String, DBInstance)> = candidates
             .into_iter()
             .filter(|record| filters.iter().all(|filter| matches_filter(record, filter)))
-            .map(|record| (record.identifier.clone(), record.to_wire()))
+            .map(|record| (record.identifier.clone(), store.instance_to_wire(record)))
             .collect();
 
         // A `Marker` no prior page issued is refused rather than resynchronised: see

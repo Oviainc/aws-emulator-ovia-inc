@@ -384,6 +384,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The DB subnet group the instance reports is that GROUP's own record, resolved
+        // here — before the instance record is taken mutably below — so the answer carries
+        // the group as it reads now (`instance_to_wire` is the same answer).
+        let db_subnet_group = store
+            .db_instances
+            .get(&key)
+            .and_then(|record| store.db_subnet_group_of(record));
         let record = store
             .db_instances
             .get_mut(&key)
@@ -398,9 +405,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it is the instance's own, so it goes with the instance (deleted below, with the
         // store unlocked) — see [`crate::state::owned_master_user_secret`].
         let managed_secret = crate::state::owned_master_user_secret(record);
-        let db_instance = record.to_wire();
         let replicated_source = record.read_replica_source_db_instance_identifier.clone();
         let replicas = record.read_replica_db_instance_identifiers.clone();
+        let db_instance = record.to_wire(db_subnet_group.as_ref());
         // The relationship this instance was half of ends with it. A replica that is being
         // deleted is no longer one of its source's replicas, and the replicas of a SOURCE
         // that is being deleted are promoted to standalone DB instances — so neither side
