@@ -1054,6 +1054,12 @@ mod cloudformation_provisions_codebuild_projects;
 mod ecr_push_triggers_its_pipeline;
 #[path = "all/codepipeline_build_action_invokes_codebuild.rs"]
 mod codepipeline_build_action_invokes_codebuild;
+// `cloudformation_lambda_ssm_sourced_update`, `cloudfront_edge_cache_refresh`,
+// `cloudformation_imports_an_existing_queue` and `logs_subscription_filter_to_firehose_s3`
+// each stood here too and are ALREADY declared above (lines 57, 431, 889 and 984): two
+// concurrent changes appended the same entry, which is a redefinition and stops this
+// target from compiling, so the duplicate lines are removed here and the first declaration
+// of each stands — the same resolution the note further up records for five others.
 #[path = "all/zz_opensearch_fgac_probe.rs"]
 mod zz_opensearch_fgac_probe;
 // Declared here, in this same head region, for the reason the entries above record: this

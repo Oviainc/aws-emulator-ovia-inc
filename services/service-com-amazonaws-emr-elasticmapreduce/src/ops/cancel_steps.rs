@@ -171,6 +171,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
+        // Which steps a cancel can still act on depends on the state each is in NOW, so
+        // the cluster's step runner materialises the transitions the clock already made
+        // due before any step is cancelled.
+        crate::state::run_due_steps(&*self.engine, &mut store, &input.cluster_id, now);
+
         let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
             return Err(CancelStepsErrorModeled::InvalidRequestException(
                 crate::state::unknown_cluster(&input.cluster_id),

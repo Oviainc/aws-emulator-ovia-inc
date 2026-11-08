@@ -762,43 +762,79 @@ async fn submitted_steps_are_read_back_as_submitted_newest_first() {
             "case {label:?}: the step's runtime role must round-trip, got {out}"
         );
 
-        // Nothing ran this step, so it is PENDING with a creation instant and no
-        // start, end, reason or failure.
-        assert_eq!(
-            at(step, &["Status", "State"]).as_str(),
-            Some("PENDING"),
-            "case {label:?}: a submitted step is PENDING, got {out}"
-        );
+        // The step records when it was created, whatever the cluster's step runner has
+        // since made of it: this case is about the submitted definition round-tripping,
+        // and the lifecycle rule is the subject of tests/all/glue_metastore_steps.rs.
         assert!(
             at(step, &["Status", "Timeline", "CreationDateTime"])
                 .as_f64()
                 .is_some(),
             "case {label:?}: the step records when it was created, got {out}"
         );
-        for absent in ["StartDateTime", "EndDateTime"] {
-            assert!(
-                at(step, &["Status", "Timeline", absent]).is_null(),
-                "case {label:?}: nothing ran, so {absent} must be absent, got {out}"
-            );
-        }
-        for absent in ["StateChangeReason", "FailureDetails"] {
-            assert!(
-                at(step, &["Status", absent]).is_null(),
-                "case {label:?}: nothing ran, so {absent} must be absent, got {out}"
-            );
-        }
+        // The work of each of these steps — a jar of its own, or a command submitting no
+        // statement — is work this emulator does not run, so the runner settles the step in
+        // the modelled failure state rather than reporting a success for it. Polled, so the
+        // assertion does not depend on how fast this machine is.
+        let settled = await_settled_step(&emr, &cluster_id, step_id).await;
+        assert_eq!(
+            at(&settled, &["Status", "State"]).as_str(),
+            Some("FAILED"),
+            "case {label:?}: work this emulator does not run fails the step, got {settled}"
+        );
+        assert!(
+            at(&settled, &["Status", "FailureDetails", "Message"])
+                .as_str()
+                .is_some_and(|message| message.contains("No application was started")),
+            "case {label:?}: the failure says no application ran, got {settled}"
+        );
+        assert!(
+            at(&settled, &["Status", "StateChangeReason", "Code"]).is_null(),
+            "case {label:?}: the service publishes no code for the state change, got {settled}"
+        );
 
-        // The ListSteps summary of the same step agrees with DescribeStep.
-        let summary = reported
-            .iter()
-            .find(|candidate| candidate["Id"].as_str() == Some(step_id.as_str()))
-            .unwrap_or_else(|| panic!("case {label:?}: {step_id} missing from {listed}"));
+        // The ListSteps summary of the same step agrees with DescribeStep, read at the
+        // same point in the step's life.
+        let listed_now = emr
+            .list_steps(json!({ "ClusterId": &cluster_id, "StepIds": [step_id] }))
+            .await;
+        let summary = &listed_now["Steps"][0];
         for member in ["Name", "Config", "ActionOnFailure", "Status"] {
             assert_eq!(
-                summary[member], step[member],
-                "case {label:?}: the ListSteps {member} must agree with DescribeStep"
+                summary[member], settled[member],
+                "case {label:?}: the ListSteps {member} must agree with DescribeStep, got \
+                 {listed_now}"
             );
         }
+    }
+}
+
+/// Poll `DescribeStep` until the step has left the states a further transition is owed
+/// from, answering the step as it settled.
+///
+/// `pub(crate)` so every suite in this test target waits for a step the same way.
+pub(crate) async fn await_settled_step(emr: &Emr, cluster_id: &str, step_id: &str) -> Value {
+    const SETTLED: [&str; 4] = ["COMPLETED", "CANCELLED", "FAILED", "INTERRUPTED"];
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let out = emr
+            .ok(
+                "DescribeStep",
+                json!({ "ClusterId": cluster_id, "StepId": step_id }),
+            )
+            .await;
+        let step = out["Step"].clone();
+        let state = at(&step, &["Status", "State"])
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        if SETTLED.contains(&state.as_str()) {
+            return step;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "step {step_id} must reach a state it never leaves, last saw {state:?} in {out}"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
 }
 
@@ -823,6 +859,9 @@ async fn list_steps_honours_its_filters_and_paginates_on_marker() {
         .run_job_flow(json!({
             "Name": "paged",
             "JobFlowRole": INSTANCE_PROFILE, "ServiceRole": SERVICE_ROLE,
+            // Every step runs at once, so the runner settles them all within one span and
+            // the StepStates case below has settled states to filter on.
+            "StepConcurrencyLevel": total,
             "Instances": { "InstanceCount": 1, "MasterInstanceType": "m5.xlarge",
                            "KeepJobFlowAliveWhenNoSteps": true },
             "Steps": steps,
@@ -885,25 +924,56 @@ async fn list_steps_honours_its_filters_and_paginates_on_marker() {
         walked.len()
     );
 
-    // StepStates filter: PENDING matches everything persisted; no other state does.
+    // StepStates filter: it answers exactly the steps whose State it names. The ten steps
+    // asserted on are first waited out to the state they never leave — their work is a jar
+    // this emulator does not run, so the runner settles each FAILED
+    // (tests/all/glue_metastore_steps.rs owns that rule) — so what the filter must answer
+    // is known rather than racing the clock.
+    let wanted: Vec<String> = first_page.iter().take(10).cloned().collect();
+    for step_id in &wanted {
+        let settled = await_settled_step(&emr, &cluster_id, step_id).await;
+        assert_eq!(
+            at(&settled, &["Status", "State"]).as_str(),
+            Some("FAILED"),
+            "case \"settled\": work this emulator does not run fails the step, got {settled}"
+        );
+    }
     for (label, states, expected) in [
-        ("states PENDING", json!(["PENDING"]), PAGE_SIZE),
+        ("states FAILED", json!(["FAILED"]), wanted.len()),
+        ("states FAILED+CANCELLED", json!(["FAILED", "CANCELLED"]), wanted.len()),
+        ("states COMPLETED+FAILED", json!(["COMPLETED", "FAILED"]), wanted.len()),
+        ("states PENDING", json!(["PENDING"]), 0),
         ("states COMPLETED", json!(["COMPLETED"]), 0),
-        ("states FAILED+CANCELLED", json!(["FAILED", "CANCELLED"]), 0),
-        (
-            "states COMPLETED+PENDING",
-            json!(["COMPLETED", "PENDING"]),
-            PAGE_SIZE,
-        ),
+        ("states INTERRUPTED", json!(["INTERRUPTED"]), 0),
     ] {
         let out = emr
-            .list_steps(json!({ "ClusterId": &cluster_id, "StepStates": states }))
+            .list_steps(json!({
+                "ClusterId": &cluster_id,
+                "StepIds": &wanted,
+                "StepStates": states.clone(),
+            }))
             .await;
+        let got: Vec<&str> = out["Steps"]
+            .as_array()
+            .map(|steps| {
+                steps
+                    .iter()
+                    .map(|step| step["Id"].as_str().unwrap_or_default())
+                    .collect()
+            })
+            .unwrap_or_default();
         assert_eq!(
-            out["Steps"].as_array().map(Vec::len),
-            Some(expected),
-            "case {label:?}: expected {expected} steps, got {out}"
+            got.len(),
+            expected,
+            "case {label:?}: expected {expected} of the ten settled steps, got {out}"
         );
+        if expected > 0 {
+            let newest_first: Vec<&str> = wanted.iter().map(String::as_str).collect();
+            assert_eq!(
+                got, newest_first,
+                "case {label:?}: expected exactly the settled steps, newest first, got {out}"
+            );
+        }
     }
 
     // StepIds filter: exactly the named steps, still newest first.

@@ -33,6 +33,19 @@ aws-sdk-iam = { version = "1", default-features = false }
 aws-sdk-ec2 = { version = "1", default-features = false }
 # The tree's one ARN parse, for reading a `JobFlowRole` given as an ARN.
 service-common = { path = "../common" }
+# A cluster configured with the AWS Glue Data Catalog as its Hive metastore resolves the
+# tables a step's work names in that catalog, so the step runner reads the ONE Glue Data
+# Catalog store this emulator holds rather than keeping a second copy of it here.
+service-com-amazonaws-glue-awsglue = { workspace = true }
+# `sqlparser`: the SQL statement a step's command submits is read off that command by
+# PARSING it with the maintained parser this workspace already uses for caller-supplied
+# SQL; the `visitor` feature is what provides `ast::visit_relations`, the walk that
+# reports every table a statement names.
+sqlparser = { version = "0.59", features = ["visitor"] }
+# `shell-words`: a step's command may arrive as one argument holding a whole command line
+# (`bash -c '…'`), which is lexed with the POSIX shell's own word rules rather than split
+# by hand.
+shell-words = "1"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

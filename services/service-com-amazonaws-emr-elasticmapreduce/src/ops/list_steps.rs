@@ -173,6 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
+        // Reporting only: the cluster's step runner materialises the step transitions the
+        // clock already made due (PENDING -> RUNNING -> COMPLETED/FAILED), which were owed
+        // at this instant whether or not anybody listed the steps.
+        crate::state::run_due_steps(&*self.engine, &mut store, &input.cluster_id, now);
+
         let Some(cluster) = store.cluster_mut(&input.cluster_id, now) else {
             return Err(ListStepsErrorModeled::InvalidRequestException(
                 crate::state::unknown_cluster(&input.cluster_id),

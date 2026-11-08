@@ -166,6 +166,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let mut store = state.lock();
 
+        // Where a step of this cluster is in its lifecycle is reported here too, so the
+        // cluster's step runner materialises the transitions the clock already made due
+        // before anything is counted or queued.
+        crate::state::run_due_steps(&*self.engine, &mut store, &input.job_flow_id, now);
+
         // This operation models no client error, so a request it must refuse is answered
         // with the 400 `ValidationException` channel rather than a 501 or an empty 200.
         // The legacy job-flow surface's sentence is CONSTANT: it names no id.

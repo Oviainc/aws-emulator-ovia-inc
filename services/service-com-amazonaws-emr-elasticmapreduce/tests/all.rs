@@ -29,6 +29,8 @@ mod created_window;
 mod emr_control_plane;
 #[path = "all/enum_refusal_identity.rs"]
 mod enum_refusal_identity;
+#[path = "all/glue_metastore_steps.rs"]
+mod glue_metastore_steps;
 #[path = "all/input_refusals.rs"]
 mod input_refusals;
 #[path = "all/instance_fleet_target_capacities.rs"]

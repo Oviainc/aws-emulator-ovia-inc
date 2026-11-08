@@ -47,6 +47,12 @@ use crate::ops::types::{
 mod instance_catalog;
 pub use instance_catalog::*;
 
+/// The cluster's step runner — what a submitted step's work answered — split out of this
+/// root as its own concern; its names are re-exported so every caller keeps reaching them
+/// through `crate::state`.
+mod step_runner;
+pub use step_runner::*;
+
 /// A cluster's master node — the address it holds and the DNS name the cluster reports
 /// for it — split out of this root as its own concern and re-exported the same way.
 mod master_node;
@@ -3992,6 +3998,15 @@ pub struct StepRecord {
     pub stop_due_at: Option<SystemTime>,
     /// The state [`Self::stop_due_at`] lands this step in.
     pub stop_state: Option<String>,
+    /// The work this step's command submits, read off that command once when the step was
+    /// submitted ([`read_step_work`]), and `None` when the command submits none this
+    /// service can account for.
+    pub work: Option<StepWork>,
+    /// What that work ANSWERED, once the step runner has resolved it against the state the
+    /// work depends on ([`run_due_steps`]) — which is what the step ends in instead of the
+    /// not-executed failure every other step ends in. `None` while nothing has been
+    /// resolved for this step.
+    pub outcome: Option<StepOutcome>,
 }
 
 impl StepRecord {
@@ -4000,6 +4015,10 @@ impl StepRecord {
     /// The step is `PENDING`: it is queued behind whatever its cluster is already running,
     /// and the cluster's step runner ([`ClusterRecord::advance_steps`]) is what starts it
     /// once the cluster is ready and one of its concurrency slots is free.
+    ///
+    /// The work the command submits is READ here ([`read_step_work`]), because it follows
+    /// from the command and the command never changes; what that work answers is resolved
+    /// later, against the state it depends on.
     pub fn from_config(
         id: String,
         config: StepConfig,
@@ -4010,13 +4029,18 @@ impl StepRecord {
             .step_monitoring_configuration
             .as_ref()
             .and_then(|monitoring| monitoring.s3_monitoring_configuration.as_ref());
+        let args = config.hadoop_jar_step.args.unwrap_or_default();
+        // The work the step's command submits follows from the command, which never
+        // changes, so it is read once here and resolved against the metastore when the
+        // runner dispatches the step.
+        let work = read_step_work(&config.hadoop_jar_step.jar, &args);
         Self {
             id,
             name: config.name,
             action_on_failure: config.action_on_failure,
             jar: config.hadoop_jar_step.jar,
             main_class: config.hadoop_jar_step.main_class,
-            args: config.hadoop_jar_step.args.unwrap_or_default(),
+            args,
             properties: config
                 .hadoop_jar_step
                 .properties
@@ -4033,6 +4057,8 @@ impl StepRecord {
             end_date_time: None,
             stop_due_at: None,
             stop_state: None,
+            work,
+            outcome: None,
         }
     }
 
@@ -4133,10 +4159,16 @@ impl StepRecord {
     /// `RUNNING` and records when it started; one whose span has passed has ENDED, and it
     /// ends in the state this service can account for.
     ///
-    /// That end is the modelled FAILURE state, with the details saying why
-    /// ([`STEP_NOT_EXECUTED_REASON`]): this service runs the step lifecycle — the queue,
-    /// the concurrency slots, the timeline — but it executes no Hadoop jar, so the
-    /// application the step submitted produced no outcome, and `COMPLETED` ("the step
+    /// That end is the state the step's own WORK answered, when the step runner could
+    /// resolve it ([`StepOutcome`], [`run_due_steps`]): a statement whose only effect is
+    /// reading, submitted to a cluster whose Hive metastore this service holds, ends
+    /// `COMPLETED` when every table it names resolves and `FAILED` with the driver's
+    /// table-not-found when one does not.
+    ///
+    /// For every other step that end is the modelled FAILURE state, with the details
+    /// saying why ([`STEP_NOT_EXECUTED_REASON`]): this service runs the step lifecycle —
+    /// the queue, the concurrency slots, the timeline — but it executes no Hadoop jar, so
+    /// the application the step submitted produced no outcome, and `COMPLETED` ("the step
     /// completed successfully") would be a success for work nothing performed. The reason
     /// is what tells a caller that apart from an application that really failed.
     ///
@@ -4153,7 +4185,10 @@ impl StepRecord {
             return;
         }
         if now >= end {
-            self.state = step_state::FAILED.to_string();
+            self.state = self
+                .outcome
+                .as_ref()
+                .map_or_else(|| step_state::FAILED.to_string(), |outcome| outcome.state.clone());
             self.start_date_time = Some(start);
             self.end_date_time = Some(end);
             return;
@@ -4181,22 +4216,36 @@ impl StepRecord {
 
     /// The wire `StepStatus` for this record.
     fn to_status(&self) -> StepStatus {
-        // A step that ENDED without its application running says so, in both members the
-        // model gives a failure: "the reason for the step failure"
-        // (`FailureDetails$Reason`) and the descriptive message beside it. Every other
-        // state has nothing to report — "currently, the service provides no code for the
-        // state change" (`StepStateChangeReason$Code` doc), so the code member stays
-        // absent even where the message is given.
+        // A step that ENDED in a failure says why, in both members the model gives one:
+        // "the reason for the step failure" (`FailureDetails$Reason`) and the descriptive
+        // message beside it. Where the step's own WORK answered, that answer is the
+        // failure ([`StepOutcome::failure`]); where this service ran the lifecycle and no
+        // application ([`STEP_NOT_EXECUTED_REASON`]), that is. Every other state has
+        // nothing to report — "currently, the service provides no code for the state
+        // change" (`StepStateChangeReason$Code` doc), so the code member stays absent even
+        // where the message is given.
         let failed = self.state == step_state::FAILED;
+        let (reason, message) = match self.outcome.as_ref().and_then(|outcome| {
+            outcome
+                .failure
+                .as_ref()
+                .map(|failure| (failure.reason.clone(), failure.message.clone()))
+        }) {
+            Some(answered) => answered,
+            None => (
+                STEP_NOT_EXECUTED_REASON.to_string(),
+                STEP_NOT_EXECUTED_MESSAGE.to_string(),
+            ),
+        };
         StepStatus {
             state: Some(self.state.clone()),
             state_change_reason: failed.then(|| StepStateChangeReason {
                 code: None,
-                message: Some(STEP_NOT_EXECUTED_REASON.to_string()),
+                message: Some(reason.clone()),
             }),
-            failure_details: failed.then(|| FailureDetails {
-                reason: Some(STEP_NOT_EXECUTED_REASON.to_string()),
-                message: Some(STEP_NOT_EXECUTED_MESSAGE.to_string()),
+            failure_details: failed.then_some(FailureDetails {
+                reason: Some(reason),
+                message: Some(message),
                 // No step log was written, so there is no path to one to report.
                 log_file: None,
             }),
