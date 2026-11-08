@@ -66,7 +66,8 @@
 //! ## Errors
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — Request references a resource which does not
-//!   exist.
+//!   exist. Reported under the tagging plane's own wire code
+//!   (`crate::state::TAGGING_NOT_FOUND_ERROR_CODE`) — see `crate::state::TaggingRefusal`.
 //! * `ValidationException` (HTTP 400) — The input fails to satisfy the specified constraints.
 //! * `InternalServerException` (HTTP 500) — widened in through `extra_errors` (see below):
 //!   a shape this SERVICE models, for an unreachable store.
@@ -100,17 +101,21 @@ pub enum ListTagsForResourceErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::list_tags_for_resource::ListTagsForResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type ListTagsForResourceError = crate::scaffolded::Scaffolded<ListTagsForResourceErrorModeled>;
+/// (`crate::ops::list_tags_for_resource::ListTagsForResourceError`).
+///
+/// The shared [`crate::state::TaggingErrorChannel`] rather than
+/// `crate::scaffolded::Scaffolded`: this operation is implemented, so it needs neither the
+/// 501 nor the framework's synthetic `ValidationException`, and what it does need is the
+/// tagging plane's own wire code for an ARN that resolves to nothing — exactly as
+/// `TagResource` and `UntagResource` declare it.
+pub type ListTagsForResourceError =
+    crate::state::TaggingErrorChannel<ListTagsForResourceErrorModeled>;
 
-/// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
-/// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// Lets `?` and `.into()` lift a modeled failure into the error channel, so the handler
+/// writes `Err(SomeModeledError.into())` rather than naming the wrapper variant.
 impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
     fn from(modeled: ListTagsForResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Modeled(modeled)
     }
 }
 
@@ -181,16 +186,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         // Tags are listed for a resource that EXISTS; an existing resource nobody has
         // tagged carries no tags, which is reported as the empty map below rather than
-        // as a missing resource.
+        // as a missing resource. The tagging plane words the refusal itself, under its
+        // own wire code.
         if !store.holds_resource_at_arn(&input.resource_arn) {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: st::tagged_resource_not_found_message(&input.resource_arn),
-                    resource_id: input.resource_arn,
-                    resource_type: resource_type.to_string(),
-                },
-            )
-            .into());
+            return Err(ListTagsForResourceError::not_found(
+                &input.resource_arn,
+                resource_type,
+            ));
         }
 
         Ok(ListTagsForResourceOutput {

@@ -59,7 +59,8 @@
 //! ## Errors
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — Request references a resource which does not
-//!   exist.
+//!   exist. Reported under the tagging plane's own wire code
+//!   (`crate::state::TAGGING_NOT_FOUND_ERROR_CODE`) — see `crate::state::TaggingRefusal`.
 //! * `ValidationException` (HTTP 400) — The input fails to satisfy the specified constraints.
 //! * `InternalServerException` (HTTP 500) — widened in through `extra_errors` (see below):
 //!   a shape this SERVICE models, for an unreachable store.
@@ -93,17 +94,20 @@ pub enum UntagResourceErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::untag_resource::UntagResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type UntagResourceError = crate::scaffolded::Scaffolded<UntagResourceErrorModeled>;
+/// (`crate::ops::untag_resource::UntagResourceError`).
+///
+/// The shared [`crate::state::TaggingErrorChannel`] rather than
+/// `crate::scaffolded::Scaffolded`: this operation is implemented, so it needs neither the
+/// 501 nor the framework's synthetic `ValidationException`, and what it does need is the
+/// tagging plane's own wire code for an ARN that resolves to nothing — exactly as
+/// `TagResource` and `ListTagsForResource` declare it.
+pub type UntagResourceError = crate::state::TaggingErrorChannel<UntagResourceErrorModeled>;
 
-/// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
-/// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// Lets `?` and `.into()` lift a modeled failure into the error channel, so the handler
+/// writes `Err(SomeModeledError.into())` rather than naming the wrapper variant.
 impl From<UntagResourceErrorModeled> for UntagResourceError {
     fn from(modeled: UntagResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Modeled(modeled)
     }
 }
 
@@ -173,16 +177,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         // Only an existing resource can be untagged, and the refusal is decided before
-        // anything is removed, so a refused call changes nothing.
+        // anything is removed, so a refused call changes nothing. The tagging plane words
+        // this refusal itself, under its own wire code.
         if !store.holds_resource_at_arn(&input.resource_arn) {
-            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: st::tagged_resource_not_found_message(&input.resource_arn),
-                    resource_id: input.resource_arn,
-                    resource_type: resource_type.to_string(),
-                },
-            )
-            .into());
+            return Err(UntagResourceError::not_found(
+                &input.resource_arn,
+                resource_type,
+            ));
         }
 
         store.remove_tags(&input.resource_arn, &input.tag_keys);

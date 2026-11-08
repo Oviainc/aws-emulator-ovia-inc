@@ -194,10 +194,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => Err(
                 GetConfiguredTableAssociationErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "configured table association {} not found in membership {}",
-                            input.configured_table_association_identifier,
-                            input.membership_identifier
+                        message: st::configured_table_association_not_found_message(
+                            &input.configured_table_association_identifier,
+                            &input.membership_identifier,
                         ),
                         resource_id: input.configured_table_association_identifier,
                         resource_type: st::RESOURCE_TYPE_CONFIGURED_TABLE_ASSOCIATION.to_string(),

@@ -91,7 +91,7 @@ use crate::ops::types::{
     MembershipSyntheticDataGenerationPaymentConfig, PaymentConfiguration, PrivacyBudgetTemplate,
     PrivacyBudgetTemplateParametersInput, PrivacyBudgetTemplateParametersOutput, ProtectedQuery,
     ProtectedQueryError, ProtectedQueryOutputConfiguration, ProtectedQueryResultConfiguration,
-    QueryComputePaymentConfig, SyntheticDataParameters, TableReference,
+    QueryComputePaymentConfig, ResourceNotFoundException, SyntheticDataParameters, TableReference,
     WorkerComputeConfiguration,
 };
 
@@ -806,7 +806,9 @@ pub struct ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
     /// (`/memberships/{membershipIdentifier}/configuredTableAssociations/{configuredTableAssociationIdentifier}/analysisRule/{analysisRuleType}`),
     /// so a read is a lookup and not a scan, and which types an association holds a rule
     /// for stays on the association itself, in
-    /// `ConfiguredTableAssociation$analysisRuleTypes`.
+    /// `ConfiguredTableAssociation$analysisRuleTypes`. The membership is NOT part of the
+    /// key: an association belongs to exactly one membership, which is what scopes the
+    /// lookup (`Self::configured_table_association_in`).
     pub configured_table_association_analysis_rules:
         HashMap<(String, String), ConfiguredTableAssociationAnalysisRule>,
     /// Protected queries by `ProtectedQuery.id`.
@@ -1196,7 +1198,8 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
     /// `ConfiguredTableAssociation$analysisRuleTypes` is "the analysis rule types for the
     /// configured table association", so it is maintained here rather than recomputed by
     /// every reader, and the association's `updateTime` moves to the rule's instant
-    /// because that member of it has changed.
+    /// because that member of it has changed. The mirror of
+    /// [`Self::insert_configured_table_analysis_rule`] for the association plane.
     pub fn insert_configured_table_association_analysis_rule(
         &mut self,
         rule: ConfiguredTableAssociationAnalysisRule,
@@ -1285,6 +1288,8 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
                 self.tags.remove(&association.arn);
             }
             self.configured_table_association_order.retain(|held| held != &id);
+            // An association's analysis rules are reachable only through it, so they go
+            // with it rather than staying behind under a key nothing resolves.
             self.configured_table_association_analysis_rules
                 .retain(|(association, _), _| association != &id);
         }
@@ -1850,18 +1855,45 @@ pub fn membership_not_invited_message(account_id: &str) -> String {
 /// The message `DeleteMembership` reports when the membership it addresses is the one the
 /// collaboration's own creator holds in a collaboration that still exists.
 ///
-/// Composed from the membership and the collaboration that depends on it, plus what would
-/// make the call succeed: deleting the collaboration, which is the only thing that removes
-/// its creator's membership.
-pub fn creator_membership_not_deletable_message(
-    membership_id: &str,
-    collaboration_id: &str,
+/// Entirely FIXED text: the refusal states the rule the call broke — a creator keeps its
+/// membership for as long as that membership is [`MEMBERSHIP_STATUS_ACTIVE`] — and names
+/// no value of the request, so no membership, collaboration or account id is interpolated
+/// into it. The ids of the resources involved travel in the exception's `resourceId` /
+/// `resourceType` members, which is where a client reads them.
+pub const CREATOR_MEMBERSHIP_ACTIVE_CONFLICT_MESSAGE: &str =
+    "Cannot delete membership for the creator of the collaboration while their membership \
+     is still ACTIVE.";
+
+/// The message `CreateConfiguredTableAnalysisRule` reports when the configured table it
+/// addresses already holds an analysis rule.
+///
+/// Two clauses: the constraint the request broke ("only one analysis rule per configured
+/// table") and what the stored table already holds. Composed from the request's
+/// `configuredTableIdentifier` and the TYPE of the rule the table is holding — the second
+/// clause is a statement about stored state, so the type is read from that state rather
+/// than echoed from the request, which is what makes it true when the request asks for
+/// another type.
+pub fn configured_table_analysis_rule_exists_message(
+    configured_table_identifier: &str,
+    held_analysis_rule_type: &str,
 ) -> String {
     format!(
-        "Cannot delete membership {membership_id} while collaboration {collaboration_id} \
-         exists. The collaboration creator's membership is removed by deleting the \
-         collaboration"
+        "Only one Analysis Rule is allowed per Configured Table Configured Table \
+         {configured_table_identifier} already has a {held_analysis_rule_type} analysis rule."
     )
+}
+
+/// The message a privacy-budget-template lookup reports when the identifier names no
+/// template reachable through the membership in the path.
+///
+/// Composed from the request's two identifiers: a template is read and deleted through ONE
+/// membership (`/memberships/{membershipIdentifier}/privacybudgettemplates/{id}`), so the
+/// membership is what says the lookup failed in the namespace that membership reaches
+/// rather than that the template id exists nowhere. Shared by every operation that
+/// addresses a stored template, so a read and a delete of the same resource report the
+/// same thing.
+pub fn privacy_budget_template_not_found_message(template_id: &str, membership_id: &str) -> String {
+    format!("No privacy budget template found with id {template_id} for membership {membership_id}.")
 }
 
 /// The message `CreatePrivacyBudgetTemplate` reports when the collaboration already holds
@@ -1885,7 +1917,18 @@ pub fn privacy_budget_template_exists_message(
 /// covered, so a value added to `PrivacyBudgetType` reads correctly without a second
 /// table to maintain.
 pub fn privacy_budget_type_display(privacy_budget_type: &str) -> String {
-    privacy_budget_type
+    capitalised_words(privacy_budget_type, " ")
+}
+
+/// A SHOUTY_SNAKE_CASE catalog value as capitalised words joined by `separator`: each
+/// underscore-separated word keeps its first character upper-cased and the rest lowered
+/// (DIFFERENTIAL_PRIVACY -> "Differential Privacy" with " ", "DifferentialPrivacy" with
+/// "").
+///
+/// One implementation of the capitalisation rule, so the refusal messages that render a
+/// catalog value as prose and the ones that render it as a class name cannot drift apart.
+fn capitalised_words(catalog_value: &str, separator: &str) -> String {
+    catalog_value
         .split('_')
         .filter(|word| !word.is_empty())
         .map(|word| {
@@ -1898,7 +1941,7 @@ pub fn privacy_budget_type_display(privacy_budget_type: &str) -> String {
             }
         })
         .collect::<Vec<String>>()
-        .join(" ")
+        .join(separator)
 }
 
 /// The account segment of `role_arn`, when the value is an IAM role ARN at all.
@@ -1965,6 +2008,30 @@ pub fn configured_table_association_exists_message(name: &str, membership_id: &s
     )
 }
 
+/// The internal name of an analysis rule class, which is how the service names a rule
+/// TYPE in a refusal (the modelled catalog value is what the request and the stored rule
+/// carry).
+///
+/// Catalog source: model shape `ConfiguredTableAssociationAnalysisRuleType`
+/// (AGGREGATION | LIST | CUSTOM). The rule applied to the whole catalog is "the catalog
+/// value as one CamelCase word", so a value added to it reads correctly without a second
+/// table to maintain. LIST is the one value whose class does not follow its catalog name:
+/// a list analysis returns the intersection of the joined tables, and the class is named
+/// for that, which is why it is the one branch written out here.
+///
+/// Only LIST's internal name is observed: the other two are derived by the rule above and
+/// are UNVERIFIED against the service, because neither the model nor any recorded refusal
+/// in this repository names them. The derivation, not the two derived strings, is what
+/// this function claims.
+pub fn configured_table_association_analysis_rule_type_internal_name(
+    analysis_rule_type: &str,
+) -> String {
+    if analysis_rule_type == ANALYSIS_RULE_TYPE_LIST {
+        return "IntersectionList".to_string();
+    }
+    capitalised_words(analysis_rule_type, "")
+}
+
 /// The most tags one resource can carry.
 ///
 /// `TagMap` is `len 0..200`, and `ListTagsForResourceOutput$tags` IS a `TagMap`, so a
@@ -1977,11 +2044,192 @@ pub const MAX_TAGS_PER_RESOURCE: usize = 200;
 /// The message a tagging operation reports when its `resourceArn` names no resource
 /// this service holds.
 ///
-/// Composed from the request's `resourceArn`: a tagging operation addresses its
-/// resource by ARN and by nothing else, so the ARN is the one value whose resolution
-/// failed. It deliberately does not say which kind of resource the ARN looks like.
-pub fn tagged_resource_not_found_message(resource_arn: &str) -> String {
-    format!("No such resource: {resource_arn}")
+/// Entirely FIXED text: the tagging plane states that the addressed resource is absent and
+/// interpolates nothing — no ARN, no id, no resource kind. The ARN the caller sent is
+/// already known to it, and the kind travels in the exception's `resourceType` member.
+pub const TAGGED_RESOURCE_NOT_FOUND_MESSAGE: &str = "Resource was not found";
+
+/// The wire error code the tagging plane names a resource it cannot find by.
+///
+/// The CRUD operations of this service answer `ResourceNotFoundException`, the shape its
+/// model declares; the three ARN-addressed tagging operations answer the shorter
+/// `NotFoundException`, which the model declares nowhere — the tagging plane has its own
+/// error vocabulary, and an SDK generates a distinct exception class for it, so a client
+/// catching one of the two does not catch the other. Here rather than on an operation,
+/// because the code is a property of the refusal and of the plane that makes it rather
+/// than of whichever of the three operations was called.
+pub const TAGGING_NOT_FOUND_ERROR_CODE: &str = "NotFoundException";
+
+/// A refusal the ARN-addressed tagging plane words itself, carrying the ONE mapping from
+/// the refusal to the wire code, the HTTP status and the body it answers with.
+///
+/// `TagResource`, `UntagResource` and `ListTagsForResource` are one plane, so they cannot
+/// word one condition three ways: an ARN naming no resource is
+/// [`TAGGING_NOT_FOUND_ERROR_CODE`] carrying the modelled `ResourceNotFoundException`
+/// payload and its 404. Each of the three operations' error channels wraps this type and
+/// delegates every `smithy_server_runtime::OperationError` method to the methods below, so
+/// the mapping is declared once here instead of once per operation.
+#[derive(Debug)]
+pub enum TaggingRefusal {
+    /// "That ARN names no resource of this service" — the modelled shape's payload,
+    /// worded with [`TAGGED_RESOURCE_NOT_FOUND_MESSAGE`].
+    NotFound(ResourceNotFoundException),
+}
+
+impl TaggingRefusal {
+    /// The not-found refusal for a `resourceArn` naming no resource this service holds.
+    ///
+    /// The carried payload is the modelled shape's, so the answer still reports which
+    /// resource was addressed (`resource_id`, the ARN) and of which kind
+    /// (`resource_type`); only the code on the wire is the tagging plane's own.
+    pub fn not_found(resource_arn: &str, resource_type: &str) -> Self {
+        Self::NotFound(ResourceNotFoundException {
+            message: TAGGED_RESOURCE_NOT_FOUND_MESSAGE.to_string(),
+            resource_id: resource_arn.to_string(),
+            resource_type: resource_type.to_string(),
+        })
+    }
+
+    /// The body this refusal serializes: the modelled shape itself, so its own schema
+    /// decides which members the answer carries.
+    pub fn as_serializable(&self) -> &dyn ::aws_smithy_schema::serde::SerializableStruct {
+        match self {
+            Self::NotFound(e) => e,
+        }
+    }
+
+    /// The schema the answer is written against: the modelled shape's own.
+    pub fn variant_schema(&self) -> &'static ::aws_smithy_schema::Schema {
+        match self {
+            Self::NotFound(_) => &crate::ops::types::SCHEMA_RESOURCE_NOT_FOUND_EXCEPTION,
+        }
+    }
+
+    /// The code on the wire, which the framework reads from an operation's `shape_name`
+    /// rather than from the schema — the one respect in which this refusal differs from
+    /// the modelled shape it carries.
+    pub fn error_code(&self) -> &'static str {
+        match self {
+            Self::NotFound(_) => TAGGING_NOT_FOUND_ERROR_CODE,
+        }
+    }
+
+    /// The HTTP status: the carried shape's own `@httpError`, so the code on the wire
+    /// changes and the status does not.
+    pub fn http_status(&self) -> u16 {
+        match self {
+            Self::NotFound(_) => 404,
+        }
+    }
+
+    /// No `awsQueryError` code: restJson1 is this service's only protocol, and the carried
+    /// shape carries no such trait to honour in any case.
+    pub fn query_error_code(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// The sentence the body states, for the `Display` rendering below.
+    fn message(&self) -> &str {
+        match self {
+            Self::NotFound(e) => &e.message,
+        }
+    }
+}
+
+impl ::std::fmt::Display for TaggingRefusal {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        write!(f, "{}: {}", self.error_code(), self.message())
+    }
+}
+
+impl ::std::error::Error for TaggingRefusal {}
+
+/// The error channel of a tagging operation: one of the operation's own modelled errors,
+/// or a refusal the tagging plane words itself ([`TaggingRefusal`]).
+///
+/// `TagResource`, `UntagResource` and `ListTagsForResource` each name this as their
+/// `Operation::Error`, so the three answer one condition one way. It replaces
+/// `crate::scaffolded::Scaffolded` on them: all three are implemented, so they need
+/// neither the 501 (that variant is the stub signal) nor the framework's synthetic
+/// `ValidationException` (this service's model declares its own); what they do need, and
+/// what the generic wrapper cannot express, is the tagging plane's own wire code.
+#[derive(Debug)]
+pub enum TaggingErrorChannel<E> {
+    /// One of the operation's modelled errors, rendered exactly as the model declares it.
+    Modeled(E),
+    /// A refusal the tagging plane words itself: the code, the status and the carried body
+    /// are [`TaggingRefusal`]'s.
+    Refused(TaggingRefusal),
+}
+
+impl<E> TaggingErrorChannel<E> {
+    /// The tagging plane's not-found refusal for a `resourceArn` naming no resource this
+    /// service holds.
+    pub fn not_found(resource_arn: &str, resource_type: &str) -> Self {
+        Self::Refused(TaggingRefusal::not_found(resource_arn, resource_type))
+    }
+}
+
+impl<E: ::std::fmt::Display> ::std::fmt::Display for TaggingErrorChannel<E> {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        match self {
+            Self::Modeled(e) => write!(f, "{e}"),
+            Self::Refused(refusal) => write!(f, "{refusal}"),
+        }
+    }
+}
+
+/// `source()` forwards to the wrapped error rather than taking the default `None`, so a
+/// modelled error's own `source()` is preserved through the channel.
+impl<E: ::std::error::Error + 'static> ::std::error::Error for TaggingErrorChannel<E> {
+    fn source(&self) -> Option<&(dyn ::std::error::Error + 'static)> {
+        match self {
+            Self::Modeled(e) => e.source(),
+            Self::Refused(refusal) => refusal.source(),
+        }
+    }
+}
+
+/// Every method delegates: a modelled failure to the modelled error, so it is rendered
+/// exactly as `#[operation_error]` renders it, and a plane refusal to [`TaggingRefusal`],
+/// so each of the three operations answers that condition identically.
+impl<E: ::smithy_server_runtime::OperationError> ::smithy_server_runtime::OperationError
+    for TaggingErrorChannel<E>
+{
+    fn as_serializable(&self) -> &dyn ::aws_smithy_schema::serde::SerializableStruct {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::as_serializable(e),
+            Self::Refused(refusal) => refusal.as_serializable(),
+        }
+    }
+
+    fn variant_schema(&self) -> &'static ::aws_smithy_schema::Schema {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::variant_schema(e),
+            Self::Refused(refusal) => refusal.variant_schema(),
+        }
+    }
+
+    fn shape_name(&self) -> &'static str {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::shape_name(e),
+            Self::Refused(refusal) => refusal.error_code(),
+        }
+    }
+
+    fn http_status(&self) -> u16 {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::http_status(e),
+            Self::Refused(refusal) => refusal.http_status(),
+        }
+    }
+
+    fn query_error_code(&self) -> Option<&'static str> {
+        match self {
+            Self::Modeled(e) => ::smithy_server_runtime::OperationError::query_error_code(e),
+            Self::Refused(refusal) => refusal.query_error_code(),
+        }
+    }
 }
 
 /// The message a tagging operation reports when its `resourceArn` addresses no kind of
@@ -2228,17 +2476,20 @@ pub fn configured_table_association_not_found_message(
 /// What the service says when the `(configured table association, analysis rule type)`
 /// pair a request addresses holds no analysis rule.
 ///
-/// The two variable parts are the identifier and the type the REQUEST carried, echoed as
-/// sent: the pair is the rule's identity, so the refusal names the pair that resolved to
-/// nothing rather than describing the association. Worded like the configured-table
-/// refusal ([`no_such_configured_table_analysis_rule_message`]) because the two name the
-/// same kind of miss.
+/// The variable parts are the identifier the REQUEST carried, echoed as sent, and the rule
+/// type rendered by the INTERNAL name of its rule class
+/// ([`configured_table_association_analysis_rule_type_internal_name`]) rather than by the
+/// catalog value from the path: the pair is the rule's identity, so the refusal names the
+/// pair that resolved to nothing rather than describing the association. Worded like the
+/// configured-table refusal ([`no_such_configured_table_analysis_rule_message`]) because
+/// the two name the same kind of miss.
 pub fn no_such_configured_table_association_analysis_rule_message(
     configured_table_association_identifier: &str,
     analysis_rule_type: &str,
 ) -> String {
     format!(
-        "No such analysis rule with configuredTableAssociationId: {configured_table_association_identifier} and type {analysis_rule_type}"
+        "No such analysis rule with configuredTableAssociationId: {configured_table_association_identifier} and type {}",
+        configured_table_association_analysis_rule_type_internal_name(analysis_rule_type)
     )
 }
 

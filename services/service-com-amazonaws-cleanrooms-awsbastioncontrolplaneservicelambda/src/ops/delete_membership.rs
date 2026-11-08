@@ -180,7 +180,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The collaboration an account created depends on that account's membership, so
         // the creator cannot leave its own live collaboration: what removes that
         // membership is deleting the collaboration. The state of the membership is what
-        // refuses the call, so it is the ConflictException this operation models.
+        // refuses the call, so it is the ConflictException this operation models, and the
+        // sentence is fixed — the membership and collaboration it is about travel in the
+        // exception's `resourceId` / `resourceType`.
         let creator_of_live_collaboration = store
             .collaborations
             .get(&membership.collaboration_id)
@@ -188,10 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if creator_of_live_collaboration {
             return Err(DeleteMembershipErrorModeled::ConflictException(
                 ConflictException {
-                    message: Some(st::creator_membership_not_deletable_message(
-                        &membership.id,
-                        &membership.collaboration_id,
-                    )),
+                    message: Some(st::CREATOR_MEMBERSHIP_ACTIVE_CONFLICT_MESSAGE.to_string()),
                     resource_id: Some(membership.id.clone()),
                     resource_type: Some(st::RESOURCE_TYPE_MEMBERSHIP.to_string()),
                     reason: Some(st::CONFLICT_REASON_INVALID_STATE.to_string()),

@@ -8,7 +8,10 @@
 //! A membership the store does not hold, an association that membership does not hold,
 //! an association holding no rule of this type, and a type no association could hold a
 //! rule for are all the modelled 404 `ResourceNotFoundException` — the resource the pair
-//! names does not exist.
+//! names does not exist. The rule refusal reports the TYPE by the INTERNAL name of its
+//! rule class (`crate::state::no_such_configured_table_association_analysis_rule_message`),
+//! which is how the service names a rule class in a refusal, while the stored rule and
+//! the 200 answer carry the modelled catalog value.
 //!
 //! ## Shape of an operation
 //!

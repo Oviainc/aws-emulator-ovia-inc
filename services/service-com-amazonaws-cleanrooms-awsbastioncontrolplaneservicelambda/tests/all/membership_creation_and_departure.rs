@@ -192,12 +192,20 @@ async fn the_creator_cannot_leave_its_own_live_collaboration_but_a_participant_c
             "case {label:?}: expected reason INVALID_STATE, got {:?}",
             refused["reason"]
         );
-        assert!(
-            error_message(&refused).contains(&own_membership_id)
-                && error_message(&refused).contains(&own_id),
-            "case {label:?}: the message must name the membership and the collaboration that \
-             depends on it, got {:?}",
+        assert_eq!(
+            error_message(&refused),
+            "Cannot delete membership for the creator of the collaboration while their \
+             membership is still ACTIVE.",
+            "case {label:?}: the refusal states the rule in fixed text, interpolating no \
+             membership or collaboration id, got {:?}",
             error_message(&refused)
+        );
+        assert_eq!(
+            refused["resourceId"].as_str(),
+            Some(own_membership_id.as_str()),
+            "case {label:?}: the refusal must name the membership it is about in \
+             resourceId, got {:?}",
+            refused["resourceId"]
         );
         // The refusal changed nothing: the membership is still there and still ACTIVE.
         let (status, fetched) = emulator.get_membership(&own_membership_id).await;

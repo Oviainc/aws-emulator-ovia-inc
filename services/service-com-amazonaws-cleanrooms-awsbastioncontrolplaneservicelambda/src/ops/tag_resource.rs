@@ -62,7 +62,9 @@
 //! ## Errors
 //!
 //! * `ResourceNotFoundException` (HTTP 404) — Request references a resource which does not
-//!   exist.
+//!   exist. Reported under the tagging plane's own wire code
+//!   (`crate::state::TAGGING_NOT_FOUND_ERROR_CODE`), the code that plane names an absent
+//!   resource by — see `crate::state::TaggingRefusal`.
 //! * `ValidationException` (HTTP 400) — The input fails to satisfy the specified constraints.
 //! * `InternalServerException` (HTTP 500) — widened in through `extra_errors` (see below):
 //!   a shape this SERVICE models, for an unreachable store.
@@ -96,17 +98,20 @@ pub enum TagResourceErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::tag_resource::TagResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type TagResourceError = crate::scaffolded::Scaffolded<TagResourceErrorModeled>;
+/// (`crate::ops::tag_resource::TagResourceError`).
+///
+/// The shared [`crate::state::TaggingErrorChannel`] rather than
+/// `crate::scaffolded::Scaffolded`: this operation is implemented, so it needs neither the
+/// 501 nor the framework's synthetic `ValidationException`, and what it does need is the
+/// tagging plane's own wire code for an ARN that resolves to nothing — exactly as
+/// `UntagResource` and `ListTagsForResource` declare it.
+pub type TagResourceError = crate::state::TaggingErrorChannel<TagResourceErrorModeled>;
 
-/// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
-/// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// Lets `?` and `.into()` lift a modeled failure into the error channel, so the handler
+/// writes `Err(SomeModeledError.into())` rather than naming the wrapper variant.
 impl From<TagResourceErrorModeled> for TagResourceError {
     fn from(modeled: TagResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        Self::Modeled(modeled)
     }
 }
 
@@ -177,16 +182,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         // Only an existing resource can be tagged, so the store is checked BEFORE it is
         // written: a refused call leaves no tags behind for an ARN nothing is stored
-        // under, which a later create of that same ARN would otherwise inherit.
+        // under, which a later create of that same ARN would otherwise inherit. The
+        // tagging plane words this refusal itself: its wire code is `NotFoundException`,
+        // not the `ResourceNotFoundException` the CRUD operations answer.
         if !store.holds_resource_at_arn(&input.resource_arn) {
-            return Err(TagResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: st::tagged_resource_not_found_message(&input.resource_arn),
-                    resource_id: input.resource_arn,
-                    resource_type: resource_type.to_string(),
-                },
-            )
-            .into());
+            return Err(TagResourceError::not_found(
+                &input.resource_arn,
+                resource_type,
+            ));
         }
 
         // A tag set past what a `TagMap` can hold could not be reported by

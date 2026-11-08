@@ -15,9 +15,9 @@
 //!   exactly one `ConfiguredTableAnalysisRuleType`, so a request whose `analysisRuleType`
 //!   names another type is refused with a `ValidationException` and persists nothing;
 //! * `CreateConfiguredTableAnalysisRule`: "Currently, only one analysis rule can be
-//!   created for a given configured table" — a further create is a `ConflictException`
-//!   with reason `ALREADY_EXISTS`, whatever type it asks for, and leaves the stored rule
-//!   alone;
+//!   created for a given configured table" — a further create fails that input constraint
+//!   and is a `ValidationException` (400) whatever type it asks for, stating the constraint
+//!   and the type of the rule the table already holds, and leaves the stored rule alone;
 //! * a configured table / analysis rule type pair the store holds no rule for is a
 //!   `ResourceNotFoundException` ("Configured table analysis rules are uniquely
 //!   identified by their configured table identifier and analysis rule type").
@@ -29,7 +29,7 @@
 
 use serde_json::{json, Value};
 
-use super::cleanrooms_collaboration_lifecycle::{account_id, error_code, Emulator};
+use super::cleanrooms_collaboration_lifecycle::{account_id, error_code, error_message, Emulator};
 use super::cleanrooms_configured_table::{
     create_body, ALL_ANALYSIS_METHODS, ALL_TABLE_REFERENCE_TYPES, COLUMN_NAMES,
 };
@@ -343,28 +343,31 @@ async fn only_one_analysis_rule_can_be_created_for_a_configured_table() {
                 .create_analysis_rule(&table_id, second, second_policy)
                 .await;
             assert_eq!(
-                status, 409,
-                "case {label:?}: a second analysis rule must be refused with 409, got {status} with {response}"
+                status, 400,
+                "case {label:?}: a second analysis rule must be refused with 400, got {status} with {response}"
             );
             assert_eq!(
                 error_code(&response),
-                "ConflictException",
-                "case {label:?}: expected ConflictException, got {response}"
+                "ValidationException",
+                "case {label:?}: expected ValidationException, got {response}"
+            );
+            // The sentence states the constraint and what the stored table already holds:
+            // the table the request addressed, and the type of the rule ON it — which is
+            // the FIRST type even when the second create asks for another one.
+            assert_eq!(
+                error_message(&response),
+                format!(
+                    "Only one Analysis Rule is allowed per Configured Table Configured Table \
+                     {table_id} already has a {first} analysis rule."
+                ),
+                "case {label:?}: the message must name the addressed table and the type it \
+                 already holds, got {:?}",
+                error_message(&response)
             );
             assert_eq!(
                 response["reason"].as_str(),
-                Some("ALREADY_EXISTS"),
-                "case {label:?}: expected reason ALREADY_EXISTS, got {response}"
-            );
-            assert_eq!(
-                response["resourceId"].as_str(),
-                Some(table_id.as_str()),
-                "case {label:?}: expected resourceId {table_id:?}, got {response}"
-            );
-            assert_eq!(
-                response["resourceType"].as_str(),
-                Some("CONFIGURED_TABLE"),
-                "case {label:?}: expected resourceType CONFIGURED_TABLE, got {response}"
+                Some("INVALID_CONFIGURATION"),
+                "case {label:?}: expected reason INVALID_CONFIGURATION, got {response}"
             );
 
             // The refused create left the stored rule and its table exactly as they were.

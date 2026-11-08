@@ -23,8 +23,8 @@
 //!   (`crate::state::analysis_rule_columns_outside_allowed`) — the same rule
 //!   `UpdateConfiguredTable` keeps when it narrows that list;
 //! * "Currently, only one analysis rule can be created for a given configured table", so
-//!   a create against a table that already holds one is a `ConflictException` with reason
-//!   `ALREADY_EXISTS`
+//!   a create against a table that already holds one fails that input constraint and is a
+//!   `ValidationException`
 //!   (`crate::state::CleanRoomsState::analysis_rule_of_configured_table`).
 //!
 //! ## Shape of an operation
@@ -271,19 +271,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "Currently, only one analysis rule can be created for a given configured
-        // table." A further create collides with the stored rule whatever type it asks
-        // for; `UpdateConfiguredTableAnalysisRule` is what replaces an existing policy.
+        // table." That is an input constraint the request fails — not a state conflict a
+        // retry could clear — so it is the ValidationException this operation declares,
+        // stating the constraint and what the stored table already holds;
+        // `UpdateConfiguredTableAnalysisRule` is what replaces an existing policy. A
+        // further create collides with the stored rule whatever type it asks for, so the
+        // type the message names is the STORED rule's.
         if let Some(existing) = store.analysis_rule_of_configured_table(&configured_table_id) {
             let existing_type = existing.r#type.clone();
             return Err(
-                CreateConfiguredTableAnalysisRuleErrorModeled::ConflictException(
-                    ConflictException {
-                        message: Some(format!(
-                            "configured table {configured_table_id} already has a {existing_type} analysis rule; only one analysis rule can be created for a given configured table"
+                CreateConfiguredTableAnalysisRuleErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(st::configured_table_analysis_rule_exists_message(
+                            &input.configured_table_identifier,
+                            &existing_type,
                         )),
-                        resource_id: Some(configured_table_id.clone()),
-                        resource_type: Some(st::RESOURCE_TYPE_CONFIGURED_TABLE.to_string()),
-                        reason: Some(st::CONFLICT_REASON_ALREADY_EXISTS.to_string()),
+                        // The request's own members are each well formed; what refuses it
+                        // is the configuration the addressed table is already in, and no
+                        // single member of the request is at fault, so no field list.
+                        reason: Some(st::VALIDATION_REASON_INVALID_CONFIGURATION.to_string()),
+                        field_list: None,
                     },
                 )
                 .into(),

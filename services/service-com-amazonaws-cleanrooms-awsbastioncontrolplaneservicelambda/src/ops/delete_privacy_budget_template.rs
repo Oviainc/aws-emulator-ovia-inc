@@ -189,15 +189,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 DeletePrivacyBudgetTemplateErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "privacy budget template {template_id} not found in collaboration {}",
-                            membership.collaboration_id
+                        message: st::privacy_budget_template_not_found_message(
+                            &template_id,
+                            &input.membership_identifier,
                         ),
-                        // The model's `ResourceType` catalog names no privacy budget
-                        // template, and both members are required, so the pair names the
-                        // collaboration the lookup was scoped to, as the read does.
-                        resource_id: membership.collaboration_id.clone(),
-                        resource_type: st::RESOURCE_TYPE_COLLABORATION.to_string(),
+                        // The resource the caller addressed is the template, so that is
+                        // what the refusal reports as missing, exactly as the read does;
+                        // the model's `ResourceType` catalog names no privacy budget
+                        // template, so the member reports the kind that was not found.
+                        resource_id: template_id.clone(),
+                        resource_type: st::RESOURCE_TYPE_PRIVACY_BUDGET_TEMPLATE.to_string(),
                     },
                 )
                 .into(),

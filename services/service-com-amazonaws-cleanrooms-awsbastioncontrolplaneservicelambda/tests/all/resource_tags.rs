@@ -15,9 +15,11 @@
 //! * the rule holds for EVERY kind of resource addressable by a `resourceArn`, not for
 //!   one kind: the rows below cover each kind this service persists an ARN for whose ARN
 //!   fits `CleanroomsArn`'s published 100-character bound;
-//! * an ARN no resource is stored under is a `ResourceNotFoundException` (404) on all
-//!   three operations, reporting the requested ARN and the resource type the ARN names,
-//!   and changing nothing; an ARN whose resource segment names no kind of Clean Rooms
+//! * an ARN no resource is stored under is refused 404 on all three operations under the
+//!   tagging plane's OWN error code — `NotFoundException`, not the
+//!   `ResourceNotFoundException` the CRUD operations answer — with the plane's fixed
+//!   sentence, reporting the requested ARN and the resource type the ARN names and
+//!   changing nothing; an ARN whose resource segment names no kind of Clean Rooms
 //!   resource at all is a `ValidationException` (400) naming `resourceArn`.
 //!
 //! The tables vary what those rules generalise over: the kind of resource, the number of
@@ -49,6 +51,14 @@ const TAG_MAP_MAX: usize = 200;
 /// The published maximum length of `CleanroomsArn`, the shape every tagging operation's
 /// `resourceArn` targets (model shape `CleanroomsArn`, len ..100).
 const MAX_CLEANROOMS_ARN_LEN: usize = 100;
+
+/// The message the tagging plane reports for an ARN that resolves to no resource. Fixed
+/// text: the refusal interpolates no ARN, id or resource kind.
+const TAGGED_RESOURCE_NOT_FOUND: &str = "Resource was not found";
+
+/// The wire error code the tagging plane names an absent resource by — the plane's own,
+/// distinct from the `ResourceNotFoundException` the CRUD operations answer.
+const TAGGING_NOT_FOUND_CODE: &str = "NotFoundException";
 
 /// Ids in the model's `UUID` form that no create in these tests mints.
 const NEVER_MINTED_IDS: [&str; 3] = [
@@ -579,8 +589,8 @@ async fn every_tagging_operation_refuses_an_arn_no_resource_is_stored_under() {
             );
             assert_eq!(
                 error_code(body),
-                "ResourceNotFoundException",
-                "case {case:?}: expected ResourceNotFoundException, got {body}"
+                TAGGING_NOT_FOUND_CODE,
+                "case {case:?}: expected {TAGGING_NOT_FOUND_CODE}, got {body}"
             );
             assert_eq!(
                 body["resourceId"].as_str(),
@@ -594,9 +604,10 @@ async fn every_tagging_operation_refuses_an_arn_no_resource_is_stored_under() {
                 "case {case:?}: expected resourceType {:?}, got {body}",
                 unheld.resource_type
             );
-            assert!(
-                error_message(body).contains(&unheld.arn),
-                "case {case:?}: the message must name the ARN that resolved to nothing, got {:?}",
+            assert_eq!(
+                error_message(body),
+                TAGGED_RESOURCE_NOT_FOUND,
+                "case {case:?}: the tagging plane's refusal is fixed text, got {:?}",
                 error_message(body)
             );
         }
@@ -888,8 +899,8 @@ async fn a_deleted_resource_is_no_longer_taggable_and_keeps_no_tags() {
     );
     assert_eq!(
         error_code(&body),
-        "ResourceNotFoundException",
-        "expected ResourceNotFoundException, got {body}"
+        TAGGING_NOT_FOUND_CODE,
+        "expected {TAGGING_NOT_FOUND_CODE}, got {body}"
     );
 
     let (status, body) = emulator.tag_resource(&arn, json!({ "env": "new" })).await;

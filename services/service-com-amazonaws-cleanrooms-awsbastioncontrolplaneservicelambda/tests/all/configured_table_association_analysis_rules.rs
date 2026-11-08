@@ -49,6 +49,19 @@ const ABSENT_UUID: &str = "00000000-0000-0000-0000-000000000000";
 /// An account id that is not the caller's, twelve digits as `AccountId` declares.
 const OTHER_RESULT_RECEIVER: &str = "210987654321";
 
+/// The INTERNAL name the service reports a rule type by when it refuses a read: the
+/// catalog value as one CamelCase word, except LIST, whose rule class is the
+/// intersection-list rule and is named for it. Catalog source: model shape
+/// `ConfiguredTableAssociationAnalysisRuleType` (AGGREGATION | LIST | CUSTOM).
+fn internal_rule_type_name(rule_type: &str) -> &'static str {
+    match rule_type {
+        "AGGREGATION" => "Aggregation",
+        "LIST" => "IntersectionList",
+        "CUSTOM" => "Custom",
+        other => panic!("no internal name for analysis rule type {other:?}"),
+    }
+}
+
 /// The union member of `ConfiguredTableAssociationAnalysisRulePolicyV1` that carries the
 /// policy of `rule_type`.
 fn policy_member(rule_type: &str) -> &'static str {
@@ -679,8 +692,9 @@ async fn a_pair_holding_no_rule_is_reported_as_the_association_that_would_own_it
         assert_eq!(
             error_message(&read),
             format!(
-                "No such analysis rule with configuredTableAssociationId: {} and type {rule_type}",
-                stored.id
+                "No such analysis rule with configuredTableAssociationId: {} and type {}",
+                stored.id,
+                internal_rule_type_name(rule_type)
             ),
             "case {label:?}: expected the refusal to name the pair, got {:?}",
             error_message(&read)

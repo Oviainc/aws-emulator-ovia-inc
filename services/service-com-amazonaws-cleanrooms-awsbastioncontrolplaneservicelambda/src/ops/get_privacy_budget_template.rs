@@ -185,17 +185,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }),
             None => Err(GetPrivacyBudgetTemplateErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
-                    message: format!(
-                        "privacy budget template {} not found in collaboration {}",
-                        input.privacy_budget_template_identifier, membership.collaboration_id
+                    message: st::privacy_budget_template_not_found_message(
+                        &input.privacy_budget_template_identifier,
+                        &input.membership_identifier,
                     ),
-                    // The model's `ResourceType` catalog (COLLABORATION | MEMBERSHIP |
-                    // CONFIGURED_TABLE | CONFIGURED_TABLE_ASSOCIATION) names no privacy
-                    // budget template, and both members are required here, so the pair
-                    // names ONE resource the catalog does have: the collaboration the
-                    // lookup was scoped to. The requested template id is in the message.
-                    resource_id: membership.collaboration_id.clone(),
-                    resource_type: st::RESOURCE_TYPE_COLLABORATION.to_string(),
+                    // The resource the caller addressed is the template, so that is what
+                    // the refusal reports as missing. The model's `ResourceType` catalog
+                    // (COLLABORATION | MEMBERSHIP | CONFIGURED_TABLE |
+                    // CONFIGURED_TABLE_ASSOCIATION) names no privacy budget template, so
+                    // the member reports the kind of resource that was not found rather
+                    // than one of the four that is not it — the same choice
+                    // `RESOURCE_TYPE_ANALYSIS_TEMPLATE` makes.
+                    resource_id: input.privacy_budget_template_identifier,
+                    resource_type: st::RESOURCE_TYPE_PRIVACY_BUDGET_TEMPLATE.to_string(),
                 },
             )
             .into()),
