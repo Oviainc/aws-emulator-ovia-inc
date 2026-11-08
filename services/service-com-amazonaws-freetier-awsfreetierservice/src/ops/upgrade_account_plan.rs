@@ -12,6 +12,13 @@
 //! is refused with the modelled `ValidationException` and its plan record is
 //! left exactly as it was — not even established.
 //!
+//! Before any of that, the request is AUTHORIZED
+//! ([`crate::service::authorization`]): this operation's model declares
+//! `AccessDeniedException` (HTTP 403), and AWS takes that decision at the IAM
+//! layer ahead of the service reading or writing any record, so a caller whose
+//! identity-based policies do not allow `freetier:UpgradeAccountPlan` is refused
+//! and nothing of the account's plan record is read or changed.
+//!
 //! This is the service's ONLY plan-writing operation, so it is also what
 //! establishes the record for an account that holds no account-plan data yet
 //! ([`crate::state::ComAmazonawsFreetierAwsfreetierserviceState::plan_mut`]);
@@ -162,7 +169,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // IAM first: this operation models `AccessDeniedException`, and the decision is
+        // taken before the request's own input is looked at or anything is written, so a
+        // caller no identity-based policy allows changes nothing.
+        crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME)
+            .map_err(UpgradeAccountPlanErrorModeled::AccessDeniedException)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(UpgradeAccountPlanErrorModeled::InternalServerException(
                 InternalServerException {

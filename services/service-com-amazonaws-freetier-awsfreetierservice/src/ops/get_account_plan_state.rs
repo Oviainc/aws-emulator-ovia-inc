@@ -14,6 +14,13 @@
 //! what [`crate::state::ComAmazonawsFreetierAwsfreetierserviceState::settled_plan`]
 //! (as opposed to `plan_mut`) buys.
 //!
+//! Before any of that, the request is AUTHORIZED
+//! ([`crate::service::authorization`]): this operation's model declares
+//! `AccessDeniedException` (HTTP 403), and AWS takes that decision at the IAM
+//! layer ahead of the service reading any record, so a caller whose
+//! identity-based policies do not allow `freetier:GetAccountPlanState` is
+//! refused without learning whether the account holds plan data at all.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -156,7 +163,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // The input shape has no members: the plan reported is the caller's own.
-        let _ = (&input, ctx);
+        let _ = &input;
+        // IAM first: this operation models `AccessDeniedException`, and AWS decides
+        // authorization ahead of the service looking at any record, so a caller no
+        // identity-based policy allows is refused here and learns nothing about the
+        // account's plan data.
+        crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME)
+            .map_err(GetAccountPlanStateErrorModeled::AccessDeniedException)?;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetAccountPlanStateErrorModeled::InternalServerException(
                 InternalServerException {

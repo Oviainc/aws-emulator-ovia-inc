@@ -23,6 +23,8 @@ mod date_time_wire_form;
 mod dimension_decode;
 #[path = "all/free_tier.rs"]
 mod free_tier;
+#[path = "all/identity_authorization.rs"]
+mod identity_authorization;
 #[path = "all/language_code_subtag_rule.rs"]
 mod language_code_subtag_rule;
 #[path = "all/match_option_cardinality.rs"]

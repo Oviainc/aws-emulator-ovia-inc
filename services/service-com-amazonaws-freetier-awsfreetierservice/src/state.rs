@@ -65,6 +65,18 @@ pub const CURRENCY_USD: &str = "USD";
 /// operations (`@default: 10`).
 pub const DEFAULT_MAX_RESULTS: i32 = 10;
 
+/// The Region segment every ARN of this service carries.
+///
+/// Free Tier is a GLOBAL API with a single endpoint: its documentation names one
+/// "Service endpoint" for the whole API (the service shape's
+/// `smithy.api#documentation`, `smithy_query(query="service_info")`), and that
+/// endpoint is `freetier.us-east-1.amazonaws.com`. So an ARN naming one of its
+/// API resources carries this one Region whatever Region a client signed for,
+/// and a refusal of such a call names a resource in this Region too — the same
+/// position every other globally-served billing-family control plane of this
+/// emulator is in.
+pub const SERVICE_REGION: &str = "us-east-1";
+
 /// The language a request that names no `languageCode` is answered in, and the
 /// language every catalog row holds its base text in.
 ///

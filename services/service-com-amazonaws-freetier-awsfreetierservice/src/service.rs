@@ -110,6 +110,9 @@
 //! words every one of them the same way.
 
 pub mod announced_media_type;
+/// The per-request IAM decision the operations whose model declares
+/// `AccessDeniedException` take before they read or write any plan state.
+pub mod authorization;
 /// Reached by [`crate::state`] as well: a bound a HANDLER enforces on top of the model's
 /// is stated in the same words as one the walk found (see that module's rule 7).
 pub(crate) mod validation;

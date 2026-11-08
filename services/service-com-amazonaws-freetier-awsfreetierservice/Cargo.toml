@@ -8,10 +8,18 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
-# `response_media_type`: the tree's one statement of the media type a service
-# announces on every response, and the operation-seam wrapper that reaches the
+# `iam_authorization`: the shared evaluation of IAM policy documents against
+# (action, resource, principal), which the authorization gate of the operations that
+# model `AccessDeniedException` runs; `iam_role`: the one reading of which IAM entity a
+# principal ARN names; `response_media_type`: the tree's one statement of the media type a
+# service announces on every response, and the operation-seam wrapper that reaches the
 # framework's refusal tail with it.
 service-common = { path = "../common" }
+# The IAM store holds the identity-based policies of the principal a request speaks
+# for, and the STS store resolves which principal that is: this service reads both
+# services' OWN state accessors rather than keeping a second copy of either fact.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -34,6 +42,10 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The authorization suite makes the principals it calls as through IAM's and STS's own
+# operations, so the policies it asserts on are the ones those services wrote.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [lints]
 workspace = true
