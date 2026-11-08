@@ -135,6 +135,8 @@ mod snapshot_copy_grants;
 mod snapshot_copy_retention_period;
 #[path = "all/snapshot_restore.rs"]
 mod snapshot_restore;
+#[path = "all/snapshot_schedules.rs"]
+mod snapshot_schedules;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/static_catalog.rs"]

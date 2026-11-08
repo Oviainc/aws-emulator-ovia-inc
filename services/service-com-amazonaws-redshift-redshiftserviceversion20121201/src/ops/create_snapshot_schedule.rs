@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSnapshotSchedule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSnapshotSchedule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSnapshotSchedule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Inserts a new snapshot schedule into this service's store and reports it
+//! back: the identifier as given, the schedule expressions its snapshots are
+//! taken on, the description and the tags the request carried, the upcoming
+//! invocation times COMPUTED from those expressions, and the clusters the store
+//! holds that are associated with the schedule. A second create under the same
+//! identifier is refused with `SnapshotScheduleAlreadyExistsFault` and
+//! overwrites nothing.
+//!
+//! Every definition is read as the schedule it states BEFORE anything is
+//! written ([`crate::state::parse_schedule_definition`]): a definition written
+//! in an expression type this service reads no schedule from is refused with
+//! `ScheduleDefinitionTypeUnsupportedFault`, and one of an offered type that
+//! states no schedule with `InvalidScheduleFault` — so no stored schedule
+//! carries a definition nothing can be computed from.
+//!
+//! A request whose `DryRun` asks for the create to be CHECKED rather than
+//! performed is answered with the schedule it describes, invocation times
+//! included, and stores nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -88,6 +98,10 @@
 //! * `SnapshotScheduleQuotaExceededFault` (HTTP 400) — You have exceeded the quota of
 //!   snapshot schedules.
 //! * `TagLimitExceededFault` (HTTP 400) — You have exceeded the number of tags allowed.
+//! * `DependentServiceUnavailableFault` (HTTP 400) — widened in through `extra_errors` (see
+//!   below): the shared store this service's records live in could not be reached.
+//! * `ValidationException` (HTTP 400) — the request's `ScheduleIdentifier` is outside the
+//!   documented syntax, which the model does not express.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -102,8 +116,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `CreateSnapshotScheduleError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#CreateSnapshotSchedule")]
+// to construct until the model says otherwise. The server-side fault for an
+// unreachable shared store — which this SERVICE models and this operation's own
+// error list omits — is widened in through `extra_errors`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#CreateSnapshotSchedule",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum CreateSnapshotScheduleErrorModeled {
     InvalidScheduleFault(InvalidScheduleFault),
@@ -112,6 +131,7 @@ pub enum CreateSnapshotScheduleErrorModeled {
     SnapshotScheduleAlreadyExistsFault(SnapshotScheduleAlreadyExistsFault),
     SnapshotScheduleQuotaExceededFault(SnapshotScheduleQuotaExceededFault),
     TagLimitExceededFault(TagLimitExceededFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -148,6 +168,32 @@ impl<Eng> CreateSnapshotSchedule<Eng> {
     }
 }
 
+/// The refusal one DEFINITION of the request dictates, lifted onto this
+/// operation's error channel: the two faults the model declares for a definition
+/// the service will not store a schedule with.
+fn definition_refusal(
+    refusal: crate::state::ScheduleDefinitionRefusal,
+) -> CreateSnapshotScheduleError {
+    use crate::state::ScheduleDefinitionRefusal as Refusal;
+
+    match refusal {
+        Refusal::Unsupported(message) => {
+            CreateSnapshotScheduleErrorModeled::ScheduleDefinitionTypeUnsupportedFault(
+                ScheduleDefinitionTypeUnsupportedFault {
+                    message: Some(message),
+                },
+            )
+            .into()
+        }
+        Refusal::Invalid(message) => {
+            CreateSnapshotScheduleErrorModeled::InvalidScheduleFault(InvalidScheduleFault {
+                message: Some(message),
+            })
+            .into()
+        }
+    }
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for CreateSnapshotSchedule<Eng>
 {
@@ -163,20 +209,148 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSnapshotSchedule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSnapshotScheduleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                CreateSnapshotScheduleErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Every definition is read as the schedule it states before the store is
+        // touched at all, so a request carrying one nothing can be computed from
+        // is refused with nothing stored. The parsed schedules are not kept: the
+        // STORED definitions are the record, and the invocation times a response
+        // reports are computed from them by the one reading both paths share.
+        let definitions = input.schedule_definitions.clone().unwrap_or_default();
+        // How many definitions one schedule may carry: every one of them is read
+        // and evaluated on every request that reports the schedule, so the
+        // number is bounded before any of them is read.
+        if definitions.len() > st::MAX_SCHEDULE_DEFINITIONS {
+            return Err(
+                CreateSnapshotScheduleErrorModeled::InvalidScheduleFault(InvalidScheduleFault {
+                    message: Some(st::too_many_schedule_definitions_message(definitions.len())),
+                })
+                .into(),
+            );
+        }
+        for definition in &definitions {
+            if let Err(refusal) = st::parse_schedule_definition(definition) {
+                return Err(definition_refusal(refusal));
+            }
+        }
+
+        // The request's own tag list is capped BEFORE the store is locked and
+        // before any per-element work: a resource can carry only so many tags,
+        // so a request carrying more entries than one resource may hold is
+        // refused on its length alone.
+        let tags = input.tags.clone().unwrap_or_default();
+        if tags.len() > st::MAX_TAGS_PER_RESOURCE {
+            return Err(CreateSnapshotScheduleErrorModeled::TagLimitExceededFault(
+                TagLimitExceededFault {
+                    message: Some(st::tag_quota_message(tags.len())),
+                },
+            )
+            .into());
+        }
+        if let Err(message) = st::check_tags(&tags) {
+            return Err(CreateSnapshotScheduleErrorModeled::InvalidTagFault(
+                InvalidTagFault {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // How many upcoming invocations the response reports: the number the
+        // request asked for, or the next one when it asked for no particular
+        // number. A count outside the window the service reports is REFUSED
+        // rather than quietly served a different number of invocations, and it is
+        // decided here, before the store is locked, so no request-chosen count
+        // decides how much work is done under the lock.
+        let reported_invocations = match input.next_invocations {
+            None => st::DEFAULT_REPORTED_NEXT_INVOCATIONS,
+            Some(asked) => match usize::try_from(asked) {
+                Ok(asked) if asked <= st::MAX_REPORTED_NEXT_INVOCATIONS => asked,
+                _ => {
+                    return Err(crate::scaffolded::Scaffolded::validation(
+                        st::next_invocations_out_of_range_message(asked),
+                    ))
+                }
+            },
+        };
+
+        // The identifier a schedule is stored and looked up under, checked under
+        // the documented syntax: the model bounds the member only at `len 0..`,
+        // so the constraint the service publishes for it is enforced here. It is
+        // checked the same way whatever the request is for — a schedule that
+        // could not be stored under the identifier a request names is refused
+        // whether that request performs the create or only CHECKS it.
+        let dry_run = input.dry_run.unwrap_or(false);
+        let identifier = input.schedule_identifier.clone().unwrap_or_default();
+        if let Err(message) = st::check_snapshot_schedule_identifier(&identifier) {
+            return Err(crate::scaffolded::Scaffolded::validation(message));
+        }
+
+        let schedule = st::StoredSnapshotSchedule {
+            schedule_identifier: identifier.clone(),
+            schedule_definitions: definitions,
+            schedule_description: input.schedule_description.clone(),
+            tags,
+        };
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // The clock already owed these transitions at this instant, so applying
+        // them here shows nothing a later caller could not already have seen —
+        // and the association state a schedule reports for a cluster is read off
+        // that cluster's own status.
+        store.settle(::std::time::Instant::now());
+
+        // Identity before capacity: a request that would create nothing keeps
+        // the more specific fault even when the store is at its bound. The
+        // IDENTIFIER is what an account's schedules are unique on, so a second
+        // create under one identifier is refused and overwrites nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSnapshotSchedule"))
+        // Both checks are made for a request that is only being CHECKED too: a
+        // dry run is the create's own refusals without the write, so a dry run
+        // of a create that could not succeed is refused exactly as that create
+        // would be.
+        if store.snapshot_schedule(&identifier).is_some() {
+            return Err(
+                CreateSnapshotScheduleErrorModeled::SnapshotScheduleAlreadyExistsFault(
+                    SnapshotScheduleAlreadyExistsFault {
+                        message: Some(st::snapshot_schedule_already_exists_message(&identifier)),
+                    },
+                )
+                .into(),
+            );
+        }
+        if store.snapshot_schedules.len() >= st::SNAPSHOT_SCHEDULE_QUOTA {
+            return Err(
+                CreateSnapshotScheduleErrorModeled::SnapshotScheduleQuotaExceededFault(
+                    SnapshotScheduleQuotaExceededFault {
+                        message: Some(st::snapshot_schedule_quota_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A request that is only being checked reports the schedule it describes
+        // and writes nothing.
+        if dry_run {
+            return Ok(store.snapshot_schedule_view(&schedule, now, reported_invocations));
+        }
+
+        store.snapshot_schedules.push(schedule.clone());
+        Ok(store.snapshot_schedule_view(&schedule, now, reported_invocations))
     }
 }

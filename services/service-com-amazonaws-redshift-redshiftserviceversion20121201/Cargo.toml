@@ -44,6 +44,12 @@ aws-sdk-ec2 = { version = "1", default-features = false }
 # The Region-label grammar the EC2 endpoint a hop addresses is read under, shared
 # by every service that resolves a caller-supplied Region into an endpoint URL.
 service-common = { path = "../common" }
+# The `cron(...)` half of a snapshot schedule's definitions is read by this
+# maintained parser rather than by a hand-written grammar, and `chrono` (which it
+# is written in) is what the invocation times it yields are computed in
+# (`state::snapshot_schedules`).
+cron = "0.15"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 # The Redshift Serverless client the SERVERLESS arm of a namespace registration
 # change is resolved through, over the same in-process callback: a serverless
 # namespace and its workgroup are resources of that control plane, so whether

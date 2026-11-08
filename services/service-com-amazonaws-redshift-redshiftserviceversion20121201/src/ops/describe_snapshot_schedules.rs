@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeSnapshotSchedules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeSnapshotSchedules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeSnapshotSchedules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the snapshot schedules the account holds, in creation order: the ONE
+//! the `ScheduleIdentifier` names, the ones the cluster a `ClusterIdentifier`
+//! names is associated with, or every one of them when the request narrows
+//! neither — each with the upcoming invocation times computed from its own
+//! definitions and the clusters associated with it.
+//!
+//! A pure report: it stores nothing, and an identifier that names no schedule is
+//! an EMPTY page rather than a refusal, because this operation models no
+//! not-found fault at all (`smithy_query(query="operation",
+//! operation="DescribeSnapshotSchedules")` lists no errors).
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +80,14 @@
 //!   value in the marker parameter and retrying the command. If the marker field is empty,
 //!   all response records have been retrieved for the request.
 //! * `SnapshotSchedules` (SnapshotScheduleList) — A list of SnapshotSchedules.
+//!
+//! ## Errors
+//!
+//! The model declares NONE for this operation. Two are answered all the same, and both
+//! are widened in rather than invented: `DependentServiceUnavailableFault` (HTTP 400,
+//! through `extra_errors`) for a shared store that could not be reached, and
+//! `InvalidParameterValue` (HTTP 400) for a `MaxRecords` or `Marker` outside the window
+//! this service publishes for its paginated reads.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -92,10 +102,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // model declares for this operation, so the scaffold's `NotImplemented` cannot live
 // here — hence the `DescribeSnapshotSchedulesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
-// to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribeSnapshotSchedules")]
+// to construct until the model says otherwise. The server-side fault for an
+// unreachable shared store — which this SERVICE models and this operation's own
+// error list omits entirely — is widened in through `extra_errors`.
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribeSnapshotSchedules",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeSnapshotSchedulesErrorModeled {
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -147,20 +163,92 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeSnapshotSchedules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeSnapshotSchedulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeSnapshotSchedules"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeSnapshotSchedulesErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The clock already owed these transitions at this instant, so applying
+        // them here shows nothing a later caller could not already have seen —
+        // and the association state a schedule reports for a cluster is read off
+        // that cluster's own status.
+        store.settle(::std::time::Instant::now());
+
+        // The schedule the cluster a `ClusterIdentifier` names is associated
+        // with, resolved ONCE before the walk: a cluster carries at most one
+        // snapshot schedule, so the filter is a comparison per schedule rather
+        // than a pass over the clusters per schedule. `Some(None)` is a request
+        // naming a cluster that is associated with no schedule at all — or none
+        // this store holds — which no schedule matches.
+        let cluster_schedule: Option<Option<String>> =
+            input.cluster_identifier.as_deref().map(|identifier| {
+                store
+                    .cluster(identifier)
+                    .and_then(|cluster| cluster.cluster.snapshot_schedule_identifier.clone())
+            });
+
+        // The schedules this request reports: the one its `ScheduleIdentifier`
+        // names, the one the cluster its `ClusterIdentifier` names is associated
+        // with, and those carrying a tag its filter asks for. Each member
+        // narrows the same list, so a request naming both an identifier and a
+        // cluster reports the schedule only when that cluster is associated with
+        // it.
+        let matched: Vec<&st::StoredSnapshotSchedule> = store
+            .snapshot_schedules
+            .iter()
+            .filter(|schedule| {
+                input
+                    .schedule_identifier
+                    .as_deref()
+                    .is_none_or(|wanted| schedule.schedule_identifier == wanted)
+                    && cluster_schedule.as_ref().is_none_or(|associated| {
+                        associated.as_deref() == Some(schedule.schedule_identifier.as_str())
+                    })
+                    && st::tags_match(
+                        &schedule.tags,
+                        input.tag_keys.as_deref(),
+                        input.tag_values.as_deref(),
+                    )
+            })
+            .collect();
+
+        let (start, end, next_marker) =
+            match st::page_bounds(input.marker.as_deref(), input.max_records, matched.len()) {
+                Ok(page) => page,
+                Err(message) => {
+                    return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(message))
+                }
+            };
+
+        // Only the PAGE is rendered: the invocation times and the associations
+        // of a schedule a later page carries are computed when that page is
+        // asked for, so one request's work is proportional to its page.
+        Ok(DescribeSnapshotSchedulesOutput {
+            snapshot_schedules: Some(
+                matched[start..end]
+                    .iter()
+                    .map(|schedule| {
+                        store.snapshot_schedule_view(
+                            schedule,
+                            now,
+                            st::DEFAULT_REPORTED_NEXT_INVOCATIONS,
+                        )
+                    })
+                    .collect(),
+            ),
+            marker: next_marker,
+        })
     }
 }

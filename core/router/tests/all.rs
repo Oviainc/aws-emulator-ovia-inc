@@ -1012,6 +1012,13 @@ mod medical_imaging_dicom_import;
 // answered with, and the one stream record each new item they write carries.
 #[path = "all/apigateway_repeated_stage_requests.rs"]
 mod apigateway_repeated_stage_requests;
+// The suites that stood here — `apigateway_iam_authenticated_invoke`,
+// `cloudformation_rollback_triggers_revert_the_operation`,
+// `cloudformation_wafv2_protection_stack`, `lambda_sqs_event_source_batching_window` and
+// `cloudformation_asset_bucket_publishing_role` — are each ALREADY declared above, in the
+// sorted head. Two concurrent changes appended the same entry, which is a redefinition and
+// stops this target from compiling; the duplicate lines are removed here and the first
+// declaration of each stands.
 // Declared here, in the appended tail: WAFv2 protection a stack provisions. It stood twice in
 // this tail and once in the sorted head across concurrent changes; one declaration of each
 // suite is what this target compiles, so the entry lives here, once.
@@ -1034,6 +1041,10 @@ mod bedrock_agentcore_data_plane_parent_resources;
 // at the end of this file: the tail is where every suite landing in the same window appends.
 #[path = "all/cloudfront_edge_metrics_drive_the_alarm_chain.rs"]
 mod cloudfront_edge_metrics_drive_the_alarm_chain;
+// Several suites that stood here are each ALREADY declared above, in the sorted head: two
+// concurrent changes appended the same entry, which is a redefinition and stops this target
+// from compiling, so the duplicate lines are removed and the first declaration of each
+// stands.
 // Nothing below this point re-declares a suite: several landing in the same window each
 // appended their own entry to this tail, so the same suite stood here two and three times
 // over, which is a redefinition (`E0428`) that stops this target from compiling. The
@@ -1075,6 +1086,22 @@ mod zz_opensearch_fgac_probe;
 // the sorted list either.
 #[path = "all/all_rs_declares_each_suite_once.rs"]
 mod all_rs_declares_each_suite_once;
+// `cloudformation_wafv2_protection_stack` is NOT re-declared here: it is already declared in
+// the sorted head, and a second `mod` for the same file is a redefinition that stops this
+// target from compiling.
+// `bedrock_agentcore_data_plane_parent_resources` is NOT re-declared here either: it stands
+// in the sorted head, and one `mod` per file is what this target compiles with.
+// Declared here, in the appended tail, for the reason the entries above record: the sorted
+// `e…` span is a region concurrently landing suites add their line to.
+// declaration of each stands. `bedrock_agentcore_data_plane_parent_resources`, which stood
+// just below, was appended the same way and is declared in that head too.
+// `cloudformation_wafv2_protection_stack`, `lambda_sqs_event_source_batching_window`,
+// `cloudformation_asset_bucket_publishing_role` and
+// `bedrock_agentcore_data_plane_parent_resources` — are each ALREADY declared above, in the
+// Several suites that stood here are each ALREADY declared above: two concurrent changes
+// appended the same entry, which is a redefinition and stops this target from compiling, so
+// the duplicate lines are removed and the first declaration of each stands.
+// appended tail and the sorted `c…`/`s…` spans are both regions concurrently landing suites
 #[path = "all/cloudformation_rest_api_serves_its_stage.rs"]
 mod cloudformation_rest_api_serves_its_stage;
 // Declared HERE, beside the sibling SESv2 suites above in this quiet span, for the same
@@ -1126,6 +1153,10 @@ mod sesv2_probe3;
 // `s…` span every SNS suite lands in is a region concurrently landing suites append to.
 #[path = "all/sns_lambda_invoke_permission_revocation.rs"]
 mod sns_lambda_invoke_permission_revocation;
+// Several suites that stood here are each ALREADY declared above, in the sorted head: two
+// from compiling, so the duplicate lines are removed and the first declaration of each
+// stands. Add a NEW suite in the sorted span its name belongs to, and check it is not
+// already declared before appending it here.
 // Declared here, in the appended tail: the log group a stack DECLARES, read back by the name
 // the stack published, and the records the function pointed at it leaves in it.
 #[path = "all/cloudformation_declared_log_group_takes_its_function_logs.rs"]

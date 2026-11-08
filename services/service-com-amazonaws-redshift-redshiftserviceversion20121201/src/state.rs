@@ -7,7 +7,9 @@
 //! cluster subnet groups they are configured from, the HSM configurations that
 //! tell a cluster where to store its database encryption keys, the usage limits
 //! set on their features, the snapshot copy grants that let Redshift encrypt
-//! copied snapshots in another region, the Query Editor (QEV2) and the Redshift
+//! copied snapshots in another region, the snapshot schedules a cluster's
+//! backups are taken on (see [`StoredSnapshotSchedule`]),
+//! the Query Editor (QEV2) and the Redshift
 //! IAM Identity Center applications the account registered, and the namespace registrations
 //! that expose a cluster's or a serverless namespace's data to a consumer
 //! account through the Glue Data Catalog, and the event notification
@@ -45,10 +47,10 @@ use crate::ops::types::{
     AccountAttribute, AccountWithRestoreAccess, AquaConfiguration, Association,
     AttributeValueTarget,
     AuthenticationProfile, AuthorizeEndpointAccessOutput, AvailabilityZone, CertificateAssociation,
-    Cluster, ClusterIamRole,
+    Cluster, ClusterAssociatedToSchedule, ClusterIamRole,
     ClusterNode, ClusterParameterGroup, ClusterParameterGroupStatus, ClusterParameterStatus,
     ClusterSubnetGroup, ClusterVersion, CreateEndpointAccessOutput, CreateIntegrationOutput,
-    CreateUsageLimitOutput, Endpoint,
+    CreateSnapshotScheduleOutput, CreateUsageLimitOutput, Endpoint,
     Event, EventCategoriesMap, EventInfoMap,
     EventSubscription, HsmClientCertificate, HsmConfiguration, InboundIntegration,
     MaintenanceTrack,
@@ -96,6 +98,9 @@ mod naming;
 /// The subnets a cluster subnet group is made of, resolved against the service
 /// that owns them.
 mod ec2_subnets;
+/// The snapshot schedules an account created, and the invocation times computed
+/// from their definitions.
+mod snapshot_schedules;
 
 pub use clusters::*;
 pub use ec2_subnets::*;
@@ -105,6 +110,7 @@ pub use naming::*;
 pub use parameters::*;
 pub use policy_resources::*;
 pub use reserved_nodes::*;
+pub use snapshot_schedules::*;
 pub use tags::*;
 
 /// How long after the call that starts it a provisioning transition falls due:
@@ -2361,6 +2367,15 @@ pub struct ComAmazonawsRedshiftRedshiftserviceversion20121201State {
     /// [`ComAmazonawsRedshiftRedshiftserviceversion20121201State::usage_limits`],
     /// this collection needs no `Stored*` wrapper.
     pub snapshot_copy_grants: Vec<SnapshotCopyGrant>,
+    /// Every snapshot schedule, keyed by `ScheduleIdentifier`, in creation
+    /// order.
+    ///
+    /// Unlike the collections around it this one holds a `Stored*` wrapper even
+    /// though a schedule carries no status the clock moves: three members of the
+    /// modelled `SnapshotSchedule` shape are DERIVED when the schedule is
+    /// reported rather than stored, so the record holds only what a create gave
+    /// it (see [`StoredSnapshotSchedule`]).
+    pub snapshot_schedules: Vec<StoredSnapshotSchedule>,
     /// Every Query Editor (QEV2) IAM Identity Center application the account
     /// registered, keyed by `Qev2IdcApplicationArn`, in creation order.
     ///
@@ -2547,6 +2562,7 @@ impl Default for ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             usage_limits: Vec::new(),
             hsm_configurations: Vec::new(),
             snapshot_copy_grants: Vec::new(),
+            snapshot_schedules: Vec::new(),
             qev2_idc_applications: Vec::new(),
             redshift_idc_applications: Vec::new(),
             cluster_versions: published_cluster_versions(),
