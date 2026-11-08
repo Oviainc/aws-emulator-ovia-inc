@@ -562,31 +562,34 @@ async fn a_served_response_carries_no_bucket_name_element() {
 }
 
 #[tokio::test]
-async fn a_bucket_name_in_the_envelope_is_xml_escaped() {
-    // The element's text is a value the CALLER chose, so it is written through the codec
-    // that escapes XML metacharacters rather than pasted into the document: a bucket name
-    // carrying an ampersand must leave the envelope well-formed and read back unchanged.
-    // An ampersand is the one metacharacter a URI path may legally carry, so it is what a
-    // request can actually address a bucket with.
+async fn a_bucket_name_carrying_an_xml_metacharacter_is_refused_for_the_name() {
+    // An ampersand is the one XML metacharacter a URI path may legally carry, and the
+    // published bucket naming rules admit no such character — so a request addressing it is
+    // refused for the NAME rather than reported as a bucket that is absent, and the
+    // caller's own text is never pasted into a document at all. The envelope stays
+    // well-formed either way, which is what this pins; that a caller-chosen value which CAN
+    // carry a metacharacter is escaped on its way into an envelope is pinned on one that
+    // can — the `<UploadId>` of [`super::refusal_detail_members`].
     let router = router();
     let answer = send(&router, "GET", "/envelope&escaped?cors", &[], "").await;
 
     assert_eq!(
-        answer.status, 404,
-        "a read of a bucket that does not exist must be a 404, got {} with body {:?}",
+        answer.status, 400,
+        "a name the published rules do not admit is refused for the name, got {} with body \
+         {:?}",
         answer.status,
         String::from_utf8_lossy(&answer.body)
     );
     assert_eq!(
-        answer.element(BUCKET_NAME_ELEMENT).as_deref(),
-        Some("envelope&escaped"),
-        "the envelope must name the bucket the request addressed, got {:?}",
-        answer.element(BUCKET_NAME_ELEMENT)
+        answer.error_code(),
+        "InvalidBucketName",
+        "expected the InvalidBucketName code, got {:?}",
+        answer.error_code()
     );
     let body = String::from_utf8_lossy(&answer.body).to_string();
     assert!(
-        body.contains("<BucketName>envelope&amp;escaped</BucketName>"),
-        "the metacharacter must be escaped in the document, got {body:?}"
+        !body.contains("envelope&escaped"),
+        "the caller's own text must not be pasted into the document, got {body:?}"
     );
     // And the document as a whole still parses, so nothing the caller chose broke it.
     let mut reader = quick_xml::Reader::from_str(&body);

@@ -237,6 +237,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::invalid_canned_acl(value));
         }
 
+        // The LOCATION this create asks for has to be one S3 can create a bucket in. The
+        // value is judged HERE, from the document the request carried, for the same reason
+        // the canned ACL above is: the refusal names the rejected value in a member of its
+        // own, which only a handler's envelope can carry — see
+        // [`crate::service::wire::rejected_location_constraint`], which is what withholds
+        // such a value from the codec, and [`invalid_location_constraint`], which is the
+        // envelope S3 answers it with.
+        if let Some(constraint) = crate::service::wire::rejected_location_constraint(
+            super::types::CREATE_BUCKET_INPUT_SCHEMA,
+        ) {
+            return Err(invalid_location_constraint(&constraint));
+        }
+
+        // And the OBJECT OWNERSHIP setting it asks for, judged here for the same reason: the
+        // refusal names the header and echoes the value as sent, which only this envelope can
+        // carry — see [`crate::service::wire::rejected_object_ownership`], which is where the
+        // request's own header is read.
+        if let Some(value) = crate::service::wire::rejected_object_ownership(
+            ctx.parts(),
+            super::types::CREATE_BUCKET_INPUT_SCHEMA,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_argument(
+                crate::state::OBJECT_OWNERSHIP_ARGUMENT,
+                Some(value),
+                crate::state::invalid_object_ownership_message(value),
+            ));
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // The store is unreachable only when this service is mounted on an engine
             // that is not the shared `InMemoryEngine`; the emulator then cannot create
@@ -253,16 +281,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let placement = directory_placement(&input.bucket, configuration)?;
 
         // The NAME a general purpose bucket comes into being under has to be one S3 can
-        // hold a bucket under at all: every sentence of the published general purpose
-        // bucket naming rules, read through the one reading every service in this
-        // workspace judges a caller-supplied bucket name by
+        // CREATE a bucket under: every sentence of the published general purpose bucket
+        // naming rules, read through the one reading every service in this workspace judges
+        // a caller-supplied bucket name by
         // (`service_common::s3_bucket_name::is_well_formed`) — the length bound, the
         // lowercase character class, the first and last character, adjacent periods, a
-        // name formatted as an IP address, and the reserved prefixes and suffixes. A name
-        // outside them names no bucket in any account (such a bucket cannot even be
-        // addressed virtual-hosted-style), so the create is refused BEFORE any state is
-        // written, with the code and sentence S3's published error list states for it and
-        // the `<BucketName>` member that envelope names the rejected name by.
+        // name formatted as an IP address, and the reserved prefixes and suffixes. No bucket
+        // can come into being under a name outside them, so the create is refused BEFORE any
+        // state is written, with the code and sentence S3's published error list states for
+        // it and the `<BucketName>` member that envelope names the rejected name by.
+        //
+        // This create is the one call that applies those rules, and the reason it is: every
+        // other request ADDRESSES a bucket that already exists, which is judged by the wider
+        // syntax a request may name one by (`crate::service::names_a_bucket`) — a bucket
+        // created under the legacy rules still exists, and a name no NEW bucket may carry is
+        // still a name an existing one can be addressed by.
         //
         // A DIRECTORY bucket is judged by its own rule instead, in `directory_placement`
         // above: its name carries the zone the bucket is placed in and ends in the
@@ -345,6 +378,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the one a read of an ACL-disabled bucket still reports — so a create naming the
         // `private` canned ACL beside the enforced setting is served.
         let grants = requested_grants(&input, &region)?;
+        // The TAGS this create asks the bucket to come into being with: "an array of tags
+        // that you can apply to the bucket that you're creating"
+        // (`CreateBucketConfiguration$Tags`). Judged against the BUCKET's own published tag
+        // limits — the same rule, and the same refusal envelope, `PutBucketTagging` judges a
+        // tag set by — BEFORE the bucket is recorded, so a create carrying a tag set S3 does
+        // not hold leaves nothing behind.
+        let tags = requested_tags(configuration)?;
         if ownership == crate::state::BUCKET_OWNER_ENFORCED
             && grants
                 .as_deref()
@@ -391,6 +431,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     if let Some(grants) = grants {
                         bucket.set_acl_grants(grants);
                     }
+                    // The tag set the create carried, associated with the bucket as it comes
+                    // into being, so a `GetBucketTagging` right after the create reports the
+                    // tags the create asked for rather than "this bucket carries none" — the
+                    // same store a later `PutBucketTagging` replaces
+                    // ([`crate::state::Bucket::replace_tags`]), so one bucket has one tag set
+                    // however it was set. A create that carried no tags writes none, which
+                    // leaves the bucket untagged.
+                    if !tags.is_empty() {
+                        bucket.replace_tags(tags);
+                    }
                 }
                 Ok(CreateBucketOutput {
                     location: Some(location_of(
@@ -398,13 +448,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &region,
                         input.bucket_namespace.as_deref(),
                     )),
-                    // "This parameter is only supported for S3 directory buckets"
-                    // (`CreateBucketOutput$BucketArn`), so a general purpose bucket reports
-                    // none and a directory bucket reports its own ARN in the `s3express`
-                    // namespace ([`crate::state::directory_bucket_arn`]).
-                    bucket_arn: placement
-                        .as_ref()
-                        .map(|_| crate::state::directory_bucket_arn(&region, &input.bucket)),
+                    // The new bucket's OWN ARN, read off the record that was just written
+                    // ([`crate::state::Bucket::arn`]), which is the one place the kind of a
+                    // bucket decides which form its ARN takes — so a create names a bucket
+                    // exactly as `HeadBucket` and `ListBuckets` name the same one.
+                    //
+                    // The member's documentation says "this parameter is only supported for
+                    // S3 directory buckets" (`CreateBucketOutput$BucketArn`), but a create
+                    // of a GENERAL PURPOSE bucket answers the `x-amz-bucket-arn` header this
+                    // member is bound to as well (recorded behaviour), so every created
+                    // bucket reports one: a caller that has just created a bucket and has to
+                    // name it to another service reads it here rather than assembling an ARN
+                    // of its own.
+                    bucket_arn: store
+                        .bucket(&input.bucket)
+                        .map(|bucket| bucket.arn(&input.bucket)),
                 })
             }
             crate::state::BucketCreation::NameTaken => {
@@ -460,7 +518,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &existing_region,
                         input.bucket_namespace.as_deref(),
                     )),
-                    bucket_arn: None,
+                    // The ARN of the bucket that is already there, read off its own record:
+                    // a re-create reports the same ARN every other reader of that bucket
+                    // reports ([`crate::state::Bucket::arn`]), whichever kind it is.
+                    bucket_arn: store
+                        .bucket(&input.bucket)
+                        .map(|bucket| bucket.arn(&input.bucket)),
                 })
             }
             // The account is at its bucket quota, so this create is refused instead of
@@ -679,6 +742,68 @@ fn requested_grants(
         )
     })?;
     Ok(Some(grants))
+}
+
+/// The refusal S3 answers a create whose `LocationConstraint` names no location it can create
+/// a bucket in: `InvalidLocationConstraint` (400) with the sentence S3's published error list
+/// states for that code ([`crate::state::INVALID_LOCATION_CONSTRAINT_MESSAGE`]), naming the
+/// rejected value in the `<LocationConstraint>` member that envelope carries it in.
+///
+/// Distinct from the refusal above a constraint naming a REAL Region the endpoint reached
+/// cannot place a bucket in ([`crate::state::ILLEGAL_LOCATION_CONSTRAINT_CODE`]): this one is
+/// about a value that is no Region of the partition at all — the Regions
+/// `CreateBucketConfiguration$LocationConstraint` publishes, among which `us-east-1` is
+/// deliberately absent, that Region being the one an ABSENT constraint means.
+///
+/// The sentence is fixed text, with nothing of the request interpolated into it; the value is
+/// the variable part, copied from the request's own document. Answered through the unmodelled
+/// channel because `CreateBucket` declares only the two name-in-use errors
+/// (`smithy_query(query="operation",operation="CreateBucket")`).
+fn invalid_location_constraint(constraint: &str) -> CreateBucketError {
+    crate::scaffolded::Scaffolded::unmodeled(
+        crate::state::INVALID_LOCATION_CONSTRAINT_CODE,
+        crate::state::INVALID_ARGUMENT_STATUS,
+        crate::state::INVALID_LOCATION_CONSTRAINT_MESSAGE,
+    )
+    .naming(crate::scaffolded::ErrorDetail::LocationConstraint(
+        constraint.to_string(),
+    ))
+}
+
+/// The tag set this create asks the new bucket to carry, empty when it names none, or the
+/// refusal a tag set S3 does not hold earns.
+///
+/// "An array of tags that you can apply to the bucket that you're creating"
+/// (`CreateBucketConfiguration$Tags`): the tags are the BUCKET's, so they are judged against
+/// the bucket's own published limits through the SAME rule and the SAME envelope
+/// `PutBucketTagging` judges a tag set by ([`crate::state::validate_tag_set`] with
+/// [`crate::state::BUCKET_TAG_SET_LIMITS`], and
+/// [`crate::scaffolded::Scaffolded::tag_set`]) — so a tag set is accepted at create exactly
+/// when it is accepted afterwards, and refused with the same code either way. Judged here,
+/// before the bucket is recorded, so a refused create leaves nothing behind.
+fn requested_tags(
+    configuration: Option<&CreateBucketConfiguration>,
+) -> Result<Vec<crate::state::ResourceTag>, CreateBucketError> {
+    let tags: Vec<crate::state::ResourceTag> = configuration
+        .and_then(|configuration| configuration.tags.as_ref())
+        .map(|tags| {
+            tags.iter()
+                .map(|tag| crate::state::ResourceTag {
+                    key: tag.key.clone(),
+                    value: tag.value.clone(),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if tags.is_empty() {
+        return Ok(tags);
+    }
+    if let Err(rejection) =
+        crate::state::validate_tag_set(&tags, crate::state::BUCKET_TAG_SET_LIMITS)
+    {
+        return Err(crate::scaffolded::Scaffolded::tag_set(&rejection));
+    }
+    Ok(tags)
 }
 
 /// The `Location` a created bucket reports.

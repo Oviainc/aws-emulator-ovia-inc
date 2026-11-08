@@ -318,8 +318,10 @@ async fn a_directory_bucket_is_placed_in_the_zone_its_location_names() {
         );
     }
 
-    // A general purpose bucket is unchanged by all of this: it carries no ARN on the create,
-    // because the member is for directory buckets only.
+    // A general purpose bucket's create reports an ARN too, in the `s3` namespace and by its
+    // globally unique name alone (recorded behaviour, pinned over a table of its own by
+    // [`super::bucket_create_list_and_tagging_contracts`]) — so what the KIND of bucket
+    // decides is which ARN is reported, not whether one is.
     let general = send(&router, "PUT", "/general-purpose-bucket", &[], "").await;
     assert_eq!(
         general.status, 200,
@@ -328,9 +330,10 @@ async fn a_directory_bucket_is_placed_in_the_zone_its_location_names() {
         text(&general)
     );
     assert_eq!(
-        general.header("x-amz-bucket-arn"),
-        None,
-        "case \"a general purpose bucket\": expected no bucket ARN, got {:?}",
+        general.header("x-amz-bucket-arn").as_deref(),
+        Some("arn:aws:s3:::general-purpose-bucket"),
+        "case \"a general purpose bucket\": expected the general purpose bucket's own ARN, \
+         got {:?}",
         general.header("x-amz-bucket-arn")
     );
 }

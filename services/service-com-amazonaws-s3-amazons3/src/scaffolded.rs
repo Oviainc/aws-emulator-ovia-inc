@@ -967,6 +967,21 @@ static MAX_SIZE_ALLOWED: Schema = Schema::new_member(
 )
 .with_xml_name("MaxSizeAllowed");
 
+/// The `<LocationConstraint>` of an S3 error document: the location constraint a refused
+/// `CreateBucket` document named, as the request spelled it — the only place that refusal
+/// says WHICH location was rejected, since its sentence names none. See [`BUCKET_NAME`].
+static LOCATION_CONSTRAINT: Schema = Schema::new_member(
+    ShapeId::from_static(
+        "smithy.framework#RefusedResource$locationConstraint",
+        "smithy.framework",
+        "locationConstraint",
+    ),
+    ShapeType::String,
+    "locationConstraint",
+    23,
+)
+.with_xml_name("LocationConstraint");
+
 /// The `<Message>` S3 sends with [`crate::state::NOT_IMPLEMENTED_CODE`] when it is a QUERY
 /// PARAMETER that asked for functionality the service does not implement for the resource
 /// addressed: "NotImplemented — A query parameter you provided implies functionality that is
@@ -1146,6 +1161,10 @@ pub enum ErrorDetail {
         /// The ceiling it was judged against, in bytes.
         max_size_allowed: i64,
     },
+    /// A refusal about the LOCATION a create asked for, named by `<LocationConstraint>`: the
+    /// value the request's own `CreateBucketConfiguration` carried, which is what says which
+    /// location was rejected — the sentence of that class names none.
+    LocationConstraint(String),
     /// A request asking for functionality the service does not implement for the resource it
     /// addressed, named by the `<Header>` or the `<QueryParameter>` that asked for it: the
     /// sentence of that class names only the KIND of thing that implied it, so the member is
@@ -1256,6 +1275,7 @@ impl ErrorDetail {
                 s.write_long(&ACTUAL_OBJECT_SIZE, *actual_object_size)
             }
             Self::Condition(condition) => s.write_string(&UNMET_CONDITION, condition),
+            Self::LocationConstraint(location) => s.write_string(&LOCATION_CONSTRAINT, location),
             Self::Size {
                 size,
                 max_size_allowed,
@@ -1284,7 +1304,8 @@ impl ErrorDetail {
             | Self::Object { key: name, .. }
             | Self::Argument { name, .. }
             | Self::Upload(name)
-            | Self::Condition(name) => name.clone(),
+            | Self::Condition(name)
+            | Self::LocationConstraint(name) => name.clone(),
             Self::Unimplemented(by) => by.name().to_string(),
             // The first of the series, which is the one such a refusal is reported by.
             Self::Arguments(arguments) => arguments

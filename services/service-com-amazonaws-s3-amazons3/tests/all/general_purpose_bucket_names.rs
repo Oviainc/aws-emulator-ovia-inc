@@ -40,12 +40,18 @@ const INVALID_BUCKET_NAME: &str = "InvalidBucketName";
 /// See [`INVALID_BUCKET_NAME`] — the fixed text of that error class.
 const INVALID_BUCKET_NAME_MESSAGE: &str = "The specified bucket is not valid.";
 
-/// One row: the case, the name the create carries, and whether S3 holds a bucket under it.
+/// One row: the case, the name the create carries, whether S3 holds a bucket under it, and
+/// the status a `HeadBucket` of that same name answers — 404 for a name a request can still
+/// ADDRESS a bucket by (it just holds none), and 400 for one it cannot, which is refused for
+/// the name itself ([`super::bucket_create_list_and_tagging_contracts`] pins that split
+/// across the bucket-addressed calls). Stated per row rather than computed, so the rule and
+/// not the implementation decides it.
 #[derive(Debug, Clone)]
 struct Row {
     case: String,
     bucket: String,
     held: bool,
+    head_status: u16,
 }
 
 impl Row {
@@ -55,15 +61,28 @@ impl Row {
             case: case.to_string(),
             bucket: bucket.to_string(),
             held: true,
+            head_status: 200,
         }
     }
 
-    /// A row whose name the published rules REFUSE.
+    /// A row whose name the published CREATE rules refuse and a request can still address a
+    /// bucket by.
     fn refused(case: &str, bucket: impl Into<String>) -> Self {
         Self {
             case: case.to_string(),
             bucket: bucket.into(),
             held: false,
+            head_status: 404,
+        }
+    }
+
+    /// A row whose name no request can address a bucket by either.
+    fn unaddressable(case: &str, bucket: impl Into<String>) -> Self {
+        Self {
+            case: case.to_string(),
+            bucket: bucket.into(),
+            held: false,
+            head_status: 400,
         }
     }
 }
@@ -92,11 +111,11 @@ fn rows() -> Vec<Row> {
         Row::refused("an upper-case letter and an underscore", "Invalid_Bucket_Name"),
         Row::refused("upper-case letters alone", "uppercaseletterS"),
         Row::refused("an underscore alone", "under_score"),
-        Row::refused("a tilde", "tilde~name"),
-        Row::refused("a character outside the class", "br(acket)s"),
-        Row::refused("a leading hyphen", "-leading-hyphen"),
+        Row::unaddressable("a tilde", "tilde~name"),
+        Row::unaddressable("a character outside the class", "br(acket)s"),
+        Row::unaddressable("a leading hyphen", "-leading-hyphen"),
         Row::refused("a trailing hyphen", "trailing-hyphen-"),
-        Row::refused("a leading period", ".leading-period"),
+        Row::unaddressable("a leading period", ".leading-period"),
         Row::refused("a trailing period", "trailing-period."),
         Row::refused("two adjacent periods", "two..periods"),
         Row::refused("a name formatted as an IP address", "192.168.5.4"),
@@ -135,7 +154,12 @@ async fn a_create_is_refused_for_every_name_the_published_rules_do_not_admit() {
 
     let rows = rows();
     for row in &rows {
-        let Row { case, bucket, held } = row;
+        let Row {
+            case,
+            bucket,
+            held,
+            head_status,
+        } = row;
         let created = create_bucket(&router, bucket, None, None).await;
         if *held {
             assert_eq!(
@@ -181,12 +205,16 @@ async fn a_create_is_refused_for_every_name_the_published_rules_do_not_admit() {
             created.element("BucketName"),
             text(&created)
         );
-        // Refused BEFORE anything is written: the bucket is not there afterwards.
+        // Refused BEFORE anything is written: the bucket is not there afterwards. WHICH of
+        // the two "no bucket here" answers a HEAD of the same name earns is the row's own
+        // ([`Row`]): one S3 can ADDRESS no bucket by is refused for the name (400), and one
+        // that is addressable but cannot be created — an upper-case letter, an underscore, a
+        // reserved prefix — addresses a bucket that is simply not there (404).
         let read = head_bucket(&router, bucket).await;
         assert_eq!(
-            read.status, 404,
-            "case {case:?}: a refused create must leave no bucket behind, expected HTTP 404, \
-             got {}",
+            read.status, *head_status,
+            "case {case:?}: a refused create must leave no bucket behind, expected HTTP \
+             {head_status}, got {}",
             read.status
         );
     }
@@ -196,7 +224,12 @@ async fn a_create_is_refused_for_every_name_the_published_rules_do_not_admit() {
     let listing = list_buckets(&router, "").await;
     let document = text(&listing);
     for row in &rows {
-        let Row { case, bucket, held } = row;
+        let Row {
+            case,
+            bucket,
+            held,
+            ..
+        } = row;
         let reported = document.contains(&format!("<Name>{bucket}</Name>"));
         assert_eq!(
             reported, *held,

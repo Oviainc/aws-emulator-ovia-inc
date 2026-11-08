@@ -31,6 +31,8 @@ mod bucket_configuration_id_addressing;
 mod bucket_cors;
 #[path = "all/bucket_cors_delete.rs"]
 mod bucket_cors_delete;
+#[path = "all/bucket_create_list_and_tagging_contracts.rs"]
+mod bucket_create_list_and_tagging_contracts;
 #[path = "all/bucket_deletion_emptiness.rs"]
 mod bucket_deletion_emptiness;
 #[path = "all/bucket_encryption.rs"]

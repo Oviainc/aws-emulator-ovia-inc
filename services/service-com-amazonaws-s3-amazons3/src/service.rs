@@ -64,6 +64,9 @@
 // the request carries, and the account the request says owns the bucket — see
 // `service/authorization.rs`.
 pub mod authorization;
+// The refusal a request addressing a bucket by a name S3 can address no bucket by earns, for
+// every operation of this service but the create — see `service/invalid_bucket_name.rs`.
+pub mod invalid_bucket_name;
 // What an update of one of an S3 Metadata configuration's tables must satisfy about the
 // configuration's journal table — see `service/metadata_tables.rs`.
 pub mod metadata_tables;
@@ -175,6 +178,60 @@ pub(crate) fn bucket_name_shaped(label: &str) -> bool {
         && label.chars().all(allowed)
         && label.chars().next().is_some_and(alphanumeric)
         && label.chars().next_back().is_some_and(alphanumeric)
+}
+
+/// The shortest and longest a bucket name may be for S3 to ADDRESS a bucket by it: "bucket
+/// names must be between 3 and 255 characters long" (Amazon S3 User Guide, *Bucket naming
+/// rules*, the legacy US East (N. Virginia) rules).
+const ADDRESSABLE_BUCKET_NAME_CHARS: ::std::ops::RangeInclusive<usize> = 3..=255;
+
+/// Whether `name` is a name Amazon S3 can ADDRESS a bucket by at all.
+///
+/// The syntax a bucket name has to have for a request to be ABOUT a bucket: between
+/// [`ADDRESSABLE_BUCKET_NAME_CHARS`] characters, made of "uppercase letters, lowercase
+/// letters, numbers, periods (.), hyphens (-), and underscores (_)", and starting with a
+/// letter or a number — the legacy US East (N. Virginia) naming rules, which are the WIDER
+/// set: a bucket created under them still exists and only a path-style request can address
+/// it, so S3 cannot refuse the name a request addresses it by. A name outside that set names
+/// no bucket in any account, so a request carrying one is refused for the NAME
+/// ([`wire::UnwrappedXmlRestXml::invalid_bucket_name_violation`]) rather than answered about
+/// a bucket that is merely absent.
+///
+/// NOT the rules a bucket may be CREATED under today, which are narrower in every direction
+/// — lowercase only, at most 63 characters, no underscore, no reserved prefix or suffix, not
+/// an IP address: `CreateBucket` applies those to the name it is asked to mint, through the
+/// one reading every service in this workspace judges a caller-supplied bucket name by
+/// (`service_common::s3_bucket_name::is_well_formed`). A name no new bucket may carry is
+/// still a name an existing bucket can be addressed by, so a read of it is answered about
+/// the bucket rather than about the name.
+///
+/// `pub`: this is the question the wire layer asks of the bucket EVERY request addresses, and
+/// `tests/all/general_purpose_bucket_names.rs` asks it to tell which of the two answers a
+/// name earns.
+pub fn names_a_bucket(name: &str) -> bool {
+    name.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric() || byte == b'.' || byte == b'-' || byte == b'_'
+    }) && ADDRESSABLE_BUCKET_NAME_CHARS.contains(&name.len())
+        && name
+            .bytes()
+            .next()
+            .is_some_and(|byte| byte.is_ascii_alphanumeric())
+}
+
+/// The bucket a request names in the `{Bucket}` label of `path`, as the request spelled it —
+/// decoded the way the codec decodes a path label.
+///
+/// `path` is the request's address in the PATH-STYLE form every route of this service is
+/// bound in ([`EmulatedService::path_style_path`]), so a virtual-hosted-style request — whose
+/// bucket is the first label of its host and whose path is the KEY alone — names the same
+/// bucket a path-style one does. `None` for a path that carries no such segment, which is the
+/// service root (`GET /?x-id=ListBuckets`).
+///
+/// The one reading the name-refusal seam and the operation that answers it share
+/// ([`invalid_bucket_name`]), so the name judged and the name the envelope reports cannot
+/// differ.
+pub(crate) fn addressed_bucket_name(path: &str) -> Option<String> {
+    first_path_segment(path).map(sigv4::percent_decoded)
 }
 
 /// Whether the store in `engine` holds a bucket named `name`.
@@ -495,6 +552,17 @@ fn published_refusal(violation: &Violation) -> Option<Refused> {
         .or(violation.value.as_deref())
         .unwrap_or_default();
     let (code, message) = match member {
+        // The BUCKET every bucket-addressed route binds from its `{Bucket}` label: a name
+        // outside the syntax S3 can address a bucket by names no bucket in any account,
+        // which S3's published error list states one code and one sentence for, whichever
+        // rule the name broke. The refusal is made where it can carry the name
+        // (`service::invalid_bucket_name`) and by `CreateBucket` for the name it is asked to
+        // mint; this words the one such value the model itself can refuse — a `{Bucket}`
+        // label the request leaves empty — in the same class.
+        "bucket" => (
+            crate::state::INVALID_BUCKET_NAME_CODE,
+            crate::state::INVALID_BUCKET_NAME_MESSAGE.to_string(),
+        ),
         // The two `CopyObject` directives, each an enum over [COPY, REPLACE].
         "taggingDirective" => (
             crate::state::INVALID_ARGUMENT_CODE,
@@ -524,17 +592,29 @@ fn published_refusal(violation: &Violation) -> Option<Refused> {
                 .message()
                 .to_string(),
         ),
-        // `CreateBucket` echoes the header value it did not recognise.
-        "objectOwnership" => (
-            crate::state::INVALID_ARGUMENT_CODE,
-            format!("Invalid x-amz-object-ownership header: {rejected}"),
-        ),
-        // `ListBuckets` states the bound rather than the value: the range is
-        // `MaxBuckets`' own (`min 1`, `max 10000`).
-        "maxBuckets" => (
-            crate::state::INVALID_ARGUMENT_CODE,
-            "Argument max-buckets must be an integer between 1 and 10000".to_string(),
-        ),
+        // `CreateBucket`'s location constraint, the one member of its document S3 publishes
+        // a refusal of its own for: the value "specifies the Region where the bucket will be
+        // created" (`CreateBucketConfiguration$LocationConstraint`), so a value outside the
+        // Regions that member publishes names no location a bucket can be created in — which
+        // S3 reports against the CONSTRAINT rather than as a document that does not validate
+        // against its schema: the document is well formed and it is the Region that is not
+        // one.
+        //
+        // A value the request SPELLED is withheld from the codec and answered by the
+        // operation, whose envelope also names the rejected value
+        // (`wire::rejected_location_constraint` and `ops::create_bucket`); this is what
+        // words the one such value a document can carry without spelling any text — an
+        // empty `<LocationConstraint></LocationConstraint>` — in the same class rather than
+        // as a malformed document.
+        "createBucketConfiguration" => {
+            if !segments.any(|segment| segment == "locationConstraint") {
+                return None;
+            }
+            (
+                crate::state::INVALID_LOCATION_CONSTRAINT_CODE,
+                crate::state::INVALID_LOCATION_CONSTRAINT_MESSAGE.to_string(),
+            )
+        }
         // The id a bucket configuration is addressed by ([`CONFIGURATION_ID_PARAMETER`]): a
         // call that states none names no configuration at all, which S3 reports against the
         // id itself rather than as a bare bad argument — the same refusal a handler answers
@@ -930,6 +1010,14 @@ fn front_door<Eng: Send + Sync + 'static>(
         post_object::POST_OBJECT,
         Box::new(post_object::PostObject::new(Arc::clone(engine))),
     );
+    // And the refusal a request earns for the bucket NAME it addresses, held here for the
+    // same reason and under a key of the same kind
+    // ([`invalid_bucket_name::REFUSE_INVALID_BUCKET_NAME`]): it stands in front of every
+    // operation of this service that addresses a bucket, which no routing key can name.
+    table.add_operation(
+        invalid_bucket_name::REFUSE_INVALID_BUCKET_NAME,
+        Box::new(invalid_bucket_name::RefuseInvalidBucketName::new()),
+    );
     table
 }
 
@@ -1228,6 +1316,51 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             .ok()
     }
 
+    /// The operation that answers `req` for the bucket NAME it addresses, when that name is
+    /// one Amazon S3 can address no bucket by ([`names_a_bucket`]) — else `None`, which is
+    /// every request that addresses a bucket by an addressable name and every request that
+    /// addresses no bucket at all.
+    ///
+    /// Two requests keep the answer they would otherwise get. One whose address names no
+    /// MODELLED operation of this service keeps the failure it earns — a routing error, or
+    /// the answer one of the operations this service resolves itself gives it (the
+    /// browser-form upload, [`post_object`], which judges the bucket it is POSTed to in that
+    /// operation) — because a name refusal here would claim a route that is not there. And a
+    /// `CreateBucket` judges the name itself: it is the call that MINTS one, against the
+    /// narrower rules a bucket may be created under today (`crate::ops::create_bucket`), and
+    /// its refusal names the rejected name the same way — so the two cannot disagree about a
+    /// name, and the create's own rule is not weakened to the addressing one.
+    ///
+    /// And a VIRTUAL-HOSTED-STYLE request to a bucket this emulator HOLDS is judged by that
+    /// bucket rather than by its key: the address is read in the PATH-STYLE form every route
+    /// of this service is bound in ([`EmulatedService::path_style_path`]), which puts the
+    /// host's bucket back in front of the key. A host-style request naming a bucket this
+    /// emulator does NOT hold resolves no bucket out of its host at all ([`addressed_in_host`]
+    /// answers only for one it holds), so the whole service — this seam and every route's own
+    /// `{Bucket}` label alike — reads its first path segment as the bucket it addresses, and
+    /// this refusal is about the same text that segment binds.
+    ///
+    /// See [`invalid_bucket_name`] for what the refusal is and why it is an OPERATION.
+    fn refuses_the_bucket_name(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
+        use smithy_server_runtime::Operation;
+
+        // The address in the PATH-STYLE form every route of this service is bound in, so a
+        // virtual-hosted-style request to a bucket this emulator holds is judged by the
+        // bucket its host named and not by the first segment of its key.
+        let addressed = addressed_bucket_name(&self.path_style_path(req))?;
+        if names_a_bucket(&addressed) {
+            return None;
+        }
+        let operation = self.entry.protocol().routing_key(req).ok()?.to_string();
+        if operation == crate::ops::create_bucket::CreateBucket::<Eng>::NAME
+            || self.entry.routing_table().get(&operation).is_none()
+        {
+            return None;
+        }
+        self.door
+            .get(invalid_bucket_name::REFUSE_INVALID_BUCKET_NAME)
+    }
+
     /// `refused` rendered with the DETAIL members S3's document carries for it
     /// ([`refused_argument`]), in the same envelope and at the same status a constraint
     /// refusal is rendered with: HTTP 400, the status every protocol answers a value outside
@@ -1388,6 +1521,12 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // worded from that bucket's own configuration, and the seam that words it is handed
         // no request to read it from.
         sigv4::remember(req, first_path_segment(&self.path_style_path(req)));
+        // A request addressing a bucket by a name S3 can address no bucket by is refused for
+        // the NAME, whichever operation its address names; see
+        // [`Self::refuses_the_bucket_name`] and [`invalid_bucket_name`].
+        if let Some(refusal) = self.refuses_the_bucket_name(req) {
+            return Some(refusal);
+        }
         // A `?session` request against a bucket that HAS no session subresource — a general
         // purpose bucket — is the bucket's own listing and not `CreateSession`; see
         // [`LISTING_WITHOUT_SUBRESOURCE`]. Resolved before the model's routing table, which

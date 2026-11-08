@@ -126,6 +126,26 @@
 //! generated output shapes cannot carry the version. [`ActedOnVersion`] is the one place
 //! that binding lives: it wraps a modelled output, writes it unchanged, and reports the
 //! version beside it through [`ACTED_ON_VERSION_ID_MEMBER`].
+//!
+//! ## An INSTANT, at the resolution S3 reports one
+//!
+//! Every instant S3 writes into a document is in one fixed-width form —
+//! `2026-11-02T10:44:23.000Z`, whole seconds and a three-digit fraction — whichever
+//! operation reports it, because the instants it records have one-second resolution. The
+//! framework's serializer renders a timestamp at whatever resolution the value carries and
+//! drops trailing zeros from its fraction, so an instant taken from the clock goes out in a
+//! width no S3 response has. [`with_second_resolution_timestamps`] is the one place that
+//! rule lives, scoped to the elements the model reports a timestamp in
+//! ([`DOCUMENT_TIMESTAMP_ELEMENTS`]).
+//!
+//! ## A BUCKET NAME S3 holds no bucket under
+//!
+//! The one refusal this protocol makes that is not about a document: a request addressing a
+//! bucket whose name is outside the published naming rules names no bucket in any account,
+//! and S3 refuses it for the name rather than reporting the bucket as absent. Every
+//! operation bound under the `{Bucket}` label is refused the same way, so the rule lives
+//! here, at the point every such request passes through — see
+//! [`UnwrappedXmlRestXml::invalid_bucket_name_violation`].
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -1208,20 +1228,24 @@ fn as_bound_timestamp(value: &str, format: ::aws_smithy_types::date_time::Format
 /// The request headers whose value the OPERATION judges rather than the boundary, each
 /// WITHHELD from the codec when it is outside the value set the model publishes for it.
 ///
-/// `x-amz-acl` is the one such header. A canned ACL outside the published set is refused by
-/// S3 with its own `InvalidArgument` envelope — an empty `<Message>` and the
-/// `<ArgumentName>` / `<ArgumentValue>` pair naming the header and the value as sent
-/// ([`crate::scaffolded::Scaffolded::invalid_canned_acl`]) — and an envelope with members of
-/// its own is something only a handler can answer: the boundary's refusal carries the
-/// constraint clause the validating walk wrote, which names the Smithy member path and the
-/// model's value list instead.
+/// `x-amz-acl` and `x-amz-object-ownership` are the two. A value outside the published set
+/// is refused by S3 with its own `InvalidArgument` envelope — the `<ArgumentName>` /
+/// `<ArgumentValue>` pair naming the header and the value as sent, beside a sentence that is
+/// empty for the one ([`crate::scaffolded::Scaffolded::invalid_canned_acl`]) and names the
+/// header for the other ([`crate::state::invalid_object_ownership_message`]) — and an
+/// envelope with members of its own is something only a handler can answer: the boundary's
+/// refusal carries the constraint clause the validating walk wrote, which names the Smithy
+/// member path and the model's value list instead.
 ///
 /// So the value is kept from the codec, exactly as a website document the owning operation
 /// is the one to refuse is ([`crate::state::website_document_rejection`]), and every
-/// operation that binds this header answers the refusal itself from the request's own
-/// headers ([`rejected_canned_acl`]). The set is still enforced, in that one place: nothing
-/// outside it is ever stored.
-const HEADERS_JUDGED_BY_THE_HANDLER: [&str; 1] = [crate::state::CANNED_ACL_ARGUMENT];
+/// operation that binds the header answers the refusal itself from the request's own
+/// headers ([`rejected_canned_acl`], [`rejected_object_ownership`]). The set is still
+/// enforced, in that one place: nothing outside it is ever stored.
+const HEADERS_JUDGED_BY_THE_HANDLER: [&str; 2] = [
+    crate::state::CANNED_ACL_ARGUMENT,
+    crate::state::OBJECT_OWNERSHIP_ARGUMENT,
+];
 
 /// The `x-amz-acl` value `parts` carried that is outside the set `input_schema`'s own `ACL`
 /// member publishes, or `None` for a request carrying a published value or no such header at
@@ -1245,6 +1269,147 @@ pub(crate) fn rejected_canned_acl<'p>(
     )?)?;
     (!permitted.contains(&value)).then_some(value)
 }
+
+/// The `x-amz-object-ownership` value `parts` carried that is outside the set
+/// `input_schema`'s own `ObjectOwnership` member publishes, or `None` for a request carrying
+/// a published value or no such header at all.
+///
+/// The judgement the boundary would have made, made where the refusal can carry S3's own
+/// envelope — see [`HEADERS_JUDGED_BY_THE_HANDLER`], which is what withholds the value from
+/// the codec, and [`rejected_canned_acl`], the same reading for the other header judged that
+/// way. The set comes from the operation's OWN member, so nothing outside it is ever stored.
+pub(crate) fn rejected_object_ownership<'p>(
+    parts: &'p ::http::request::Parts,
+    input_schema: &Schema,
+) -> Option<&'p str> {
+    let value = parts
+        .headers
+        .get(crate::state::OBJECT_OWNERSHIP_ARGUMENT)
+        .and_then(|value| value.to_str().ok())?;
+    let permitted = permitted_values(header_member(
+        input_schema,
+        crate::state::OBJECT_OWNERSHIP_ARGUMENT,
+    )?)?;
+    (!permitted.contains(&value)).then_some(value)
+}
+
+/// The `max-buckets` value `parts` carried that bounds no page of buckets, with the fault it
+/// carries — or `None` for a request bounding one, and for an operation that binds no such
+/// parameter.
+///
+/// The judgement the boundary would have made, made where the refusal can carry S3's own
+/// envelope: the `<ArgumentName>` / `<ArgumentValue>` pair naming the parameter and the value
+/// as sent, which only a handler's envelope can carry. A value that is no INTEGER the
+/// boundary cannot word at all — its codec reports a parse failure, in a sentence about Rust
+/// types — so such a value is withheld from the codec
+/// ([`without_withheld_max_buckets`]) and the operation answers both faults, through the one
+/// reading of them ([`crate::state::max_buckets_fault`]).
+pub(crate) fn rejected_max_buckets(
+    parts: &::http::request::Parts,
+    input_schema: &Schema,
+) -> Option<(String, crate::state::MaxBucketsFault)> {
+    rejected_max_buckets_in(parts.uri.query().unwrap_or_default(), input_schema)
+}
+
+/// [`rejected_max_buckets`] over a request's QUERY STRING, which is what the protocol reads
+/// it from on the way in (where a request is a runtime-API one rather than its parts).
+fn rejected_max_buckets_in(
+    query: &str,
+    input_schema: &Schema,
+) -> Option<(String, crate::state::MaxBucketsFault)> {
+    query_member(input_schema, crate::state::MAX_BUCKETS_ARGUMENT)?;
+    let value = super::sigv4::query_parameter(query, crate::state::MAX_BUCKETS_ARGUMENT)?;
+    crate::state::max_buckets_fault(&value).map(|fault| (value, fault))
+}
+
+/// The INPUT member `input_schema` binds to the request query parameter `name`, or `None` for
+/// a parameter this operation binds nothing from — the query half of [`header_member`].
+fn query_member<'s>(input_schema: &'s Schema, name: &str) -> Option<&'s Schema> {
+    input_schema
+        .members()
+        .iter()
+        .find(|member| {
+            member
+                .http_query()
+                .is_some_and(|query| query.value() == name)
+        })
+        .copied()
+}
+
+/// `query` with the `max-buckets` parameter removed when its value is one the codec must not
+/// be handed ([`crate::state::withholds_max_buckets`]) — a value bounding no page, which the
+/// operation refuses itself ([`rejected_max_buckets`]), and a parameter stated with no value,
+/// which states no bound at all. `None` when the query carries nothing to withhold, which
+/// leaves it exactly as it arrived.
+fn without_withheld_max_buckets(query: &str, input_schema: &Schema) -> Option<String> {
+    query_member(input_schema, crate::state::MAX_BUCKETS_ARGUMENT)?;
+    let value = super::sigv4::query_parameter(query, crate::state::MAX_BUCKETS_ARGUMENT)?;
+    if !crate::state::withholds_max_buckets(&value) {
+        return None;
+    }
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|parameter| {
+            parameter.split('=').next().unwrap_or(parameter) != crate::state::MAX_BUCKETS_ARGUMENT
+        })
+        .collect();
+    Some(kept.join("&"))
+}
+
+/// The member a create's configuration names the Region the bucket is to be created in, as
+/// the model declares it and as restXml spells its element
+/// (`smithy_query(query="shape",shape="CreateBucketConfiguration")` reports
+/// `LocationConstraint`).
+const LOCATION_CONSTRAINT_MEMBER: &str = "LocationConstraint";
+
+/// The `<LocationConstraint>` the request's own document spelled that is outside the set the
+/// model publishes for it, or `None` for a request that spelled a published value, none at
+/// all, or no document.
+///
+/// The judgement the boundary would have made, made where the refusal can carry S3's own
+/// envelope — the same seam the canned ACL is judged through
+/// ([`HEADERS_JUDGED_BY_THE_HANDLER`] and [`rejected_canned_acl`]): the refusal of a value
+/// that names no location names the VALUE in a member of its own, which only a handler's
+/// envelope can carry, and the value is withheld from the codec
+/// ([`without_rejected_location_constraint`]) so the boundary does not refuse the document
+/// first. The set is the GENERATED one the model's own enum produced
+/// ([`crate::ops::types::BUCKET_LOCATION_CONSTRAINT_VALUES`]), the same set the validating
+/// walk judges the member by, so the two cannot drift and nothing outside it is ever stored.
+///
+/// `input_schema` is the operation's own, so the judgement is made only for an operation
+/// whose document declares that member — every other operation's request is untouched.
+pub(crate) fn rejected_location_constraint(input_schema: &Schema) -> Option<String> {
+    if !carries_xml_document_payload(input_schema)
+        || !input_schema
+            .members()
+            .iter()
+            .any(|member| member.member_name() == Some(CREATE_BUCKET_CONFIGURATION_MEMBER))
+    {
+        return None;
+    }
+    let spelled = spelled_in_request(LOCATION_CONSTRAINT_MEMBER)?;
+    (!crate::ops::types::BUCKET_LOCATION_CONSTRAINT_VALUES.contains(&spelled.as_str()))
+        .then_some(spelled)
+}
+
+/// The input member `CreateBucket` binds its configuration document as
+/// (`smithy_query(query="operation",operation="CreateBucket")` reports
+/// `CreateBucketConfiguration` as the `@httpPayload`) — the one document that carries a
+/// location constraint.
+const CREATE_BUCKET_CONFIGURATION_MEMBER: &str = "CreateBucketConfiguration";
+
+/// The document the codec is handed in place of a create configuration naming a location S3
+/// cannot create a bucket in: the container with no member in it, exactly as a website
+/// document the owning operation refuses is replaced by [`EMPTY_WEBSITE_CONFIGURATION`].
+///
+/// Nothing is read from it: `CreateBucket` refuses such a request from the text the document
+/// actually carried ([`spelled_in_request`]) before it reads the configuration at all, so the
+/// stand-in only has to be a document the codec can build — and replacing the whole container
+/// rather than cutting one element out of it keeps the one reading of what the document SPELLS
+/// (the module's XML reader, through [`rejected_location_constraint`]) the only reading there
+/// is.
+const EMPTY_CREATE_BUCKET_CONFIGURATION: &[u8] =
+    b"<CreateBucketConfiguration></CreateBucketConfiguration>";
 
 /// The request headers a CONDITION arrives in as a date, and whose value a recipient is to
 /// IGNORE when it is not one.
@@ -1948,6 +2113,157 @@ fn without_unbound_body(mut response: Response, output_schema: &Schema) -> Respo
     response
 }
 
+/// The fraction every instant S3 writes into a document carries: three zero digits, because
+/// the instants it records have one-second resolution (see
+/// [`as_second_resolution_date_time`]). Fixed text, so the form is fixed-width.
+const SECOND_RESOLUTION_FRACTION: &str = ".000";
+
+/// The elements a response DOCUMENT of this service reports an instant S3 ITSELF RECORDED in.
+///
+/// The generated schemas carry an operation's own members and not the shapes they reach, so
+/// which elements a document reports a timestamp in cannot be walked at serialization time;
+/// the catalog lives here instead, and `tests/all/bucket_create_list_and_tagging_contracts.rs`
+/// re-derives it from the model — every `timestamp` member of an operation OUTPUT and of the
+/// shapes those outputs reach, under the element name restXml writes it with — so a model
+/// update that reports another instant cannot quietly keep the framework's rendering of it.
+///
+/// A timestamp a REQUEST document also carries is deliberately NOT here: a lifecycle rule's
+/// `Date` and an Object Lock `RetainUntilDate` are values the CALLER sent and the service
+/// stored, and a stored configuration reads back as the caller wrote it. The form below is the
+/// one S3 renders the instants IT records in, which is why the catalog is the output-only
+/// half.
+pub const DOCUMENT_TIMESTAMP_ELEMENTS: &[&str] = &[
+    "CreationDate",
+    "Expiration",
+    "Initiated",
+    "LastModified",
+    "RestoreExpiryDate",
+];
+
+/// Whether `output_schema`'s response body is one of this service's XML DOCUMENTS.
+///
+/// An output whose `@httpPayload` member is a SCALAR (a blob or a string) IS its body: an
+/// object's own bytes, or a bucket policy's JSON, neither of which is a document of this
+/// service's and neither of which may be rewritten, whatever text it happens to carry.
+fn answers_xml_document(output_schema: &Schema) -> bool {
+    !output_schema
+        .members()
+        .iter()
+        .any(|member| member.http_payload().is_some() && !is_structured_shape(member))
+}
+
+/// Whether `schema`'s target is a shape a document is written FOR, rather than a scalar
+/// bound to the raw body.
+fn is_structured_shape(schema: &Schema) -> bool {
+    matches!(
+        schema.shape_type(),
+        ShapeType::Structure | ShapeType::Union | ShapeType::List | ShapeType::Map
+    )
+}
+
+/// `response` with every instant its document reports rendered the way Amazon S3 renders
+/// one: the fixed-width ISO-8601 form `YYYY-MM-DDTHH:MM:SS.000Z` — whole seconds, and the
+/// three-digit fraction S3's own values carry.
+///
+/// S3 records an instant at one-second resolution and reports it at that one width wherever
+/// it appears — a bucket's `CreationDate`, an object's `LastModified`, an upload's
+/// `Initiated` — so the form is a property of this service's wire rather than of one
+/// operation, and a client that reads S3's fixed-width timestamp (or compares one by shape)
+/// rejects any other width. The framework's serializer renders a timestamp at whatever
+/// resolution the VALUE carries and drops trailing zeros from its fraction, which for an
+/// instant taken from the clock is a microsecond form no S3 response has.
+///
+/// Scoped twice over, so nothing but an instant is ever touched: only a response whose body
+/// is one of this service's documents is read at all ([`answers_xml_document`]), only the
+/// elements the model reports a timestamp in are looked for
+/// ([`DOCUMENT_TIMESTAMP_ELEMENTS`]), and only text that reads back as an instant is
+/// rewritten. A `content-length` the serializer set is corrected rather than left
+/// stale, the way [`with_served_root_element`] corrects it.
+fn with_second_resolution_timestamps(mut response: Response, output_schema: &Schema) -> Response {
+    if !answers_xml_document(output_schema) {
+        return response;
+    }
+    let Some(body) = response.body().bytes() else {
+        return response;
+    };
+    let mut document = String::from_utf8_lossy(body).into_owned();
+    let mut rewritten = false;
+    for element in DOCUMENT_TIMESTAMP_ELEMENTS {
+        if let Some(rendered) = with_second_resolution_text(&document, element) {
+            document = rendered;
+            rewritten = true;
+        }
+    }
+    if !rewritten {
+        return response;
+    }
+    let length = document.len();
+    *response.body_mut() = SdkBody::from(document);
+    if response.headers().get("content-length").is_some() {
+        response
+            .headers_mut()
+            .insert("content-length", length.to_string());
+    }
+    response
+}
+
+/// `document` with the text of every `element` that reads back as an instant re-rendered by
+/// [`as_second_resolution_date_time`], or `None` when nothing changed.
+///
+/// The text of an element is the run between its start and end tags, and an instant carries
+/// no markup, so the run is read without a parser; text that does NOT read back as an
+/// instant is left exactly as it is.
+fn with_second_resolution_text(document: &str, element: &str) -> Option<String> {
+    let open = format!("<{element}>");
+    // A document that does not carry the element at all is left alone without copying it:
+    // the catalog is walked for every response, and most responses report no instant.
+    if !document.contains(&open) {
+        return None;
+    }
+    let close = format!("</{element}>");
+    let mut rendered = String::with_capacity(document.len());
+    let mut rest = document;
+    let mut changed = false;
+    while let Some(start) = rest.find(&open) {
+        let after_open = start + open.len();
+        let Some(text_length) = rest.get(after_open..).and_then(|tail| tail.find(&close)) else {
+            break;
+        };
+        let text = rest.get(after_open..after_open + text_length)?;
+        rendered.push_str(rest.get(..after_open)?);
+        match as_second_resolution_date_time(text) {
+            Some(instant) => {
+                changed |= instant != text;
+                rendered.push_str(&instant);
+            }
+            None => rendered.push_str(text),
+        }
+        rest = rest.get(after_open + text_length..)?;
+    }
+    rendered.push_str(rest);
+    changed.then_some(rendered)
+}
+
+/// The instant `text` names, rendered the way S3 writes one into a document, or `None` for
+/// text that does not read back as an ISO-8601 instant at all.
+///
+/// The whole seconds are rendered by the library (the calendar is its own) and the fraction
+/// is written as the three zero digits S3's own values carry: S3 records an instant at
+/// ONE-SECOND resolution — a bucket's creation date, an object's last-modified date — and
+/// renders it with a three-digit fraction, so every value it sends ends in `.000Z`. Anything
+/// finer in the value is resolution the service does not keep, so it is dropped rather than
+/// reported.
+fn as_second_resolution_date_time(text: &str) -> Option<String> {
+    let instant = DateTime::from_str(text, aws_smithy_types::date_time::Format::DateTime).ok()?;
+    let whole_seconds = DateTime::from_secs(instant.secs())
+        .fmt(aws_smithy_types::date_time::Format::DateTime)
+        .ok()?;
+    Some(format!(
+        "{}{SECOND_RESOLUTION_FRACTION}Z",
+        whole_seconds.strip_suffix('Z')?
+    ))
+}
+
 impl ServerProtocol for UnwrappedXmlRestXml {
     type Request = Request;
     type Response = Response;
@@ -1989,15 +2305,16 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // It is the bucket of the request's address in either form: the first label of the
         // host for a virtual-hosted-style request ([`super::addressed_in_host`]), else the
         // first segment of the path, which is the `{Bucket}` label every bucket-scoped
-        // route binds. A name LONGER than a bucket name may be
-        // ([`super::BUCKET_NAME_CHARS`]) names no bucket at all and is not recorded: the
-        // element is a bucket's name, not an echo of arbitrary request text.
+        // route binds. A name S3 can address no bucket by ([`super::names_a_bucket`]) names
+        // no bucket at all and is not recorded: the element is a bucket's name, not an echo
+        // of arbitrary request text — and such a request is refused for the NAME anyway
+        // (`crate::service::invalid_bucket_name`).
         let addressed_bucket = self
             .addressed_in_host(request)
             .or_else(|| {
                 super::first_path_segment(request_path(request.uri())).map(str::to_string)
             })
-            .filter(|name| name.chars().count() <= *super::BUCKET_NAME_CHARS.end());
+            .filter(|name| super::names_a_bucket(name));
         crate::state::addressed_bucket::remember(addressed_bucket.as_deref());
         // And the OBJECT it addresses, for the `<Key>` and `<VersionId>` an object-scoped
         // error document names it by — recorded under the same discipline, from the request's
@@ -2058,6 +2375,13 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // value an OPERATION judges ([`normalized_headers`]). `None` leaves the headers
         // exactly as they arrived, which is every request that needs no normalization.
         let folded_headers = normalized_headers(request, input_schema);
+        // The QUERY the bound members are read from, with the one PARAMETER an OPERATION
+        // judges withheld: a `max-buckets` that bounds no page is kept from the codec, whose
+        // own report of a value that is no integer is a sentence about Rust types, so
+        // `ListBuckets` answers the refusal S3 publishes for it instead
+        // ([`rejected_max_buckets`]), and so is one stated with no value at all, which states
+        // no bound. `None` leaves the query exactly as it arrived.
+        let folded_query = without_withheld_max_buckets(request_query(request.uri()), input_schema);
         // Only a request whose BODY IS AN XML DOCUMENT can carry a member the framework's
         // codec cannot bind as the document spells it, and only a body that actually
         // spells one needs normalizing; everything else — every request whose body is not
@@ -2101,12 +2425,22 @@ impl ServerProtocol for UnwrappedXmlRestXml {
             {
                 normalized = Some(EMPTY_WEBSITE_CONFIGURATION.to_vec());
             }
+            // And a FOURTH, for the one VALUE a create's configuration carries that the
+            // operation rather than the boundary refuses: a location constraint naming no
+            // Region the model publishes is withheld from the codec — the whole container is
+            // replaced by [`EMPTY_CREATE_BUCKET_CONFIGURATION`] — so `CreateBucket` answers
+            // the refusal S3 publishes for it, which names the value in a member of its own,
+            // rather than the boundary reporting the document as one that does not validate.
+            // See [`rejected_location_constraint`].
+            if rejected_location_constraint(input_schema).is_some() {
+                normalized = Some(EMPTY_CREATE_BUCKET_CONFIGURATION.to_vec());
+            }
             if let Some(document) = normalized {
                 let uri = request.uri();
                 let binding = HttpBindingDeserializer::new(
                     input_schema.http().map(|http| http.uri()),
                     host_style_path.as_deref().unwrap_or(request_path(uri)),
-                    request_query(uri),
+                    folded_query.as_deref().unwrap_or_else(|| request_query(uri)),
                     folded_headers.unwrap_or_else(|| request_headers(request)),
                     OwnedXmlBody {
                         document: document.clone(),
@@ -2116,13 +2450,14 @@ impl ServerProtocol for UnwrappedXmlRestXml {
                 return Ok(Box::new(binding));
             }
         }
-        if host_style_path.is_some() || folded_headers.is_some() {
-            // The framework's own deserializer reads the path and the headers off the request,
-            // which for a virtual-hosted-style request carries no bucket in its path and for a
-            // request spelling a mode in another case carries a value the model's enum does not
-            // list — so this one is built over the normalized path and headers instead.
-            // Everything else is the framework's: the same binding deserializer, over the same
-            // query and body.
+        if host_style_path.is_some() || folded_headers.is_some() || folded_query.is_some() {
+            // The framework's own deserializer reads the path, the query and the headers off
+            // the request, which for a virtual-hosted-style request carries no bucket in its
+            // path, for a request spelling a mode in another case carries a value the model's
+            // enum does not list, and for a page bound the operation judges carries a value
+            // the codec cannot read — so this one is built over the normalized path, query
+            // and headers instead. Everything else is the framework's: the same binding
+            // deserializer, over the same body.
             let path = match host_style_path {
                 Some(path) => path,
                 None => request_path(request.uri()).to_string(),
@@ -2139,7 +2474,7 @@ impl ServerProtocol for UnwrappedXmlRestXml {
             let binding = HttpBindingDeserializer::new(
                 input_schema.http().map(|http| http.uri()),
                 &path,
-                request_query(uri),
+                folded_query.as_deref().unwrap_or_else(|| request_query(uri)),
                 folded_headers.unwrap_or_else(|| request_headers(request)),
                 OwnedXmlBody {
                     document: body.to_vec(),
@@ -2203,7 +2538,9 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         };
         // A member the model marks `@xmlAttribute` has been written as an element; it
         // belongs on its parent's start tag, where the API publishes it and where a
-        // namespace-aware parser can read it. And a response that reports a
+        // namespace-aware parser can read it. Every instant the document reports is
+        // rendered in the fixed-width form S3 writes one in
+        // ([`with_second_resolution_timestamps`]). And a response that reports a
         // `Content-Range` carries PART of the object, which HTTP answers with 206, while a
         // retrieval one operation INITIATED is the 202 its documentation states. A
         // timestamp header the model binds in the `date-time` format is re-rendered in it.
@@ -2211,9 +2548,12 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         Ok(with_request_correlation(
             without_unbound_body(
                 with_date_time_timestamp_headers(with_accepted_status(
-                    with_partial_content_status(with_served_root_element(
-                        with_attribute_members(response),
-                        operation_name,
+                    with_partial_content_status(with_second_resolution_timestamps(
+                        with_served_root_element(
+                            with_attribute_members(response),
+                            operation_name,
+                        ),
+                        output_schema,
                     )),
                     operation_name,
                     accepted,

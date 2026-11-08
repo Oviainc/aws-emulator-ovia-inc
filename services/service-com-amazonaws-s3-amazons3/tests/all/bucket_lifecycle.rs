@@ -421,11 +421,14 @@ async fn creating_a_bucket_reports_its_location_and_region_and_reads_back() {
             "case {case:?}: expected Location {expected_location:?}, got {:?}",
             created.header("location")
         );
-        // Directory buckets only, per `CreateBucketOutput$BucketArn`'s documentation.
+        // The new bucket's own ARN, which a create reports for a general purpose bucket as
+        // well as for a directory bucket (recorded behaviour, pinned over a table of its own
+        // by [`super::bucket_create_list_and_tagging_contracts`]): a general purpose
+        // bucket's carries its globally unique name alone.
         assert_eq!(
-            created.header("x-amz-bucket-arn"),
-            None,
-            "case {case:?}: a general purpose bucket reports no BucketArn, got {:?}",
+            created.header("x-amz-bucket-arn").as_deref(),
+            Some(format!("arn:aws:s3:::{bucket}").as_str()),
+            "case {case:?}: expected the created bucket's ARN, got {:?}",
             created.header("x-amz-bucket-arn")
         );
 

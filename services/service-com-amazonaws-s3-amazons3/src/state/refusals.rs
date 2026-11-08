@@ -142,6 +142,87 @@ pub const COPY_SOURCE_INVALID_VERSION_MESSAGE: &str = "Invalid Request";
 pub const COPY_SOURCE_IS_DELETE_MARKER_MESSAGE: &str =
     "The source of a copy request may not specifically refer to a delete marker by version id.";
 
+/// The request field a refused page bound is reported against — the query parameter
+/// `ListBuckets` binds it from (`smithy_query(query="operation",operation="ListBuckets")`
+/// reports `MaxBuckets: {httpQuery: "max-buckets"}`).
+pub const MAX_BUCKETS_ARGUMENT: &str = "max-buckets";
+
+/// The bounds a page of buckets may be asked for within: `MaxBuckets`' own published range
+/// (`range {min 1, max 10000}`, the same source).
+pub const MAX_BUCKETS_BOUNDS: ::std::ops::RangeInclusive<i32> = 1..=10_000;
+
+/// Why a `max-buckets` value cannot bound a page of buckets.
+///
+/// The two faults S3 states different sentences for: a value that is no integer at all, and
+/// an integer outside the published bounds. See [`MaxBucketsFault::message`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MaxBucketsFault {
+    /// The value is not an integer (`1.5`, `many`), so it names no number of buckets.
+    NotAnInteger,
+    /// The value is an integer outside [`MAX_BUCKETS_BOUNDS`].
+    OutsideBounds,
+}
+
+impl MaxBucketsFault {
+    /// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for this fault.
+    ///
+    /// Each is fixed text: the one for a value that is no integer says so, and the one for an
+    /// integer outside the range states the BOUNDS rather than the value — the value is the
+    /// envelope's `<ArgumentValue>`, beside the `<ArgumentName>` naming
+    /// [`MAX_BUCKETS_ARGUMENT`].
+    pub fn message(&self) -> String {
+        match self {
+            Self::NotAnInteger => {
+                format!("Provided {MAX_BUCKETS_ARGUMENT} not an integer or within integer range")
+            }
+            Self::OutsideBounds => format!(
+                "Argument {MAX_BUCKETS_ARGUMENT} must be an integer between {} and {}",
+                MAX_BUCKETS_BOUNDS.start(),
+                MAX_BUCKETS_BOUNDS.end()
+            ),
+        }
+    }
+}
+
+/// How `value` fails to bound a page of buckets, or `None` for a value that bounds one.
+///
+/// A parameter stated with NO value states no bound at all — `?max-buckets=` names no number
+/// — so it is no fault either: such a request is served the page an absent parameter asks
+/// for. (The boundary withholds it from the codec for the same reason, since the codec reads
+/// the empty text as an integer it cannot parse.)
+///
+/// One reading, so the boundary that WITHHOLDS such a value from the codec and the operation
+/// that refuses it cannot disagree about which values are servable.
+pub fn max_buckets_fault(value: &str) -> Option<MaxBucketsFault> {
+    if value.is_empty() {
+        return None;
+    }
+    match value.parse::<i32>() {
+        Err(_) => Some(MaxBucketsFault::NotAnInteger),
+        Ok(bound) if !MAX_BUCKETS_BOUNDS.contains(&bound) => Some(MaxBucketsFault::OutsideBounds),
+        Ok(_) => None,
+    }
+}
+
+/// Whether the codec must not be handed the `max-buckets` value `value`: one that bounds no
+/// page ([`max_buckets_fault`]), and one stated with no value at all, which the codec would
+/// read as an integer it cannot parse where S3 serves the request.
+pub fn withholds_max_buckets(value: &str) -> bool {
+    value.is_empty() || max_buckets_fault(value).is_some()
+}
+
+/// The request field a refused Object Ownership setting is reported against — the header
+/// `CreateBucket` binds it from (`smithy_query(query="operation",operation="CreateBucket")`
+/// reports `ObjectOwnership: {httpHeader: "x-amz-object-ownership"}`).
+pub const OBJECT_OWNERSHIP_ARGUMENT: &str = "x-amz-object-ownership";
+
+/// The `<Message>` S3 sends with [`INVALID_ARGUMENT_CODE`] for an Object Ownership setting
+/// outside the published set: the header's own name and then the value as the request sent
+/// it, which is the one variable part of it.
+pub fn invalid_object_ownership_message(value: &str) -> String {
+    format!("Invalid {OBJECT_OWNERSHIP_ARGUMENT} header: {value}")
+}
+
 /// The request field a refused canned ACL is reported against — the header every operation
 /// that takes one binds it from (`smithy_query(query="operation",
 /// operation="CopyObject,PutObject,CreateBucket,CreateMultipartUpload,PutBucketAcl,PutObjectAcl")`
@@ -327,6 +408,25 @@ pub fn first_forbidden_xml_char(document: &str) -> Option<char> {
 /// documents for an upload that specifies none), so a later `GetObject` or `HeadObject`
 /// reports exactly that rather than a type the caller never sent.
 pub const DEFAULT_CONTENT_TYPE: &str = "binary/octet-stream";
+
+/// The code S3 answers a `CreateBucket` whose location constraint is not a location it can
+/// create a bucket in at all: "InvalidLocationConstraint - The specified
+/// location-constraint is not valid", HTTP 400 (Amazon S3 "Error responses", list of error
+/// codes).
+///
+/// Distinct from [`ILLEGAL_LOCATION_CONSTRAINT_CODE`], which is about a constraint naming a
+/// REAL Region the endpoint the request reached cannot place a bucket in: this one is about
+/// a value that names no Region the constraint publishes at all
+/// (`CreateBucketConfiguration$LocationConstraint`'s own value set — which is where
+/// `us-east-1` is absent, that Region being the one an ABSENT constraint means).
+pub const INVALID_LOCATION_CONSTRAINT_CODE: &str = "InvalidLocationConstraint";
+
+/// See [`INVALID_LOCATION_CONSTRAINT_CODE`] — the text that list publishes for it.
+///
+/// Fixed text: the value that was rejected is named by the envelope's `<LocationConstraint>`
+/// member rather than interpolated into the sentence.
+pub const INVALID_LOCATION_CONSTRAINT_MESSAGE: &str =
+    "The specified location-constraint is not valid";
 
 /// The code S3 answers a `CreateBucket` whose location constraint cannot be served by the
 /// endpoint the request was sent to: "IllegalLocationConstraintException - The specified

@@ -158,17 +158,25 @@ const CONTINUATION_TOKEN_MARKER: &str = "s3lb1 ";
 /// Encode the resume point of a truncated page as the response's `ContinuationToken`.
 ///
 /// "ContinuationToken is obfuscated and is not a real bucket"
-/// (`ListBucketsOutput$ContinuationToken`) — hex of a marker plus the first bucket name
-/// NOT returned, so the token a page hands back resumes exactly where it stopped without
-/// storing per-caller cursor state. Obfuscated, NOT confidential: hex is trivially
-/// reversible, and the token is only opaque in the sense that a client must not read a
-/// bucket name out of it or mint one of its own.
-fn encode_continuation_token(first_bucket_not_returned: &str) -> String {
-    hex::encode(format!("{CONTINUATION_TOKEN_MARKER}{first_bucket_not_returned}").as_bytes())
+/// (`ListBucketsOutput$ContinuationToken`) — hex of a marker plus the LAST bucket name the
+/// page DID return, so the token a page hands back is a cursor in the listing's own order
+/// rather than a position in one walk, and no per-caller cursor state is stored.
+/// Obfuscated, NOT confidential: hex is trivially reversible, and the token is only opaque
+/// in the sense that a client must not read a bucket name out of it or mint one of its own.
+///
+/// The name the token carries is the last one REPORTED and the next page begins after it,
+/// rather than the first name NOT reported: the listing is in bucket-name order, so "after
+/// the last name reported" is a point in that order and names the next bucket in it
+/// WHATEVER the account holds when the next page is asked for. A bucket created (or
+/// deleted) between two pages therefore lands in the page its name belongs to — a token
+/// naming the first bucket a page did not report would skip a bucket whose name sorts
+/// before it and was created after that page was served.
+fn encode_continuation_token(last_bucket_returned: &str) -> String {
+    hex::encode(format!("{CONTINUATION_TOKEN_MARKER}{last_bucket_returned}").as_bytes())
 }
 
-/// The bucket name a `ContinuationToken` resumes at (inclusive), or `None` when the token
-/// is not one this operation issued.
+/// The bucket name a `ContinuationToken` resumes AFTER (exclusive), or `None` when the
+/// token is not one this operation issued.
 fn decode_continuation_token(token: &str) -> Option<String> {
     let decoded = String::from_utf8(hex::decode(token).ok()?).ok()?;
     decoded
@@ -210,12 +218,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // The page bound this request asks for has to be one a page can be bounded by. The
+        // value is judged HERE rather than at the boundary because the refusal carries
+        // members of its own — the `<ArgumentName>` / `<ArgumentValue>` pair naming the
+        // parameter and the value as sent — see
+        // [`crate::service::wire::rejected_max_buckets`], which is where the request's own
+        // query is read and which withholds such a value from the codec, and
+        // [`crate::state::MaxBucketsFault::message`], which is the sentence S3 states for
+        // each of the two ways a value fails.
+        if let Some((value, fault)) = crate::service::wire::rejected_max_buckets(
+            ctx.parts(),
+            super::types::LIST_BUCKETS_INPUT_SCHEMA,
+        ) {
+            return Err(crate::scaffolded::Scaffolded::invalid_argument(
+                crate::state::MAX_BUCKETS_ARGUMENT,
+                Some(&value),
+                fault.message(),
+            ));
+        }
+
         // How many buckets this page may carry. `MaxBuckets` is modeled
-        // `range {min 1, max 10000}`, so the boundary validator has already refused
-        // anything outside it; the clamp is what keeps this handler total rather than a
-        // second statement of that bound.
+        // `range {min 1, max 10000}`, and a value outside it is refused above, so the clamp
+        // is what keeps this handler total rather than a second statement of that bound.
         let page_limit = match input.max_buckets {
             Some(requested) => requested.clamp(1, MAX_BUCKETS_PER_PAGE) as usize,
             None => DEFAULT_PAGE_SIZE,
@@ -281,15 +307,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 continue;
             }
-            // The token's name is the first one this page owes, inclusive.
-            if resume_at.as_deref().is_some_and(|from| name < from) {
+            // The token names the last bucket the previous page reported, so this page
+            // begins at the next name AFTER it.
+            if resume_at.as_deref().is_some_and(|after| name <= after) {
                 continue;
             }
 
-            // Out of slots: this bucket starts the NEXT page, and its name is what the
-            // token hands back.
+            // Out of slots: this bucket starts the NEXT page, so the page stops here and
+            // hands back a cursor naming the last bucket it DID report.
             if buckets.len() >= page_limit {
-                next_continuation_token = Some(encode_continuation_token(name));
+                next_continuation_token = buckets
+                    .last()
+                    .and_then(|last| last.name.as_deref())
+                    .map(encode_continuation_token);
                 break;
             }
 

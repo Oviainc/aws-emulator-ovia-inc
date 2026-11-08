@@ -1162,7 +1162,9 @@ pub async fn read_edi_object(
             use ::aws_sdk_s3::error::ProvideErrorMetadata;
             let detail = ::aws_smithy_types::error::display::DisplayErrorContext(&error).to_string();
             match error.code() {
-                Some("NoSuchKey" | "NoSuchBucket" | "NotFound") => {
+                // A name S3 can address no bucket by (`InvalidBucketName`) holds no object
+                // either, so it is the same verdict as a bucket or key that is not there.
+                Some("NoSuchKey" | "NoSuchBucket" | "NotFound" | "InvalidBucketName") => {
                     ObjectError::NotFound(s3_object_not_found(&bucket, &key))
                 }
                 _ => ObjectError::Unreadable(format!(

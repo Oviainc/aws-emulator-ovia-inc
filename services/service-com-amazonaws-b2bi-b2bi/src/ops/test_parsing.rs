@@ -1640,8 +1640,10 @@ pub(crate) fn requirement_messages_for(
 }
 
 /// The S3 error codes that mean the object `inputFile` names is not there — which is the
-/// modelled `ResourceNotFoundException`, not a service fault.
-const ABSENT_OBJECT_CODES: &[&str] = &["NoSuchKey", "NoSuchBucket", "NotFound"];
+/// modelled `ResourceNotFoundException`, not a service fault. `InvalidBucketName` is one of
+/// them: a name S3 can address no bucket by holds no object either.
+const ABSENT_OBJECT_CODES: &[&str] =
+    &["NoSuchKey", "NoSuchBucket", "NotFound", "InvalidBucketName"];
 
 /// The S3 error codes that mean the input file could not be read because the read was not
 /// PERMITTED — which is the modelled `AccessDeniedException` (HTTP 403), "you do not have

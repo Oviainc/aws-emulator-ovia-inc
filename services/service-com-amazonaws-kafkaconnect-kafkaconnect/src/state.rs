@@ -2340,9 +2340,10 @@ pub const CUSTOM_PLUGIN_FILE_UNREADABLE: &str =
 
 /// The Amazon S3 error codes in which S3 reports that the object a request
 /// names cannot be READ: it is not there (`NoSuchBucket`, `NoSuchKey`,
-/// `NoSuchVersion`) or reading it is not permitted (`AccessDenied`,
-/// `AllAccessDisabled`, a bucket policy or an ownership check refusing the
-/// read).
+/// `NoSuchVersion`, `InvalidBucketName` — a name S3 can address no bucket by,
+/// under which no bucket can ever be held) or reading it is not permitted
+/// (`AccessDenied`, `AllAccessDisabled`, a bucket policy or an ownership check
+/// refusing the read).
 ///
 /// Keyed on S3's OWN code rather than on the HTTP status, because a status is
 /// not evidence that S3 answered at all: a request that reached no S3 is a 404
@@ -2360,6 +2361,9 @@ const UNREADABLE_CODES: &[&str] = &[
     "NoSuchBucket",
     "NoSuchKey",
     "NoSuchVersion",
+    // A name S3 can address no bucket by at all: no bucket can ever be held under it, so
+    // this is S3 reporting that the file is not there just as `NoSuchBucket` is.
+    "InvalidBucketName",
     "AccessDenied",
     "AllAccessDisabled",
 ];
