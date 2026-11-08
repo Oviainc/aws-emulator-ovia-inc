@@ -99,8 +99,8 @@ const COMBINATIONS: [Combination; 6] = [
         action: "DescribeInstances",
         id_field: "InstanceId.1",
         id: "i-0123456789abcdef0",
-        first: "InstanceIds",
-        second: "MaxResults",
+        first: "instancesSet",
+        second: "maxResults",
     },
     Combination {
         action: "DescribeNetworkInterfaces",

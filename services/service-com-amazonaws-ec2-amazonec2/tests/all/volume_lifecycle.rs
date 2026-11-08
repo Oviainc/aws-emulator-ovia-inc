@@ -998,9 +998,11 @@ async fn describe_volumes_narrows_by_id_filter_and_page() {
         );
     }
 
-    // Every page size from one volume per page to more than the whole collection walks
-    // the same set exactly once.
-    for page_size in [1usize, 2, 3, created.len(), created.len() + 1] {
+    // Every page size from the smallest page this operation publishes to more than the
+    // whole collection walks the same set exactly once. A page size below that minimum is
+    // refused rather than served, which `published_page_size_minimums` covers, where the
+    // walk across pages at the minimum is covered too.
+    for page_size in [5usize, created.len(), created.len() + 1] {
         let case = format!("MaxResults={page_size}");
         let mut walked: Vec<String> = Vec::new();
         let mut next_token: Option<String> = None;

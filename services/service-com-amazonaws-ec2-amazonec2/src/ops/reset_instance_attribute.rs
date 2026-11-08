@@ -165,25 +165,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::scaffolded::Scaffolded;
         use crate::state::{
-            require_known_instance, require_service_state, InstanceStateName,
-            DEFAULT_SOURCE_DEST_CHECK, INSTANCE_ATTRIBUTE_KERNEL, INSTANCE_ATTRIBUTE_RAMDISK,
-            INSTANCE_ATTRIBUTE_SOURCE_DEST_CHECK, RESETTABLE_INSTANCE_ATTRIBUTES,
+            require_known_instance, require_service_state, unknown_attribute_parameter_value,
+            InstanceStateName, DEFAULT_SOURCE_DEST_CHECK, INSTANCE_ATTRIBUTE_KERNEL,
+            INSTANCE_ATTRIBUTE_RAMDISK, INSTANCE_ATTRIBUTE_SOURCE_DEST_CHECK,
+            RESETTABLE_INSTANCE_ATTRIBUTES,
         };
 
         // "You can only reset the following attributes: kernel | ramdisk |
         // sourceDestCheck" (`ResetInstanceAttributeRequest$Attribute`). Every other
         // `InstanceAttributeName` is a well-formed value this operation cannot act on, so
-        // it is refused with the code EC2 answers a value it rejects with rather than
-        // silently doing nothing. The modelled enum constraint is refused by the request
-        // walk before this handler runs; this narrows that enum to the resettable subset
-        // the operation documents.
+        // it is refused the way EC2 refuses an `attribute` parameter it cannot act on — the
+        // value it was sent and the sentence that says the service knows no such attribute
+        // ([`crate::state::unknown_attribute_parameter_value`]) — rather than silently doing
+        // nothing or enumerating the subset here. The modelled enum constraint is refused by
+        // the request walk before this handler runs; this narrows that enum to the resettable
+        // subset the operation documents.
         let attribute = input.attribute.as_str();
         if !RESETTABLE_INSTANCE_ATTRIBUTES.contains(&attribute) {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "Value ({attribute}) for parameter attribute is invalid. \
-                 You can only reset the following attributes: {resettable}",
-                resettable = RESETTABLE_INSTANCE_ATTRIBUTES.join(" | "),
-            )));
+            return Err(unknown_attribute_parameter_value(attribute));
         }
 
         let state = require_service_state(&*self.engine)?;

@@ -378,10 +378,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // — which is what a modification is held to instead.
                 let floor = *state::CAPACITY_RESERVATION_INSTANCE_COUNT_RANGE.start();
                 if requested < floor {
-                    return Err(Scaffolded::invalid_parameter_value(format!(
-                        "Invalid value '{requested}' for instanceCount: a Capacity \
-                         Reservation reserves capacity for at least {floor} instance"
-                    )));
+                    // Refused through the one constructor this crate words an instance count
+                    // outside its published range with
+                    // ([`crate::state::instance_count_outside_published_range`]), so the
+                    // create and the modify cannot state that range two ways.
+                    return Err(state::instance_count_outside_published_range(
+                        &state::CAPACITY_RESERVATION_INSTANCE_COUNT_RANGE,
+                    ));
                 }
                 // "The number of instances can't be increased or decreased by more than
                 // 1000 in a single request" (`$InstanceCount`). Widened to `i64` so the

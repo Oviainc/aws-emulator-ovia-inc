@@ -15,6 +15,23 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// How this service refuses a request that violates a PUBLISHED parameter limit: the
+// page-size bounds of a paged describe, the instance-count range of a Capacity Reservation,
+// the order of a launch's two counts, the one attribute type a modify names, the attributes
+// a reset acts on, and the hardware a Dedicated Host can be configured for — each in EC2's
+// own sentence for that violation class, with the bound the operation publishes in it.
+// Declared beside `prefix_lists` for the reason the note above gives: the sorted
+// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
+#[path = "all/published_parameter_limits.rs"]
+mod published_parameter_limits;
+// EC2 as a regional service: a stored resource is reported only in the Region it was created
+// in, an account has one default VPC per Region, a Region it has not opted into refuses every
+// request, an instance type is offered in some of a Region's zones and not others, and a
+// terminated instance has released its network. Declared beside `prefix_lists` for the reason
+// the note above gives: the sorted neighbourhood and the tail of this file are where every new
+// ec2 suite inserts its lines.
+#[path = "all/region_scoped_state.rs"]
+mod region_scoped_state;
 // What an Elastic IP association binds to and what both sides of it report: the interface
 // the request names or the instance's primary one, the address record `DescribeAddresses`
 // reports, the interface's own `association`, and the `DisassociateAddress` that ends it so
@@ -1525,12 +1542,6 @@ mod instance_attribute_describe;
 // `CapacityManager.Disabled` refusal an account that has not enabled Capacity Manager gets.
 #[path = "all/capacity_manager_metric_dimensions.rs"]
 mod capacity_manager_metric_dimensions;
-// EC2 as a regional service: a stored resource is reported only in the Region it was created
-// in, an account has one default VPC per Region, a Region it has not opted into refuses every
-// request, an instance type is offered in some of a Region's zones and not others, and a
-// terminated instance has released its network. Declared beside `prefix_lists` for the reason
-#[path = "all/region_scoped_state.rs"]
-mod region_scoped_state;
 // What `DeleteNetworkInsightsAccessScopeAnalysis` takes out of the Network Access Scope
 // analysis store: the one analysis the request names, answered by its id, with the client
 // token that named it and the bytes it held released — and the ids and dry run it refuses

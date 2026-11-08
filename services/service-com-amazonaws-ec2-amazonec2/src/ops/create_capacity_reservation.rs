@@ -305,14 +305,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The number of instances for which to reserve capacity … Valid range: 1 - 1000"
         // (`InstanceCount`). The model puts no range on the member, so this is the only
-        // place the published one is enforced.
+        // place the published one is enforced, and a value outside it is refused with the
+        // sentence EC2 states that range in
+        // ([`crate::state::instance_count_outside_published_range`]).
         if !state::CAPACITY_RESERVATION_INSTANCE_COUNT_RANGE.contains(&input.instance_count) {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "Invalid value '{}' for instanceCount: the valid range is {}-{}",
-                input.instance_count,
-                state::CAPACITY_RESERVATION_INSTANCE_COUNT_RANGE.start(),
-                state::CAPACITY_RESERVATION_INSTANCE_COUNT_RANGE.end(),
-            )));
+            return Err(state::instance_count_outside_published_range(
+                &state::CAPACITY_RESERVATION_INSTANCE_COUNT_RANGE,
+            ));
         }
 
         // The wall clock every date on this reservation is written against and compared

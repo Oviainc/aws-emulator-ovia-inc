@@ -864,9 +864,11 @@ async fn a_token_this_service_did_not_mint_is_refused() {
     }
 }
 
-/// A page of no items is not a page: a `MaxResults` below 1 is refused as the value it is,
-/// rather than answered with a full page. A size ABOVE the maximum is not refused — the
-/// member documents its own answer for that, which the walk above covers.
+/// A page of no items is not a page: a `MaxResults` below the minimum this operation
+/// publishes is refused in EC2's own sentence for that violation, which names the value at
+/// fault and the minimum it has to reach, rather than answered with a full page. A size
+/// ABOVE the maximum is not refused — the member documents its own answer for that, which
+/// the walk above covers.
 #[tokio::test]
 async fn a_page_size_below_one_is_refused() {
     let router = super::ec2_query::emulator().0;
@@ -884,7 +886,10 @@ async fn a_page_size_below_one_is_refused() {
         );
         assert_eq!(
             error_message(&body),
-            format!("Invalid value '{case}' for maxResults. It must be at least 1"),
+            format!(
+                "Value ( {case} ) for parameter maxResults is invalid. \
+                 Expecting a value greater than 1."
+            ),
             "case {case:?}: expected the refusal to name the size at fault, got {body}"
         );
     }

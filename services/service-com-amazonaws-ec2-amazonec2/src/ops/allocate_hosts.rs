@@ -212,17 +212,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "Either availabilityZone or availabilityZoneId must be specified",
                 ));
             }
-            (Some(zone_name), None) => crate::state::availability_zone_of_region(
+            (Some(zone_name), None) => zone_of_signed_region(
                 &zones,
-                &region,
-                "availabilityZone",
+                "AvailabilityZone",
                 zone_name,
                 |zone| zone.zone_name.as_str(),
             )?,
-            (None, Some(zone_id)) => crate::state::availability_zone_of_region(
+            (None, Some(zone_id)) => zone_of_signed_region(
                 &zones,
-                &region,
-                "availabilityZoneId",
+                "AvailabilityZoneId",
                 zone_id,
                 |zone| zone.zone_id.as_str(),
             )?,
@@ -535,4 +533,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             host_ids: Some(host_ids),
         })
     }
+}
+
+/// The Availability Zone of the signed Region a request names, or the refusal EC2 answers
+/// for a value that names no zone of it.
+///
+/// A Dedicated Host is allocated IN one Availability Zone, and `AvailabilityZone` and
+/// `AvailabilityZoneId` are the two members that name one — so a value that is no zone of
+/// the Region the call was signed for leaves this request with nowhere to put the host,
+/// which makes the REQUEST invalid ([`crate::state::invalid_request`]) rather than inviting
+/// a retry with another value for the parameter. That is the class the recorded refusal of
+/// this operation's zone members carries, and it is the same class as naming both ways of
+/// configuring a host: the sentence names the member as the MODEL declares it, the way this
+/// operation's other refusals of a member do, and the value the request sent — bounded by
+/// [`crate::state::echoed_resource_id`] like every other echoed value — and stops there.
+///
+/// The LOOKUP is the shared one
+/// ([`crate::state::availability_zone_refused_with`]), so both spellings of a zone resolve
+/// the one way every other operation resolves them and only the refusal is this
+/// operation's; `member` says which of the two a refusal is about.
+fn zone_of_signed_region<'zones, E>(
+    zones: &'zones [crate::state::AvailabilityZoneRecord],
+    member: &str,
+    value: &str,
+    select: fn(&crate::state::AvailabilityZoneRecord) -> &str,
+) -> Result<&'zones crate::state::AvailabilityZoneRecord, crate::scaffolded::Scaffolded<E>> {
+    crate::state::availability_zone_refused_with(zones, value, select, || {
+        crate::state::invalid_request(format!(
+            "Invalid value '{}' for {member}.",
+            crate::state::echoed_resource_id(value)
+        ))
+    })
 }

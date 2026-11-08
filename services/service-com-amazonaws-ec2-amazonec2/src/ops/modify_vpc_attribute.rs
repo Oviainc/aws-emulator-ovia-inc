@@ -155,15 +155,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state;
 
-        // "You cannot modify the DNS resolution and DNS hostnames attributes in the same
-        // request. Use separate requests for each attribute"
-        // (`ModifyVpcAttributeRequest$EnableDnsSupport` and `$EnableDnsHostnames`).
-        if input.enable_dns_support.is_some() && input.enable_dns_hostnames.is_some() {
-            return Err(state::invalid_parameter_combination(
-                "You cannot modify enableDnsSupport and enableDnsHostnames in the same \
-                 request. Use separate requests for each attribute.",
-            ));
-        }
         // Every member of this request names one attribute to set, so the request itself
         // is the list of modifications to apply.
         let requested: Vec<(&str, bool)> = [
@@ -189,7 +180,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 state::missing_parameter(format!("The parameter {name} must have a value"))
             })
         })
-        .collect::<Result<_, Self::Error>>()?;
+        .collect::<Result<Vec<(&str, bool)>, Self::Error>>()?;
+        // "You cannot modify the DNS resolution and DNS hostnames attributes in the same
+        // request. Use separate requests for each attribute"
+        // (`ModifyVpcAttributeRequest$EnableDnsSupport` and `$EnableDnsHostnames`) — one
+        // call sets ONE attribute type, whichever types the request names, and EC2 refuses
+        // a request naming more than one with the sentence that lists the ones it named
+        // ([`crate::state::fields_for_multiple_attribute_types`]).
+        if requested.len() > 1 {
+            let named: Vec<&str> = requested.iter().map(|(name, _)| *name).collect();
+            return Err(state::fields_for_multiple_attribute_types(&named));
+        }
         if requested.is_empty() {
             return Err(state::missing_parameter(format!(
                 "The request must name an attribute to modify: {support}, {hostnames} or \

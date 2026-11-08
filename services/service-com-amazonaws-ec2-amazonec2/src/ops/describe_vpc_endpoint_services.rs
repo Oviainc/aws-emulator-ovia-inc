@@ -232,10 +232,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // maximum is NOT refused, the member documenting its own answer for that: "Constraint:
         // If the value is greater than 1,000, we return only 1,000 items."
         if let Some(max_results) = input.max_results {
-            if max_results < 1 {
-                return Err(state::invalid_parameter_value(format!(
-                    "Invalid value '{max_results}' for maxResults. It must be at least 1"
-                )));
+            if max_results < crate::state::SMALLEST_PAGE_SIZE {
+                return Err(state::max_results_below_published_minimum(
+                    max_results,
+                    crate::state::SMALLEST_PAGE_SIZE,
+                ));
             }
         }
 

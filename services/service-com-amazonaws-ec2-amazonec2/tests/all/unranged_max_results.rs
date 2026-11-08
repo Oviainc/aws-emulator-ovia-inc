@@ -13,7 +13,9 @@
 //! Each row is one operation and one page size, and the rows differ along what the rule
 //! generalises over: whether the operation's `MaxResults` carries a modelled `@range`,
 //! which bound a size sits on (each published bound, one past it, far past it), and which
-//! operation of this service is asked. No row is the specification.
+//! operation of this service is asked. No row is the specification. The operations that
+//! publish a page-size MINIMUM without a modelled range are covered by
+//! [`super::published_parameter_limits`].
 
 use ec2::state::{MAX_PAGE_SIZE, availability_zones_in_region};
 use service_com_amazonaws_ec2_amazonec2 as ec2;
@@ -42,16 +44,16 @@ fn p(key: &str, value: impl Into<String>) -> (String, String) {
 /// size:
 ///
 /// ```text
-/// smithy_query(query="operation",operation="DescribeVolumes,DescribeInstances,DescribeImages,DescribeVolumeStatus,DescribePrefixLists,DescribeImportImageTasks,DescribeImportSnapshotTasks,DescribeSpotInstanceRequests,DescribeSpotFleetRequests,DescribeSpotPriceHistory,DescribeVpcEndpointConnectionNotifications",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// smithy_query(query="operation",operation="DescribeImages,DescribeVolumeStatus,DescribePrefixLists,DescribeImportImageTasks,DescribeImportSnapshotTasks,DescribeSpotInstanceRequests,DescribeSpotFleetRequests,DescribeSpotPriceHistory,DescribeVpcEndpointConnectionNotifications",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
 /// ```
 ///
 /// `DescribeVolumesModifications` is deliberately NOT here: the model declares no range for
 /// it either, but its own member documents "the maximum number of results (up to a limit of
 /// 500)" — a bound the service publishes — so that operation keeps its refusal.
-/// `DescribeInstances` is out for the same reason, on the other bound: AWS publishes a
-/// minimum of 5 for its `MaxResults`, which [`PUBLISHED_MINIMUM_OPERATIONS`] covers.
-const UNRANGED_PAGE_SIZE_OPERATIONS: [&str; 10] = [
-    "DescribeVolumes",
+/// `DescribeInstances` and `DescribeVolumes` are out for the same reason, on the other
+/// bound: AWS publishes a minimum of 5 for each one's `MaxResults`, which
+/// [`PUBLISHED_MINIMUM_OPERATIONS`] covers.
+const UNRANGED_PAGE_SIZE_OPERATIONS: [&str; 9] = [
     "DescribeImages",
     "DescribeVolumeStatus",
     "DescribePrefixLists",
@@ -64,11 +66,12 @@ const UNRANGED_PAGE_SIZE_OPERATIONS: [&str; 10] = [
 ];
 
 /// The paged describes whose `MaxResults` the MODEL leaves unbounded but whose own
-/// documentation publishes a MINIMUM page size, with that minimum: `DescribeInstances`
-/// targets a plain `Integer`, and the EC2 API Reference publishes "Valid Range: Minimum
-/// value of 5. Maximum value of 1000." for the member, so a smaller page is refused rather
-/// than served.
-const PUBLISHED_MINIMUM_OPERATIONS: [(&str, i64); 1] = [("DescribeInstances", 5)];
+/// documentation publishes a MINIMUM page size, with that minimum: `DescribeInstances` and
+/// `DescribeVolumes` each target a plain `Integer`, and the EC2 API Reference publishes
+/// "Valid Range: Minimum value of 5" for both members (maximum 1000 and 500), so a smaller
+/// page is refused rather than served.
+const PUBLISHED_MINIMUM_OPERATIONS: [(&str, i64); 2] =
+    [("DescribeInstances", 5), ("DescribeVolumes", 5)];
 
 /// The paged describes whose `MaxResults` the model DOES bound, with the bounds it
 /// declares, from the same `smithy_query` call as above: `DescribeSecurityGroupsMaxResults`
@@ -220,11 +223,12 @@ async fn a_modelled_range_is_served_at_its_bounds_and_refused_past_them() {
 async fn a_page_size_above_the_ceiling_holds_everything_and_carries_no_token() {
     let router = emulator();
 
-    // Volumes, because this suite can create as many of them as it needs: three, which is
-    // below every page size asserted below, so each of those pages holds all three.
+    // Volumes, because this suite can create as many of them as it needs: six, which is
+    // below every page size asserted below, so each of those pages holds all six, and above
+    // the page size the cut below asks for.
     let zone = availability_zones_in_region(REGION)[0].zone_name.clone();
     let mut created: Vec<String> = Vec::new();
-    for size in [4_i32, 8, 12] {
+    for size in [4_i32, 8, 12, 16, 20, 24] {
         let (status, body) = call(
             &router,
             REGION,
@@ -264,19 +268,19 @@ async fn a_page_size_above_the_ceiling_holds_everything_and_carries_no_token() {
         );
     }
 
-    let (status, body) = with_page_size(&router, "DescribeVolumes", 2).await;
+    let (status, body) = with_page_size(&router, "DescribeVolumes", 5).await;
     assert_eq!(
         status, 200,
-        "case MaxResults=2: expected HTTP 200, got {status} with body {body}"
+        "case MaxResults=5: expected HTTP 200, got {status} with body {body}"
     );
     let page = elements(&body, "volumeId");
     assert_eq!(
         page.len(),
-        2,
-        "case MaxResults=2: expected a page of two volumes, got {page:?} in {body}"
+        5,
+        "case MaxResults=5: expected a page of five volumes, got {page:?} in {body}"
     );
     assert!(
         element(&body, "nextToken").is_some(),
-        "case MaxResults=2: a third volume follows the page, so a token is due, got {body}"
+        "case MaxResults=5: a sixth volume follows the page, so a token is due, got {body}"
     );
 }

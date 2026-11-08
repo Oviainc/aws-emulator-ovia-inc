@@ -198,7 +198,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             encode_page_token, invalid_launch_template_id_malformed,
             invalid_launch_template_id_not_found, invalid_launch_template_name_not_found,
             invalid_pagination_token_for, launch_template_id_is_well_formed, matches_every_filter,
-            require_service_state, resolve_launch_template_version,
+            max_results_outside_published_range, require_service_state,
+            resolve_launch_template_version,
         };
 
         // A launch template version carries no Region member and this operation reads no
@@ -272,10 +273,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => MAX_PAGE_SIZE,
             Some(max_results) => {
                 if !(MIN_PAGE_SIZE..=MAX_PAGE_SIZE).contains(&max_results) {
-                    return Err(Scaffolded::invalid_parameter_value(format!(
-                        "Invalid value '{max_results}' for maxResults. \
-                         MaxResults must be between {MIN_PAGE_SIZE} and {MAX_PAGE_SIZE}"
-                    )));
+                    // Refused in EC2's own sentence for a page size outside an operation's
+                    // published range, which states the range and names no value
+                    // ([`crate::state::max_results_outside_published_range`]).
+                    return Err(max_results_outside_published_range(
+                        MIN_PAGE_SIZE,
+                        MAX_PAGE_SIZE,
+                    ));
                 }
                 max_results
             }

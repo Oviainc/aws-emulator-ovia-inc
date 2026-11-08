@@ -703,13 +703,17 @@ async fn allocate_hosts_refuses_a_request_it_cannot_satisfy() {
             "InvalidParameterCombination",
         ),
         (
+            // A value that names no zone of the signed Region leaves the request with
+            // nowhere to put the host, so the REQUEST is what is invalid — the class the
+            // recorded refusal of these two members carries, where
+            // `InvalidParameterValue` invites a retry with another value for the parameter.
             "a zone name the Region does not have",
             vec![
                 p("InstanceType", "mac2.metal"),
                 p("AvailabilityZone", "eu-west-1a"),
                 p("Quantity", "1"),
             ],
-            "InvalidParameterValue",
+            "InvalidRequest",
         ),
         (
             "a zone id the Region does not have",
@@ -718,7 +722,7 @@ async fn allocate_hosts_refuses_a_request_it_cannot_satisfy() {
                 p("AvailabilityZoneId", "euw1-az1"),
                 p("Quantity", "1"),
             ],
-            "InvalidParameterValue",
+            "InvalidRequest",
         ),
         (
             "no quantity",

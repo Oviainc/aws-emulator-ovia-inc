@@ -119,7 +119,7 @@ use super::types::*;
 use crate::state::{
     ComAmazonawsEc2Amazonec2State, INSTANCE_ID_PREFIX, INSTANCE_IDS_PARAMETER, InstanceRecord,
     dry_run_operation, echoed_resource_id, internal_error, invalid_id_parameter_value,
-    invalid_parameter_value, require_instance_record_worded, require_service_state,
+    require_instance_record_worded, require_service_state, unknown_attribute_parameter_value,
 };
 
 /// Refuse a value that is no instance id of the form EC2 issues: HTTP 400
@@ -226,10 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // all.
         let attribute = input.attribute.as_str();
         if !INSTANCE_ATTRIBUTE_NAME_VALUES.contains(&attribute) {
-            return Err(invalid_parameter_value(format!(
-                "Value ({}) for parameter attribute is invalid. Unknown attribute.",
-                echoed_resource_id(attribute)
-            )));
+            return Err(unknown_attribute_parameter_value(attribute));
         }
 
         let state = require_service_state(&*self.engine)?;

@@ -175,21 +175,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "The maximum number of results (up to a limit of 500)"
         // (`DescribeVolumesModificationsRequest$MaxResults`): the model declares no
-        // `@range`, so the handler is the only place that documented ceiling can be
+        // `@range`, so the handler is the only place that documented range can be
         // enforced — and an unbounded page size is how a caller asks for the whole store
-        // in one answer. The value is bound once, so the number the refusal reports cannot
-        // drift from the one that was tested.
+        // in one answer. A value outside the published range is refused with the sentence
+        // EC2 states that range in
+        // ([`crate::state::max_results_outside_published_range`]).
         if let Some(max_results) = input.max_results {
-            if max_results < 1 {
-                return Err(Scaffolded::invalid_parameter_value(format!(
-                    "Invalid value '{max_results}' for maxResults. It must be at least 1"
-                )));
-            }
-            if usize::try_from(max_results).unwrap_or(usize::MAX) > MAX_RESULTS {
-                return Err(Scaffolded::invalid_parameter_value(format!(
-                    "Invalid value '{max_results}' for maxResults. It must be at most \
-                     {MAX_RESULTS}"
-                )));
+            let largest = i32::try_from(MAX_RESULTS).unwrap_or(i32::MAX);
+            if !(crate::state::SMALLEST_PAGE_SIZE..=largest).contains(&max_results) {
+                return Err(crate::state::max_results_outside_published_range(
+                    crate::state::SMALLEST_PAGE_SIZE,
+                    largest,
+                ));
             }
         }
 

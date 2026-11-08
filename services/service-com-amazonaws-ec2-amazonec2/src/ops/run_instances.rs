@@ -335,7 +335,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             architecture_for, availability_zones_in_region, echoed_resource_id,
             iam_instance_profile_association_payload_bytes, invalid_ami_id_malformed_expecting_ami,
-            invalid_ami_id_not_found, issued_image_id_is_well_formed, private_dns_name,
+            invalid_ami_id_not_found, issued_image_id_is_well_formed,
+            maximum_instance_count_below_minimum, private_dns_name,
             request_region, require_service_state, resolve_iam_instance_profile,
             ssm_image_alias_parameter, validate_kernel_or_ramdisk_id,
             validate_tag_size,
@@ -420,12 +421,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 input.min_count
             )));
         }
+        // "Maximum instance count must not be smaller than minimum instance count" is the
+        // whole rule and EC2's whole sentence for breaking it
+        // ([`crate::state::maximum_instance_count_below_minimum`]): the refusal is about the
+        // ORDER of the two counts, so it names neither.
         if input.max_count < input.min_count {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "Invalid value '{}' for maxCount. \
-                 MaxCount must be greater than or equal to MinCount",
-                input.max_count
-            )));
+            return Err(maximum_instance_count_below_minimum());
         }
         if input.private_ip_address.is_some() && input.max_count > 1 {
             return Err(Scaffolded::invalid_parameter_combination(

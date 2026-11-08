@@ -183,10 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // declares no `@range`, so the handler is the only place that bound is enforced.
         if let Some(max_results) = input.max_results {
             if !(MIN_HOSTS_PER_PAGE..=MAX_HOSTS_PER_PAGE).contains(&max_results) {
-                return Err(Scaffolded::invalid_parameter_value(format!(
-                    "Invalid value '{max_results}' for maxResults. It must be between \
-                     {MIN_HOSTS_PER_PAGE} and {MAX_HOSTS_PER_PAGE}"
-                )));
+                return Err(crate::state::max_results_outside_published_range(
+                    MIN_HOSTS_PER_PAGE,
+                    MAX_HOSTS_PER_PAGE,
+                ));
             }
         }
 

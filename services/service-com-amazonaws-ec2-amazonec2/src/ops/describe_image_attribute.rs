@@ -125,8 +125,8 @@
 #[allow(unused_imports)]
 use super::types::*;
 use crate::state::{
-    EXECUTABLE_BY_ALL, dry_run_operation, internal_error, invalid_parameter_value,
-    require_resolvable_image, require_service_state,
+    EXECUTABLE_BY_ALL, dry_run_operation, internal_error, require_resolvable_image,
+    require_service_state, unknown_attribute_parameter_value,
 };
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -219,10 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with a response carrying no attribute at all.
         let attribute = input.attribute.as_str();
         if !IMAGE_ATTRIBUTE_NAME_VALUES.contains(&attribute) {
-            return Err(invalid_parameter_value(format!(
-                "Value ({attribute}) for parameter attribute is invalid. \
-                 Unknown attribute."
-            )));
+            return Err(unknown_attribute_parameter_value(attribute));
         }
 
         // "The blockDeviceMapping attribute is deprecated. Using this attribute returns the

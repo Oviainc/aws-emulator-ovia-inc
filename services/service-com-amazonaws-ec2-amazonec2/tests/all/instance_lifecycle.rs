@@ -1303,7 +1303,8 @@ async fn max_results_pages_over_reservations() {
 
     // Page sizes at and above the smallest page this operation pages with (AWS publishes a
     // minimum of 5 for its `MaxResults`): one that divides the set, ones that do not, and
-    // one larger than the set.
+    // one larger than the set. A page size below that minimum is refused rather than
+    // served, which the rows further down cover.
     for page_size in [5_usize, 6, 7, 12, 14] {
         let mut seen: Vec<String> = Vec::new();
         let mut token: Option<String> = None;
@@ -1380,7 +1381,7 @@ async fn max_results_pages_over_reservations() {
         .await;
     assert_eq!(
         bad_token.error_code(),
-        "InvalidParameterValue",
+        "InvalidPaginationToken",
         "a NextToken that names no reservation must be refused, got {}",
         bad_token.body
     );

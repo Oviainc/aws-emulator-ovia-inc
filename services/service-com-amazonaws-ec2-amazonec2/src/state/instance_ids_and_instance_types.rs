@@ -758,15 +758,32 @@ pub fn availability_zone_of_region<'zones, E>(
     value: &str,
     select: fn(&AvailabilityZoneRecord) -> &str,
 ) -> Result<&'zones AvailabilityZoneRecord, Scaffolded<E>> {
+    availability_zone_refused_with(zones, value, select, || {
+        invalid_parameter_value(format!(
+            "Invalid value '{value}' for {member}. \
+             Region '{region}' has no such Availability Zone"
+        ))
+    })
+}
+
+/// The same lookup as [`availability_zone_of_region`], refused with the sentence `refusal`
+/// builds.
+///
+/// The LOOKUP is one fact of a Region while the REFUSAL is a fact of the operation: an
+/// operation whose recorded answer for a zone the Region does not have is not the
+/// parameter-value one — `AllocateHosts`, where the zone is part of a host configuration the
+/// request could not have — passes its own constructor here rather than keeping a second
+/// copy of the search, so the two cannot drift in which zone list they consult.
+pub fn availability_zone_refused_with<'zones, E>(
+    zones: &'zones [AvailabilityZoneRecord],
+    value: &str,
+    select: fn(&AvailabilityZoneRecord) -> &str,
+    refusal: impl FnOnce() -> Scaffolded<E>,
+) -> Result<&'zones AvailabilityZoneRecord, Scaffolded<E>> {
     zones
         .iter()
         .find(|zone| select(zone) == value)
-        .ok_or_else(|| {
-            invalid_parameter_value(format!(
-                "Invalid value '{value}' for {member}. \
-                 Region '{region}' has no such Availability Zone"
-            ))
-        })
+        .ok_or_else(refusal)
 }
 
 /// A Region's zone-id prefix: its leading component, then every further component

@@ -182,7 +182,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             decode_page_token, filter_name_supported, instance_region,
-            max_results_below_bound_message, page_from_cursor, request_region,
+            max_results_below_published_minimum, page_from_cursor, request_region,
             require_decoded_instance_record, require_service_state, CompiledFilter, MatchBudget,
             PageTokenRule, ReservationView, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES,
             MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE, MAX_RESOURCE_IDS,
@@ -203,11 +203,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Documented on `MaxResults`: "You cannot specify this parameter and the
         // instance IDs parameter in the same request", refused through the one template
         // this service words that pair with
-        // ([`crate::state::parameters_cannot_be_combined`]).
+        // ([`crate::state::parameters_cannot_be_combined`]) — with the two parameters named
+        // the way THIS operation's own refusals name them, which is the wire spelling its
+        // recorded page-size refusal uses (`maxResults`, not `MaxResults`) and the wire set
+        // name of its id list beside it.
         if !requested_ids.is_empty() && input.max_results.is_some() {
             return Err(crate::state::parameters_cannot_be_combined(
-                "InstanceIds",
-                "MaxResults",
+                "instancesSet",
+                "maxResults",
             ));
         }
         // The model declares no `@range` on `MaxResults`, so the handler is the only place
@@ -234,7 +237,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The filter '<name>' is invalid" — with the name taken from the request.
         let mut filters: Vec<CompiledFilter> = Vec::new();
         for filter in input.filters.iter().flatten() {
-            let name = filter.name.clone().unwrap_or_default();
+            // An entry that names NO filter is still an entry the operation cannot use, and
+            // EC2 reports it by the name it has for an absent one
+            // ([`crate::state::UNNAMED_FILTER`]) rather than by an empty name, so the
+            // caller can see which entry was refused.
+            let name = filter
+                .name
+                .clone()
+                .unwrap_or_else(|| crate::state::UNNAMED_FILTER.to_string());
             if !filter_name_supported(&name) {
                 return Err(Scaffolded::invalid_parameter_value(format!(
                     "The filter '{name}' is invalid"
@@ -267,15 +277,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.max_results.is_some_and(|max_results| max_results < MIN_MAX_RESULTS) {
             // EC2 refuses a page size below the smallest the operation pages with rather
             // than serving it: a request that mis-sizes its page must not read as an empty
-            // account. The sentence is the one EC2 was recorded wording this operation's
-            // refused `maxResults` with ([`crate::state::max_results_below_bound_message`]),
+            // account. Answered through the one constructor every hand-enforced page-size
+            // floor of this crate uses
+            // ([`crate::state::max_results_below_published_minimum`]), which words the
+            // sentence EC2 was recorded wording this operation's refused `maxResults` with,
             // carrying the value the caller sent and the bound it has to reach. Asked AFTER
             // the filter names, so a request that gets both wrong is told about the filter.
-            return Err(Scaffolded::invalid_parameter_value(
-                max_results_below_bound_message(
-                    &input.max_results.unwrap_or_default().to_string(),
-                    &MIN_MAX_RESULTS.to_string(),
-                ),
+            return Err(max_results_below_published_minimum(
+                input.max_results.unwrap_or_default(),
+                MIN_MAX_RESULTS,
             ));
         }
 
@@ -369,11 +379,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .clamp(1, MAX_PAGE_SIZE);
         let start_at = match input.next_token.as_deref() {
             None => None,
-            Some(token) => Some(decode_page_token(token).ok_or_else(|| {
-                Scaffolded::invalid_parameter_value(
-                    "The NextToken value is not a token this service issued",
-                )
-            })?),
+            // A token this service did not mint is refused with EC2's own code and sentence
+            // for an unusable pagination token, which names the token the request sent
+            // ([`crate::state::invalid_pagination_token_for`]) — the one definition every
+            // paged describe of this service answers it through.
+            Some(token) => Some(
+                decode_page_token(token)
+                    .ok_or_else(|| crate::state::invalid_pagination_token_for(token))?,
+            ),
         };
         // Launch order IS id order — an instance id is 17 hex digits of a counter that only
         // grows, and a reservation's id likewise — so the set assembled above is already in

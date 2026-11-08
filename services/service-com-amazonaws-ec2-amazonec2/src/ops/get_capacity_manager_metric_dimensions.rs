@@ -278,10 +278,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => state::MAX_PAGE_SIZE,
             Some(max_results) => {
                 if !(MIN_RESULTS_PER_PAGE..=ceiling).contains(&max_results) {
-                    return Err(state::invalid_parameter_value(format!(
-                        "Invalid value '{max_results}' for MaxResults. MaxResults must be \
-                         between {MIN_RESULTS_PER_PAGE} and {ceiling}"
-                    )));
+                    return Err(state::max_results_outside_published_range(
+                        MIN_RESULTS_PER_PAGE,
+                        ceiling,
+                    ));
                 }
                 usize::try_from(max_results).unwrap_or(state::MAX_PAGE_SIZE)
             }

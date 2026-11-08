@@ -139,7 +139,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::state::{
             dry_run_operation, fpga_image_id_is_well_formed, internal_error,
             invalid_fpga_image_id_malformed, invalid_fpga_image_id_not_found,
-            invalid_parameter_value, require_service_state,
+            require_service_state, unknown_attribute_parameter_value,
         };
 
         // An AFI carries no Region member of its own, so nothing here depends on the Region
@@ -158,9 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // answered with a result carrying no attribute at all.
         let attribute = input.attribute.as_str();
         if !FPGA_IMAGE_ATTRIBUTE_NAME_VALUES.contains(&attribute) {
-            return Err(invalid_parameter_value(format!(
-                "Value ({attribute}) for parameter attribute is invalid. Unknown attribute."
-            )));
+            return Err(unknown_attribute_parameter_value(attribute));
         }
 
         // The permission question, answered before the resource one — the order every

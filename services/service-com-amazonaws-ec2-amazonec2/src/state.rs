@@ -2292,6 +2292,10 @@ mod instance_ids_and_instance_types;
 mod instances_and_filters;
 mod vpcs_and_security_groups;
 mod store;
+/// The published parameter bounds the handlers enforce by hand, and the sentences EC2
+/// refuses a violation of one with.
+mod parameter_bounds;
+pub use parameter_bounds::*;
 pub use store::*;
 pub use vpcs_and_security_groups::*;
 pub use instances_and_filters::*;

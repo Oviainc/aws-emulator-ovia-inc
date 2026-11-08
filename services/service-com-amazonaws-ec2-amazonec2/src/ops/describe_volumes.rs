@@ -162,8 +162,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             decode_page_token, invalid_id_parameter_value, invalid_pagination_token_for,
-            invalid_volume_id_not_found, issued_id_is_well_formed, require_service_state,
-            CompiledFilter, MatchBudget, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES,
+            invalid_volume_id_not_found, issued_id_is_well_formed,
+            max_results_below_published_minimum, require_service_state, CompiledFilter,
+            MatchBudget, MAX_FILTERS, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUES,
             MAX_FILTER_VALUE_BYTES, MAX_PAGE_SIZE, MAX_RESOURCE_IDS, VOLUME_ID_PREFIX,
             VOLUME_IDS_PARAMETER,
         };
@@ -204,15 +205,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 VOLUME_ID_PREFIX,
             ));
         }
-        // The model declares no `@range` on `MaxResults`, so the only bound on the page
-        // size is the largest page this operation serves: a value above it is not refused,
-        // it is served as that page with a `NextToken` for the rest (the clamp below). A
-        // page of NONE is not a page, so zero and below is still refused.
-        if input.max_results.is_some_and(|max_results| max_results < 1) {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "Invalid value '{}' for maxResults. It must be at least 1",
-                input.max_results.unwrap_or_default()
-            )));
+        // The model declares no `@range` on `MaxResults`, so the page size's published
+        // bounds are enforced here: the minimum this operation publishes is refused in
+        // EC2's own sentence for a page below it, carrying that minimum
+        // ([`crate::state::max_results_below_published_minimum`]), while a value ABOVE the
+        // largest page it serves is not refused at all — it is served as that page with a
+        // `NextToken` for the rest (the clamp below).
+        if let Some(max_results) = input
+            .max_results
+            .filter(|max_results| *max_results < MIN_MAX_RESULTS)
+        {
+            return Err(max_results_below_published_minimum(
+                max_results,
+                MIN_MAX_RESULTS,
+            ));
         }
 
         // Matching cost is filters x values x held values x stored volumes and the model
@@ -528,3 +534,15 @@ fn matches_every_filter(
             .any(|pattern| held.iter().any(|value| pattern.matches_within(value, budget)))
     })
 }
+
+/// The smallest `MaxResults` this operation pages with.
+///
+/// The model declares no `@range` on `DescribeVolumesRequest$MaxResults`
+/// (`smithy_query(query="operation",operation="DescribeVolumes")` reports a plain
+/// `Integer`), so the bound comes from what AWS publishes for the member in the EC2 API
+/// Reference ("Valid Range: Minimum value of 5. Maximum value of 500."): a page size below
+/// it is refused rather than served, so a paginating client that mis-sizes its page is told
+/// its value is wrong instead of reading an empty answer as an empty account. The MAXIMUM is
+/// clamped rather than refused, because a larger page is served as that page with a token
+/// for the rest — the same way `DescribeInstances` treats its own published pair.
+const MIN_MAX_RESULTS: i32 = 5;

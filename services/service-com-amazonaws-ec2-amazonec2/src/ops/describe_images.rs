@@ -224,10 +224,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the rest (the clamp below). A page of NONE is not a page, so zero and below is
         // still refused.
         if let Some(max_results) = input.max_results {
-            if max_results < 1 {
-                return Err(invalid_parameter_value(format!(
-                    "Invalid value '{max_results}' for maxResults. It must be at least 1"
-                )));
+            if max_results < crate::state::SMALLEST_PAGE_SIZE {
+                return Err(crate::state::max_results_below_published_minimum(
+                    max_results,
+                    crate::state::SMALLEST_PAGE_SIZE,
+                ));
             }
         }
 

@@ -175,10 +175,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (min_page_size, max_page_size) = RECYCLE_BIN_PAGE_SIZE_RANGE;
         if let Some(max_results) = input.max_results {
             if max_results < min_page_size || max_results > max_page_size {
-                return Err(Scaffolded::invalid_parameter_value(format!(
-                    "Invalid value '{max_results}' for maxResults. It must be between \
-                     {min_page_size} and {max_page_size}"
-                )));
+                return Err(crate::state::max_results_outside_published_range(
+                    min_page_size,
+                    max_page_size,
+                ));
             }
         }
 

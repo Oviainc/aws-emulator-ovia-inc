@@ -154,12 +154,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .max_results
             .is_some_and(|max_results| max_results < MIN_PAGE_SIZE)
         {
-            return Err(state::invalid_parameter_value(format!(
-                "Invalid value '{}' for MaxResults. It must be between {MIN_PAGE_SIZE} and \
-                 {max}",
+            return Err(state::max_results_below_published_minimum(
                 input.max_results.unwrap_or_default(),
-                max = state::MAX_PAGE_SIZE,
-            )));
+                MIN_PAGE_SIZE,
+            ));
         }
 
         // Matching cost is filters x values x held values x stored configurations and the

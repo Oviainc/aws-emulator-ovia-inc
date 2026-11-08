@@ -200,16 +200,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // "The number of instances to allocate from your source reservation. You can only
         // allocate available instances (also called unused capacity)"
-        // (`InstanceCount`): an allocation allocates instances, so there has to be at least
-        // one of them. The model puts no range on the member, so the handler is the only
-        // place this bound can be enforced; how many are AVAILABLE is a fact of the source
-        // reservation and is checked below, once it has been resolved.
-        if input.instance_count < 1 {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "Invalid value '{}' for instanceCount: an interruptible allocation \
-                 allocates at least 1 instance",
-                input.instance_count
-            )));
+        // (`InstanceCount`): the member has a published range of its own, which the model
+        // puts no `@range` on, so the handler is the only place it can be enforced — and a
+        // value outside it is refused with the absolute range EC2 states for an instance
+        // count ([`crate::state::instance_count_outside_published_range`]), BEFORE any
+        // capacity is looked at. How many instances are AVAILABLE is a fact of the source
+        // reservation and a different refusal, checked below once it has been resolved.
+        if !state::CAPACITY_RESERVATION_INSTANCE_COUNT_RANGE.contains(&input.instance_count) {
+            return Err(state::instance_count_outside_published_range(
+                &state::CAPACITY_RESERVATION_INSTANCE_COUNT_RANGE,
+            ));
         }
 
         let region = state::request_region(ctx.parts());

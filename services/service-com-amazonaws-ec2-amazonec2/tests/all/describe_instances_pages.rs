@@ -125,7 +125,8 @@ async fn max_results_caps_a_page_and_the_token_walks_to_the_full_set() {
 
         // Rows: the smallest page this operation pages with (`DescribeInstances` publishes
         // a minimum of 5), one that divides the set, one larger than the set, and the
-        // largest page the service serves.
+        // largest page the service serves. A page size BELOW that minimum is refused rather
+        // than served, which `published_page_size_minimums` covers.
         for max_results in [5_u32, 6, 7, 1000] {
             let case = format!("{setup} with MaxResults={max_results}");
             let mut walked: Vec<String> = Vec::new();

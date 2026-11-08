@@ -245,10 +245,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // attribute no result member corresponds to would be answered with a response
         // carrying no attribute at all.
         if !NETWORK_INTERFACE_ATTRIBUTE_VALUES.contains(&attribute) {
-            return Err(state::invalid_parameter_value(format!(
-                "Value ({}) for parameter attribute is invalid. Unknown attribute.",
-                state::echoed_resource_id(attribute)
-            )));
+            return Err(state::unknown_attribute_parameter_value(attribute));
         }
 
         let network_interface_id = input.network_interface_id.as_str();

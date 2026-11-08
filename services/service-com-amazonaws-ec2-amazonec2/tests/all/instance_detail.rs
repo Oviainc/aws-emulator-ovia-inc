@@ -1159,6 +1159,8 @@ async fn a_tag_filtered_describe_reports_the_matching_instances_across_pages() {
     ];
 
     for (case, narrowing) in &rows {
+        // The page size is the smallest `DescribeInstances` pages with, so the walk below
+        // spans pages without asking for a page the operation refuses.
         for page_size in [None, Some(5)] {
             let mut params = narrowing.clone();
             if let Some(page_size) = page_size {

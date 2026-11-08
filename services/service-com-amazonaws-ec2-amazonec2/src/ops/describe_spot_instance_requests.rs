@@ -185,11 +185,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // largest page this operation serves: a value above it is not refused, it is served
         // as that page with a `NextToken` for the rest (the clamp below). A page of NONE is
         // not a page, so zero and below is still refused.
-        if input.max_results.is_some_and(|max_results| max_results < 1) {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "Invalid value '{}' for maxResults. It must be at least 1",
-                input.max_results.unwrap_or_default()
-            )));
+        if input
+            .max_results
+            .is_some_and(|max_results| max_results < crate::state::SMALLEST_PAGE_SIZE)
+        {
+            return Err(crate::state::max_results_below_published_minimum(
+                input.max_results.unwrap_or_default(),
+                crate::state::SMALLEST_PAGE_SIZE,
+            ));
         }
 
         // Matching cost is filters x values x held values x stored requests and the model

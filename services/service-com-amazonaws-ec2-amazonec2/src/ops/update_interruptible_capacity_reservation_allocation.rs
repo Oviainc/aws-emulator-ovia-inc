@@ -234,10 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let target = input.target_instance_count.unwrap_or(current_target);
         let highest = *state::CAPACITY_RESERVATION_INSTANCE_COUNT_RANGE.end();
         if !(0..=highest).contains(&target) {
-            return Err(Scaffolded::invalid_parameter_value(format!(
-                "The instance count isn't valid. Enter a value between 0 and {highest} \
-                 instances, and try again"
-            )));
+            return Err(state::instance_count_outside_published_range(&(0..=highest)));
         }
         // Added capacity comes out of what the source has left: "you can only allocate
         // available instances (also called unused capacity)"

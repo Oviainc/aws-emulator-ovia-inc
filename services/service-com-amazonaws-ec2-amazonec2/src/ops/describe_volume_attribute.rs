@@ -147,10 +147,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // answered with a response carrying no attribute at all.
         let attribute = input.attribute.as_str();
         if !VOLUME_ATTRIBUTE_NAME_VALUES.contains(&attribute) {
-            return Err(state::invalid_parameter_value(format!(
-                "Value ({attribute}) for parameter attribute is invalid. \
-                 Unknown attribute."
-            )));
+            return Err(state::unknown_attribute_parameter_value(attribute));
         }
 
         // Something that is not a volume id at all is refused before anything else looks

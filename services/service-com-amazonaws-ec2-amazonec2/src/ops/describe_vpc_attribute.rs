@@ -145,10 +145,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `VpcAttributeName`, and the response carries only the member it names.
         let attribute = input.attribute.as_str();
         if !VPC_ATTRIBUTE_NAME_VALUES.contains(&attribute) {
-            return Err(state::invalid_parameter_value(format!(
-                "Value ({attribute}) for parameter attribute is invalid. \
-                 Unknown attribute."
-            )));
+            return Err(state::unknown_attribute_parameter_value(attribute));
         }
 
         let store = state::require_service_state(&*self.engine)?;
