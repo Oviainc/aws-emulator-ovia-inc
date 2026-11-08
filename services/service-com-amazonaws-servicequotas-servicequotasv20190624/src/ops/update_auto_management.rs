@@ -17,9 +17,10 @@
 //!
 //! An exclusion names the quota it excludes by `(ServiceCode, QuotaCode)`, so an
 //! `ExclusionList` this call names is RESOLVED against this service's catalog before
-//! anything is written — a key naming no service, or a code that service publishes no
-//! quota under, names a resource that does not exist and is refused with the modelled
-//! `NoSuchResourceException`, leaving the running configuration exactly as it was. It
+//! anything is written, leaving the running configuration exactly as it was when it is
+//! refused: a key naming no service is the modelled `NoSuchResourceException`, while a
+//! code a published service holds no quota under is a bad argument in that map —
+//! `IllegalArgumentException`, naming the entry that resolved to nothing. It
 //! is the rule `StartAutoManagement` applies to the same member, and what resolves is
 //! stored in the order the caller named it. The configuration this call changes is
 //! looked up FIRST, so an account with nothing running is told that rather than being
@@ -170,11 +171,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let exclusion_list = quotas_state
             .resolved_exclusion_list(input.exclusion_list)
             .map_err(|refusal| {
-                UpdateAutoManagementErrorModeled::NoSuchResourceException(NoSuchResourceException {
-                    message: Some(
-                        crate::service::refusals::exclusion_refusal_message(&refusal).to_string(),
-                    ),
-                })
+                // Which fact the entry got wrong decides the error class: a key naming
+                // no service is a resource that does not exist, while a code under a
+                // service the catalog does publish is a bad ARGUMENT — one entry of the
+                // map the caller sent, which the refusal names.
+                let message = Some(crate::service::refusals::exclusion_refusal_message(&refusal));
+                match refusal {
+                    crate::state::ExclusionRefusal::UnknownService { .. } => {
+                        UpdateAutoManagementErrorModeled::NoSuchResourceException(
+                            NoSuchResourceException { message },
+                        )
+                    }
+                    crate::state::ExclusionRefusal::UnknownQuota { .. } => {
+                        UpdateAutoManagementErrorModeled::IllegalArgumentException(
+                            IllegalArgumentException { message },
+                        )
+                    }
+                }
             })?;
 
         if let Some(opt_in_type) = input.opt_in_type {

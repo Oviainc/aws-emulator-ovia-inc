@@ -188,8 +188,13 @@ pub(crate) async fn configuration(client: &Client, case: &str) -> Value {
 }
 
 /// Dispatch a call that must be refused, and return its status, error code and the
-/// `Message` member that says what was wrong. `quota_workflow`'s own helper reports
+/// message member that says what was wrong. `quota_workflow`'s own helper reports
 /// only the status and the code.
+///
+/// The modelled errors carry their own `Message` member, while the synthetic
+/// `ValidationException` the request-validation front end answers with carries the
+/// protocol's generic lowercase `message`; a client reads whichever its SDK maps, so
+/// this reads both.
 pub(crate) async fn refused(
     client: &Client,
     operation: &str,
@@ -203,7 +208,13 @@ pub(crate) async fn refused(
             .unwrap_or("<absent>")
             .to_string()
     };
-    (status, member("__type"), member("Message"))
+    let message = parsed
+        .get("Message")
+        .or_else(|| parsed.get("message"))
+        .and_then(Value::as_str)
+        .unwrap_or("<absent>")
+        .to_string();
+    (status, member("__type"), message)
 }
 
 /// One row of the start table.
@@ -640,35 +651,51 @@ async fn a_start_or_update_is_one_record_for_the_whole_account() {
 }
 
 /// A request that breaks a modelled constraint is refused at the boundary, before any
-/// of it is recorded — in this service's own modelled `IllegalArgumentException`, whose
-/// `Message` names the member the caller got wrong (see `src/service.rs` and the
-/// `error_envelope` suite) — so the account is left with no configuration at all.
+/// of it is recorded, by the validator that owns the violation (see `src/service.rs` and
+/// the `error_envelope` suite): a value outside an enumerated type's value set is a
+/// malformed request, refused by the request-validation front end as
+/// `ValidationException` inside AWS's count envelope and reporting the value set the
+/// member admits, while every other constraint keeps this service's own modelled
+/// `IllegalArgumentException` naming the member the caller got wrong. Either way the
+/// account is left with no configuration at all.
 ///
 /// The rows differ in WHICH constraint the request breaks: an `OptInLevel` or
 /// `OptInType` outside its value set, a required member left out, and a
 /// `NotificationArn` that does not match the modeled pattern.
 #[tokio::test]
 async fn a_configuration_that_breaks_a_modeled_constraint_records_nothing() {
-    let rows: Vec<(&str, Value, &str)> = vec![
+    // Each row: why it is invalid, the request, the error code the refusal carries, and
+    // the opening of the clause its message states.
+    let rows: Vec<(&str, Value, &str, String)> = vec![
         (
             "an opt-in level outside the value set",
             json!({"OptInLevel": "ORGANIZATION", "OptInType": "NotifyOnly"}),
-            "OptInLevel",
+            "ValidationException",
+            "1 validation error detected: Value at 'optInLevel' failed to satisfy \
+             constraint: Member must satisfy enum value set: ["
+                .to_string(),
         ),
         (
             "an opt-in level in the wrong case",
             json!({"OptInLevel": "Account", "OptInType": "NotifyOnly"}),
-            "OptInLevel",
+            "ValidationException",
+            "1 validation error detected: Value at 'optInLevel' failed to satisfy \
+             constraint: Member must satisfy enum value set: ["
+                .to_string(),
         ),
         (
             "an opt-in type outside the value set",
             json!({"OptInLevel": ACCOUNT_LEVEL, "OptInType": "NotifySometimes"}),
-            "OptInType",
+            "ValidationException",
+            "1 validation error detected: Value at 'optInType' failed to satisfy \
+             constraint: Member must satisfy enum value set: ["
+                .to_string(),
         ),
         (
             "an absent required opt-in type",
             json!({"OptInLevel": ACCOUNT_LEVEL}),
-            "OptInType",
+            "IllegalArgumentException",
+            "OptInType failed to satisfy constraint: Member must not be null".to_string(),
         ),
         (
             "a notification ARN that is not an ARN",
@@ -677,7 +704,8 @@ async fn a_configuration_that_breaks_a_modeled_constraint_records_nothing() {
                 "OptInType": "NotifyOnly",
                 "NotificationArn": "quota-alerts",
             }),
-            "NotificationArn",
+            "IllegalArgumentException",
+            "NotificationArn failed to satisfy constraint: ".to_string(),
         ),
         (
             "a notification ARN whose account id is not twelve digits",
@@ -686,11 +714,12 @@ async fn a_configuration_that_breaks_a_modeled_constraint_records_nothing() {
                 "OptInType": "NotifyOnly",
                 "NotificationArn": "arn:aws:notifications::123:configuration/quota-alerts",
             }),
-            "NotificationArn",
+            "IllegalArgumentException",
+            "NotificationArn failed to satisfy constraint: ".to_string(),
         ),
     ];
 
-    for (case, request, member) in rows {
+    for (case, request, expected_code, clause) in rows {
         let engine = emulator();
         let client = client(&engine, "us-east-1");
 
@@ -700,13 +729,12 @@ async fn a_configuration_that_breaks_a_modeled_constraint_records_nothing() {
             "case {case}: expected {request} to be refused with HTTP {CLIENT_FAULT}, got {status}"
         );
         assert_eq!(
-            code, "IllegalArgumentException",
-            "case {case}: expected {request} to be refused as IllegalArgumentException, got {code}"
+            code, expected_code,
+            "case {case}: expected {request} to be refused as {expected_code}, got {code}"
         );
         assert!(
-            message.starts_with(member),
-            "case {case}: the refusal must name the member that was wrong ({member}), \
-             got {message:?}"
+            message.starts_with(&clause),
+            "case {case}: the refusal must state {clause:?}, got {message:?}"
         );
 
         // Nothing was recorded, so the read still reports an account that never opted

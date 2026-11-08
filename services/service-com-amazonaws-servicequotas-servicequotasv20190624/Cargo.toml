@@ -21,6 +21,12 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# `service-common` carries the workspace's ONE rendering of AWS's
+# `N validation error(s) detected: ` envelope (`validation_message::envelope_over`),
+# which this service's request-validation front end puts its OWN clauses in
+# (`src/service.rs`): the count word and the separator must not differ between two
+# services.
+service-common = { path = "../common" }
 # Pagination tokens: base64 of the position a token names, over the standard
 # alphabet the modelled `NextToken` pattern allows.
 base64 = "0.22"

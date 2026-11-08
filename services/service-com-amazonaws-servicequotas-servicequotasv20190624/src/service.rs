@@ -68,16 +68,18 @@
 //! ## Three validators, three wordings
 //!
 //! Service Quotas does not answer every constraint violation with one code or one
-//! sentence, and which refusal a member gets is RECORDED behaviour rather than anything
-//! the model states — `ValidationException` is not in this service's model at all. The
-//! refusal a member gets is chosen in [`FRONT_END_VALIDATED_MEMBERS`] (the
-//! request-validation front end, which answers `ValidationException` and names the
-//! member as the wire spells it) and [`SERVICE_OWN_VALIDATED_MEMBERS`] (this service's
-//! own application layer, which answers the modelled `IllegalArgumentException` with
-//! one fixed illegal-value sentence), where the recordings behind each split are cited;
-//! every other member keeps the modelled `IllegalArgumentException` with the
-//! member-and-rule clause. The message FORM of each recording is what tells the three
-//! apart.
+//! sentence, and which refusal a violation gets is RECORDED behaviour rather than
+//! anything the model states — `ValidationException` is not in this service's model at
+//! all. The refusal is chosen in [`front_end_validated`] (the request-validation front
+//! end, which answers `ValidationException`, names the member as the wire spells it and
+//! wraps its clauses in AWS's `N validation error(s) detected: ` envelope — the members
+//! of [`FRONT_END_VALIDATED_MEMBERS`], and every value outside an enumerated type's
+//! value set, whichever member carries it) and [`SERVICE_OWN_VALIDATED_MEMBERS`] (this
+//! service's own application layer, which answers the modelled
+//! `IllegalArgumentException` with one fixed illegal-value sentence), where the
+//! recordings behind each split are cited; every other member keeps the modelled
+//! `IllegalArgumentException` with the member-and-rule clause and no envelope. The
+//! message FORM of each recording is what tells the three apart.
 //! A refusal a HANDLER makes after reading a request the model accepts — a quota that
 //! is not adjustable, a desired value that is not an increase — is a semantic refusal
 //! and stays the modelled `IllegalArgumentException` wherever it is raised.
@@ -136,6 +138,10 @@ const REFUSAL_STATUS: u16 = 400;
 /// wherever this service declares it — `GetRequestedServiceQuotaChange` and
 /// `CreateSupportCase` both take a `RequestId` — instead of being keyed to one
 /// operation or to one recorded request.
+///
+/// A violation of an ENUMERATED type's value set belongs to the front end whichever
+/// member carries it, which is a property of the CONSTRAINT rather than of a member —
+/// see [`front_end_validated`].
 const FRONT_END_VALIDATED_MEMBERS: &[&str] = &["RequestId"];
 
 /// The clause joining the member a caller got wrong to the rule it broke, as AWS
@@ -322,10 +328,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // spelling the framework's walk reports.
         match refusal {
             Refusal::Invalid(violations) if violations.first().is_some_and(front_end_owned) => {
-                let first = violations.first()?;
                 Some(Refused {
                     code: VALIDATION_EXCEPTION_CODE.to_string(),
-                    message: front_end_message(first),
+                    message: front_end_message(violations)?,
                 })
             }
             Refusal::Invalid(violations) => Some(Refused {
@@ -488,17 +493,22 @@ enum ConstraintRefusal {
 }
 
 impl ConstraintRefusal {
-    /// The refusal `violation` gets: the front end's for a member it owns, this
+    /// The refusal `violations` get: the front end's for a violation it owns, this
     /// service's own for every other.
-    fn of(violation: &Violation, input_schema: &Schema) -> Self {
-        match modelled_member_name(&violation.path, input_schema) {
-            Some(member) if FRONT_END_VALIDATED_MEMBERS.contains(&member.as_str()) => {
-                Self::FrontEnd(crate::scaffolded::ValidationException::new(
-                    front_end_message(violation),
-                ))
-            }
-            _ => Self::Modelled(illegal_argument(refusal_message(violation, input_schema))),
-        }
+    ///
+    /// WHICH refusal is a property of the FIRST violation — AWS names one member per
+    /// refusal and the walk visits members in schema order — while the front end's own
+    /// message states every violation the walk reported, inside the count envelope it
+    /// always sends.
+    fn of(violations: &[Violation], input_schema: &Schema) -> Option<Self> {
+        let first = violations.first()?;
+        Some(if front_end_validated(first, input_schema) {
+            Self::FrontEnd(crate::scaffolded::ValidationException::new(
+                front_end_message(violations)?,
+            ))
+        } else {
+            Self::Modelled(illegal_argument(refusal_message(first, input_schema)))
+        })
     }
 
     /// The wire error code (`__type`) this refusal carries.
@@ -566,26 +576,41 @@ fn modelled_refusal<Op: Operation>(
                     // `@sensitive`.
                     sensitive: false,
                 };
-                return Some(ConstraintRefusal::of(&absent, Op::INPUT_SCHEMA));
+                return ConstraintRefusal::of(&[absent], Op::INPUT_SCHEMA);
             }
             // Any other codec failure is not a refusal this service rewords.
             Err(_) => return None,
         }
     };
     let violations = constraints::validate(&input, Op::INPUT_SCHEMA);
-    // AWS names ONE member per refusal, and the walk visits members in schema order,
-    // so "the first" is a property of the input shape rather than of the request.
-    let first = violations.first()?;
-    Some(ConstraintRefusal::of(first, Op::INPUT_SCHEMA))
+    ConstraintRefusal::of(&violations, Op::INPUT_SCHEMA)
 }
 
-/// Whether `violation` names a member the request-validation front end owns, placed
-/// without an input schema: each listed member name is lowerCamel-ed onto the path the
-/// framework's walk reports, so the model is still the source of the spelling.
+/// Whether the request-validation FRONT END owns the refusal of `violation`, rather than
+/// this service's own application layer.
+///
+/// It owns two things. The members listed in [`FRONT_END_VALIDATED_MEMBERS`], and — for
+/// any member at all — a value outside an ENUMERATED type's value set: a value the API's
+/// own types cannot hold is rejected while the request is being read, so it is a
+/// malformed request rather than an argument this service's semantics refused. That is
+/// what [`crate::scaffolded::ValidationException`] tells a caller apart from the modelled
+/// `IllegalArgumentException`, and the clause it carries reports the value set the member
+/// does admit.
+fn front_end_validated(violation: &Violation, input_schema: &Schema) -> bool {
+    matches!(violation.kind, ViolationKind::EnumValue(_))
+        || modelled_member_name(&violation.path, input_schema)
+            .is_some_and(|member| FRONT_END_VALIDATED_MEMBERS.contains(&member.as_str()))
+}
+
+/// Whether `violation` is one the request-validation front end owns, placed without an
+/// input schema: a violation of an enumerated value set, or one of the listed member
+/// names lowerCamel-ed onto the path the framework's walk reports, so the model is still
+/// the source of the spelling.
 fn front_end_owned(violation: &Violation) -> bool {
-    FRONT_END_VALIDATED_MEMBERS
-        .iter()
-        .any(|member| constraints::path::member(member) == violation.path)
+    matches!(violation.kind, ViolationKind::EnumValue(_))
+        || FRONT_END_VALIDATED_MEMBERS
+            .iter()
+            .any(|member| constraints::path::member(member) == violation.path)
 }
 
 /// Whether `violation` is an illegal VALUE of a member this service checks in its own
@@ -602,11 +627,21 @@ fn service_own_owned(violation: &Violation, input_schema: &Schema) -> bool {
             .is_some_and(|member| SERVICE_OWN_VALIDATED_MEMBERS.contains(&member.as_str()))
 }
 
-/// How the request-validation front end words a value that broke a rule the model
-/// declares: the member path as the WIRE spells it (the validating walk's lowerCamel,
-/// which is the spelling the recorded message carries) and the rule it broke —
-/// `Value at 'requestId' failed to satisfy constraint: Member must satisfy regular
-/// expression pattern: …`.
+/// How the request-validation front end words the violations a request carries: AWS's
+/// count envelope around one clause per violation, each naming
+/// the member path as the WIRE spells it (the validating walk's lowerCamel, which is the
+/// spelling the recorded message carries) and the rule it broke — `1 validation error
+/// detected: Value at 'requestId' failed to satisfy constraint: Member must satisfy
+/// regular expression pattern: …`.
+///
+/// The envelope itself is the workspace's one rendering of it
+/// ([`::service_common::validation_message::envelope_over`]): the count word and the
+/// separator are the same for every service, and only the CLAUSES inside are this
+/// service's, which is why they are stated here and the envelope is not. `None` only for
+/// no violation at all, which is not a refusal.
+///
+/// The count is what makes the envelope worth sending: a client that reads it knows how
+/// many clauses follow, so the one-violation and many-violation forms stay distinct.
 ///
 /// The rejected value is NOT quoted back: a refusal states the rule, and echoing input
 /// into a 400 body puts caller-supplied bytes in every client log. The one value a
@@ -615,7 +650,14 @@ fn service_own_owned(violation: &Violation, input_schema: &Schema) -> bool {
 ///
 /// A violation this cannot render a requirement for keeps the framework's own sentence,
 /// which already names both the path and the rule.
-fn front_end_message(violation: &Violation) -> String {
+fn front_end_message(violations: &[Violation]) -> Option<String> {
+    let clauses: Vec<String> = violations.iter().map(front_end_clause).collect();
+    ::service_common::validation_message::envelope_over(&clauses)
+}
+
+/// One clause of [`front_end_message`]: the member path as the WIRE spells it and the
+/// rule the value broke.
+fn front_end_clause(violation: &Violation) -> String {
     let Some(requirement) = requirement(violation) else {
         return violation.message();
     };

@@ -777,11 +777,12 @@ pub struct TagCeilingExceeded {
 /// Why an `ExclusionList` a write carries names something this service publishes no
 /// quota for.
 ///
-/// Both arms are the model's `NoSuchResourceException` ("The specified resource does
-/// not exist"): an exclusion names the quota it excludes by `(ServiceCode,
-/// QuotaCode)`, so a pair no quota answers to names a resource that does not exist.
-/// The arm decides which of the two facts the refusal states, and the sentence each is
-/// stated in is the crate's one wording for that fact
+/// An exclusion names the quota it excludes by `(ServiceCode, QuotaCode)`, and the arm
+/// decides which of the two facts the refusal states: a key naming no service at all is
+/// the model's `NoSuchResourceException` ("The specified resource does not exist"), while
+/// a code under a service the catalog DOES publish is a bad argument in the map the call
+/// carried and is the model's `IllegalArgumentException`. The sentence each is stated in
+/// is the crate's one wording for that fact
 /// ([`crate::service::refusals::exclusion_refusal_message`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExclusionRefusal {
@@ -998,8 +999,8 @@ impl ComAmazonawsServicequotasServicequotasv20190624State {
     ///
     /// An exclusion names the quota it excludes by `(ServiceCode, QuotaCode)`, so
     /// every entry has to answer to a quota this service publishes: a key the service
-    /// catalog does not hold, or a code that service publishes no quota under, names a
-    /// resource that does not exist and is refused ([`ExclusionRefusal`]) instead of
+    /// catalog does not hold, or a code that service publishes no quota under, is
+    /// refused ([`ExclusionRefusal`], whose arm decides in which error class) instead of
     /// recorded. A service named with no codes of its own excludes that service's
     /// quotas, so it resolves on the key alone.
     ///
@@ -2434,12 +2435,16 @@ fn derive_id(seed: &str, now: SystemTime) -> String {
 /// A quota's `Utilization`: the account's current usage / the value in force * 100, the
 /// formula the model's `UtilizationPct` documents.
 ///
-/// Service Quotas tracks a quota's usage through the CloudWatch usage metric that
-/// quota publishes, so there are two reasons a record carries no `Utilization` at all
-/// rather than a number: the quota publishes NO usage metric, so there is nothing to
-/// count it by, or it publishes one no reader of [`usage`] can count, so this emulator
-/// holds no source for it. A reading of zero, on the other hand, is a measurement —
-/// the account holds none of what the quota permits — and is reported as 0 %.
+/// Service Quotas tracks a quota's usage through the CloudWatch usage metric that quota
+/// publishes, and this emulator's own state is the whole account — so a quota whose usage
+/// NOTHING here meters (it publishes no usage metric, or one no reader of [`usage`]
+/// counts) is a quota the account holds none of what it permits, and reads 0 %. Every
+/// record of a report therefore carries a percentage, which is the figure the report
+/// exists to deliver.
+///
+/// The one case that reports nothing is a count that was STARTED and could not be
+/// finished — the owning service did not answer, or answered only part of its listing:
+/// the resources are there to be counted, so any number for them would be invented.
 ///
 /// A value in force of zero (AWS publishes several, e.g. an opt-in instance family
 /// whose default is 0) is no denominator to divide by: with nothing in use, none of
@@ -2447,13 +2452,17 @@ fn derive_id(seed: &str, now: SystemTime) -> String {
 /// force has no finite percentage, so that case reports nothing rather than an invented
 /// number.
 fn utilization_pct(default: &DefaultQuota, applied: f64, usage: &QuotaUsage) -> Option<f64> {
-    // No usage metric, no usage source, no percentage to report — and the same for a
-    // metric nothing in this emulator can count.
-    let usage = usage.reading(default.usage_metric.as_ref()?)?;
+    let used = match default.usage_metric.as_ref() {
+        // A quota a reader does meter: its reading, and nothing at all when the count
+        // could not be completed.
+        Some(metric) if usage.metered_by_a_reader(metric) => usage.reading(metric)?,
+        // A quota nothing here meters: the account holds none of what it counts.
+        _ => 0.0,
+    };
     if applied <= 0.0 {
-        return (usage <= 0.0).then_some(0.0);
+        return (used <= 0.0).then_some(0.0);
     }
-    Some(usage / applied * 100.0)
+    Some(used / applied * 100.0)
 }
 
 /// Report order for two utilization records: utilization descending, the records

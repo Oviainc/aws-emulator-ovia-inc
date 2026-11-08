@@ -8,9 +8,10 @@
 //! limit" (`QuotaUtilizationInfo$Utilization`) — where the usage is counted in the
 //! resources the quota's own CloudWatch usage metric meters, read from the service that
 //! owns them. So the figure moves with what the account holds: it is not a constant, a
-//! quota whose usage this emulator holds no source for reports no `Utilization` at all
-//! rather than a canned percentage, and the documented "highest utilization first"
-//! ordering really does put the account's hottest quota on the first page.
+//! quota nothing here meters reads 0 % because the account holds none of what it
+//! permits, a count that was STARTED and could not be finished reports no `Utilization`
+//! rather than an invented one, and the documented "highest utilization first" ordering
+//! really does put the account's hottest quota on the first page.
 //!
 //! That rule spans two services, so both are mounted on ONE engine: Service Quotas is
 //! driven over the wire the way a client drives it, and EC2 — which owns the VPCs and
@@ -537,43 +538,63 @@ async fn a_vcpu_quota_reports_the_vcpus_of_the_accounts_running_instances() {
     );
 }
 
-/// A quota whose usage this emulator holds no source for reports no `Utilization` at
-/// all: a percentage is reported exactly for the quotas that were counted, and never as
-/// a stand-in for a count nobody made.
+/// EVERY record of a report carries a `Utilization`, whichever way its usage is metered:
+/// a quota nothing here meters is one the account holds none of what it permits, so it
+/// reads 0 % rather than being published without the figure the report exists to deliver.
+///
+/// The rows span the three ways a quota's usage is reached: a quota that publishes no
+/// usage metric at all, one whose metric no reader of this emulator meters, and one a
+/// reader does meter and counted.
 #[tokio::test]
-async fn a_quota_with_no_usage_source_reports_no_utilization() {
+async fn every_record_carries_a_utilization_however_its_usage_is_metered() {
     let emulator = Emulator::new();
     let records = report_records(&emulator, "eu-central-1").await;
 
+    let mut unmetered = 0usize;
     for record in &records {
         let case = format!(
             "{}/{}",
             record["ServiceCode"].as_str().unwrap_or_default(),
             record["QuotaCode"].as_str().unwrap_or_default()
         );
-        // A quota publishes a usage metric or it does not; without one there is nothing
-        // to count it by, so a `Utilization` can only ever accompany a `Namespace`.
+        // A percentage on every record, and never a negative one: a utilization is a
+        // share of the value in force.
+        let reported = utilization(record, &case);
+        assert!(
+            reported >= 0.0,
+            "case {case}: expected a percentage, got {reported} in {record}"
+        );
+        // A quota publishes a usage metric or it does not; without one nothing meters
+        // it, so the account holds none of what it counts.
         if record["Namespace"].is_null() {
-            assert!(
-                record["Utilization"].is_null(),
-                "case {case}: a quota with no usage metric cannot report a utilization, \
-                 got {record}"
+            unmetered += 1;
+            assert_eq!(
+                reported, 0.0,
+                "case {case}: a quota with no usage metric holds none of what it permits, \
+                 so it reads 0 %, got {record}"
             );
         }
     }
+    assert!(
+        unmetered > 0,
+        "case setup: the catalog must publish quotas with no usage metric, got \
+         {} records",
+        records.len()
+    );
 
-    // Lambda's concurrent executions are metered by a usage metric, and nothing in this
-    // emulator holds how many invocations are in flight — so that quota is reported
-    // without a utilization rather than with a canned zero.
-    let case = "a usage metric with no source in this emulator";
+    // Lambda's concurrent executions ARE metered by a usage metric, and no reader of
+    // this emulator counts invocations in flight — so nothing here holds any, and the
+    // quota reads 0 % too.
+    let case = "a usage metric no reader of this emulator meters";
     let concurrent_executions = record_for(&records, "lambda", "L-B99A9384");
     assert!(
         !concurrent_executions["Namespace"].is_null(),
         "case {case}: the quota must publish its usage metric, got {concurrent_executions}"
     );
-    assert!(
-        concurrent_executions["Utilization"].is_null(),
-        "case {case}: expected no utilization, got {concurrent_executions}"
+    assert_eq!(
+        utilization(concurrent_executions, case),
+        0.0,
+        "case {case}: expected 0 %, got {concurrent_executions}"
     );
 
     // And the quotas EC2 IS the source for carry one, counted at this moment, in an

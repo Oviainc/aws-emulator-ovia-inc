@@ -24,7 +24,16 @@
 //! * a call that resolves one quota increase request by its `RequestId` is answered with
 //!   [`NO_SUCH_QUOTA_REQUEST_MESSAGE`];
 //! * a quota value that is not an increase is answered by [`not_an_increase_message`],
-//!   which puts the two bounds in the order the service checks them.
+//!   which puts the two bounds in the order the service checks them;
+//! * a `NextToken` that names no position in the listing it was presented to is answered
+//!   with [`INVALID_PAGINATION_TOKEN_MESSAGE`];
+//! * a quota the catalog publishes as not adjustable is answered with
+//!   [`QUOTA_NOT_ADJUSTABLE_MESSAGE`], and a quota plane that already has a request
+//!   awaiting a decision with [`ONE_OPEN_REQUEST_MESSAGE`];
+//! * an Automatic Management exclusion entry naming a quota under a service the catalog
+//!   does publish is answered by [`excluded_quota_absent_message`], which names the pair
+//!   the entry spelled — the one sentence here whose variable parts come from the
+//!   request, because this refusal is about the ENTRY the caller has to correct.
 //!
 //! The sentence for a value this service's own application layer will not accept lives
 //! beside the validator that states it, as [`super::ILLEGAL_VALUE_MESSAGE`].
@@ -56,6 +65,33 @@ pub const QUOTA_AND_SERVICE_ABSENT_MESSAGE: &str =
 pub const NO_SUCH_QUOTA_REQUEST_MESSAGE: &str = "The request failed because the specified \
                                                  requestId to increase the service quota \
                                                  does not exist.";
+
+/// How Service Quotas states that a `NextToken` names no position in the listing it was
+/// presented to, for the modelled `InvalidPaginationTokenException`.
+///
+/// Fixed text, shared by every paginated listing and by the utilization report: the
+/// token is not echoed back, and the sentence tells the caller where a usable token
+/// comes from instead of describing what this token failed.
+pub const INVALID_PAGINATION_TOKEN_MESSAGE: &str =
+    "You specified an invalid value for nextToken. You must get the value from the \
+     response to the previous API call.";
+
+/// How Service Quotas states that the quota a write named is not one AWS lets an account
+/// adjust, for the modelled `IllegalArgumentException`.
+///
+/// Fixed text: neither the `ServiceCode` nor the `QuotaCode` the caller named appears in
+/// it, so a client matching the sentence to decide that the quota can never be raised
+/// matches whatever quota it asked about.
+pub const QUOTA_NOT_ADJUSTABLE_MESSAGE: &str =
+    "The request failed because the specified quota is not adjustable.";
+
+/// How Service Quotas states that the quota plane a write named already has a request
+/// awaiting a decision, for the modelled `ResourceAlreadyExistsException`.
+///
+/// Fixed text: the stored request's own id is NOT interpolated — it is a value this
+/// service minted, so a refusal carrying it reads differently on every call.
+pub const ONE_OPEN_REQUEST_MESSAGE: &str =
+    "Only one open service quota increase request is allowed per quota.";
 
 /// The fixed half of the refusal of a quota value below the quota's AWS default: the
 /// sentence ends with that default value.
@@ -119,12 +155,36 @@ pub fn quota_value_text(value: f64) -> String {
 /// How an Automatic Management write states that its `ExclusionList` names something this
 /// service publishes no quota for.
 ///
-/// An entry is keyed by a `ServiceCode` and names `QuotaCode`s under it, so the key that
-/// names no service states the service fact (the entry need not name a quota at all) and a
-/// code under a published service states the failed pair lookup.
-pub fn exclusion_refusal_message(refusal: &crate::state::ExclusionRefusal) -> &'static str {
+/// An entry is keyed by a `ServiceCode` and names `QuotaCode`s under it, so the two halves
+/// state two different facts — and the error SHAPE each is stated in follows the fact, as
+/// the handlers that call this choose it:
+///
+/// * a key naming no service at all is the service fact, in the fixed
+///   [`SERVICE_NOT_AVAILABLE_MESSAGE`], as the modelled `NoSuchResourceException`: the
+///   call is scoped to a service this endpoint serves no quotas for;
+/// * a code under a service the catalog DOES publish is a bad ARGUMENT, as the modelled
+///   `IllegalArgumentException` naming the pair the entry spelled
+///   ([`excluded_quota_absent_message`]): the exclusion the caller has to correct is one
+///   entry of a map it sent, so the refusal names which one.
+pub fn exclusion_refusal_message(refusal: &crate::state::ExclusionRefusal) -> String {
     match refusal {
-        crate::state::ExclusionRefusal::UnknownService { .. } => SERVICE_NOT_AVAILABLE_MESSAGE,
-        crate::state::ExclusionRefusal::UnknownQuota { .. } => QUOTA_AND_SERVICE_ABSENT_MESSAGE,
+        crate::state::ExclusionRefusal::UnknownService { .. } => {
+            SERVICE_NOT_AVAILABLE_MESSAGE.to_string()
+        }
+        crate::state::ExclusionRefusal::UnknownQuota {
+            service_code,
+            quota_code,
+        } => excluded_quota_absent_message(service_code, quota_code),
     }
+}
+
+/// How Service Quotas states that an `ExclusionList` entry names no quota of a service it
+/// does publish, for the modelled `IllegalArgumentException`.
+///
+/// The fixed text is the sentence around the two names; the variable parts are the entry
+/// itself — the map KEY (the excluded service) and the `QuotaCode` listed under it, which
+/// the exclusion list calls a limit code. They come from the request because the refusal
+/// says which of the entries the caller sent is the one to correct.
+pub fn excluded_quota_absent_message(service_code: &str, quota_code: &str) -> String {
+    format!("Service code '{service_code}' with limit code '{quota_code}' does not exist")
 }

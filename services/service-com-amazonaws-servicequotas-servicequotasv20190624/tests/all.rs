@@ -87,6 +87,8 @@ mod quota_utilization_usage;
 mod quota_workflow;
 #[path = "all/quotas_catalog.rs"]
 mod quotas_catalog;
+#[path = "all/refusal_message_contract.rs"]
+mod refusal_message_contract;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
 #[path = "all/report_token_before_status.rs"]

@@ -213,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ListRequestedServiceQuotaChangeHistoryByQuotaErrorModeled::InvalidPaginationTokenException(
                 InvalidPaginationTokenException {
                     message: Some(
-                        "NextToken does not name a position in this listing".to_string(),
+                        crate::service::refusals::INVALID_PAGINATION_TOKEN_MESSAGE.to_string(),
                     ),
                 },
             )

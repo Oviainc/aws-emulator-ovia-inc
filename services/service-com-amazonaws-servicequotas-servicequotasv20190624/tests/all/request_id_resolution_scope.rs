@@ -290,8 +290,9 @@ async fn an_endpoint_resolves_every_request_id_it_names() {
             .to_string();
 
         // The other endpoint asks for the same quota while the first request is still
-        // awaiting a decision: on one account-wide plane that is refused, and the
-        // refusal names the open request.
+        // awaiting a decision: on one account-wide plane that is refused, in the
+        // service's fixed sentence for the fact — which names no request, so which
+        // request holds the plane is read back through the endpoint instead.
         if row.global {
             let (status, code, message) =
                 refusal(&other, row.service_code, &quota_code, default_value * 3.0).await;
@@ -303,22 +304,18 @@ async fn an_endpoint_resolves_every_request_id_it_names() {
                 row.why,
                 row.read_at[0]
             );
-            let named = named_request_id(&message).unwrap_or_else(|| {
-                panic!(
-                    "case {}: the refusal must name the open request, got {message:?}",
-                    row.why
-                )
-            });
-            let seen = read_request(&other, &named).await;
             assert_eq!(
-                seen["Id"].as_str(),
-                Some(named.as_str()),
-                "case {}: the endpoint that named request {named} must resolve it, got {seen}",
+                named_request_id(&message),
+                None,
+                "case {}: the refusal must name no request of this service, got {message:?}",
                 row.why
             );
+            let seen = read_request(&other, &first_id).await;
             assert_eq!(
-                named, first_id,
-                "case {}: the refusal must name the open request {first_id}, got {named}",
+                seen["Id"].as_str(),
+                Some(first_id.as_str()),
+                "case {}: the endpoint that was refused must resolve the request {first_id} \
+                 holding the plane, got {seen}",
                 row.why
             );
         } else {

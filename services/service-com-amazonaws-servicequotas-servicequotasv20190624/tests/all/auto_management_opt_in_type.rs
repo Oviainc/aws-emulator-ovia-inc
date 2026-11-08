@@ -13,9 +13,10 @@
 //! The rule asserted, over a table of values generated from the model's own value list:
 //! which values an enum-valued member accepts is decided by the ENUM the model
 //! declares, so a value OUTSIDE it — a member mis-cased, misspelt, padded, the empty
-//! string, or a mode the model never declared — is what gets refused, with this
-//! service's modelled `IllegalArgumentException` naming the member, and the refused call
-//! records nothing. It is a property of the member, so BOTH writers are driven: the
+//! string, or a mode the model never declared — is what gets refused, as the
+//! `ValidationException` the request-validation front end answers a value the API's own
+//! types cannot hold, and the refused call records nothing. It is a property of the
+//! member, so BOTH writers are driven: the
 //! FULL writer (`StartAutoManagement`) and the PARTIAL one (`UpdateAutoManagement`) over
 //! a running configuration, which must keep the mode it was started on.
 //!
@@ -75,9 +76,11 @@ async fn start_running(caller: &Client, case: &str, mode: &str) {
 }
 
 /// A value OUTSIDE the `OptInType` enum is what the member refuses — on BOTH writers,
-/// with the modelled `IllegalArgumentException` naming the member — and the refused call
-/// records nothing: an account that had nothing running still reports `DISABLED` with no
-/// mode, and a running configuration keeps the mode it was started on.
+/// with the `ValidationException` the request-validation front end answers a value the
+/// enumerated type cannot hold, naming the member as the wire spells it and reporting
+/// the value set it does admit — and the refused call records nothing: an account that
+/// had nothing running still reports `DISABLED` with no mode, and a running
+/// configuration keeps the mode it was started on.
 ///
 /// The rows are GENERATED from the model's own value list, one near-miss of each form a
 /// caller gets wrong — the member lower-cased, upper-cased, suffixed, padded with a
@@ -122,13 +125,16 @@ async fn a_value_outside_the_opt_in_type_enum_is_refused_by_both_writers() {
                  got {status}"
             );
             assert_eq!(
-                code, "IllegalArgumentException",
-                "case {case}: expected IllegalArgumentException, got {code}"
+                code, "ValidationException",
+                "case {case}: expected ValidationException, got {code}"
             );
             assert!(
-                message.starts_with("OptInType"),
-                "case {case}: the refusal must name the member that was wrong, got \
-                 {message:?}"
+                message.starts_with(
+                    "1 validation error detected: Value at 'optInType' failed to satisfy \
+                     constraint: Member must satisfy enum value set: ["
+                ),
+                "case {case}: the refusal must name the member that was wrong and the \
+                 value set it admits, got {message:?}"
             );
 
             // The refusal recorded nothing: either the account still has no

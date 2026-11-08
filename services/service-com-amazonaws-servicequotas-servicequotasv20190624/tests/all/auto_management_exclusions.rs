@@ -11,10 +11,12 @@
 //!
 //! The rule asserted, over a TABLE of exclusion lists rather than one case: an
 //! exclusion names the quota it excludes by `(ServiceCode, QuotaCode)`, so a write that
-//! carries a name no quota of this service answers to is refused with the modelled
-//! `NoSuchResourceException` — in the same words the catalog states the same fact in —
-//! and records nothing, while a list whose every entry resolves is stored and reported
-//! with the `QuotaName` the catalog holds for each code.
+//! carries a name no quota of this service answers to is refused and records nothing —
+//! a key naming no service at all with the modelled `NoSuchResourceException`, in the
+//! same words the catalog states that fact in, and a code a published service holds no
+//! quota under with the modelled `IllegalArgumentException`, naming the service code and
+//! the limit code of the entry that resolved to nothing — while a list whose every entry
+//! resolves is stored and reported with the `QuotaName` the catalog holds for each code.
 //!
 //! Both writers of the member are driven: the FULL writer (`StartAutoManagement`) and
 //! the PARTIAL one (`UpdateAutoManagement`) over a running configuration, whose stored
@@ -29,6 +31,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_servicequotas_servicequotasv20190624::ops::types::{
     OPT_IN_LEVEL_VALUES, OPT_IN_TYPE_VALUES,
 };
+use service_com_amazonaws_servicequotas_servicequotasv20190624::service::refusals::excluded_quota_absent_message;
 use service_com_amazonaws_servicequotas_servicequotasv20190624::state::{
     OPT_IN_STATUS_DISABLED, OPT_IN_STATUS_ENABLED,
 };
@@ -89,29 +92,33 @@ async fn answer(client: &Client, operation: &str, body: &Value) -> (u16, String,
     (status, member("__type"), member("Message"))
 }
 
-/// How the CATALOG states that `unresolvable` names nothing it holds: the `Message` of
-/// the `NoSuchResourceException` the matching catalog read answers with. The exclusion
-/// writers must state the same fact in the same words.
-async fn catalog_message(client: &Client, unresolvable: Unresolvable) -> String {
-    let (operation, request) = match unresolvable {
-        Unresolvable::Service(service_code) => (
-            "ListAWSDefaultServiceQuotas",
-            json!({ "ServiceCode": service_code }),
-        ),
+/// How the service states that `unresolvable` names nothing it holds: the error code and
+/// the `Message` an exclusion write must answer with.
+///
+/// A key naming no service is the SAME fact a catalog listing scoped to that code states,
+/// so it is read back off the catalog instead of being spelled a second time here. A code
+/// under a service the catalog does publish is a bad argument in the map the call carried,
+/// and names the entry the caller has to correct.
+async fn expected_refusal(client: &Client, unresolvable: Unresolvable) -> (&'static str, String) {
+    match unresolvable {
+        Unresolvable::Service(service_code) => {
+            let request = json!({ "ServiceCode": service_code });
+            let (status, code, message) =
+                answer(client, "ListAWSDefaultServiceQuotas", &request).await;
+            assert_eq!(
+                (status, code.as_str()),
+                (CLIENT_FAULT, "NoSuchResourceException"),
+                "case catalog {unresolvable:?}: expected the catalog listing to refuse a \
+                 service code it does not hold with HTTP {CLIENT_FAULT} \
+                 NoSuchResourceException, got {status} {code} {message:?}"
+            );
+            ("NoSuchResourceException", message)
+        }
         Unresolvable::Quota(service_code, quota_code) => (
-            "GetAWSDefaultServiceQuota",
-            json!({ "ServiceCode": service_code, "QuotaCode": quota_code }),
+            "IllegalArgumentException",
+            excluded_quota_absent_message(service_code, quota_code),
         ),
-    };
-    let (status, code, message) = answer(client, operation, &request).await;
-    assert_eq!(
-        (status, code.as_str()),
-        (CLIENT_FAULT, "NoSuchResourceException"),
-        "case catalog {unresolvable:?}: expected {operation} to refuse a name the catalog \
-         does not hold with HTTP {CLIENT_FAULT} NoSuchResourceException, got {status} \
-         {code} {message:?}"
-    );
-    message
+    }
 }
 
 /// One reported exclusion: the `QuotaCode` and the `QuotaName` beside it — each `None`
@@ -154,14 +161,14 @@ async fn configuration(client: &Client, case: &str) -> Value {
     body
 }
 
-/// Assert that `operation` refused `request` with the modelled
-/// `NoSuchResourceException` on this front end's client-fault status, stating exactly
-/// `expected`.
-async fn refused_as_no_such_resource(
+/// Assert that `operation` refused `request` with `expected_code` on this front end's
+/// client-fault status, stating exactly `expected`.
+async fn refused_with(
     client: &Client,
     case: &str,
     operation: &str,
     request: &Value,
+    expected_code: &str,
     expected: &str,
 ) {
     let (status, code, message) = answer(client, operation, request).await;
@@ -171,8 +178,8 @@ async fn refused_as_no_such_resource(
          with {message:?}"
     );
     assert_eq!(
-        code, "NoSuchResourceException",
-        "case {case}: expected NoSuchResourceException, got {code} with {message:?}"
+        code, expected_code,
+        "case {case}: expected {expected_code}, got {code} with {message:?}"
     );
     assert_eq!(
         message, expected,
@@ -245,7 +252,7 @@ async fn an_exclusion_that_names_no_quota_is_refused_and_records_nothing() {
         // with no configuration at all.
         let start_engine = emulator();
         let start_client = client(&start_engine, "us-east-1");
-        let expected = catalog_message(&start_client, unresolvable).await;
+        let (expected_code, expected) = expected_refusal(&start_client, unresolvable).await;
 
         let start_case = format!("StartAutoManagement {case}");
         let request = json!({
@@ -253,11 +260,12 @@ async fn an_exclusion_that_names_no_quota_is_refused_and_records_nothing() {
             "OptInType": OPT_IN_TYPE,
             "ExclusionList": exclusion_request(exclusions),
         });
-        refused_as_no_such_resource(
+        refused_with(
             &start_client,
             &start_case,
             "StartAutoManagement",
             &request,
+            expected_code,
             &expected,
         )
         .await;
@@ -292,11 +300,12 @@ async fn an_exclusion_that_names_no_quota_is_refused_and_records_nothing() {
         let running = configuration(&update_client, &update_case).await;
 
         let update = json!({ "ExclusionList": exclusion_request(exclusions) });
-        refused_as_no_such_resource(
+        refused_with(
             &update_client,
             &update_case,
             "UpdateAutoManagement",
             &update,
+            expected_code,
             &expected,
         )
         .await;
@@ -340,8 +349,15 @@ async fn an_update_with_nothing_running_states_that_before_resolving_names() {
         );
 
         let update = json!({ "ExclusionList": exclusion_request(exclusions) });
-        refused_as_no_such_resource(&client, &case, "UpdateAutoManagement", &update, &expected)
-            .await;
+        refused_with(
+            &client,
+            &case,
+            "UpdateAutoManagement",
+            &update,
+            "NoSuchResourceException",
+            &expected,
+        )
+        .await;
 
         let read = configuration(&client, &case).await;
         assert_eq!(

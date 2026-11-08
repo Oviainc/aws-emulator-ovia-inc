@@ -18,9 +18,12 @@
 //!
 //! An exclusion names the quota it excludes by `(ServiceCode, QuotaCode)`, so the
 //! exclusion list is RESOLVED against this service's catalog before any of it is
-//! recorded: a key naming no service, or a code that service publishes no quota under,
-//! names a resource that does not exist and is refused with the modelled
-//! `NoSuchResourceException` — see [`crate::state::ComAmazonawsServicequotasServicequotasv20190624State::resolved_exclusion_list`],
+//! recorded, and the fact the entry got wrong decides how it is refused: a key naming no
+//! service at all is the modelled `NoSuchResourceException`, while a code a published
+//! service holds no quota under is a bad argument in that map —
+//! `IllegalArgumentException`, naming the service code and the limit code of the entry
+//! that resolved to nothing. See
+//! [`crate::state::ComAmazonawsServicequotasServicequotasv20190624State::resolved_exclusion_list`],
 //! the rule `UpdateAutoManagement` applies to the same member. What resolves is stored
 //! in the order the caller named it, and each code is paired with its catalog
 //! `QuotaName` when the configuration is read back.
@@ -155,11 +158,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let exclusion_list = quotas_state
             .resolved_exclusion_list(input.exclusion_list)
             .map_err(|refusal| {
-                StartAutoManagementErrorModeled::NoSuchResourceException(NoSuchResourceException {
-                    message: Some(
-                        crate::service::refusals::exclusion_refusal_message(&refusal).to_string(),
-                    ),
-                })
+                // Which fact the entry got wrong decides the error class: a key naming
+                // no service is a resource that does not exist, while a code under a
+                // service the catalog does publish is a bad ARGUMENT — one entry of the
+                // map the caller sent, which the refusal names.
+                let message = Some(crate::service::refusals::exclusion_refusal_message(&refusal));
+                match refusal {
+                    crate::state::ExclusionRefusal::UnknownService { .. } => {
+                        StartAutoManagementErrorModeled::NoSuchResourceException(
+                            NoSuchResourceException { message },
+                        )
+                    }
+                    crate::state::ExclusionRefusal::UnknownQuota { .. } => {
+                        StartAutoManagementErrorModeled::IllegalArgumentException(
+                            IllegalArgumentException { message },
+                        )
+                    }
+                }
             })?;
 
         quotas_state.set_auto_management(crate::state::AutoManagementConfig {

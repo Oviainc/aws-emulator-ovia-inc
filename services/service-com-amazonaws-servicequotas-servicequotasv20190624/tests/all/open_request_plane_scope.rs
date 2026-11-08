@@ -24,6 +24,7 @@
 use std::time::Duration;
 
 use serde_json::{json, Value};
+use service_com_amazonaws_servicequotas_servicequotasv20190624::service::refusals::ONE_OPEN_REQUEST_MESSAGE;
 use service_com_amazonaws_servicequotas_servicequotasv20190624::state::{
     REQUEST_DECISION_DELAY, STATUS_APPROVED, STATUS_PENDING, SUPPORT_CASE_OPEN_DELAY,
 };
@@ -323,9 +324,17 @@ async fn an_open_request_blocks_the_whole_plane_it_was_made_on() {
                 row.why,
                 row.second_at
             );
+            assert_eq!(
+                message,
+                ONE_OPEN_REQUEST_MESSAGE,
+                "case {}: the refusal must state the service's fixed sentence for the \
+                 fact, got {message:?}",
+                row.why
+            );
             assert!(
-                message.contains(&first_id),
-                "case {}: the refusal must name the open request {first_id}, got {message:?}",
+                !message.contains(&first_id),
+                "case {}: the refusal must not name the open request {first_id}, got \
+                 {message:?}",
                 row.why
             );
         } else {

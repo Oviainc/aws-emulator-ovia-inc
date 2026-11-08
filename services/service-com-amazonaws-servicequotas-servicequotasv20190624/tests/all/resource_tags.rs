@@ -332,12 +332,12 @@ async fn every_other_member_keeps_its_own_validators_wording() {
         ),
         (
             // A member the request-validation FRONT END owns: another code, and
-            // another clause.
+            // another clause — inside AWS's count envelope.
             "a request id outside its pattern",
             "GetRequestedServiceQuotaChange",
             json!({"RequestId": "-leading-dash"}),
             "ValidationException",
-            "Value at 'requestId' failed to satisfy constraint: ",
+            "1 validation error detected: Value at 'requestId' failed to satisfy constraint: ",
         ),
     ];
 

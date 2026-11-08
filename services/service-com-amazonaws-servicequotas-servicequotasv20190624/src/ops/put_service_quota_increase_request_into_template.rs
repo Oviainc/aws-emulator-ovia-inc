@@ -216,13 +216,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if !adjustable {
+            // The crate's one sentence for that fact, shared with the write that asks
+            // for an increase outright: fixed text, carrying neither code the request
+            // named.
             return Err(
                 PutServiceQuotaIncreaseRequestIntoTemplateErrorModeled::IllegalArgumentException(
                     IllegalArgumentException {
-                        message: Some(format!(
-                            "QuotaCode '{}' of ServiceCode '{}' is not adjustable",
-                            input.quota_code, input.service_code
-                        )),
+                        message: Some(
+                            crate::service::refusals::QUOTA_NOT_ADJUSTABLE_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

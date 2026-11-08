@@ -15,10 +15,11 @@
 //!   The `@httpError` an error shape declares is not the status on the wire
 //!   ([`service_com_amazonaws_servicequotas_servicequotasv20190624::scaffolded::wire_http_status`]).
 //! * a request that breaks a rule the model declares is refused on HTTP 400, with the
-//!   error code of the validator that owns the member it names — the modelled
+//!   error code of the validator that owns the violation it names — the modelled
 //!   `IllegalArgumentException` for the members Service Quotas validates itself, and
-//!   `ValidationException` for the members its request-validation front end owns — and
-//!   a message naming that member and the constraint it failed.
+//!   `ValidationException`, inside AWS's `N validation error(s) detected: ` envelope,
+//!   for the violations its request-validation front end owns — and a message naming
+//!   the member and the constraint it failed.
 //!
 //! This suite carries its own client because it reads the whole response BODY (the
 //! `Message` member), while `quota_workflow`'s refusal helper reports only the status
@@ -214,13 +215,18 @@ async fn a_constraint_refusal_names_its_validator_the_member_and_the_rule() {
     // enumerated value set and `@required` — on several members and operations.
     //
     // The CODE column is the recorded split between the two validators (see
-    // `src/service.rs::FRONT_END_VALIDATED_MEMBERS`): `RequestId` is refused by the
-    // request-validation front end, as `ValidationException` naming the member the way
-    // the wire spells it; every other member is refused by Service Quotas itself, as
-    // the modelled `IllegalArgumentException` naming the member the way the MODEL
-    // spells it.
+    // `src/service.rs::front_end_validated`): `RequestId`, and a value outside an
+    // enumerated type's value set whichever member carries it, are refused by the
+    // request-validation front end — as `ValidationException`, naming the member the way
+    // the wire spells it and inside AWS's `N validation error(s) detected: ` count
+    // envelope; every other member is refused by Service Quotas itself, as the modelled
+    // `IllegalArgumentException` naming the member the way the MODEL spells it, with no
+    // envelope.
     const ILLEGAL: &str = "IllegalArgumentException";
     const VALIDATION: &str = "ValidationException";
+    // The envelope every front-end refusal opens with, for the one violation each row
+    // below carries.
+    const ONE_ERROR: &str = "1 validation error detected: ";
     let rows: Vec<(&str, &str, Value, &str, String)> = vec![
         (
             "a quota code outside its pattern",
@@ -249,9 +255,10 @@ async fn a_constraint_refusal_names_its_validator_the_member_and_the_rule() {
             VALIDATION,
             // `@pattern ^[0-9a-zA-Z][a-zA-Z0-9-]{1,128}$` — a different character class
             // from the two above, so the rule is not read off one member.
-            "Value at 'requestId' failed to satisfy constraint: Member must satisfy regular \
-             expression pattern: [0-9a-zA-Z][a-zA-Z0-9-]{1,128}"
-                .to_string(),
+            format!(
+                "{ONE_ERROR}Value at 'requestId' failed to satisfy constraint: Member must \
+                 satisfy regular expression pattern: [0-9a-zA-Z][a-zA-Z0-9-]{{1,128}}"
+            ),
         ),
         (
             // The same member on ANOTHER operation — one this emulator still answers
@@ -261,9 +268,10 @@ async fn a_constraint_refusal_names_its_validator_the_member_and_the_rule() {
             "CreateSupportCase",
             json!({"RequestId": "!!!not-a-valid-request-id!!!"}),
             VALIDATION,
-            "Value at 'requestId' failed to satisfy constraint: Member must satisfy regular \
-             expression pattern: [0-9a-zA-Z][a-zA-Z0-9-]{1,128}"
-                .to_string(),
+            format!(
+                "{ONE_ERROR}Value at 'requestId' failed to satisfy constraint: Member must \
+                 satisfy regular expression pattern: [0-9a-zA-Z][a-zA-Z0-9-]{{1,128}}"
+            ),
         ),
         (
             "a request id past its length maximum",
@@ -271,9 +279,10 @@ async fn a_constraint_refusal_names_its_validator_the_member_and_the_rule() {
             json!({"RequestId": over_long_request_id}),
             VALIDATION,
             // `@length 1..128`: the same member, a different constraint kind.
-            "Value at 'requestId' failed to satisfy constraint: Member must have length less \
-             than or equal to 128"
-                .to_string(),
+            format!(
+                "{ONE_ERROR}Value at 'requestId' failed to satisfy constraint: Member must \
+                 have length less than or equal to 128"
+            ),
         ),
         (
             "an absent request id",
@@ -282,8 +291,10 @@ async fn a_constraint_refusal_names_its_validator_the_member_and_the_rule() {
             VALIDATION,
             // An absent member is the one case a clause reports a value — the `null`
             // the request shape has, not anything the caller sent.
-            "Value null at 'requestId' failed to satisfy constraint: Member must not be null"
-                .to_string(),
+            format!(
+                "{ONE_ERROR}Value null at 'requestId' failed to satisfy constraint: Member \
+                 must not be null"
+            ),
         ),
         (
             "a service code past its length maximum",
@@ -337,12 +348,16 @@ async fn a_constraint_refusal_names_its_validator_the_member_and_the_rule() {
             "a status outside the enumerated set",
             HISTORY,
             json!({"ServiceCode": "vpc", "QuotaCode": "L-F678F1CE", "Status": "NOT_A_STATUS"}),
-            ILLEGAL,
+            // A value the enumerated type cannot hold is a malformed request, so the
+            // front end owns it whichever member carries it.
+            VALIDATION,
             // The `RequestStatus` enum: the refusal states the published value set,
             // which this row only pins the opening of — the members and their order are
             // the model's.
-            "Status failed to satisfy constraint: Member must satisfy enum value set: ["
-                .to_string(),
+            format!(
+                "{ONE_ERROR}Value at 'status' failed to satisfy constraint: Member must \
+                 satisfy enum value set: ["
+            ),
         ),
         (
             "an absent required member",
@@ -432,8 +447,8 @@ async fn a_constraint_refusal_names_its_validator_the_member_and_the_rule() {
     assert_eq!(
         message.as_deref(),
         Some(
-            "Value at 'requestId' failed to satisfy constraint: Member must satisfy regular \
-             expression pattern: [0-9a-zA-Z][a-zA-Z0-9-]{1,128}"
+            "1 validation error detected: Value at 'requestId' failed to satisfy constraint: \
+             Member must satisfy regular expression pattern: [0-9a-zA-Z][a-zA-Z0-9-]{1,128}"
         ),
         "case the whole constraint clause, front-end-validated: got {parsed}"
     );

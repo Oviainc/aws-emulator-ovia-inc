@@ -226,13 +226,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         if !adjustable {
+            // The crate's one sentence for that fact, which is fixed text: a quota AWS
+            // does not let an account adjust is the same refusal whichever quota was
+            // named, so neither code the request carried is interpolated into it.
             return Err(
                 RequestServiceQuotaIncreaseErrorModeled::IllegalArgumentException(
                     IllegalArgumentException {
-                        message: Some(format!(
-                            "QuotaCode '{}' of ServiceCode '{}' is not adjustable",
-                            input.quota_code, input.service_code
-                        )),
+                        message: Some(
+                            crate::service::refusals::QUOTA_NOT_ADJUSTABLE_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),
@@ -278,14 +280,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.quota_code,
             input.context_id.as_deref(),
         );
-        if let Some(open) = open {
+        if open.is_some() {
+            // Stated in the crate's one fixed sentence for the fact: the id of the
+            // request already awaiting a decision is a value this service minted, so
+            // interpolating it would make the refusal read differently on every call.
             return Err(
                 RequestServiceQuotaIncreaseErrorModeled::ResourceAlreadyExistsException(
                     ResourceAlreadyExistsException {
-                        message: Some(format!(
-                            "request {} for QuotaCode '{}' is still awaiting a decision",
-                            open.id, input.quota_code
-                        )),
+                        message: Some(
+                            crate::service::refusals::ONE_OPEN_REQUEST_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into(),

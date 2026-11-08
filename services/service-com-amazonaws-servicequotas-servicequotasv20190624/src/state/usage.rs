@@ -25,13 +25,14 @@
 //! both instead of this service keeping a count of its own that nothing updates.
 //!
 //! A metric no reader here can count is left with NO reading, and the quota carrying it
-//! then reports no `Utilization` at all (see `crate::state::utilization_pct`): an
-//! account's in-flight Lambda invocations or its API call rate are not state this
-//! emulator holds, and a canned percentage for them would be a number no client could
-//! act on. A reading of `0.0` therefore means "counted, and nothing is in use", which is
-//! a different answer from "not counted".
+//! then reports no `Utilization` ([`crate::state::utilization_pct`]) — the resources are
+//! there to be counted, so a figure for them would be invented. A metric NO reader here
+//! meters at all is a different answer: nothing in this emulator holds what that quota
+//! counts, so the account holds none of it and the quota reads 0 %. A reading of `0.0` is
+//! therefore the same answer either way — "none of what the quota permits is in use" —
+//! and only a count that was started and could not be finished reports nothing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::MetricInfo;
 
@@ -118,18 +119,37 @@ type MetricIdentity = (String, String, BTreeMap<String, String>);
 
 /// The account's measured usage, per usage metric.
 ///
-/// A metric is in the map only when something actually counted it, so the absence of an
-/// entry is the honest answer "this emulator holds no usage source for that metric"
-/// rather than a usage of zero.
+/// Two things are recorded, because a quota's `Utilization` turns on which: the metrics a
+/// reader here METERS at all, and the reading each of those a count was completed for
+/// came back with. A metric no reader meters is usage this emulator's account cannot
+/// hold; a metric a reader meters but could not finish counting is a count nobody made.
 #[derive(Debug, Default, Clone)]
 pub struct QuotaUsage {
     readings: BTreeMap<MetricIdentity, f64>,
+    metered: BTreeSet<MetricIdentity>,
 }
 
 impl QuotaUsage {
+    /// Declare `metric` one a reader here meters, before it goes and counts it — so a
+    /// read that fails or stops short is still known to be about a metric this emulator
+    /// has a source for.
+    pub fn metering(&mut self, metric: &MetricInfo) {
+        if let Some(identity) = identity(metric) {
+            self.metered.insert(identity);
+        }
+    }
+
+    /// Whether a reader here meters `metric` at all. The account's usage of a quota
+    /// metered by none of them is nothing this emulator can hold, which is a different
+    /// answer from a metric whose count could not be completed.
+    pub fn metered_by_a_reader(&self, metric: &MetricInfo) -> bool {
+        identity(metric).is_some_and(|identity| self.metered.contains(&identity))
+    }
+
     /// Record `metric` as counted, reading `usage`.
     pub fn set(&mut self, metric: &MetricInfo, usage: f64) {
         if let Some(identity) = identity(metric) {
+            self.metered.insert(identity.clone());
             self.readings.insert(identity, usage);
         }
     }
@@ -236,6 +256,9 @@ async fn measure_ec2(
 /// Nothing is recorded unless the listing was read to its last page: a tally of the
 /// pages that fitted is not the account's count.
 async fn measure_vpcs(ec2: &::aws_sdk_ec2::Client, usage: &mut QuotaUsage) {
+    // The metric is metered HERE whatever EC2 answers, so a read that fails or stops
+    // short is a count that could not be made rather than a quota nothing meters.
+    usage.metering(&super::vpcs_per_region_usage_metric());
     let mut vpcs = 0usize;
     let mut walk = PageWalk::new();
     while walk.wants_page() {
@@ -283,6 +306,13 @@ struct RunningInstance {
 /// answered only in PART is half the facts too: a metric is recorded only when every
 /// instance it counts was accounted for, and left uncounted otherwise.
 async fn measure_running_vcpus(ec2: &::aws_sdk_ec2::Client, usage: &mut QuotaUsage) {
+    // Every vCPU group and purchase model is metered here whatever EC2 answers, for the
+    // same reason the VPC count is.
+    for class in super::vcpu_group_classes() {
+        for purchase_model in [super::PURCHASE_MODEL_ON_DEMAND, super::PURCHASE_MODEL_SPOT] {
+            usage.metering(&super::vcpu_usage_metric_for(class, purchase_model));
+        }
+    }
     let Some(running) = running_instances(ec2).await else {
         return;
     };

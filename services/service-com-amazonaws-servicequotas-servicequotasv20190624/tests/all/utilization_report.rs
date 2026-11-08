@@ -18,9 +18,11 @@
 //!   re-starts converges on one report instead of accumulating them;
 //! * every record in a report agrees, field for field, with what the quota reads
 //!   report for the same `(ServiceCode, QuotaCode)` pair — for EVERY pair in the
-//!   catalog — and carries a `Utilization` only where that quota publishes the usage
-//!   metric its usage would be counted by (what the figure itself is, measured against
-//!   an account that holds resources, is tabled in `quota_utilization_usage`);
+//!   catalog — carries the `Namespace` of the usage metric its usage is counted by
+//!   where it publishes one, and reports a `Utilization` of 0 % for a quota nothing
+//!   here meters, because the account then holds none of what that quota permits (what
+//!   the figure itself is, measured against an account that holds resources, is tabled
+//!   in `quota_utilization_usage`);
 //! * the report is ordered by utilization descending and is walked to the same
 //!   records whatever page size is used, with page boundaries that do not move;
 //! * a report is a SNAPSHOT: an increase approved after it was started does not change
@@ -473,19 +475,20 @@ async fn every_report_record_agrees_with_the_quota_reads_for_the_same_pair() {
         );
 
         // Service Quotas tracks usage through the CloudWatch usage metric a quota
-        // publishes, so the record carries the namespace of THAT metric — and a
-        // Utilization can only ever accompany one: with no metric there is nothing to
-        // count the quota by, so there is no percentage to report.
+        // publishes, so the record carries the namespace of THAT metric. A quota with no
+        // usage metric is one nothing here meters, and this emulator's state is the whole
+        // account, so the account holds none of what it permits: 0 %.
         let metric_namespace = applied["UsageMetric"]["MetricNamespace"].clone();
         assert_eq!(
             record["Namespace"], metric_namespace,
             "case {case}: Namespace must be the usage metric's namespace, got {record}"
         );
         if metric_namespace.is_null() {
-            assert!(
-                record["Utilization"].is_null(),
-                "case {case}: a quota with no usage metric cannot report a utilization, \
-                 got {record}"
+            assert_eq!(
+                record["Utilization"].as_f64(),
+                Some(0.0),
+                "case {case}: a quota nothing meters holds none of what it permits, so it \
+                 reads 0 %, got {record}"
             );
         }
         // The usage itself is counted in the services that OWN the resources a quota is
