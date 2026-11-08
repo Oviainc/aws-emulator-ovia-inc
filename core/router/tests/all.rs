@@ -15,11 +15,16 @@
 // are where concurrently landing suites add their line, so a declaration placed there
 // collides with every one of them. The head of the list is the one region nothing
 // else appends to.
-// Declared in this same head region, for the reason the note above records.
-#[path = "all/bedrock_agentcore_data_plane_parent_resources.rs"]
-mod bedrock_agentcore_data_plane_parent_resources;
 #[path = "all/cloudformation_fifo_resource_generated_names.rs"]
 mod cloudformation_fifo_resource_generated_names;
+// Declared here, in this same head region, for the reason the entry above records: what a
+// deployed `AWS_IAM` method makes of the credential its request presents, on a router that
+// verifies request signatures.
+#[path = "all/apigateway_iam_authenticated_invoke.rs"]
+mod apigateway_iam_authenticated_invoke;
+// Declared here, in this same head region, for the reason the entry above records.
+#[path = "all/cloudformation_rollback_triggers_revert_the_operation.rs"]
+mod cloudformation_rollback_triggers_revert_the_operation;
 // Declared here, in this same head region, for the reason the entry above records: this
 // suite holds the committed `Cargo.lock` to the workspace's manifests, so it belongs to no
 // service's span of the sorted list.
@@ -51,6 +56,8 @@ mod directory_data_access_cycle;
 // appended tail and the sorted `k…` span are both regions concurrently landing suites add
 #[path = "all/kinesisvideo_discovered_data_plane.rs"]
 mod kinesisvideo_discovered_data_plane;
+#[path = "all/lambda_sqs_event_source_batching_window.rs"]
+mod lambda_sqs_event_source_batching_window;
 #[path = "all/codebuild_service_role_trust.rs"]
 mod codebuild_service_role_trust;
 #[path = "all/codebuild_artifacts_override_bucket.rs"]
@@ -976,6 +983,12 @@ mod sns_lambda_cdk_subscription_delivery;
 // and the log group the invocation that path makes writes its run to.
 #[path = "all/apigateway_proxy_lambda_ddb_pipeline.rs"]
 mod apigateway_proxy_lambda_ddb_pipeline;
+// Declared here, in the appended tail: what a DICOM import job leaves in its data store,
+// read from the objects Amazon S3 holds under the role IAM holds.
+#[path = "all/medical_imaging_dicom_import.rs"]
+mod medical_imaging_dicom_import;
+#[path = "all/cloudformation_wafv2_protection_stack.rs"]
+mod cloudformation_wafv2_protection_stack;
 // Declared here, in the appended tail: what REPEATED requests to one deployed stage are each
 // answered with, and the one stream record each new item they write carries.
 #[path = "all/apigateway_repeated_stage_requests.rs"]
@@ -995,3 +1008,8 @@ mod lambda_sqs_event_source_batching_window;
 // reason those entries record: the appended tail at the end of this file and the `e…` span
 #[path = "all/eks_control_plane_logs.rs"]
 mod eks_control_plane_logs;
+// Declared in this same head region, for the reason the note above records.
+#[path = "all/bedrock_agentcore_data_plane_parent_resources.rs"]
+mod bedrock_agentcore_data_plane_parent_resources;
+#[path = "all/cloudformation_asset_bucket_publishing_role.rs"]
+mod cloudformation_asset_bucket_publishing_role;

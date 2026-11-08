@@ -25,6 +25,8 @@ mod datastore_lifecycle;
 mod datastore_listing_page_tokens;
 #[path = "all/datastore_status_guard.rs"]
 mod datastore_status_guard;
+#[path = "all/dicom_part10_reading.rs"]
+mod dicom_part10_reading;
 #[path = "all/error_message_texts.rs"]
 mod error_message_texts;
 #[path = "all/image_frames.rs"]
@@ -63,6 +65,8 @@ mod image_set_series_attributes;
 mod image_set_tombstone_content;
 #[path = "all/image_set_version_listing.rs"]
 mod image_set_version_listing;
+#[path = "all/import_job_datastore_conflicts.rs"]
+mod import_job_datastore_conflicts;
 #[path = "all/import_job_idempotent_replay.rs"]
 mod import_job_idempotent_replay;
 #[path = "all/import_job_listing.rs"]

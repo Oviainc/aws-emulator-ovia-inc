@@ -59,8 +59,7 @@ fn unheld_id() -> String {
 }
 
 /// The workflow status a seeded image set carries going in: `IMPORTED`, which is what a
-/// DICOM import leaves behind, and the status the source must be back on once the copy
-/// it took part in has completed.
+/// DICOM import leaves behind.
 ///
 /// `pub(crate)` because `crate::image_set_lock_visibility` asserts what a seeded version
 /// still reports while a write holds the image set, so its expectation is tied to what
@@ -527,12 +526,9 @@ async fn a_copy_lands_a_new_version_and_the_clock_releases_both_image_sets() {
         );
         assert_eq!(
             source.string(&["imageSetWorkflowStatus"]),
-            if case.source_versions > 1 {
-                SEEDED_LATER_WORKFLOW_STATUS.as_wire()
-            } else {
-                SEEDED_WORKFLOW_STATUS.as_wire()
-            },
-            "case {:?}: a copy leaves the source's own status alone, got {source:?}",
+            "COPIED",
+            "case {:?}: a completed copy is what last happened to the source too, got \
+             {source:?}",
             case.case
         );
 

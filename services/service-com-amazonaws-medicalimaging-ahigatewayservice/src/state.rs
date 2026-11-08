@@ -63,6 +63,10 @@ use smithy_server_runtime::{Violation, ViolationKind};
 
 use crate::ops::types::{DICOMTags, ImportConfiguration};
 
+/// What a DICOM import READS, and the image sets it materialises from what it read.
+mod dicom_import;
+pub use dicom_import::*;
+
 /// How long after `CreateDatastore` the data store leaves `CREATING` for `ACTIVE`.
 ///
 /// AWS publishes no duration for it, so this is a chosen span: long enough that a
@@ -85,12 +89,22 @@ pub const DATASTORE_DELETION_DELAY: Duration = Duration::from_millis(500);
 pub const DATASTORE_DELETED_RETENTION: Duration = Duration::from_millis(500);
 
 /// How long after `StartDICOMImportJob` the job leaves `SUBMITTED` for `IN_PROGRESS`.
-/// A chosen span, for the same reason as [`DATASTORE_ACTIVATION_DELAY`].
-pub const IMPORT_JOB_IN_PROGRESS_DELAY: Duration = Duration::from_millis(300);
+///
+/// A chosen span, for the same reason as [`DATASTORE_ACTIVATION_DELAY`], and HALF of
+/// [`IMPORT_JOB_COMPLETION_DELAY`]: `SUBMITTED` and `IN_PROGRESS` are both non-terminal
+/// statuses the model declares, so each of them is observable for the same part of the
+/// window the job is in flight for.
+pub const IMPORT_JOB_IN_PROGRESS_DELAY: Duration = Duration::from_secs(2);
 
-/// How long after `StartDICOMImportJob` the job reaches `COMPLETED` and gets `endedAt`.
-/// A chosen span, for the same reason as [`DATASTORE_ACTIVATION_DELAY`].
-pub const IMPORT_JOB_COMPLETION_DELAY: Duration = Duration::from_millis(600);
+/// How long after `StartDICOMImportJob` the job reaches its terminal status and gets
+/// `endedAt`.
+///
+/// A chosen span, for the same reason as [`DATASTORE_ACTIVATION_DELAY`], but a WIDER one:
+/// a job in flight is what `DeleteDatastore` refuses a delete of
+/// ([`DATASTORE_RUNNING_IMPORT_JOBS_MESSAGE`]), so the window has to stay open long enough
+/// for a client that submits a job and then calls another operation to observe it, rather
+/// than being a window only a tight loop can catch.
+pub const IMPORT_JOB_COMPLETION_DELAY: Duration = Duration::from_secs(4);
 
 /// How long after `CopyImageSet` the copy completes: the source image set leaves
 /// `COPYING_WITH_READ_ONLY_ACCESS` and the destination leaves `COPYING`, both returning
@@ -391,10 +405,22 @@ pub const METADATA_COMPUTED_KEYS: [&str; 3] = [
 
 /// The text this service refuses a call that would act on a data store, or on the
 /// contents of one, that has not settled into `ACTIVE` with — one still `CREATING` or
-/// already `DELETING`. Constant, and stated by rule rather than by which store it was,
-/// exactly like [`IMAGE_SET_NOT_ACTIVE_MESSAGE`] one resource kind down.
-pub const DATASTORE_NOT_ACTIVE_MESSAGE: &str =
-    "The data store is not in the ACTIVE state, so it cannot serve this request.";
+/// already `DELETING`.
+///
+/// AWS's own sentence for this conflict: the whole of it is fixed text, carrying neither
+/// the data store's identifier nor the status it was in — stated by RULE rather than by
+/// which store it was, exactly like [`IMAGE_SET_NOT_ACTIVE_MESSAGE`] one resource kind
+/// down.
+pub const DATASTORE_NOT_ACTIVE_MESSAGE: &str = "The datastore is not active.";
+
+/// The text this service refuses the DELETE of a data store that still has a DICOM import
+/// job running on it with.
+///
+/// A constant, carrying neither the data store it was nor which jobs were in flight —
+/// AWS's own sentence for this conflict, which interpolates nothing from the request or
+/// from state.
+pub const DATASTORE_RUNNING_IMPORT_JOBS_MESSAGE: &str =
+    "Cannot delete a datastore with running import jobs";
 
 /// The text this service refuses the DELETE of a data store whose creation is still in
 /// flight with. A separate sentence from [`DATASTORE_NOT_ACTIVE_MESSAGE`] because the
@@ -526,7 +552,9 @@ pub fn constraint_requirement(kind: ViolationKind) -> String {
 /// A member that names another AWS resource (`lambdaAuthorizerArn`, `dataAccessRoleArn`)
 /// is in neither class and keeps its echoed value — which is what the recorded corpus
 /// shows: the clauses about the data store's name and its KMS key carry no value where
-/// the one about the authorizer's function ARN carries it.
+/// the one about the authorizer's function ARN carries it. The resource IDENTIFIERS the
+/// request URI carries are their own class, keyed on the whole validation path rather
+/// than on the member name ([`URI_LABEL_MEMBERS`]).
 const VALUE_WITHHOLDING_MEMBERS: &[&str] = &[
     "datastorename",
     "jobname",
@@ -534,6 +562,32 @@ const VALUE_WITHHOLDING_MEMBERS: &[&str] = &[
     "copiableattributes",
     "updatableattributes",
     "removableattributes",
+];
+
+/// The input members this service's model binds to the request URI's PATH
+/// (`@httpLabel`), in the same lowercased spelling — the resource identifiers a request
+/// addresses a resource by.
+///
+/// A clause about one of them carries NO value: the recorded corpus words the refusal of
+/// a `datastoreId` outside its `@pattern` as `datastoreId failed to satisfy constraint:
+/// …`, with no `Value '<v>' at '<path>'` prefix — the rejected value is the URI the
+/// caller addressed the request to rather than something a member of the request held.
+/// Every `@httpLabel` of this service is listed (`smithy_query(query="digest")`:
+/// `datastoreId`, `imageSetId`, `sourceImageSetId`, `jobId`, and the `resourceArn` the
+/// tagging operations take), so the whole class is worded the one way rather than only
+/// the member the corpus happens to record.
+///
+/// Matched on the WHOLE validation path, which is why this is a separate list from
+/// [`VALUE_WITHHOLDING_MEMBERS`]: an `@httpLabel` is always a top-level member of the
+/// input, while a member of a nested payload that shares its name
+/// (`copyImageSetInformation.destinationImageSet.imageSetId`) is a value the request
+/// CARRIED, and keeps its echoed value.
+const URI_LABEL_MEMBERS: &[&str] = &[
+    "datastoreid",
+    "imagesetid",
+    "sourceimagesetid",
+    "jobid",
+    "resourcearn",
 ];
 
 /// The DICOM attribute members, in the same lowercased spelling. The model marks every
@@ -558,8 +612,13 @@ const SENSITIVE_DICOM_MEMBERS: &[&str] = &[
 ///
 /// Keyed on the MEMBER — the last segment of the validation path — never on what the
 /// caller sent: the same member withholds its value whatever the violation and whatever
-/// the value was.
+/// the value was. The resource identifiers the URI binds are keyed on the WHOLE path
+/// instead, for the reason [`URI_LABEL_MEMBERS`] states.
 fn withholds_value(path: &str) -> bool {
+    let whole = path.to_ascii_lowercase();
+    if URI_LABEL_MEMBERS.contains(&whole.as_str()) {
+        return true;
+    }
     let member = path.rsplit('.').next().unwrap_or(path).to_ascii_lowercase();
     VALUE_WITHHOLDING_MEMBERS.contains(&member.as_str())
         || SENSITIVE_DICOM_MEMBERS.contains(&member.as_str())
@@ -929,6 +988,12 @@ impl JobStatus {
             _ => None,
         }
     }
+
+    /// Whether this is a status a job never leaves: the two the model declares as
+    /// outcomes of an import, as against the two it is in while the import runs.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, Self::Completed | Self::Failed)
+    }
 }
 
 /// One persisted DICOM import job, owned by the data store it imports into.
@@ -965,7 +1030,7 @@ impl ImportJob {
 
     /// Materialise every status change the clock owed this job by `now`.
     fn advance_to(&mut self, now: SystemTime) {
-        if matches!(self.job_status, JobStatus::Completed | JobStatus::Failed) {
+        if self.job_status.is_terminal() {
             return;
         }
         if now >= self.in_progress_due_at && self.job_status == JobStatus::Submitted {
@@ -1844,6 +1909,19 @@ impl Datastore {
         self.image_sets
             .values()
             .filter(|image_set| !image_set.is_deleted())
+    }
+
+    /// Every DICOM import job of this data store that is still RUNNING — one the clock
+    /// has not yet moved to a terminal `jobStatus` ([`JobStatus::is_terminal`]).
+    ///
+    /// What `DeleteDatastore` consults: an import writes image sets INTO the data store,
+    /// so deleting the store under a job still in flight would leave the job and the store
+    /// disagreeing about the resource, which is the inconsistent state the modelled
+    /// `ConflictException` (HTTP 409) reports.
+    pub fn running_import_jobs(&self) -> impl Iterator<Item = &ImportJob> {
+        self.import_jobs
+            .values()
+            .filter(|job| !job.job_status.is_terminal())
     }
 
     /// Materialise every change the clock owed this data store by `now`.

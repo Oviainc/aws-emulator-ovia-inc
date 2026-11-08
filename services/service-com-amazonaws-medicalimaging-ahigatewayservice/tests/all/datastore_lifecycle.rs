@@ -42,6 +42,19 @@ pub(crate) fn sigv4_for(region: &str) -> String {
 /// The account id every emulated ARN carries (`engine::EMULATOR_ACCOUNT_ID`).
 pub(crate) const ACCOUNT: &str = engine::EMULATOR_ACCOUNT_ID;
 
+/// `body`, decoded from the gzip format a response declared it in — what a client does
+/// with a payload whose `Content-Encoding` names a compression.
+///
+/// Decoded through the crate's own inverse of the compression it applied
+/// (`crate::ops::get_image_set_metadata::decoded_metadata_blob`), so this suite reads the
+/// blob the way the handler wrote it rather than stating the format a second time. A body
+/// that does not decode is handed back as it stands, so a case about a malformed answer
+/// still sees what arrived rather than an empty one.
+fn decompress_gzip(body: &[u8]) -> Vec<u8> {
+    service_com_amazonaws_medicalimaging_ahigatewayservice::ops::get_image_set_metadata::decoded_metadata_blob(body)
+        .unwrap_or_else(|| body.to_vec())
+}
+
 /// One HTTP answer, reduced to what these cases assert on.
 ///
 /// `pub(crate)` because the sibling suites in `tests/all/` drive the same front door
@@ -52,6 +65,10 @@ pub(crate) struct Answer {
     pub(crate) body: Value,
     /// The RAW response body, for an operation whose `@httpPayload` is a blob rather
     /// than JSON (`GetImageFrame`'s `imageFrameBlob`), where [`Answer::body`] is null.
+    ///
+    /// DECODED first, as a client decodes a body: a payload the answer declares a
+    /// `Content-Encoding` for ([`Answer::content_encoding`]) is decompressed here, so
+    /// every case reads the CONTENT the answer carried rather than its wire encoding.
     pub(crate) body_bytes: Vec<u8>,
     /// The `Content-Type` the answer carried, empty when it carried none.
     pub(crate) content_type: String,
@@ -149,10 +166,17 @@ impl Emulator {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_string();
-        let body: Value = if response.body().is_empty() {
+        // What a client has once it has decoded the answer: a body the response declares
+        // a compression for is decompressed before anything reads it.
+        let payload = if content_encoding == "gzip" {
+            decompress_gzip(response.body())
+        } else {
+            response.body().to_vec()
+        };
+        let body: Value = if payload.is_empty() {
             Value::Null
         } else {
-            serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+            serde_json::from_slice(&payload).unwrap_or(Value::Null)
         };
         let raw_code = if header_code.is_empty() {
             body["__type"].as_str().unwrap_or_default().to_string()
@@ -170,7 +194,7 @@ impl Emulator {
         Answer {
             status,
             body,
-            body_bytes: response.body().to_vec(),
+            body_bytes: payload,
             content_type,
             content_encoding,
             error_code,

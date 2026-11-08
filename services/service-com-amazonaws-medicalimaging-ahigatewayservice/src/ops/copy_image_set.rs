@@ -60,9 +60,9 @@
 //!
 //! Both image sets come back `LOCKED` — the source `COPYING_WITH_READ_ONLY_ACCESS`,
 //! the destination `COPYING` — and the CLOCK, not a later reader, releases them after
-//! [`crate::state::IMAGE_SET_COPY_DELAY`]: the destination then reports `COPIED` and
-//! the source the workflow status it carried before the copy, since a copy changes
-//! nothing about the source. Nothing here sleeps.
+//! [`crate::state::IMAGE_SET_COPY_DELAY`]: both then report `COPIED`, the workflow status
+//! the model declares for a completed copy, because the copy is what last happened to each
+//! of them. What the copy leaves alone is the source's CONTENT. Nothing here sleeps.
 //!
 //! The DATA STORE the copy runs in must have settled into `ACTIVE` as well: a copy
 //! writes into the store, so one still `CREATING`, or already `DELETING`, is refused
@@ -600,9 +600,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
-        // A copy leaves the source's content alone, so the status it reports once the
-        // copy has completed is the one it carried going in.
-        let source_workflow_status_before_copy = source.latest_version.workflow_status;
         // Which DICOM hierarchy the source belongs to, which a whole copy of it carries.
         let source_is_primary = source.is_primary;
         // The pixel data this copy carries to its destination: read from the source as
@@ -860,7 +857,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`crate::state::ImageSet::advance_to`).
         source.record_access(now);
         source.pending = Some(PendingImageSetTransition {
-            workflow_status: source_workflow_status_before_copy,
+            // `imageSetWorkflowStatus` reports WHAT LAST HAPPENED to an image set, and
+            // `COPIED` is "the image set copy is complete"
+            // (`smithy_query(query="shape",shape="ImageSetWorkflowStatus")`). A completed
+            // copy happened to BOTH image sets it names, so the source reports it too
+            // once its read-only lock is released — the same status the destination lands
+            // on, from the same instant. What a copy leaves alone is the source's
+            // CONTENT, not the record of what it last took part in.
+            //
+            // Recorded, not inferred: the behavioural replay of a client that copies an
+            // image set and then waits for its SOURCE to reach a terminal copy status
+            // reads `COPIED` there
+            // (`issues/things-that-now-work/20261029T201912Z-medical-imaging-imported-image-sets-never-materialise-deletedatastore.md`,
+            // the `copy-image-set-creates-active-copy-with-matching-metadata` check). An
+            // earlier change here restored the status the source carried going in, which
+            // that client waits on forever.
+            workflow_status: ImageSetWorkflowStatus::Copied,
             // A copy READS its source and writes its destination, so the release of the
             // source's read-only lock delivers no pixel data.
             delivered_image_frames: None,

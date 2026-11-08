@@ -7,8 +7,9 @@
 //! 1. An input-constraint refusal states the AWS envelope
 //!    (`N validation error(s) detected: `) over the framework's own clauses, quoting
 //!    every `@pattern` without the `^` / `$` the model spells it with — and withholding
-//!    the rejected value for a member that carries a caller-chosen name or an
-//!    encryption-key reference, where every other member's clause echoes it.
+//!    the rejected value for a member that carries a caller-chosen name, an
+//!    encryption-key reference or a resource identifier the request URI binds
+//!    (`@httpLabel`), where every other member's clause echoes it.
 //! 2. A `nextToken` this service did not issue is refused with ONE fixed sentence that
 //!    does not vary with the token supplied.
 //! 3. A request naming a resource that does not exist is refused with a text that is a
@@ -56,6 +57,10 @@ const NEXT_TOKEN_PATTERN: &str = r"\p{ASCII}{0,8192}";
 /// (`smithy_query(query="shape",shape="RoleArn")`: len 20..2048,
 /// `^arn:aws(-[^:]+)?:iam::[0-9]{12}:role/.+$`).
 const ROLE_ARN_PATTERN: &str = r"arn:aws(-[^:]+)?:iam::[0-9]{12}:role/.+";
+
+/// `DatastoreId`'s `@pattern`, unanchored
+/// (`smithy_query(query="shape",shape="DatastoreId")`: `^[0-9a-z]{32}$`).
+const DATASTORE_ID_PATTERN: &str = r"[0-9a-z]{32}";
 
 /// The service's fixed invalid-`NextToken` sentence, as the wire corpus records it.
 const INVALID_NEXT_TOKEN: &str =
@@ -112,8 +117,8 @@ struct ClauseCase {
 }
 
 /// A clause for a member that WITHHOLDS the rejected value: the member path, then the
-/// requirement. The recorded form for a member carrying a caller-chosen name or an
-/// encryption-key reference.
+/// requirement. The recorded form for a member carrying a caller-chosen name, an
+/// encryption-key reference or a resource identifier the request URI binds.
 fn clause(member: &str, requirement: &str) -> String {
     format!("{member} failed to satisfy constraint: {requirement}")
 }
@@ -154,16 +159,17 @@ fn envelope(clauses: &[String]) -> String {
 /// RULE: an input-constraint refusal is HTTP 400 `ValidationException` whose message is
 /// the AWS envelope `N validation error(s) detected: ` over one clause per violation,
 /// every `@pattern` requirement quoting the expression WITHOUT the model's `^` / `$`
-/// anchors — and a member carrying a caller-chosen NAME or an encryption-key reference
-/// states its clause as `<memberPath> failed to satisfy constraint: <requirement>`,
-/// withholding the rejected value that every other member's clause echoes.
+/// anchors — and a member carrying a caller-chosen NAME, an encryption-key reference or a
+/// resource identifier the request URI binds (`@httpLabel`) states its clause as
+/// `<memberPath> failed to satisfy constraint: <requirement>`, withholding the rejected
+/// value that every other member's clause echoes.
 ///
 /// Rows span the axes the rule generalises over: the constraint CLASS (pattern, both
 /// length bounds, both range bounds, an absent required member), the member (body
 /// member, query parameter, URI label) and whether it withholds its value — including
 /// `jobName`, a name member the issue never cited — the operation (CreateDatastore,
-/// ListDatastores, StartDICOMImportJob, GetDICOMImportJob) and, for one pattern, two
-/// different offending values, which get the same message.
+/// ListDatastores, StartDICOMImportJob, GetDICOMImportJob, GetDatastore) and, for one
+/// pattern, two different offending values, which get the same message.
 #[tokio::test]
 async fn a_constraint_refusal_states_the_services_clause_for_every_member() {
     let unknown = "0".repeat(32);
@@ -401,6 +407,10 @@ async fn a_constraint_refusal_states_the_services_clause_for_every_member() {
             clauses: vec![clause("jobName", &pattern_requirement(JOB_NAME_PATTERN))],
         },
         ClauseCase {
+            // A URI LABEL: the identifier the request addressed a resource by. Its clause
+            // carries no value — the rejected value is the path of the URI the caller
+            // sent, not something a member of the request held — so every `@httpLabel` of
+            // this service withholds it, `jobId` as much as the `datastoreId` beside it.
             case: "GetDICOMImportJob with a jobId past the length bound",
             method: "GET",
             uri: format!(
@@ -409,11 +419,25 @@ async fn a_constraint_refusal_states_the_services_clause_for_every_member() {
             ),
             body: None,
             offending: "j".repeat(33),
-            withholds_value: false,
-            clauses: vec![clause_with_value(
-                &"j".repeat(33),
+            withholds_value: true,
+            clauses: vec![clause(
                 "jobId",
                 "Member must have length less than or equal to 32",
+            )],
+        },
+        ClauseCase {
+            // The same class, on the other label of the same URI and under another
+            // constraint: `datastoreId` outside its `@pattern` is the clause the corpus
+            // records, and it withholds the value too.
+            case: "GetDatastore with a datastoreId outside the pattern",
+            method: "GET",
+            uri: "/datastore/not-a-valid-datastore-id!!".to_string(),
+            body: None,
+            offending: "not-a-valid-datastore-id!!".to_string(),
+            withholds_value: true,
+            clauses: vec![clause(
+                "datastoreId",
+                &pattern_requirement(DATASTORE_ID_PATTERN),
             )],
         },
     ];

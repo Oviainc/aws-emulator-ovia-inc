@@ -63,6 +63,11 @@ use crate::image_set_copy::{copy_image_set, get_image_set, information};
 /// "Default is `text/plain`"). `crate::content_type_reporting` is that rule's suite.
 const EXPECTED_CONTENT_TYPE: &str = "text/plain";
 
+/// The `contentEncoding` the document is served with: the compression format AWS
+/// HealthImaging returns the aggregated metadata blob in, which is why the response
+/// declares one at all. `crate::content_type_reporting` is that rule's suite.
+const EXPECTED_CONTENT_ENCODING: &str = "gzip";
+
 /// The format version the aggregated metadata document carries, asserted as the literal
 /// the document must state rather than through the handler's own constant.
 const EXPECTED_SCHEMA_VERSION: &str = "1.1";
@@ -108,11 +113,11 @@ pub(crate) fn document(answer: &Answer, case: &str) -> Value {
         "case {case:?}: expected contentType {EXPECTED_CONTENT_TYPE:?}, got {:?}",
         answer.content_type
     );
-    // Nothing compressed the document, so the answer names no compression format: a
-    // `contentEncoding` here would claim an encoding the blob is not in.
-    assert!(
-        answer.content_encoding.is_empty(),
-        "case {case:?}: an uncompressed document must report no contentEncoding, got {:?}",
+    // The blob is served COMPRESSED, as AWS returns it, and the answer names the format
+    // it is in — a `contentEncoding` must name the compression that was really applied.
+    assert_eq!(
+        answer.content_encoding, EXPECTED_CONTENT_ENCODING,
+        "case {case:?}: expected contentEncoding {EXPECTED_CONTENT_ENCODING:?}, got {:?}",
         answer.content_encoding
     );
     let decoded = String::from_utf8(answer.body_bytes.clone()).unwrap_or_else(|error| {

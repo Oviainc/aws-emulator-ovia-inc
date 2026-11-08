@@ -26,6 +26,28 @@ hex = { workspace = true }
 # Digests the canonical text of a search's filters into its page-token marker, so the
 # marker's length does not grow with the filters the request carries.
 sha2 = { workspace = true }
+# `iam_role`: the one resolution of a caller-supplied IAM role ARN against the account's
+# IAM records, which `StartDICOMImportJob` puts its `dataAccessRoleArn` through before a
+# job is minted.
+service-common = { path = "../common" }
+# The AWS SDK for Amazon S3, driven over the in-process callback
+# (`OperationContext::callback`): a DICOM import reads the objects of the `inputS3Uri`
+# prefix it was asked to import. Only the generated client is needed — the emulator
+# supplies the transport.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# Reads the DICOM Part 10 files an import is handed with a maintained DICOM library, so
+# the dataset an image set is built from is parsed rather than guessed at.
+dicom-object = "0.10"
+# The DICOM tag constants `dicom-object` reads an element by — the standard data
+# dictionary, so an attribute is named by its keyword rather than by a literal group and
+# element written here.
+dicom-dictionary-std = "0.10"
+# The `Tag` type those constants are, and the value conversions a read element's text and
+# numbers come out of.
+dicom-core = "0.10"
+# The gzip format `GetImageSetMetadata` reports its metadata blob in
+# (`contentEncoding: gzip`), applied with a maintained codec rather than written here.
+flate2 = "1"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

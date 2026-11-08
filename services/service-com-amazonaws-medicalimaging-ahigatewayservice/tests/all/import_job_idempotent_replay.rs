@@ -45,11 +45,13 @@ use crate::import_job_listing::{list_jobs, summaries};
 enum Change {
     /// Nothing: the store is still `ACTIVE` and the job still young.
     Nothing,
-    /// The store's deletion is in flight (`DELETING`), held so the case cannot race it.
+    /// The clock has carried the job to its terminal status and the store's deletion is in
+    /// flight (`DELETING`) on top of that, held so the case cannot race it.
+    ///
+    /// The job settling FIRST is not an extra the row chose: a data store with a DICOM
+    /// import job still running is not deletable at all, so a deletion in flight is only
+    /// reachable once the job has reached a terminal status ([`settle_the_job`]).
     DeletionInFlight,
-    /// The clock has carried the job to its terminal status, and the store's deletion is
-    /// in flight on top of that.
-    JobSettledAndDeletionInFlight,
     /// The per-store import-job cap is full.
     JobCapFull,
     /// The deletion finished and the store's record was reaped, taking its jobs with it.
@@ -155,17 +157,24 @@ async fn jobs_held(emulator: &Emulator, case: &str, datastore_id: &str) -> usize
     }
 }
 
+/// Wait out the clock the submitted job owes, so the data store holds no RUNNING import
+/// job.
+///
+/// Every row that DELETES the store goes through here first: a data store with a DICOM
+/// import job still in flight is refused the delete outright, so a deletion in flight is
+/// reachable only once the job has settled.
+async fn settle_the_job() {
+    tokio::time::sleep(SETTLE_MULTIPLE * IMPORT_JOB_COMPLETION_DELAY).await;
+}
+
 /// Bring about the row's change, so the retry under test arrives into it.
 async fn apply(emulator: &Emulator, case: &str, change: Change, datastore_id: &str, index: usize) {
     match change {
         Change::Nothing => {}
         Change::DeletionInFlight => {
-            start_deleting(emulator, case, datastore_id, Hold::Yes).await;
-        }
-        Change::JobSettledAndDeletionInFlight => {
-            // The job's own clock first, while the store is still ACTIVE: the deletion
-            // is what the row stacks ON TOP of a job that has already finished.
-            tokio::time::sleep(SETTLE_MULTIPLE * IMPORT_JOB_COMPLETION_DELAY).await;
+            // The job's own clock first, while the store is still ACTIVE: the deletion is
+            // what the row stacks ON TOP of a job that has already finished.
+            settle_the_job().await;
             start_deleting(emulator, case, datastore_id, Hold::Yes).await;
         }
         Change::JobCapFull => {
@@ -183,6 +192,7 @@ async fn apply(emulator: &Emulator, case: &str, change: Change, datastore_id: &s
         Change::DatastoreReaped => {
             // NOT held: this row is the one that waits the deletion, and the retention
             // after it, all the way out.
+            settle_the_job().await;
             start_deleting(emulator, case, datastore_id, Hold::No).await;
             tokio::time::sleep(SETTLE_MULTIPLE * (DATASTORE_DELETION_DELAY + DATASTORE_DELETED_RETENTION))
                 .await;
@@ -226,7 +236,7 @@ async fn start_deleting(emulator: &Emulator, case: &str, datastore_id: &str, hol
 /// those preconditions still does.
 #[tokio::test]
 async fn a_recorded_client_token_replays_the_job_it_named() {
-    let rows = vec![
+    let rows = [
         Row {
             case: "nothing changed, recorded token",
             change: Change::Nothing,
@@ -249,7 +259,7 @@ async fn a_recorded_client_token_replays_the_job_it_named() {
             token: Token::Recorded,
             retries: 3,
             expectation: Expectation::SameJob,
-            settled_status: None,
+            settled_status: Some("COMPLETED"),
         },
         Row {
             case: "the store's deletion is in flight, fresh token",
@@ -257,14 +267,6 @@ async fn a_recorded_client_token_replays_the_job_it_named() {
             token: Token::Fresh,
             retries: 2,
             expectation: Expectation::Conflict(DATASTORE_NOT_ACTIVE_MESSAGE),
-            settled_status: None,
-        },
-        Row {
-            case: "the job has completed and the store's deletion is in flight, recorded token",
-            change: Change::JobSettledAndDeletionInFlight,
-            token: Token::Recorded,
-            retries: 2,
-            expectation: Expectation::SameJob,
             settled_status: Some("COMPLETED"),
         },
         Row {

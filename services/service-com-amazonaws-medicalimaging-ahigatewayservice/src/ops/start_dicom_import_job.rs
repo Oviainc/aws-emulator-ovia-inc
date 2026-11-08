@@ -12,6 +12,25 @@
 //! [`crate::state::IMPORT_JOB_IN_PROGRESS_DELAY`] and
 //! [`crate::state::IMPORT_JOB_COMPLETION_DELAY`]. Nothing here sleeps.
 //!
+//! # What the import IMPORTS
+//!
+//! "The import job imports DICOM P10 files … found in the S3 prefix specified by the
+//! `inputS3Uri` parameter", so this call READS that prefix out of this emulator's own
+//! Amazon S3 and materialises an image set for every DICOM series it found
+//! ([`crate::state::read_import_prefix`], [`crate::state::imported_image_sets`]). Each
+//! one comes into existence with the job, `LOCKED` / `IMPORTING` — the state and workflow
+//! status the model declares for an image set a write holds — and the clock DELIVERS its
+//! DICOM attributes and its image frames at the instant the job reaches its terminal
+//! status, landing it `ACTIVE` / `IMPORTED`. So an attribute becomes searchable, and a
+//! frame readable, exactly when the import that produced it completed; and an image set
+//! exists only where a DICOM file really was read, never because a job was submitted.
+//!
+//! `dataAccessRoleArn` is the role the import RUNS AS, so it is resolved against the
+//! account's IAM records before anything is written — the shared reading every service
+//! handed a role ARN uses (`service_common::iam_role`). A role this account does not hold,
+//! or one whose trust policy does not let this service assume it, is the modelled
+//! `AccessDeniedException` (HTTP 403), and the refused call creates no job.
+//!
 //! The data store must have settled into `ACTIVE` first — the model opens this
 //! operation's documentation with "Start importing bulk data into an ACTIVE data store"
 //! — so a store still `CREATING`, or already `DELETING`, is refused with the modeled
@@ -88,7 +107,12 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{ImportJob, JobStatus};
+use ::std::time::SystemTime;
+
+use crate::state::{
+    ComAmazonawsMedicalimagingAhigatewayserviceState, ImageSet, ImageSetState,
+    ImageSetWorkflowStatus, ImportJob, JobStatus, PendingImageSetTransition,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -128,6 +152,101 @@ impl From<StartDICOMImportJobErrorModeled> for StartDICOMImportJobError {
     }
 }
 
+/// What the store answered about one submission, with the state lock held.
+enum Admitted {
+    /// The `clientToken` is already in the ledger and names a job this data store holds:
+    /// the call reports that job and submits nothing.
+    Replay(StartDICOMImportJobOutput),
+    /// Nothing stands in the way of a fresh submission; the data store's ARN is what the
+    /// image sets the import materialises are named under.
+    Fresh { datastore_arn: String },
+}
+
+/// Everything the STORE decides about a submission: whether the data store is there, is
+/// `ACTIVE` and has room for another job, and whether this `clientToken` has already
+/// submitted one.
+///
+/// Called twice — once before the import's input is read and once with the write about to
+/// be made — so the conditions are stated in exactly one place and a condition that
+/// changed while the input was being read is answered the same way it would have been
+/// answered up front.
+fn admit(
+    store: &mut ComAmazonawsMedicalimagingAhigatewayserviceState,
+    region: &str,
+    input: &StartDICOMImportJobInput,
+    token_key: &str,
+) -> Result<Admitted, StartDICOMImportJobError> {
+    // Reached in the region this request was addressed to: a data store exists in
+    // ONE region, so one held in another is not found here at all.
+    let Some(datastore) = store.datastore_in(region, &input.datastore_id) else {
+        return Err(StartDICOMImportJobErrorModeled::ResourceNotFoundException(
+            ResourceNotFoundException {
+                // Constant, and stated by resource KIND: the requested id is not
+                // reflected back (`crate::state::DATASTORE_NOT_FOUND_MESSAGE`).
+                message: crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string(),
+            },
+        )
+        .into());
+    };
+    let datastore_is_active = datastore.is_active();
+    let datastore_arn = datastore.datastore_arn.clone();
+    let import_jobs = datastore.import_jobs.len();
+
+    // `@idempotencyToken`, scoped to the data store the job runs against: a token
+    // already in the ledger names the job it submitted, so the repeat call reports
+    // that job's CURRENT status rather than submitting a second one.
+    //
+    // Resolved BEFORE this operation's refusals, exactly as the sibling idempotent
+    // writer [`crate::ops::create_datastore`] resolves its own ledger: a replay
+    // submits nothing, so no precondition on submitting — the store's status, the
+    // per-store job cap, the role the import would run as — governs it, and a condition
+    // that changed after the first call was answered cannot turn the retry into a
+    // failure.
+    if let Some(existing_id) = store.client_tokens.get(token_key).cloned() {
+        if let Some(existing) = store
+            .datastore_in(region, &input.datastore_id)
+            .and_then(|datastore| datastore.import_jobs.get(&existing_id))
+        {
+            return Ok(Admitted::Replay(StartDICOMImportJobOutput {
+                datastore_id: existing.datastore_id.clone(),
+                job_id: existing.job_id.clone(),
+                job_status: existing.job_status.as_wire().to_string(),
+                submitted_at: crate::state::to_date_time(existing.submitted_at),
+            }));
+        }
+    }
+
+    // "Start importing bulk data into an ACTIVE data store": a store the clock has
+    // not yet settled — still `CREATING`, or already `DELETING` — cannot take an
+    // import, which is what the modelled `ConflictException` (HTTP 409) reports
+    // ([`crate::state::Datastore::is_active`]). This governs a SUBMISSION, which is
+    // all that reaches it now that a replay has already been answered above.
+    if !datastore_is_active {
+        return Err(StartDICOMImportJobErrorModeled::ConflictException(ConflictException {
+            message: crate::state::DATASTORE_NOT_ACTIVE_MESSAGE.to_string(),
+        })
+        .into());
+    }
+
+    // Bound the memory one caller can make this emulator hold, per data store, so
+    // the product of data stores and jobs stays bounded too. The cap is the
+    // emulator's own ([`crate::state::MAX_IMPORT_JOBS_PER_DATASTORE`]), refused
+    // with the operation's modelled quota error.
+    if import_jobs >= crate::state::MAX_IMPORT_JOBS_PER_DATASTORE {
+        return Err(StartDICOMImportJobErrorModeled::ServiceQuotaExceededException(
+            ServiceQuotaExceededException {
+                message: format!(
+                    "this emulator holds at most {} import jobs per data store",
+                    crate::state::MAX_IMPORT_JOBS_PER_DATASTORE
+                ),
+            },
+        )
+        .into());
+    }
+
+    Ok(Admitted::Fresh { datastore_arn })
+}
+
 /// The `StartDICOMImportJob` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -165,87 +284,109 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let region = crate::state::request_region(ctx);
-        let now = ::std::time::SystemTime::now();
+        let now = SystemTime::now();
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             StartDICOMImportJobErrorModeled::InternalServerException(InternalServerException {
                 message: "the medical-imaging state store is unavailable".to_string(),
             })
         })?;
-        let mut store = state.lock();
-        store.advance_clock(now);
-
-        // Reached in the region this request was addressed to: a data store exists in
-        // ONE region, so one held in another is not found here at all.
-        let datastore_is_active = match store.datastore_in(&region, &input.datastore_id) {
-            Some(datastore) => datastore.is_active(),
-            None => {
-                return Err(StartDICOMImportJobErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        // Constant, and stated by resource KIND: the requested id is not
-                        // reflected back (`crate::state::DATASTORE_NOT_FOUND_MESSAGE`).
-                        message: crate::state::DATASTORE_NOT_FOUND_MESSAGE.to_string(),
-                    },
-                )
-                .into());
-            }
-        };
-
-        // `@idempotencyToken`, scoped to the data store the job runs against: a token
-        // already in the ledger names the job it submitted, so the repeat call reports
-        // that job's CURRENT status rather than submitting a second one.
-        //
-        // Resolved BEFORE this operation's refusals, exactly as the sibling idempotent
-        // writer [`crate::ops::create_datastore`] resolves its own ledger: a replay
-        // submits nothing, so no precondition on submitting — the store's status, the
-        // per-store job cap — governs it, and a condition that changed after the first
-        // call was answered cannot turn the retry into a failure.
         let token_key = crate::state::client_token_key(
             &region,
             &format!("StartDICOMImportJob/{}", input.datastore_id),
             &input.client_token,
         );
-        if let Some(existing_id) = store.client_tokens.get(&token_key).cloned() {
-            if let Some(existing) = store
-                .datastore_in(&region, &input.datastore_id)
-                .and_then(|datastore| datastore.import_jobs.get(&existing_id))
-            {
-                return Ok(StartDICOMImportJobOutput {
-                    datastore_id: existing.datastore_id.clone(),
-                    job_id: existing.job_id.clone(),
-                    job_status: existing.job_status.as_wire().to_string(),
-                    submitted_at: crate::state::to_date_time(existing.submitted_at),
-                });
+
+        // Everything the store decides, before the import's input is read: a request the
+        // store refuses reads no object and resolves no role, and a replay of a job
+        // already submitted reports that job.
+        {
+            let mut store = state.lock();
+            store.advance_clock(now);
+            if let Admitted::Replay(replayed) = admit(&mut store, &region, &input, &token_key)? {
+                return Ok(replayed);
             }
         }
 
-        // "Start importing bulk data into an ACTIVE data store": a store the clock has
-        // not yet settled — still `CREATING`, or already `DELETING` — cannot take an
-        // import, which is what the modelled `ConflictException` (HTTP 409) reports
-        // ([`crate::state::Datastore::is_active`]). This governs a SUBMISSION, which is
-        // all that reaches it now that a replay has already been answered above.
-        if !datastore_is_active {
-            return Err(StartDICOMImportJobErrorModeled::ConflictException(ConflictException {
-                message: crate::state::DATASTORE_NOT_ACTIVE_MESSAGE.to_string(),
-            })
+        // "The Amazon Resource Name (ARN) of the IAM role that grants permission to access
+        // medical imaging resources": an import RUNS AS that role, so it is resolved
+        // against the account's IAM records before anything is written — the one reading
+        // of a caller-supplied role ARN every service that takes one shares
+        // (`service_common::iam_role`). A role this account does not hold, or one whose
+        // trust policy does not let this service assume it, is the modelled
+        // `AccessDeniedException` (HTTP 403), and the call creates nothing.
+        if ::service_common::iam_role::role_is_unassumable(
+            ctx,
+            &region,
+            &input.data_access_role_arn,
+            crate::state::IMPORT_SERVICE_PRINCIPAL,
+        )
+        .await
+        {
+            return Err(StartDICOMImportJobErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: crate::state::unassumable_role_message(&input.data_access_role_arn),
+                },
+            )
             .into());
         }
 
-        // Bound the memory one caller can make this emulator hold, per data store, so
-        // the product of data stores and jobs stays bounded too. The cap is the
-        // emulator's own ([`crate::state::MAX_IMPORT_JOBS_PER_DATASTORE`]), refused
-        // with the operation's modelled quota error.
-        if store
+        // "The data is found in the S3 prefix specified by the inputS3Uri parameter":
+        // what the import is asked to import is read HERE, through this emulator's own
+        // Amazon S3, so the image sets the job goes on to materialise describe files that
+        // really exist ([`crate::state::read_import_prefix`]).
+        let instances =
+            crate::state::read_import_prefix(ctx, &region, &input.input_s3_uri).await;
+
+        let mut store = state.lock();
+        store.advance_clock(now);
+        // Asked again with the write about to be made: the lock was given up while the
+        // input was being read, so a store that was deleted, a quota that filled or a
+        // token that submitted in the meantime is answered exactly as it would have been
+        // up front.
+        let datastore_arn = match admit(&mut store, &region, &input, &token_key)? {
+            Admitted::Replay(replayed) => return Ok(replayed),
+            Admitted::Fresh { datastore_arn } => datastore_arn,
+        };
+
+        // The image sets this import will leave behind, one per DICOM series it read, with
+        // their identifiers minted from the one minter this service mints every resource
+        // id with.
+        let imported = {
+            let mut mint = || store.mint_id();
+            crate::state::imported_image_sets(&instances, &mut mint)
+        };
+
+        // The per-data-store bounds on image sets this emulator holds, counted over what
+        // the store WOULD hold once the import had landed, while the request is still
+        // being checked — so no admitted import lands a data store past them. The caps are
+        // the emulator's own, refused with the operation's modelled quota error, exactly
+        // as the sibling image-set writer `crate::ops::copy_image_set` refuses them.
+        let (held_image_sets, image_set_records) = store
             .datastore_in(&region, &input.datastore_id)
-            .is_some_and(|datastore| {
-                datastore.import_jobs.len() >= crate::state::MAX_IMPORT_JOBS_PER_DATASTORE
-            })
-        {
+            .map_or((0, 0), |datastore| {
+                (
+                    datastore.held_image_sets().count(),
+                    datastore.image_sets.len(),
+                )
+            });
+        if held_image_sets + imported.len() > crate::state::MAX_IMAGE_SETS_PER_DATASTORE {
             return Err(StartDICOMImportJobErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: format!(
-                        "this emulator holds at most {} import jobs per data store",
-                        crate::state::MAX_IMPORT_JOBS_PER_DATASTORE
+                        "this emulator holds at most {} image sets per data store",
+                        crate::state::MAX_IMAGE_SETS_PER_DATASTORE
+                    ),
+                },
+            )
+            .into());
+        }
+        if image_set_records + imported.len() > crate::state::MAX_IMAGE_SET_RECORDS_PER_DATASTORE {
+            return Err(StartDICOMImportJobErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "this emulator holds at most {} image set records per data store",
+                        crate::state::MAX_IMAGE_SET_RECORDS_PER_DATASTORE
                     ),
                 },
             )
@@ -253,6 +394,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let job_id = store.mint_id();
+        let completed_due_at = now + crate::state::IMPORT_JOB_COMPLETION_DELAY;
         let job = ImportJob {
             job_id: job_id.clone(),
             job_name: input.job_name.clone(),
@@ -267,23 +409,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ended_at: None,
             message: None,
             in_progress_due_at: now + crate::state::IMPORT_JOB_IN_PROGRESS_DELAY,
-            completed_due_at: now + crate::state::IMPORT_JOB_COMPLETION_DELAY,
+            completed_due_at,
         };
         let job_status = job.job_status.as_wire().to_string();
         let submitted_at = crate::state::to_date_time(job.submitted_at);
 
         // Persist FIRST, and refuse rather than branch past the insert: answering 200
         // with a jobId that was never stored would dress absence as success.
-        store
+        let datastore = store
             .datastore_in_mut(&region, &input.datastore_id)
             .ok_or_else(|| {
                 StartDICOMImportJobErrorModeled::InternalServerException(InternalServerException {
                     message: "the data store could not be reached while submitting the import job"
                         .to_string(),
                 })
-            })?
-            .import_jobs
-            .insert(job_id.clone(), job);
+            })?;
+        datastore.import_jobs.insert(job_id.clone(), job);
+
+        // Each image set the import read comes into existence with the job: `IMPORTING` is
+        // the workflow status the model declares for one an import is writing, and
+        // `LOCKED` is the state an image set a write holds is in — so nothing can be read
+        // out of it or written into it while the import runs. Its DICOM attributes and its
+        // image frames are DELIVERED by the clock at the instant the job reaches its
+        // terminal status, which is when the image set lands `ACTIVE` / `IMPORTED`: an
+        // attribute is searchable, and a frame readable, exactly when the import that
+        // delivered it completed and not before
+        // (`crate::state::ImageSet::advance_to`).
+        for one in imported {
+            let mut image_set = ImageSet::new(
+                one.image_set_id.clone(),
+                crate::state::image_set_arn(&datastore_arn, &one.image_set_id),
+                ImageSetState::Locked,
+                ImageSetWorkflowStatus::Importing,
+                // An imported image set is in the primary DICOM hierarchy: it is the
+                // original of the study's content rather than a copy taken out of it.
+                true,
+                false,
+                now,
+            );
+            image_set.pending = Some(PendingImageSetTransition {
+                due_at: completed_due_at,
+                image_set_state: ImageSetState::Active,
+                workflow_status: ImageSetWorkflowStatus::Imported,
+                delivered_image_frames: Some(one.image_frames),
+                delivered_attributes: Some(one.attributes),
+                // An import does not retire an image set: it brings one into existence.
+                retires_image_set: false,
+            });
+            datastore
+                .image_sets
+                .insert(one.image_set_id.clone(), image_set);
+        }
         store.remember_client_token(token_key, job_id.clone());
 
         Ok(StartDICOMImportJobOutput {

@@ -17,6 +17,12 @@
 //! refused with `ConflictException`, worded by that rule and nothing else
 //! ([`crate::state::DATASTORE_STILL_HOLDS_IMAGE_SETS_MESSAGE`]).
 //!
+//! A DICOM import job still RUNNING on the data store refuses it with the same modelled
+//! `ConflictException`, and is checked FIRST: an import writes image sets into the store,
+//! so a delete admitted while one is in flight would destroy the store under work the
+//! service has already accepted
+//! ([`crate::state::DATASTORE_RUNNING_IMPORT_JOBS_MESSAGE`]).
+//!
 //! The same `ConflictException` ("Updating or deleting a resource can cause an
 //! inconsistent state") refuses the delete of a store whose CREATION is still in flight:
 //! a store the service has just answered `CREATING` for is still on its way to `ACTIVE`,
@@ -173,6 +179,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if datastore.creation_in_flight() {
             return Err(DeleteDatastoreErrorModeled::ConflictException(ConflictException {
                 message: crate::state::DATASTORE_STILL_CREATING_MESSAGE.to_string(),
+            })
+            .into());
+        }
+
+        // A DICOM import job still RUNNING on this data store is work writing INTO it, so
+        // a delete admitted here would destroy the store under an import the service has
+        // already accepted — the inconsistent state the modelled `ConflictException`
+        // (HTTP 409) reports. Refused BEFORE anything is written, and BEFORE the image
+        // sets the store holds are counted: a store with an import in flight is refused
+        // for the import whether or not the import has already written an image set into
+        // it ([`crate::state::Datastore::running_import_jobs`]).
+        if datastore.running_import_jobs().next().is_some() {
+            return Err(DeleteDatastoreErrorModeled::ConflictException(ConflictException {
+                // Constant, and stated by the RULE: neither the data store it was nor
+                // which jobs were in flight
+                // (`crate::state::DATASTORE_RUNNING_IMPORT_JOBS_MESSAGE`).
+                message: crate::state::DATASTORE_RUNNING_IMPORT_JOBS_MESSAGE.to_string(),
             })
             .into());
         }

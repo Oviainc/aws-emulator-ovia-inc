@@ -38,8 +38,7 @@ use service_com_amazonaws_medicalimaging_ahigatewayservice::state::IMAGE_SET_NOT
 
 use crate::datastore_lifecycle::{Answer, Emulator};
 use crate::image_set_copy::{
-    copy_image_set, get_image_set, information, seed_image_set, SEEDED_LATER_WORKFLOW_STATUS,
-    SEEDED_WORKFLOW_STATUS,
+    copy_image_set, get_image_set, information, seed_image_set, SEEDED_WORKFLOW_STATUS,
 };
 use crate::image_set_deletion::move_due_instant;
 use crate::image_set_metadata_updates::{dicom_updates, update_metadata};
@@ -73,16 +72,14 @@ impl Lock {
         }
     }
 
-    /// The status the latest version reports once the clock has released the lock, for an
-    /// image set seeded with `versions` versions. The seeded statuses are the seeder's own
-    /// (`crate::image_set_copy`), so a change there cannot desynchronise this suite.
-    fn landed_status(self, versions: u32) -> &'static str {
+    /// The status the latest version reports once the clock has released the lock.
+    ///
+    /// `COPIED` is "the image set copy is complete", and a completed copy is what last
+    /// happened to BOTH image sets it names — the destination it wrote and the source it
+    /// read — so neither goes back to a status it carried going in.
+    fn landed_status(self) -> &'static str {
         match self {
-            Lock::CopyIntoDestination => "COPIED",
-            // A copy leaves its source's content alone, so the source goes back to the
-            // status its latest version carried going in.
-            Lock::CopySource if versions == 1 => SEEDED_WORKFLOW_STATUS.as_wire(),
-            Lock::CopySource => SEEDED_LATER_WORKFLOW_STATUS.as_wire(),
+            Lock::CopyIntoDestination | Lock::CopySource => "COPIED",
             Lock::MetadataUpdate | Lock::MetadataRevert => "UPDATED",
         }
     }
@@ -421,10 +418,10 @@ async fn every_version_reports_the_state_the_image_set_is_in_while_a_write_holds
                 .last()
                 .map(|entry| entry["ImageSetWorkflowStatus"].as_str())
                 .unwrap_or_default(),
-            Some(case.lock.landed_status(case.versions)),
+            Some(case.lock.landed_status()),
             "case {name:?}: expected the latest version to report {} once the write landed, got \
              {after:?}",
-            case.lock.landed_status(case.versions)
+            case.lock.landed_status()
         );
     }
 }

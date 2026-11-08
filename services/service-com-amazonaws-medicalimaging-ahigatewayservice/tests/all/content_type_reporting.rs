@@ -11,8 +11,9 @@
 //! default, whatever the aggregated document holds and whichever version it was built from;
 //! `GetImageFrame`'s member documents a per-transfer-syntax catalog with a default of its
 //! own, so its answers report the entry documented for the syntax the pixel data is stored
-//! in. Neither read names a compression the blob is not in, so `contentEncoding` stays
-//! absent while this emulator writes the document uncompressed.
+//! in. Neither read names a compression its blob is not in: the metadata blob is served
+//! gzip-compressed, as AWS returns it, and names that format in `contentEncoding`, while
+//! the pixel data is served as it was stored and names none.
 //!
 //! Each suite is a TABLE whose rows differ along what the rule generalises over: for the
 //! metadata read, how much the document holds (nothing stored at all, every modelled
@@ -55,6 +56,11 @@ use crate::image_set_metadata_updates::{seeded_tags, STUDY_UID};
 /// Spelled as the literal the member documents rather than read off the handler's own
 /// constant, so a case here fails if that constant moves away from the documentation.
 const DOCUMENTED_METADATA_CONTENT_TYPE: &str = "text/plain";
+
+/// The compression format AWS HealthImaging returns the aggregated metadata blob in, which
+/// is what `contentEncoding` ("the compression format in which image set metadata
+/// attributes are returned") names.
+const DOCUMENTED_METADATA_CONTENT_ENCODING: &str = "gzip";
 
 /// Stored transfer syntax -> the `contentType` `GetImageFrame` must report for it.
 ///
@@ -210,8 +216,9 @@ fn metadata_cases() -> Vec<MetadataCase> {
     ]
 }
 
-/// Assert one metadata answer carries the documented format, names no compression, and
-/// still holds the JSON document in its blob; answer how many bytes that blob held.
+/// Assert one metadata answer carries the documented format, names the compression its
+/// blob is really in, and still holds the JSON document in that blob; answer how many bytes
+/// that document held.
 fn assert_metadata_answer(answer: &Answer, case: &str) -> usize {
     assert_eq!(
         answer.status, 200,
@@ -222,9 +229,10 @@ fn assert_metadata_answer(answer: &Answer, case: &str) -> usize {
         "case {case:?}: expected contentType {DOCUMENTED_METADATA_CONTENT_TYPE:?}, got {:?}",
         answer.content_type
     );
-    assert!(
-        answer.content_encoding.is_empty(),
-        "case {case:?}: an uncompressed document must name no compression, got {:?}",
+    assert_eq!(
+        answer.content_encoding, DOCUMENTED_METADATA_CONTENT_ENCODING,
+        "case {case:?}: expected contentEncoding {DOCUMENTED_METADATA_CONTENT_ENCODING:?}, got \
+         {:?}",
         answer.content_encoding
     );
     // The header states the format; the blob is untouched by it, so the aggregated

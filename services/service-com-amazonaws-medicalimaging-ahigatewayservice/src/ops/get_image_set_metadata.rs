@@ -20,12 +20,14 @@
 //! SOP instance) or collapses a level of the hierarchy, so the document can only ever name
 //! the records it was built from.
 //!
-//! The document is JSON, written into the blob as it stands, and `contentType` — "the format
-//! in which the study metadata is returned to the customer" — reports the format that member
-//! documents this operation returns it in ([`METADATA_CONTENT_TYPE`]), not a format chosen
-//! here. `contentEncoding` — "the compression format in which image set metadata attributes
-//! are returned" — is absent, because nothing compressed it. The response never names a
-//! compression the blob is not in, so a client decodes the blob from the response alone.
+//! The document is JSON, and `contentType` — "the format in which the study metadata is
+//! returned to the customer" — reports the format that member documents this operation
+//! returns it in ([`METADATA_CONTENT_TYPE`]), not a format chosen here. The blob itself is
+//! COMPRESSED, as AWS HealthImaging returns it, and `contentEncoding` — "the compression
+//! format in which image set metadata attributes are returned" — names the format it is in
+//! ([`METADATA_CONTENT_ENCODING`]). The response never names a compression the blob is not
+//! in, nor applies one it does not name, so a client decodes the blob from the response
+//! alone.
 //!
 //! `version` names ONE version of the image set, and the document reports the DICOM
 //! attributes THAT version holds: the latest version's are the attributes the image set
@@ -122,10 +124,21 @@ use crate::state::{
 /// it is the JSON one `metadata_document` builds.
 pub const METADATA_CONTENT_TYPE: &str = "text/plain";
 
-// `contentEncoding` — "the compression format in which image set metadata attributes are
-// returned" — is REPORTED BY ABSENCE here: this handler writes the document into the blob
-// uncompressed, so there is no compression format to name. Nothing in the response may
-// claim a compression that was not applied, which is why no constant for one exists.
+/// The `contentEncoding` this operation reports — "the compression format in which image
+/// set metadata attributes are returned"
+/// (`smithy_query(query="doc",shape="GetImageSetMetadataResponse",member="contentEncoding")`).
+///
+/// AWS HealthImaging returns the aggregated metadata document COMPRESSED, which is why the
+/// response declares a compression format at all and why the published way to read the
+/// blob is to decompress it (`aws medical-imaging get-image-set-metadata …
+/// studymetadata.json.gz`). So the blob this handler writes really is gzip-compressed, and
+/// the member names the format it is in: nothing in the response claims a compression that
+/// was not applied, and nothing applies one the response does not name.
+///
+/// `contentEncoding` is the compression the CONTENT is carried under;
+/// [`METADATA_CONTENT_TYPE`] is what the content itself is, which the compression does not
+/// change.
+pub const METADATA_CONTENT_ENCODING: &str = "gzip";
 
 /// The version of the aggregated-metadata document this handler writes, carried in the
 /// document's own `SchemaVersion` member so a reader can tell which shape it is reading.
@@ -303,6 +316,38 @@ fn merge_stored_attributes(document: &mut Value, stored: &Map<String, Value>) {
     }
 }
 
+/// `document`, in the gzip format [`METADATA_CONTENT_ENCODING`] names, or `None` when the
+/// codec could not write it.
+///
+/// The compression is DETERMINISTIC: the same document compresses to the same bytes every
+/// time, so two reads of one version of an image set serve the blob byte for byte alike.
+fn gzip(document: &[u8]) -> Option<Vec<u8>> {
+    use ::std::io::Write;
+
+    let mut encoder =
+        ::flate2::write::GzEncoder::new(Vec::new(), ::flate2::Compression::default());
+    encoder.write_all(document).ok()?;
+    encoder.finish().ok()
+}
+
+/// The bytes of the aggregated metadata document a `GetImageSetMetadata` blob carries,
+/// decoded from the compression [`METADATA_CONTENT_ENCODING`] names — the inverse of
+/// [`gzip`], and `None` when the blob is not in that format.
+///
+/// Kept beside the compression it undoes, so the blob's encoding is stated in ONE place:
+/// a reader of this response — a client of this crate, or a suite asserting what the wire
+/// carried — decodes it the way the handler wrote it rather than re-deriving the format
+/// from the header.
+pub fn decoded_metadata_blob(blob: &[u8]) -> Option<Vec<u8>> {
+    use ::std::io::Read;
+
+    let mut document = Vec::new();
+    ::flate2::read::GzDecoder::new(blob)
+        .read_to_end(&mut document)
+        .ok()?;
+    Some(document)
+}
+
 /// The whole aggregated metadata document `attributes` describe for `image_set`, as it
 /// stands in `datastore_id`.
 ///
@@ -472,13 +517,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "the image set metadata document could not be written".to_string(),
             })
         })?;
+        let compressed = gzip(&serialized).ok_or_else(|| {
+            GetImageSetMetadataErrorModeled::InternalServerException(InternalServerException {
+                message: "the image set metadata document could not be compressed".to_string(),
+            })
+        })?;
 
         let output = GetImageSetMetadataOutput {
-            image_set_metadata_blob: serialized,
+            image_set_metadata_blob: compressed,
             content_type: Some(METADATA_CONTENT_TYPE.to_string()),
-            // Nothing compressed the document, so there is no compression format to
-            // report: the member is absent rather than naming one the blob is not in.
-            content_encoding: None,
+            // The blob really is in that compression format: it was compressed just above
+            // ([`METADATA_CONTENT_ENCODING`]).
+            content_encoding: Some(METADATA_CONTENT_ENCODING.to_string()),
         };
 
         // The metadata WAS served, so the content this image set holds was accessed at
