@@ -13,8 +13,8 @@
 //!    A well-formed ARN no record answers to is a different class and keeps
 //!    `ResourceNotFoundException`.
 //! 2. `UpdateCertificateOptions` applies only to a certificate ACM has ISSUED, and a
-//!    request naming one in any other status has reached no state the operation can be
-//!    served in: `InvalidStateException` (HTTP 400), with nothing written.
+//!    request naming one in any other status fails that constraint of the request:
+//!    `ValidationException` (HTTP 400), with nothing written.
 //! 3. A union of this service's input carries exactly one member, and a request that
 //!    sets more than one is refused with `ValidationException` (HTTP 400) whose
 //!    message is built FROM the request: it names the union, states the
@@ -42,9 +42,9 @@ use crate::certificate_validation_state_machine::{make_validation_due_now, PRIVA
 /// The one sentence this service reports for a pagination token it did not issue.
 const INVALID_NEXT_TOKEN: &str = "Invalid next token.";
 
-/// The one sentence ACM reports when an operation needs an issued, valid certificate
-/// and the request names one that is neither.
-const NOT_ISSUED_MESSAGE: &str = "The selected certificate is not Issued and/or Valid.";
+/// The one sentence ACM reports when `UpdateCertificateOptions` names a certificate it
+/// has not issued.
+const NOT_ISSUED_MESSAGE: &str = "Certificate is not issued";
 
 /// The byte `ListCertificateDomainValidations` joins a `NextToken`'s two keys with.
 const CURSOR_SEPARATOR: char = '\u{1f}';
@@ -260,10 +260,11 @@ async fn bad_parameters_of_a_domain_validation_listing_are_one_validation_except
 }
 
 /// RULE 2: `UpdateCertificateOptions` applies only to a certificate ACM has ISSUED,
-/// and any other status is a PROCESSING STATE the request has to wait out rather than a
-/// malformed request: `InvalidStateException` (HTTP 400), with nothing written.
+/// and a request naming one in any other status fails that constraint of the request
+/// rather than reporting the certificate's processing state: `ValidationException`
+/// (HTTP 400), with nothing written.
 #[tokio::test]
-async fn updating_the_options_of_a_certificate_that_is_not_issued_is_an_invalid_state_exception() {
+async fn updating_the_options_of_a_certificate_that_is_not_issued_is_a_validation_exception() {
     // The rows differ along the statuses a stored certificate can be in other than
     // ISSUED, and along the `Options` member the request asks for.
     let cases: &[(&str, Value, bool, &str, Value)] = &[
@@ -320,8 +321,8 @@ async fn updating_the_options_of_a_certificate_that_is_not_issued_is_an_invalid_
         let (status, response) = update_options(&router, &arn, options).await;
         assert_eq!(
             (status, error_code(&response).as_str()),
-            (400, "InvalidStateException"),
-            "case {case}: expected 400 InvalidStateException for a {expected_status} \
+            (400, "ValidationException"),
+            "case {case}: expected 400 ValidationException for a {expected_status} \
              certificate, got {status} {response}"
         );
         let message = error_message(&response);
@@ -371,8 +372,8 @@ async fn updating_the_options_of_a_certificate_that_is_not_issued_is_an_invalid_
         update_options(&router, &arn, &json!({ "ValidationMethod": "HTTP" })).await;
     assert_eq!(
         (status, error_code(&response).as_str()),
-        (400, "InvalidStateException"),
-        "case once revoked: expected 400 InvalidStateException, got {status} {response}"
+        (400, "ValidationException"),
+        "case once revoked: expected 400 ValidationException, got {status} {response}"
     );
 }
 

@@ -13,7 +13,7 @@
 //!    naming the defect and the member it was found in; the invalid-parameter class is
 //!    for the request's own parameters, not for its material.
 //! 2. `UpdateCertificateOptions` applies to a certificate ACM has ISSUED: a record in
-//!    any other status is refused with `InvalidStateException` (HTTP 400) under one
+//!    any other status is refused with `ValidationException` (HTTP 400) under one
 //!    fixed sentence, and a request that asks for an `Export` value other than the one
 //!    in force is refused with `ValidationException` (HTTP 400) under its own, whatever
 //!    status the certificate is in — and neither refusal changes the record.
@@ -67,10 +67,11 @@ const PRIVATE_KEY_NOT_PEM: &str = "The private key is not PEM-encoded or is not 
 
 /// The one sentence ACM reports when `UpdateCertificateOptions` is handed a
 /// certificate that is not issued: fixed text naming neither the certificate nor its
-/// status. The release corpus records this refusal as `InvalidStateException` with this
-/// sentence (acm.update-certificate-options-pending-validation-fails and three sibling
-/// units), so that is what this suite holds the operation to.
-const NOT_ISSUED: &str = "The selected certificate is not Issued and/or Valid.";
+/// status, and terminated by no period. Two corpora record this refusal as
+/// `ValidationException` with this sentence — the behavioral contract check for the
+/// operation and the recorded wire traffic of the request-certificate lifecycle — which
+/// is what this suite holds the operation to.
+const NOT_ISSUED: &str = "Certificate is not issued";
 
 /// The sentence `UpdateCertificateOptions` answers for a request that asks to change
 /// `Export`, which "cannot [be updated] after the the certificate is created"
@@ -337,12 +338,10 @@ async fn import_material_defects_are_one_class_under_their_own_sentence() {
 type OptionsCase<'a> = (&'a str, Value, bool, &'a str, Value, &'a str, &'a str);
 
 /// RULE 2: `UpdateCertificateOptions` is served only for a certificate ACM has ISSUED,
-/// and `Export` can never be changed — the status precondition reported as the
-/// certificate's own processing state and the `Export` rule as a constraint failure of
-/// the request, each under its own fixed sentence, with the record left exactly as it
-/// was. The `Export` rule is a fact of the request, so it is decided first: a
-/// certificate that is not issued AND asks for a different `Export` is told about
-/// `Export`.
+/// and `Export` can never be changed — each refused as a constraint failure of the
+/// request (`ValidationException`) under its OWN fixed sentence, with the record left
+/// exactly as it was. The `Export` sentence is decided first, so a certificate that is
+/// not issued AND asks for a different `Export` is told about `Export`.
 #[tokio::test]
 async fn options_update_refusals_carry_the_sentence_of_the_rule_they_break() {
     // Rows differ along the status the certificate is in, the `Options` member the
@@ -355,7 +354,7 @@ async fn options_update_refusals_carry_the_sentence_of_the_rule_they_break() {
             false,
             "PENDING_VALIDATION",
             json!({ "ValidationMethod": "DNS" }),
-            "InvalidStateException",
+            "ValidationException",
             NOT_ISSUED,
         ),
         (
@@ -364,7 +363,7 @@ async fn options_update_refusals_carry_the_sentence_of_the_rule_they_break() {
             false,
             "PENDING_VALIDATION",
             json!({ "CertificateTransparencyLoggingPreference": "DISABLED" }),
-            "InvalidStateException",
+            "ValidationException",
             NOT_ISSUED,
         ),
         (
@@ -375,7 +374,7 @@ async fn options_update_refusals_carry_the_sentence_of_the_rule_they_break() {
             false,
             "PENDING_VALIDATION",
             json!({ "Export": "DISABLED" }),
-            "InvalidStateException",
+            "ValidationException",
             NOT_ISSUED,
         ),
         (
@@ -393,7 +392,7 @@ async fn options_update_refusals_carry_the_sentence_of_the_rule_they_break() {
             true,
             "FAILED",
             json!({ "ValidationMethod": "HTTP" }),
-            "InvalidStateException",
+            "ValidationException",
             NOT_ISSUED,
         ),
         (
@@ -405,7 +404,7 @@ async fn options_update_refusals_carry_the_sentence_of_the_rule_they_break() {
                 "ValidationMethod": "EMAIL",
                 "CertificateTransparencyLoggingPreference": "ENABLED",
             }),
-            "InvalidStateException",
+            "ValidationException",
             NOT_ISSUED,
         ),
         (

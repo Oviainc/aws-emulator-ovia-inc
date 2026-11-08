@@ -2890,15 +2890,18 @@ pub fn certificate_resource_message(
     )
 }
 
-/// The `InvalidStateException` message for a request that needs an issued, valid
-/// certificate and names one that is neither.
+/// The `ValidationException` message `UpdateCertificateOptions` answers for a
+/// certificate that is not [`STATUS_ISSUED`].
 ///
-/// `InvalidStateException` carries one modelled member (`message: String`) and the
-/// model documents no text for it, so the sentence comes from ACM's recorded
-/// behaviour: ONE constant sentence for the whole refusal class, naming neither the
-/// certificate nor the status it is in. Rendered here so every operation that requires
-/// an issued certificate reports the same sentence.
-pub const NOT_ISSUED_MESSAGE: &str = "The selected certificate is not Issued and/or Valid.";
+/// The options this operation changes are those of a certificate ACM has issued, so a
+/// `CertificateArn` naming a record in any other `CertificateStatus` is input this
+/// operation's constraints do not admit — which is what `ValidationException` reports
+/// ("the supplied input failed to satisfy constraints of an Amazon Web Services
+/// service"). `ValidationException` carries one modelled member (`message: String`) and
+/// the model documents no text for it, so the sentence comes from ACM's recorded
+/// behaviour for this refusal: ONE constant sentence naming neither the certificate nor
+/// the status it is in, and terminated by no period.
+pub const CERTIFICATE_NOT_ISSUED_MESSAGE: &str = "Certificate is not issued";
 
 /// The `RequestInProgressException` message for a request that asks for the
 /// certificate material of a resource this service holds none for.

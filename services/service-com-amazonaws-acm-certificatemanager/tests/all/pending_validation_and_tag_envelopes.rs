@@ -46,9 +46,9 @@ use crate::certificate_lifecycle::{
 use crate::certificate_validation_state_machine::make_validation_due_now;
 use crate::resource_tagging::{create_endpoint, tag_pairs};
 
-/// The one sentence ACM reports when an operation needs an issued, valid certificate
-/// and the request names one that is neither.
-const NOT_ISSUED_MESSAGE: &str = "The selected certificate is not Issued and/or Valid.";
+/// The one sentence ACM reports when `UpdateCertificateOptions` names a certificate it
+/// has not issued.
+const NOT_ISSUED_MESSAGE: &str = "Certificate is not issued";
 
 /// The one sentence ACM reports for a request past the per-resource user-tag quota: the
 /// bound, and nothing of the request.
@@ -135,7 +135,7 @@ fn assert_challenge_target(case: &str, value: &str) {
 /// RULE 1: a public request whose names could be proven waits in `PENDING_VALIDATION`
 /// for the documented validation window — nothing pre-empts it — so its evidence stays
 /// live; and RULE 2: `UpdateCertificateOptions` on such a certificate is refused with
-/// `InvalidStateException`.
+/// `ValidationException`.
 #[tokio::test]
 async fn a_public_request_waits_in_pending_validation_with_its_evidence_live() {
     // Rows differ along what the rule generalises over: the validation method asked for
@@ -192,9 +192,9 @@ async fn a_public_request_waits_in_pending_validation_with_its_evidence_live() {
         .await;
         assert_eq!(
             (status, error_code(&response).as_str(), error_message(&response).as_str()),
-            (400, "InvalidStateException", NOT_ISSUED_MESSAGE),
-            "case {case}: a pending certificate's options are refused as a processing \
-             state, got {status} {response}"
+            (400, "ValidationException", NOT_ISSUED_MESSAGE),
+            "case {case}: a pending certificate's options are refused as a request that \
+             names no issued certificate, got {status} {response}"
         );
 
         // The evidence the method asks for is on the record while the request waits.
@@ -386,8 +386,8 @@ async fn the_same_options_update_succeeds_once_the_certificate_is_issued() {
     let (status, response) = call(&router, "UpdateCertificateOptions", &update).await;
     assert_eq!(
         (status, error_code(&response).as_str()),
-        (400, "InvalidStateException"),
-        "case while pending: expected the processing-state refusal, got {status} {response}"
+        (400, "ValidationException"),
+        "case while pending: expected the not-issued refusal, got {status} {response}"
     );
 
     make_validation_due_now(&engine);
