@@ -53,6 +53,8 @@ mod established_generated_values;
 mod event_instant_round_trip;
 #[path = "all/extended_metric_dimension_entries.rs"]
 mod extended_metric_dimension_entries;
+#[path = "all/iam_denial_wording.rs"]
+mod iam_denial_wording;
 #[path = "all/identity_policy_sources.rs"]
 mod identity_policy_sources;
 #[path = "all/list_app_monitors_page_size.rs"]
