@@ -259,6 +259,8 @@ mod blueprints;
 mod catalog;
 mod classifiers;
 mod column_statistics;
+mod column_statistics_source;
+mod column_statistics_values;
 mod crawler_roles_and_connections;
 mod crawlers;
 mod data_assets;
@@ -278,6 +280,8 @@ pub use blueprints::*;
 pub use catalog::*;
 pub use classifiers::*;
 pub use column_statistics::*;
+pub use column_statistics_source::*;
+pub use column_statistics_values::*;
 pub use crawler_roles_and_connections::*;
 pub use crawlers::*;
 pub use data_assets::*;
@@ -307,7 +311,11 @@ use crate::ops::types::{
     CatalogProperties,
     CatalogPropertiesOutput,
     Classifier,
-    CodeGenConfigurationNode, Column, ColumnStatisticsTaskRun, ColumnStatisticsTaskSettings,
+    BinaryColumnStatisticsData, BooleanColumnStatisticsData,
+    CodeGenConfigurationNode, Column, ColumnStatistics, ColumnStatisticsData,
+    ColumnStatisticsTaskRun, ColumnStatisticsTaskSettings,
+    DateColumnStatisticsData, DecimalColumnStatisticsData, DecimalNumber,
+    DoubleColumnStatisticsData, LongColumnStatisticsData, StringColumnStatisticsData,
     ConfigurationObject,
     Condition,
     Connection, ConnectionInput,
@@ -1264,9 +1272,38 @@ impl ComAmazonawsGlueAwsglueState {
     /// is for a job run: a run's next state was due at
     /// [`ColumnStatisticsTaskRunEntry::settles_at`] whether or not anybody called, so
     /// materialising it on read reports the state the clock had already reached.
+    ///
+    /// A run that reaches its SUCCEEDED state is the run that generated the statistics of
+    /// the columns it covered, so settling it also stores those statistics on the table —
+    /// which is what makes them readable through `GetColumnStatisticsForTable`. The work
+    /// itself was done when the run was started
+    /// ([`compute_column_statistics`]); nothing is computed here. One walk moves the runs
+    /// and the next writes the tables, because a run and the table it covers are reached
+    /// through the same store.
     pub fn settle_due_column_statistics_task_runs(&mut self, now: SystemTime) {
+        let mut generated: Vec<(String, String, String, SettledColumnStatistics)> = Vec::new();
         for run in &mut self.column_statistics_task_runs {
-            run.settle_if_due(now);
+            if let Some(settled) = run.settle_if_due(now) {
+                generated.push((
+                    run.catalog_id.clone(),
+                    run.database_name.clone(),
+                    run.table_name.clone(),
+                    settled,
+                ));
+            }
+        }
+        for (catalog_id, database_name, table_name, settled) in generated {
+            // A table dropped while its run was in flight is a table there is nothing to
+            // publish onto: the run still reports the status it reached.
+            let Some(table) = self.table_mut(&catalog_id, &database_name, &table_name) else {
+                continue;
+            };
+            for computed in &settled.statistics {
+                table.column_statistics.insert(
+                    fold_name(&computed.column_name),
+                    computed.to_column_statistics(settled.analyzed_at),
+                );
+            }
         }
     }
 
@@ -1577,6 +1614,19 @@ impl ComAmazonawsGlueAwsglueState {
         self.catalogs
             .get_mut(catalog_id)
             .and_then(|catalog| catalog.databases.get_mut(&fold_name(name)))
+    }
+
+    /// The stored table, mutably: `None` when the catalog, the database or the table is
+    /// absent. Names are matched folded, the way the catalog stores them.
+    pub fn table_mut(
+        &mut self,
+        catalog_id: &str,
+        database_name: &str,
+        table_name: &str,
+    ) -> Option<&mut TableEntry> {
+        let table = fold_name(table_name);
+        self.database_mut(catalog_id, database_name)
+            .and_then(|database| database.tables.get_mut(&table))
     }
 
     /// The stored connection definition `name` of `catalog_id`, or `None` when either the

@@ -949,6 +949,17 @@ pub fn column_statistics_task_run_not_found(run_id: &str) -> String {
     format!("Column statistics task run with id {run_id} does not exist")
 }
 
+/// A column statistics read (`GetColumnStatisticsForTable`) for a name the addressed
+/// table declares no column under: the `ErrorDetail$ErrorMessage` of that name's entry
+/// in `Errors`, "a column name that failed and the reason for failure".
+///
+/// NOT recorded: the sentence follows the per-resource template of the recorded misses
+/// above, built from the column the request asked for and the table it addressed —
+/// which are what the caller needs to tell a mistyped column from one the table has.
+pub fn column_not_found(column_name: &str, table_name: &str) -> String {
+    format!("Column {column_name} does not exist in table {table_name}.")
+}
+
 /// A column statistics task settings read (`GetColumnStatisticsTaskSettings`) for a
 /// table no create has written settings for. RECORDED constant: the whole sentence is
 /// fixed — it names the MEMBERS the request addressed the entry by rather than the

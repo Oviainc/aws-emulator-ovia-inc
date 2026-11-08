@@ -2,6 +2,11 @@
 
 //! The column-statistics records of a table: the task runs started for it, the task settings
 //! a create recorded, and the states a run moves through.
+//!
+//! WHAT a run computes and where it reads it from live beside this
+//! ([`super::column_statistics_source`], [`super::column_statistics_values`]): a run is
+//! performed where it is started, carries its outcome, and publishes the statistics it
+//! computed onto the table when the clock settles it.
 
 use super::*;
 
@@ -46,6 +51,15 @@ pub struct ColumnStatisticsTaskRunEntry {
     pub end_time: Option<SystemTime>,
     /// `ErrorMessage`: "The error message for the job", absent until one has failed.
     pub error_message: Option<String>,
+    /// What this run's computation over the table's data produced: the statistics of the
+    /// columns it covers, or the reason it could not compute them.
+    ///
+    /// The work is done where the run is STARTED (`StartColumnStatisticsTaskRun` performs
+    /// it with no store guard held, see
+    /// [`compute_column_statistics`]), and this is what it answered — so the terminal
+    /// status the clock owes this run is decided by the data, and the statistics a
+    /// successful run publishes onto the table are the ones its own reading produced.
+    pub outcome: ColumnStatisticsRunOutcome,
 }
 
 impl ColumnStatisticsTaskRunEntry {
@@ -61,20 +75,16 @@ impl ColumnStatisticsTaskRunEntry {
         catalog_id: &str,
         id: String,
         now: SystemTime,
+        outcome: ColumnStatisticsRunOutcome,
     ) -> Self {
         Self {
             id,
             catalog_id: catalog_id.to_string(),
             database_name: table.database_name.clone(),
             table_name: table.name.clone(),
-            // "If none is supplied, all column names for the table will be used by
-            // default": an EMPTY list supplies no column name either, so it takes the
-            // same default rather than recording a run that covers nothing.
-            column_name_list: input
-                .column_name_list
-                .clone()
-                .filter(|names| !names.is_empty())
-                .unwrap_or_else(|| table_column_names(table)),
+            // The columns the run covers, resolved ONCE
+            // ([`covered_column_names`]) — the same list the run was performed over.
+            column_name_list: covered_column_names(input, table),
             role: input.role.clone(),
             sample_size: input.sample_size,
             security_configuration: input.security_configuration.clone(),
@@ -89,6 +99,7 @@ impl ColumnStatisticsTaskRunEntry {
             end_time: None,
             // Nothing has failed yet: a run carries an error message only once it has.
             error_message: None,
+            outcome,
         }
     }
 
@@ -110,24 +121,46 @@ impl ColumnStatisticsTaskRunEntry {
             && self.table_name == table
     }
 
-    /// Move this run into the status the clock owed it at `now`, if it owed one.
+    /// Move this run into the status the clock owed it at `now`, if it owed one, and
+    /// answer the statistics that status publishes onto the table.
     ///
     /// The run was due to leave [`COLUMN_STATISTICS_TASK_RUN_STATE_STARTING`] at
     /// [`Self::settles_at`] whether or not anybody called, and the instants recorded are
     /// that DUE instant, not the instant somebody read it — so two reads of a settled run
     /// report the same run.
-    pub fn settle_if_due(&mut self, now: SystemTime) {
-        let Some(due) = self.settles_at else {
-            return;
-        };
+    ///
+    /// WHICH status it reaches is [`Self::outcome`]: a run whose reading of the table's
+    /// data produced statistics succeeded and carries no error message, and one that could
+    /// not compute them failed carrying the reason. `Some` answers the statistics of a
+    /// successful run, to be stored on the table it covers
+    /// ([`ComAmazonawsGlueAwsglueState::settle_due_column_statistics_task_runs`] is the
+    /// one caller, because only the store can reach that table).
+    #[must_use]
+    pub fn settle_if_due(&mut self, now: SystemTime) -> Option<SettledColumnStatistics> {
+        let due = self.settles_at?;
         if due > now {
-            return;
+            return None;
         }
         self.settles_at = None;
-        self.status = COLUMN_STATISTICS_TASK_RUN_STATE_FAILED.to_string();
-        self.error_message = Some(COLUMN_STATISTICS_TASK_RUN_NOT_EXECUTED_MESSAGE.to_string());
         self.end_time = Some(due);
         self.last_updated = due;
+        match &self.outcome {
+            ColumnStatisticsRunOutcome::Computed(statistics) => {
+                self.status = COLUMN_STATISTICS_TASK_RUN_STATE_SUCCEEDED.to_string();
+                // A run that generated statistics failed at nothing, so it carries no
+                // error message at all.
+                self.error_message = None;
+                Some(SettledColumnStatistics {
+                    analyzed_at: due,
+                    statistics: statistics.clone(),
+                })
+            }
+            ColumnStatisticsRunOutcome::Failed(reason) => {
+                self.status = COLUMN_STATISTICS_TASK_RUN_STATE_FAILED.to_string();
+                self.error_message = Some(reason.clone());
+                None
+            }
+        }
     }
 
     /// Move this run into the state a stop leaves it in.
@@ -192,9 +225,10 @@ impl ColumnStatisticsTaskRunEntry {
             sample_size: self.sample_size,
             security_configuration: self.security_configuration.clone(),
             // "The number of workers used to generate column statistics" and "the
-            // calculated DPU usage in seconds for all autoscaled workers": no worker ran,
-            // so neither figure has anything to report and each stays at the model's own
-            // default, and no `WorkerType` was used either.
+            // calculated DPU usage in seconds for all autoscaled workers": the statistics
+            // are computed in this process rather than by a fleet this emulator
+            // provisions, so neither figure has anything to report and each stays at the
+            // model's own default, and no `WorkerType` was used either.
             number_of_workers: 0,
             worker_type: None,
             dpu_seconds: 0.0,
@@ -207,6 +241,26 @@ impl ColumnStatisticsTaskRunEntry {
             error_message: self.error_message.clone(),
         }
     }
+}
+
+/// The columns a `StartColumnStatisticsTaskRun` request covers of the stored table it
+/// addressed: the ones it listed, else every column the STORED table declares ("If none is
+/// supplied, all column names for the table will be used by default" — an EMPTY list
+/// supplies no column name either, so it takes the same default rather than covering
+/// nothing).
+///
+/// ONE resolution, so the columns the run is PERFORMED over
+/// ([`ColumnStatisticsRunPlan::of`]) and the columns the recorded run REPORTS
+/// ([`ColumnStatisticsTaskRunEntry::column_name_list`]) cannot drift apart.
+pub fn covered_column_names(
+    input: &StartColumnStatisticsTaskRunInput,
+    table: &TableEntry,
+) -> Vec<String> {
+    input
+        .column_name_list
+        .clone()
+        .filter(|names| !names.is_empty())
+        .unwrap_or_else(|| table_column_names(table))
 }
 
 /// Every column name the stored table has, in the order the table declares them: the
@@ -359,6 +413,10 @@ pub const COLUMN_STATISTICS_TASK_RUN_STATE_STARTING: &str = "STARTING";
 /// See [`COLUMN_STATISTICS_TASK_RUN_STATE_STARTING`].
 pub const COLUMN_STATISTICS_TASK_RUN_STATE_FAILED: &str = "FAILED";
 
+/// See [`COLUMN_STATISTICS_TASK_RUN_STATE_STARTING`]: the state a run reaches once it has
+/// generated the statistics of the columns it covers.
+pub const COLUMN_STATISTICS_TASK_RUN_STATE_SUCCEEDED: &str = "SUCCEEDED";
+
 /// See [`COLUMN_STATISTICS_TASK_RUN_STATE_STARTING`]: the state
 /// `StopColumnStatisticsTaskRun` leaves the run it stopped in.
 pub const COLUMN_STATISTICS_TASK_RUN_STATE_STOPPED: &str = "STOPPED";
@@ -368,10 +426,25 @@ pub const COLUMN_STATISTICS_TASK_RUN_STATE_STOPPED: &str = "STOPPED";
 /// [`COLUMN_STATISTICS_TASK_RUN_STATE_STARTING`], the ones that name a finished run. The
 /// other two (`STARTING`, `RUNNING`) each still owe a further state.
 pub const TERMINAL_COLUMN_STATISTICS_TASK_RUN_STATES: [&str; 3] = [
-    "SUCCEEDED",
+    COLUMN_STATISTICS_TASK_RUN_STATE_SUCCEEDED,
     COLUMN_STATISTICS_TASK_RUN_STATE_FAILED,
     COLUMN_STATISTICS_TASK_RUN_STATE_STOPPED,
 ];
+
+/// The statistics a settled column statistics task run publishes onto the table it
+/// covers, and the instant it generated them.
+///
+/// The instant is the run's own DUE instant, which is what the run reports as its end:
+/// `ColumnStatistics$AnalyzedTime` is "the timestamp of when column statistics were
+/// generated", so it is the instant the run finished rather than the instant some later
+/// read materialised it — two reads of one settled run therefore report one instant.
+#[derive(Debug, Clone)]
+pub struct SettledColumnStatistics {
+    /// When the statistics were generated.
+    pub analyzed_at: SystemTime,
+    /// The statistics of each covered column that has them.
+    pub statistics: Vec<ComputedColumnStatistics>,
+}
 
 /// How long a column statistics task run stays in
 /// [`COLUMN_STATISTICS_TASK_RUN_STATE_STARTING`] before the clock owes it its terminal
@@ -383,17 +456,6 @@ pub const TERMINAL_COLUMN_STATISTICS_TASK_RUN_STATES: [&str; 3] = [
 /// flight, and the refusal that goes with a run in flight. The due instant is stored on
 /// the run and materialised by whichever later call reads it; nothing sleeps.
 pub const COLUMN_STATISTICS_TASK_RUN_SETTLES_AFTER: Duration = Duration::from_millis(500);
-
-/// `ColumnStatisticsTaskRun$ErrorMessage` for the terminal state the clock owes every
-/// column statistics task run.
-///
-/// This emulator is the Glue control plane: it records a task run faithfully, but it
-/// reads none of the table's underlying data and so computes no statistics from it — the
-/// run therefore ends in the modelled failure state carrying a reason that says exactly
-/// that, rather than reporting statistics nothing computed.
-pub const COLUMN_STATISTICS_TASK_RUN_NOT_EXECUTED_MESSAGE: &str =
-    "This emulator records column statistics task runs but reads none of the table's \
-     underlying data, so the run ended without generating statistics.";
 
 /// `ColumnStatisticsTaskRun$ComputationType` of a run `StartColumnStatisticsTaskRun`
 /// started: of the modelled `ComputationType` (`FULL | INCREMENTAL`), the full

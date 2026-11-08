@@ -67,6 +67,8 @@ mod catalog_structure;
 mod catalogs;
 #[path = "all/classifiers.rs"]
 mod classifiers;
+#[path = "all/column_statistics_computation.rs"]
+mod column_statistics_computation;
 #[path = "all/column_statistics_task_conflicts.rs"]
 mod column_statistics_task_conflicts;
 #[path = "all/column_statistics_task_run_history.rs"]

@@ -14,9 +14,10 @@
 //! under that id, in a non-terminal `ColumnStatisticsState` until the status the clock
 //! owes it falls due and in a terminal one afterwards. While a run of a table is in
 //! flight, another start for THAT table is refused; a start for any other table is not.
-//! Because this emulator reads none of the table's underlying data, the status the clock
-//! owes is the modelled failure status carrying the reason nothing was generated, so a
-//! run never reports statistics nothing computed.
+//! The status the clock owes is decided by the table's own DATA: no object store is mounted
+//! beside Glue here, so every table below points at data that cannot be read and every run
+//! settles in the modelled failure status carrying that reason. The runs that DO read data
+//! and settle `SUCCEEDED` are in [`crate::column_statistics_computation`].
 //!
 //! The recorded case — one table started with an explicit column list — is ONE row of the
 //! tables below; the rows differ along which members the start names, how many columns it
@@ -32,11 +33,11 @@ use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
-    ColumnStatisticsTaskRunEntry, ComAmazonawsGlueAwsglueState,
-    COLUMN_STATISTICS_COMPUTATION_TYPE_FULL, COLUMN_STATISTICS_TASK_RUN_NOT_EXECUTED_MESSAGE,
-    COLUMN_STATISTICS_TASK_RUN_SETTLES_AFTER, COLUMN_STATISTICS_TASK_RUN_STATE_FAILED,
-    COLUMN_STATISTICS_TASK_RUN_STATE_STARTING, MAX_COLUMN_STATISTICS_TASK_RUNS,
-    TERMINAL_COLUMN_STATISTICS_TASK_RUN_STATES,
+    column_statistics_task_run_unreadable_data, ColumnStatisticsTaskRunEntry,
+    ComAmazonawsGlueAwsglueState, COLUMN_STATISTICS_COMPUTATION_TYPE_FULL,
+    COLUMN_STATISTICS_TASK_RUN_NO_TABLE_LOCATION, COLUMN_STATISTICS_TASK_RUN_SETTLES_AFTER,
+    COLUMN_STATISTICS_TASK_RUN_STATE_FAILED, COLUMN_STATISTICS_TASK_RUN_STATE_STARTING,
+    MAX_COLUMN_STATISTICS_TASK_RUNS, TERMINAL_COLUMN_STATISTICS_TASK_RUN_STATES,
 };
 // The fixed sentence the in-flight refusal carries, read from the crate rather than
 // spelled a second time here.
@@ -81,7 +82,7 @@ async fn store_table(router: &MultiServiceRouter, database: &str, table: &str, c
     let mut table_input = json!({ "Name": table, "TableType": "EXTERNAL_TABLE" });
     if !columns.is_empty() {
         table_input["StorageDescriptor"] = json!({
-            "Location": format!("s3://bucket/{}/", table.to_lowercase()),
+            "Location": table_location(table),
             "Columns": columns
                 .iter()
                 .map(|name| json!({ "Name": name, "Type": "string" }))
@@ -94,6 +95,25 @@ async fn store_table(router: &MultiServiceRouter, database: &str, table: &str, c
         &json!({ "DatabaseName": database, "TableInput": table_input }),
     )
     .await;
+}
+
+/// Why a run over the table [`store_table`] stored could not generate statistics: no
+/// object store is mounted beside Glue in this suite, so a table that points at data
+/// cannot have it read, and a table stored without a storage descriptor points at none at
+/// all.
+///
+/// Read from the crate rather than spelled here, so the reason a run reports and the reason
+/// asserted cannot drift apart.
+pub fn unreadable_reason(table: &str, columns: &[&str]) -> String {
+    if columns.is_empty() {
+        return COLUMN_STATISTICS_TASK_RUN_NO_TABLE_LOCATION.to_string();
+    }
+    column_statistics_task_run_unreadable_data(&table_location(table))
+}
+
+/// Where [`store_table`] points a stored table's data at.
+pub fn table_location(table: &str) -> String {
+    format!("s3://bucket/{}/", table.to_lowercase())
 }
 
 /// Start a run and answer the `ColumnStatisticsTaskRunId` it reports.
@@ -469,8 +489,8 @@ async fn a_started_run_is_read_back_through_get_column_statistics_task_run() {
         );
         assert_eq!(
             settled.get("ErrorMessage").and_then(Value::as_str),
-            Some(COLUMN_STATISTICS_TASK_RUN_NOT_EXECUTED_MESSAGE),
-            "case {case:?}: a run that generated no statistics says so, got {settled}"
+            Some(unreadable_reason(table, columns).as_str()),
+            "case {case:?}: a run that could not read the table's data says so, got {settled}"
         );
         assert!(
             reported_number(&settled, "EndTime") > 0.0,

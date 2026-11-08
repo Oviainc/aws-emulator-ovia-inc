@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetColumnStatisticsForTable
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetColumnStatisticsForTable`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetColumnStatisticsForTable::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the column statistics of ONE stored table: "retrieves table statistics of
+//! columns" — the `ColumnStatistics` [`crate::state`] holds for the columns the request
+//! names ([`crate::state::TableEntry::column_statistics`]), which are the statistics a
+//! column statistics task run generated from the data behind the table
+//! (`StartColumnStatisticsTaskRun`).
+//!
+//! A reporting operation, so the only write it makes is the one the CLOCK already owed:
+//! the terminal status a column statistics task run was due at its own instant, whose
+//! settling is what publishes that run's statistics onto the table
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::settle_due_column_statistics_task_runs`]).
+//! A column the table declares but nothing has generated statistics for is simply not in
+//! the answer; a name the table declares no column under is reported in `Errors`, "a column
+//! name that failed and the reason for failure".
 //!
 //! ## Shape of an operation
 //!
@@ -153,20 +158,102 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetColumnStatisticsForTable` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetColumnStatisticsForTableErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetColumnStatisticsForTableErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue Data Catalog store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // This operation models no authorization refusal, and this store holds only the
+        // Data Catalog of the account it serves — so a `CatalogId` of another account
+        // resolves to no catalog here and the read is the catalog's own miss below.
+        let catalog_id = crate::state::resolve_catalog_id(input.catalog_id.as_ref());
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // The only write a read makes: the run statuses the clock had already made due,
+        // which is also what publishes a finished run's statistics onto the table.
+        store.settle_due_column_statistics_task_runs(now);
+
+        // `DatabaseName`, `TableName` and `ColumnNames` are `@required`, and the list's
+        // `length 0..100` is refused at the boundary — so reaching here, the only question
+        // is what the catalog holds under those names.
+        let Some(database) = store.database(&catalog_id, &input.database_name) else {
+            return Err(not_found(crate::state::messages::database_not_found(
+                &input.database_name,
+            )));
+        };
+        let Some(table) = database
+            .tables
+            .get(&crate::state::fold_name(&input.table_name))
+        else {
+            // The same miss the catalog's own table READ answers with: the statistics of a
+            // table are addressed through that table, and "the IAM permission required for
+            // this operation is GetTable".
+            return Err(not_found(
+                crate::state::messages::TABLE_ENTITY_NOT_FOUND.to_string(),
+            ));
+        };
+
+        // The requested columns are walked in the order the request asked for them, so the
+        // caller reads the answer against its own list. A name asked for twice is answered
+        // twice: nothing of the request is rewritten here.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetColumnStatisticsForTable"))
+        // Which names the table declares a column under is read once, folded the way the
+        // catalog addresses a column name.
+        let declared: Vec<String> = crate::state::table_column_names(table)
+            .iter()
+            .map(|name| crate::state::fold_name(name))
+            .collect();
+        let mut statistics: Vec<ColumnStatistics> = Vec::new();
+        let mut errors: Vec<ColumnError> = Vec::new();
+        for name in &input.column_names {
+            let folded = crate::state::fold_name(name);
+            if let Some(stored) = table.column_statistics.get(&folded) {
+                statistics.push(stored.clone());
+                continue;
+            }
+            // A column the table HAS but nothing has generated statistics for has no
+            // entry and no failure either: there is nothing to retrieve for it yet.
+            if declared.contains(&folded) {
+                continue;
+            }
+            errors.push(ColumnError {
+                column_name: Some(name.clone()),
+                // Built the way every per-item failure of this catalog is, so the
+                // `__type` tag the Data Catalog writes onto a nested `ErrorDetail` is on
+                // this one too.
+                error: Some(crate::state::catalog_error_detail(
+                    COLUMN_NOT_FOUND_ERROR_CODE,
+                    crate::state::messages::column_not_found(name, &input.table_name),
+                )),
+            });
+        }
+
+        Ok(GetColumnStatisticsForTableOutput {
+            // Both lists are always definite: an empty list is the answer that nothing
+            // was retrieved, or that nothing failed.
+            column_statistics_list: Some(statistics),
+            errors: Some(errors),
+        })
     }
+}
+
+/// The `ErrorDetail$ErrorCode` a requested name the table declares no column under is
+/// reported with: the service's own name for an entity that does not exist, which is the
+/// error class this operation models for a resource it cannot resolve
+/// (`EntityNotFoundException`, "a specified entity does not exist").
+const COLUMN_NOT_FOUND_ERROR_CODE: &str = "EntityNotFoundException";
+
+/// This operation's modelled miss: "A specified entity does not exist".
+fn not_found(message: String) -> GetColumnStatisticsForTableError {
+    GetColumnStatisticsForTableErrorModeled::EntityNotFoundException(EntityNotFoundException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
 }

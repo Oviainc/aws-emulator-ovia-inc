@@ -30,7 +30,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use crate::column_statistics_task_runs::{already_past, far_future, set_due_instant};
 use crate::wire::{emulator_on, ok, string_list, ACCOUNT_ID};
 use service_com_amazonaws_glue_awsglue::state::{
-    ColumnStatisticsTaskRunEntry, ComAmazonawsGlueAwsglueState,
+    ColumnStatisticsRunOutcome, ColumnStatisticsTaskRunEntry, ComAmazonawsGlueAwsglueState,
     COLUMN_STATISTICS_TASK_RUN_STATE_STARTING, COLUMN_STATISTICS_TASK_RUN_STATE_STOPPED,
     TERMINAL_COLUMN_STATISTICS_TASK_RUN_STATES,
 };
@@ -306,6 +306,9 @@ fn seeded_run(index: usize) -> ColumnStatisticsTaskRunEntry {
         last_updated: started_at,
         end_time: Some(started_at),
         error_message: None,
+        // A seeded run has already come to rest, so what its reading of the table's data
+        // produced is behind it: it covers no column and publishes nothing.
+        outcome: ColumnStatisticsRunOutcome::Computed(Vec::new()),
     }
 }
 

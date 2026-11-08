@@ -34,13 +34,15 @@ use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
     COLUMN_STATISTICS_EXECUTION_STATUS_FAILED, COLUMN_STATISTICS_EXECUTION_STATUS_STARTED,
     COLUMN_STATISTICS_SCHEDULE_TYPE_CRON, COLUMN_STATISTICS_SETTING_SOURCE_TABLE,
-    COLUMN_STATISTICS_TASK_RUN_NOT_EXECUTED_MESSAGE, SCHEDULE_STATE_SCHEDULED,
+    SCHEDULE_STATE_SCHEDULED,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 // The run lifecycle's clock helpers live with the suite that owns that lifecycle; the
 // attempt a settings read reports is driven through the same ones rather than a second copy.
-use crate::column_statistics_task_runs::{already_past, far_future, set_due_instant};
+use crate::column_statistics_task_runs::{
+    already_past, far_future, set_due_instant, unreadable_reason,
+};
 use crate::wire::{call, emulator, emulator_on, error_code, error_message, ok, ACCOUNT_ID};
 
 /// The IAM role a create names: "The role used for running the column statistics."
@@ -740,7 +742,7 @@ async fn the_read_reports_the_last_run_of_that_table_as_the_execution_attempt() 
     );
     assert_eq!(
         attempt.get("ErrorMessage").and_then(Value::as_str),
-        Some(COLUMN_STATISTICS_TASK_RUN_NOT_EXECUTED_MESSAGE),
+        Some(unreadable_reason("attempt_table", &["a", "b"]).as_str()),
         "the attempt reports why the run generated nothing, got {attempt}"
     );
 

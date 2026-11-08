@@ -11,10 +11,16 @@
 //! later ([`crate::state::COLUMN_STATISTICS_TASK_RUN_SETTLES_AFTER`]) — so a caller that
 //! reads the run straight after this call still sees it in flight, and a second start for
 //! the same table while that run is in flight is refused with the operation's modelled
-//! `ColumnStatisticsTaskRunningException`. Because this emulator reads none of the
-//! table's underlying data, the status the clock owes is the modelled failure status
-//! carrying [`crate::state::COLUMN_STATISTICS_TASK_RUN_NOT_EXECUTED_MESSAGE`] rather than
-//! statistics nothing computed.
+//! `ColumnStatisticsTaskRunningException`.
+//!
+//! The run itself is PERFORMED here, before the record exists: it reads the objects behind
+//! the covered table's `StorageDescriptor$Location` out of the emulator's own Amazon S3 and
+//! aggregates the columns it covers ([`crate::state::compute_column_statistics`]), and what
+//! that answered is the status the clock owes the run — `SUCCEEDED` with no error message
+//! for a run that generated the statistics, and the modelled failure status carrying the
+//! reason for a table whose data could not be read. The statistics land on the table when
+//! the run settles, which is what makes them readable through
+//! `GetColumnStatisticsForTable`.
 //!
 //! ## Shape of an operation
 //!
@@ -209,13 +215,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
-        // Everything the clock already owed the stored runs is materialised before they
-        // are consulted, so a run the clock has already finished does not count as one in
-        // flight.
-        store.settle_due_column_statistics_task_runs(now);
+        let region = crate::state::request_region(ctx.parts());
 
-        let (run_id, run) = {
+        // What the run has to do is resolved under the store's guard, and the guard is
+        // released before the table's data is read: nothing is awaited while the store is
+        // held, and the run computes over the table as it stood when it started.
+        let plan = {
+            let mut store = state.lock();
+            // Everything the clock already owed the stored runs is materialised before
+            // they are consulted, so a run the clock has already finished does not count
+            // as one in flight.
+            store.settle_due_column_statistics_task_runs(now);
+
             let Some(database) = store.database(&catalog_id, &input.database_name) else {
                 return Err(not_found(crate::state::messages::database_not_found(
                     &input.database_name,
@@ -251,33 +262,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .is_some()
             {
-                return Err(
-                    StartColumnStatisticsTaskRunErrorModeled::ColumnStatisticsTaskRunningException(
-                        ColumnStatisticsTaskRunningException {
-                            message: Some(
-                                crate::state::messages::COLUMN_STATISTICS_TASK_RUN_ALREADY_STARTED
-                                    .to_string(),
-                            ),
-                        },
-                    )
-                    .into(),
-                );
+                return Err(already_running());
+            }
+
+            // The columns the run covers are the ones the request listed, else every
+            // column the STORED table declares — so the default is read from the
+            // catalog, not echoed from the request.
+            crate::state::ColumnStatisticsRunPlan::of(
+                table,
+                &crate::state::covered_column_names(&input, table),
+            )
+        };
+
+        // The run is PERFORMED here, with no store guard held: it reads the objects behind
+        // the table's location out of the emulator's own Amazon S3 and aggregates the
+        // columns it covers, and what it answered is what the status the clock owes this
+        // run reports. Nothing is published yet — the statistics land on the table when
+        // the run settles.
+        let outcome = crate::state::compute_column_statistics(ctx, &region, &plan).await;
+
+        // The instants the run reports are stamped AFTER the reading, so the span the
+        // clock owes the run starts when the run was recorded: a caller that reads the run
+        // straight after this call still observes it in flight, however long the reading
+        // took.
+        let started_at = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // Everything the clock owed the stored runs at that instant is materialised again
+        // before they are consulted a second time, for the reason the first block does it:
+        // a run the clock has already finished must not count as one in flight — and the
+        // reading above may have taken longer than the span a run owes.
+        store.settle_due_column_statistics_task_runs(started_at);
+        // The catalog is re-read under the guard the run is recorded under: a drop or
+        // another start that landed while the data was being read decides this start.
+        let (run_id, run) = {
+            let Some(database) = store.database(&catalog_id, &input.database_name) else {
+                return Err(not_found(crate::state::messages::database_not_found(
+                    &input.database_name,
+                )));
+            };
+            let Some(table) = database
+                .tables
+                .get(&crate::state::fold_name(&input.table_name))
+            else {
+                return Err(not_found(crate::state::messages::table_not_found(
+                    &input.table_name,
+                )));
+            };
+            if store
+                .running_column_statistics_task_run(
+                    &catalog_id,
+                    &input.database_name,
+                    &input.table_name,
+                )
+                .is_some()
+            {
+                return Err(already_running());
             }
 
             // The id is minted only once the request is going to be served, so a
             // refusal above hands out none.
             let run_id = crate::state::new_column_statistics_task_run_id();
-            // The columns the run covers are the ones the request listed, else every
-            // column the STORED table declares — so the default is read from the
-            // catalog, not echoed from the request. A column the request names that the
-            // table does not declare is recorded as asked for: the service documents no
-            // rule that refuses one, and the run reports the columns it was started for.
+            // A column the request names that the table does not declare is recorded as
+            // asked for: the service documents no rule that refuses one, and the run
+            // reports the columns it was started for — it just has no statistics to
+            // generate for a column that is not there.
             let run = crate::state::ColumnStatisticsTaskRunEntry::start(
                 &input,
                 table,
                 &catalog_id,
                 run_id.clone(),
-                now,
+                started_at,
+                outcome,
             );
             (run_id, run)
         };
@@ -304,5 +359,21 @@ fn not_found(message: String) -> StartColumnStatisticsTaskRunError {
         message: Some(message),
         from_federation_source: None,
     })
+    .into()
+}
+
+/// This operation's modelled conflict: "An exception thrown when you try to start another
+/// job while running a column stats generation job."
+///
+/// ONE constructor, so the refusal the table's in-flight run earns is worded the same
+/// whether it is read before the table's data or after it.
+fn already_running() -> StartColumnStatisticsTaskRunError {
+    StartColumnStatisticsTaskRunErrorModeled::ColumnStatisticsTaskRunningException(
+        ColumnStatisticsTaskRunningException {
+            message: Some(
+                crate::state::messages::COLUMN_STATISTICS_TASK_RUN_ALREADY_STARTED.to_string(),
+            ),
+        },
+    )
     .into()
 }
