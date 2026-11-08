@@ -24,12 +24,20 @@
 //!   submitting feedback on a stale response"): the refusal is a property of the targeted
 //!   version's STATE, not of a token. Feedback on another version of the same query, or on
 //!   another query, targets a version of its own and is recorded;
-//! * `clientToken` is this operation's `@idempotencyToken`, the replay layer ON TOP of that
-//!   rule: "If this token matches a previous request, the service ignores the request, but
-//!   does not return an error" — so a repeat of one request records nothing further and
-//!   answers the `submittedAt` the first call answered, and the same token on a request
-//!   targeting something else is refused with the modelled `ConflictException`, exactly as
-//!   `CreateComplianceInquiry` refuses it.
+//! * `clientToken` is this operation's `@idempotencyToken`, and what the model says a token
+//!   this service has already recorded does, it says without exception: "If this token
+//!   matches a previous request, the service ignores the request, but does not return an
+//!   error". So a request carrying a remembered token is IGNORED rather than refused for
+//!   carrying it — nothing further is recorded — and answered with the `submittedAt` the
+//!   call that recorded the token answered, however the rest of that request differs from
+//!   it: NO refusal of this operation is keyed on a token, and the one thing that can still
+//!   refuse such a request is the targeted version's own state above. A RETRY (the token on
+//!   the very request it was recorded for) is ignored before that state rule, because the
+//!   record it would conflict with is the one it already made; the same token on another
+//!   request is ignored after it, because the rule judges the targeted version's state
+//!   whatever token reached it. `CreateComplianceInquiry`'s own `clientToken` carries no
+//!   such sentence ("Idempotency token for the request."), so its conflict on a token
+//!   reused for a different create stands.
 //!
 //! `responseRevisionId` is not compared against a GENERATED revision: nothing here
 //! produces a response or an edit to one (see [`crate::state::InquiryQuery::response`]), so
@@ -238,17 +246,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // treatment `ExportComplianceInquiry` gives its `queryIdentifiers`.
         let reason_codes = crate::state::request_set(input.reason_codes.clone().unwrap_or_default());
 
-        // What this request's `clientToken` identifies: every member that shapes the
-        // feedback recorded, so a token replayed on a different request can be told from a
-        // retry of the same one.
+        // What this request's `clientToken` was recorded for: every member that shapes the
+        // feedback recorded, so a RETRY of the request the token was recorded on can be
+        // told from the same token sent on another request.
         let fingerprint = request_fingerprint(&input, &reason_codes);
 
         let mut store = state.lock();
 
         // Read before the inquiry is borrowed for the write. WHICH answer the caller sees
-        // is decided below in the order the service decides it: a retry of this very
-        // request replays its first answer, then the TARGET's state decides the conflict,
-        // and only then does a token recorded for a different request.
+        // is decided below in the order the service decides it: a retry of the request this
+        // token was recorded on is answered first, then the TARGET's state decides a
+        // refusal, and a token recorded on another request is ignored after it.
         let remembered = input
             .client_token
             .as_deref()
@@ -304,15 +312,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "If this token matches a previous request, the service ignores the request, but
+        // does not return an error". A RETRY — this token on the very request it was
+        // recorded for — is answered here, before the state rule below, because the record
+        // it would conflict with is the one it already made: nothing further is recorded and
+        // the answer is the one that call gave, read off the remembered record. The retry is
+        // still a call on a state-changing operation, so it is attributable: it recorded
+        // nothing further, which is its outcome.
         if let Some(record) = &remembered {
             if record.fingerprint == fingerprint {
-                // "If this token matches a previous request, the service ignores the
-                // request, but does not return an error": nothing further is recorded and
-                // the answer is the one the first call gave, read off the remembered
-                // record. The replay is checked BEFORE the state rule below, because the
-                // record the repeat would conflict with is the one it already made. The
-                // repeat is still a call on a state-changing operation, so it is
-                // attributable: it recorded nothing further, which is its outcome.
                 ::tracing::info!(
                     target: "emulator::audit",
                     operation = "PutComplianceInquiryFeedback",
@@ -334,7 +342,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // with the revision of that query's response — accepts exactly one submitted
         // feedback, so a version this inquiry already holds feedback for is refused with the
         // modelled `ConflictException`. The refusal is keyed on the targeted version's
-        // state, so a fresh `clientToken` does not get past it.
+        // state, so no `clientToken` gets past it: a fresh one, none, or one this service
+        // already recorded for another request.
         let target: crate::state::FeedbackTarget =
             (input.query_identifier, input.response_revision_id);
         if inquiry.feedback_for(target).is_some() {
@@ -356,9 +365,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // The idempotency layer on top of it: this token identifies ONE call, and this
-        // request is not that call, so honouring it would either hide this submission or
-        // answer with another one's timestamp.
+        // The same sentence, for this token on a request it was NOT recorded for: it still
+        // "matches a previous request", so this request is IGNORED as well — nothing is
+        // recorded for it, whatever it asked for — and it is answered with the instant the
+        // call that recorded the token answered. So no refusal of this operation is keyed on
+        // a `clientToken`: only the targeted version's state above refuses a submission, and
+        // it does so whatever token the request carried. Attributable like every other path:
+        // the call recorded nothing, which is its outcome.
         if let Some(record) = &remembered {
             ::tracing::info!(
                 target: "emulator::audit",
@@ -368,14 +381,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 compliance_inquiry_id = %input.compliance_inquiry_id,
                 query_identifier = input.query_identifier,
                 response_revision_id = input.response_revision_id,
-                outcome = "refused",
-                reason = "the clientToken was replayed on a different request",
+                outcome = "ignored",
+                reason = "the clientToken was recorded for another request",
                 "state-changing operation"
             );
-            return Err(PutComplianceInquiryFeedbackErrorModeled::ConflictException(
-                crate::state::feedback_token_mismatch(&record.inquiry_id),
-            )
-            .into());
+            return Ok(PutComplianceInquiryFeedbackOutput {
+                submitted_at: ::aws_smithy_types::DateTime::from(record.submitted_at),
+            });
         }
 
         // Residency bound: one inquiry holds at most `FEEDBACK_PER_INQUIRY_CAPACITY`
@@ -454,8 +466,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// A fingerprint of the feedback submission this request carries, so a replayed
-/// `clientToken` can be told from a token reused on a different submission.
+/// A fingerprint of the feedback submission this request carries, so a RETRY of the request
+/// a `clientToken` was recorded on can be told from the same token sent on another request.
+///
+/// The two are ignored at different points of the handler — a retry before the per-version
+/// rule, because the record it would conflict with is its own, and a reuse after it, because
+/// that rule is keyed on the targeted version's state — and neither is answered with an
+/// error.
 ///
 /// Every member that shapes the recorded feedback is absorbed into the shared
 /// [`crate::state::RequestFingerprint`], which labels and length-prefixes each one so no

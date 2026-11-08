@@ -15,10 +15,11 @@
 //!   `ConflictException`, whatever `clientToken` it carries (a fresh one, none, or the
 //!   first request's), while a submission against another version of the same query,
 //!   another query, or another inquiry is a record of its own;
-//! * `clientToken` is the operation's `@idempotencyToken` layered ON TOP of that rule: a
-//!   repeat of one request records nothing further and answers the `submittedAt` the first
-//!   call answered, while the same token on a different request — one targeting a version
-//!   nothing has rated yet — is refused with the modelled `ConflictException`;
+//! * `clientToken` is the operation's `@idempotencyToken`, and what the model says a token
+//!   this service has already recorded does, it says without exception: the request is
+//!   IGNORED — nothing further is recorded — and answered with the `submittedAt` the call
+//!   that recorded the token answered, however the rest of that request differs from it, so
+//!   no refusal of this operation is keyed on a token;
 //! * `queryIdentifier` must name a query of THAT inquiry, so one it does not own is
 //!   refused with the modelled `ValidationException` naming the member;
 //! * an inquiry id the store does not hold is refused the way every other inquiry
@@ -536,7 +537,7 @@ async fn a_repeated_submission_under_one_client_token_replays_the_first_answer()
 }
 
 #[tokio::test]
-async fn the_same_client_token_on_a_different_submission_is_refused_with_a_conflict() {
+async fn the_same_client_token_on_a_different_submission_is_ignored_without_an_error() {
     const TOKEN: &str = "token-reused";
     let first = Submission::rated(RATINGS[0])
         .on_query(1)
@@ -544,32 +545,41 @@ async fn the_same_client_token_on_a_different_submission_is_refused_with_a_confl
         .commenting("Good answer.")
         .on_revision(1)
         .with_token(TOKEN);
-    // One row per member a second request can differ in — each the only difference —
-    // every one of them targeting a response version NOTHING has rated yet, so what is
-    // under test is the idempotency rule alone rather than the per-version rule the test
-    // below covers: these requests would be recorded if they carried a token of their own.
-    let conflicting: Vec<(&str, Submission)> = vec![
+    // One row per member a second request carrying the SAME token can differ in — each the
+    // only difference, and the rows span the values those members take: both ratings, one
+    // reason code against every one of them, a comment against none, a query identifier
+    // against none, and a revision from the first one up to the largest an Integer carries.
+    // Every row targets a response version NOTHING has rated yet, so a request of its own
+    // would be recorded for it: what is under test is the token sentence alone. (On a
+    // version that already carries feedback the version rule refuses the submission first,
+    // whatever token it carries, which `one_response_version_accepts_exactly_one_feedback`
+    // pins.)
+    let repeats: Vec<(&str, Submission)> = vec![
         (
-            "another rating, on another revision",
+            "another rating, on a version nothing has rated",
             first.clone().rated_as(RATINGS[1]).on_revision(2),
         ),
         (
-            "another comment, on another revision",
+            "another comment, on a version nothing has rated",
             first.clone().commenting("Bad answer.").on_revision(3),
         ),
         (
-            "another reason code set, on another revision",
+            "every reason code, on a version nothing has rated",
             first.clone().because(&REASON_CODES).on_revision(4),
         ),
-        ("another revision id", first.clone().on_revision(5)),
+        ("another revision id alone", first.clone().on_revision(5)),
         ("no query identifier", first.clone().on_no_query()),
         (
-            "no comment, on another revision",
+            "no comment, on a version nothing has rated",
             first.clone().without_comment().on_revision(6),
+        ),
+        (
+            "the largest revision an Integer carries",
+            first.clone().on_revision(i32::MAX),
         ),
     ];
 
-    for (label, second) in conflicting {
+    for (label, second) in repeats {
         let router = emulator();
         let inquiry_id = held_inquiry(&router, &text_body("Encryption", "Encrypted?")).await;
 
@@ -581,54 +591,37 @@ async fn the_same_client_token_on_a_different_submission_is_refused_with_a_confl
         );
         let submitted_at = original.submitted_at().to_string();
 
-        let refused = put_feedback(&router, &second.body(&inquiry_id)).await;
+        // A span passes between the two calls, so a handler answering `now` rather than the
+        // remembered instant would answer a different timestamp.
+        std::thread::sleep(Duration::from_millis(20));
+
+        let ignored = put_feedback(&router, &second.body(&inquiry_id)).await;
         assert_eq!(
-            refused.status, 409,
-            "case {label:?}: a token reused on a different submission is a conflict, got \
-             {} with {:?}",
-            refused.status, refused.body
+            ignored.status, 200,
+            "case {label:?}: a token this service has already seen is ignored rather than \
+             answered with an error, got {} with {:?}",
+            ignored.status, ignored.body
         );
         assert_eq!(
-            refused.error_code(),
-            "ConflictException",
-            "case {label:?}: expected the modelled ConflictException, got {:?}",
-            refused.body
-        );
-        assert_eq!(
-            refused.body["resourceId"],
-            json!(inquiry_id),
-            "case {label:?}: the conflict names the inquiry the token recorded feedback \
-             on, got {:?}",
-            refused.body["resourceId"]
-        );
-        assert_eq!(
-            refused.body["resourceType"],
-            json!("ComplianceInquiry"),
-            "case {label:?}: the conflict names the resource type, got {:?}",
-            refused.body["resourceType"]
-        );
-        // A client must be able to tell "my token collided" (retry with a new token) from
-        // "this response version has been rated" (terminal), so the two refusals do not
-        // state the same thing.
-        assert_ne!(
-            refused.body["message"],
-            json!(ALREADY_SUBMITTED),
-            "case {label:?}: a token collision must not be reported as a version that \
-             already carries feedback, got {:?}",
-            refused.body["message"]
+            ignored.submitted_at(),
+            submitted_at,
+            "case {label:?}: an ignored request answers the submittedAt the call that \
+             recorded the token answered, got {:?}",
+            ignored.body["submittedAt"]
         );
 
-        // The refusal left the first submission exactly as it was.
+        // And the request really was IGNORED: nothing further was recorded, and the first
+        // submission stands unreplaced.
         let feedback = exported_feedback(&router, &inquiry_id).await;
         assert_eq!(
             feedback,
             vec![first.expected_entry(&submitted_at)],
-            "case {label:?}: a refused submission records nothing, got {feedback:?}"
+            "case {label:?}: an ignored request must record nothing, got {feedback:?}"
         );
     }
 
-    // The same token on another INQUIRY is a different submission too: which resource the
-    // feedback is on is part of the request the token identifies.
+    // The same token on another INQUIRY is ignored too: the token names a request this
+    // service has already run, whatever resource the later one addresses.
     let router = emulator();
     let one = held_inquiry(&router, &text_body("One", "First question?")).await;
     let other = held_inquiry(&router, &text_body("Two", "Second question?")).await;
@@ -638,18 +631,35 @@ async fn the_same_client_token_on_a_different_submission_is_refused_with_a_confl
         "the first submission must be recorded, got {} with {:?}",
         recorded.status, recorded.body
     );
-    let crossed = put_feedback(&router, &first.body(&other)).await;
+    let submitted_at = recorded.submitted_at().to_string();
+    let crossed = put_feedback(
+        &router,
+        &first.clone().rated_as(RATINGS[1]).on_revision(9).body(&other),
+    )
+    .await;
     assert_eq!(
-        crossed.status, 409,
-        "case \"another inquiry\": expected a conflict, got {} with {:?}",
+        crossed.status, 200,
+        "case \"another inquiry\": the reused token is ignored, got {} with {:?}",
         crossed.status, crossed.body
     );
     assert_eq!(
-        crossed.body["resourceId"],
-        json!(one),
-        "case \"another inquiry\": the conflict names the inquiry the token recorded \
-         feedback on, got {:?}",
-        crossed.body["resourceId"]
+        crossed.submitted_at(),
+        submitted_at,
+        "case \"another inquiry\": the ignored request answers the first call's \
+         submittedAt, got {:?}",
+        crossed.body["submittedAt"]
+    );
+    let crossed_feedback = exported_feedback(&router, &other).await;
+    assert!(
+        crossed_feedback.is_empty(),
+        "case \"another inquiry\": the ignored request records nothing on the inquiry it \
+         addressed, got {crossed_feedback:?}"
+    );
+    let feedback = exported_feedback(&router, &one).await;
+    assert_eq!(
+        feedback,
+        vec![first.expected_entry(&submitted_at)],
+        "case \"another inquiry\": the first inquiry keeps its one record, got {feedback:?}"
     );
 }
 
@@ -781,7 +791,8 @@ async fn one_response_version_accepts_exactly_one_feedback() {
     // inquiry's response as a whole, a revision named or not, a bound of Integer) and along
     // what the second request carries: a FRESH clientToken, no token at all, or the first
     // request's token on different content. None of them gets past the refusal, because it
-    // is keyed on the version's state rather than on a token.
+    // is keyed on the version's state rather than on a token — a reused token is ignored
+    // only once this rule has had its say, which the idempotency test covers.
     let rows: Vec<(&str, Submission, Submission)> = vec![
         (
             "a fresh token, on the same query and revision",
@@ -804,7 +815,7 @@ async fn one_response_version_accepts_exactly_one_feedback() {
                 .commenting("Reconsidered."),
         ),
         (
-            "the first request's token on different content",
+            "the first request's token on different content, same version",
             Submission::rated(RATINGS[0])
                 .on_query(1)
                 .on_revision(7)

@@ -6,15 +6,17 @@
 //! operation of this service that WRITES state a later caller can observe leaves EXACTLY ONE
 //! structured record on the audit target, naming the operation, the caller (the access key id
 //! and the credential-scope region the request presented), what the call addressed and the
-//! outcome. A state-changing call that changed nothing is still attributable, so the refusal
-//! and idempotent-replay paths report their outcome too; and no record carries caller content
+//! outcome. A state-changing call that changed nothing is still attributable, so the
+//! refusal, idempotent-replay and ignored-reuse paths report their outcome too; and no
+//! record carries caller content
 //! or a credential — not the inquiry's `@sensitive` name, content or feedback comment, and not
 //! the download token or presigned URL a mint hands back.
 //!
 //! The rows differ along what the rule generalises over: which of the four writes made the
 //! call (`CreateComplianceInquiry`, `PutComplianceInquiryFeedback`, `ExportComplianceInquiry`,
 //! `GetTermForReport`), which path through that write the request took (a fresh write, an
-//! idempotent replay, each refusal the handler states), the form of the submitted content, how
+//! idempotent replay, a request ignored for the token it reused, each refusal the handler
+//! states), the form of the submitted content, how
 //! many reason codes a submission carried, whether the resource the call addressed exists at
 //! all, and which region the request was signed for.
 //!
@@ -476,7 +478,8 @@ async fn every_inquiry_write_emits_exactly_one_attributable_audit_record() {
             names: Names::Nothing,
         },
         Case {
-            case: "that feedback token on another response version",
+            case: "that feedback token on another response version, which the model has the \
+                   service ignore",
             operation: "PutComplianceInquiryFeedback",
             method: "PUT",
             uri: "/v1/compliance-inquiry/putFeedback".to_string(),
@@ -488,13 +491,13 @@ async fn every_inquiry_write_emits_exactly_one_attributable_audit_record() {
                 "clientToken": feedback_token
             })),
             region: REGION,
-            status: 409,
-            outcome: "refused",
+            status: 200,
+            outcome: "ignored",
             fields: vec![
                 format!("compliance_inquiry_id={rated}"),
                 "query_identifier=1".to_string(),
                 "response_revision_id=1".to_string(),
-                "reason=the clientToken was replayed on a different request".to_string(),
+                "reason=the clientToken was recorded for another request".to_string(),
             ],
             names: Names::Nothing,
         },

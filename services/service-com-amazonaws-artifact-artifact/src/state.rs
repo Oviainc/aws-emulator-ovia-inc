@@ -60,9 +60,11 @@
 //! state (see [`INQUIRY_EXPORT_OBJECT`]), and the key is what makes the stored feedback
 //! readable at all — the model declares no operation that reports it back. The
 //! `clientToken` that call carries is remembered in
-//! [`ComAmazonawsArtifactArtifactState::inquiry_feedback_tokens`], so a repeat of one
-//! request replays its first answer — the idempotency layer ON TOP of the per-target rule,
-//! never the rule itself.
+//! [`ComAmazonawsArtifactArtifactState::inquiry_feedback_tokens`], and the model has the
+//! service IGNORE a later request carrying a remembered one, answering it with that call's
+//! instant — so a token never produces a refusal here: the per-target rule above is the
+//! only thing that refuses a submission, and it is reached by every request whose token this
+//! service has not already recorded.
 //!
 //! An inquiry EXPORT is the second thing a caller creates: `ExportComplianceInquiry`
 //! produces a document from one inquiry, so each call mints an [`InquiryExport`] whose id
@@ -1385,14 +1387,17 @@ pub struct InquiryCreateRecord {
     pub fingerprint: String,
 }
 
-/// What one remembered `PutComplianceInquiryFeedback` `clientToken` replays: the inquiry
-/// the first call with that token recorded feedback on, the fingerprint of that request —
-/// so the same token on a DIFFERENT request is a conflict rather than a replay — and the
-/// `submittedAt` the first call answered, which is what the replay answers again.
+/// What one remembered `PutComplianceInquiryFeedback` `clientToken` answers: the inquiry
+/// the call with that token recorded feedback on, the fingerprint of the request it was
+/// recorded for — so a RETRY of that request can be told from the token sent on another one
+/// — and the `submittedAt` that call answered, which is what every later request carrying
+/// the token is answered with.
 ///
 /// "If this token matches a previous request, the service ignores the request, but does not
 /// return an error" (`PutComplianceInquiryFeedbackRequest$clientToken`): ignoring the
-/// request means the stored feedback and the answered timestamp both stay the first call's.
+/// request means the stored feedback and the answered timestamp both stay the first call's,
+/// whichever of the two a later request is — the fingerprint decides only WHERE in the
+/// handler it is ignored, never whether it is refused.
 #[derive(Debug, Clone)]
 pub struct InquiryFeedbackRecord {
     pub inquiry_id: String,
@@ -1668,7 +1673,7 @@ impl ComAmazonawsArtifactArtifactState {
         );
     }
 
-    /// Remember that `token` recorded the feedback the first call with it submitted on
+    /// Remember that `token` recorded the feedback the call carrying it submitted on
     /// `inquiry_id` at `submitted_at`, from the request `fingerprint` — bounded exactly as
     /// [`record_inquiry_create`](Self::record_inquiry_create) is, so a caller sending a
     /// fresh `clientToken` on every request cannot grow this map without end.
@@ -2649,29 +2654,6 @@ pub fn feedback_already_submitted(inquiry_id: &str) -> ConflictException {
 /// The message [`feedback_already_submitted`] states, as AWS states it for this condition.
 pub const FEEDBACK_ALREADY_SUBMITTED_MESSAGE: &str =
     "Feedback already submitted for this response version.";
-
-/// The modelled `ConflictException` for a `clientToken` replayed on a feedback submission
-/// that is not the one it recorded feedback for.
-///
-/// This is the IDEMPOTENCY layer, not the per-revision rule above: it refuses a token
-/// reused on a request that targets something else, and a submission against an
-/// already-rated revision is refused by [`feedback_already_submitted`] first, whatever
-/// token it carries.
-///
-/// The same judgement [`inquiry_token_mismatch`] states for a create, for the same reason:
-/// an `@idempotencyToken` identifies ONE call, so honouring it on a different request would
-/// either hide the second submission or silently replace the first. It is decided AFTER
-/// [`feedback_already_submitted`], because the state of the targeted response version is
-/// what AWS keys the refusal on; the token only tells a retry from a new submission.
-pub fn feedback_token_mismatch(inquiry_id: &str) -> ConflictException {
-    ConflictException {
-        message: "the clientToken was already used to submit different feedback on a \
-                  compliance inquiry"
-            .to_string(),
-        resource_id: inquiry_id.to_string(),
-        resource_type: INQUIRY_RESOURCE_TYPE.to_string(),
-    }
-}
 
 /// The modelled `ValidationException` for a token this service never issued, carrying
 /// `ValidationExceptionReason`'s `invalidToken`.
