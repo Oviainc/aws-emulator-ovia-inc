@@ -203,6 +203,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `Alias` is the one condition key this operation publishes: "This alias will be
         // compared to the rum:alias context key in the resource-based policy"
         // (`PutRumEventsRequest$Alias`).
+        //
+        // The decision is taken on the monitor's ARN — what a policy statement's `Resource`
+        // names — while a refusal names the monitor by the `Id` the request carried: `Id`
+        // is this operation's only resource member (`uri /appmonitors/{Id}/`), so it is the
+        // identifier the data-plane caller can correlate the refusal with
+        // (`crate::state::authorization::authorize_naming`).
         let context: Vec<(String, String)> = input
             .alias
             .iter()
@@ -213,11 +219,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
             })
             .collect();
-        if let Err(denial) = crate::state::authorization::authorize(
+        if let Err(denial) = crate::state::authorization::authorize_naming(
             &*self.engine,
             ctx,
             crate::state::authorization::PUT_RUM_EVENTS,
             &resource_arn,
+            &input.id,
             resource_policy.as_deref(),
             &context,
         ) {

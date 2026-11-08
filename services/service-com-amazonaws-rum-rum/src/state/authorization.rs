@@ -171,7 +171,9 @@ pub struct Denied {
     pub principal: String,
     /// The IAM action it asked for.
     pub action: String,
-    /// The resource it asked to act on.
+    /// The resource it asked to act on, AS THE REFUSAL NAMES IT — which is the identifier
+    /// the operation's own request addresses the resource by, not necessarily the resource
+    /// the decision was taken on (see [`authorize_naming`]).
     pub resource: String,
     /// Which policy kind took the decision, which is the reason a refusal states.
     pub reason: Reason,
@@ -223,11 +225,48 @@ impl Denied {
 /// one; `context` the condition keys this call publishes (the `rum:alias` the request
 /// named, say). `Ok(())` when the request is allowed; `Err` carries the refusal every
 /// operation renders as its own modelled `AccessDeniedException`.
+///
+/// A refusal names the resource by `resource`, the ARN the decision was taken on, which is
+/// how the operations that address an app monitor by its `Name` (or by its ARN) name it.
+/// An operation that addresses the monitor by another identifier goes through
+/// [`authorize_naming`].
 pub fn authorize<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     action: &str,
     resource: &str,
+    resource_policy: Option<&str>,
+    context: &[(String, String)],
+) -> Result<(), Denied> {
+    authorize_naming(
+        engine,
+        ctx,
+        action,
+        resource,
+        resource,
+        resource_policy,
+        context,
+    )
+}
+
+/// Whether IAM lets this request perform `action` on `resource`, with a refusal that names
+/// the resource by `named`.
+///
+/// The decision itself is ALWAYS taken on `resource`, the resource's ARN: that is what a
+/// policy statement's `Resource` is matched against, so what a refusal spells changes
+/// nothing about who is allowed what. What it changes is the identifier the refusal hands
+/// back to the caller, and AWS hands back the identifier the OPERATION takes: an operation
+/// whose request addresses the app monitor by an identifier of its own — the data plane,
+/// whose only resource member is the monitor's minted `AppMonitorId` — is refused about that
+/// identifier, so the caller can correlate the refusal with what it sent, while the
+/// operations that address the monitor by `Name` or by its ARN are refused about the ARN
+/// ([`authorize`]).
+pub fn authorize_naming<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    action: &str,
+    resource: &str,
+    named: &str,
     resource_policy: Option<&str>,
     context: &[(String, String)],
 ) -> Result<(), Denied> {
@@ -240,7 +279,7 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     let refusal = |reason: Reason| Denied {
         principal: caller.arn.clone(),
         action: action.to_string(),
-        resource: resource.to_string(),
+        resource: named.to_string(),
         reason,
     };
     // An explicit deny wins over every grant, including the account's own credential.

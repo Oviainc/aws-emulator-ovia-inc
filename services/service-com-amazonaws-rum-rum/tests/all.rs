@@ -39,6 +39,8 @@ mod custom_metric_event_fields;
 mod cw_log_delivery;
 #[path = "all/cw_log_event_copies.rs"]
 mod cw_log_event_copies;
+#[path = "all/data_plane_denial_identifier.rs"]
+mod data_plane_denial_identifier;
 #[path = "all/deleted_app_monitor_addressing.rs"]
 mod deleted_app_monitor_addressing;
 #[path = "all/deobfuscation_source_maps.rs"]

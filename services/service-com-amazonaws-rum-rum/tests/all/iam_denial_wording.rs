@@ -29,8 +29,9 @@
 //! `tests/all/authorization.rs`: the principals are made with IAM's and STS's own calls and
 //! the RUM request carries the credential's access key id in its SigV4 credential scope.
 //!
-//! `PutRumEvents` is not a row: the identifier its refusal names is the subject of its own
-//! open report, and every assertion here is on a whole message.
+//! `PutRumEvents` is not a row: its refusal names the app monitor by the `Id` the request
+//! carried rather than by the ARN this table asserts, which is the subject of
+//! `data_plane_denial_identifier.rs`, and every assertion here is on a whole message.
 
 use serde_json::{json, Value};
 
