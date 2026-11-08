@@ -221,6 +221,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_modified_time: created_at,
             kms_key_id,
             kms_encryption_context,
+            // A create writes the blueprint at ONE stage; it exists at no other
+            // until a `CopyBlueprintStage` places its content there.
+            stage_copies: ::std::collections::BTreeMap::new(),
             versions: ::std::collections::BTreeMap::new(),
             next_version: 1,
             tags: input.tags.unwrap_or_default(),

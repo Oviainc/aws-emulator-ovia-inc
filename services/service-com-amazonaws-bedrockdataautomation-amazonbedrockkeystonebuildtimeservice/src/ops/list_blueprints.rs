@@ -242,8 +242,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .is_none_or(|arn| arn == record.blueprint_arn)
                 })
                 .filter(|record| {
+                    // A stage filter keeps the blueprints that EXIST at that stage:
+                    // the stage one was last written at, or any a
+                    // `CopyBlueprintStage` has placed its content at.
                     stage_filter.is_none_or(|stage| {
-                        stage == STAGE_FILTER_ALL || stage == record.blueprint_stage
+                        stage == STAGE_FILTER_ALL || record.exists_at(stage)
                     })
                 })
                 .filter(|record| {

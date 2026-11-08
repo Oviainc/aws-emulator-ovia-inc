@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CopyBlueprintStage
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CopyBlueprintStage`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CopyBlueprintStage::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Copies a Blueprint from one stage to another: the schema the blueprint holds at
+//! `sourceStage` is placed at `targetStage` too, so after the call the blueprint
+//! exists at BOTH stages carrying that schema, and `targetStage` is the stage it
+//! was last written at. The source stage keeps its own content — this copies, it
+//! does not move. A blueprint that exists at no `sourceStage` is refused with the
+//! modelled `ResourceNotFoundException` (HTTP 404) and nothing is written.
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +113,18 @@ impl From<CopyBlueprintStageErrorModeled> for CopyBlueprintStageError {
     }
 }
 
+/// The refusal this operation answers when the blueprint it was handed, at the stage
+/// it was asked to copy FROM, resolves to nothing: the service's FIXED sentence for a
+/// blueprint lookup that resolved to nothing, single-homed in `crate::state`, with
+/// nothing taken from the request.
+fn not_found() -> CopyBlueprintStageError {
+    CopyBlueprintStageError::Modeled(CopyBlueprintStageErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(crate::state::BLUEPRINT_ARN_NOT_FOUND_MESSAGE.to_string()),
+        },
+    ))
+}
+
 /// The `CopyBlueprintStage` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -151,18 +161,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CopyBlueprintStage` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CopyBlueprintStageErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CopyBlueprintStage"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CopyBlueprintStageError::Modeled(
+                CopyBlueprintStageErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the Bedrock Data Automation store is unavailable".to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        let mut store = state.lock();
+
+        // An `@idempotencyToken` replay of THIS copy is a no-op: the first call
+        // already placed the source stage's content at the target stage, and a replay
+        // must not copy again whatever the source holds by now. A token last recorded
+        // for another blueprint, or for another pair of stages, is a different request
+        // and is served as a fresh copy. Which copy a request asks for is the
+        // blueprint and the pair of stages it names.
+        if let Some(token) = input.client_token.as_deref() {
+            // Which copy this request asks for: the blueprint and the pair of stages
+            // it names. Built here, where a token makes it matter, so a call that
+            // carries none assembles no key.
+            let copy = (
+                input.blueprint_arn.clone(),
+                input.source_stage.clone(),
+                input.target_stage.clone(),
+            );
+            let replayed = store
+                .stage_copy_tokens
+                .get(&copy)
+                .is_some_and(|stored| stored == token);
+            // A replay answers for the copy the first call made, so it answers only
+            // while that copy's source still resolves: a blueprint since released, or
+            // one that no longer exists at the source stage, is refused the way a
+            // first call would be.
+            let resolves = store
+                .blueprints
+                .get(&input.blueprint_arn)
+                .is_some_and(|record| record.exists_at(&input.source_stage));
+            if replayed && resolves {
+                return Ok(CopyBlueprintStageOutput {});
+            }
+        }
+
+        let now = crate::state::now();
+        let record = store
+            .blueprints
+            .get_mut(&input.blueprint_arn)
+            .ok_or_else(not_found)?;
+
+        // The copy's SOURCE is a blueprint AT A STAGE: a blueprint that exists at no
+        // such stage is not the resource the caller named, so nothing is written and
+        // the service answers the same sentence as any other blueprint lookup that
+        // resolved to nothing. On success the source stage keeps the content it holds
+        // and the target stage holds a copy of it.
+        if !record.copy_stage(&input.source_stage, &input.target_stage, now) {
+            return Err(not_found());
+        }
+
+        if let Some(token) = input.client_token {
+            store.stage_copy_tokens.insert(
+                (input.blueprint_arn, input.source_stage, input.target_stage),
+                token,
+            );
+        }
+
+        // `CopyBlueprintStageResponse` models no members: the answer is a 200 with an
+        // empty body, and what the call did is observed by reading the blueprint back
+        // at either stage.
+        Ok(CopyBlueprintStageOutput {})
     }
 }

@@ -174,18 +174,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let record = store.blueprints.get(&input.blueprint_arn).ok_or_else(not_found)?;
 
-        // `blueprintStage` selects a stage; a blueprint that is not at the stage
-        // asked for is not the resource the caller named.
+        // `blueprintStage` selects a stage; a blueprint that exists at no such
+        // stage is not the resource the caller named. A blueprint exists at the
+        // stage it was last written at AND at every stage a `CopyBlueprintStage`
+        // has placed its content at, and each stage carries its own schema.
         if let Some(stage) = input.blueprint_stage.as_deref() {
-            if stage != record.blueprint_stage {
+            if !record.exists_at(stage) {
                 return Err(not_found());
             }
         }
 
         // `blueprintVersion` is modeled `^[0-9]*$`, so a value that reaches this
-        // handler is digits — but a version nothing ever cut does not exist.
+        // handler is digits — but a version nothing ever cut does not exist. A
+        // version snapshot is of the blueprint, not of one stage, so it is reported
+        // as cut whichever stage the read scoped itself to.
         let blueprint = match input.blueprint_version.as_deref() {
-            None => record.to_blueprint(),
+            None => match input.blueprint_stage.as_deref() {
+                Some(stage) => record.to_blueprint_at(stage).ok_or_else(not_found)?,
+                None => record.to_blueprint(),
+            },
             Some(raw) => {
                 let version = raw.parse::<u64>().map_err(|_| not_found())?;
                 record

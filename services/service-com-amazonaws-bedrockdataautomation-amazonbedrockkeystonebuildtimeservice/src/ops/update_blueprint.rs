@@ -167,15 +167,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `schema` is @required, so it always replaces the stored one; every other
         // member replaces only what the request names. `creationTime` never moves.
-        record.schema = input.schema;
-        if let Some(stage) = input.blueprint_stage {
-            record.blueprint_stage = stage;
-        }
+        // The write lands AT A STAGE — the one the request names, or the stage the
+        // blueprint already stands at — and leaves every other stage holding the
+        // content it has.
+        let stage = input
+            .blueprint_stage
+            .unwrap_or_else(|| record.blueprint_stage.clone());
+        record.write_stage(&stage, input.schema, crate::state::now());
         if let Some(config) = input.encryption_configuration {
             record.kms_key_id = Some(config.kms_key_id);
             record.kms_encryption_context = config.kms_encryption_context;
         }
-        record.last_modified_time = crate::state::now();
 
         Ok(UpdateBlueprintOutput {
             blueprint: record.to_blueprint(),

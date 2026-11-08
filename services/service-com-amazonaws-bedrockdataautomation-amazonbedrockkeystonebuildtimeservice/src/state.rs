@@ -4,7 +4,8 @@
 //!
 //! This module owns the Blueprint record the control-plane operations
 //! (`CreateBlueprint`, `GetBlueprint`, `ListBlueprints`, `UpdateBlueprint`,
-//! `DeleteBlueprint`, `CreateBlueprintVersion`) share and the DataAutomationProject
+//! `DeleteBlueprint`, `CreateBlueprintVersion`, `CopyBlueprintStage`) share and the
+//! DataAutomationProject
 //! record `CreateDataAutomationProject`, `GetDataAutomationProject` and
 //! `UpdateDataAutomationProject` share, the DataAutomationLibrary record
 //! `CreateDataAutomationLibrary` mints and `GetDataAutomationLibrary` reports,
@@ -482,6 +483,20 @@ pub struct BlueprintVersionSnapshot {
     pub created_at: ::aws_smithy_types::DateTime,
 }
 
+/// What a blueprint holds AT ONE STAGE: the schema stored there and when it was
+/// last written there.
+///
+/// A blueprint's stages are independent copies of its content — that is what
+/// `CopyBlueprintStage` ("Copies a Blueprint from one stage to another",
+/// `smithy_query(query="doc",shape="CopyBlueprintStage")`) copies between — so each
+/// stage carries its own schema and its own `lastModifiedTime` rather than sharing
+/// the record's.
+#[derive(Debug, Clone)]
+pub struct BlueprintStageContent {
+    pub schema: String,
+    pub last_modified_time: ::aws_smithy_types::DateTime,
+}
+
 /// A stored blueprint: exactly the members the modeled `Blueprint` shape carries
 /// that this service owns, plus the version snapshots and the tag list.
 #[derive(Debug, Clone)]
@@ -489,12 +504,28 @@ pub struct BlueprintRecord {
     pub blueprint_arn: String,
     pub blueprint_name: String,
     pub r#type: String,
+    /// The schema stored at [`Self::blueprint_stage`] — the stage this blueprint
+    /// was last written at.
     pub schema: String,
+    /// The stage this blueprint was last WRITTEN at: the one its create named, or
+    /// the one the last `UpdateBlueprint`/`CopyBlueprintStage` wrote. It is the
+    /// stage a read that scopes itself to no stage reports; every other stage the
+    /// blueprint exists at is in [`Self::stage_copies`].
     pub blueprint_stage: String,
     pub creation_time: ::aws_smithy_types::DateTime,
     pub last_modified_time: ::aws_smithy_types::DateTime,
     pub kms_key_id: Option<String>,
     pub kms_encryption_context: Option<HashMap<String, String>>,
+    /// What this blueprint holds at the stages OTHER than
+    /// [`Self::blueprint_stage`], keyed by stage: one entry per stage a write
+    /// ([`Self::write_stage`], reached by `CopyBlueprintStage` and
+    /// `UpdateBlueprint`) has left holding content while writing elsewhere, and
+    /// no later write has taken over. A blueprint exists at a stage exactly
+    /// when that stage is [`Self::blueprint_stage`] or a key of this map
+    /// ([`Self::exists_at`]), which is at most one entry here because
+    /// `BlueprintStage` models two values (`smithy_query(shape="BlueprintStage")`
+    /// -> `["DEVELOPMENT", "LIVE"]`) and every write lands at one of them.
+    pub stage_copies: BTreeMap<String, BlueprintStageContent>,
     /// Schema snapshots keyed by their version number.
     pub versions: BTreeMap<u64, BlueprintVersionSnapshot>,
     /// The version number the NEXT cut takes. Monotonic: it is never rolled back
@@ -505,6 +536,88 @@ pub struct BlueprintRecord {
 }
 
 impl BlueprintRecord {
+    /// What this blueprint holds at `stage`, or `None` when it exists at no such
+    /// stage — which every operation that scopes itself to a stage answers with
+    /// the modelled 404.
+    pub fn content_at(&self, stage: &str) -> Option<BlueprintStageContent> {
+        if stage == self.blueprint_stage {
+            return Some(BlueprintStageContent {
+                schema: self.schema.clone(),
+                last_modified_time: self.last_modified_time,
+            });
+        }
+        self.stage_copies.get(stage).cloned()
+    }
+
+    /// Whether this blueprint exists at `stage` at all.
+    pub fn exists_at(&self, stage: &str) -> bool {
+        stage == self.blueprint_stage || self.stage_copies.contains_key(stage)
+    }
+
+    /// Project this blueprint AS IT STANDS AT ONE STAGE onto the modeled
+    /// `Blueprint` shape: that stage's schema and `lastModifiedTime` over the
+    /// record's own identity. `None` when it exists at no such stage.
+    pub fn to_blueprint_at(&self, stage: &str) -> Option<Blueprint> {
+        let content = self.content_at(stage)?;
+        Some(Blueprint {
+            schema: content.schema,
+            last_modified_time: content.last_modified_time,
+            blueprint_stage: Some(stage.to_string()),
+            ..self.to_blueprint()
+        })
+    }
+
+    /// Store `schema` as this blueprint's content at `stage`, written at `now`.
+    ///
+    /// Every OTHER stage keeps the content it holds: a write names one stage, so it
+    /// cannot move another stage's schema or its `lastModifiedTime`. `stage` becomes
+    /// the stage the blueprint was last written at, which is the one an unscoped read
+    /// reports.
+    pub fn write_stage(
+        &mut self,
+        stage: &str,
+        schema: String,
+        now: ::aws_smithy_types::DateTime,
+    ) {
+        if stage != self.blueprint_stage {
+            // The stage the blueprint was written at until now keeps its own content,
+            // as one of the OTHER stages; `stage` is the stage last written from here
+            // on, so it is no longer one of them.
+            let previous = BlueprintStageContent {
+                schema: self.schema.clone(),
+                last_modified_time: self.last_modified_time,
+            };
+            let previous_stage = std::mem::replace(&mut self.blueprint_stage, stage.to_string());
+            self.stage_copies.insert(previous_stage, previous);
+            self.stage_copies.remove(stage);
+        }
+        self.schema = schema;
+        self.last_modified_time = now;
+    }
+
+    /// Place the content stored at `source` at `target` too, as of `now`.
+    ///
+    /// `false` when this blueprint exists at no `source` stage, so the caller
+    /// answers the modelled 404 and nothing is written. A copy LEAVES the source
+    /// stage holding its own content: after it the blueprint exists at both
+    /// stages, carrying the same schema, and `target` is the stage it was last
+    /// written at — so it is what an unscoped read reports. Copying a stage onto
+    /// itself writes nothing: the content is already there.
+    pub fn copy_stage(
+        &mut self,
+        source: &str,
+        target: &str,
+        now: ::aws_smithy_types::DateTime,
+    ) -> bool {
+        let Some(content) = self.content_at(source) else {
+            return false;
+        };
+        if source != target {
+            self.write_stage(target, content.schema, now);
+        }
+        true
+    }
+
     /// The highest version still stored for this blueprint, if any. This is what
     /// a summary reports; the number the next cut takes is [`Self::next_version`],
     /// which does not move back when a snapshot is released.
@@ -675,6 +788,17 @@ pub struct ComAmazonawsBedrockdataautomationAmazonbedrockkeystonebuildtimeservic
     pub create_idempotency: HashMap<String, String>,
     /// `CreateBlueprintVersion` `clientToken` -> (ARN, version) it cut.
     pub version_idempotency: HashMap<String, (String, u64)>,
+    /// The `CopyBlueprintStage` `clientToken` of the last copy served for each
+    /// (`blueprintArn`, `sourceStage`, `targetStage`): what makes an
+    /// `@idempotencyToken` replay of that copy a no-op rather than a second copy
+    /// of whatever the source stage holds by then.
+    ///
+    /// Keyed by the COPY rather than by the token, so copying under fresh tokens
+    /// cannot grow this map: `BlueprintStage` models two values, so it holds at
+    /// most four entries per live blueprint, and
+    /// [`ComAmazonawsBedrockdataautomationAmazonbedrockkeystonebuildtimeserviceState::remove_blueprint`]
+    /// drops the entries of a released one.
+    pub stage_copy_tokens: HashMap<(String, String, String), String>,
     /// Every stored DataAutomationProject, keyed by its ARN.
     pub projects: HashMap<String, DataAutomationProjectRecord>,
     /// `projectName` -> `projectArn`; the uniqueness index behind
@@ -733,6 +857,8 @@ impl ComAmazonawsBedrockdataautomationAmazonbedrockkeystonebuildtimeserviceState
         self.create_idempotency.retain(|_, stored| stored != arn);
         self.version_idempotency
             .retain(|_, (stored, _)| stored != arn);
+        self.stage_copy_tokens
+            .retain(|(stored, _, _), _| stored != arn);
         Some(record)
     }
 
@@ -747,7 +873,8 @@ impl ComAmazonawsBedrockdataautomationAmazonbedrockkeystonebuildtimeserviceState
 
     /// Whether this store can tell that the submission's blueprint reference names NO
     /// blueprint of this account: either nothing is stored under `blueprint_arn`, or
-    /// what is stored is not at the `stage` the submission selected — a reference a
+    /// what is stored does not exist at the `stage` the submission selected — a
+    /// reference a
     /// blueprint-optimization job cannot be run against, because the blueprint's schema
     /// IS what such a job optimizes.
     ///
@@ -760,7 +887,7 @@ impl ComAmazonawsBedrockdataautomationAmazonbedrockkeystonebuildtimeserviceState
         }
         match self.blueprints.get(blueprint_arn) {
             None => true,
-            Some(record) => stage.is_some_and(|stage| stage != record.blueprint_stage),
+            Some(record) => stage.is_some_and(|stage| !record.exists_at(stage)),
         }
     }
 
