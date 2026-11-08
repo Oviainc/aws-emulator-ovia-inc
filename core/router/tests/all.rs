@@ -999,6 +999,14 @@ mod sns_lambda_cdk_subscription_delivery;
 // and the log group the invocation that path makes writes its run to.
 #[path = "all/apigateway_proxy_lambda_ddb_pipeline.rs"]
 mod apigateway_proxy_lambda_ddb_pipeline;
+// Declared here, in this same head region, for the reason the entry above records: what a
+// deployed `AWS_IAM` method makes of the credential its request presents, on a router that
+// verifies request signatures.
+// EVERY suite in this file is declared EXACTLY ONCE: a second `mod` for one file is a
+// redefinition (and `clippy::duplicate_mod`), which stops this target compiling. Two
+// regions here are documented as where a concurrently landing suite adds its line, so the
+// same suite is sometimes appended to both; a line removed in this file is therefore always
+// a duplicate of one that stands elsewhere in it, never a suite dropped.
 // Declared here, in the appended tail: what a DICOM import job leaves in its data store,
 // read from the objects Amazon S3 holds under the role IAM holds.
 #[path = "all/medical_imaging_dicom_import.rs"]

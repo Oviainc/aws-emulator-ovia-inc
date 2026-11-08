@@ -190,6 +190,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
         let mut store = state.lock();
 
+        // A submission runs under the Data Automation profile its `dataAutomationProfileArn`
+        // names, and AWS publishes those profiles rather than an account creating them: an
+        // ARN whose resource id names none of them resolves to nothing, so there is no
+        // profile to run the job under. Refused with the modelled `ValidationException`
+        // BEFORE anything is minted, so a refused submission leaves the store — and the
+        // blueprint it referenced — exactly as it was.
+        if !crate::state::data_automation_profile::resolves(&input.data_automation_profile_arn) {
+            return Err(
+                InvokeBlueprintOptimizationAsyncErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(
+                            crate::state::data_automation_profile::INVALID_PROFILE_MESSAGE
+                                .to_string(),
+                        ),
+                        field_list: None,
+                    },
+                )
+                .into(),
+            );
+        }
+
         // The job optimizes the blueprint its submission references, so a reference this
         // store cannot resolve describes no job: the blueprint's stored schema IS what
         // such a job reads. Refused BEFORE anything is minted, so a refused submission

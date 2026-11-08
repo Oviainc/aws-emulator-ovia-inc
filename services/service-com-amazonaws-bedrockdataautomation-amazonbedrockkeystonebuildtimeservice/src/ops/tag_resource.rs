@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op TagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `TagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`TagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Sets tags on a resource of this service: the tags the request names are MERGED into
+//! the list the resource already holds ([`crate::state::tagging`] owns that merge and the
+//! ARN resolution behind it, shared with `UntagResource` and `ListTagsForResource`), and
+//! an ARN naming no resource this store holds is the modelled 404.
 //!
 //! ## Shape of an operation
 //!
@@ -149,18 +145,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `TagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(TagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("TagResource"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            TagResourceError::Modeled(TagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the Bedrock Data Automation store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        let mut store = state.lock();
+
+        // Tagging addresses one resource by ARN, so an ARN this store holds no resource
+        // under has no tags to set: the modelled `ResourceNotFoundException`, worded once
+        // in `crate::state::tagging` for all three tagging operations
+        // (`crate::state::tagging::tag_quota_message` below is the quota one).
+        let held = store
+            .resource_tags_mut(&input.resource_arn)
+            .ok_or_else(|| {
+                TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(crate::state::tagging::resource_not_found_message(
+                        &input.resource_arn,
+                    )),
+                })
+            })?;
+
+        // A resource holds at most as many tags as the modelled tag collection carries —
+        // the list a read reports it through — and only the keys the resource does not
+        // already hold grow the list. Past that the request is over the service's quota for
+        // tags on one resource, which this service words the way it words its other quota
+        // refusals ([`crate::state::tagging::tag_quota_message`]): fixed text naming the
+        // quota and what to do about it, with nothing taken from the request. The whole
+        // request is refused before a single pair is applied, so a refused call leaves the
+        // resource's tags exactly as they were.
+        let merged = crate::state::tagging::tag_count_after(held, &input.tags);
+        if merged > crate::state::tagging::MAX_TAGS_PER_RESOURCE {
+            return Err(TagResourceErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: Some(crate::state::tagging::tag_quota_message()),
+                },
+            )
+            .into());
+        }
+
+        // The tags are MERGED into the list the resource holds, so a call naming one tag
+        // leaves every other tag of the resource in place.
+        crate::state::tagging::apply_tags(held, input.tags);
+        Ok(TagResourceOutput {})
     }
 }

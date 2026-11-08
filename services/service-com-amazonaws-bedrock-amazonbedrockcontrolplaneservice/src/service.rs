@@ -90,6 +90,7 @@
 //! addressed and never against an ARN of another family the request happens to carry.
 
 pub mod authorization;
+pub mod data_automation_tagging;
 pub mod validation;
 
 use std::collections::HashMap;
@@ -149,6 +150,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// TYPE and a handle on the one shared engine, so this is a table of names rather than
     /// a second set of operations.
     gated: HashMap<&'static str, Box<dyn ErasedOperation>>,
+    /// The Bedrock Data Automation half of the three tagging paths this service binds:
+    /// built once here over the same shared engine, and handed back from
+    /// `override_operation` for a tagging request whose `resourceARN` names one of that
+    /// service's resources (see [`data_automation_tagging`]).
+    data_automation_tagging: data_automation_tagging::DataAutomationTagging<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -158,6 +164,9 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             gated: gated_table::<Eng>(&engine),
+            data_automation_tagging: data_automation_tagging::DataAutomationTagging::new(
+                Arc::clone(&engine),
+            ),
             entry: crate::ServiceDefinition::new(engine),
         }
     }
@@ -214,6 +223,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Keyed on the routing key the model names each operation by, so a request that
         // names no modelled operation resolves exactly as it did before.
         let key = self.entry.protocol().routing_key(req).ok()?;
+        // The three tagging paths this service binds are bound identically by
+        // `bedrock-data-automation`, and the family's claim rule gives the whole segment to
+        // this service — so a tagging request whose `resourceARN` names one of THAT
+        // service's resources is served out of that model here, which is the first seam
+        // handed the body the ARN lives in (see [`data_automation_tagging`]). Every other
+        // request, tagging or not, is this service's own.
+        if self.data_automation_tagging.serves(key, req) {
+            return Some(&self.data_automation_tagging);
+        }
         self.gated.get(key).map(|wrapper| &**wrapper)
     }
 

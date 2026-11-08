@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDataAutomationLibraries
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDataAutomationLibraries`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDataAutomationLibraries::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the DataAutomationLibraries this store holds, in this service's listing
+//! order (`creationTime`, then ARN), one modelled page at a time. A REPORTING operation:
+//! it projects what is stored and writes nothing. `projectFilter` narrows the listing to
+//! the libraries ONE project references.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +144,100 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDataAutomationLibraries` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDataAutomationLibrariesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDataAutomationLibraries"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListDataAutomationLibrariesError::Modeled(
+                ListDataAutomationLibrariesErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(
+                            "the Bedrock Data Automation store is unavailable".to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+        // A read: it only projects what is already stored.
+        let store = state.lock();
+
+        let cursor = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::PageCursor::from_token(token).ok_or_else(|| {
+                ListDataAutomationLibrariesError::Modeled(
+                    ListDataAutomationLibrariesErrorModeled::ValidationException(
+                        ValidationException {
+                            message: Some(
+                                "nextToken is not a token this service issued".to_string(),
+                            ),
+                            field_list: Some(vec![ValidationExceptionField {
+                                name: "nextToken".to_string(),
+                                message: "must be a nextToken returned by a previous \
+                                          ListDataAutomationLibraries call"
+                                    .to_string(),
+                            }]),
+                        },
+                    ),
+                )
+            })?),
+        };
+
+        // `projectFilter` narrows the listing to the libraries ONE project's stored
+        // library configuration references, by that project's ARN and — where the filter
+        // states one — its stage. This operation models no `ResourceNotFoundException`
+        // (`smithy_query(query="operation",operation="ListDataAutomationLibraries")`
+        // declares only the four service-common errors), so a filter naming a project this
+        // store does not hold narrows the listing to nothing rather than being refused: a
+        // project that holds no library reference and one that is not there both reference
+        // no library.
+        let referenced: Option<Vec<String>> = input.project_filter.as_ref().map(|filter| {
+            store
+                .projects
+                .get(&filter.project_arn)
+                .filter(|record| {
+                    filter
+                        .project_stage
+                        .as_deref()
+                        .is_none_or(|stage| stage == record.project_stage)
+                })
+                .map(|record| {
+                    record
+                        .library_references()
+                        .map(|item| item.library_arn.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        });
+
+        let matching: Vec<&crate::state::DataAutomationLibraryRecord> = store
+            .libraries_in_order()
+            .into_iter()
+            .filter(|record| {
+                referenced
+                    .as_ref()
+                    .is_none_or(|arns| arns.contains(&record.library_arn))
+            })
+            .filter(|record| cursor.as_ref().is_none_or(|c| c.precedes(*record)))
+            .collect();
+
+        // `maxResults` caps the page; absent, the server's own page limit does, so a
+        // listing never serialises more than one modeled-maximum page. The modeled range is
+        // 1..1000, so a value reaching this handler is in range; clamping to 1 at the bottom
+        // keeps a page honest if that ever changes.
+        let limit = input
+            .max_results
+            .unwrap_or(crate::state::LIBRARY_PAGE_LIMIT)
+            .clamp(1, crate::state::LIBRARY_PAGE_LIMIT) as usize;
+        let page = &matching[..limit.min(matching.len())];
+
+        // A token is handed back only when something is left AFTER this page, so the last
+        // page of a listing never carries one.
+        let next_token = page
+            .last()
+            .filter(|_| matching.len() > page.len())
+            .map(|record| crate::state::PageCursor::after(*record).to_token());
+
+        Ok(ListDataAutomationLibrariesOutput {
+            libraries: Some(page.iter().map(|record| record.to_summary()).collect()),
+            next_token,
+        })
     }
 }

@@ -25,14 +25,24 @@ use crate::ops::types::{
     Blueprint, BlueprintItem, BlueprintOptimizationOutputConfiguration,
     BlueprintOptimizationSample, BlueprintSummary, CustomOutputConfiguration,
     DataAutomationLibrary, DataAutomationLibraryConfiguration, DataAutomationLibraryItem,
-    DataAutomationProject, DataAutomationProjectSummary, EntityTypeInfo, OverrideConfiguration,
-    StandardOutputConfiguration, Tag,
+    DataAutomationLibrarySummary, DataAutomationProject, DataAutomationProjectSummary,
+    EntityTypeInfo, OverrideConfiguration, StandardOutputConfiguration, Tag,
 };
 
 /// How a project's STORED configuration becomes the EFFECTIVE configuration a read
 /// reports: the service's defaults materialised wherever the create or the update was
 /// silent. Used by [`DataAutomationProjectRecord::to_project`].
 pub mod project_configuration;
+
+/// Which ARN addresses a taggable resource of this service, where that resource's tags
+/// live in this store, and how a tagging call changes them. Used by the `TagResource`,
+/// `UntagResource` and `ListTagsForResource` handlers.
+pub mod tagging;
+
+/// Which `dataAutomationProfileArn` a submission can be run under: the Data Automation
+/// profiles this service resolves one against. Used by
+/// `InvokeBlueprintOptimizationAsync`.
+pub mod data_automation_profile;
 
 /// The `blueprintStage` a blueprint takes when `CreateBlueprint` names none.
 ///
@@ -715,6 +725,14 @@ pub const LIBRARY_ACTIVE: &str = "ACTIVE";
 /// nor an account's adjustments, so this is the emulator's OWN bound on the store.
 pub const LIBRARY_QUOTA: usize = 1_000;
 
+/// The largest page `ListDataAutomationLibraries` serves, and the page size it uses when
+/// the request names no `maxResults`. The same value as [`BLUEPRINT_PAGE_LIMIT`] because it
+/// has the same source: this listing binds `maxResults` to the one modelled `MaxResults`
+/// shape (`smithy_query(query="operation",operation="ListDataAutomationLibraries")` ->
+/// `@range(min: 1, max: 1000)`), so no caller can ask for more than this and an absent
+/// `maxResults` cannot serialise the whole store either.
+pub const LIBRARY_PAGE_LIMIT: i32 = BLUEPRINT_PAGE_LIMIT;
+
 /// What `CreateDataAutomationLibrary` answers when some live library already holds
 /// the `libraryName` it was handed.
 ///
@@ -771,6 +789,22 @@ impl DataAutomationLibraryRecord {
             entity_types: Some(self.entity_types.clone()),
             kms_key_id: self.kms_key_id.clone(),
             kms_encryption_context: self.kms_encryption_context.clone(),
+        }
+    }
+
+    /// Project the record onto the NARROW `DataAutomationLibrarySummary` item
+    /// `ListDataAutomationLibraries` serves.
+    ///
+    /// `smithy_query(query="shape",shape="DataAutomationLibrarySummary")` carries three
+    /// members — the ARN (the identity), the name and the creation instant — and a listing
+    /// fills all three: unlike the blueprint summary, this shape's name member is the
+    /// library's own, so a caller enumerating libraries reads them without a read per
+    /// library.
+    pub fn to_summary(&self) -> DataAutomationLibrarySummary {
+        DataAutomationLibrarySummary {
+            library_arn: self.library_arn.clone(),
+            library_name: Some(self.library_name.clone()),
+            creation_time: self.creation_time,
         }
     }
 }
@@ -840,6 +874,11 @@ impl ComAmazonawsBedrockdataautomationAmazonbedrockkeystonebuildtimeserviceState
     /// ARN) — the order [`in_listing_order`] gives every listing of this service.
     pub fn projects_in_order(&self) -> Vec<&DataAutomationProjectRecord> {
         in_listing_order(self.projects.values())
+    }
+
+    /// Every stored DataAutomationLibrary in that same listing order.
+    pub fn libraries_in_order(&self) -> Vec<&DataAutomationLibraryRecord> {
+        in_listing_order(self.libraries.values())
     }
 
     /// Reserve the next blueprint-ARN sequence number, advancing the counter.
@@ -1050,6 +1089,16 @@ impl ListedResource for DataAutomationProjectRecord {
             self.creation_time.secs(),
             self.creation_time.subsec_nanos(),
             self.project_arn.as_str(),
+        )
+    }
+}
+
+impl ListedResource for DataAutomationLibraryRecord {
+    fn order_key(&self) -> (i64, u32, &str) {
+        (
+            self.creation_time.secs(),
+            self.creation_time.subsec_nanos(),
+            self.library_arn.as_str(),
         )
     }
 }

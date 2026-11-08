@@ -19,12 +19,18 @@ mod blueprint_optimization;
 mod blueprint_stage_copy;
 #[path = "all/data_automation_library_lifecycle.rs"]
 mod data_automation_library_lifecycle;
+#[path = "all/data_automation_library_listing.rs"]
+mod data_automation_library_listing;
 #[path = "all/data_automation_project_lifecycle.rs"]
 mod data_automation_project_lifecycle;
 #[path = "all/data_automation_project_listing.rs"]
 mod data_automation_project_listing;
 #[path = "all/data_automation_project_update.rs"]
 mod data_automation_project_update;
+#[path = "all/identity_authorization.rs"]
+mod identity_authorization;
+#[path = "all/optimization_profile_resolution.rs"]
+mod optimization_profile_resolution;
 #[path = "all/project_effective_configuration.rs"]
 mod project_effective_configuration;
 #[path = "all/refusal_wording.rs"]

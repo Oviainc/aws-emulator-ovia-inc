@@ -59,6 +59,8 @@ mod custom_model_deployments;
 mod custom_model_source_bucket;
 #[path = "all/custom_models.rs"]
 mod custom_models;
+#[path = "all/data_automation_tagging.rs"]
+mod data_automation_tagging;
 #[path = "all/default_prompt_routers.rs"]
 mod default_prompt_routers;
 #[path = "all/enforced_guardrail_configuration.rs"]

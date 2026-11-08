@@ -41,6 +41,11 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # The IAM store, for the identity-based policy documents in force on that principal, which
 # is what the authorization gate in front of this service's handlers decides on.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The Bedrock Data Automation build-time emulator: it binds the three tagging paths
+# (`/tagResource`, `/untagResource`, `/listTagsForResource`) identically to this service, so
+# a tagging request naming one of ITS resources is served out of its own model here (see
+# `src/service/data_automation_tagging.rs`).
+service-com-amazonaws-bedrockdataautomation-amazonbedrockkeystonebuildtimeservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
