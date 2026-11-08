@@ -39,6 +39,8 @@ mod legal_hold_coverage;
 mod legal_hold_date_range;
 #[path = "all/logically_air_gapped_vault.rs"]
 mod logically_air_gapped_vault;
+#[path = "all/plan_and_selection_refusals.rs"]
+mod plan_and_selection_refusals;
 #[path = "all/recovery_point_deletion.rs"]
 mod recovery_point_deletion;
 #[path = "all/recovery_point_read.rs"]

@@ -12,11 +12,10 @@
 //! answering its own refusal.
 //!
 //! The rows differ in how the read addresses the plan (no version, the version
-//! the create minted, a version the plan never had), in how many rules and
-//! advanced settings the deleted plan carried, and in which read operation
-//! resolves it — which is what the rule generalises over; the behavioural
-//! instance (one single-rule plan read with no version after its delete) is one
-//! row.
+//! the create minted, a version the plan never had) and in how many rules and
+//! advanced settings the deleted plan carried — which is what the rule
+//! generalises over; the behavioural instance (one single-rule plan read with no
+//! version after its delete) is one row.
 //!
 //! The request harness (`router`, `call`, `error_code`) is the one
 //! `vault_and_backup_job.rs` exposes to this test binary, so there is ONE wire
@@ -67,7 +66,8 @@ async fn delete_plan(router: &MultiServiceRouter, plan_id: &str) -> (u16, Value)
 }
 
 /// `GET /backup/plans/{BackupPlanId}/selections` — `ListBackupSelections`'s
-/// binding, the other read that resolves a plan by id.
+/// binding, which reports the selections assigned to the plan rather than
+/// resolving the plan itself.
 async fn list_selections(router: &MultiServiceRouter, plan_id: &str) -> (u16, Value) {
     call(
         router,
@@ -198,22 +198,26 @@ async fn a_deleted_backup_plan_is_no_longer_readable() {
             }
         }
 
-        // The other read that resolves a plan by id answers the same way: the
-        // resolution is the plan read's, not one operation's.
-        let (status, refused) = list_selections(&router, &plan_id).await;
+        // The listing of its selections is NOT such a read: it reports the
+        // selections assigned to the plan, and a deleted plan has none, so it
+        // answers an empty page (`plan_and_selection_refusals.rs`).
+        let (status, listed) = list_selections(&router, &plan_id).await;
         assert_eq!(
-            (status, error_code(&refused).as_str()),
-            (400, NOT_FOUND),
-            "case {case:?}: expected the deleted plan's selections to be unreadable, \
-             got {status} {refused:?}"
+            (
+                status,
+                listed.get("BackupSelectionsList").and_then(Value::as_array)
+            ),
+            (200, Some(&Vec::new())),
+            "case {case:?}: expected the deleted plan's selections to list empty, \
+             got {status} {listed:?}"
         );
     }
 }
 
-/// The two conditions a plan read refuses are told apart: a version of a plan
-/// the account holds that is not there to read answers the unreadable-version
-/// refusal, while an id the account holds no plan under answers the refusal for
-/// an absent plan. Both are 400 `ResourceNotFoundException`.
+/// The two conditions a plan read refuses are ONE: a plan read answers from the
+/// plan at a version, so an id the account holds no plan under, a plan whose
+/// deletion is recorded and a version the plan never had all answer the
+/// unreadable-version refusal, with its own `Code`.
 #[tokio::test]
 async fn an_unreadable_version_and_an_unheld_plan_id_answer_their_own_refusals() {
     let router = router();
@@ -247,16 +251,19 @@ async fn an_unreadable_version_and_an_unheld_plan_id_answer_their_own_refusals()
             VERSION_UNREADABLE,
         ),
         (
+            // A plan read asks for the plan AT a version — the one named, or
+            // the latest — so an id nothing answers to is again the version it
+            // could not read.
             "a plan id the account never held",
             UNHELD_VERSION,
             None,
-            "Cannot find Backup plan",
+            VERSION_UNREADABLE,
         ),
         (
             "a plan id the account never held, at a version",
             UNHELD_VERSION,
             Some(version_id.as_str()),
-            "Cannot find Backup plan",
+            VERSION_UNREADABLE,
         ),
     ];
     for (case, read_id, version, message) in cases {
@@ -265,9 +272,10 @@ async fn an_unreadable_version_and_an_unheld_plan_id_answer_their_own_refusals()
             (
                 status,
                 error_code(&refused).as_str(),
-                text(&refused, "Message").as_str()
+                text(&refused, "Message").as_str(),
+                text(&refused, "Code").as_str(),
             ),
-            (400, NOT_FOUND, message),
+            (400, NOT_FOUND, message, VERSION_UNREADABLE_CODE),
             "case {case:?}: expected 400 {NOT_FOUND} {message:?}, got {status} {refused:?}"
         );
     }

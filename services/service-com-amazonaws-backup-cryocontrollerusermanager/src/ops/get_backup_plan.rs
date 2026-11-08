@@ -124,23 +124,9 @@ use super::types::*;
 
 use ::std::time::SystemTime;
 
-/// The cron expression a rule's jobs are initiated by when the rule carries
-/// none: "When no CRON expression is provided, Backup will use the default
-/// expression `cron(0 5 ? * * *)`" (model doc for
-/// `BackupRule$ScheduleExpression`).
-const DEFAULT_SCHEDULE_EXPRESSION: &str = "cron(0 5 ? * * *)";
-
-/// How many whitespace-separated fields a rule's cron expression carries: the
-/// minute, hour, day-of-month, month, day-of-week and year of an Amazon Web
-/// Services cron expression (the model's own examples for
-/// `BackupRule$ScheduleExpression`, `0 12 * * ? *` and `15 * ? * * *`, carry six
-/// each).
-const CRON_FIELDS: usize = 6;
-
-/// The cron fields a `?` ("no specific value") may stand in, as positions within
-/// the six: the day-of-month and the day-of-week, the pair the model's examples
-/// put it in.
-const NO_SPECIFIC_VALUE_FIELDS: [usize; 2] = [2, 4];
+use crate::state::schedule::{
+    parse_schedule_expression, schedule_timezone, DEFAULT_SCHEDULE_EXPRESSION,
+};
 
 /// `RuleExecutionType` of a rule that creates continuous backups: "True causes
 /// Backup to create continuous backups capable of point-in-time restore (PITR)"
@@ -221,52 +207,13 @@ fn rule_execution_type(rule: &BackupRule) -> &'static str {
     }
 }
 
-/// A rule's `ScheduleExpression` as a parsed schedule, or `None` when it is not
-/// an expression this service can compute an execution from.
-///
-/// "A cron expression in UTC specifying when Backup initiates a backup job" —
-/// six fields (minute, hour, day-of-month, month, day-of-week, year), which the
-/// model writes both wrapped in `cron(…)` (its default expression) and bare (its
-/// two examples), so both spellings read as the same schedule. The `cron` crate
-/// parses the seven-field form that starts with seconds, so a literal `0`
-/// seconds field is prepended; a `?` is "no specific value", which that grammar
-/// spells `*`, and states nothing outside the day fields.
-fn parse_schedule_expression(expression: &str) -> Option<::cron::Schedule> {
-    let expression = expression.trim();
-    let body = expression
-        .strip_prefix("cron(")
-        .and_then(|rest| rest.strip_suffix(')'))
-        .unwrap_or(expression);
-    let fields: Vec<&str> = body.split_whitespace().collect();
-    if fields.len() != CRON_FIELDS {
-        return None;
-    }
-    let seconds = ::std::iter::once("0");
-    let normalised: Vec<&str> = seconds
-        .chain(fields.iter().enumerate().map(|(position, field)| {
-            if *field == "?" && NO_SPECIFIC_VALUE_FIELDS.contains(&position) {
-                "*"
-            } else {
-                *field
-            }
-        }))
-        .collect();
-    normalised.join(" ").parse::<::cron::Schedule>().ok()
-}
-
-/// The time zone a rule's schedule is read in: "The timezone in which the
-/// schedule expression is set. By default, ScheduleExpressions are in UTC"
-/// (model doc for `BackupRule$ScheduleExpressionTimezone`). `None` when the
-/// stored name resolves to no zone at all.
-fn schedule_timezone(timezone: Option<&str>) -> Option<::chrono_tz::Tz> {
-    match timezone {
-        None => Some(::chrono_tz::UTC),
-        Some(name) => name.parse::<::chrono_tz::Tz>().ok(),
-    }
-}
-
 /// The first `count` instants `schedule` fires at strictly after `after`, read
 /// in `timezone`.
+///
+/// The schedule itself and the zone it is read in come from the state module's
+/// ONE reading of those members ([`crate::state::schedule`]) — the same reading
+/// that decides whether a plan body is stored at all, so no stored plan has a
+/// rule whose runs this preview cannot compute.
 ///
 /// Every conversion is fallible on purpose: the schedule and the zone come from
 /// a stored request, so an instant that cannot be represented drops out of the

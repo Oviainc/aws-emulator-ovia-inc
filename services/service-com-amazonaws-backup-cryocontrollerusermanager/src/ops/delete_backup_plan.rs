@@ -160,22 +160,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteBackupPlanErrorModeled::ServiceUnavailableException(ServiceUnavailableException {
                 message: Some("the backup vault store is unavailable".to_string()),
                 ..Default::default()
             })
         })?;
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
         let mut store = state.lock();
         // A plan this account does not hold, and one whose deletion is already
-        // recorded, are the same condition: there is no live plan of that id to
-        // delete.
+        // recorded, are the same condition: this delete reads the plan's LATEST
+        // version to supersede it, and there is none to read, which is the
+        // refusal that names the plan it could not read — by the ARN built from
+        // this request's region and the id it carried.
         if store.live_backup_plan(&input.backup_plan_id).is_none() {
             return Err(DeleteBackupPlanErrorModeled::ResourceNotFoundException(
-                crate::state::backup_plan_not_found(),
+                crate::state::latest_backup_plan_version_unreadable(
+                    &crate::state::backup_plan_arn(&region, &input.backup_plan_id),
+                ),
             )
             .into());
         }
@@ -201,10 +205,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let Some(plan) = store.backup_plans.get_mut(&input.backup_plan_id) else {
             // Unreachable: the lookup above resolved the plan under this same
-            // lock. Answered as the absent resource it would be rather than
+            // lock. Answered with the same refusal as that lookup rather than
             // reporting a deletion of a plan nothing holds.
             return Err(DeleteBackupPlanErrorModeled::ResourceNotFoundException(
-                crate::state::backup_plan_not_found(),
+                crate::state::latest_backup_plan_version_unreadable(
+                    &crate::state::backup_plan_arn(&region, &input.backup_plan_id),
+                ),
             )
             .into());
         };

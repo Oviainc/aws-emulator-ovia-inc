@@ -3,9 +3,12 @@
 //! @op DeleteBackupSelection
 //!
 //! Removes the selection stored under the requested (`BackupPlanId`,
-//! `SelectionId`) pair, so the plan stops holding the resources it assigned. A
-//! pair this account does not hold is the modelled `ResourceNotFoundException`,
-//! which is also what a repeated delete of the same selection answers.
+//! `SelectionId`) pair, so the plan stops holding the resources it assigned.
+//! The one condition it refuses is a `BackupPlanId` naming no plan this account
+//! holds, which is the modelled `InvalidParameterValueException`; once the plan
+//! is resolved the removal is idempotent, so a `SelectionId` the plan does not
+//! hold — one nothing created, or one a previous delete removed — answers the
+//! same empty success.
 //!
 //! ## Shape of an operation
 //!
@@ -174,19 +177,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut store = state.lock();
-        let key = (input.backup_plan_id, input.selection_id);
-        if store.backup_selections.remove(&key).is_none() {
-            // Neither half of the pair is disclosed as the one at fault: a plan
-            // this account does not hold and a selection that plan does not hold
-            // are one condition, worded by `crate::state` for every selection
-            // read and this delete alike.
+        // The PLAN is what this delete resolves: a `BackupPlanId` naming no
+        // plan this account holds is a parameter value it cannot resolve, and
+        // that is the one condition it refuses.
+        if store.live_backup_plan(&input.backup_plan_id).is_none() {
             return Err(
-                DeleteBackupSelectionErrorModeled::ResourceNotFoundException(
-                    crate::state::backup_selection_not_found(),
+                DeleteBackupSelectionErrorModeled::InvalidParameterValueException(
+                    crate::state::selection_plan_not_found(
+                        crate::state::ERROR_CODE_SELECTION_DELETE_PLAN_NOT_FOUND,
+                    ),
                 )
                 .into(),
             );
         }
+        // Once the plan is resolved the removal is IDEMPOTENT: the call states
+        // that the named selection is not to be assigned any more, which is
+        // already true of a `SelectionId` the plan does not hold, so the second
+        // delete of one — and the delete of one nothing ever created — answers
+        // the same empty success as the first.
+        store
+            .backup_selections
+            .remove(&(input.backup_plan_id, input.selection_id));
         Ok(DeleteBackupSelectionOutput)
     }
 }

@@ -47,6 +47,8 @@
 //! decision before the existence lookup, so none of them can disclose a vault the
 //! caller cannot see.
 
+pub mod schedule;
+
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -727,22 +729,87 @@ pub const ERROR_CODE_VAULT_ALREADY_EXISTS: &str = "ERROR_1101";
 /// The sentence AWS states for that condition — fixed, like the one above.
 pub const MESSAGE_VAULT_ALREADY_EXISTS: &str = "Backup vault with the same name already exists";
 
-/// The sentence AWS states for "the backup plan asked about is not one this
-/// account holds" — fixed, and worded as this service words the same condition
-/// for a backup job ([`MESSAGE_BACKUP_JOB_NOT_FOUND`]): it names no part of the
-/// request, so neither the plan id nor the version asked about appears in it.
-/// No `Code`: this condition has no observed token.
+/// The sentence AWS states for "the backup plan this call resolves is not one
+/// this account holds" on a call that resolves one WITHOUT reading a version of
+/// it — fixed, and worded as this service words the same condition for a backup
+/// job ([`MESSAGE_BACKUP_JOB_NOT_FOUND`]): it names no part of the request. A
+/// plan READ states the version it could not read instead
+/// ([`MESSAGE_BACKUP_PLAN_VERSION_UNREADABLE`]). No `Code`: this condition has
+/// no observed token.
 pub const MESSAGE_BACKUP_PLAN_NOT_FOUND: &str = "Cannot find Backup plan";
 
 /// `Code` for "the version of the backup plan this read asks for cannot be
 /// read".
 pub const ERROR_CODE_BACKUP_PLAN_VERSION_UNREADABLE: &str = "ERROR_2202";
 /// The sentence AWS states for that condition — fixed: it names neither the
-/// plan id nor the version asked about. It is the condition a read is in once
-/// the plan's deletion is recorded, and the one a `VersionId` the plan does not
-/// carry puts it in: in both, the version named is no longer there to read.
+/// plan id nor the version asked about. A plan READ answers from the plan at a
+/// version, so it is the sentence for EVERY way such a read can fail to resolve
+/// one: the plan's deletion is recorded, the `VersionId` names a version the
+/// plan never had, or the account holds no plan of that id at all — in each,
+/// the version the read asked for is not there to read.
 pub const MESSAGE_BACKUP_PLAN_VERSION_UNREADABLE: &str =
     "Failed reading Backup plan with provided version";
+
+/// The FIXED text AWS states for "the LATEST version of the backup plan this
+/// call must read before it acts is not there to read", up to and after the one
+/// variable part: the ARN of the plan the call addressed.
+///
+/// Unlike [`MESSAGE_BACKUP_PLAN_VERSION_UNREADABLE`], which a READ of a named
+/// version answers, this is the sentence the call that reads a plan's latest
+/// version states, and it names the plan — built from the partition, region and
+/// account of the request and the `BackupPlanId` it carried
+/// ([`backup_plan_arn`]), never from anything else the request sent. Composed by
+/// [`latest_backup_plan_version_unreadable`], the one place it is built.
+pub const MESSAGE_LATEST_BACKUP_PLAN_VERSION_UNREADABLE_PREFIX: &str =
+    "Failed reading latest version of backup plan ";
+/// The text that follows the plan ARN in that sentence.
+pub const MESSAGE_LATEST_BACKUP_PLAN_VERSION_UNREADABLE_SUFFIX: &str =
+    " - backup plan does not exist!";
+
+/// `Code` for "a RULE of the backup plan body carries something AWS Backup
+/// refuses". ONE token for the whole per-rule validation class: which rule and
+/// which reason is reported in `Context` and in the sentence, not in the token.
+pub const ERROR_CODE_BACKUP_PLAN_RULE_INVALID: &str = "ERROR_3015";
+
+/// The FIXED text that opens the sentence AWS states for that class; the
+/// per-rule validation reason follows it, and is also carried whole in
+/// `Context` ([`rejected_backup_plan_rule`]).
+pub const MESSAGE_BACKUP_PLAN_RULES_PREFIX: &str = "Error in some rules due to : ";
+
+/// The FIXED text that opens the per-rule reason for a `ScheduleExpression`
+/// that is not a cron expression; the parse failure follows it.
+pub const MESSAGE_CRON_INVALID_PREFIX: &str = "Cron expression is not valid: ";
+
+/// The parse failure stated for an expression that is not a cron expression at
+/// all — the whole condition [`schedule::rule_schedule_refusal`] decides, since
+/// what fails is the parse and no part of the expression is quoted back.
+pub const MESSAGE_CRON_INVALID: &str = "Invalid cron expression";
+
+/// The service principal a role AWS Backup acts under has to let assume it:
+/// this service's own, which the model states — the service shape's
+/// `aws.api#service` trait carries `cloudTrailEventSource` `backup.amazonaws.com`
+/// (`smithy_query(query="service_info")`).
+pub const SERVICE_PRINCIPAL: &str = "backup.amazonaws.com";
+
+/// `Code` for "the IAM role this call would act under is not one AWS Backup can
+/// assume".
+pub const ERROR_CODE_ROLE_NOT_ASSUMABLE: &str = "ERROR_3017";
+/// The sentence AWS states for that condition — FIXED text: it names neither
+/// the role nor the resource the call addressed.
+pub const MESSAGE_ROLE_NOT_ASSUMABLE: &str = "IAM Role cannot be assumed by AWS Backup";
+
+/// `Code` for "the `BackupPlanId` a selection READ carries names no backup plan
+/// of this account".
+pub const ERROR_CODE_SELECTION_READ_PLAN_NOT_FOUND: &str = "ERROR_2304";
+/// `Code` for the same condition on the selection DELETE: AWS Backup numbers
+/// its tokens per call, so the two differ even though the condition is one.
+pub const ERROR_CODE_SELECTION_DELETE_PLAN_NOT_FOUND: &str = "ERROR_2302";
+/// The sentence AWS states for that condition — FIXED text: the plan id asked
+/// about does not appear in it.
+pub const MESSAGE_BACKUP_PLAN_NOT_FOUND_BY_ID: &str = "Cannot find Backup plan with ID";
+
+/// `Code` for "the selection asked about is not one the named plan holds".
+pub const ERROR_CODE_BACKUP_SELECTION_NOT_FOUND: &str = "ERROR_2303";
 
 /// The sentence AWS states for "the recovery point asked about is not one the
 /// named vault holds" — fixed, and worded as this service words the same
@@ -773,7 +840,8 @@ pub const MESSAGE_RECOVERY_POINT_HELD: &str =
 /// The sentence AWS states for "the backup selection asked about is not one the
 /// named plan holds" — fixed, and worded as this service words the same
 /// condition for a backup plan ([`MESSAGE_BACKUP_PLAN_NOT_FOUND`]): it names no
-/// part of the request. No `Code`: this condition has no observed token.
+/// part of the request. Its token is
+/// [`ERROR_CODE_BACKUP_SELECTION_NOT_FOUND`].
 pub const MESSAGE_BACKUP_SELECTION_NOT_FOUND: &str = "Cannot find Backup selection";
 
 /// The sentence AWS states for "a backup plan of this name already exists",
@@ -967,8 +1035,9 @@ pub fn backup_vault_not_found(vault_name: &str) -> ResourceNotFoundException {
     }
 }
 
-/// The modelled refusal for a backup plan id (or a version of it) this account
-/// does not hold.
+/// The modelled refusal for a backup plan id this account does not hold, for
+/// the call that resolves a plan WITHOUT reading a version of it — the update
+/// that stores the next version is the one that does.
 pub fn backup_plan_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: Some(MESSAGE_BACKUP_PLAN_NOT_FOUND.to_string()),
@@ -976,14 +1045,119 @@ pub fn backup_plan_not_found() -> ResourceNotFoundException {
     }
 }
 
-/// The modelled refusal for a read of a plan VERSION that is no longer there:
-/// the account holds a plan of that id, but the version the read asks for has
-/// been deleted or was never one of the plan's — see
-/// [`MESSAGE_BACKUP_PLAN_VERSION_UNREADABLE`], with the condition's own token.
+/// The modelled refusal for a plan READ that cannot resolve the version it
+/// asks for: the plan read answers from the plan at a version — the one named,
+/// or the plan's latest — so an id the account holds no plan under, a plan
+/// whose deletion is recorded and a `VersionId` the plan never had are all this
+/// one condition. See [`MESSAGE_BACKUP_PLAN_VERSION_UNREADABLE`], with the
+/// condition's own token.
 pub fn backup_plan_version_unreadable() -> ResourceNotFoundException {
     ResourceNotFoundException {
         code: Some(ERROR_CODE_BACKUP_PLAN_VERSION_UNREADABLE.to_string()),
         message: Some(MESSAGE_BACKUP_PLAN_VERSION_UNREADABLE.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a call that has to read a plan's LATEST version
+/// before it acts and finds no plan of that id to read it from — see
+/// [`MESSAGE_LATEST_BACKUP_PLAN_VERSION_UNREADABLE_PREFIX`].
+///
+/// `plan_arn` is the ARN of the plan the call addressed ([`backup_plan_arn`] of
+/// the request's region and the `BackupPlanId` it carried), which is the only
+/// variable part of the sentence. No `Code`: this condition has no observed
+/// token.
+pub fn latest_backup_plan_version_unreadable(plan_arn: &str) -> ResourceNotFoundException {
+    ResourceNotFoundException {
+        message: Some(format!(
+            "{MESSAGE_LATEST_BACKUP_PLAN_VERSION_UNREADABLE_PREFIX}{plan_arn}\
+             {MESSAGE_LATEST_BACKUP_PLAN_VERSION_UNREADABLE_SUFFIX}"
+        )),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a RULE of a backup plan body AWS Backup does not
+/// accept, stated by the per-rule validation `reason`.
+///
+/// ONE builder for the class, so no operation that stores a plan body words it
+/// differently: AWS reports the class's own `Code`
+/// ([`ERROR_CODE_BACKUP_PLAN_RULE_INVALID`]), carries the per-rule reason whole
+/// in `Context` — the member a client reads to learn what the rule got wrong —
+/// and states that same reason after the class's fixed prefix
+/// ([`MESSAGE_BACKUP_PLAN_RULES_PREFIX`]).
+pub fn rejected_backup_plan_rule(reason: &str) -> InvalidParameterValueException {
+    InvalidParameterValueException {
+        code: Some(ERROR_CODE_BACKUP_PLAN_RULE_INVALID.to_string()),
+        message: Some(format!("{MESSAGE_BACKUP_PLAN_RULES_PREFIX}{reason}")),
+        context: Some(reason.to_string()),
+        ..Default::default()
+    }
+}
+
+/// The modelled refusal for a call that would act under an IAM role AWS Backup
+/// cannot assume — see [`MESSAGE_ROLE_NOT_ASSUMABLE`], with the condition's own
+/// token.
+pub fn role_not_assumable() -> InvalidParameterValueException {
+    InvalidParameterValueException {
+        code: Some(ERROR_CODE_ROLE_NOT_ASSUMABLE.to_string()),
+        message: Some(MESSAGE_ROLE_NOT_ASSUMABLE.to_string()),
+        ..Default::default()
+    }
+}
+
+/// Why the `IamRoleArn` a backup selection would be stored with names no role
+/// AWS Backup could assume, or `None` when nothing shows it could not.
+///
+/// A selection assigns resources to be backed up AS that role, so the role is
+/// resolved BEFORE anything is persisted and a role this service could not
+/// assume is refused ([`role_not_assumable`]) rather than stored on a selection
+/// whose jobs could never run. The value is unusable in either of two ways:
+///
+/// * it names no IAM role of THIS account at all
+///   (`::service_common::iam_role::role_name`, the tree's one reading of an IAM
+///   ARN): the model types the member as an `ARN` with no pattern, so a bucket,
+///   a user or another account's role reaches here, and none of those is a role
+///   this account's Backup service could assume for it;
+/// * this account's IAM ANSWERED that the role is one this service cannot
+///   assume: it holds no role under that name, or the trust policy the role
+///   carries does not grant [`SERVICE_PRINCIPAL`] `sts:AssumeRole`. That whole
+///   question is the ONE reading every emulated service that resolves a
+///   caller-supplied role shares
+///   (`::service_common::iam_role::role_is_unassumable`), so this service states
+///   only WHICH principal has to be admitted.
+///
+/// IAM is reached the way any emulated service reaches another: over the
+/// emulator's own in-process callback, so nothing here opens a socket.
+/// Everything that is not one of those two answers is accepted — an emulator
+/// with no IAM mounted to ask included — because a refusal grounded in a record
+/// has to be grounded in what IAM actually said. Awaited with NO store guard
+/// held.
+pub async fn rejected_selection_role(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+) -> Option<InvalidParameterValueException> {
+    let names_a_role_of_this_account = ::service_common::iam_role::role_name(role_arn).is_some();
+    let unassumable = !names_a_role_of_this_account
+        || ::service_common::iam_role::role_is_unassumable(ctx, region, role_arn, SERVICE_PRINCIPAL)
+            .await;
+    unassumable.then(role_not_assumable)
+}
+
+/// The modelled refusal for a selection-scoped call whose `BackupPlanId` names
+/// no backup plan this account holds — see
+/// [`MESSAGE_BACKUP_PLAN_NOT_FOUND_BY_ID`].
+///
+/// The PARAMETER-value class, not the not-found one: what the call could not
+/// resolve is the plan the request named, and AWS Backup tells that condition
+/// apart from the selection the plan does not hold
+/// ([`backup_selection_not_found`]) by both the class and the token. `code` is
+/// the asking call's own, since AWS numbers this condition per call.
+pub fn selection_plan_not_found(code: &str) -> InvalidParameterValueException {
+    InvalidParameterValueException {
+        code: Some(code.to_string()),
+        message: Some(MESSAGE_BACKUP_PLAN_NOT_FOUND_BY_ID.to_string()),
         ..Default::default()
     }
 }
@@ -1023,12 +1197,16 @@ pub fn missing_recovery_point_selection() -> MissingParameterValueException {
     }
 }
 
-/// The modelled refusal for a selection id the named plan does not hold — and
-/// for a plan id no plan of this account answers to, which is the same condition
-/// as far as a selection read is concerned: the resource asked about is not
-/// there, and the refusal does not say which half of the pair was wrong.
+/// The modelled refusal for a selection id the named plan does not hold, with
+/// its `Code`.
+///
+/// Only that condition: a `BackupPlanId` that names no plan of this account is
+/// a DIFFERENT condition, which the plan-scoped refusal states
+/// ([`selection_plan_not_found`]), so a client can tell "no such selection of
+/// this plan" from "no such plan".
 pub fn backup_selection_not_found() -> ResourceNotFoundException {
     ResourceNotFoundException {
+        code: Some(ERROR_CODE_BACKUP_SELECTION_NOT_FOUND.to_string()),
         message: Some(MESSAGE_BACKUP_SELECTION_NOT_FOUND.to_string()),
         ..Default::default()
     }
@@ -1242,6 +1420,9 @@ pub enum RejectedBackupPlanBody {
 /// * a rule is identified within its plan by its name, so two rules of one
 ///   plan cannot share one;
 /// * both backup windows carry a documented range ([`rejected_window_minutes`]);
+/// * every rule's `ScheduleExpression` is an expression jobs can be initiated
+///   from ([`schedule::rule_schedule_refusal`]), rather than a rule being
+///   stored whose schedule nothing resolves;
 /// * the members the model types as `ARN` with no pattern carry one
 ///   ([`rejected_arn`]), rather than a rule being stored whose destination no
 ///   ARN resolves to.
@@ -1282,6 +1463,15 @@ pub fn rejected_backup_plan_body(plan: &BackupPlanInput) -> Option<RejectedBacku
             if let Some(refusal) = rejected_window_minutes(member, minutes, minimum) {
                 return Some(RejectedBackupPlanBody::Value(refusal));
             }
+        }
+        // A rule initiates its jobs from its `ScheduleExpression`, so a rule
+        // whose expression is not one this service resolves to a schedule
+        // schedules nothing: it is refused with the per-rule validation
+        // envelope, which states the reason this rule failed.
+        if let Some(reason) = schedule::rule_schedule_refusal(rule) {
+            return Some(RejectedBackupPlanBody::Value(rejected_backup_plan_rule(
+                &reason,
+            )));
         }
         let arns = rule
             .target_logically_air_gapped_backup_vault_arn
@@ -2302,17 +2492,13 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
     /// Resolve a backup plan for a read, by the id it is stored under and
     /// optionally the version asked for.
     ///
-    /// A read answers from a version the account still HOLDS, so two conditions
-    /// are refused here and this is the one place either is decided — every
-    /// plan read goes through it:
-    ///
-    /// * the id names no plan of this account at all
-    ///   ([`backup_plan_not_found`]);
-    /// * the plan is there but the version asked for is not there to be read
-    ///   ([`backup_plan_version_unreadable`]) — because `DeleteBackupPlan`
-    ///   recorded the plan's deletion, or because the `VersionId` names a
-    ///   version the plan never had. Neither refusal tells the caller which
-    ///   half of the pair was wrong.
+    /// A plan read answers from the plan AT A VERSION — the one the request
+    /// named, or the plan's latest where it named none — so every way such a
+    /// read can fail to resolve one is the SAME condition: the version it was
+    /// asked for is not there to be read ([`backup_plan_version_unreadable`]).
+    /// That covers an id this account holds no plan under, a plan whose
+    /// deletion `DeleteBackupPlan` recorded, and a `VersionId` the plan never
+    /// had; the refusal does not tell the caller which of them it was.
     ///
     /// A read that names NO version answers from the plan's current version,
     /// the one the latest update stored; one that names a version answers from
@@ -2329,7 +2515,7 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
         let plan = self
             .backup_plans
             .get(plan_id)
-            .ok_or_else(backup_plan_not_found)?;
+            .ok_or_else(backup_plan_version_unreadable)?;
         if plan.deletion_date.is_some() {
             return Err(backup_plan_version_unreadable());
         }
@@ -2389,10 +2575,11 @@ impl ComAmazonawsBackupCryocontrollerusermanagerState {
     /// Resolve one resource selection for a read, by the pair AWS Backup
     /// addresses one by.
     ///
-    /// A plan id this account does not hold and a selection id the plan it does
-    /// hold does not are ONE condition: the resource asked about is not there, so
-    /// both answer the same modelled refusal and neither tells the caller which
-    /// half of the pair was wrong.
+    /// This answers for the SELECTION half of the pair only: whether the plan
+    /// half names a plan this account holds is a different condition, with its
+    /// own class and its own token ([`selection_plan_not_found`]), which the
+    /// calling operation resolves FIRST — so the caller is told which half of
+    /// the pair was wrong.
     pub fn backup_selection(
         &self,
         plan_id: &str,

@@ -14,12 +14,13 @@
 //!   a selection the plan already holds is `AlreadyExistsException`, and one
 //!   naming a plan the account does not hold is
 //!   `InvalidParameterValueException`;
-//! * a pair the account does not hold — a selection that was never created, one
-//!   that has been deleted, or a plan id nothing answers to — is
-//!   `ResourceNotFoundException`;
+//! * a pair the account does not hold is refused by the half at fault: a
+//!   selection that was never created or has been deleted is
+//!   `ResourceNotFoundException` on the read, while a plan id nothing answers
+//!   to is `InvalidParameterValueException`;
 //! * the selections of a plan are listed in `SelectionId` order, one page of
 //!   `MaxResults` of them at a time, and a plan the account does not hold lists
-//!   nothing but `ResourceNotFoundException`;
+//!   an empty page;
 //! * a plan rule created without a backup window carries the service's own
 //!   defaults for both windows, and one created with either window keeps the
 //!   value it was given;
@@ -375,8 +376,12 @@ async fn a_second_create_replays_or_is_refused() {
     );
 }
 
-/// Every pair the account does not hold is the same refusal: a selection id
-/// nothing created, one a delete removed, and a plan id nothing answers to.
+/// The halves of a pair the account does not hold are refused APART: a
+/// selection id nothing created and one a delete removed are the absent
+/// selection on the READ, and the read of a plan id nothing answers to is the
+/// plan-scoped refusal. The delete refuses only the plan half — once the plan
+/// resolves, removing a selection it does not hold is the empty success
+/// `plan_and_selection_refusals.rs` spans with every token and sentence.
 #[tokio::test]
 async fn a_pair_the_account_does_not_hold_is_not_found() {
     let router = router();
@@ -405,31 +410,47 @@ async fn a_pair_the_account_does_not_hold_is_not_found() {
     );
 
     let unknown = "11111111-2222-3333-4444-555555555555";
-    for (case, plan, selection) in [
-        ("a selection the delete removed", plan_id.as_str(), selection_id.as_str()),
-        ("a selection id nothing created", plan_id.as_str(), unknown),
-        ("a plan id nothing created", unknown, selection_id.as_str()),
+    for (case, plan, selection, read_error) in [
+        (
+            "a selection the delete removed",
+            plan_id.as_str(),
+            selection_id.as_str(),
+            "ResourceNotFoundException",
+        ),
+        (
+            "a selection id nothing created",
+            plan_id.as_str(),
+            unknown,
+            "ResourceNotFoundException",
+        ),
+        (
+            "a plan id nothing created",
+            unknown,
+            selection_id.as_str(),
+            "InvalidParameterValueException",
+        ),
     ] {
         let (status, read) = get_selection(&router, plan, selection).await;
         assert_eq!(
-            status, 400,
-            "case {case:?}: expected GetBackupSelection 400, got {status} {read:?}"
+            (status, error_code(&read).as_str()),
+            (400, read_error),
+            "case {case:?}: expected GetBackupSelection 400 {read_error}, got {status} \
+             {read:?}"
         );
-        assert_eq!(
-            error_code(&read),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {read:?}"
-        );
-        // The second delete of the same pair is the same condition.
+        // The delete answers for the PLAN half only: a plan nothing holds is
+        // refused, and a selection the plan does not hold is already not
+        // assigned, which is a success.
         let (status, again) = delete_selection(&router, plan, selection).await;
+        let expected = if read_error == "InvalidParameterValueException" {
+            (400, "InvalidParameterValueException")
+        } else {
+            (200, "<none>")
+        };
         assert_eq!(
-            status, 400,
-            "case {case:?}: expected DeleteBackupSelection 400, got {status} {again:?}"
-        );
-        assert_eq!(
-            error_code(&again),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException from the delete, got {again:?}"
+            (status, error_code(&again).as_str()),
+            expected,
+            "case {case:?}: expected DeleteBackupSelection {expected:?}, got {status} \
+             {again:?}"
         );
     }
 }
@@ -740,18 +761,19 @@ async fn the_selections_of_a_plan_are_listed_a_page_at_a_time() {
         );
     }
 
-    // A plan the account does not hold lists nothing: the resource asked about is
-    // not there.
-    let (status, refused) =
+    // A plan the account does not hold holds no selections either, so the
+    // listing reports an empty page rather than refusing
+    // (`plan_and_selection_refusals.rs` spans that rule over every way a plan
+    // can hold none).
+    let (status, listed) =
         list_selections(&router, "99999999-8888-7777-6666-555555555555", None).await;
     assert_eq!(
-        status, 400,
-        "expected ListBackupSelections on an unknown plan to be refused 400, got {status} \
-         {refused:?}"
-    );
-    assert_eq!(
-        error_code(&refused),
-        "ResourceNotFoundException",
-        "expected ResourceNotFoundException for an unknown plan, got {refused:?}"
+        (
+            status,
+            listed.get("BackupSelectionsList").and_then(Value::as_array)
+        ),
+        (200, Some(&Vec::new())),
+        "expected ListBackupSelections on an unknown plan to answer 200 with an empty list, \
+         got {status} {listed:?}"
     );
 }

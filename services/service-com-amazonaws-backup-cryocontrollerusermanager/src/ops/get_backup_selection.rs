@@ -166,6 +166,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = state.lock();
         // A read, so nothing here writes: the selection is reported exactly as
         // it was stored.
+        //
+        // The PLAN is resolved first, and its own refusal is a different one:
+        // a `BackupPlanId` naming no plan this account holds is a parameter
+        // value this call cannot resolve, while a `SelectionId` the plan does
+        // not hold is the absent selection. Reporting them apart is what lets a
+        // client tell which half of the pair was wrong.
+        if store.live_backup_plan(&input.backup_plan_id).is_none() {
+            return Err(
+                GetBackupSelectionErrorModeled::InvalidParameterValueException(
+                    crate::state::selection_plan_not_found(
+                        crate::state::ERROR_CODE_SELECTION_READ_PLAN_NOT_FOUND,
+                    ),
+                )
+                .into(),
+            );
+        }
         let selection = store
             .backup_selection(&input.backup_plan_id, &input.selection_id)
             .map_err(GetBackupSelectionErrorModeled::ResourceNotFoundException)?;

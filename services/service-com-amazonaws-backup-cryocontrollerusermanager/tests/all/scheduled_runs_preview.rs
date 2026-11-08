@@ -20,6 +20,10 @@
 //! * computing a preview is part of a READ: it stores nothing, so the plan a
 //!   later caller reads is the plan that was created.
 //!
+//! A rule whose expression names no run at all is not among the rows: a plan
+//! body carrying one is refused by the create and the update
+//! (`plan_and_selection_refusals.rs`), so no stored rule can have one.
+//!
 //! Each row asserts the SHAPE of the schedule it names (the time of day its runs
 //! fall at, the spacing between them, the weekdays they may fall on) rather than
 //! any one instant, so the suite pins the rule and not the day it ran on.
@@ -213,22 +217,6 @@ const PREVIEW_CASES: &[PreviewCase] = &[
         max_runs: 1,
         expected_runs: 1,
         second_of_day: Some(7 * SECONDS_PER_HOUR),
-        spacing: None,
-        weekdays: None,
-    },
-    PreviewCase {
-        case: "a stored schedule that is not a cron expression names no run",
-        rules: &[RuleSpec {
-            rule_name: "unreadable",
-            // `CronExpression` carries no pattern, so this is stored as given;
-            // nothing computes a run from it, and none is invented.
-            schedule: Some("cron(not a cron expression)"),
-            timezone: None,
-            continuous: false,
-        }],
-        max_runs: 5,
-        expected_runs: 0,
-        second_of_day: None,
         spacing: None,
         weekdays: None,
     },

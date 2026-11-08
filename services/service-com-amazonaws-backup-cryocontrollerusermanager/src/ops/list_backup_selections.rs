@@ -8,6 +8,10 @@
 //! model declares: the metadata ABOUT a selection, never the selection body
 //! `GetBackupSelection` answers with.
 //!
+//! A `BackupPlanId` that holds no selections — including one this account holds
+//! no plan under — reports an EMPTY `BackupSelectionsList` rather than a
+//! refusal: the page is the set of selections, which is empty.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -169,15 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let store = state.lock();
-        // A plan this account does not hold — one it never held, and one whose
-        // deletion is recorded — holds no selections to list: the resource asked
-        // about is not there, which is this operation's modelled not-found
-        // refusal rather than an empty page. The resolution is the plan read's
-        // own (`crate::state`), so this listing and `GetBackupPlan` cannot
-        // disagree about which plans the account holds.
-        store
-            .backup_plan(&input.backup_plan_id, None)
-            .map_err(ListBackupSelectionsErrorModeled::ResourceNotFoundException)?;
+        // The plan is NOT resolved here: this listing reports the selections
+        // assigned to the named plan, and a plan that holds none — one this
+        // account never held included — has an empty set to report, so the
+        // answer is an empty page rather than a refusal.
+        //
         // A read, so nothing here writes. The selections of one plan are a range
         // of the store's own (`BackupPlanId`, `SelectionId`)-keyed map, so this
         // walk is already in `SelectionId` order — which is what makes the

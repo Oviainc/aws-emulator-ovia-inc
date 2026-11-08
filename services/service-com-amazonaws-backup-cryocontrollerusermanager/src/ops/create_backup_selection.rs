@@ -14,6 +14,12 @@
 //! refused with `AlreadyExistsException`. A `BackupPlanId` naming no live plan
 //! of this account is a bad parameter value — this operation models no
 //! not-found error — so nothing is stored for a plan that does not exist.
+//!
+//! The selection's `IamRoleArn` is the role AWS Backup acts under to back the
+//! selected resources up, so it is resolved against this account's IAM before
+//! anything is stored ([`crate::state::rejected_selection_role`]) and a role
+//! this service could not assume is refused.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -162,7 +168,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // `BackupSelection` is `@required`, as are its `SelectionName` (which
         // targets a patterned shape) and `IamRoleArn`: an absent or malformed one
         // is refused before this handler runs, and `crate::service` words that
@@ -176,6 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
         })?;
+        let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
         let selection = input.backup_selection;
 
@@ -206,6 +212,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .into(),
                 );
             }
+        }
+
+        // A selection assigns resources to be backed up AS the role it names, so
+        // the role is resolved against this account's IAM BEFORE anything is
+        // stored and one AWS Backup could not assume is refused rather than
+        // stored on a selection whose jobs could never run. Awaited before the
+        // store guard below is taken, so no lock is held across the hop.
+        if let Some(refusal) =
+            crate::state::rejected_selection_role(ctx, &region, &selection.iam_role_arn).await
+        {
+            return Err(
+                CreateBackupSelectionErrorModeled::InvalidParameterValueException(refusal).into(),
+            );
         }
 
         let mut store = state.lock();
