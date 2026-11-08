@@ -199,6 +199,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // WHERE the directory's servers go: the subnets the request names, resolved against
+        // the service that OWNS subnets, so each server can be given an address out of its
+        // own subnet's block — the `DnsIpAddrs` this directory serves — and so the other
+        // half of the placement rule can be decided. Asked ONCE, BEFORE the store lock below
+        // is taken, so no guard is held across the hop; an identifier the owner reports no
+        // subnet for contributes nothing, and the create still stores the placement the
+        // request named.
+        let subnet_networks = match input.vpc_settings.as_ref() {
+            Some(requested) => {
+                crate::state::resolve_subnet_networks(ctx, &primary_region, &requested.subnet_ids)
+                    .await
+            }
+            None => ::std::collections::BTreeMap::new(),
+        };
+
+        // Two DIFFERENT subnets still have to be in two different zones, which only that
+        // service can answer: a pair EC2 reports in ONE zone is refused as the
+        // resource-semantics failure it is (`ClientException`), a different class to the
+        // validation refusal a MALFORMED subnet id gets — and nothing is refused where EC2
+        // could not be asked.
+        if let Some(defect) = input.vpc_settings.as_ref().and_then(|requested| {
+            crate::state::single_zone_defect(&subnet_networks, &requested.subnet_ids)
+        }) {
+            return Err(
+                CreateDirectoryErrorModeled::ClientException(crate::state::refusal(defect)).into(),
+            );
+        }
+
         // Nothing caller-sized reaches the store unchecked: the tag list is bounded
         // before the store lock is taken at all. `CreateDirectory` models no
         // `TagLimitExceededException`, so the bound is reported as the invalid
@@ -215,20 +243,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into_iter()
             .map(|tag| (tag.key, tag.value))
             .collect();
-
-        // WHERE the directory's servers go: the subnets the request names, resolved against
-        // the service that OWNS subnets, so each server can be given an address out of its
-        // own subnet's block — the `DnsIpAddrs` this directory serves. Asked BEFORE the
-        // store lock below is taken, so no guard is held across the hop; an identifier the
-        // owner reports no subnet for contributes nothing, and the create still stores the
-        // placement the request named.
-        let subnet_networks = match input.vpc_settings.as_ref() {
-            Some(requested) => {
-                crate::state::resolve_subnet_networks(ctx, &primary_region, &requested.subnet_ids)
-                    .await
-            }
-            None => ::std::collections::BTreeMap::new(),
-        };
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();

@@ -477,6 +477,8 @@ async fn an_alias_drives_the_access_url_and_is_assigned_once() {
             case,
         )
         .await;
+        // An alias is assigned only to a directory that has reached its serving stage.
+        tokio::time::sleep(PAST_ONE_SPAN).await;
 
         let answer = ok(
             &router,
@@ -524,6 +526,7 @@ async fn an_alias_drives_the_access_url_and_is_assigned_once() {
             case,
         )
         .await;
+        tokio::time::sleep(PAST_ONE_SPAN).await;
         refused(
             &router,
             "CreateAlias",
@@ -1049,6 +1052,8 @@ async fn a_deleted_directory_is_gone_and_its_alias_stays_reserved() {
         case,
     )
     .await;
+    // An alias is assigned only to a directory that has reached its serving stage.
+    tokio::time::sleep(PAST_ONE_SPAN).await;
     ok(
         &router,
         "CreateAlias",
@@ -1071,12 +1076,12 @@ async fn a_deleted_directory_is_gone_and_its_alias_stays_reserved() {
     );
 
     // Every reader of the deleted id now reports it does not exist, and a second
-    // delete does too.
+    // delete does too — with ONE exception, the reporting call whose `DirectoryIds` is a
+    // FILTER: an id this account HAD and deleted narrows `DescribeDirectories` to nothing
+    // and is answered 200 with an empty page, which is what a client polling for its own
+    // deletion reads it off (`crate::refusal_classification_rules` is the rule's own
+    // suite). Every MUTATION of the id still refuses.
     for (operation, body) in [
-        (
-            "DescribeDirectories",
-            json!({ "DirectoryIds": [&doomed] }),
-        ),
         ("ListTagsForResource", json!({ "ResourceId": &doomed })),
         ("DeleteDirectory", json!({ "DirectoryId": &doomed })),
         (
@@ -1097,6 +1102,18 @@ async fn a_deleted_directory_is_gone_and_its_alias_stays_reserved() {
         )
         .await;
     }
+    let polled = ok(
+        &router,
+        "DescribeDirectories",
+        json!({ "DirectoryIds": [&doomed] }),
+        "DescribeDirectories after delete",
+    )
+    .await;
+    assert_eq!(
+        polled["DirectoryDescriptions"],
+        json!([]),
+        "case {case:?}: expected the deleted id to narrow the page to nothing, got {polled}"
+    );
 
     // The surviving directory is untouched, and the alias the deleted directory held
     // stays reserved: "After an alias has been created, it cannot be deleted or
@@ -1151,31 +1168,43 @@ async fn the_alias_reservation_index_is_bounded() {
     // in this slice a caller can grow without deleting anything. The guard mirrors
     // `state::MAX_RESERVED_ALIASES`, which is stated as its own figure rather than
     // derived from a directory quota.
+    //
+    // The passes run in BATCHES of the Region's own Simple AD quota: an alias is assigned
+    // only to a directory that has reached its serving stage, so each batch creates its
+    // directories, waits ONCE for the transition their creates owe, and then reserves and
+    // deletes — which is the same sequence per pass with one wait per batch instead of one
+    // per directory.
     const ALIAS_RESERVATION_GUARD: usize = 100;
-    for index in 0..ALIAS_RESERVATION_GUARD {
-        let id = create_directory(
-            &router,
-            minimal_create(&format!("res{index}.example.com")),
-            case,
-        )
-        .await;
-        ok(
-            &router,
-            "CreateAlias",
-            json!({ "DirectoryId": &id, "Alias": format!("reserved{index}") }),
-            case,
-        )
-        .await;
-        ok(
-            &router,
-            "DeleteDirectory",
-            json!({ "DirectoryId": &id }),
-            case,
-        )
-        .await;
+    const BATCH: usize = CLOUD_ONLY_QUOTA;
+    for batch in 0..ALIAS_RESERVATION_GUARD / BATCH {
+        let mut created: Vec<(usize, String)> = Vec::with_capacity(BATCH);
+        for offset in 0..BATCH {
+            let index = batch * BATCH + offset;
+            created.push((
+                index,
+                create_directory(
+                    &router,
+                    minimal_create(&format!("res{index}.example.com")),
+                    case,
+                )
+                .await,
+            ));
+        }
+        tokio::time::sleep(PAST_ONE_SPAN).await;
+        for (index, id) in &created {
+            ok(
+                &router,
+                "CreateAlias",
+                json!({ "DirectoryId": id, "Alias": format!("reserved{index}") }),
+                case,
+            )
+            .await;
+            ok(&router, "DeleteDirectory", json!({ "DirectoryId": id }), case).await;
+        }
     }
 
     let id = create_directory(&router, minimal_create("last.example.com"), case).await;
+    tokio::time::sleep(PAST_ONE_SPAN).await;
     refused(
         &router,
         "CreateAlias",

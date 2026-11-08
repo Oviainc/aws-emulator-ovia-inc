@@ -7,6 +7,11 @@
 //! been created, it cannot be deleted or reused" — is what makes both an alias already
 //! taken and a directory that already has one an `EntityAlreadyExistsException`.
 //!
+//! The directory has to be SERVING for an alias to be assigned to it: a directory still
+//! being built by the transition its create owes is refused with the modelled
+//! `InvalidParameterException` and keeps no alias
+//! ([`crate::state::alias_stage_defect`]).
+//!
 //! The `Alias` member's modelled `@pattern` is checked FIRST, before the directory is
 //! resolved, and a value outside it is the framework's `ValidationException` rather than
 //! one of this operation's resolution errors — see [`alias_pattern_violation`], which is
@@ -178,6 +183,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::refusal(crate::state::no_such_directory(&input.directory_id)),
             )
             .into());
+        }
+
+        // An alias is assigned to a directory that is SERVING: a directory still being
+        // built by the transition its create owes has no alias assigned to it, and the
+        // call is refused — with the modelled `InvalidParameterException`, because the
+        // stage is a precondition of this call rather than the directory being
+        // unreachable. The alias stays unassigned and unreserved, so the identical call
+        // succeeds once the same directory has reached its serving stage.
+        if let Some(defect) = store
+            .directories
+            .get(&input.directory_id)
+            .and_then(|directory| {
+                crate::state::alias_stage_defect(&input.directory_id, &directory.stage)
+            })
+        {
+            return Err(
+                CreateAliasErrorModeled::InvalidParameterException(crate::state::refusal(defect))
+                    .into(),
+            );
         }
 
         // An alias is unique across the account and a directory has at most one, so

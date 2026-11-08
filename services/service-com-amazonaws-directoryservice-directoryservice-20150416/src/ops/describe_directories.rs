@@ -7,6 +7,12 @@
 //! [`crate::state::ComAmazonawsDirectoryserviceDirectoryservice20150416State::advance_clock`],
 //! which materialises the stage transition the clock had already made due.
 //!
+//! The `DirectoryIds` member is a FILTER over those records, so an id of a directory this
+//! account HAD and has since deleted narrows the listing to nothing and the page is served
+//! EMPTY — a client polling this listing to confirm its own `DeleteDirectory` finished
+//! reads the deletion off an empty page rather than off an exception. An id this account
+//! never had is a value this listing cannot be narrowed by and is still refused.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -223,12 +229,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.advance_clock(::std::time::SystemTime::now());
 
-        // A `DirectoryIds` filter narrows the result, and an id naming no stored
-        // directory is reported rather than silently dropped from the page. The ids
-        // arrived as a FILTER over the directories, so the refusal reports the VALUES as
-        // invalid directory ids — every unresolved one of them, in the order the filter
-        // sent them — rather than stating that one directory does not exist: the two ds
-        // not-found families are worded differently.
+        // A `DirectoryIds` filter narrows the result, and an id this account never had is
+        // reported rather than silently dropped from the page. The ids arrived as a FILTER
+        // over the directories, so the refusal reports the VALUES as invalid directory ids
+        // — every unresolved one of them, in the order the filter sent them — rather than
+        // stating that one directory does not exist: the two ds not-found families are
+        // worded differently.
+        //
+        // An id of a directory this account HAD and has since deleted is NOT such a value:
+        // the filter named something that was there, so it narrows this reporting call to
+        // nothing and the page is served empty (HTTP 200). That is what a client polling
+        // this listing to confirm its own `DeleteDirectory` finished reads the deletion
+        // off, and it is this operation's reading alone: a MUTATION of a deleted id still
+        // refuses, since there is no directory to act on.
         if let Some(filtered_ids) = input.directory_ids.as_ref() {
             // Scanned in FILTER order (the caller's list), not in the order the lookup set
             // above holds them, so the nth name in the diagnostic answers the nth id the
@@ -239,6 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut unresolved: Vec<String> = Vec::new();
             for directory_id in filtered_ids {
                 if !store.directories.contains_key(directory_id)
+                    && !store.was_deleted(directory_id)
                     && !unresolved.contains(directory_id)
                 {
                     unresolved.push(directory_id.clone());

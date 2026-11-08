@@ -158,6 +158,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // reused", so it stays reserved against the id it was created for and a later
         // `CreateAlias` asking for it is refused.
 
+        // The id itself is remembered, and nothing else of the directory: an account that
+        // HAD this directory and deleted it is what makes a later reporting call filtered
+        // by this id an empty result rather than a refusal, while an id this account never
+        // had stays a refusal. The record is gone, so nothing about the directory can be
+        // reported from this.
+        store.remember_deleted_directory(&removed.directory_id, removed.seq);
+
         // A snapshot is a snapshot OF this directory, so it does not outlive it: real
         // Directory Service deletes a directory's snapshots with the directory ("all
         // snapshots of a directory are deleted when the directory is deleted"), and

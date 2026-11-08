@@ -219,6 +219,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(defect));
         }
 
+        // The other half of that rule: two DIFFERENT subnets still have to be in two
+        // different zones, which only the service that owns subnets can answer. WHERE the
+        // directory's servers go is resolved once, here, and the answer serves both the
+        // refusal and the record below: a pair EC2 reports in ONE zone is refused as the
+        // resource-semantics failure it is (`ClientException`), which is a different class
+        // to the validation refusal a MALFORMED subnet id gets — and nothing is refused
+        // where EC2 could not be asked. Asked BEFORE the store lock is taken, so no guard
+        // is held across the hop.
+        let subnet_networks = crate::state::resolve_subnet_networks(
+            ctx,
+            &crate::state::region_from_request(ctx.parts()),
+            &input.vpc_settings.subnet_ids,
+        )
+        .await;
+        if let Some(defect) =
+            crate::state::single_zone_defect(&subnet_networks, &input.vpc_settings.subnet_ids)
+        {
+            return Err(
+                CreateMicrosoftADErrorModeled::ClientException(crate::state::refusal(defect))
+                    .into(),
+            );
+        }
+
         // Nothing caller-sized reaches the store unchecked: the tag list is bounded
         // before the store lock is taken at all. `CreateMicrosoftAD` models no
         // `TagLimitExceededException`, so the bound is reported as the invalid
@@ -240,18 +263,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(requested) => Some(requested),
             None => default_short_name(&input.name),
         };
-
-        // WHERE the directory's servers go: the subnets the request names, resolved against
-        // the service that OWNS subnets, so each server can be given an address out of its
-        // own subnet's block. Asked BEFORE the store lock below is taken, so no guard is
-        // held across the hop; an identifier the owner reports no subnet for contributes
-        // nothing, and the create still stores the placement the request named.
-        let subnet_networks = crate::state::resolve_subnet_networks(
-            ctx,
-            &crate::state::region_from_request(ctx.parts()),
-            &input.vpc_settings.subnet_ids,
-        )
-        .await;
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();

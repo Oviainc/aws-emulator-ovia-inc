@@ -35,8 +35,10 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::directory_lifecycle::{
-    call, call_in_region, create_directory, minimal_create, ok, service, string, TAG_QUOTA,
+    call, call_in_region, create_directory, minimal_create, ok, service, string, PAST_ONE_SPAN,
+    TAG_QUOTA,
 };
+use crate::microsoft_ad::{create_microsoft_ad, minimal_microsoft_ad};
 
 /// Ids of the modelled `DirectoryId` / `ResourceId` shape (`^d-[0-9a-f]{10}$`) that name
 /// no stored directory. Several, because the diagnostic is built from the request: the
@@ -385,6 +387,11 @@ async fn populated() -> (MultiServiceRouter, String, String) {
     let subject = create_directory(&router, minimal_create("subject.example.com"), case).await;
     let holder = create_directory(&router, minimal_create("holder.example.com"), case).await;
     let taken_alias = "takenalias";
+    // An alias is assigned only to a directory that has reached its serving stage, so the
+    // holder is waited past the transition its create owes before it takes the alias. The
+    // `CreateAlias` row of the table below then refuses on the alias being taken, which is
+    // what it is a row about.
+    tokio::time::sleep(PAST_ONE_SPAN).await;
     ok(
         &router,
         "CreateAlias",
@@ -536,12 +543,14 @@ async fn remove_region_words_a_missing_directory_from_the_request_alone() {
         }
     }
 
-    // And the same text for a directory that EXISTS but not in the Region the call was
-    // signed for: that is also "the id you passed names no directory I can act on here",
-    // and it is still worded from the request alone.
-    let created = create_directory(
+    // And the same text for a directory that EXISTS but holds no replica entry for the
+    // Region the call was signed for: that is also "the id you passed names no directory I
+    // can act on here", and it is still worded from the request alone. The directory is an
+    // Enterprise Managed Microsoft AD, the only kind that replicates across Regions at all,
+    // so this branch is reached rather than the edition gate ahead of it.
+    let created = create_microsoft_ad(
         &router,
-        minimal_create("single-region.example.com"),
+        minimal_microsoft_ad("single-region.example.com"),
         "a directory in its primary Region only",
     )
     .await;
@@ -616,6 +625,9 @@ async fn an_alias_outside_its_modelled_pattern_is_a_validation_failure() {
             &case,
         )
         .await;
+        // An alias is assigned only to a directory that has reached its serving stage, so
+        // the row waits for the transition the create owes before the alias is asked for.
+        tokio::time::sleep(PAST_ONE_SPAN).await;
         let (status, answer) = call(
             &router,
             "CreateAlias",
@@ -673,6 +685,9 @@ async fn a_malformed_alias_is_refused_before_the_directory_is_resolved() {
     // answer: the member constraint is checked first, so the refusal is the validation
     // failure and never the operation's own resolution error.
     let holder = create_directory(&router, minimal_create("ordering.example.com"), "ordering").await;
+    // The alias the holder row needs is assigned once the directory serves, which is the
+    // stage `CreateAlias` admits.
+    tokio::time::sleep(PAST_ONE_SPAN).await;
     ok(
         &router,
         "CreateAlias",
@@ -733,12 +748,15 @@ async fn an_alias_outside_its_modelled_length_is_a_validation_failure() {
         // A fresh directory for each accepted row, since an alias is a directory's only
         // one; the refused rows store nothing, so they can share one.
         let subject = if satisfies {
-            create_directory(
+            let created = create_directory(
                 &router,
                 minimal_create(&format!("len{}.example.com", alias.len())),
                 case,
             )
-            .await
+            .await;
+            // An alias is assigned only to a directory that has reached its serving stage.
+            tokio::time::sleep(PAST_ONE_SPAN).await;
+            created
         } else {
             directory_id.clone()
         };

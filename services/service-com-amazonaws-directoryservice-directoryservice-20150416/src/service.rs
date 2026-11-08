@@ -50,13 +50,17 @@
 //!
 //! A second seam is taken for the one thing this service words differently from the
 //! framework when it refuses a request at its boundary: see the `override_refusal` body
-//! below and [`stated_enum_values`].
+//! below and [`stated_enum_values`]. A refusal of a constraint a LIST's ELEMENTS break is
+//! stated at the list member instead of at the element, which needs the request as well as
+//! the violations and so is answered in that same operation wrapper
+//! ([`list_element_refusals`]).
 //!
 //! [`authorization`] is not a seam at all: it is the IAM decision the operations whose
 //! model declares `AccessDeniedException` take before they touch the store, held beside
 //! this file because it reads the IAM and STS stores rather than this service's own.
 
 pub mod authorization;
+pub mod list_element_refusals;
 pub mod request_id_header;
 
 use request_id_header::RequestIdHeaderOperation;
@@ -111,20 +115,31 @@ fn enum_order_refusal(refusal: &Refusal) -> Option<Refused> {
     }
     let restated: Vec<Violation> = violations
         .iter()
-        .map(|violation| match &violation.kind {
-            ViolationKind::EnumValue(allowed) => Violation {
-                path: violation.path.clone(),
-                kind: ViolationKind::EnumValue(stated_enum_values(allowed)),
-                value: violation.value.clone(),
-                sensitive: violation.sensitive,
-            },
-            _ => violation.clone(),
-        })
+        .map(enum_value_set_in_the_services_own_order)
         .collect();
     Some(Refused {
         code: VALIDATION_EXCEPTION.to_string(),
         message: ::aws_smithy_schema_server::envelope(&restated)?,
     })
+}
+
+/// `violation` with an enum's admissible values LISTED the way this service lists them
+/// ([`stated_enum_values`]), and everything else — its member path, its echoed value, its
+/// sensitivity and every other constraint class — exactly as the framework found it.
+///
+/// THE one place that restating is made, so the two paths it is applied on (the boundary
+/// refusal this file words, and the list-element clause
+/// [`list_element_refusals`] words) cannot disagree about the order.
+fn enum_value_set_in_the_services_own_order(violation: &Violation) -> Violation {
+    match &violation.kind {
+        ViolationKind::EnumValue(allowed) => Violation {
+            path: violation.path.clone(),
+            kind: ViolationKind::EnumValue(stated_enum_values(allowed)),
+            value: violation.value.clone(),
+            sensitive: violation.sensitive,
+        },
+        _ => violation.clone(),
+    }
 }
 
 /// The `com-amazonaws-directoryservice-directoryservice-20150416` emulated service: the generated [`ServiceDefinition`] plus

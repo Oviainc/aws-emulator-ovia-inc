@@ -19,8 +19,15 @@
 //! modelled error, the scaffold's 501 and a refusal raised while that operation was being
 //! served — through [`RequestIdHeaderOperation`], the operation wrapper
 //! `Service::override_operation` hands back.
+//!
+//! That wrapper is also where a refusal this service states from the REQUEST is answered,
+//! for the one class whose clause the violations alone cannot carry: a constraint a list's
+//! ELEMENTS break, stated at the list member quoting the list the request sent
+//! ([`crate::service::list_element_refusals`]). A request that breaks no such constraint is
+//! handed to the routing table's operation untouched.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
+use aws_smithy_schema_server::ProtocolError;
 use smithy_server_runtime::{BoxFuture, ErasedOperation, OperationContext, Service};
 
 /// The header AWS reports a response's own request id in.
@@ -85,6 +92,22 @@ impl ErasedOperation for RequestIdHeaderOperation {
         ctx: &'r OperationContext<'r>,
     ) -> BoxFuture<'r, RtResponse> {
         Box::pin(async move {
+            // The refusal this service states from the request itself, for the one class the
+            // centralized walk's violations cannot carry on their own; `None` leaves the
+            // whole sequence below exactly as it was. The definition is read, used and
+            // dropped inside each statement: `&dyn ErasedServiceDefinition` is not `Sync`, so
+            // holding it across the await below would make this future non-`Send`.
+            let refused = crate::service::list_element_refusals::stated(
+                svc.definition().protocol(),
+                req,
+            );
+            if let Some((violations, stated)) = refused {
+                return with_request_id_header(svc.definition().refusal_response(
+                    ProtocolError::Invalid(violations),
+                    Some(stated),
+                    req,
+                ));
+            }
             match modeled_operation(svc, req) {
                 Some(op) => with_request_id_header(op.run(svc, req, ctx).await),
                 // Unreachable through `Service::override_operation`, which claims a

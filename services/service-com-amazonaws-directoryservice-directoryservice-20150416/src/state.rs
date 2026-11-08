@@ -58,6 +58,9 @@
 //! * [`directory_network`], where a directory's servers sit on the account's network: the
 //!   subnets a create places them in, as the service that OWNS subnets reports them, and the
 //!   address each server answers DNS at, counted out of its own subnet's CIDR block.
+//! * [`subnet_zones`], the half of the two-zone placement rule ([`subnet_pair_defect`] is
+//!   the other) that is a fact about that network rather than about the request, decided
+//!   over the subnets a create already resolved.
 //!
 //! The administrator `Password` `CreateDirectory` is called with is deliberately NOT a
 //! field here: the model marks it `@sensitive`, no operation reports it back, and state
@@ -65,8 +68,10 @@
 
 pub mod directory_network;
 pub mod security_log;
+pub mod subnet_zones;
 
 pub use directory_network::{resolve_subnet_networks, server_address, SubnetNetwork};
+pub use subnet_zones::single_zone_defect;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -221,6 +226,17 @@ pub fn microsoft_ad_size(edition: &str) -> &'static str {
 /// same way.
 pub const REQUIRED_SUBNETS: usize = 2;
 
+/// The most `SubnetIds` entries a placement may name.
+///
+/// NOT an AWS quota: a resource guard, and the one that makes resolving a placement's zones
+/// against the service that owns subnets ([`subnet_zones::single_zone_defect`]) cost ONE hop
+/// whatever the request body carries — the work of that hop is (identifiers asked x subnets
+/// the account stores), so the identifiers have to be bounded here, BEFORE any of them is
+/// resolved, rather than per hop. Deliberately well above any servable placement — a
+/// directory's servers sit in [`REQUIRED_SUBNETS`] subnets — so no request a caller has
+/// reason to send reaches it.
+pub const MAX_PLACEMENT_SUBNETS: usize = 16;
+
 /// Why the `SubnetIds` of a create's settings block cannot carry a directory's servers,
 /// or `None` when they can.
 ///
@@ -230,12 +246,25 @@ pub const REQUIRED_SUBNETS: usize = 2;
 /// two different Availability Zones, so a list naming fewer than two DISTINCT subnets
 /// cannot be two zones and is refused before anything is persisted.
 ///
-/// Whether two DIFFERENT subnets are in two different zones is a fact about the VPC rather
-/// than about the request, so it is not decided here: this service holds no subnet
-/// topology, and resolving one belongs to the operations that resolve a `VpcId` against
-/// EC2. Both failures are refused with the SAME diagnostic ([`INVALID_SUBNET_IDS`]), which
-/// is the sentence Directory Service states the rule in.
+/// It is also where nothing caller-sized gets past the placement checks: a list longer than
+/// [`MAX_PLACEMENT_SUBNETS`] is refused here, before the zones of any of its entries are
+/// resolved, so the resolution that follows costs one hop whatever the request carries.
+///
+/// Whether two DIFFERENT subnets are in two different zones is a fact about the account's
+/// NETWORK rather than about the request, so it is not decided here: it is decided against
+/// what the service that owns subnets answers ([`subnet_zones::single_zone_defect`] over
+/// [`resolve_subnet_networks`], which every placement runs after this check), and refused as
+/// the resource-semantics failure it is. This one is refused with [`INVALID_SUBNET_IDS`], the
+/// sentence Directory Service states the request-level half of the rule in.
 pub fn subnet_pair_defect(subnet_ids: &[String]) -> Option<String> {
+    // The guard comes first, so a list no placement could accept is refused on its SIZE
+    // before anything is allocated from it or resolved against another service.
+    if subnet_ids.len() > MAX_PLACEMENT_SUBNETS {
+        return Some(format!(
+            "SubnetIds may name at most {MAX_PLACEMENT_SUBNETS} subnets, got {got}",
+            got = subnet_ids.len()
+        ));
+    }
     // Whether the list names two DIFFERENT subnets, decided by a scan rather than by
     // collecting the caller's list into a set: nothing caller-sized is allocated to
     // answer it.
@@ -913,6 +942,15 @@ pub const MAX_TOPIC_NAMES_PER_REQUEST: usize = 100;
 /// published per-category quota does: it is well above the [`MAX_DIRECTORIES`]
 /// directories a Region can hold at once, and past it `CreateAlias` is refused.
 pub const MAX_RESERVED_ALIASES: usize = 100;
+
+/// The most deleted `DirectoryId`s this emulator remembers (see
+/// [`ComAmazonawsDirectoryserviceDirectoryservice20150416State::deleted_directories`]).
+///
+/// NOT an AWS quota: a resource guard, the twin of [`MAX_RESERVED_ALIASES`] over the other
+/// store a create/delete cycle grows. Well above the [`MAX_DIRECTORIES`] directories a
+/// Region can hold at once, so every id a client could still be polling for after its own
+/// deletions is remembered; past it the earliest-created id is dropped.
+pub const MAX_REMEMBERED_DELETIONS: usize = 1_000;
 
 /// The most `DirectoryIds` entries a single `DescribeDirectories` will resolve.
 ///
@@ -2456,6 +2494,19 @@ impl Directory {
         self.primary_region == region || self.additional_regions.contains_key(region)
     }
 
+    /// Whether this directory supports multi-Region replication at all.
+    ///
+    /// Replicating a directory across Regions is a feature of the Enterprise edition of
+    /// AWS Managed Microsoft AD, so a Simple AD directory, an AD Connector and a
+    /// Standard-edition Managed Microsoft AD support none of the multi-Region calls. THE
+    /// one predicate `AddRegion` and `RemoveRegion` gate on, so both refuse the same
+    /// directory, with the same sentence ([`MULTI_REGION_ENTERPRISE_ONLY`]), before
+    /// anything about Regions is looked up.
+    pub fn replicates_across_regions(&self) -> bool {
+        self.edition.as_deref() == Some(DEFAULT_MICROSOFT_AD_EDITION)
+            && self.directory_type == TYPE_MICROSOFT_AD
+    }
+
     /// This directory's Regions as the modelled `RegionsDescription` list: its primary
     /// Region first — the one it was created in — then the Regions it is replicated to, in
     /// Region-name order, narrowed to `wanted` when the request asked for one Region.
@@ -3144,6 +3195,21 @@ pub struct ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// is why this index carries its own cap, [`MAX_RESERVED_ALIASES`], enforced at
     /// the single insert site in `create_alias.rs`.
     pub aliases: BTreeMap<String, String>,
+    /// The `DirectoryId` of every directory this account HAD and has since deleted, with
+    /// the creation rank it carried ([`Self::next_seq`]).
+    ///
+    /// Why a deletion is remembered: a reporting call that FILTERS by directory id answers
+    /// a deleted id with an empty result rather than refusing it, while an id this account
+    /// never had is refused — so a client polling `DescribeDirectories` to confirm a
+    /// deletion finished gets a clean empty page instead of an exception, and one that
+    /// passes an id nobody ever minted is still told the value is wrong. Only the id is
+    /// kept: the record itself is gone, so nothing of the deleted directory can be
+    /// reported.
+    ///
+    /// Bounded by [`MAX_REMEMBERED_DELETIONS`] at its single insert site
+    /// ([`Self::remember_deleted_directory`]), which drops the earliest-created id once the
+    /// bound is reached — so a create/delete cycle cannot grow this store without end.
+    pub deleted_directories: BTreeMap<String, u64>,
     /// Drives [`Self::mint_directory_id`]; see there for how an id is derived from it.
     id_seed: u64,
     /// Drives [`Self::mint_assessment_id`], the way [`Self::id_seed`] drives the
@@ -3252,6 +3318,38 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// over its own seed.
     pub fn mint_domain_controller_id(&mut self) -> String {
         mint_id(&mut self.domain_controller_id_seed, "dc")
+    }
+
+    /// Record that the directory `directory_id`, created at rank `seq`, has been deleted.
+    ///
+    /// THE single insert site of [`Self::deleted_directories`], so the bound on that store
+    /// is enforced in one place: once [`MAX_REMEMBERED_DELETIONS`] ids are remembered the
+    /// earliest-created one is dropped, which keeps the store finite however many
+    /// create/delete cycles a caller runs. A dropped id is then one this account cannot be
+    /// shown to have had, and a filter naming it is refused the way an id nobody minted is.
+    pub fn remember_deleted_directory(&mut self, directory_id: &str, seq: u64) {
+        self.deleted_directories
+            .insert(directory_id.to_string(), seq);
+        while self.deleted_directories.len() > MAX_REMEMBERED_DELETIONS {
+            let Some(earliest) = self
+                .deleted_directories
+                .iter()
+                .min_by_key(|(_, seq)| **seq)
+                .map(|(id, _)| id.clone())
+            else {
+                break;
+            };
+            self.deleted_directories.remove(&earliest);
+        }
+    }
+
+    /// Whether `directory_id` names a directory this account HAD and has since deleted.
+    ///
+    /// What it is for: a reporting call that filters by directory id answers such an id
+    /// with an empty result, while an id this account never had is refused — see
+    /// [`Self::deleted_directories`].
+    pub fn was_deleted(&self, directory_id: &str) -> bool {
+        self.deleted_directories.contains_key(directory_id)
     }
 
     /// Place `count` domain controllers in the directory `directory_id`, as of `now`.
@@ -4226,12 +4324,73 @@ pub fn conditional_forwarder_stage_defect(
     if CONDITIONAL_FORWARDER_SERVING_STAGES.contains(&stage) {
         return None;
     }
-    Some(format!(
-        "Could not {action} conditional forwarder as directory: {directory_id} is not in \
-         {required} state.",
-        required = CONDITIONAL_FORWARDER_SERVING_STAGES.join(" or ")
+    Some(stage_defect(
+        &format!("{action} conditional forwarder"),
+        directory_id,
+        &CONDITIONAL_FORWARDER_SERVING_STAGES,
     ))
 }
+
+/// The sentence Directory Service states a mutation it cannot perform because the
+/// directory's STAGE does not admit it in: the action it could not perform, the directory
+/// the request named and the stages that action needs.
+///
+/// THE one place that sentence is written, so the conditional-forwarder family states one
+/// rule one way. The stages come from the operation rather than from the directory, so the
+/// message discloses nothing about where in its build the directory is. [`refusal`] appends
+/// the request id, once.
+pub fn stage_defect(action: &str, directory_id: &str, required: &[&str]) -> String {
+    format!(
+        "Could not {action} as directory: {directory_id} is not in {required} state.",
+        required = required.join(" or ")
+    )
+}
+
+/// The stages an alias assignment is served in: [`STAGE_ACTIVE`] alone.
+///
+/// `CreateAlias` creates "an alias for a directory and assigns the alias to the
+/// directory", which is a change to a directory that is already serving: Directory Service
+/// admits it only once the directory has reached `Active`, and refuses it while the
+/// directory is still being built — with the modelled `InvalidParameterException`, since the
+/// stage is a precondition of the call rather than the directory being unreachable.
+pub const ALIAS_SERVING_STAGES: [&str; 1] = [STAGE_ACTIVE];
+
+/// Why the directory in `stage` cannot be given an alias, or `None` when it can.
+///
+/// The stage-gate family [`stage_defect`] words, as the conditional-forwarder mutations
+/// state it: the action `CreateAlias` performs, the directory the request named and the
+/// stages that action needs ([`ALIAS_SERVING_STAGES`]) — so the sentence states the
+/// condition that actually refused the call, and a caller is told to wait for the directory
+/// rather than to fix its request. It is NOT the directory-lookup sentence
+/// ([`no_such_directory`]): the directory the request named does exist, and this operation
+/// answers that one under its own `EntityDoesNotExistException` for an id that resolves to
+/// nothing.
+pub fn alias_stage_defect(directory_id: &str, stage: &str) -> Option<String> {
+    if ALIAS_SERVING_STAGES.contains(&stage) {
+        return None;
+    }
+    Some(stage_defect(
+        ALIAS_ACTION_CREATE,
+        directory_id,
+        &ALIAS_SERVING_STAGES,
+    ))
+}
+
+/// The action `CreateAlias` states in that refusal, as its own name says it.
+const ALIAS_ACTION_CREATE: &str = "create alias";
+
+/// The `UnsupportedOperationException` message for a multi-Region call on a directory that
+/// does not replicate across Regions.
+///
+/// FIXED text, the rule the directory broke: multi-Region replication is a feature of the
+/// Enterprise edition of AWS Managed Microsoft AD, so a directory of another type or
+/// edition supports none of these calls. It quotes neither the directory nor the Region,
+/// so `AddRegion` and `RemoveRegion` state the same sentence for the same unsupported
+/// directory ([`Directory::replicates_across_regions`] is the predicate both gate on).
+/// [`refusal`] appends the request id, once.
+pub const MULTI_REGION_ENTERPRISE_ONLY: &str =
+    "Multi-region replication is only supported for AWS Managed Microsoft AD (Enterprise \
+     edition) directories.";
 
 /// The verb each conditional-forwarder mutation states in that refusal: the action it could
 /// not perform, as its own name says it.
@@ -4349,11 +4508,13 @@ pub fn invalid_snapshot_id(snapshot_id: &str) -> String {
 ///
 /// The error shape's own documentation states the failure ("The specified directory has
 /// not been shared with this Amazon Web Services account."); this says it of the pairing
-/// the call asked about, worded the way this service's lookup family is
-/// ([`no_such_directory`]): the quoted id the request sent, the quoted account it named,
-/// and nothing else. [`refusal`] appends the request id, once.
+/// the call asked about, worded the way Directory Service words a pairing of a directory
+/// and an account ([`directory_already_shared`], the mirror of this refusal): the id the
+/// request sent and the account it named, BOTH UNQUOTED, under the capitalised spelling of
+/// `Account`, and the clause closed by a full stop. [`refusal`] appends the request id,
+/// once.
 pub fn directory_not_shared(directory_id: &str, shared_account_id: &str) -> String {
-    format!("Directory: '{directory_id}' is not shared with account: '{shared_account_id}'.")
+    format!("Directory {directory_id} is not shared with Account: {shared_account_id}.")
 }
 
 /// The `EntityDoesNotExistException` message for a remote domain a directory forwards

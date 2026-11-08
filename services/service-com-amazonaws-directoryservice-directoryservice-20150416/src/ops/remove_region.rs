@@ -5,17 +5,22 @@
 //! Stops a stored directory's replication in the Region the request was made against.
 //!
 //! The Region is not a request member: it is the one the call was signed for, read from
-//! the sigv4 credential scope ([`crate::state::region_from_request`]). Three outcomes
-//! follow from what the store holds for that Region:
+//! the sigv4 credential scope ([`crate::state::region_from_request`]). The refusal ladder
+//! is walked in this order, so each outcome tells a caller a different thing:
 //!
-//! * the directory id names no stored directory, or names one that does not exist in
-//!   the Region the call was made against — `DirectoryDoesNotExistException`, "The
-//!   specified directory does not exist in the system";
-//! * it names the directory's PRIMARY Region — refused with
-//!   `UnsupportedOperationException`, because this operation's own documentation says
-//!   "You cannot remove the primary Region with this operation. Instead, use the
-//!   DeleteDirectory API";
-//! * it names a Region the directory is replicated to — the replication is dropped.
+//! * the directory id names no stored directory — `DirectoryDoesNotExistException`;
+//! * it names a directory that does not replicate across Regions at all (a Simple AD
+//!   directory, an AD Connector, a Standard-edition Managed Microsoft AD) — refused with
+//!   `UnsupportedOperationException` stating that rule
+//!   ([`crate::state::MULTI_REGION_ENTERPRISE_ONLY`]), before any Region is looked up;
+//! * it names a Region the directory holds no replica entry for — one it was never
+//!   replicated to, one already removed, or the directory's own PRIMARY Region, which is
+//!   the directory rather than a replication of it and is removed with `DeleteDirectory`
+//!   ("You cannot remove the primary Region with this operation. Instead, use the
+//!   DeleteDirectory API") — `DirectoryDoesNotExistException`;
+//! * it names a replica entry on a directory that is not in service —
+//!   `DirectoryUnavailableException`;
+//! * it names a replica entry of a directory in service — the replication is dropped.
 //!
 //! The call is AUTHORIZED first ([`crate::service::authorization`]): this operation
 //! models `AccessDeniedException`, so a caller whose identity-based policies do not permit
@@ -180,21 +185,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&input.directory_id)
             .ok_or_else(|| directory_does_not_exist(&input.directory_id))?;
 
-        if !directory.exists_in_region(&region) {
-            return Err(directory_does_not_exist(&input.directory_id).into());
-        }
-
-        if directory.primary_region == region {
+        // The EDITION GATE comes first: multi-Region replication is a feature of the
+        // Enterprise edition of AWS Managed Microsoft AD, so on any other directory this
+        // call asks for something the directory does not support at all — which is a
+        // different thing to tell a caller than "there is no such replicated Region", and
+        // it is decided before any Region is looked up. `AddRegion` gates on the same
+        // predicate with the same sentence.
+        if !directory.replicates_across_regions() {
             return Err(
                 RemoveRegionErrorModeled::UnsupportedOperationException(crate::state::refusal(
-                    format!(
-                        "Region {region} is the primary Region of directory {id} and cannot \
-                         be removed with RemoveRegion; use DeleteDirectory instead",
-                        id = directory.directory_id
-                    ),
+                    crate::state::MULTI_REGION_ENTERPRISE_ONLY,
                 ))
                 .into(),
             );
+        }
+
+        // Then the per-Region lookup: this operation "deletes the local Region", so what
+        // it acts on is the REPLICA entry `AddRegion` recorded for the Region the call was
+        // signed for. A directory that has none there — one that was never replicated to
+        // it, one whose replication has already been removed, and the directory's own
+        // PRIMARY Region, which is the directory itself rather than a replication of it —
+        // is refused as a directory that does not exist in this Region. The primary Region
+        // is removed with `DeleteDirectory`, not with this operation.
+        if !directory.additional_regions.contains_key(&region) {
+            return Err(directory_does_not_exist(&input.directory_id).into());
         }
 
         // Stopping replication and removing domain controllers changes the directory

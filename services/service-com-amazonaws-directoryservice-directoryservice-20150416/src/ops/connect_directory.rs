@@ -197,6 +197,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(defect));
         }
 
+        // WHERE the connector's servers go: the subnets the request names, resolved against
+        // the service that OWNS subnets, so each connector server can be given an address
+        // out of its own subnet's block — the `ConnectIps` this directory reports — and so
+        // the other half of the placement rule can be decided. Asked ONCE, BEFORE the store
+        // lock below is taken, so no guard is held across the hop; an identifier the owner
+        // reports no subnet for contributes nothing, and the create still stores the
+        // placement the request named.
+        let subnet_networks = crate::state::resolve_subnet_networks(
+            ctx,
+            &crate::state::region_from_request(ctx.parts()),
+            &input.connect_settings.subnet_ids,
+        )
+        .await;
+
+        // Two DIFFERENT subnets still have to be in two different zones, which only that
+        // service can answer: a pair EC2 reports in ONE zone is refused as the
+        // resource-semantics failure it is (`ClientException`), a different class to the
+        // validation refusal a MALFORMED subnet id gets — and nothing is refused where EC2
+        // could not be asked.
+        if let Some(defect) = crate::state::single_zone_defect(
+            &subnet_networks,
+            &input.connect_settings.subnet_ids,
+        ) {
+            return Err(
+                ConnectDirectoryErrorModeled::ClientException(crate::state::refusal(defect))
+                    .into(),
+            );
+        }
+
         // Nothing caller-sized reaches the store unchecked: the tag list is bounded
         // before the store lock is taken at all. `ConnectDirectory` models no
         // `TagLimitExceededException`, so the bound is reported as the invalid parameter
@@ -213,19 +242,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into_iter()
             .map(|tag| (tag.key, tag.value))
             .collect();
-
-        // WHERE the connector's servers go: the subnets the request names, resolved against
-        // the service that OWNS subnets, so each connector server can be given an address
-        // out of its own subnet's block — the `ConnectIps` this directory reports. Asked
-        // BEFORE the store lock below is taken, so no guard is held across the hop; an
-        // identifier the owner reports no subnet for contributes nothing, and the create
-        // still stores the placement the request named.
-        let subnet_networks = crate::state::resolve_subnet_networks(
-            ctx,
-            &crate::state::region_from_request(ctx.parts()),
-            &input.connect_settings.subnet_ids,
-        )
-        .await;
 
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();

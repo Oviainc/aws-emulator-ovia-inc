@@ -158,6 +158,35 @@ async fn active_directory_in(
     id
 }
 
+/// An Enterprise Managed Microsoft AD created against `region` and waited past the
+/// clock-owed stage transition: the only kind of directory that replicates across Regions,
+/// so a multi-Region call on it is decided by the per-Region lookup rather than by the
+/// edition gate ahead of it.
+async fn active_microsoft_ad_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    name: &str,
+    case: &str,
+) -> String {
+    let (status, body) = call_in_region(
+        router,
+        "CreateMicrosoftAD",
+        crate::microsoft_ad::minimal_microsoft_ad(name),
+        region,
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: CreateMicrosoftAD in {region} answers 200, got {status} with {body}"
+    );
+    let id = body["DirectoryId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: expected a DirectoryId, got {body}"))
+        .to_string();
+    tokio::time::sleep(PAST_ONE_SPAN).await;
+    id
+}
+
 /// A call signed for `region` that must be refused with HTTP 400 and `expected_code`.
 async fn refused_in(
     router: &MultiServiceRouter,
@@ -1284,20 +1313,24 @@ async fn remove_region_acts_on_the_region_the_call_was_signed_for() {
     let (router, engine) = emulator();
 
     // The rows differ in which Region the directory was created in, so what counts as
-    // its primary Region is read from the store rather than fixed.
+    // its primary Region is read from the store rather than fixed. The directory is an
+    // Enterprise Managed Microsoft AD, the only kind that replicates across Regions at
+    // all: a kind that does not is refused by the edition gate ahead of every Region
+    // lookup, which is the row at the end.
     for primary in ["us-east-1", "eu-west-1", "ap-northeast-1"] {
         let case = format!("a directory created in {primary}");
-        let id = active_directory_in(&router, primary, "corp.example.com", &case).await;
+        let id = active_microsoft_ad_in(&router, primary, "corp.example.com", &case).await;
 
-        // Its own Region is the primary one, which this operation does not remove:
-        // "You cannot remove the primary Region with this operation. Instead, use the
-        // DeleteDirectory API."
+        // Its own Region holds no replica entry — the primary Region is not a replication
+        // of the directory but the directory itself, and "You cannot remove the primary
+        // Region with this operation. Instead, use the DeleteDirectory API" — so the call
+        // is refused as a directory that does not exist there.
         refused_in(
             &router,
             primary,
             "RemoveRegion",
             json!({ "DirectoryId": id }),
-            "UnsupportedOperationException",
+            "DirectoryDoesNotExistException",
             &case,
         )
         .await;
@@ -1317,8 +1350,8 @@ async fn remove_region_acts_on_the_region_the_call_was_signed_for() {
         }
 
         // A Region the directory IS replicated to is removed, and is then a Region it
-        // no longer exists in. A Simple AD directory does not replicate across Regions,
-        // so the replication is seeded directly.
+        // no longer exists in. The replication is seeded directly, so the row does not
+        // depend on `AddRegion`'s own ladder.
         let replica = "us-west-2";
         with_directory(&engine, &id, |directory| {
             directory
@@ -1364,18 +1397,54 @@ async fn remove_region_acts_on_the_region_the_call_was_signed_for() {
             Some(1),
             "case {case:?}: the directory itself survives, got {described}"
         );
+
+        // A directory of a kind that does not replicate across Regions at all is refused
+        // by the edition gate ahead of every one of those Region lookups, in its own
+        // Region and in any other.
+        let simple = active_directory_in(
+            &router,
+            primary,
+            "simple-region.example.com",
+            &format!("{case}, a Simple AD"),
+        )
+        .await;
+        for region in [primary, "us-west-2"] {
+            refused_in(
+                &router,
+                region,
+                "RemoveRegion",
+                json!({ "DirectoryId": &simple }),
+                "UnsupportedOperationException",
+                &format!("{case}, a Simple AD called in {region}"),
+            )
+            .await;
+        }
     }
 }
 
 #[tokio::test]
 async fn removing_a_region_needs_a_directory_that_is_in_service() {
     let (router, engine) = emulator();
-    let id = create_directory(
+    // An Enterprise Managed Microsoft AD, the only kind that replicates across Regions, so
+    // the call reaches the stage check rather than the edition gate ahead of it; the
+    // replication is seeded directly because `AddRegion` needs a directory in service,
+    // which is exactly the state this row is about not having yet.
+    let (status, body) = call_in_region(
         &router,
-        minimal_create("corp.example.com"),
-        "a directory still being built",
+        "CreateMicrosoftAD",
+        crate::microsoft_ad::minimal_microsoft_ad("corp.example.com"),
+        "us-east-1",
     )
     .await;
+    assert_eq!(
+        status, 200,
+        "case \"a directory still being built\": CreateMicrosoftAD answers 200, got {status} \
+         with {body}"
+    );
+    let id = body["DirectoryId"]
+        .as_str()
+        .unwrap_or_else(|| panic!("expected a DirectoryId, got {body}"))
+        .to_string();
     with_directory(&engine, &id, |directory| {
         directory.additional_regions.insert(
             "us-west-2".to_string(),

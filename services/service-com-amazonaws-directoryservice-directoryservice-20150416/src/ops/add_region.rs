@@ -208,6 +208,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The other half of that rule: two DIFFERENT subnets still have to be in two
+        // different zones, which only the service that owns subnets can answer — asked in
+        // the Region the replication is being added to, since that is where those subnets
+        // live. A pair EC2 reports in ONE zone is refused as the resource-semantics failure
+        // it is (`ClientException`), and nothing is refused where EC2 could not be asked.
+        // Asked before the store lock is taken: this is an in-process call to another
+        // service.
+        let subnet_networks = crate::state::resolve_subnet_networks(
+            ctx,
+            &input.region_name,
+            &input.vpc_settings.subnet_ids,
+        )
+        .await;
+        if let Some(defect) =
+            crate::state::single_zone_defect(&subnet_networks, &input.vpc_settings.subnet_ids)
+        {
+            return Err(
+                AddRegionErrorModeled::ClientException(crate::state::refusal(defect)).into(),
+            );
+        }
+
         let mut store = state.lock();
         store.advance_clock(::std::time::SystemTime::now());
 
@@ -223,19 +244,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Multi-Region replication is a feature of the Enterprise edition of AWS Managed
         // Microsoft AD: a directory of another type, or of the other edition, does not
         // replicate across Regions, so the call asks for something it does not support.
-        if directory.edition.as_deref() != Some(crate::state::DEFAULT_MICROSOFT_AD_EDITION) {
-            let described = directory
-                .edition
-                .clone()
-                .unwrap_or_else(|| directory.directory_type.clone());
+        // The sentence is that rule's own FIXED text, shared with `RemoveRegion` so both
+        // multi-Region calls refuse the same directory the same way.
+        if !directory.replicates_across_regions() {
             return Err(AddRegionErrorModeled::UnsupportedOperationException(
-                crate::state::refusal(format!(
-                    "DirectoryId {id} names a {described} directory; Region replication is \
-                     supported for {edition} edition {supported} directories only",
-                    id = input.directory_id,
-                    edition = crate::state::DEFAULT_MICROSOFT_AD_EDITION,
-                    supported = crate::state::TYPE_MICROSOFT_AD
-                )),
+                crate::state::refusal(crate::state::MULTI_REGION_ENTERPRISE_ONLY),
             )
             .into());
         }

@@ -1000,6 +1000,10 @@ mod cloudformation_provisions_cognito_identity_pools;
 // directory FORWARDS of the writes that plane makes.
 #[path = "all/ds_log_subscription_forwarding.rs"]
 mod ds_log_subscription_forwarding;
+// Declared beside it, for the same reason: the Availability Zones of the subnets a directory
+// create places its servers in, which only Amazon EC2 can answer.
+#[path = "all/ds_placement_zones.rs"]
+mod ds_placement_zones;
 #[path = "all/sns_lambda_cdk_subscription_delivery.rs"]
 mod sns_lambda_cdk_subscription_delivery;
 // Declared here, in the appended tail: the whole ingest path of a deployed `AWS_PROXY` stage,

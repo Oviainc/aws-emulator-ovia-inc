@@ -121,6 +121,8 @@ async fn the_home_region_add_is_refused_with_one_fixed_sentence() {
         )
         .await;
         if let Some(alias) = alias {
+            // An alias is assigned only once the directory has reached its serving stage.
+            tokio::time::sleep(PAST_ONE_SPAN).await;
             ok(
                 &router,
                 "CreateAlias",
@@ -424,6 +426,8 @@ async fn the_access_url_is_the_bare_host_of_the_directorys_alias() {
         let created = ok(&router, operation, body, case).await;
         let directory = string(&created, "DirectoryId", case);
         if let Some(alias) = alias {
+            // An alias is assigned only once the directory has reached its serving stage.
+            tokio::time::sleep(PAST_ONE_SPAN).await;
             ok(
                 &router,
                 "CreateAlias",
