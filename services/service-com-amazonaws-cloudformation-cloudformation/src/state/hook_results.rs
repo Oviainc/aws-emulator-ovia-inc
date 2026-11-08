@@ -73,6 +73,18 @@ pub mod target_type {
 /// (`ListHookResultsInput$TargetType`).
 pub const FILTERABLE_TARGET_TYPES: &[&str] = &[target_type::CHANGE_SET, target_type::CLOUD_CONTROL];
 
+/// The message CloudFormation answers a request that filters on a `TargetType` the model
+/// admits but the operation does not FILTER on.
+///
+/// `ListHookResultsTargetType` carries four values, so such a value is a well-formed one the
+/// operation refuses at RUN time: the sentence is the fixed text `Invalid TargetType: ` and
+/// the value the request named — the one part of it that comes from the request — and it
+/// states nothing about which values are filterable, because the service's own refusal does
+/// not ([`FILTERABLE_TARGET_TYPES`] is what decides, not what is reported).
+pub fn invalid_target_type(target_type: &str) -> String {
+    format!("Invalid TargetType: {target_type}")
+}
+
 /// The model's `HookInvocationPoint` enum: the single point "in the provisioning process
 /// where the Hook is invoked".
 pub mod invocation_point {

@@ -3012,6 +3012,23 @@ impl ComAmazonawsCloudformationCloudformationState {
             .map(|i| &mut self.stacks[i])
     }
 
+    /// The stack a request names, including one whose deletion has COMPLETED and which a
+    /// NAME therefore no longer resolves to ([`Self::resolve`]).
+    ///
+    /// CloudFormation keeps a deleted stack addressable — "information for stacks that have
+    /// been deleted is kept for 90 days" — so a request whose answer depends on what became
+    /// of that stack's resources is decided from its record rather than answered as if the
+    /// stack had never existed. The MOST RECENT stack of the Region carrying the name, since
+    /// a name is reusable once the stack holding it is gone and the newest record is the one
+    /// the request is about; the stacks are held in creation order, so that is the last one.
+    pub fn resolve_any(&self, region: &str, name_or_id: &str) -> Option<&StoredStack> {
+        self.resolve(region, name_or_id).or_else(|| {
+            self.stacks
+                .iter()
+                .rfind(|stack| stack.region == region && stack.stack_name == name_or_id)
+        })
+    }
+
     /// `Some(name_or_id)` when a request named a stack this Region holds none for, and
     /// `None` when it resolves or when the request named no stack at all.
     ///
@@ -3859,6 +3876,41 @@ pub fn change_set_does_not_exist(name_or_id: &str) -> String {
 /// cannot drift apart.
 pub fn stack_cannot_be_updated(stack_id: &str, status: &str) -> String {
     format!("Stack:{stack_id} is in {status} state and can not be updated.")
+}
+
+/// The message CloudFormation answers a DELETION of a stack whose current status does not
+/// allow one ([`status_takes_a_delete`]).
+///
+/// The same frame the refusal of an UPDATE of such a stack carries
+/// ([`stack_cannot_be_updated`]) — the stack's id, the status it is in and the operation that
+/// cannot be carried out from it — since the two refuse the same class of request: a call
+/// whose stack is busy with another operation. The two variable parts are read off the stack
+/// the request resolved; no part of the sentence comes from any one run.
+pub fn stack_cannot_be_deleted(stack_id: &str, status: &str) -> String {
+    format!("Stack:{stack_id} is in {status} state and can not be deleted.")
+}
+
+/// Whether a stack whose last operation left it in `status` can take a DELETE, or whether the
+/// request is the refusal [`stack_cannot_be_deleted`] words.
+///
+/// CloudFormation runs one operation at a time against a stack, and an UPDATE is the
+/// operation a deletion cannot run beside: it is changing, replacing and removing the very
+/// resources a deletion would dispose of, so a delete accepted while it runs would race it
+/// and leave a stack whose resources neither operation accounts for. The three statuses an
+/// update holds the stack in — the update itself, the rollback of one that failed, and the
+/// cleanup of the resources a completed update replaced — therefore refuse it, and the
+/// caller waits for that update or cancels it (`CancelUpdateStack`).
+///
+/// Every other status takes a delete, including the create still in flight and the
+/// review-only stack a `CREATE` change set brought into existence, for both of which
+/// deleting the stack is how a client clears it up.
+pub fn status_takes_a_delete(status: &str) -> bool {
+    !matches!(
+        status,
+        status::UPDATE_IN_PROGRESS
+            | status::UPDATE_ROLLBACK_IN_PROGRESS
+            | status::UPDATE_COMPLETE_CLEANUP_IN_PROGRESS
+    )
 }
 
 /// Whether a stack whose last operation left it in `status` can take an UPDATE at all, or

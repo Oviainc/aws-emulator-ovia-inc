@@ -130,7 +130,7 @@ fn stated_from_request<O: Operation>(
         |collection| lists.get(collection).cloned(),
         // ...and the requirement it nests, with an enum's value set in the order this service
         // lists it.
-        |collection| element_set_in_the_services_own_order(O::INPUT_SCHEMA, collection),
+        |collection| element_set_as_the_service_states_it(O::INPUT_SCHEMA, collection),
     )?;
     Some((
         violations,
@@ -144,14 +144,14 @@ fn stated_from_request<O: Operation>(
 }
 
 /// The requirement a clause stated at `collection` nests: the element shape's whole declared
-/// constraint set, with an enum's value set listed in the order this SERVICE lists it
-/// ([`super::service_ordered_value_set`]).
+/// constraint set, with an enum's value set as this SERVICE states it
+/// ([`super::stated_value_set`]).
 ///
 /// The set itself is the one the shared reading of the schema produces
-/// ([`element_constraint_set`]) — the model's, constraint for constraint — and only the ORDER
-/// an enum's values are listed in is this service's. `None` where the schema declares no
+/// ([`element_constraint_set`]) — the model's, constraint for constraint — and only an enum's
+/// own value set is restated as the service states it. `None` where the schema declares no
 /// constraint on that member's elements, which leaves the clause the framework's own.
-fn element_set_in_the_services_own_order(
+fn element_set_as_the_service_states_it(
     input_schema: &'static Schema,
     collection: &str,
 ) -> Option<String> {
@@ -161,9 +161,9 @@ fn element_set_in_the_services_own_order(
         .map(|kind| {
             let kind = match kind {
                 ViolationKind::EnumValue(values) => {
-                    match super::service_ordered_value_set(&values) {
-                        Some(ordered) => ViolationKind::EnumValue(
-                            ordered.iter().map(|value| (*value).to_string()).collect(),
+                    match super::stated_value_set(&values) {
+                        Some(stated) => ViolationKind::EnumValue(
+                            stated.iter().map(|value| (*value).to_string()).collect(),
                         ),
                         None => ViolationKind::EnumValue(values),
                     }

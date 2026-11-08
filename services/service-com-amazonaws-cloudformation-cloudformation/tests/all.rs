@@ -81,6 +81,8 @@ mod delete_stack_export_in_use;
 mod delete_stack_instances;
 #[path = "all/delete_stack_retain_resources.rs"]
 mod delete_stack_retain_resources;
+#[path = "all/delete_stack_single_writer.rs"]
+mod delete_stack_single_writer;
 #[path = "all/delete_stack_set.rs"]
 mod delete_stack_set;
 #[path = "all/denied_replacement_identity.rs"]
@@ -315,6 +317,8 @@ mod sam_policies_shorthand;
 mod sam_transform;
 #[path = "all/scan_and_registry_reads.rs"]
 mod scan_and_registry_reads;
+#[path = "all/scan_hook_and_progress_refusal_wording.rs"]
+mod scan_hook_and_progress_refusal_wording;
 #[path = "all/scratch.rs"]
 mod scratch;
 #[path = "all/search_indexing_pipeline_outputs.rs"]

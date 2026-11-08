@@ -95,7 +95,7 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-use crate::state::hook_results::{StoredHookResult, FILTERABLE_TARGET_TYPES};
+use crate::state::hook_results::{invalid_target_type, StoredHookResult, FILTERABLE_TARGET_TYPES};
 
 /// WHICH invocation results the request selects: "This operation supports the following
 /// parameter combinations: No parameters … `TypeArn` only … `TypeArn` and `Status` …
@@ -149,13 +149,11 @@ impl Selection {
             };
             // "Currently, only CHANGE_SET and CLOUD_CONTROL are supported filter options."
             // The other two values the enum admits are target types a RESULT can carry,
-            // not ones a request may filter on.
+            // not ones a request may filter on — so the value is a MODELLED one this
+            // operation refuses at run time, in the service's own wording for it
+            // ([`invalid_target_type`]).
             if !FILTERABLE_TARGET_TYPES.contains(&target_type) {
-                return Err(format!(
-                    "TargetType {target_type} is not a supported filter option; the \
-                     supported filter options are {}",
-                    FILTERABLE_TARGET_TYPES.join(" and ")
-                ));
+                return Err(invalid_target_type(target_type));
             }
             return Ok(Self::Target {
                 target_type: target_type.to_string(),

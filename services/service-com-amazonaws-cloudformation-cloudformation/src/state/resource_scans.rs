@@ -794,20 +794,27 @@ pub fn too_many_requested_resources(requested: usize) -> String {
     )
 }
 
-/// The message answered when a scan of this account and Region is already running, which is
-/// the sentence the modelled `ResourceScanInProgressException` documents. The refusal of a
-/// request to START another scan: what it states is the exclusivity.
+/// The message answered when a scan of this account and Region is already running — the
+/// refusal of a request to START another scan, carried by the modelled
+/// `ResourceScanInProgressException`.
+///
+/// The service's OWN sentence, which is not the one the error shape's documentation states:
+/// it tells the caller to WAIT for the running scan and names the call that reports its
+/// status, rather than restating the one-scan-at-a-time rule. Entirely FIXED text, naming
+/// nothing of the request — the same footing [`OPERATION_WHILE_SCANNING`] is on, whose
+/// sentence this one is the start's counterpart of.
 pub const SCAN_IN_PROGRESS: &str =
-    "A resource scan is currently in progress. Only one can be run at a time for an account \
-     in a Region.";
+    "There is an active ResourceScan in progress. Please wait for it to finish before \
+     starting a new ResourceScan. Describe ResourceScans to see the status of the \
+     in-progress ResourceScan.";
 
 /// The message answered a request that operates ON a scan that has not finished — a read of
 /// the result a running scan has not produced yet.
 ///
 /// The same modelled `ResourceScanInProgressException`, but a DIFFERENT sentence from
-/// [`SCAN_IN_PROGRESS`]: this one tells the caller to wait for THAT scan and where to watch
-/// it, rather than stating the one-scan-at-a-time rule a start is refused under. Entirely
-/// fixed text, naming nothing of the request.
+/// [`SCAN_IN_PROGRESS`]: this one is about the scan the request NAMED and the operations on
+/// it, where that one is about starting another scan. Entirely fixed text, naming nothing of
+/// the request.
 pub const OPERATION_WHILE_SCANNING: &str =
     "The ResourceScan is in progress. Please wait for it to finish before performing any \
      further operations on it. Describe ResourceScans to see the status of the in-progress \

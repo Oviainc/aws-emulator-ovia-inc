@@ -33,7 +33,16 @@
 //! removed — nothing is asked of the service that owns it, so the resource stays exactly as
 //! it is and goes on serving its own clients, the stack records its deletion as
 //! `DELETE_SKIPPED`, and the stack's own deletion completes around it. It is refused for a
-//! stack in any other status, as CloudFormation refuses it.
+//! stack in any other status, as CloudFormation refuses it, and so is a list naming a
+//! resource that is not there to be retained: a resource is retained by being LEFT where it
+//! is, so one whose own deletion already completed — which is every resource of a stack
+//! whose deletion completed — cannot be
+//! ([`RETAINED_RESOURCES_MUST_EXIST`]).
+//!
+//! A deletion is refused outright while an UPDATE of the stack is in flight
+//! ([`crate::state::status_takes_a_delete`]): CloudFormation runs one operation at a time
+//! against a stack, and that update is changing the very resources this deletion would
+//! dispose of.
 //!
 //! ## Shape of an operation
 //!
@@ -191,6 +200,45 @@ fn force_delete_needs_a_failed_deletion(stack_name: &str, status: &str) -> Strin
     )
 }
 
+/// The message `DeleteStack` answers a `RetainResources` list that names a resource it cannot
+/// retain.
+///
+/// FIXED text, naming nothing of the request: a resource is retained by being LEFT exactly
+/// where it is, so the list can only name resources that are still there. A record the stack
+/// holds in `DELETE_COMPLETE` is one a previous deletion already disposed of — there is
+/// nothing left to retain — and the sentence states that requirement and the status that
+/// breaks it.
+const RETAINED_RESOURCES_MUST_EXIST: &str =
+    "The specified resources to retain must be in a valid state. Do not specify resources \
+     that are in the DELETE_COMPLETE state.";
+
+/// Whether `retained` names a resource of `stack` that is not there to be retained, which is
+/// what [`RETAINED_RESOURCES_MUST_EXIST`] refuses.
+///
+/// Two ways a logical id fails: the stack holds a record for it whose own deletion already
+/// COMPLETED, and the stack holds no record for it at all. Every resource of a stack whose
+/// own deletion completed is in the first of those, so such a stack can retain nothing —
+/// which is what a second `DeleteStack` naming the resources of an already-deleted stack
+/// asks for.
+///
+/// One lookup per id named, over records the stack holds: both counts are bounded by the
+/// per-template resource quota the caller's list is checked against before this runs
+/// ([`crate::state::template::MAX_RESOURCES_PER_TEMPLATE`]).
+fn names_a_resource_that_cannot_be_retained(
+    stack: &crate::state::StoredStack,
+    retained: &::std::collections::BTreeSet<&str>,
+) -> bool {
+    retained.iter().any(|logical_id| {
+        stack
+            .resources
+            .iter()
+            .find(|deployed| deployed.resource.logical_id == *logical_id)
+            .is_none_or(|deployed| {
+                deployed.status == crate::state::resource_status::DELETE_COMPLETE
+            })
+    })
+}
+
 /// The `DeleteStack` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -253,6 +301,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // instant that update failed, whether or not anybody called
         // (`crate::state::settle_due_rollbacks`).
         crate::state::settle_due_rollbacks(ctx, &*self.engine).await;
+        // "During deletion, CloudFormation deletes the stack but doesn't delete the retained
+        // resources": the logical ids this request names, read once — the gate below is
+        // about them, and so is the teardown further down.
+        //
+        // The list is caller-COUNTED and the model carries no `@length` for it, so it is
+        // bounded BEFORE it drives any work, the way every other unmodelled list of this
+        // service is: a request naming more logical ids than a stack can possibly have
+        // ([`crate::state::template::MAX_RESOURCES_PER_TEMPLATE`], the documented
+        // per-template resource quota) names ids no stack holds, and is refused rather than
+        // walked.
+        if input.retain_resources.as_deref().is_some_and(|retain| {
+            retain.len() > crate::state::template::MAX_RESOURCES_PER_TEMPLATE
+        }) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "RetainResources must name at most {} resources",
+                crate::state::template::MAX_RESOURCES_PER_TEMPLATE
+            )));
+        }
+        let retained: ::std::collections::BTreeSet<&str> = input
+            .retain_resources
+            .iter()
+            .flatten()
+            .map(String::as_str)
+            .collect();
         // The store lock is taken for the write and RELEASED at the end of this block: the
         // calls that delete the stack's resources run after it, and each of those reaches
         // another service's own handler, which takes that service's lock.
@@ -260,6 +332,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut store = state.lock();
             store.settle(now);
 
+            // A resource is RETAINED by being left exactly where it is, so every logical id
+            // the request names has to be a resource that is still there. Weighed against
+            // the stack's records BEFORE the shortcuts below, and against the record of a
+            // stack whose deletion already COMPLETED too
+            // ([`crate::state::ComAmazonawsCloudformationCloudformationState::resolve_any`]):
+            // such a stack's resources are all disposed of, so the request asks for a
+            // retention that cannot happen, and answering it the no-op success below would
+            // report one that did not.
+            if !retained.is_empty()
+                && store
+                    .resolve_any(&request_region, &input.stack_name)
+                    .is_some_and(|stack| {
+                        names_a_resource_that_cannot_be_retained(stack, &retained)
+                    })
+            {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    RETAINED_RESOURCES_MUST_EXIST.to_string(),
+                ));
+            }
             // Deleting a stack that is not in the live set is a no-op that succeeds: the
             // request asks for a state the store is already in.
             let Some(previous) = store.resolve(&request_region, &input.stack_name) else {
@@ -287,34 +378,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // are associated with the resources you want to retain." A stack in any other
             // state is refused, as CloudFormation refuses it; what the named resources
             // themselves get is the teardown below.
-            if input
-                .retain_resources
-                .as_deref()
-                .is_some_and(|retain| !retain.is_empty())
-                && previous.status != status::DELETE_FAILED
-            {
+            if !retained.is_empty() && previous.status != status::DELETE_FAILED {
                 return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                     "RetainResources can only be specified for a stack in the \
                      DELETE_FAILED state; stack [{}] is in {} state",
                     input.stack_name, previous.status
-                )));
-            }
-            // The list is caller-COUNTED and the model carries no `@length` for it, so it is
-            // bounded here before it drives any work, the way every other unmodelled list of
-            // this service is: a request naming more logical ids than a stack can possibly
-            // have ([`crate::state::template::MAX_RESOURCES_PER_TEMPLATE`], the documented
-            // per-template resource quota) names ids no stack holds, and is refused rather
-            // than walked.
-            if input
-                .retain_resources
-                .as_deref()
-                .is_some_and(|retain| {
-                    retain.len() > crate::state::template::MAX_RESOURCES_PER_TEMPLATE
-                })
-            {
-                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                    "RetainResources must name at most {} resources",
-                    crate::state::template::MAX_RESOURCES_PER_TEMPLATE
                 )));
             }
             // "A unique identifier for this DeleteStack request": a token an operation on
@@ -353,15 +421,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The deletion this call would START has to be one the request's `DeletionMode`
             // can start: the forced mode is for a deletion that has already FAILED
             // ([`force_delete_needs_a_failed_deletion`]), so it is refused from every other
-            // status — weighed here, AFTER the shortcut above, so a repeat of a deletion
-            // already in flight is still the no-op success it is under the standard mode
-            // rather than a refusal about the status that deletion itself put the stack in.
+            // status a deletion CAN be started from — weighed here, AFTER the shortcut above,
+            // so a repeat of a deletion already in flight is still the no-op success it is
+            // under the standard mode rather than a refusal about the status that deletion
+            // itself put the stack in.
             if input.deletion_mode.as_deref()
                 == Some(crate::state::deletion_mode::FORCE_DELETE_STACK)
                 && previous.status != status::DELETE_FAILED
             {
                 return Err(crate::scaffolded::Scaffolded::validation_error(
                     force_delete_needs_a_failed_deletion(&input.stack_name, &previous.status),
+                ));
+            }
+            // CloudFormation runs ONE operation at a time against a stack, and the operation
+            // a deletion cannot run beside is an UPDATE
+            // ([`crate::state::status_takes_a_delete`]): that update is changing and
+            // replacing the very resources this deletion would dispose of, so a delete taken
+            // while it runs would race it. The model declares no error for it, so it is the
+            // service-common refusal — weighed last of the status gates, so what the REQUEST
+            // itself asks for is still answered first: a repeat of a deletion already in
+            // flight stays the no-op success it is, a token another operation claimed is
+            // still the duplicate submission the modelled error refuses, and a `DeletionMode`
+            // this status cannot start is still refused about that mode.
+            if !crate::state::status_takes_a_delete(&previous.status) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::stack_cannot_be_deleted(&previous.stack_id, &previous.status),
                 ));
             }
 
@@ -459,15 +543,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // member exists for ("retaining resources is useful when you can't delete a resource,
         // such as a non-empty S3 bucket, but you want to delete the stack"); every other
         // resource of the stack is deleted exactly as it is without the member.
-        //
-        // ONE pass over the stack's resources, against the set of ids the request named, so
-        // the work is the sum of the two counts rather than their product.
-        let retained: ::std::collections::BTreeSet<&str> = input
-            .retain_resources
-            .iter()
-            .flatten()
-            .map(String::as_str)
-            .collect();
         if !retained.is_empty() {
             for resource in &mut resources {
                 if retained.contains(resource.logical_id.as_str()) {

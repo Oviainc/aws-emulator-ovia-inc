@@ -397,9 +397,13 @@ async fn a_delete_blocked_by_a_live_importer_is_canceled_and_the_stack_stays_hea
     }
 }
 
-/// A stack a cancelled deletion left behind is never LEFT in an `*_IN_PROGRESS` status,
-/// even when the call arrived while another operation of the stack was still in flight: the
-/// cancellation restores the healthy status that operation was going to reach.
+/// A stack a cancelled deletion left behind is never LEFT in an `*_IN_PROGRESS` status: the
+/// cancellation restores the healthy status the stack held.
+///
+/// A delete that arrives while an UPDATE of that stack is still in flight never gets as far
+/// as being cancelled — CloudFormation runs one operation at a time against a stack, so it is
+/// refused and the update goes on running (`delete_stack_single_writer.rs`) — and the delete
+/// that stack takes once the update has concluded is the one this case follows.
 #[tokio::test]
 async fn a_canceled_delete_never_leaves_an_in_progress_status() {
     let case = "the delete arrives while an update of the exporter is still in flight";
@@ -413,10 +417,9 @@ async fn a_canceled_delete_never_leaves_an_in_progress_status() {
     )
     .await;
 
-    // No wait between the two calls: the update is still in flight when the delete arrives
-    // (and if it loses the race to the clock, the delete is cancelled the same way). The
-    // update keeps publishing the export the importer holds — one that withdrew it would be
-    // cancelled in its own right (`update_stack_export_in_use.rs`) — and changes the stack
+    // No wait between the two calls: the update is still in flight when the delete arrives.
+    // The update keeps publishing the export the importer holds — one that withdrew it would
+    // be cancelled in its own right (`update_stack_export_in_use.rs`) — and changes the stack
     // by declaring one resource more.
     let in_flight = [("in-flight-export", "in-flight-value")];
     let (code, body) = call(
@@ -438,9 +441,33 @@ async fn a_canceled_delete_never_leaves_an_in_progress_status() {
         &[member("StackName", "in-flight-exporter")],
     )
     .await;
+    // Refused while that update runs; a delete that lost the race to the clock met a stack
+    // the update had already settled, and is the accepted-and-cancelled call instead.
+    if code == 400 {
+        assert!(
+            body.contains(status::UPDATE_IN_PROGRESS) && body.contains("can not be deleted"),
+            "case {case:?}: expected the refusal to name the update in flight, got {body}"
+        );
+    } else {
+        assert_eq!(
+            code, 200,
+            "case {case:?}: expected the delete either refused or accepted, got {code} {body}"
+        );
+    }
+    wait_for_the_transition().await;
+    wait_for_the_transition().await;
+
+    // The stack the update left behind takes the delete, which the export in use CANCELS:
+    // the stack reports the attempt and then goes back to the healthy status it holds.
+    let (code, body) = call(
+        &router,
+        "DeleteStack",
+        &[member("StackName", "in-flight-exporter")],
+    )
+    .await;
     assert_eq!(
         code, 200,
-        "case {case:?}: DeleteStack must be accepted, got {code} {body}"
+        "case {case:?}: the delete of the settled stack must be accepted, got {code} {body}"
     );
     wait_for_the_transition().await;
     wait_for_the_transition().await;

@@ -15,8 +15,8 @@
 //!
 //! 2. **A request that operates ON a scan that has not finished is refused 400
 //!    `ResourceScanInProgress`, telling the caller to wait for THAT scan** — a different
-//!    sentence from the one a request to START a second scan is refused with, which states
-//!    the one-scan-at-a-time rule instead. A read of a scan this account and Region holds no
+//!    sentence from the one a request to START a second scan is refused with, which is about
+//!    starting a new scan instead. A read of a scan this account and Region holds no
 //!    record of is refused 400 `ResourceScanNotFound` with a sentence that names nothing of
 //!    the request.
 //!
@@ -380,7 +380,8 @@ async fn an_unfinished_scan_refuses_the_reads_of_its_result() {
     }
 
     // A request to START another scan is refused with the SAME modelled error and the OTHER
-    // sentence: what it states is the one-scan-at-a-time rule, not a wait on this scan.
+    // sentence: what it states is the new scan the caller cannot start, not a wait on an
+    // operation against this one.
     let case = "a second StartResourceScan";
     let (status, body) = start_scan(&router, &[]).await;
     if started.elapsed() < scans::SCAN_DELAY {

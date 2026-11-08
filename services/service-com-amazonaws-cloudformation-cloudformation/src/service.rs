@@ -53,8 +53,9 @@
 //! PUBLIC EXTENSION BY ARN, which CloudFormation's registry parses itself, is stated as the
 //! registry states it rather than as a generic request-validation failure — see
 //! [`registry_refusal_of_a_public_extension_arn`] — a value outside an enum whose value
-//! set this service lists in its own order is stated in THAT order, see
-//! [`enum_value_set_in_the_services_own_order`], and every other refusal the framework
+//! set this service STATES differently from the model's declaration of it (in another order,
+//! or over more values) is stated as the service states it, see
+//! [`enum_value_set_as_the_service_states_it`], and every other refusal the framework
 //! describes carries the one CODE this service publishes for a refused request, see
 //! [`the_services_own_refusal_code`].
 //!
@@ -164,60 +165,109 @@ const STACK_STATUS_VALUE_SET: &[&str] = &[
     "UPDATE_ROLLBACK_COMPLETE",
 ];
 
-/// Every enum of this service whose value set its own refusals state in an order other than
-/// the model's declaration order.
+/// `OperationStatus`, as the value set CloudFormation's OWN input validation STATES for it —
+/// which is not the set the model declares.
 ///
-/// Keyed by the SET rather than by an operation or a member, so each entry governs every
-/// member that targets that enum and one refusal cannot drift from another's.
-const SERVICE_ORDERED_ENUM_VALUE_SETS: &[&[&str]] = &[
-    REGISTRATION_STATUS_VALUE_SET,
-    TEMPLATE_STAGE_VALUE_SET,
-    STACK_STATUS_VALUE_SET,
+/// The model carries four values (`crate::ops::types::OPERATION_STATUS_VALUES`), and the
+/// service's refusal of a value outside the set reports SIX: the cancellation statuses a
+/// handler reports beside them are accepted too, and the clause is the list a caller fixes
+/// its request from, so it states them. Neither the model's order nor a sort of the values —
+/// this is the order the refusal lists them in.
+///
+/// Only the SENTENCE states those two: a request carrying one is still refused, because the
+/// member's wire contract is the model's enum and the validating walk that admits a value is
+/// built from that model — which this crate does not author (`smithy-model/` is the service's
+/// shipped model and `src/lib.rs` is generated from it), so there is no seam here that could
+/// widen the set a member ACCEPTS without changing the model. Stating the wider set is what
+/// the clause is for, and it is deliberate that the two differ until the model carries them.
+const OPERATION_STATUS_VALUE_SET: &[&str] = &[
+    "CANCEL_IN_PROGRESS",
+    "SUCCESS",
+    "IN_PROGRESS",
+    "PENDING",
+    "FAILED",
+    "CANCEL_COMPLETE",
 ];
 
-/// The order this service states `allowed` in, when it is one of the sets
-/// [`SERVICE_ORDERED_ENUM_VALUE_SETS`] names — compared as a SET, so the model's declaration
-/// order is what the entry replaces.
-fn service_ordered_value_set(allowed: &[String]) -> Option<&'static [&'static str]> {
-    SERVICE_ORDERED_ENUM_VALUE_SETS
+/// One enum of this service whose own refusals do not state its value set the way the MODEL
+/// declares it — in another order, or over more values than the model's set.
+///
+/// Keyed by the values a violation of that enum ARRIVES carrying (the model's declaration,
+/// compared as a SET) rather than by an operation or a member, so each entry governs every
+/// member that targets that enum and one refusal cannot drift from another's.
+struct StatedEnumValueSet {
+    /// The model's own values for the enum, which is what the entry is matched on.
+    modelled: &'static [&'static str],
+    /// The value set the SERVICE states, in the order it states it. The same values as
+    /// `modelled` where only the order is the service's; a SUPERSET where the service
+    /// reports values the model does not declare.
+    stated: &'static [&'static str],
+}
+
+/// Every enum of this service whose refusals state a value set the model's declaration does
+/// not give — one entry per enum.
+const STATED_ENUM_VALUE_SETS: &[StatedEnumValueSet] = &[
+    StatedEnumValueSet {
+        modelled: crate::ops::types::REGISTRATION_STATUS_VALUES,
+        stated: REGISTRATION_STATUS_VALUE_SET,
+    },
+    StatedEnumValueSet {
+        modelled: crate::ops::types::TEMPLATE_STAGE_VALUES,
+        stated: TEMPLATE_STAGE_VALUE_SET,
+    },
+    StatedEnumValueSet {
+        modelled: crate::ops::types::STACK_STATUS_VALUES,
+        stated: STACK_STATUS_VALUE_SET,
+    },
+    StatedEnumValueSet {
+        modelled: crate::ops::types::OPERATION_STATUS_VALUES,
+        stated: OPERATION_STATUS_VALUE_SET,
+    },
+];
+
+/// The value set this service STATES for the enum whose modelled values are `allowed`, when
+/// it is one of the enums [`STATED_ENUM_VALUE_SETS`] names — matched as a SET, so the order
+/// the values reached the clause in does not enter into it.
+fn stated_value_set(allowed: &[String]) -> Option<&'static [&'static str]> {
+    STATED_ENUM_VALUE_SETS
         .iter()
-        .copied()
-        .find(|ordered| {
-            ordered.len() == allowed.len()
+        .find(|entry| {
+            entry.modelled.len() == allowed.len()
                 && allowed
                     .iter()
-                    .all(|value| ordered.contains(&value.as_str()))
+                    .all(|value| entry.modelled.contains(&value.as_str()))
         })
+        .map(|entry| entry.stated)
 }
 
 /// This service's wording for a value outside an enum's declared set: the same refusal the
-/// framework states, with the value set listed in the order the SERVICE lists it
-/// ([`SERVICE_ORDERED_ENUM_VALUE_SETS`]).
+/// framework states, with the value set as the SERVICE states it
+/// ([`STATED_ENUM_VALUE_SETS`]).
 ///
 /// The message is a requirement of this error class — a client matching the service's
-/// refusal text matches the order too — and only the order changes: the status, the code and
-/// every other word stay the framework's, which is why the sentence is rebuilt through the
-/// framework's own envelope rather than spelled again here. `None` when no violation of this
-/// request names a set this service orders differently, which keeps every other refusal
-/// exactly as the framework worded it.
-fn enum_value_set_in_the_services_own_order(violations: &[Violation]) -> Option<Refused> {
+/// refusal text matches the set and its order too — and only that list changes: the status,
+/// the code and every other word stay the framework's, which is why the sentence is rebuilt
+/// through the framework's own envelope rather than spelled again here. `None` when no
+/// violation of this request names an enum this service states differently, which keeps
+/// every other refusal exactly as the framework worded it.
+fn enum_value_set_as_the_service_states_it(violations: &[Violation]) -> Option<Refused> {
     let mut restated = violations.to_vec();
-    let mut reordered = false;
+    let mut reworded = false;
     for violation in &mut restated {
         let ViolationKind::EnumValue(allowed) = &mut violation.kind else {
             continue;
         };
-        let Some(ordered) = service_ordered_value_set(allowed) else {
+        let Some(stated) = stated_value_set(allowed) else {
             continue;
         };
-        let in_the_services_order: Vec<String> =
-            ordered.iter().map(|value| (*value).to_string()).collect();
-        if *allowed != in_the_services_order {
-            *allowed = in_the_services_order;
-            reordered = true;
+        let as_the_service_states_it: Vec<String> =
+            stated.iter().map(|value| (*value).to_string()).collect();
+        if *allowed != as_the_service_states_it {
+            *allowed = as_the_service_states_it;
+            reworded = true;
         }
     }
-    if !reordered {
+    if !reworded {
         return None;
     }
     Some(Refused {
@@ -487,14 +537,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // service reword it. Three classes are reworded here: a refusal of the member that
         // names a PUBLIC EXTENSION BY ARN, which the registry parses itself (see
         // [`registry_refusal_of_a_public_extension_arn`]), a value outside an enum whose
-        // value set this service lists in its own order (see
-        // [`enum_value_set_in_the_services_own_order`]), and — for every refusal neither of
+        // value set this service states differently from the model's declaration (see
+        // [`enum_value_set_as_the_service_states_it`]), and — for every refusal neither of
         // those restates — the CODE this service publishes for a refused request, with the
         // framework's own sentence (see [`the_services_own_refusal_code`]).
         match refusal {
             Refusal::Invalid(violations) => {
                 registry_refusal_of_a_public_extension_arn(violations)
-                    .or_else(|| enum_value_set_in_the_services_own_order(violations))
+                    .or_else(|| enum_value_set_as_the_service_states_it(violations))
                     .or_else(|| the_services_own_refusal_code(violations))
             }
             _ => None,
