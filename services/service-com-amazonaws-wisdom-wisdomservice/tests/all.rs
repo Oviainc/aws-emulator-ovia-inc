@@ -19,6 +19,8 @@ mod assistant_association;
 mod assistant_lifecycle;
 #[path = "all/client_error_refusals.rs"]
 mod client_error_refusals;
+#[path = "all/content_precondition_message.rs"]
+mod content_precondition_message;
 #[path = "all/content_precondition_refusal.rs"]
 mod content_precondition_refusal;
 #[path = "all/content_revisions.rs"]

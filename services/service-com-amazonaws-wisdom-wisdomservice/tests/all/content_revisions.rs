@@ -68,10 +68,10 @@ const MESSAGE_CONTENT_NOT_FOUND: &str = "Content does not exist.";
 /// The sentence an `uploadId` naming no upload of this knowledge base is refused with.
 const MESSAGE_INVALID_UPLOAD_ID: &str = "Invalid uploadId";
 
-/// The sentence a write naming a revision the content no longer carries is refused with,
-/// written out here rather than imported from the implementation so the assertion pins the
-/// wire text.
-const MESSAGE_PRECONDITION_FAILED: &str = "Request precondition failed";
+/// The optional member of the modelled `PreconditionFailedException`, which this endpoint
+/// leaves UNSET: the whole of that refusal is its 412 and its error code, so the assertions
+/// pin the member's absence rather than any text.
+const MEMBER_MESSAGE: &str = "message";
 
 /// One wire answer, reduced to what a client branches on.
 #[derive(Debug)]
@@ -111,6 +111,14 @@ impl Reply {
 
     fn message(&self) -> String {
         self.string("/message")
+    }
+
+    /// Whether the body carries the error's `message` member at all — what decides the
+    /// empty message a client reads.
+    fn carries_message(&self) -> bool {
+        self.body
+            .as_object()
+            .is_some_and(|body| body.contains_key(MEMBER_MESSAGE))
     }
 }
 
@@ -667,10 +675,10 @@ async fn a_request_naming_a_superseded_revision_is_refused_and_writes_nothing() 
             refused.code(),
             refused.body
         );
-        assert_eq!(
+        assert!(
+            !refused.carries_message(),
+            "case {case:?}: the refusal must carry no {MEMBER_MESSAGE} member, got {:?} in {}",
             refused.message(),
-            MESSAGE_PRECONDITION_FAILED,
-            "case {case:?}: unexpected message in {}",
             refused.body
         );
         let after = emulator
@@ -761,10 +769,11 @@ async fn concurrent_writers_naming_one_revision_have_exactly_one_winner() {
                         answer.code(),
                         answer.body
                     );
-                    assert_eq!(
+                    assert!(
+                        !answer.carries_message(),
+                        "case {case:?}, caller {caller}: the refusal must carry no \
+                         {MEMBER_MESSAGE} member, got {:?} in {}",
                         answer.message(),
-                        MESSAGE_PRECONDITION_FAILED,
-                        "case {case:?}, caller {caller}: unexpected message in {}",
                         answer.body
                     );
                     refusals += 1;

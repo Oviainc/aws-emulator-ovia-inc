@@ -130,16 +130,6 @@ impl From<UpdateContentErrorModeled> for UpdateContentError {
     }
 }
 
-/// The sentence a write naming a revision the content no longer carries is refused with.
-///
-/// It is the fixed text the recorded wire answer of this endpoint carries for that class,
-/// and it carries NO value: neither the revision the request named nor the one the record
-/// holds, so a refused writer learns only that the precondition it stated did not hold —
-/// which, with the rule the member documents ("this argument acts as an optimistic lock to
-/// ensure content was not modified since it was last read"), is the whole of what it can
-/// act on.
-const MESSAGE_STALE_REVISION: &str = "Request precondition failed";
-
 /// The `UpdateContent` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -230,10 +220,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .as_deref()
             .is_some_and(|named| named != current_revision)
         {
+            // The whole of this refusal is its status and its code: the endpoint sends NO
+            // `message` for this class, and the member is optional in the model, so it is
+            // left absent rather than filled with text this service invents. A refused
+            // writer learns only that the precondition it stated did not hold — which,
+            // with the rule the member documents ("this argument acts as an optimistic
+            // lock to ensure content was not modified since it was last read"), is the
+            // whole of what it can act on.
             return Err(UpdateContentErrorModeled::PreconditionFailedException(
-                PreconditionFailedException {
-                    message: Some(MESSAGE_STALE_REVISION.to_string()),
-                },
+                PreconditionFailedException { message: None },
             )
             .into());
         }
