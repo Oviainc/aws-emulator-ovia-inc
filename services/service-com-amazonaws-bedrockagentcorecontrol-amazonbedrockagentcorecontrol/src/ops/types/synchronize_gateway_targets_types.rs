@@ -24,7 +24,16 @@ pub struct SynchronizeGatewayTargetsOutput {
     pub targets: Option<Vec<GatewayTarget>>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.bedrockagentcorecontrol#GatewayTarget")]
+/// `GatewayTarget`, the row `SynchronizeGatewayTargets` carries. Its schema and codec come
+/// from [`agentcore_schema_and_codec!`] rather than
+/// `#[smithy_macros::smithy(shape = ...)]` because `createdAt`, `updatedAt` and
+/// `lastSynchronizedAt` target `DateTimestamp`, which carries
+/// `@timestampFormat("date-time")` (`smithy_query(query="shape", shape="GatewayTarget")`),
+/// and the derive does not put that trait on a member schema — see
+/// `types/date_time_wire.rs`.
+///
+/// The member list below is the model's, member for member: same shape ids, same wire
+/// names, same order, same shape types.
 #[derive(Debug, Clone)]
 pub struct GatewayTarget {
     pub gateway_arn: String,
@@ -45,4 +54,92 @@ pub struct GatewayTarget {
     pub protocol_type: Option<String>,
     pub certificate_configurations: Option<Vec<CertificateConfiguration>>,
 }
+
+agentcore_schema_and_codec!(
+    GatewayTarget,
+    GATEWAY_TARGET_SCHEMA,
+    "com.amazonaws.bedrockagentcorecontrol#GatewayTarget",
+    "com.amazonaws.bedrockagentcorecontrol",
+    "GatewayTarget",
+    (M_GATEWAY_ARN, gateway_arn, "gatewayArn", 0, req, string),
+    (M_TARGET_ID, target_id, "targetId", 1, req, string),
+    (M_CREATED_AT, created_at, "createdAt", 2, req, date_time),
+    (M_UPDATED_AT, updated_at, "updatedAt", 3, req, date_time),
+    (M_STATUS, status, "status", 4, req, string),
+    (
+        M_STATUS_REASONS,
+        status_reasons,
+        "statusReasons",
+        5,
+        opt,
+        list_of_string
+    ),
+    (M_NAME, name, "name", 6, req, string),
+    (M_DESCRIPTION, description, "description", 7, opt, string),
+    (
+        M_TARGET_CONFIGURATION,
+        target_configuration,
+        "targetConfiguration",
+        8,
+        req,
+        union_of(TargetConfiguration)
+    ),
+    (
+        M_CREDENTIAL_PROVIDER_CONFIGURATIONS,
+        credential_provider_configurations,
+        "credentialProviderConfigurations",
+        9,
+        req,
+        list_of_struct(CredentialProviderConfiguration)
+    ),
+    (
+        M_LAST_SYNCHRONIZED_AT,
+        last_synchronized_at,
+        "lastSynchronizedAt",
+        10,
+        opt,
+        date_time
+    ),
+    (
+        M_METADATA_CONFIGURATION,
+        metadata_configuration,
+        "metadataConfiguration",
+        11,
+        opt,
+        struct_of(MetadataConfiguration)
+    ),
+    (
+        M_PRIVATE_ENDPOINT,
+        private_endpoint,
+        "privateEndpoint",
+        12,
+        opt,
+        union_of(PrivateEndpoint)
+    ),
+    (
+        M_PRIVATE_ENDPOINT_MANAGED_RESOURCES,
+        private_endpoint_managed_resources,
+        "privateEndpointManagedResources",
+        13,
+        opt,
+        list_of_struct(ManagedResourceDetails)
+    ),
+    (
+        M_AUTHORIZATION_DATA,
+        authorization_data,
+        "authorizationData",
+        14,
+        opt,
+        union_of(AuthorizationData)
+    ),
+    (M_PROTOCOL_TYPE, protocol_type, "protocolType", 15, opt, string),
+    (
+        M_CERTIFICATE_CONFIGURATIONS,
+        certificate_configurations,
+        "certificateConfigurations",
+        16,
+        opt,
+        list_of_union(CertificateConfiguration)
+    ),
+);
 

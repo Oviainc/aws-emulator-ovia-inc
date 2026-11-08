@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SynchronizeGatewayTargets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SynchronizeGatewayTargets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SynchronizeGatewayTargets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -160,18 +151,89 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SynchronizeGatewayTargets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SynchronizeGatewayTargetsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SynchronizeGatewayTargets"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SynchronizeGatewayTargetsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the gateway store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        // A gateway whose deletion the clock has already made due is gone before
+        // this call looks for it, and its targets with it.
+        store.expire_deleted_gateways_and_targets(now);
+        let gateway = store
+            .gateways
+            .get_mut(&input.gateway_identifier)
+            .ok_or_else(|| {
+                SynchronizeGatewayTargetsErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY),
+                )
+            })?;
+        let gateway_arn = gateway.gateway_arn.clone();
+        // A target is served BY the gateway, so the gateway has to be ready to
+        // serve it: while the clock still owes the gateway a transition
+        // (`CREATING`, `UPDATING`), or it is on its way out in `DELETING`, its
+        // targets are not synchronized, and the caller is told which status to
+        // wait out. The refusal is worded by the ONE helper every operation this
+        // service refuses on gateway status shares, so they cannot drift.
+        let gateway_status = gateway.status_at(now).to_string();
+        if gateway_status != crate::state::STATUS_READY {
+            return Err(SynchronizeGatewayTargetsErrorModeled::ValidationException(
+                crate::state::gateway_status_conflict(Self::NAME, &gateway_status),
+            )
+            .into());
+        }
+
+        // EVERY target the request names is resolved and judged before any one of
+        // them is written: a request naming a target that cannot be synchronized
+        // synchronizes none of them, so a caller never has to work out which half
+        // of its list took effect.
+        for target_id in &input.target_id_list {
+            // A target id naming no target OF THIS GATEWAY is the modelled 404:
+            // a target is addressed only through the gateway that serves it. A
+            // target whose deletion `DeleteGatewayTarget` has already accepted is
+            // on its way out and is no longer there to synchronize, so it is the
+            // same 404.
+            let target = gateway
+                .targets
+                .get(target_id)
+                .filter(|target| !target.is_deleting())
+                .ok_or_else(|| {
+                    SynchronizeGatewayTargetsErrorModeled::ResourceNotFoundException(
+                        crate::state::resource_not_found(crate::state::RESOURCE_GATEWAY_TARGET),
+                    )
+                })?;
+            // This operation fetches tool definitions FROM the target's endpoint,
+            // so a target whose tools do not live there — one carrying them in its
+            // own configuration, or an MCP server pinned to a static tool schema —
+            // has nothing to fetch and is refused with the modelled validation
+            // error.
+            if !crate::state::target_discovers_tool_definitions(&target.target_configuration) {
+                return Err(SynchronizeGatewayTargetsErrorModeled::ValidationException(
+                    crate::state::target_discovers_no_tool_definitions(
+                        &target.target_configuration,
+                    ),
+                )
+                .into());
+            }
+        }
+
+        let mut targets = Vec::new();
+        for target_id in &input.target_id_list {
+            // Every id was resolved against this same guard above, so each one
+            // still names a target of this gateway.
+            if let Some(target) = gateway.targets.get_mut(target_id) {
+                target.synchronize(now);
+                targets.push(target.gateway_target(&gateway_arn, now));
+            }
+        }
+
+        Ok(SynchronizeGatewayTargetsOutput {
+            targets: Some(targets),
+        })
     }
 }

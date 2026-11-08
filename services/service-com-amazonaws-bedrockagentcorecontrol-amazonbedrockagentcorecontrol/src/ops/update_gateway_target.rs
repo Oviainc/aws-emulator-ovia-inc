@@ -364,6 +364,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         record.transient_status = crate::state::STATUS_UPDATING.to_string();
         record.settled_status = crate::state::STATUS_READY.to_string();
         record.settles_at = now + crate::state::GATEWAY_SETTLE_DELAY;
+        // The status the reconfigured target settles into has no reason to report:
+        // whatever an earlier operation left behind — the reason a failed
+        // synchronization of the previous configuration carried — is not a reason
+        // for the status THIS change settles into.
+        record.settled_status_reasons.clear();
         let output = record.update_output(&gateway_arn, now);
 
         // The gateway's configuration includes the targets it serves, so

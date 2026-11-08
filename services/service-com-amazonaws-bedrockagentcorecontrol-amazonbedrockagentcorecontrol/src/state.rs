@@ -961,11 +961,26 @@ pub struct GatewayTargetRecord {
     pub transient_status: String,
     pub settled_status: String,
     pub settles_at: SystemTime,
+    /// Why the target is in the status it SETTLES into, for a status that has a
+    /// reason (the `FAILED` a synchronization that could not fetch the target's
+    /// tool definitions leaves behind); empty for a status that has none.
+    ///
+    /// Reported as `statusReasons` only once the settled status is the one the
+    /// target reports ([`GatewayTargetRecord::status_reasons_at`]): while the
+    /// clock still owes the transition, the target is in its transient status and
+    /// that status's outcome has not happened yet.
+    pub settled_status_reasons: Vec<String>,
     pub target_configuration: TargetConfiguration,
     pub credential_provider_configurations: Vec<CredentialProviderConfiguration>,
     pub metadata_configuration: Option<MetadataConfiguration>,
     pub private_endpoint: Option<PrivateEndpoint>,
     pub certificate_configurations: Option<Vec<CertificateConfiguration>>,
+    /// The instant this target's tool definitions were last fetched from its
+    /// endpoint, once `SynchronizeGatewayTargets` has fetched them; `None` for a
+    /// target nothing has synchronized yet. Reported as `lastSynchronizedAt` by
+    /// every response that carries this target, so one synchronization is
+    /// reported by the create's own envelope, a read and a listing alike.
+    pub last_synchronized_at: Option<SystemTime>,
     /// The instant an accepted deletion removes this target, once
     /// `DeleteGatewayTarget` has accepted one; `None` for a target nobody has
     /// deleted. Stored, never slept on: the removal is the clock's, materialised
@@ -991,6 +1006,17 @@ impl GatewayTargetRecord {
         }
     }
 
+    /// The `statusReasons` this target reports at `now`: the reasons of the status
+    /// it settles into, once the clock has made that status due, and `None` while
+    /// it is still in its transient status or when the settled status has no
+    /// reason — the member is reported only for a status that HAS one.
+    pub fn status_reasons_at(&self, now: SystemTime) -> Option<Vec<String>> {
+        if now < self.settles_at || self.settled_status_reasons.is_empty() {
+            return None;
+        }
+        Some(self.settled_status_reasons.clone())
+    }
+
     /// This target as `CreateGatewayTarget`'s response envelope. `gateway_arn` is
     /// the owning gateway's, which the response reports and the target itself
     /// does not store twice.
@@ -1005,14 +1031,16 @@ impl GatewayTargetRecord {
             created_at: timestamp(self.created_at),
             updated_at: timestamp(self.updated_at),
             status: self.status_at(now).to_string(),
-            status_reasons: None,
+            // Reported only for a status that HAS a reason, and only once the
+            // clock has made that status due.
+            status_reasons: self.status_reasons_at(now),
             name: self.name.clone(),
             description: self.description.clone(),
             target_configuration: self.target_configuration.clone(),
             credential_provider_configurations: self.credential_provider_configurations.clone(),
-            // Nothing has synchronized this target: `SynchronizeGatewayTargets`
-            // is the operation that would, and it is not implemented.
-            last_synchronized_at: None,
+            // The instant `SynchronizeGatewayTargets` last fetched this target's
+            // tool definitions, absent until it has fetched them once.
+            last_synchronized_at: self.last_synchronized_at.map(timestamp),
             metadata_configuration: self.metadata_configuration.clone(),
             private_endpoint: self.private_endpoint.clone(),
             // Reported for a target served through a private endpoint, which
@@ -1052,9 +1080,10 @@ impl GatewayTargetRecord {
                     .resource_priority
                     .unwrap_or(DEFAULT_TARGET_RESOURCE_PRIORITY)
             }),
-            // Nothing has synchronized this target: `SynchronizeGatewayTargets`
-            // is the operation that would, and it is not implemented.
-            last_synchronized_at: None,
+            // The instant `SynchronizeGatewayTargets` last fetched this target's
+            // tool definitions, read off the same record the single-target read
+            // reports it from, so a listing cannot drift from a read.
+            last_synchronized_at: self.last_synchronized_at.map(timestamp),
             // Carried only by a credential provider with an authorization-code
             // grant that needs user federation; none of the providers a target
             // can be created with here does.
@@ -1745,7 +1774,13 @@ pub mod runtime_logs;
 /// itself lives in. Re-exported, so a handler names `crate::state::…` for it
 /// exactly as it does for the token vault the providers belong to.
 pub mod api_key_credential_providers;
+/// Synchronizing a gateway target's tool definitions: which targets have any to
+/// fetch, how one that has none is refused, and the envelope the
+/// synchronization reports a target in. Re-exported, so a handler names
+/// `crate::state::…` for it exactly as it does for the target record itself.
+pub mod gateway_target_synchronization;
 pub use api_key_credential_providers::*;
+pub use gateway_target_synchronization::*;
 pub use memory_strategies::*;
 pub use resource_policies::*;
 pub use runtime_logs::*;

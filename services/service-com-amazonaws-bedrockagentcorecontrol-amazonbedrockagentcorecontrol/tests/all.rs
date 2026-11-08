@@ -53,6 +53,8 @@ mod gateway_target_deletion;
 mod gateway_target_listing;
 #[path = "all/gateway_target_mutation.rs"]
 mod gateway_target_mutation;
+#[path = "all/gateway_target_synchronization.rs"]
+mod gateway_target_synchronization;
 #[path = "all/gateway_target_update_validation.rs"]
 mod gateway_target_update_validation;
 #[path = "all/gateway_wire_shape.rs"]

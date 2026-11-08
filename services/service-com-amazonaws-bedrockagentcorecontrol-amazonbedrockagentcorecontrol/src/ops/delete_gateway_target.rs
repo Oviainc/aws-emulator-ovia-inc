@@ -221,6 +221,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             record.transient_status = crate::state::STATUS_DELETING.to_string();
             record.settled_status = crate::state::STATUS_DELETING.to_string();
             record.settles_at = now;
+            // `DELETING` has no reason to report, so whatever an earlier
+            // operation left behind does not travel with it.
+            record.settled_status_reasons.clear();
             record.removal_due_at = Some(now + crate::state::GATEWAY_SETTLE_DELAY);
             record.updated_at = now;
         }

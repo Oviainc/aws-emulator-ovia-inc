@@ -331,6 +331,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             transient_status: crate::state::STATUS_CREATING.to_string(),
             settled_status: crate::state::STATUS_READY.to_string(),
             settles_at: now + crate::state::GATEWAY_SETTLE_DELAY,
+            // The status a new target settles into has no reason to report.
+            settled_status_reasons: Vec::new(),
             target_configuration: input.target_configuration,
             credential_provider_configurations:
                 crate::state::effective_credential_provider_configurations(
@@ -339,6 +341,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             metadata_configuration: input.metadata_configuration,
             private_endpoint: input.private_endpoint,
             certificate_configurations: input.certificate_configurations,
+            // Nothing has synchronized this target yet:
+            // `SynchronizeGatewayTargets` is what fetches its tool definitions
+            // and stamps the instant it did.
+            last_synchronized_at: None,
             // Nothing has deleted this target: `DeleteGatewayTarget` is what
             // arms the clock-owed removal.
             removal_due_at: None,
