@@ -509,8 +509,11 @@ fn parameter_members(parameters: &[(&str, &str)]) -> Vec<(String, String)> {
 
 #[tokio::test]
 async fn a_change_set_reports_the_detail_behind_every_change_it_plans() {
-    let (router, engine) = router_with_engine();
     for case in preview_cases() {
+        // One engine per case: the base template names its log group, and CloudWatch Logs
+        // holds one group per name — so two cases deploying the same declaration are two
+        // creates of one group, which the second is refused.
+        let (router, engine) = router_with_engine();
         let name = case.case;
         let (code, body) = create_stack(&router, case.stack, &base_template(), &[]).await;
         assert_eq!(

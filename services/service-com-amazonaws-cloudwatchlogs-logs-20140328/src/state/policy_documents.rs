@@ -1,5 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
+//! The POLICY DOCUMENTS this service stores, and the rules each document is held to: the
+//! account-level policy shapes, the per-kind document checks (subscription filter, field
+//! index, transformer, metric extraction, data protection), and the selection criteria that
+//! say which log groups an account-level policy applies to.
+
 use super::*;
 
 /// Whether an ARN names an IAM role — what `OpenSearchResourceConfig$dataSourceRoleArn`

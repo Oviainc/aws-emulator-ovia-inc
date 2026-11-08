@@ -103,8 +103,8 @@ impl Emulator {
         let template = serde_json::json!({
             "Resources": {
                 "Group": {
-                    "Type": "AWS::Logs::LogGroup",
-                    "Properties": { "LogGroupName": format!("{stack_name}-group") }
+                    "Type": "AWS::CloudWatch::Alarm",
+                    "Properties": { "AlarmName": format!("{stack_name}-alarm") }
                 }
             }
         })

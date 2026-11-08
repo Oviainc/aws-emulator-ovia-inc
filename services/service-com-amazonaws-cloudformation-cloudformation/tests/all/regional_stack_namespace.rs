@@ -116,7 +116,9 @@ async fn the_same_stack_name_in_a_second_region_is_a_second_stack() {
         },
         RegionPair {
             // Neither Region is the emulator's default: the rule is about the Region the
-            // request is signed for, not about one privileged Region.
+            // request is signed for, not about one privileged Region. The resource is a
+            // topic, which each Region holds its own of, so the same template really
+            // deploys in both.
             case: "two Regions, neither the default, in JSON",
             first: "eu-central-1",
             second: "ap-southeast-2",

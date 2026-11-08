@@ -161,6 +161,8 @@ mod lookup_table_tagging;
 mod lookup_table_updates;
 #[path = "all/lookup_tables.rs"]
 mod lookup_tables;
+#[path = "all/metric_filter_dimension_refusal_wording.rs"]
+mod metric_filter_dimension_refusal_wording;
 #[path = "all/metric_filter_enumeration.rs"]
 mod metric_filter_enumeration;
 #[path = "all/metric_filter_extraction.rs"]

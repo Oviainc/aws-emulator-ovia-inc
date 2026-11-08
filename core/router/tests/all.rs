@@ -962,6 +962,10 @@ mod cloudformation_updates_lambda_functions;
 mod cloudformation_provisions_lambda_event_source_mappings;
 #[path = "all/cloudformation_lambda_versions_and_aliases.rs"]
 mod cloudformation_lambda_versions_and_aliases;
+// Declared here, in this quiet span rather than in the contended tail: the log group a stack
+// declares, with the retention it declares, in CloudWatch Logs.
+#[path = "all/cloudformation_provisions_logs_log_groups.rs"]
+mod cloudformation_provisions_logs_log_groups;
 // Declared here, in the sorted block, for the reason the entries above give: the appended
 // tail of this file is the contended region every other new suite lands in.
 #[path = "all/cloudformation_sam_http_api_definitions.rs"]

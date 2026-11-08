@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
+//! The LOG ANOMALY DETECTORS this account holds, and the LOOKUP TABLES their queries enrich
+//! log events from, as they are stored.
+
 use super::*;
 
 /// One log anomaly detector — "one anomaly detector in the account" — as it is stored.
