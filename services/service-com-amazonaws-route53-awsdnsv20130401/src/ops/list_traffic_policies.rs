@@ -90,14 +90,20 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{StoredTrafficPolicy, MAX_TRAFFIC_POLICIES};
+use crate::state::{StoredTrafficPolicy, DEFAULT_PAGE_SIZE, MAX_TRAFFIC_POLICIES};
 
 /// The most traffic policy summaries one response carries.
 ///
 /// `ListTrafficPoliciesRequest$MaxItems` publishes no ceiling of its own, and
 /// the whole listing is bounded by the account's traffic policy quota
 /// ([`MAX_TRAFFIC_POLICIES`]) — the account cannot hold more policies than that
-/// — so no page can be larger than it, whatever `maxitems` asks for.
+/// — so no page can be larger than it, whatever `maxitems` asks for. It is a
+/// bound on the WORK, not the size the caller is answered with: a request
+/// naming no `maxitems` asks for [`DEFAULT_PAGE_SIZE`] and reads that back,
+/// even where this quota cuts the page it is served shorter. Nothing observable
+/// turns on the difference, because a listing the quota cuts short cannot
+/// exist: the account holds at most that many policies, so such a page is
+/// never truncated.
 const MAX_PAGE_SIZE: i32 = MAX_TRAFFIC_POLICIES as i32;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -202,11 +208,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let page_size = input
             .max_items
-            .unwrap_or(MAX_PAGE_SIZE)
+            .unwrap_or(DEFAULT_PAGE_SIZE)
             .clamp(1, MAX_PAGE_SIZE);
-        // Route 53 echoes the `maxitems` the caller asked for; the clamped
-        // `page_size` above only bounds the work and the response size.
-        let reported_max_items = input.max_items.unwrap_or(MAX_PAGE_SIZE);
+        // Route 53 echoes "the value that you specified for the MaxItems
+        // parameter", and the default page size a request that specified none
+        // asked for; the clamped `page_size` above only bounds the work and the
+        // response size.
+        let reported_max_items = input.max_items.unwrap_or(DEFAULT_PAGE_SIZE);
         let marker = input
             .traffic_policy_id_marker
             .as_deref()

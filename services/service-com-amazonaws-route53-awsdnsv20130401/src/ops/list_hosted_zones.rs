@@ -93,13 +93,17 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{no_such_delegation_set, normalize_delegation_set_id, normalize_zone_id};
+use crate::state::{
+    no_such_delegation_set, normalize_delegation_set_id, normalize_zone_id, DEFAULT_PAGE_SIZE,
+};
 
 /// The most hosted zones one response carries.
 ///
 /// The operation's own documentation: "Amazon Route 53 returns a maximum of 100
 /// items in each response. If you have a lot of hosted zones, you can use the
-/// maxitems parameter to list them in groups of up to 100."
+/// maxitems parameter to list them in groups of up to 100." It CAPS the size a
+/// request may ask for; the size a request asking for none is served is
+/// [`DEFAULT_PAGE_SIZE`].
 const MAX_PAGE_SIZE: i32 = 100;
 
 /// The one `HostedZoneType` the model declares, which selects private zones.
@@ -193,11 +197,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let page_size = input
             .max_items
-            .unwrap_or(MAX_PAGE_SIZE)
+            .unwrap_or(DEFAULT_PAGE_SIZE)
             .clamp(1, MAX_PAGE_SIZE);
-        // Route 53 echoes the `maxitems` the caller asked for; the clamped
+        // Route 53 echoes the `maxitems` the caller asked for, and the default
+        // page size it applied when the caller asked for none; the clamped
         // `page_size` above only bounds the work and the response size.
-        let reported_max_items = input.max_items.unwrap_or(MAX_PAGE_SIZE);
+        let reported_max_items = input.max_items.unwrap_or(DEFAULT_PAGE_SIZE);
         // `Marker` is the hosted zone id the previous page stopped before; the
         // response echoes it verbatim, so it is kept as the caller sent it.
         let marker = input.marker.clone().unwrap_or_default();

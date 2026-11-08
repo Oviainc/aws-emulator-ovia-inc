@@ -330,6 +330,21 @@ pub const MAX_VPC_ASSOCIATION_AUTHORIZATIONS: usize = 1_000;
 /// page."
 pub const MAX_VPC_AUTHORIZATIONS_PER_PAGE: i32 = 50;
 
+/// The page size a `maxitems`-paged listing serves, and reports in its required
+/// `MaxItems`, when the request names no `maxitems` of its own.
+///
+/// Route 53 pages a listing of account resources a hundred items at a time
+/// unless the caller asks for a size: the `maxitems` ceilings the individual
+/// operations publish ("Amazon Route 53 returns a maximum of 1000 items" on
+/// `ListHealthChecksRequest$MaxItems`, say) CAP what a request may ask for, they
+/// are not the size a request that asks for nothing is served. Shared by every
+/// listing in this service, so the default page size is stated once rather than
+/// reinvented per operation; a listing whose own documentation publishes a
+/// different default (`ListResourceRecordSets`' "returns up to 300 resource
+/// record sets at a time", `ListVPCAssociationAuthorizations`' 50 per page) uses
+/// the documented one instead.
+pub const DEFAULT_PAGE_SIZE: i32 = 100;
+
 /// The most reusable delegation sets the account may hold.
 ///
 /// Route 53's documented account quota ("Reusable delegation sets: 100 per
@@ -896,24 +911,29 @@ impl StoredZone {
             linked_service: None,
             // Read off the zone, so what the last accepted features update left
             // is what every hosted-zone read reports.
-            features: self.to_hosted_zone_features(),
+            features: Some(self.to_hosted_zone_features()),
         }
     }
 
     /// The `Features` a hosted-zone read reports for this zone.
     ///
-    /// Present once `UpdateHostedZoneFeatures` has configured the zone, and
-    /// absent while nothing has: `HostedZone$Features` has no default, so a zone
-    /// with no features configuration reports the container absent rather than
-    /// an invented status. `FailureReasons` stays absent because no features
-    /// change this store accepts fails.
-    pub fn to_hosted_zone_features(&self) -> Option<HostedZoneFeatures> {
-        self.accelerated_recovery
-            .as_ref()
-            .map(|feature| HostedZoneFeatures {
-                accelerated_recovery_status: Some(feature.status().to_string()),
-                failure_reasons: None,
-            })
+    /// The container itself is ALWAYS reported — Route 53 projects the
+    /// `Features` structure on every hosted zone it answers with — so a client
+    /// deserialising `HostedZone` into a strict shape always finds the member,
+    /// and "no feature configured" is distinguishable from "not reported". Its
+    /// MEMBERS are what the zone's state decides: `AcceleratedRecoveryStatus`
+    /// has no default, so it is reported only once `UpdateHostedZoneFeatures`
+    /// has configured the zone and the container is otherwise empty, and
+    /// `FailureReasons` stays absent because no features change this store
+    /// accepts fails.
+    pub fn to_hosted_zone_features(&self) -> HostedZoneFeatures {
+        HostedZoneFeatures {
+            accelerated_recovery_status: self
+                .accelerated_recovery
+                .as_ref()
+                .map(|feature| feature.status().to_string()),
+            failure_reasons: None,
+        }
     }
 
     /// Whether accelerated recovery is the setting the zone holds or is moving

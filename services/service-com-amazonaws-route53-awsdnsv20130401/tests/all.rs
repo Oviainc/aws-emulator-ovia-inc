@@ -76,6 +76,10 @@ mod hosted_zone_config;
 mod hosted_zone_count;
 #[path = "all/hosted_zone_features.rs"]
 mod hosted_zone_features;
+// Declared beside the features suite: this one is the `Features` CONTAINER every
+// hosted-zone projection carries, which the setting suite's tables do not ask about.
+#[path = "all/hosted_zone_features_envelope.rs"]
+mod hosted_zone_features_envelope;
 #[path = "all/hosted_zone_limits.rs"]
 mod hosted_zone_limits;
 #[path = "all/hosted_zone_records.rs"]
@@ -84,6 +88,10 @@ mod hosted_zone_records;
 mod hosted_zones_by_name;
 #[path = "all/hosted_zones_by_vpc.rs"]
 mod hosted_zones_by_vpc;
+// Declared beside the listing suites: this one is the page size every
+// `maxitems`-paged listing reports, across all of them at once.
+#[path = "all/listing_page_size_echo.rs"]
+mod listing_page_size_echo;
 #[path = "all/reference_catalogs.rs"]
 mod reference_catalogs;
 #[path = "all/refusal_message_rules.rs"]

@@ -80,14 +80,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::normalize_delegation_set_id;
+use crate::state::{normalize_delegation_set_id, DEFAULT_PAGE_SIZE};
 
 /// The most reusable delegation sets one response carries.
 ///
 /// `ListReusableDelegationSetsRequest$MaxItems`'s own documentation: "The number
 /// of reusable delegation sets that you want Amazon Route 53 to return in the
 /// response to this request. If you specify a value greater than 100, Route 53
-/// returns only the first 100 reusable delegation sets."
+/// returns only the first 100 reusable delegation sets." It CAPS the size a
+/// request may ask for; the size a request asking for none is served is
+/// [`DEFAULT_PAGE_SIZE`].
 const MAX_PAGE_SIZE: i32 = 100;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -168,11 +170,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let page_size = input
             .max_items
-            .unwrap_or(MAX_PAGE_SIZE)
+            .unwrap_or(DEFAULT_PAGE_SIZE)
             .clamp(1, MAX_PAGE_SIZE);
         // Route 53 echoes the `maxitems` the caller asked for; the clamped
         // `page_size` above only bounds the work and the response size.
-        let reported_max_items = input.max_items.unwrap_or(MAX_PAGE_SIZE);
+        let reported_max_items = input.max_items.unwrap_or(DEFAULT_PAGE_SIZE);
         // `Marker` is "the ID of the first reusable delegation set that Amazon
         // Route 53 will return if you submit another request", so a page RESUMES
         // at it, and the response echoes it back as the caller sent it.

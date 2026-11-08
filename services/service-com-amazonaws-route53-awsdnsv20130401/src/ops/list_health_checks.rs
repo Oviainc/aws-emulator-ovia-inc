@@ -89,13 +89,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::monitored_alarm;
+use crate::state::{monitored_alarm, DEFAULT_PAGE_SIZE};
 
 /// The most health checks one response carries.
 ///
 /// `ListHealthChecksRequest$MaxItems`'s own documentation: "Amazon Route 53
 /// returns a maximum of 1000 items. If you set MaxItems to a value greater than
-/// 1000, Route 53 returns only the first 1000 health checks."
+/// 1000, Route 53 returns only the first 1000 health checks." It CAPS the size a
+/// request may ask for; the size a request asking for none is served is
+/// [`DEFAULT_PAGE_SIZE`].
 const MAX_PAGE_SIZE: i32 = 1_000;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -177,11 +179,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let page_size = input
             .max_items
-            .unwrap_or(MAX_PAGE_SIZE)
+            .unwrap_or(DEFAULT_PAGE_SIZE)
             .clamp(1, MAX_PAGE_SIZE);
-        // Route 53 echoes the `maxitems` the caller asked for; the clamped
+        // Route 53 echoes the `maxitems` the caller asked for, and the default
+        // page size it applied when the caller asked for none; the clamped
         // `page_size` above only bounds the work and the response size.
-        let reported_max_items = input.max_items.unwrap_or(MAX_PAGE_SIZE);
+        let reported_max_items = input.max_items.unwrap_or(DEFAULT_PAGE_SIZE);
         // `Marker` is "the ID of the first health check that Amazon Route 53 will
         // return if you submit another request", so a page RESUMES at it, and the
         // response echoes it verbatim.
@@ -227,8 +230,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             marker,
             is_truncated: next_marker.is_some(),
             next_marker,
-            // The echoed `maxitems`, so a request outside the documented range
-            // reads its own value back while the page itself stays clamped.
+            // The echoed `maxitems`, or the default page size when the request
+            // named none, so a request outside the documented range reads its
+            // own value back while the page itself stays clamped.
             max_items: reported_max_items,
         })
     }

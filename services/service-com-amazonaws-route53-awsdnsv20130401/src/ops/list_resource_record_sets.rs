@@ -128,11 +128,14 @@ use super::types::*;
 
 use crate::state::{dns_sort_key, no_such_hosted_zone, normalize_zone_id, RecordKey};
 
-/// The most record sets one response carries.
+/// The most record sets one response carries, and the page size a request that
+/// names no `maxitems` is served and answered with.
 ///
 /// The operation's own documentation: "ListResourceRecordSets returns up to 300
 /// resource record sets at a time in ASCII order, beginning at a position
-/// specified by the name and type elements."
+/// specified by the name and type elements." This listing therefore publishes a
+/// page size of its own, rather than taking the service-wide
+/// [`crate::state::DEFAULT_PAGE_SIZE`] its siblings are served in.
 const MAX_PAGE_SIZE: i32 = 300;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative

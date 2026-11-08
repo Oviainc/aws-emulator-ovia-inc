@@ -110,12 +110,13 @@ const MAX_PAGE_SIZE: i32 = MAX_TRAFFIC_POLICY_VERSION;
 ///
 /// `MaxItems` is required in the output while `maxitems` is optional in the
 /// input, so a request naming none is still answered with a `MaxItems`: the
-/// page size the service applied, which is the hundred-item default page every
-/// Route 53 listing is served in when the caller asks for no size of its own.
+/// page size the service applied, which is the service-wide
+/// [`crate::state::DEFAULT_PAGE_SIZE`] every Route 53 listing is served in when
+/// the caller asks for no size of its own.
 ///
 /// `pub` so this crate's tests assert against the value the handler serves
 /// rather than a copy of it.
-pub const DEFAULT_PAGE_SIZE: i32 = 100;
+pub const DEFAULT_PAGE_SIZE: i32 = crate::state::DEFAULT_PAGE_SIZE;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the

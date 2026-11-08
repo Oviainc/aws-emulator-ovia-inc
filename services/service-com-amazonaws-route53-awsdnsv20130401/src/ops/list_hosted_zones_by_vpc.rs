@@ -99,14 +99,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::invalid_pagination_token;
+use crate::state::{invalid_pagination_token, DEFAULT_PAGE_SIZE};
 
 /// The most hosted zones one page carries.
 ///
 /// Route 53's listing convention, which its sibling `ListHostedZones` states in
 /// its own documentation: "Amazon Route 53 returns a maximum of 100 items in
 /// each response. If you have a lot of hosted zones, you can use the maxitems
-/// parameter to list them in groups of up to 100."
+/// parameter to list them in groups of up to 100." It CAPS the size a request
+/// may ask for; the size a request asking for none is served is
+/// [`DEFAULT_PAGE_SIZE`].
 const MAX_PAGE_SIZE: i32 = 100;
 
 /// The first character of a hosted-zone id (`Z1D633PJN98FT9`), and so of the
@@ -240,12 +242,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let page_size = input
             .max_items
-            .unwrap_or(MAX_PAGE_SIZE)
+            .unwrap_or(DEFAULT_PAGE_SIZE)
             .clamp(1, MAX_PAGE_SIZE);
         // "The value that you specified for MaxItems in the most recent
         // ListHostedZonesByVPC request" — echoed as sent, while `page_size`
         // above bounds the work and the response size.
-        let reported_max_items = input.max_items.unwrap_or(MAX_PAGE_SIZE);
+        let reported_max_items = input.max_items.unwrap_or(DEFAULT_PAGE_SIZE);
 
         let store = state.lock();
         // Zones are keyed by id in a `BTreeMap`, so this walk is a stable total

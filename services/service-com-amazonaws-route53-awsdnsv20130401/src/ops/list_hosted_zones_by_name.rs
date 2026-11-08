@@ -125,13 +125,16 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use crate::state::{dns_name_problem, dns_sort_key, normalize_zone_id, DnsNameKey, StoredZone};
+use crate::state::{
+    dns_name_problem, dns_sort_key, normalize_zone_id, DnsNameKey, StoredZone, DEFAULT_PAGE_SIZE,
+};
 
 /// The most hosted zones one response carries.
 ///
 /// The operation's own documentation: "Route 53 returns up to 100 items in each
 /// response. If you have a lot of hosted zones, use the MaxItems parameter to
-/// list them in groups of up to 100."
+/// list them in groups of up to 100." It CAPS the size a request may ask for;
+/// the size a request asking for none is served is [`DEFAULT_PAGE_SIZE`].
 const MAX_PAGE_SIZE: i32 = 100;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
@@ -252,11 +255,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let page_size = input
             .max_items
-            .unwrap_or(MAX_PAGE_SIZE)
+            .unwrap_or(DEFAULT_PAGE_SIZE)
             .clamp(1, MAX_PAGE_SIZE);
         // Route 53 echoes the `maxitems` the caller asked for; the clamped
         // `page_size` above only bounds the work and the response size.
-        let reported_max_items = input.max_items.unwrap_or(MAX_PAGE_SIZE);
+        let reported_max_items = input.max_items.unwrap_or(DEFAULT_PAGE_SIZE);
 
         // "The results begin with the first hosted zone whose name is greater
         // than or equal to dnsname": the page starts at the requested name, and

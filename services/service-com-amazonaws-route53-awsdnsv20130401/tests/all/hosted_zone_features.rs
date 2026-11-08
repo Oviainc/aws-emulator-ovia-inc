@@ -10,8 +10,8 @@
 //! what the last accepted update left. A request that asks for the setting the
 //! zone already holds changes nothing and is refused as invalid input, as is
 //! turning the feature on for a zone it does not apply to; an id that names no
-//! zone is a not-found, and a zone nobody configured reports no features
-//! container at all.
+//! zone is a not-found, and a zone nobody configured reports no accelerated
+//! recovery status at all.
 //!
 //! One zone and one setting are ONE row of that class, so the tables below span
 //! it: zones differing in label count, in public/private and in their position
@@ -168,8 +168,8 @@ async fn a_features_update_persists_and_every_hosted_zone_read_reports_it() {
     let mut ids = Vec::new();
     for (case, name) in zones {
         let id = create_zone_ok(&router, name, &format!("features-persist-{case}")).await;
-        // A zone nobody has configured reports no features container: the
-        // member has no default, so there is nothing to report yet.
+        // A zone nobody has configured reports no accelerated recovery status:
+        // the member has no default, so there is nothing to report yet.
         let fresh = get_zone(&router, &id).await;
         assert!(
             reported_status(&fresh).is_none(),
@@ -356,8 +356,8 @@ async fn accelerated_recovery_cannot_be_enabled_for_a_private_hosted_zone() {
         let read = get_zone(&router, &id).await;
         assert!(
             reported_status(&read).is_none(),
-            "case {case:?}: a refused enable must leave the zone with no features \
-             configuration, got {:?} with body {}",
+            "case {case:?}: a refused enable must leave the zone with no accelerated \
+             recovery status, got {:?} with body {}",
             reported_status(&read),
             read.body
         );
@@ -445,7 +445,7 @@ async fn an_update_for_an_id_that_names_no_zone_is_a_not_found() {
     let read = get_zone(&router, &real).await;
     assert!(
         reported_status(&read).is_none(),
-        "the untouched zone must still report no features configuration, got {:?} with body {}",
+        "the untouched zone must still report no accelerated recovery status, got {:?} with body {}",
         reported_status(&read),
         read.body
     );
