@@ -310,6 +310,11 @@ async fn the_published_level_decides_which_planes_a_quota_has() {
             global_quota: false,
             adjustable_at_level: (*level).to_string(),
             context_scope_type: resource_plane.then(|| "AWS::Elasticsearch::Domain".to_string()),
+            // The scope this quota publishes on its account-wide record: the account,
+            // which is what a quota whose value is managed for the account reports (the
+            // published-per-resource case is driven over the wire by
+            // `recorded_default_catalog_rows.rs`).
+            account_record_context_scope: CONTEXT_SCOPE_ACCOUNT.to_string(),
             usage_metric: None,
             period: None,
             description: None,

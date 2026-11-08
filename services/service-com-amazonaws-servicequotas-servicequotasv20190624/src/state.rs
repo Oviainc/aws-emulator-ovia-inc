@@ -498,6 +498,11 @@ pub struct DefaultQuota {
     /// plane applies to. `None` for a quota adjustable at the account level only,
     /// which has no such plane.
     pub context_scope_type: Option<String>,
+    /// `QuotaContextInfo$ContextScope` the quota publishes on the record that names NO
+    /// resource: `ACCOUNT` for a quota whose value is managed for the account, and
+    /// `RESOURCE` for one AWS publishes as a quota OF A RESOURCE even there (see
+    /// [`Self::context_info`]).
+    pub account_record_context_scope: String,
     /// `UsageMetric`, for the quotas AWS publishes a CloudWatch usage metric for.
     pub usage_metric: Option<MetricInfo>,
     /// `Period`: the window the quota's value is measured over — the rate denominator
@@ -521,6 +526,7 @@ impl DefaultQuota {
             global_quota: row.global_quota,
             adjustable_at_level: row.adjustable_at_level,
             context_scope_type: row.context_scope_type,
+            account_record_context_scope: row.account_record_context_scope,
             usage_metric: row.usage_metric,
             period: row.period,
             description: row.description,
@@ -563,23 +569,22 @@ impl DefaultQuota {
     /// so it carries NO context, which is what `QuotaContextInfo`'s own documentation
     /// says of a quota managed at the account level for each Region. Any other quota
     /// carries one, describing the plane the record answers for: `RESOURCE` scope
-    /// naming the resource asked for, or `ACCOUNT` scope for the account-wide record of
-    /// a quota that HAS an account-wide plane ([`Self::has_plane`]). It is the SAME
-    /// predicate the record's `QuotaAppliedAtLevel` is derived from, so the two cannot
-    /// disagree about which plane the record is.
+    /// naming the resource asked for, or the scope the CATALOG publishes for the
+    /// quota's account-wide record ([`Self::account_record_context_scope`]) — `ACCOUNT`
+    /// for a quota whose value is managed for the account, and `RESOURCE` for one the
+    /// service publishes as a quota OF A RESOURCE whichever record is read, since the
+    /// context describes the plane the quota is COUNTED on rather than the record that
+    /// was read. A quota whose value can only ever be applied to an individual resource
+    /// has no account-wide plane to answer on ([`Self::has_plane`]), so its records
+    /// report `RESOURCE` however they were read.
     pub fn context_info(&self, context: Option<&str>) -> Option<QuotaContextInfo> {
         if !self.resource_adjustable() {
             return None;
         }
-        // The scope is the plane the record answers for, and a record never names a
-        // plane the quota does not have: a record read for a resource answers at
-        // `RESOURCE` scope, and so does every record of a quota whose value can only
-        // ever be applied to an individual resource, which has no account-wide plane to
-        // answer on. Only a quota that HAS that plane reports `ACCOUNT` scope.
         let scope = if context.is_some() || !self.account_adjustable() {
             CONTEXT_SCOPE_RESOURCE
         } else {
-            CONTEXT_SCOPE_ACCOUNT
+            &self.account_record_context_scope
         };
         Some(QuotaContextInfo {
             context_scope: Some(scope.to_string()),
@@ -2799,6 +2804,9 @@ struct QuotaRow {
     /// `QuotaContextInfo$ContextScopeType`: the resource type the quota's
     /// per-resource plane applies to, for a row that has one.
     context_scope_type: Option<String>,
+    /// `QuotaContextInfo$ContextScope` the quota publishes on the record that names no
+    /// resource (see [`DefaultQuota::context_info`]).
+    account_record_context_scope: String,
     /// `UsageMetric`, for a quota CloudWatch publishes usage for.
     usage_metric: Option<MetricInfo>,
     /// `Period`, for a quota AWS publishes as a RATE (so many per unit of time).
@@ -2818,6 +2826,7 @@ fn quota(name: impl Into<String>, value: f64) -> QuotaRow {
         global_quota: false,
         adjustable_at_level: LEVEL_ACCOUNT.to_string(),
         context_scope_type: None,
+        account_record_context_scope: CONTEXT_SCOPE_ACCOUNT.to_string(),
         usage_metric: None,
         period: None,
         description: None,
@@ -2860,6 +2869,20 @@ impl QuotaRow {
     fn adjustable_at(mut self, level: &str, context_scope_type: &str) -> Self {
         self.adjustable_at_level = level.to_string();
         self.context_scope_type = Some(context_scope_type.to_string());
+        self
+    }
+
+    /// AWS publishes this quota as a quota OF A RESOURCE: every record of it reports
+    /// the `RESOURCE` context scope, including the one that names no resource.
+    ///
+    /// The scope describes the plane the quota is COUNTED on, which for such a quota is
+    /// the resource whatever record is read — so it is a published fact of the row
+    /// rather than something derived from the level an increase may be asked for at
+    /// (see [`DefaultQuota::context_info`]). A row that does not name this reports the
+    /// `ACCOUNT` scope on its account-wide record, which is what a quota managed for
+    /// the account reports.
+    fn counted_per_resource(mut self) -> Self {
+        self.account_record_context_scope = CONTEXT_SCOPE_RESOURCE.to_string();
         self
     }
 
@@ -3309,6 +3332,26 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         // ([`batch_quotas`], [`cassandra_quotas`], [`cloud9_quotas`],
         // [`cloudhsm_quotas`], [`cloudtrail_quotas`], [`codeartifact_quotas`],
         // [`codedeploy_quotas`], [`codepipeline_quotas`]).
+        //
+        // And it covers eight further services whose recorded default-quota listings
+        // key every row on an AWS `L-` code and report this catalog's descriptive row
+        // as a surplus entry: `cognito-identity/IdentityPools`,
+        // `cognito-idp/UserPoolsPerAccount`, `cognito-idp/AppClientsPerUserPool`,
+        // `comprehend/CustomClassifiersPerAccount`, `dax/NodesPerCluster`,
+        // `directconnect/ConnectionsPerRegion`, `dms/Endpoints`,
+        // `dms/ReplicationInstances`, `docdb/Clusters`, `docdb/InstancesPerCluster`
+        // and `quicksight/Datasets`. Each stand-in is dropped and the quotas that
+        // evidence states under AWS's own codes are published in its place
+        // ([`cognito_identity_quotas`], [`cognito_idp_quotas`],
+        // [`comprehend_quotas`], [`dax_quotas`], [`directconnect_quotas`],
+        // [`dms_quotas`], [`docdb_quotas`], [`quicksight_quotas`]) — the DAX node
+        // plane among them, which keeps its name and value under AWS's own code. The
+        // user-pool resource-server row this catalog used to key on `L-7CDAF993` is
+        // withdrawn with them: that evidence publishes the code as one of the
+        // service's CATEGORY request-rate quotas, and the category it names is not
+        // among the data available here, so the code is left to the
+        // default-quota-set gap rather than resolving the per-user-pool plane of
+        // another quota.
         service(
             "b2bi",
             "B2B Data Interchange",
@@ -3386,26 +3429,14 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
         service(
             "cognito-identity",
             "Amazon Cognito Federated Identities",
-            vec![quota("Identity pools", 1000.0)],
+            cognito_identity_quotas(),
         ),
         service(
             "cognito-idp",
             "Amazon Cognito User Pools",
-            vec![
-                quota("User pools per account", 1000.0),
-                quota("App clients per user pool", 1000.0),
-                // AWS publishes the resource-server quota of a user pool under
-                // this code ("Quotas in Amazon Cognito", Amazon Cognito
-                // Developer Guide), so a client holding a code read out of AWS's
-                // catalog resolves the quota it names here too.
-                quota("Resource servers per user pool", 25.0).code("L-7CDAF993"),
-            ],
+            cognito_idp_quotas(),
         ),
-        service(
-            "comprehend",
-            "Amazon Comprehend",
-            vec![quota("Custom classifiers per account", 10.0)],
-        ),
+        service("comprehend", "Amazon Comprehend", comprehend_quotas()),
         service(
             "config",
             "AWS Config",
@@ -3416,32 +3447,18 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "Amazon Connect",
             vec![quota("Amazon Connect instances per account", 5.0)],
         ),
-        service(
-            "dax",
-            "Amazon DynamoDB Accelerator (DAX)",
-            vec![quota("Nodes per cluster", 11.0).fixed()],
-        ),
+        service("dax", "Amazon DynamoDB Accelerator (DAX)", dax_quotas()),
         service(
             "directconnect",
             "AWS Direct Connect",
-            vec![quota("Connections per Region", 10.0)],
+            directconnect_quotas(),
         ),
         service(
             "dms",
             "AWS Database Migration Service",
-            vec![
-                quota("Replication instances", 20.0),
-                quota("Endpoints", 1000.0),
-            ],
+            dms_quotas(),
         ),
-        service(
-            "docdb",
-            "Amazon DocumentDB",
-            vec![
-                quota("Clusters", 40.0),
-                quota("Instances per cluster", 16.0),
-            ],
-        ),
+        service("docdb", "Amazon DocumentDB", docdb_quotas()),
         service("ds", "AWS Directory Service", ds_quotas()),
         service("dynamodb", "Amazon DynamoDB", dynamodb_quotas()),
         service(
@@ -3678,11 +3695,7 @@ fn seed_quota_catalog() -> Vec<CatalogService> {
             "Amazon Quantum Ledger Database (Amazon QLDB)",
             vec![quota("Ledgers per Region", 5.0)],
         ),
-        service(
-            "quicksight",
-            "Amazon QuickSight",
-            vec![quota("Datasets", 1000.0)],
-        ),
+        service("quicksight", "Amazon QuickSight", quicksight_quotas()),
         service(
             "ram",
             "AWS Resource Access Manager (AWS RAM)",
