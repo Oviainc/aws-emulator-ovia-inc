@@ -658,24 +658,50 @@ async fn a_listing_selects_on_each_documented_filter_and_owner() {
         );
     }
 
-    let refusals: Vec<(&str, Value)> = vec![
+    // (case, the request, the error code the refusal carries): a filter naming a member
+    // this operation does not filter on is a value the `filters` parameter does not admit,
+    // which this service refuses as that parameter's value; a filter that is not a filter
+    // at all — no name, no values — is a malformed request.
+    let refusals: Vec<(&str, Value, &str)> = vec![
         (
             "a filter name this operation does not filter on",
             json!({"filters": [{"name": "owner", "values": ["Self"]}]}),
+            "InvalidParameterValueException",
         ),
         (
             "a filter with no values",
             json!({"filters": [{"name": "name"}]}),
+            "InvalidRequestException",
         ),
         (
             "a filter with no name",
             json!({"filters": [{"values": ["alpha-component"]}]}),
+            "InvalidRequestException",
         ),
     ];
-    for (case, body) in refusals {
+    for (case, body, code) in refusals {
         let (status, refused) = list_components(&router, &body).await;
-        assert_refused(case, status, &refused, 400, "InvalidRequestException");
+        assert_refused(case, status, &refused, 400, code);
     }
+
+    // The refusal of an unsupported filter states the parameter and the filters this
+    // operation allows, and echoes neither the name the request carried nor any value.
+    let (_, refused) = list_components(
+        &router,
+        &json!({"filters": [{"name": "owner", "values": ["Self"]}]}),
+    )
+    .await;
+    let message = refused
+        .get("message")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    assert_eq!(
+        message,
+        "The value supplied for parameter 'filters' is not valid. Allowed filters for \
+         ListComponents are: name, version, description, platform, type, supportedOsVersion, \
+         productCodes, status.",
+        "case \"the unsupported-filter refusal\": got {message:?}"
+    );
 }
 
 #[tokio::test]
@@ -794,7 +820,7 @@ async fn a_listing_pages_through_what_it_selected_under_a_token_of_its_own() {
         } else {
             list_components(&router, &body).await
         };
-        assert_refused(case, status, &refused, 400, "InvalidPaginationTokenException");
+        assert_refused(case, status, &refused, 400, "InvalidParameterValueException");
     }
 }
 
@@ -1044,6 +1070,6 @@ async fn a_build_version_listing_pages_under_a_token_of_its_own() {
     ];
     for (case, region, body) in tokens {
         let (status, refused) = list_build_versions_in(&router, region, &body).await;
-        assert_refused(case, status, &refused, 400, "InvalidPaginationTokenException");
+        assert_refused(case, status, &refused, 400, "InvalidParameterValueException");
     }
 }

@@ -285,7 +285,7 @@ async fn a_value_the_model_does_not_admit_is_refused_as_that_parameters_value() 
             "/ListComponents".to_string(),
             Some(json!({"maxResults": 0})),
             "maxResults",
-            "maxResults must be greater than or equal to 1".to_string(),
+            "maxResults must be bigger than or equal to 1".to_string(),
         ),
         (
             "a test timeout above the modelled maximum, inside a structure member",
@@ -316,7 +316,7 @@ async fn a_value_the_model_does_not_admit_is_refused_as_that_parameters_value() 
                 "imageTestsConfiguration": {"timeoutMinutes": 59},
             })),
             "imageTestsConfiguration.timeoutMinutes",
-            "imageTestsConfiguration.timeoutMinutes must be greater than or equal to 60"
+            "imageTestsConfiguration.timeoutMinutes must be bigger than or equal to 60"
                 .to_string(),
         ),
         (

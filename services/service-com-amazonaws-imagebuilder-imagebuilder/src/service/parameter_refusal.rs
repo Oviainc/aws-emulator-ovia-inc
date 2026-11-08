@@ -26,6 +26,8 @@
 //! class they do not — a `@length` bound, a repeated element of a `@uniqueItems` list, a
 //! member the shape requires and the request omits — is left to the framework's own
 //! refusal rather than being given a clause this service has never been seen to state.
+//! One of them, the `@range` MINIMUM, this service words its own way
+//! ([`must_be_at_least`]); every other clause is the shared statement of it.
 //!
 //! ## How it quotes an ARN expression, and why that is per BINDING
 //!
@@ -54,7 +56,7 @@
 
 use service_common::validation::SubmittedEcho;
 use service_common::validation_message::{
-    api_parameter_path, must_be_at_least, must_be_at_most, must_be_one_of, must_match_pattern,
+    api_parameter_path, must_be_at_most, must_be_one_of, must_match_pattern,
     parameter_value_mismatch, pattern_requirement_unstated,
 };
 use smithy_server_runtime::{Refused, Violation, ViolationKind};
@@ -125,6 +127,18 @@ impl StatedPattern {
             ),
         }
     }
+}
+
+/// The requirement clause this service states for a value below its member's `@range`
+/// minimum: the bound the value had to reach.
+///
+/// Image Builder's own wording for this clause is "bigger than or equal to", which is not
+/// how the shared statement of it reads ("greater than or equal to"), so it is stated here
+/// rather than taken from `service_common::validation_message`. Its sibling — a value above
+/// the maximum — is the shared clause ([`must_be_at_most`]), which Image Builder words the
+/// same way the rest of the tree does.
+fn must_be_at_least(member: &str, bound: &str) -> String {
+    format!("{member} must be bigger than or equal to {bound}")
 }
 
 /// The requirement clause this service states for `violation`, naming the parameter as
@@ -314,7 +328,7 @@ mod tests {
                 violation("maxResults", ViolationKind::MinValue("1".to_owned())),
                 Some(
                     "The value supplied for parameter 'maxResults' is not valid. maxResults \
-                     must be greater than or equal to 1",
+                     must be bigger than or equal to 1",
                 ),
             ),
             (

@@ -118,13 +118,23 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-imagebuilder-imagebuild
 // here — hence the `ListImageRecipesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.imagebuilder#ListImageRecipes")]
+// `InvalidParameterValueException` is widened in through `extra_errors`: the SERVICE models
+// that shape (a client error, `@httpError` 400 — "The value that you provided for the
+// specified parameter is invalid.") and other operations declare it, while this operation's
+// own error list does not. It is the class Image Builder refuses a parameter of this request
+// with, which is what a filter naming a member this listing does not filter on is — a value
+// its `filters` parameter does not admit.
+#[smithy_macros::operation_error(
+    "com.amazonaws.imagebuilder#ListImageRecipes",
+    extra_errors = ["InvalidParameterValueException"]
+)]
 #[derive(Debug)]
 pub enum ListImageRecipesErrorModeled {
     CallRateLimitExceededException(CallRateLimitExceededException),
     ClientException(ClientException),
     ForbiddenException(ForbiddenException),
     InvalidPaginationTokenException(InvalidPaginationTokenException),
+    InvalidParameterValueException(InvalidParameterValueException),
     InvalidRequestException(InvalidRequestException),
     ServiceException(ServiceException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -192,6 +202,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx.parts());
 
+        // The secret this store authenticates its page tokens under, taken off the store so
+        // a `nextToken` is minted and read back as the opaque value this store issued.
+        let page_token_key = state.lock().page_token_key;
+
         // Each filter names one member and the values it admits. An unnamed filter, one
         // with no values, and a name this operation does not filter on are all refused
         // rather than ignored: a filter nothing applies would answer with recipes the
@@ -214,10 +228,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
             if !crate::state::IMAGE_RECIPE_FILTER_NAMES.contains(&name) {
-                return Err(ListImageRecipesErrorModeled::InvalidRequestException(
-                    InvalidRequestException {
+                return Err(ListImageRecipesErrorModeled::InvalidParameterValueException(
+                    InvalidParameterValueException {
                         message: Some(crate::state::unsupported_filter_message(
-                            name,
+                            Self::NAME,
                             crate::state::IMAGE_RECIPE_FILTER_NAMES,
                         )),
                     },
@@ -239,12 +253,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let after = match input.next_token.as_deref() {
             None => String::new(),
-            Some(token) => match crate::state::decode_page_token(token, &cursor) {
+            Some(token) => match crate::state::decode_page_token(&page_token_key, token, &cursor) {
                 Some(after) => after,
                 None => {
                     return Err(
-                        ListImageRecipesErrorModeled::InvalidPaginationTokenException(
-                            InvalidPaginationTokenException {
+                        ListImageRecipesErrorModeled::InvalidParameterValueException(
+                            InvalidParameterValueException {
                                 message: Some(crate::state::invalid_pagination_token_message()),
                             },
                         )
@@ -314,7 +328,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|last| last.arn.clone())
             .map(|last| {
                 cursor.after = last;
-                crate::state::encode_page_token(&cursor)
+                crate::state::encode_page_token(&page_token_key, &cursor)
             });
         drop(store);
 

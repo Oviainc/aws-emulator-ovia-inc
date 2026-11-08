@@ -19,6 +19,8 @@ mod component_document_sources;
 mod component_image_recipe;
 #[path = "all/component_listing.rs"]
 mod component_listing;
+#[path = "all/component_listing_wire_members.rs"]
+mod component_listing_wire_members;
 #[path = "all/component_policy.rs"]
 mod component_policy;
 #[path = "all/distribution_configuration.rs"]

@@ -565,7 +565,7 @@ async fn a_token_belongs_to_the_listing_that_issued_it() {
             status,
             &refused,
             400,
-            "InvalidPaginationTokenException",
+            "InvalidParameterValueException",
         );
     }
 

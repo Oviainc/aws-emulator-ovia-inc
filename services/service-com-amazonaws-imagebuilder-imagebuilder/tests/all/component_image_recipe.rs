@@ -1341,7 +1341,7 @@ async fn listing_reports_the_stored_recipes_filtered_and_paginated() {
     ];
     for (case, body) in tokens {
         let (status, refused) = list_recipes(&router, &body).await;
-        assert_refused(case, status, &refused, 400, "InvalidPaginationTokenException");
+        assert_refused(case, status, &refused, 400, "InvalidParameterValueException");
     }
 
     // Each documented filter name, including the two the issue did not cite, and an
@@ -1407,24 +1407,46 @@ async fn listing_reports_the_stored_recipes_filtered_and_paginated() {
         );
     }
 
-    let refusals: Vec<(&str, Value)> = vec![
+    // (case, the request, the error code the refusal carries): a filter naming a member
+    // this operation does not filter on is a value the `filters` parameter does not admit,
+    // which this service refuses as that parameter's value; a filter that is not a filter
+    // at all — no name, no values — is a malformed request.
+    let refusals: Vec<(&str, Value, &str)> = vec![
         (
             "an unsupported filter name",
             json!({"filters": [{"name": "owner", "values": ["Self"]}]}),
+            "InvalidParameterValueException",
         ),
         (
             "a filter with no values",
             json!({"filters": [{"name": "name"}]}),
+            "InvalidRequestException",
         ),
         (
             "a filter with no name",
             json!({"filters": [{"values": ["alpha-recipe"]}]}),
+            "InvalidRequestException",
         ),
     ];
-    for (case, body) in refusals {
+    for (case, body, code) in refusals {
         let (status, refused) = list_recipes(&router, &body).await;
-        assert_refused(case, status, &refused, 400, "InvalidRequestException");
+        assert_refused(case, status, &refused, 400, code);
     }
+
+    // The refusal names the parameter and the filters THIS operation allows — its own set,
+    // not the component listing's.
+    let (_, refused) = list_recipes(
+        &router,
+        &json!({"filters": [{"name": "owner", "values": ["Self"]}]}),
+    )
+    .await;
+    let message = text("the unsupported-filter refusal", &refused, "message");
+    assert_eq!(
+        message,
+        "The value supplied for parameter 'filters' is not valid. Allowed filters for \
+         ListImageRecipes are: name, parentImage, platform.",
+        "case \"the unsupported-filter refusal\": got {message:?}"
+    );
 }
 
 #[tokio::test]

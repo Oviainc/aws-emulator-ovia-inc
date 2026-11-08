@@ -29,7 +29,16 @@ pub struct ListComponentsOutput {
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.imagebuilder#ComponentVersion")]
+/// The defining characteristics of one component version a listing reports: the members
+/// `ComponentVersion` declares, in the model's own member order, and `billable` appended
+/// last.
+///
+/// Member set and order from
+/// `smithy_query(query="shape", shape="ComponentVersion")`, plus `billable` — a member the
+/// real service reports on every listing entry and the on-disk model omits, which is why the
+/// schema and the codec come from `types/unmodelled_member_wire.rs` rather than from the
+/// derive (see that module's note). Whether a version is billable is read off the stored
+/// component (`crate::state::ComponentRecord::billable`), never fixed here.
 #[derive(Debug, Clone, Default)]
 pub struct ComponentVersion {
     pub arn: Option<String>,
@@ -43,5 +52,47 @@ pub struct ComponentVersion {
     pub date_created: Option<String>,
     pub status: Option<String>,
     pub product_codes: Option<Vec<ProductCodeListItem>>,
+    pub billable: Option<bool>,
 }
+
+ib_schema_and_codec!(
+    ComponentVersion,
+    COMPONENT_VERSION_SCHEMA,
+    "com.amazonaws.imagebuilder#ComponentVersion",
+    "com.amazonaws.imagebuilder",
+    "ComponentVersion",
+    (M_ARN, arn, "arn", 0, opt, string),
+    (M_NAME, name, "name", 1, opt, string),
+    (M_VERSION, version, "version", 2, opt, string),
+    (M_DESCRIPTION, description, "description", 3, opt, string),
+    (M_PLATFORM, platform, "platform", 4, opt, string),
+    (
+        M_SUPPORTED_OS_VERSIONS,
+        supported_os_versions,
+        "supportedOsVersions",
+        5,
+        opt,
+        list_of_string
+    ),
+    (M_TYPE, r#type, "type", 6, opt, string),
+    (M_OWNER, owner, "owner", 7, opt, string),
+    (M_DATE_CREATED, date_created, "dateCreated", 8, opt, string),
+    (M_STATUS, status, "status", 9, opt, string),
+    (
+        M_PRODUCT_CODES,
+        product_codes,
+        "productCodes",
+        10,
+        opt,
+        list_of_struct(ProductCodeListItem)
+    ),
+    (
+        M_BILLABLE,
+        billable,
+        "billable",
+        11,
+        opt,
+        recorded("com.amazonaws.imagebuilder.recorded", boolean)
+    ),
+);
 

@@ -265,6 +265,12 @@ pub const WILDCARD_VERSION: &str = "x.x.x";
 /// recipes owned by your account", so this is also the value an omitted `owner` means.
 pub const OWNERSHIP_SELF: &str = "Self";
 
+/// The owner a resource published through the Amazon Web Services Marketplace reports,
+/// from the modelled `Ownership` enum and `owner`'s own documentation: "The value is your
+/// account ID for components that you own, the sharing account's ID for shared components,
+/// or `Amazon`, `ThirdParty`, or `AWSMarketplace`."
+pub const OWNERSHIP_AWS_MARKETPLACE: &str = "AWSMarketplace";
+
 /// The filter names `ListImageRecipes` accepts, from the `filters` member's own list:
 /// "Use the following filters to streamline results: name, parentImage, platform."
 pub const IMAGE_RECIPE_FILTER_NAMES: &[&str] = &["name", "parentImage", "platform"];
@@ -290,15 +296,20 @@ pub const IMAGE_BUILD_VERSION_FILTER_NAMES: &[&str] =
 /// The filter names `ListComponents` accepts, from the `filters` member's own list:
 /// "Use the following filters to streamline results: description, name, platform,
 /// productCodes, status, supportedOsVersion, type, version."
+///
+/// Held in the order a refusal STATES them, which is the order AWS's own recorded
+/// unsupported-filter refusal of this operation lists them in rather than the alphabetical
+/// order the member's documentation happens to use; membership is what every other reader
+/// asks of this set, and order does not change it.
 pub const COMPONENT_FILTER_NAMES: &[&str] = &[
-    "description",
     "name",
+    "version",
+    "description",
     "platform",
+    "type",
+    "supportedOsVersion",
     "productCodes",
     "status",
-    "supportedOsVersion",
-    "type",
-    "version",
 ];
 
 /// The one filter a `ListComponents` request may not carry beside `byName`: "You can't
@@ -703,6 +714,21 @@ impl ComponentRecord {
         }
     }
 
+    /// Whether this component incurs Amazon Web Services Marketplace charges: the
+    /// `billable` member a read of a component and every listing entry that stands for one
+    /// of its versions reports.
+    ///
+    /// Only a component published through the Marketplace is metered — its charges are
+    /// billed through the product codes such a component carries ("Contains product codes
+    /// that are used for billing purposes for Amazon Web Services Marketplace components",
+    /// the modelled `productCodes`), and the owner of one is
+    /// [`OWNERSHIP_AWS_MARKETPLACE`]. So the value is read off the record's own owner, and
+    /// a component this account created carries no charge of that kind.
+    #[must_use]
+    pub fn billable(&self) -> bool {
+        self.owner == OWNERSHIP_AWS_MARKETPLACE
+    }
+
     /// The four version nodes this build version sorts by: the three assigned ones and
     /// the build number, so "the latest available matching component build version" is
     /// the greatest of them.
@@ -754,6 +780,8 @@ impl ComponentRecord {
             // See [`Self::view`]: a component a caller created here carries no Marketplace
             // product codes.
             product_codes: None,
+            // Which is also why it is not billable ([`Self::billable`]).
+            billable: Some(self.billable()),
         }
     }
 
@@ -1193,6 +1221,11 @@ pub struct ComAmazonawsImagebuilderImagebuilderState {
     /// ARN carries the Region, and the resource lookup a policy call makes first is what
     /// keeps a regional endpoint to its own Region's resources.
     pub resource_policies: BTreeMap<String, String>,
+    /// The secret this store's page tokens are authenticated under, drawn from the system's
+    /// randomness when the store is created ([`PageTokenKey`]) — which is what lets a
+    /// paginated read tell a `nextToken` it ISSUED from one a caller built, and refuse the
+    /// latter with the modelled `InvalidPaginationTokenException`.
+    pub page_token_key: PageTokenKey,
 }
 
 impl ComAmazonawsImagebuilderImagebuilderState {
@@ -2613,13 +2646,15 @@ fn guard_document_nesting(data: &str) -> Option<()> {
 // ---------------------------------------------------------------------------
 // Page tokens
 //
-// `ListImageRecipes` is `@paginated`, and the modelled
-// `InvalidPaginationTokenException` is how a token this service did not issue is
-// refused. A token therefore CARRIES the page it continues — which listing, in which
-// Region, under which query, and the ARN the previous page ended at — together with a
-// digest over that payload, so a fabricated or edited token is refused instead of being
-// read as a page position. Nothing is stored for it: listing is a read, so it writes
-// nothing a later caller could observe.
+// Every `@paginated` listing of this service hands back a `nextToken`, and the modelled
+// `InvalidPaginationTokenException` is how a token this service did not issue is refused.
+// A token is OPAQUE: the only thing a caller may do with one is hand it back unchanged, so
+// it exposes neither the listing it belongs to nor the query that selected it. The page
+// position therefore travels INSIDE it, under an authenticator computed with a secret this
+// store draws from the system's randomness and never reveals, and the listing it was
+// issued for travels as a digest — so a fabricated, edited or re-aimed token carries no
+// position here and is refused instead of being read as a page position. Nothing is stored
+// for it: listing is a read, so it writes nothing a later caller could observe.
 // ---------------------------------------------------------------------------
 
 /// What one page token continues.
@@ -2636,67 +2671,79 @@ pub struct PageCursor {
     pub after: String,
 }
 
-/// Separates the payload's fields. A unit separator, which no ARN, Region or rendered
-/// query carries.
+/// Separates the two fields a token's payload carries: the digest of the listing it is a
+/// position in, and the key that position names. A unit separator, which no ARN and no
+/// digest carries.
 const PAGE_TOKEN_FIELD_SEPARATOR: char = '\u{1f}';
 
-/// Separates the digest from the payload it covers.
-const PAGE_TOKEN_DIGEST_SEPARATOR: char = '.';
+/// Separates the parts of the LISTING a token was issued for, inside the text the digest
+/// over it is taken of. A record separator, which no operation name, Region or rendered
+/// query carries, so two listings never render one text.
+const PAGE_TOKEN_LISTING_SEPARATOR: char = '\u{1e}';
 
-/// How many bytes of the payload's digest the token carries.
+/// How many bytes of the listing's digest a token carries. A CHOSEN width: 128 bits is far
+/// past the chance of two listings agreeing on one digest, while keeping the token short.
 const PAGE_TOKEN_DIGEST_BYTES: usize = 16;
 
-/// The token that continues `cursor`.
+/// The secret this service's page tokens are authenticated under — the shared one every
+/// paginated read of this emulator uses, so no two services disagree about what makes a
+/// continuation token one the service ISSUED. One key per store
+/// ([`ComAmazonawsImagebuilderImagebuilderState::page_token_key`]).
+pub use ::service_common::page_tokens::PageTokenKey;
+
+/// The `nextToken` that continues `cursor`, authenticated under `key`.
+///
+/// Base64 is the spelling an AWS continuation token has, through the standard-alphabet codec
+/// this workspace already uses for every Smithy blob, so no second codec lives here. What it
+/// renders is the authenticated bytes of the position: the LISTING the token belongs to
+/// travels as a digest and the query that selected the page is nowhere in the token, so a
+/// caller that stores, logs or round-trips the value sees an opaque handle rather than this
+/// service's own query state, and cannot produce the authenticator for a position of its
+/// own. The position itself is the key the page it continues ENDED at, which is a value the
+/// caller was just handed.
 #[must_use]
-pub fn encode_page_token(cursor: &PageCursor) -> String {
-    let payload = page_token_payload(cursor);
+pub fn encode_page_token(key: &PageTokenKey, cursor: &PageCursor) -> String {
+    ::aws_smithy_types::base64::encode(key.mint(&page_token_payload(cursor)))
+}
+
+/// Where the page `token` continues starts, or `None` when `token` is not a token THIS
+/// store issued for THIS listing: one that is not base64, one whose authenticator does not
+/// match the position it travels with (a fabricated or edited value, or one another store
+/// minted), one carrying no position at all, and one issued for another operation, another
+/// Region's endpoint or another query.
+#[must_use]
+pub fn decode_page_token(key: &PageTokenKey, token: &str, cursor_of: &PageCursor) -> Option<String> {
+    let payload = key.cursor_of(&::aws_smithy_types::base64::decode(token).ok()?)?;
+    let (listing, after) = payload.split_once(PAGE_TOKEN_FIELD_SEPARATOR)?;
+    (listing == page_token_listing_digest(cursor_of)).then(|| after.to_string())
+}
+
+/// The payload a token authenticates: the digest of the listing it is a position in, then
+/// the key the previous page ended at.
+fn page_token_payload(cursor: &PageCursor) -> String {
     format!(
-        "{}{PAGE_TOKEN_DIGEST_SEPARATOR}{}",
-        page_token_digest(&payload),
-        ::hex::encode(payload.as_bytes())
+        "{}{PAGE_TOKEN_FIELD_SEPARATOR}{}",
+        page_token_listing_digest(cursor),
+        cursor.after
     )
 }
 
-/// Where the page `token` continues starts, or `None` when `token` is not a token this
-/// service issued for this listing.
-#[must_use]
-pub fn decode_page_token(token: &str, cursor_of: &PageCursor) -> Option<String> {
-    let (digest, payload) = token.split_once(PAGE_TOKEN_DIGEST_SEPARATOR)?;
-    let payload = String::from_utf8(::hex::decode(payload).ok()?).ok()?;
-    if page_token_digest(&payload) != digest {
-        return None;
-    }
-    let mut fields = payload.split(PAGE_TOKEN_FIELD_SEPARATOR);
-    let operation = fields.next()?;
-    let region = fields.next()?;
-    let query = fields.next()?;
-    let after = fields.next()?;
-    if fields.next().is_some()
-        || operation != cursor_of.operation
-        || region != cursor_of.region
-        || query != cursor_of.query
-    {
-        return None;
-    }
-    Some(after.to_string())
-}
+/// The digest of the LISTING a token belongs to: its operation, the Region whose endpoint
+/// issued it and the query that selected the items it pages over, rendered as hex.
+///
+/// A digest rather than the listing itself, so the token names which listing it continues
+/// without carrying the operation, the Region or the caller's own filter values in a form
+/// anything but this service can read.
+fn page_token_listing_digest(cursor: &PageCursor) -> String {
+    use ::sha2::Digest;
 
-/// The payload a token carries, field by field.
-fn page_token_payload(cursor: &PageCursor) -> String {
-    [
+    let listing = [
         cursor.operation.as_str(),
         cursor.region.as_str(),
         cursor.query.as_str(),
-        cursor.after.as_str(),
     ]
-    .join(&PAGE_TOKEN_FIELD_SEPARATOR.to_string())
-}
-
-/// The digest a token carries over its payload, as hex.
-fn page_token_digest(payload: &str) -> String {
-    use ::sha2::Digest;
-
-    let digest = ::sha2::Sha256::digest(payload.as_bytes());
+    .join(&PAGE_TOKEN_LISTING_SEPARATOR.to_string());
+    let digest = ::sha2::Sha256::digest(listing.as_bytes());
     ::hex::encode(&digest[..PAGE_TOKEN_DIGEST_BYTES])
 }
 
@@ -3905,17 +3952,27 @@ pub fn too_many_resource_tags_message(arn: &str, merged: usize) -> String {
     )
 }
 
-/// Why a list naming an unsupported filter is refused.
+/// Why a list naming a filter it does not filter on is refused.
+///
+/// A filter names the member it selects on, so a name the operation does not filter on is a
+/// value its `filters` parameter does not admit: the refusal is this service's own
+/// parameter-value sentence ([`crate::service::parameter_refusal`]) about that member, and
+/// its requirement states the filters the operation ALLOWS — never the name the request
+/// carried, which is the value and is withheld like every other refused value.
 ///
 /// The `supported` names are the `filters` member's own list, of the operation the request
 /// called ([`IMAGE_RECIPE_FILTER_NAMES`], [`COMPONENT_FILTER_NAMES`]) — each operation
 /// filters on the members of the resource it lists, so the wording names the ones the
-/// caller may ask for rather than any one operation's.
+/// caller may ask for rather than any one operation's — and `operation` is that operation,
+/// which the sentence names because the set belongs to it.
 #[must_use]
-pub fn unsupported_filter_message(name: &str, supported: &[&str]) -> String {
-    format!(
-        "The filter name {name} is not supported. The supported filter names are {}.",
-        supported.join(", ")
+pub fn unsupported_filter_message(operation: &str, supported: &[&str]) -> String {
+    ::service_common::validation_message::parameter_value_mismatch(
+        FILTERS_MEMBER,
+        &format!(
+            "Allowed filters for {operation} are: {}.",
+            supported.join(", ")
+        ),
     )
 }
 
@@ -3931,6 +3988,10 @@ pub fn by_name_with_version_filter_message() -> String {
          {COMPONENT_VERSION_FILTER_NAME} filter."
     )
 }
+
+/// The member every listing of this service carries its filters in, as the API addresses
+/// it — the parameter a refusal about one of them names.
+pub const FILTERS_MEMBER: &str = "filters";
 
 /// Why a list naming a filter with no name or no values is refused.
 #[must_use]
@@ -3989,13 +4050,24 @@ pub fn malformed_policy_message(member: &str) -> String {
     )
 }
 
+/// The member every paginated listing of this service carries its continuation token in, as
+/// the API addresses it — the parameter a refusal about a token names.
+pub const NEXT_TOKEN_MEMBER: &str = "nextToken";
+
 /// Why a list carrying a token this service did not issue for it is refused.
 ///
-/// The modelled `InvalidPaginationTokenException` documents the condition itself: "You
-/// have provided an invalid pagination token in your request."
+/// A continuation token is OPAQUE: the only value the parameter admits is one a previous
+/// page of that same listing handed back, so anything else is a value `nextToken` does not
+/// admit — this service's parameter-value sentence
+/// ([`crate::service::parameter_refusal`]) about that member, whose requirement states that
+/// the token is not of the form the service issues. The token itself is never echoed: it is
+/// the refused value.
 #[must_use]
 pub fn invalid_pagination_token_message() -> String {
-    "You have provided an invalid pagination token in your request.".to_string()
+    ::service_common::validation_message::parameter_value_mismatch(
+        NEXT_TOKEN_MEMBER,
+        "The provided token does not meet the required format.",
+    )
 }
 
 #[cfg(test)]
@@ -4299,6 +4371,7 @@ mod tests {
 
     #[test]
     fn a_page_token_is_read_back_only_for_the_listing_that_issued_it() {
+        let key = PageTokenKey::new();
         let cursor = PageCursor {
             operation: LIST_IMAGE_RECIPES_OPERATION.to_string(),
             region: "us-west-2".to_string(),
@@ -4306,14 +4379,27 @@ mod tests {
             after: "arn:aws:imagebuilder:us-west-2:000000000000:image-recipe/demo/1.0.0"
                 .to_string(),
         };
-        let token = encode_page_token(&cursor);
-        let actual = decode_page_token(&token, &cursor);
+        let token = encode_page_token(&key, &cursor);
+        let actual = decode_page_token(&key, &token, &cursor);
         assert_eq!(
             actual.as_deref(),
             Some(cursor.after.as_str()),
             "case issued token: expected {:?}, got {actual:?}",
             cursor.after
         );
+
+        // The token is opaque: none of the LISTING it continues is readable out of it,
+        // however it is decoded — only the position, which is the key the page it follows
+        // ended at and the caller was just handed.
+        let decoded = ::aws_smithy_types::base64::decode(&token)
+            .map(|bytes| String::from_utf8_lossy(&bytes).to_string())
+            .unwrap_or_default();
+        for secret in [LIST_IMAGE_RECIPES_OPERATION, cursor.query.as_str()] {
+            assert!(
+                !token.contains(secret) && !decoded.contains(secret),
+                "case opacity: expected {secret:?} to be absent from {token:?}"
+            );
+        }
 
         // A token read against another listing, Region or query is not this token, and
         // neither is anything the service did not issue.
@@ -4325,24 +4411,103 @@ mod tests {
             region: "eu-west-1".to_string(),
             ..cursor.clone()
         };
+        let other_operation = PageCursor {
+            operation: LIST_COMPONENTS_OPERATION.to_string(),
+            ..cursor.clone()
+        };
         let cases: &[(&str, String)] = &[
             ("another query", token.clone()),
             ("another region", token.clone()),
+            ("another operation", token.clone()),
             ("fabricated", "fabricated-token".to_string()),
-            ("edited digest", format!("00000000000000000000000000000000.{}", token
-                .split_once('.')
-                .map_or("", |(_, payload)| payload))),
+            ("another store's key", encode_page_token(&PageTokenKey::new(), &cursor)),
+            (
+                "edited authenticator",
+                ::aws_smithy_types::base64::encode(
+                    [
+                        vec![0_u8; ::service_common::page_tokens::AUTHENTICATOR_BYTES],
+                        page_token_payload(&cursor).into_bytes(),
+                    ]
+                    .concat(),
+                ),
+            ),
         ];
         for (case, candidate) in cases {
             let cursor_of = match *case {
                 "another query" => &other_query,
                 "another region" => &other_region,
+                "another operation" => &other_operation,
                 _ => &cursor,
             };
-            let actual = decode_page_token(candidate, cursor_of);
+            let actual = decode_page_token(&key, candidate, cursor_of);
             assert!(
                 actual.is_none(),
                 "case {case}: expected a refusal, got {actual:?}"
+            );
+        }
+    }
+
+    /// A component version is billable only when it is one the Marketplace publishes: the
+    /// `billable` member is read off the stored record's owner, so a component this account
+    /// created reports false.
+    #[test]
+    fn billable_follows_the_component_s_owner() {
+        let record = ComponentRecord {
+            arn: component_build_version_arn("us-west-2", "demo", "1.0.0", FIRST_BUILD_VERSION),
+            region: "us-west-2".to_string(),
+            name: "demo".to_string(),
+            version: "1.0.0".to_string(),
+            build_version: FIRST_BUILD_VERSION,
+            description: None,
+            change_description: None,
+            component_type: COMPONENT_TYPE_BUILD.to_string(),
+            platform: PLATFORM_LINUX.to_string(),
+            supported_os_versions: None,
+            owner: ::engine::EMULATOR_ACCOUNT_ID.to_string(),
+            data: None,
+            uri: None,
+            kms_key_id: None,
+            parameters: None,
+            date_created: "2026-01-01T00:00:00Z".to_string(),
+            tags: None,
+        };
+        // (case, the owner the record reports, whether the version is billable)
+        let rows: &[(&str, String, bool)] = &[
+            (
+                "this account's own",
+                ::engine::EMULATOR_ACCOUNT_ID.to_string(),
+                false,
+            ),
+            (
+                "another account's, shared with this one",
+                "210987654321".to_string(),
+                false,
+            ),
+            ("Amazon's own", "Amazon".to_string(), false),
+            ("a third party's", "ThirdParty".to_string(), false),
+            (
+                "the Marketplace's",
+                OWNERSHIP_AWS_MARKETPLACE.to_string(),
+                true,
+            ),
+        ];
+        for (case, owner, expected) in rows {
+            let record = ComponentRecord {
+                owner: owner.clone(),
+                ..record.clone()
+            };
+            let actual = record.billable();
+            assert_eq!(
+                actual, *expected,
+                "case {case:?}: expected billable {expected}, got {actual}"
+            );
+            let entry = record.version_entry(false);
+            assert_eq!(
+                entry.billable,
+                Some(*expected),
+                "case {case:?}: expected the listing entry to report billable \
+                 {expected:?}, got {:?}",
+                entry.billable
             );
         }
     }
