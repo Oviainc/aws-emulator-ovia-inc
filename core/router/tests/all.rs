@@ -868,6 +868,8 @@ mod cloudformation_provisions_elastic_beanstalk_resources;
 mod cloudformation_provisions_sqs_queue_policies;
 #[path = "all/cloudformation_provisions_sqs_queues.rs"]
 mod cloudformation_provisions_sqs_queues;
+#[path = "all/cloudformation_imports_an_existing_queue.rs"]
+mod cloudformation_imports_an_existing_queue;
 #[path = "all/opensearchserverless_cloudformation_resources.rs"]
 mod opensearchserverless_cloudformation_resources;
 #[path = "all/cloudformation_provisions_container_platform_resources.rs"]

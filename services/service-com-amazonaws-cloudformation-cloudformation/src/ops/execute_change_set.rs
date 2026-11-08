@@ -613,7 +613,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // resources and outputs are computed from that body and the parameters in
             // force, and are reported once this operation completes — exactly as they are
             // for `CreateStack` and `UpdateStack`.
-            let cannot_deploy = stack.deploy_template(&exports).err();
+            //
+            // A resource the plan ADOPTS is not created, so its record takes over the
+            // identifier it already exists under rather than the name the naming rules
+            // computed for it ([`crate::state::resource_import::adopted_identifiers`]):
+            // that is what the stack reports for the resource, what its `Ref` resolves to,
+            // and what the deployment below reconciles against.
+            let adopted_identifiers =
+                crate::state::resource_import::adopted_identifiers(&planned_changes);
+            let cannot_deploy = stack
+                .deploy_template_adopting(&exports, &adopted_identifiers)
+                .err();
             // "After the call successfully completes, CloudFormation starts updating the
             // stack": a CREATE change set creates the stack it had left in
             // REVIEW_IN_PROGRESS, an UPDATE change set updates one that already exists —

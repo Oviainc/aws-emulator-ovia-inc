@@ -212,6 +212,16 @@ pub struct StoredStack {
     /// template was deployed. A stack that imports an export is what `ListImports` reports
     /// for that export name, and what makes the exporting stack's export in use.
     pub imports: BTreeMap<String, String>,
+    /// The identifier each resource this stack ADOPTED already existed under, keyed by
+    /// logical id ([`resource_import`]): what executing an IMPORT change set took over
+    /// ([`resource_import::adopt_identifier`]).
+    ///
+    /// Remembered on the stack because nothing else can say it: the identity of a resource
+    /// CloudFormation did not create is stated nowhere in the template, so every deployment
+    /// after the import — which recomputes every other resource's identity from that
+    /// template — would otherwise read the adopted resource as a different one and replace
+    /// it. An entry is kept only while the deployed template still declares the resource.
+    pub adopted: BTreeMap<String, String>,
     /// `Stack$DriftInformation`'s `StackDriftStatus`: the stack-level result the last
     /// drift detection that COMPLETED against this stack left ([`drift`]).
     /// [`DRIFT_STATUS_NOT_CHECKED`] until one has, since "NOT_CHECKED: CloudFormation
@@ -306,6 +316,7 @@ impl StoredStack {
             retained_event_properties_bytes: 0,
             signals: ::std::collections::VecDeque::new(),
             imports: BTreeMap::new(),
+            adopted: BTreeMap::new(),
             drift_status: DRIFT_STATUS_NOT_CHECKED.to_string(),
             drift_last_check: None,
         }
@@ -400,6 +411,29 @@ impl StoredStack {
         &mut self,
         exports: &BTreeMap<String, String>,
     ) -> Result<(), String> {
+        self.deploy_template_adopting(exports, &BTreeMap::new())
+    }
+
+    /// [`Self::deploy_template`] for a deployment that ADOPTS resources that already exist:
+    /// `adopting` is the identifier each of them exists under, keyed by logical id
+    /// ([`resource_import::adopted_identifiers`]).
+    ///
+    /// Such a resource is not created, so the identity in force for it is the one it already
+    /// carries rather than the one the naming rules computed
+    /// ([`resource_import::adopt_identifier`]) — which is what makes the deployment reconcile
+    /// against the resource that is really there instead of creating a second one, and what
+    /// the stack's `Ref` to it and the outputs built from it report. The stack REMEMBERS it
+    /// ([`Self::adopted`]), so every later deployment of the same declaration keeps that
+    /// identity instead of recomputing one for a resource CloudFormation never created.
+    pub fn deploy_template_adopting(
+        &mut self,
+        exports: &BTreeMap<String, String>,
+        adopting: &BTreeMap<String, String>,
+    ) -> Result<(), String> {
+        for (logical_id, identifier) in adopting {
+            self.adopted
+                .insert(logical_id.clone(), identifier.clone());
+        }
         if self.template_body.is_none() {
             // No template to deploy: the stack a CREATE change set created, which carries
             // no resources until that change set is executed.
@@ -475,10 +509,36 @@ impl StoredStack {
         // [`provisioning::reconcile`](provisioning::reconcile), which the deploying
         // operation calls with these records.
         let already_created = self.current_resources();
+        // The identifier each resource this stack ADOPTED already exists under: the ones this
+        // deployment adopts and the ones an earlier one did ([`Self::adopted`]). Read out
+        // here so the walk below only reads it.
+        let adopted_in_force = self.adopted.clone();
         // Whether any record took over an identifier its owning service MINTED, which is
         // not the one the properties above were resolved against.
         let mut adopted_minted_identity = false;
         for resource in &mut resources {
+            // A resource this stack ADOPTED already exists in the service that owns it, under
+            // the identifier the plan that adopted it reported: that identifier is the one in
+            // force, so the record takes it over before anything is compared against it
+            // ([`resource_import::adopt_identifier`]). A declaration that STATES the
+            // resource's name decides the identity itself, so an adoption no longer applies
+            // to it — such a declaration asks for the resource that name belongs to.
+            let adopted = adopted_in_force
+                .get(&resource.logical_id)
+                .filter(|_| declared_name(resource).is_none());
+            if let Some(identifier) = adopted {
+                if resource_import::adopt_identifier(resource, identifier) {
+                    adopted_minted_identity = true;
+                }
+            }
+            // Whether the identifier a resource of this type is known by is one this
+            // deployment cannot recompute, so the record carries the one in force FORWARD
+            // rather than reading the resource as a different one: an identifier assigned
+            // ELSEWHERE ([`identity_is_assigned_elsewhere`]), and the identifier of a
+            // resource this stack ADOPTED, which CloudFormation did not create and the
+            // template therefore states nowhere.
+            let keeps_its_identifier = identity_is_assigned_elsewhere(&resource.resource_type)
+                || adopted.is_some();
             // The record of the same resource this stack already created. Judged by
             // identity first; for a type whose id the OWNING SERVICE assigns, a record
             // under the same logical id and type IS that resource, because nothing here
@@ -495,7 +555,7 @@ impl StoredStack {
                     existing.materialised && provisioning::is_same_resource(existing, resource)
                 })
                 .or_else(|| {
-                    identity_is_assigned_elsewhere(&resource.resource_type)
+                    keeps_its_identifier
                         .then(|| {
                             already_created.iter().find(|existing| {
                                 existing.materialised
@@ -516,11 +576,12 @@ impl StoredStack {
                 // reported about it, and an identity that service MINTED (which no
                 // deployment recomputes) carry forward here.
                 resource.materialised = true;
-                if identity_is_assigned_elsewhere(&resource.resource_type) {
-                    // The identifier in force is the one that service minted, so the
-                    // record keeps it: an output naming the resource reports the id a
-                    // client can call that service with, and `reconcile` sees the resource
-                    // the stack already has rather than one to create again.
+                if keeps_its_identifier {
+                    // The identifier in force is the one that service minted, or the one an
+                    // adopted resource already had, so the record keeps it: an output naming
+                    // the resource reports the id a client can call that service with, and
+                    // `reconcile` sees the resource the stack already has rather than one to
+                    // create again.
                     if existing.physical_resource_id != resource.physical_resource_id {
                         adopted_minted_identity = true;
                     }
@@ -585,6 +646,12 @@ impl StoredStack {
                 }
             }
         }
+        // An adoption is the stack's record of a resource's identity only while the stack
+        // still MANAGES that resource: a deployment whose template no longer declares the
+        // logical id stops managing it, so the entry goes with it and a later declaration of
+        // that id creates a resource of its own.
+        self.adopted
+            .retain(|logical_id, _| resources.iter().any(|resource| resource.logical_id == *logical_id));
         self.pending_deployment = Some(PendingDeployment {
             resources,
             outputs,
