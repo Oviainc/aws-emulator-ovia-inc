@@ -439,7 +439,7 @@ const REACHABLE_OPERATIONS: &[(&str, Addressed)] = &[
 
 /// The request `operation` sends, addressing the secret `secret` where it addresses one and
 /// naming `created` where it creates one.
-fn request_body(operation: &str, secret: &str, created: &str) -> Value {
+pub(crate) fn request_body(operation: &str, secret: &str, created: &str) -> Value {
     match operation {
         "ListSecrets" => json!({ "MaxResults": 1 }),
         "GetRandomPassword" => json!({ "PasswordLength": 16 }),

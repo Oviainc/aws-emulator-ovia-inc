@@ -57,6 +57,13 @@
 //!   before it stores anything — while its refusal names the NAME the request carried,
 //!   because a secret the create never made has no ARN of this account to name
 //!   ([`authorize_create`]);
+//! * an operation whose `SecretId` names a secret this account does NOT hold against the
+//!   ARN that id spells (`unheld_secret_arn`) — while its refusal names the id as the
+//!   request spelled it, for the same reason a create's does: an id this account holds no
+//!   secret for addresses no resource of this account, so there is no ARN of its own to
+//!   name. The decision is still taken, and a caller no statement allows is refused
+//!   WITHOUT the request reaching the store, so a refusal says nothing about whether the
+//!   secret exists;
 //! * an operation that addresses no secret of its own — the account-wide list, the password
 //!   generator, the batched read that selects by filter — against the resource IAM writes
 //!   for such a request ([`ANY_RESOURCE`]), and the refusal of one states no resource
@@ -324,18 +331,20 @@ pub fn authorize_secret_with<Eng: Send + Sync + 'static>(
         ctx,
         operation,
         &addressed.arn,
-        &addressed.arn,
+        &addressed.reported,
         &conditions,
         addressed.policy.as_deref(),
     )
 }
 
 /// What the store holds about the secret a request addresses, read ONCE: the ARN the
-/// request is judged against, the tags that populate the resource-tag condition keys and
-/// the resource-based policy that may itself grant the call.
+/// request is judged against, what a refusal NAMES as the resource, the tags that populate
+/// the resource-tag condition keys and the resource-based policy that may itself grant the
+/// call.
 #[derive(Debug, Clone, Default)]
 struct AddressedSecret {
     arn: String,
+    reported: String,
     tags: Vec<crate::state::StoredTag>,
     policy: Option<String>,
 }
@@ -354,6 +363,7 @@ fn addressed_secret<Eng: Send + Sync + 'static>(
     let Some(secret_id) = secret_id.filter(|id| !id.is_empty()) else {
         return AddressedSecret {
             arn: ANY_RESOURCE.to_string(),
+            reported: ANY_RESOURCE.to_string(),
             ..AddressedSecret::default()
         };
     };
@@ -368,12 +378,20 @@ fn addressed_secret<Eng: Send + Sync + 'static>(
             .view(&crate::state::request_region(ctx.parts()), secret_id)
             .map(|view| AddressedSecret {
                 arn: view.secret.arn.clone(),
+                // A secret this account HOLDS is named by the ARN it holds it under,
+                // whichever form of `SecretId` the request addressed it by.
+                reported: view.secret.arn.clone(),
                 tags: view.content.tags.clone(),
                 policy: view.content.resource_policy.clone(),
             })
     });
     held.unwrap_or_else(|| AddressedSecret {
         arn: unheld_secret_arn(ctx, secret_id),
+        // A `SecretId` this account holds no secret for addresses no resource of this
+        // account, so there is no ARN of its own to report: the refusal names the id the
+        // request carried, as it spelled it — the same reading [`authorize_create`] makes
+        // of the name of a secret a create never made.
+        reported: secret_id.to_string(),
         ..AddressedSecret::default()
     })
 }
