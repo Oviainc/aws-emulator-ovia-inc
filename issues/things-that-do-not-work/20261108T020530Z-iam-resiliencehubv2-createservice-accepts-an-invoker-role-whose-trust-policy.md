@@ -1,0 +1,48 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: iam__resiliencehubv2.invoker-role-trust-rejected-then-accepted-after-fix
+Issue-Key: iam__resiliencehubv2.invoker-role-trust-rejected-then-accepted-after-fix|_poll#7|AssertionError|raise AssertionError(f"{description} did not happen within {timeout_s}s; last {last!r}")
+Issue-Commit: 71421d5d7691e499f6e8da545eb1a0e321ec9212
+
+# CreateService accepts an invoker role whose trust policy does not allow resiliencehub.amazonaws.com: HTTP 200 instead of 400 ValidationException "Cannot assume invoker role ..."
+
+> _Note: this issue was identified against the code base at commit `71421d5d7691e499f6e8da545eb1a0e321ec9212`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateService
+
+## Description
+One root cause.
+
+Related open issue: issues/things-that-do-not-work/20261029T191749Z-iam-resiliencehubv2-createservice-never-validates-the-permissionmodel-invokerrolename-iam-role.md describes the same missing gate, but the suite did not report this check as OWNED by it (that issue's replay key is the earlier `_poll#7|Timeout` signature, while the check now fails with an AssertionError out of `_poll` at check line 52). Filing it against the current failure so the replay key is carried; a fixer may close both together.
+
+Cause 1 of 1: resiliencehubv2 CreateService performs no assumability check on the IAM role named by permissionModel.invokerRoleName, so the invoker-role trust gate does not exist in the emulator at all. Failing check: iam__resiliencehubv2.invoker-role-trust-rejected-then-accepted-after-fix.
+
+AWS: CreateService requires permissionModel (Smithy: CreateService.permissionModel -> PermissionModel, @required) and within it invokerRoleName (Smithy: PermissionModel.invokerRoleName -> IamRoleName, @required, @length min 1 max 576, @pattern ^([A-Za-z0-9_+=,.@\-]+/)*[A-Za-z0-9_+=,.@\-]+$). The operation models ValidationException (Smithy: errorKind client, httpError 400, members message @required, reason, fieldList) and its input carries a @references entry to com.amazonaws.resiliencehubv2#IamPolicyResource, i.e. the named role is a referenced IAM resource the service must be able to assume. Recorded behavior: when the named role exists but its trust policy allows sts:AssumeRole only for a principal other than resiliencehub (here Service: lambda.amazonaws.com), AWS refuses the create with HTTP 400, Error.Code `ValidationException`, Error.Message `Cannot assume invoker role '<invokerRoleName>'. Ensure the role exists and its trust policy allows access.` In that message the fixed text is `Cannot assume invoker role '` ... `'. Ensure the role exists and its trust policy allows access.`; the single variable part is the role name, taken verbatim from the request's permissionModel.invokerRoleName (never a generated id, ARN or timestamp). AWS answers the same refusal while a just-created role has not yet propagated, which is why a client retries it. Once the SAME role's trust policy is rewritten via IAM UpdateAssumeRolePolicy to allow Service: resiliencehub.amazonaws.com for sts:AssumeRole, the otherwise identical CreateService call must succeed (HTTP 200) and service.permissionModel.invokerRoleName must echo that role name.
+
+Emulator: the handler never looks at invokerRoleName beyond storing it. In services/service-com-amazonaws-resiliencehubv2-ngrhservicecore/src/ops/create_service.rs the `handle` body runs exactly four gates — store availability (InternalServerException), clientToken idempotency replay, duplicate-name ConflictException, and the MAX_SERVICES ServiceQuotaExceededException — then mints the ARN and writes the record with `permission_model: Some(input.permission_model)`. No IAM lookup, no trust-policy evaluation, and no code path constructs CreateServiceErrorModeled::ValidationException. With the wrong-principal role in place the FIRST CreateService answers HTTP 200 with a complete `service` object (observed body carries serviceArn, name, regions, permissionModel.invokerRoleName, effectivePolicyValues {}, assessmentStatus NOT_STARTED). The check therefore polls CreateService for the stable refusal AWS always gives first, never observes a ClientError, and fails with `AssertionError: CreateService answering with a refusal rather than a client error did not happen within 60.0s`. Because the create succeeds on the first attempt, the second half of the contract (the identical call starting to succeed only AFTER the trust policy is fixed) is unobservable: the emulator cannot distinguish the two states.
+
+Why: a client relying on AWS's behavior gets two things wrong. First, the negative class disappears — a genuinely misconfigured invoker role (one Resilience Hub could never assume) is silently accepted, so the emulator hands back a service that real AWS would have refused and whose assessments could never run; retry-until-propagation code paths are never exercised. Second, any workflow asserting the refusal-then-acceptance transition on a single role hangs until its own timeout instead of failing fast, and a caller cannot tell a wrong trust policy from a correct one because both answer 200 with identical bodies.
+
+Fix: belongs in the CreateService handler's validation stage — the pre-write gate sequence in `handle` of the resiliencehubv2 CreateService operation, which must resolve permissionModel.invokerRoleName against the IAM role store, evaluate its assume-role trust policy for an sts:AssumeRole Allow whose Principal Service is resiliencehub, and return the modeled ValidationException (HTTP 400) with AWS's fixed wording when the role is absent or not assumable, before the ARN is minted and the record stored. The gate must be re-evaluated per call so an UpdateAssumeRolePolicy that fixes the role flips the identical request from refused to accepted. It also needs the cross-service read path from this handler to IAM role state (role existence + AssumeRolePolicyDocument), which is the missing dependency behind the absent gate.
+
+Traces: iam__resiliencehubv2.invoker-role-trust-rejected-then-accepted-after-fix (mismatch). File citations for the missing gate: services/service-com-amazonaws-resiliencehubv2-ngrhservicecore/src/ops/create_service.rs lines 158-271 (handle); gates at 163-170, 177-186, 188-198, 200-218; ARN mint and write at 220-270.
+
+## Evidence
+Check: iam__resiliencehubv2.invoker-role-trust-rejected-then-accepted-after-fix — verdict mismatch.
+
+Expected (AWS): with an existing IAM role whose AssumeRolePolicyDocument allows only {"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}, CreateService answers HTTP 400 with Error.Code=ValidationException and Error.Message=`Cannot assume invoker role '<role-name>'. Ensure the role exists and its trust policy allows access.` — fixed text exactly as quoted, with <role-name> the request's permissionModel.invokerRoleName. After IAM UpdateAssumeRolePolicy rewrites the SAME role to allow Service: resiliencehub.amazonaws.com, the identical CreateService call answers HTTP 200 and service.permissionModel.invokerRoleName equals that role name.
+
+Actual (emulator): the FIRST CreateService call — wrong-principal trust policy still in place — answers HTTP 200 with a fully formed service, e.g. {'serviceArn': 'arn:aws:resiliencehub:<region>:<account>:service/<uuid>', 'name': <requested name>, 'regions': ['<region>'], 'permissionModel': {'invokerRoleName': '<the wrong-trust role>'}, 'effectivePolicyValues': {}, 'assessmentStatus': 'NOT_STARTED', 'openFindingsCount': 0, 'resolvedFindingsCount': 0, ...} (the arn/uuid/name/timestamps are per-run values, not requirements). No ValidationException is ever produced, so the check's poll for a stable refusal (predicate: the response is an error tuple; timeout 60s, interval 5s) never satisfies its predicate and the check fails with `AssertionError: CreateService answering with a refusal rather than a client error did not happen within 60.0s`.
+
+Source: services/service-com-amazonaws-resiliencehubv2-ngrhservicecore/src/ops/create_service.rs `handle` (lines 158-271) contains gates only for store availability, clientToken idempotency, duplicate name (ConflictException) and MAX_SERVICES (ServiceQuotaExceededException); input.permission_model is moved straight into the stored ServiceRecord at line 229 with no IAM resolution or trust-policy evaluation.
+
+## Steps to Reproduce
+1. IAM CreateRole with any role name and AssumeRolePolicyDocument {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]} — a principal that is NOT resiliencehub.
+2. resiliencehubv2 CreateService with name=<valid EntityName>, regions=[<region>], permissionModel={"invokerRoleName": "<that role name>"}.
+   Expected: HTTP 400, ValidationException, message `Cannot assume invoker role '<that role name>'. Ensure the role exists and its trust policy allows access.`
+   Observed: HTTP 200 with a created service.
+3. IAM UpdateAssumeRolePolicy on the SAME role with a PolicyDocument allowing {"Principal":{"Service":"resiliencehub.amazonaws.com"},"Action":"sts:AssumeRole"}; confirm via IAM GetRole that the trust policy now names resiliencehub.amazonaws.com.
+4. Repeat the CreateService call from step 2 (new name). Expected: only now does it succeed. Observed: both calls succeed identically, so the trust-policy change has no effect on CreateService.
+5. Replay the behavioral check: iam__resiliencehubv2.invoker-role-trust-rejected-then-accepted-after-fix.
