@@ -108,6 +108,13 @@ const SFN_SIGNING_NAME: &str = "states";
 /// See [`SFN_SIGNING_NAME`].
 const SFN_TARGET_PREFIX: &str = "AWSStepFunctions";
 
+/// The same, for the service a sibling suite mounts beside the two through
+/// [`Chain::with_dynamodb`] so a handler's own SDK call is served for real: DynamoDB's
+/// signing name and `X-Amz-Target` prefix, from its model's own `service_info`.
+const DYNAMODB_SIGNING_NAME: &str = "dynamodb";
+/// See [`DYNAMODB_SIGNING_NAME`].
+const DYNAMODB_TARGET_PREFIX: &str = "DynamoDB_20120810";
+
 /// Step Functions and Lambda over ONE engine, so the invocation a task makes is served
 /// by the very function the test created.
 ///
@@ -120,10 +127,28 @@ pub(crate) struct Chain {
 
 impl Chain {
     pub(crate) fn new() -> Self {
+        Self::mounted(false)
+    }
+
+    /// [`Self::new`] with DynamoDB mounted beside the two, for a suite whose handlers
+    /// call it through the SDK their runtime supplies: what a run wrote is then read
+    /// back through DynamoDB's own API rather than claimed by the handler's answer.
+    pub(crate) fn with_dynamodb() -> Self {
+        Self::mounted(true)
+    }
+
+    fn mounted(dynamodb: bool) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        if dynamodb {
+            router.register_service(
+                service_com_amazonaws_dynamodb_dynamodb_20120810::EmulatedService::new(Arc::clone(
+                    &engine,
+                )),
+            );
+        }
         router.register_service(
             service_com_amazonaws_lambda_awsgirapiservice::EmulatedService::new(engine),
         );
@@ -149,6 +174,35 @@ impl Chain {
             .header("content-type", "application/x-amz-json-1.0")
             .header("x-amz-target", format!("{SFN_TARGET_PREFIX}.{operation}"))
             .header("authorization", Self::authorization(SFN_SIGNING_NAME))
+            .body(Bytes::from(body.to_string()))
+            .expect("a well-formed request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let parsed = parsed(response.into_body());
+        assert_eq!(
+            status, 200,
+            "case {case:?}: {operation} must answer 200, got {status} with {parsed}"
+        );
+        parsed
+    }
+
+    /// One DynamoDB call (`awsJson1_0`), requiring a 200: how a suite reads back what a
+    /// handler's own SDK call really wrote. Only a [`Chain::with_dynamodb`] chain serves
+    /// one.
+    pub(crate) async fn ddb(&self, case: &str, operation: &str, body: &Value) -> Value {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header(
+                "host",
+                format!("{DYNAMODB_SIGNING_NAME}.{REGION}.amazonaws.com"),
+            )
+            .header("content-type", "application/x-amz-json-1.0")
+            .header(
+                "x-amz-target",
+                format!("{DYNAMODB_TARGET_PREFIX}.{operation}"),
+            )
+            .header("authorization", Self::authorization(DYNAMODB_SIGNING_NAME))
             .body(Bytes::from(body.to_string()))
             .expect("a well-formed request");
         let response = self.router.dispatch(request).await;

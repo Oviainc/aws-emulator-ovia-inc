@@ -151,6 +151,8 @@ mod role_log_and_key_authorization;
 mod run_a_job_pattern_calls;
 #[path = "all/running_execution_history.rs"]
 mod running_execution_history;
+#[path = "all/saga_compensation_on_task_failure.rs"]
+mod saga_compensation_on_task_failure;
 #[path = "all/sdk_response_envelope.rs"]
 mod sdk_response_envelope;
 #[path = "all/send_task_failure.rs"]
