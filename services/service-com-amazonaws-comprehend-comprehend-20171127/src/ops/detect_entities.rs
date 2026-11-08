@@ -16,9 +16,11 @@
 //! the modifier that places it and the day part that narrows it is reported with all
 //! of them, which is what a client highlighting or redacting the mention needs. Its
 //! `Score` is computed from THAT detection's own evidence ([`Evidence`]) — how much
-//! the rule that fired constrains the characters, how much of the mention it accounts
-//! for, and what else the same characters could be — so it is a per-detection
-//! confidence rather than a constant of the rule class or of the type.
+//! the rule that fired constrains the characters, how many of the mention's own
+//! characters it accounts for, whether the document writes the mention again, and
+//! what else those characters could be — so it is a per-detection confidence rather
+//! than a constant of the rule class or of the type: two mentions of one type in one
+//! document are reported with the confidence each one's characters leave.
 //!
 //! The operation holds NO state: the answer is a function of the submitted document
 //! alone, so repeating the call returns the same entities, and nothing a later caller
@@ -134,7 +136,7 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -225,33 +227,50 @@ const TYPE_OTHER: &str = "OTHER";
 /// than every rule of the class sharing one number.
 const EVIDENCE_PER_SPECIFICITY_LEVEL: f64 = 5.0;
 
-/// Evidence one token of a matched closed form holds: every further token the form
-/// fixed is a further constraint the span satisfied, so a date written with its year
-/// is read with more confidence than the same date without it.
-const EVIDENCE_PER_FORM_TOKEN: f64 = 2.0;
+/// Evidence ONE CHARACTER a matched closed form fixes holds.
+///
+/// A form constrains the characters it matched one at a time, so the longer the
+/// stretch of the mention it accounts for the less room is left for the match to be
+/// a coincidence: a date written with its year is read with more confidence than the
+/// same date without it, and two mentions of the SAME form are read with the
+/// confidence their own characters leave rather than with one number belonging to
+/// the form.
+const EVIDENCE_PER_FORM_CHAR: f64 = 0.45;
 
-/// Evidence a lexicon entry holds, per token of the span it names: a name the
-/// lexicon spells out is the strongest evidence this recogniser has, and a longer
-/// entry (`Bank of America`) is less likely to be a coincidence than a one-word one.
-const EVIDENCE_PER_LEXICON_TOKEN: f64 = 9.0;
+/// Evidence a lexicon entry holds, per character of the span it names: a name the
+/// lexicon spells out is the strongest evidence this recogniser has, and the longer
+/// the spelling the entry matched (`Bank of America`) the less likely it is a
+/// coincidence.
+const EVIDENCE_PER_LEXICON_CHAR: f64 = 1.5;
 
-/// Evidence one cue token holds — a legal-form designator inside the span, an
-/// honorific in front of it, a thoroughfare type after it. Cues that agree add up.
-const EVIDENCE_PER_CUE_TOKEN: f64 = 6.0;
+/// Evidence a cue holds, per character of the span it names — a legal-form
+/// designator inside the span, an honorific in front of it, a thoroughfare type
+/// after it. Cues that agree add up, and a designator spelled out
+/// (`Corporation`) constrains more of the name than its abbreviation (`Corp`).
+const EVIDENCE_PER_CUE_CHAR: f64 = 1.5;
 
-/// Evidence the SHAPE of a personal name holds, taken with the syntactic position
-/// that confirms it: a run of capitalized tokens joined only by the particles a name
-/// carries, standing where English puts a person
+/// Evidence the SHAPE of a personal name holds, per character of the span, taken
+/// with the syntactic position that confirms it: a run of capitalized tokens joined
+/// only by the particles a name carries, standing where English puts a person
 /// ([`person_bearing_position`]). It accounts for the whole span, as a lexicon entry
 /// naming every token does, but says less than one — a lexicon entry names WHO the
 /// span is, while the shape and the position only say what KIND of name it is — so it
-/// weighs below [`EVIDENCE_PER_LEXICON_TOKEN`] and below the honorific cue that
+/// weighs below [`EVIDENCE_PER_LEXICON_CHAR`] and below the honorific cue that
 /// announces a person outright.
-const EVIDENCE_PER_NAME_SHAPE: f64 = 5.0;
+const EVIDENCE_PER_NAME_SHAPE_CHAR: f64 = 0.6;
 
-/// Evidence the orthography of one capitalized token holds: in running English text a
-/// capital marks a name, which is weak on its own and corroborates every rule above.
-const EVIDENCE_PER_CAPITALIZED_TOKEN: f64 = 1.5;
+/// Evidence the orthography of one character of a capitalized token holds: in
+/// running English text a capital marks a name, which is weak on its own,
+/// corroborates every rule above, and says less about a short token — an
+/// abbreviation, a sentence's first word — than about a long one.
+const EVIDENCE_PER_CAPITALIZED_CHAR: f64 = 0.25;
+
+/// Evidence one FURTHER writing of the same mention, read the same way, holds: a
+/// document that writes a name again corroborates the reading, so a mention the
+/// document repeats is reported with more confidence than one it writes once. The
+/// evidence is a property of the document, so every writing of the mention carries
+/// it and the confidence does not depend on which occurrence a caller looks at.
+const EVIDENCE_PER_CORROBORATING_MENTION: f64 = 1.25;
 
 /// The weight of the reading in which the span names nothing at all.
 ///
@@ -264,10 +283,11 @@ const READING_NOT_AN_ENTITY: f64 = 0.4;
 /// span is a name of no listed category.
 const READING_UNTYPED_NAME: f64 = 3.0;
 
-/// The weight, per span token no evidence names, of the reading in which the span is
-/// longer than the entity inside it: a lexicon entry or a cue covering one token of a
-/// three-token span leaves the other two unaccounted for.
-const READING_UNNAMED_TOKEN: f64 = 1.5;
+/// The weight, per character of the span no evidence names, of the reading in which
+/// the span is longer than the entity inside it: a lexicon entry or a cue naming
+/// three characters of a sixteen-character span leaves the other thirteen
+/// unaccounted for.
+const READING_UNNAMED_CHAR: f64 = 0.3;
 
 /// What one candidate span's own evidence weighs, for and against the reading it is
 /// reported with.
@@ -275,8 +295,9 @@ const READING_UNNAMED_TOKEN: f64 = 1.5;
 /// The recogniser reports [`Self::confidence`], the SUPPORTED reading's share of
 /// everything the span's evidence leaves open — the same shape of calibration the
 /// service's part-of-speech tagger reports a tag with. So the confidence follows the
-/// detection: the rules that fired on it, how much of the span they account for, and
-/// what else the same characters could have been.
+/// detection: the rules that fired on it, how many of the mention's own CHARACTERS
+/// they account for, what the rest of the document says about the same mention, and
+/// what else those characters could have been.
 #[derive(Debug, Clone, Default)]
 struct Evidence {
     /// Total weight of the evidence FOR the reading reported.
@@ -1297,17 +1318,23 @@ fn pattern_entities(text: &str) -> Vec<Recognised> {
             } else {
                 (start, end)
             };
-            let span_tokens = token_regex().find_iter(&text[start..end]).count().max(1);
+            let form_chars = text[start..end]
+                .chars()
+                .filter(|character| !character.is_whitespace())
+                .count()
+                .max(1);
             found.push(Recognised {
                 start,
                 end,
                 entity_type: rule.entity_type,
                 // A closed form's evidence is the span's own characters: how much it
-                // constrains them (the rule's specificity level) and how many tokens
-                // of the mention it accounts for.
+                // constrains them (the rule's specificity level) and how many of the
+                // mention's characters it accounts for. The completion above is
+                // rule-driven too — a deictic modifier and a day part are closed
+                // lists — so every character of the reported mention is named.
                 evidence: Evidence {
                     support: EVIDENCE_PER_SPECIFICITY_LEVEL * f64::from(rule.priority)
-                        + EVIDENCE_PER_FORM_TOKEN * span_tokens as f64,
+                        + EVIDENCE_PER_FORM_CHAR * form_chars as f64,
                     competing: 0.0,
                 },
                 priority: rule.priority,
@@ -1385,27 +1412,39 @@ fn phrase_entities(text: &str) -> Vec<Recognised> {
     found
 }
 
-/// How many of a phrase's tokens are in `cues`, or `None` when none are.
-fn cue_tokens(normalised: &[String], cues: &HashSet<&'static str>) -> Option<usize> {
-    let count = normalised
+/// How many characters of the phrase the tokens in `cues` hold, or `None` when the
+/// phrase carries no cue.
+///
+/// Cues that agree add up, so a span carrying two designators is read with the
+/// characters of both; `token_chars` is the character length of each token of the
+/// phrase, in the same order as `normalised`.
+fn cue_chars(
+    normalised: &[String],
+    token_chars: &[usize],
+    cues: &HashSet<&'static str>,
+) -> Option<usize> {
+    let chars: usize = normalised
         .iter()
-        .filter(|token| cues.contains(token.as_str()))
-        .count();
-    (count > 0).then_some(count)
+        .zip(token_chars)
+        .filter(|(token, _)| cues.contains(token.as_str()))
+        .map(|(_, chars)| *chars)
+        .sum();
+    (chars > 0).then_some(chars)
 }
 
-/// The longest contiguous run of a phrase's tokens that a lexicon names, with the
-/// type that lexicon gives it. Organizations are consulted before places at equal
-/// length, so a company named after a city reads as the company.
-fn lexicon_match(normalised: &[String]) -> Option<(usize, &'static str)> {
+/// The longest contiguous run of a phrase's tokens that a lexicon names, as the run's
+/// position in the phrase, with the type that lexicon gives it. Organizations are
+/// consulted before places at equal length, so a company named after a city reads as
+/// the company.
+fn lexicon_match(normalised: &[String]) -> Option<(Range<usize>, &'static str)> {
     for length in (1..=normalised.len()).rev() {
         for start in 0..=normalised.len() - length {
             let phrase = canonical(&normalised[start..start + length].join(" "));
             if organizations().contains(phrase.as_str()) {
-                return Some((length, TYPE_ORGANIZATION));
+                return Some((start..start + length, TYPE_ORGANIZATION));
             }
             if places().contains(phrase.as_str()) {
-                return Some((length, TYPE_LOCATION));
+                return Some((start..start + length, TYPE_LOCATION));
             }
         }
     }
@@ -1461,16 +1500,27 @@ fn divide_phrase(tokens: &[Token], phrase: Range<usize>) -> Vec<Range<usize>> {
     parts
 }
 
-/// How many of a phrase's tokens carry the capital that marks a name in running
+/// The character length of each of the phrase's tokens, in phrase order: what every
+/// rule's evidence is weighed over, since a rule constrains CHARACTERS and the
+/// whitespace and punctuation between two tokens is not something it names.
+fn token_chars(text: &str, tokens: &[Token], phrase: Range<usize>) -> Vec<usize> {
+    tokens[phrase]
+        .iter()
+        .map(|token| text[token.start..token.end].chars().count())
+        .collect()
+}
+
+/// How many characters of the phrase carry the capital that marks a name in running
 /// English text.
 ///
 /// At least one, because a candidate phrase is anchored on a capitalized token: the
 /// orthographic evidence of a candidate span is never nil.
-fn capitalized_tokens(tokens: &[Token], phrase: Range<usize>) -> usize {
+fn capitalized_chars(text: &str, tokens: &[Token], phrase: Range<usize>) -> usize {
     tokens[phrase]
         .iter()
         .filter(|token| token.capitalized)
-        .count()
+        .map(|token| text[token.start..token.end].chars().count())
+        .sum::<usize>()
         .max(1)
 }
 
@@ -1557,7 +1607,7 @@ fn classify_phrase(text: &str, tokens: &[Token], phrase: Range<usize>) -> Option
     // front of the name is trimmed off.
     let written_start = tokens[phrase.start].start;
     let written_end = tokens[phrase.end - 1].end;
-    let written_tokens = phrase.len();
+    let written_chars: usize = token_chars(text, tokens, phrase.clone()).iter().sum();
     // A lexicon entry naming the phrase AS WRITTEN is the whole evidence, so the
     // name keeps the article it is written with (`The New York Times`).
     let whole = canonical_phrase(tokens, phrase.clone());
@@ -1570,12 +1620,12 @@ fn classify_phrase(text: &str, tokens: &[Token], phrase: Range<usize>) -> Option
                 start: written_start,
                 end: written_end,
                 entity_type,
-                // The lexicon names every token of the span, so nothing in it is
-                // unaccounted for; the orthography of the name corroborates it.
+                // The lexicon spells out every character of the span, so nothing in
+                // it is unaccounted for; the orthography of the name corroborates it.
                 evidence: Evidence {
-                    support: EVIDENCE_PER_LEXICON_TOKEN * written_tokens as f64
-                        + EVIDENCE_PER_CAPITALIZED_TOKEN
-                            * capitalized_tokens(tokens, phrase.clone()) as f64,
+                    support: EVIDENCE_PER_LEXICON_CHAR * written_chars as f64
+                        + EVIDENCE_PER_CAPITALIZED_CHAR
+                            * capitalized_chars(text, tokens, phrase.clone()) as f64,
                     competing: 0.0,
                 },
                 priority: 1,
@@ -1621,56 +1671,55 @@ fn classify_phrase(text: &str, tokens: &[Token], phrase: Range<usize>) -> Option
         .iter()
         .map(|token| token.lower.clone())
         .collect();
-    let span_tokens = normalised.len();
-    let capitalized = capitalized_tokens(tokens, phrase.clone());
+    // What every rule below weighs its evidence over: the characters of each token
+    // of the span, the characters of the span as a whole, and the characters the
+    // document capitalized.
+    let chars_of = token_chars(text, tokens, phrase.clone());
+    let span_chars: usize = chars_of.iter().sum();
+    let head_chars = chars_of.first().copied().unwrap_or_default();
+    let capitalized = capitalized_chars(text, tokens, phrase.clone());
     // One typed reading of the span, weighed from the evidence that typed it: the
-    // weight the rule's own evidence holds, corroborated by the span's orthography,
-    // against the reading in which the tokens that evidence does NOT name are no part
-    // of the entity.
-    let typed = |entity_type: &'static str, evidence_weight: f64, evidence_tokens: usize| {
+    // rule's own strength over the characters it names, corroborated by the span's
+    // orthography, against the reading in which the characters that evidence does NOT
+    // name are no part of the entity.
+    let typed = |entity_type: &'static str, strength_per_char: f64, named_chars: usize| {
         Some(Recognised {
             start,
             end,
             entity_type,
             evidence: Evidence {
-                support: evidence_weight + EVIDENCE_PER_CAPITALIZED_TOKEN * capitalized as f64,
-                competing: READING_UNNAMED_TOKEN
-                    * span_tokens.saturating_sub(evidence_tokens) as f64,
+                support: strength_per_char * named_chars as f64
+                    + EVIDENCE_PER_CAPITALIZED_CHAR * capitalized as f64,
+                competing: READING_UNNAMED_CHAR * span_chars.saturating_sub(named_chars) as f64,
             },
             priority: 1,
         })
     };
 
-    if let Some(cues) = cue_tokens(&normalised, organization_designators()) {
-        return typed(
-            TYPE_ORGANIZATION,
-            EVIDENCE_PER_CUE_TOKEN * cues as f64,
-            cues,
-        );
+    if let Some(cues) = cue_chars(&normalised, &chars_of, organization_designators()) {
+        return typed(TYPE_ORGANIZATION, EVIDENCE_PER_CUE_CHAR, cues);
     }
+    // An honorific announces that the name behind it is a personal one, which places
+    // the name's head; what the rest of the span adds, the cue does not name.
     if title_cue {
-        return typed(TYPE_PERSON, EVIDENCE_PER_CUE_TOKEN, 1);
+        return typed(TYPE_PERSON, EVIDENCE_PER_CUE_CHAR, head_chars);
     }
-    if let Some(cues) = cue_tokens(&normalised, geographic_designators()) {
-        return typed(TYPE_LOCATION, EVIDENCE_PER_CUE_TOKEN * cues as f64, cues);
+    if let Some(cues) = cue_chars(&normalised, &chars_of, geographic_designators()) {
+        return typed(TYPE_LOCATION, EVIDENCE_PER_CUE_CHAR, cues);
     }
-    if let Some(cues) = cue_tokens(&normalised, event_designators()) {
-        return typed(TYPE_EVENT, EVIDENCE_PER_CUE_TOKEN * cues as f64, cues);
+    if let Some(cues) = cue_chars(&normalised, &chars_of, event_designators()) {
+        return typed(TYPE_EVENT, EVIDENCE_PER_CUE_CHAR, cues);
     }
     let lexicon_hit = lexicon_match(&normalised);
     // A lexicon entry naming the WHOLE phrase outranks the given-name rule, so a
     // place that is also a given name reads as the place.
-    if let Some((length, entity_type)) = lexicon_hit {
-        if length == span_tokens {
-            return typed(
-                entity_type,
-                EVIDENCE_PER_LEXICON_TOKEN * length as f64,
-                length,
-            );
+    if let Some((run, entity_type)) = lexicon_hit.clone() {
+        if run.len() == normalised.len() {
+            return typed(entity_type, EVIDENCE_PER_LEXICON_CHAR, span_chars);
         }
     }
     if given_names().contains(normalised[0].as_str()) {
-        return typed(TYPE_PERSON, EVIDENCE_PER_CUE_TOKEN, 1);
+        return typed(TYPE_PERSON, EVIDENCE_PER_CUE_CHAR, head_chars);
     }
     // A span written like a personal name, standing where English puts a person, is
     // a PERSON however the name is spelled: the evidence is the SHAPE of the name
@@ -1680,16 +1729,13 @@ fn classify_phrase(text: &str, tokens: &[Token], phrase: Range<usize>) -> Option
         && person_name_shape(text, tokens, phrase.clone())
         && person_bearing_position(text, tokens, phrase.clone())
     {
-        return typed(TYPE_PERSON, EVIDENCE_PER_NAME_SHAPE, span_tokens);
+        return typed(TYPE_PERSON, EVIDENCE_PER_NAME_SHAPE_CHAR, span_chars);
     }
-    if let Some((length, entity_type)) = lexicon_hit {
-        return typed(
-            entity_type,
-            EVIDENCE_PER_LEXICON_TOKEN * length as f64,
-            length,
-        );
+    if let Some((run, entity_type)) = lexicon_hit {
+        let named: usize = chars_of.get(run).map_or(0, |run| run.iter().sum());
+        return typed(entity_type, EVIDENCE_PER_LEXICON_CHAR, named);
     }
-    if span_tokens >= 2 || !tokens[phrase.start].sentence_initial {
+    if normalised.len() >= 2 || !tokens[phrase.start].sentence_initial {
         // The span is a name — that is what its orthography says — but no rule
         // places it in a category, so the modelled `OTHER` is the reading reported
         // and the typed readings nothing could confirm stay open.
@@ -1698,7 +1744,7 @@ fn classify_phrase(text: &str, tokens: &[Token], phrase: Range<usize>) -> Option
             end,
             entity_type: TYPE_OTHER,
             evidence: Evidence {
-                support: EVIDENCE_PER_CAPITALIZED_TOKEN * capitalized as f64,
+                support: EVIDENCE_PER_CAPITALIZED_CHAR * capitalized as f64,
                 competing: READING_UNTYPED_NAME,
             },
             priority: 1,
@@ -1748,6 +1794,32 @@ fn resolve_overlaps(mut found: Vec<Recognised>) -> Vec<Recognised> {
     kept
 }
 
+/// Weigh in what the REST of the document says about each mention: a name the
+/// document writes again, read the same way, corroborates that reading.
+///
+/// The evidence is a property of the document rather than of one occurrence — every
+/// writing of the mention carries it — so a caller reads the same confidence whichever
+/// occurrence it looks at, and a mention written once is left exactly as its own span
+/// weighed.
+fn corroborate_repeated_mentions(text: &str, found: &mut [Recognised]) {
+    // One pass to count each reading, so the weighing stays linear in the number of
+    // detections however many mentions a document carries.
+    let mut writings: HashMap<(&str, &str), usize> = HashMap::new();
+    for entity in found.iter() {
+        *writings
+            .entry((&text[entity.start..entity.end], entity.entity_type))
+            .or_default() += 1;
+    }
+    for entity in found.iter_mut() {
+        let repeats = writings
+            .get(&(&text[entity.start..entity.end], entity.entity_type))
+            .copied()
+            .unwrap_or(1)
+            .saturating_sub(1);
+        entity.evidence.support += EVIDENCE_PER_CORROBORATING_MENTION * repeats as f64;
+    }
+}
+
 /// Every entity the recogniser finds in `text`, as the modelled `Entity` list:
 /// ordered by position, each carrying the characters it covers, the modelled type,
 /// the zero-based CHARACTER offsets of that stretch and the confidence its own
@@ -1763,7 +1835,9 @@ pub fn detect_entities(text: &str) -> Vec<Entity> {
     let char_offset = |byte: usize| char_starts.partition_point(|&start| start < byte) as i32;
     let mut found = pattern_entities(text);
     found.extend(phrase_entities(text));
-    resolve_overlaps(found)
+    let mut recognised = resolve_overlaps(found);
+    corroborate_repeated_mentions(text, &mut recognised);
+    recognised
         .into_iter()
         .map(|entity| Entity {
             score: Some(entity.evidence.confidence()),

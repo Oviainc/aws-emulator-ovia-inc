@@ -39,6 +39,8 @@ mod document_classifiers;
 mod dominant_language_jobs;
 #[path = "all/endpoints.rs"]
 mod endpoints;
+#[path = "all/entity_confidence.rs"]
+mod entity_confidence;
 #[path = "all/entity_detection.rs"]
 mod entity_detection;
 #[path = "all/entity_mention_spans.rs"]
