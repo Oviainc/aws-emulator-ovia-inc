@@ -123,11 +123,17 @@ async fn get(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
 /// immediately before its own request goes out: an instant computed once for the whole table
 /// would drift by however long the rows before it took, and a row a second inside a bound would
 /// land outside it.
+///
+/// The read is rounded UP to the next whole second. The service compares the lifetime at
+/// nanosecond precision while the member carries whole seconds, so a read rounded DOWN leaves a
+/// row one second inside a bound with only the remainder of the current second as slack, which
+/// a loaded machine spends before the request is served. The rounding is strictly less than one
+/// second, so a row one second OUTSIDE a bound stays outside it.
 fn now_seconds() -> i64 {
-    std::time::SystemTime::now()
+    let elapsed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .expect("the clock is after the epoch")
-        .as_secs() as i64
+        .expect("the clock is after the epoch");
+    elapsed.as_secs() as i64 + i64::from(elapsed.subsec_nanos() > 0)
 }
 
 /// The create body for one row: the instrumentation type under test, a location of its own (so

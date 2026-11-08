@@ -5,11 +5,20 @@
 //! to be unique within an account and region — and answers 201 with the stored record's
 //! status.
 //!
+//! Two preconditions are settled BEFORE anything is stored, because AWS answers both of
+//! them instead of creating the definition:
+//!
+//! * the `exportConfig` destination, if the request carries one, has to be a bucket this
+//!   account's object store holds (`crate::state::export_config`), else the create is
+//!   refused 400;
+//! * the `name` has to be one no definition of this account holds yet, else the create
+//!   conflicts with that resource's current state and is refused 409 — whatever the rest
+//!   of the body says, and whatever status the held definition is in.
+//!
 //! The operation is `@idempotent`, so repeating it must have the effect of calling it
-//! once: the same `clientToken`, or an identical body for a name that already exists,
-//! replays the stored definition's status, while a name that already exists with a
-//! DIFFERENT body conflicts with the current state of that resource and answers 409.
-//! Every value it answers with comes from the record it stored.
+//! once: the same `clientToken` replays the stored definition's status, while that token
+//! sent with a DIFFERENT body conflicts with what it created. Every value this operation
+//! answers with comes from the record it stored.
 //!
 //! ## Shape of an operation
 //!
@@ -123,6 +132,22 @@ impl From<CreateWorkflowDefinitionErrorModeled> for CreateWorkflowDefinitionErro
     }
 }
 
+/// What a `ConflictException` from this operation reports as the type of the resource the
+/// request conflicted with: the resource segment `WorkflowDefinitionArn` spells
+/// (`workflow-definition/<name>`), which is the type of resource a create of this
+/// operation addresses.
+const DEFINITION_RESOURCE_TYPE: &str = "workflow-definition";
+
+/// The refusal text for a create whose `name` this account already holds a definition
+/// under.
+///
+/// `CreateWorkflowDefinitionRequest$name` is documented "Must be unique within your
+/// account and region", so the condition — a definition of that name already exists — is
+/// the whole of what the caller is told, and the sentence interpolates nothing: WHICH
+/// resource it conflicted with travels in `resourceId`, as the modelled member for it
+/// ("The identifier of the resource that caused the conflict").
+const DEFINITION_ALREADY_EXISTS: &str = "Workflow definition already exists";
+
 /// The `CreateWorkflowDefinition` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -168,8 +193,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
         let region = crate::state::request_region(ctx.parts());
-        let now = ::std::time::SystemTime::now();
 
+        // PRECONDITION — the export destination. An `exportConfig` names a bucket this
+        // service would export the definition's workflow data to, so it is resolved
+        // against the emulator's own Amazon S3 before anything is stored: a destination
+        // the account does not hold is refused here rather than accepted into a definition
+        // that could never export. Resolved with NO store guard held (see the module).
+        if let Some(refusal) = crate::state::export_config::unusable_export_bucket(
+            ctx,
+            &region,
+            input.export_config.as_ref(),
+        )
+        .await
+        {
+            return Err(CreateWorkflowDefinitionErrorModeled::ValidationException(refusal).into());
+        }
+
+        // The instant this create is judged at, read AFTER the resolution above so a
+        // deletion that became due while S3 was being asked is made before the name is.
+        let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
         state.complete_due_deletions(now);
 
@@ -189,14 +231,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|token| state.idempotent_create(Self::NAME, token).cloned());
         if let Some(record) = replay {
             if record.fingerprint != fingerprint {
+                // The definition that token created, by the identifier a conflict names a
+                // resource of this service by: its own stored ARN while it is still held,
+                // else the ARN that named it.
+                let resource_id = state.definition(&record.resource_id).map_or_else(
+                    |_| crate::state::workflow_definition_arn(&region, &record.resource_id),
+                    |definition| definition.arn.clone(),
+                );
                 return Err(CreateWorkflowDefinitionErrorModeled::ConflictException(
                     ConflictException {
                         message: format!(
                             "clientToken was already used to create workflow definition {} with different parameters",
                             record.resource_id
                         ),
-                        resource_id: record.resource_id,
-                        resource_type: "workflow-definition".to_string(),
+                        resource_id,
+                        resource_type: DEFINITION_RESOURCE_TYPE.to_string(),
                     },
                 )
                 .into());
@@ -217,33 +266,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // creates it again once it is gone.
         }
 
-        let existing = state
+        // PRECONDITION — the name. The model documents it as unique within the account and
+        // region, so a name this account already holds a definition under is NOT a resource
+        // this call can create: whatever the rest of the body says, the create conflicts
+        // with the current state of that resource and nothing is stored. Only the token
+        // path above replays a success, and only for the very request that created it.
+        let existing_arn = state
             .definition(&input.name)
             .ok()
-            .map(|definition| (definition.status, definition.create_fingerprint.clone()));
-        if let Some((status, stored_fingerprint)) = existing {
-            let identical_repeat = status == crate::state::WorkflowDefinitionStatus::Active
-                && stored_fingerprint == fingerprint;
-            if !identical_repeat {
-                return Err(CreateWorkflowDefinitionErrorModeled::ConflictException(
-                    ConflictException {
-                        message: format!(
-                            "workflow definition {} already exists with status {}",
-                            input.name,
-                            status.as_wire()
-                        ),
-                        resource_id: input.name.clone(),
-                        resource_type: "workflow-definition".to_string(),
-                    },
-                )
-                .into());
-            }
-            if let Some(token) = input.client_token.as_deref() {
-                state.record_idempotent_create(Self::NAME, token, fingerprint, input.name.clone());
-            }
-            return Ok(CreateWorkflowDefinitionOutput {
-                status: status.as_wire().to_string(),
-            });
+            .map(|definition| definition.arn.clone());
+        if let Some(arn) = existing_arn {
+            return Err(CreateWorkflowDefinitionErrorModeled::ConflictException(
+                ConflictException {
+                    message: DEFINITION_ALREADY_EXISTS.to_string(),
+                    resource_id: arn,
+                    resource_type: DEFINITION_RESOURCE_TYPE.to_string(),
+                },
+            )
+            .into());
         }
 
         // The store is bounded: a create past the cap is refused, never grown into.
@@ -270,7 +310,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // ACTIVE rather than in a transient status.
             status: crate::state::WorkflowDefinitionStatus::Active,
             deletion_due_at: None,
-            create_fingerprint: fingerprint.clone(),
             runs: ::std::collections::BTreeMap::new(),
             insertion_seq,
         };

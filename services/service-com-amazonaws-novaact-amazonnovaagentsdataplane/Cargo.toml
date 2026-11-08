@@ -31,9 +31,20 @@ hex = { workspace = true }
 # expression quoted without its whole-value anchors — which `src/service.rs` states
 # this service's `@pattern` refusals through.
 service-common = { path = "../common" }
+# Amazon S3 client a `WorkflowExportConfig`'s `s3BucketName` is resolved through: a
+# definition's export destination is read before the definition is stored, and S3 is
+# called over the in-process callback into this same emulator (no network client feature
+# is enabled: the transport is the emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# The export-destination suite mounts the S3 service beside this one on a single engine,
+# because CreateWorkflowDefinition resolves an `exportConfig`'s bucket by calling S3 in
+# process.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

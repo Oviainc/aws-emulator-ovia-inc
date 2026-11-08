@@ -186,7 +186,11 @@ fn now_seconds() -> f64 {
 }
 
 /// A `clientToken` the model accepts: `len 33..256`, `^[a-zA-Z0-9](-*[a-zA-Z0-9]){0,256}$`.
-fn client_token(seed: &str) -> String {
+///
+/// `pub(crate)` so the sibling suite that drives the same `@idempotent` create
+/// (`tests/all/create_preconditions.rs`) mints its tokens the same way rather than
+/// carrying a copy of this rule.
+pub(crate) fn client_token(seed: &str) -> String {
     let mut token = format!("tok{seed}");
     while token.len() < 33 {
         token.push('0');
@@ -645,8 +649,10 @@ async fn an_unresolved_parent_is_a_resource_not_found() {
     }
 }
 
-/// `@idempotent`: repeating a create has the effect of calling it once, while the same
-/// name with a different body — or the same token with a different body — conflicts.
+/// `@idempotent`: repeating a create with the `clientToken` that made the definition has
+/// the effect of calling it once, while every OTHER repeat of a name the account already
+/// holds — with no token, or with that token and a different body — conflicts with the
+/// current state of that resource.
 #[tokio::test]
 async fn repeating_a_create_replays_it_and_changing_the_body_conflicts() {
     let emulator = Emulator::new("us-east-1");
@@ -664,10 +670,13 @@ async fn repeating_a_create_replays_it_and_changing_the_body_conflicts() {
 
     let cases: Vec<(&str, Value, u16)> = vec![
         ("the identical request with its token", first.clone(), 201),
+        // The name is documented unique within the account and region, so an untokened
+        // repeat is not a replay of anything: it asks to create a definition that is
+        // already there.
         (
             "the identical request without a token",
             json!({ "name": "idempotent", "description": "the first body" }),
-            201,
+            409,
         ),
         (
             "the same token with a different description",

@@ -106,6 +106,22 @@ fn now_seconds() -> i64 {
         .as_secs() as i64
 }
 
+/// The epoch second a LIFETIME is stated relative to: the clock read ROUNDED UP to the next
+/// whole second.
+///
+/// A lifetime the service measures from the instant it serves the request is compared at
+/// nanosecond precision, while the member carries whole seconds: read DOWN, the fraction of the
+/// current second is already spent before the request goes out, so a row one second inside a
+/// bound has only that fraction of slack and lands outside the bound on a loaded machine.
+/// Rounded up, such a row keeps a whole second of slack, and a row one second OUTSIDE a bound
+/// stays outside it — the rounding is strictly less than one second.
+fn request_instant_seconds() -> i64 {
+    let elapsed = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("the clock is after the epoch");
+    elapsed.as_secs() as i64 + i64::from(elapsed.subsec_nanos() > 0)
+}
+
 /// A `CodeLocation` of the language that requires a class name, naming one.
 fn java_location(line_number: i64) -> Value {
     json!({
@@ -199,10 +215,15 @@ struct Served {
 /// A lifetime the service measures from the TIME OF THE REQUEST is rendered here, against a
 /// clock read immediately before that request goes out, because that is the instant the rule is
 /// measured from: an absolute instant computed when the table was built drifts by however long
-/// the rows before it took, so a row one second inside a bound would land outside it.
+/// the rows before it took, so a row one second inside a bound would land outside it. The read
+/// is rounded up ([`request_instant_seconds`]) so the whole second it falls in is slack rather
+/// than already spent.
 fn body_at_call_time(body: &Value, expires_in: Option<i64>) -> Value {
     match expires_in {
-        Some(offset) => with_members(body, json!({ "ExpiresAt": now_seconds() + offset })),
+        Some(offset) => with_members(
+            body,
+            json!({ "ExpiresAt": request_instant_seconds() + offset }),
+        ),
         None => body.clone(),
     }
 }

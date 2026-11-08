@@ -239,7 +239,7 @@ pub fn decode_next_token(
     Ok(Position::new(created_at, key))
 }
 
-/// The modelled refusal for a request member a listing cannot use: HTTP 400
+/// The modelled refusal for a request member this service cannot use: HTTP 400
 /// `ValidationException` with `reason` `FieldValidationFailed` — one of the three values
 /// `ValidationExceptionReason` declares — and one `fieldList` entry naming the member, so
 /// a caller learns WHICH member to fix.

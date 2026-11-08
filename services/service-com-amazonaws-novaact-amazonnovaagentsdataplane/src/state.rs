@@ -40,6 +40,10 @@ pub mod model_catalog;
 /// service so one implementation of that rule serves all of them.
 pub mod paging;
 
+/// Resolving the Amazon S3 destination a `WorkflowExportConfig` names, before a definition
+/// that carries one is stored.
+pub mod export_config;
+
 /// The region an ARN carries when the request's SigV4 credential scope does not name a
 /// usable one (an unsigned in-process call, say). The `@pattern` on every ARN shape in
 /// this model requires a non-empty `[a-z0-9-]+` region segment, so there is no "no
@@ -337,9 +341,6 @@ pub struct WorkflowDefinition {
     /// When `DeleteWorkflowDefinition` set `status` to `DELETING`, the instant the
     /// removal becomes due. `None` while the definition is `ACTIVE`.
     pub deletion_due_at: Option<SystemTime>,
-    /// The request that created it, so an identical repeat of an `@idempotent` create is
-    /// a replay while a different body for the same name is a conflict.
-    pub create_fingerprint: String,
     pub runs: BTreeMap<String, WorkflowRun>,
     /// Creation order, so a later `List*` can honour `sortOrder` without a redesign.
     pub insertion_seq: u64,

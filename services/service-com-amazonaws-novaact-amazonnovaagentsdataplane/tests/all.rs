@@ -17,6 +17,8 @@ mod act_listing;
 mod act_status_enum_refusal;
 #[path = "all/act_status_update.rs"]
 mod act_status_update;
+#[path = "all/create_preconditions.rs"]
+mod create_preconditions;
 #[path = "all/model_catalog.rs"]
 mod model_catalog;
 #[path = "all/not_found_resource_identifier.rs"]
