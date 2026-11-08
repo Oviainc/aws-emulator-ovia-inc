@@ -668,6 +668,35 @@ fn published_refusal(violation: &Violation) -> Option<Refused> {
                 crate::state::UNSUPPORTED_EVENT_MESSAGE.to_string(),
             )
         }
+        // `PutBucketLifecycleConfiguration`'s container: the target of a transition is the
+        // one member of it the model can refuse by itself, because `TransitionStorageClass`
+        // names the six classes a rule may move an object INTO
+        // (`smithy_query(query="shape",shape="TransitionStorageClass")`) and `STANDARD` is
+        // not among them — an object is already in it. S3 reports that as a target class
+        // that is not valid for the action naming it, which is an `InvalidArgument` about
+        // the VALUE rather than the generic schema refusal: the caller has to change the
+        // class, not the shape of its document.
+        //
+        // Nothing else in the container is refused here: every other rule it breaks is one
+        // the model cannot state, which the handler's own validator refuses
+        // ([`crate::state::validate_lifecycle_configuration`]).
+        "lifecycleConfiguration" => {
+            let invalid_target = matches!(violation.kind, ViolationKind::EnumValue(_))
+                && segments.any(|segment| segment == "storageClass");
+            if !invalid_target {
+                return None;
+            }
+            // Which ACTION named it: the two transition actions carry the same target
+            // member, and S3's sentence names the action the caller has to fix.
+            let action = match violation.path.contains("noncurrentVersionTransitions") {
+                true => crate::state::NONCURRENT_VERSION_TRANSITION_ACTION.0,
+                false => crate::state::TRANSITION_ACTION.0,
+            };
+            (
+                crate::state::INVALID_ARGUMENT_CODE,
+                format!("Invalid target Storage class for {action} action"),
+            )
+        }
         _ => return None,
     };
     Some(Refused {

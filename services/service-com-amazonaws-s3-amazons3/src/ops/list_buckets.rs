@@ -220,6 +220,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // WHICH endpoint a client reached this emulator as, which is what decides the
+        // `CreationDate` each entry reports ([`crate::state::Bucket::creation_date_reported_in`]).
+        let endpoint_region = crate::state::request_region(ctx.parts());
+
         // The page bound this request asks for has to be one a page can be bounded by. The
         // value is judged HERE rather than at the boundary because the refusal carries
         // members of its own — the `<ArgumentName>` / `<ArgumentValue>` pair naming the
@@ -325,9 +329,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
             buckets.push(Bucket {
                 name: Some(name.to_string()),
-                // "Date the bucket was created" — the instant the store recorded, not the
-                // instant of this read, so two listings report the same date.
-                creation_date: bucket.created_at().map(::aws_smithy_types::DateTime::from),
+                // "Date the bucket was created" — as the endpoint this listing was served
+                // by reports it: the instant the store recorded for the bucket, or, for a
+                // listing served by another Region's endpoint, the instant that Region's
+                // record of the bucket was last written
+                // ([`crate::state::Bucket::creation_date_reported_in`]). Either way it is an
+                // instant the store HOLDS rather than the instant of this read, so two
+                // listings through the same endpoint report the same date.
+                creation_date: bucket
+                    .creation_date_reported_in(&endpoint_region)
+                    .map(::aws_smithy_types::DateTime::from),
                 bucket_region: reports_region.then(|| bucket.region.clone()),
                 // "The Amazon Resource Name (ARN) of the S3 bucket" (`Bucket$BucketArn`) —
                 // the ARN of the bucket this entry reports, built from the bucket's own

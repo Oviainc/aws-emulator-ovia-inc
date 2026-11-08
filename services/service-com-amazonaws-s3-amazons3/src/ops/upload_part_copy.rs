@@ -461,6 +461,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 {
                     crate::service::wire::note_addressed_delete_marker(
                         marker.version_id.as_deref(),
+                        marker.last_modified,
                     );
                 }
             }

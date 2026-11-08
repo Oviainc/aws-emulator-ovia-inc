@@ -722,24 +722,8 @@ async fn object_writes_and_reads_are_refused_outside_what_is_stored() {
     // this emulator does keep (see the `object_versioning` suite), so a read naming one
     // is answered rather than refused. Neither is a PARTIAL read: a `Range` and a
     // `partNumber` each name a span of the object, which is served as the 206 the
-    // `zz_probe` suite reads back in pieces.
-    for (case, headers, query) in [
-        ("a conditional read", &[("if-none-match", "\"x\"")][..], ""),
-        (
-            "a modified-since read",
-            &[("if-modified-since", "2026-10-21T07:28:00Z")][..],
-            "",
-        ),
-    ] {
-        let refused = get_object(&router, "refusal-bucket", "dags/held.py", query, headers).await;
-        assert_eq!(
-            refused.status, 501,
-            "case {case:?}: expected the scaffold's 501 for a read this emulator cannot \
-             answer, got {} with body {:?}",
-            refused.status,
-            text(&refused)
-        );
-    }
+    // `zz_probe` suite reads back in pieces. Nor are the two conditional headers that
+    // answer 304: they are served (see [`super::object_conditional_reads`]).
     for (case, headers, query) in [
         ("a ranged read", &[("range", "bytes=0-3")][..], ""),
         ("a part-scoped read", &[][..], "?partNumber=1"),

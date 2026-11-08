@@ -1681,40 +1681,49 @@ fn with_accepted_status(response: Response, operation_name: &str, initiated: boo
 /// `x-amz-version-id` of the marker itself (`$VersionId`).
 ///
 /// A read or a copy of such a key answers 404 — "if the current version is a delete marker,
-/// Amazon S3 behaves as if the object was deleted" — and the two headers are what say WHY it
-/// is not there and WHICH version to delete to bring it back; the error document itself
-/// carries no member for either. An operation that resolved the key to a marker records it
-/// ([`note_addressed_delete_marker`]) and the headers are written here, the way the status of
-/// an initiated restore is promoted here.
+/// Amazon S3 behaves as if the object was deleted" — and a read that names the marker's own
+/// version answers 405; either way the headers are what say WHY the object is not there,
+/// WHICH version to delete to bring it back and WHEN that version was written ("it has a key
+/// name and version ID like any other object", Amazon S3 User Guide, *Working with delete
+/// markers*, and when the marker was laid is what a listing reports as its `LastModified`),
+/// since the error document carries no member for any of them. An operation that resolved the
+/// address to a marker records it ([`note_addressed_delete_marker`]) and the headers are
+/// written here, the way the status of an initiated restore is promoted here.
 const DELETE_MARKER_HEADER: &str = "x-amz-delete-marker";
 /// See [`DELETE_MARKER_HEADER`] — the value that header carries for such an answer.
 const DELETE_MARKER_HEADER_VALUE: &str = "true";
 
 ::std::thread_local! {
-    /// The version id of the delete marker the operation serving this thread's request
-    /// resolved the addressed key to, or `None`.
+    /// The version id and the modification instant of the delete marker the operation
+    /// serving this thread's request resolved the addressed key to, or `None`.
     ///
     /// A request-scoped note, held under the same discipline as the restore note above: the
     /// handler records it as the last thing it does before refusing, the serializer TAKES it
     /// before anything that can fail, and every request this service deserializes clears
     /// whatever this thread may still hold.
-    static ADDRESSED_DELETE_MARKER: ::std::cell::RefCell<Option<String>> =
+    static ADDRESSED_DELETE_MARKER: ::std::cell::RefCell<Option<(String, String)>> =
         const { ::std::cell::RefCell::new(None) };
 }
 
-/// Record that the key this request addressed resolves to a DELETE MARKER, whose version is
+/// Record that the address this request names resolves to a DELETE MARKER, whose version is
 /// `version_id` (`None` for the `null` version a bucket that was not versioning-enabled
-/// stored) — see [`DELETE_MARKER_HEADER`].
-pub fn note_addressed_delete_marker(version_id: Option<&str>) {
+/// stored) and which was written at `last_modified` — see [`DELETE_MARKER_HEADER`].
+pub fn note_addressed_delete_marker(
+    version_id: Option<&str>,
+    last_modified: ::std::time::SystemTime,
+) {
     let recorded = version_id
         .unwrap_or(crate::state::NULL_VERSION_ID)
         .to_string();
-    ADDRESSED_DELETE_MARKER.with(|slot| slot.replace(Some(recorded)));
+    let written = DateTime::from(last_modified)
+        .fmt(aws_smithy_types::date_time::Format::HttpDate)
+        .unwrap_or_default();
+    ADDRESSED_DELETE_MARKER.with(|slot| slot.replace(Some((recorded, written))));
 }
 
 /// The note for the response now being serialized, TAKEN rather than read, so a note one
 /// response left behind can never name a later one.
-fn addressed_delete_marker() -> Option<String> {
+fn addressed_delete_marker() -> Option<(String, String)> {
     ADDRESSED_DELETE_MARKER.with(|slot| slot.take())
 }
 
@@ -1727,25 +1736,128 @@ fn forget_any_unanswered_delete_marker() {
 /// `response` with the two headers S3's answer about a key whose current version is a delete
 /// marker carries — see [`DELETE_MARKER_HEADER`] — for a response whose request resolved to
 /// one, and unchanged for every other.
-fn with_delete_marker_headers(mut response: Response, marker: Option<String>) -> Response {
-    let Some(version_id) = marker else {
+fn with_delete_marker_headers(
+    mut response: Response,
+    marker: Option<(String, String)>,
+) -> Response {
+    let Some((version_id, last_modified)) = marker else {
         return response;
     };
     // A value a header map refuses is dropped rather than turning a served response into a
-    // transport failure; a version id never is.
+    // transport failure; a version id and an HTTP date never are.
     let _ = response
         .headers_mut()
         .try_insert(DELETE_MARKER_HEADER, DELETE_MARKER_HEADER_VALUE);
     let _ = response
         .headers_mut()
         .try_insert(VERSION_ID_RESPONSE_HEADER, version_id);
+    let _ = response
+        .headers_mut()
+        .try_insert(LAST_MODIFIED_HEADER, last_modified);
     response
 }
 
-/// The header a response names the version it acted on in: `x-amz-version-id`, which every
+/// The header a response naming the version it acted on in: `x-amz-version-id`, which every
 /// object operation's output binds its `VersionId` to
 /// (`smithy_query(query="operation",operation="GetObject")`).
 const VERSION_ID_RESPONSE_HEADER: &str = "x-amz-version-id";
+
+/// The status a read answers when the caller's cached copy is still current: 304, which
+/// `GetObjectRequest$IfNoneMatch` and `$IfModifiedSince` both name ("otherwise, return a 304
+/// Not Modified error").
+///
+/// Such a response carries NO document at all — "the server generating a 304 response MUST
+/// NOT generate content" (RFC 9110 §15.4.5) — so this status is what tells [`serialize_error`]
+/// to answer the bare status instead of an `<Error>` body, the way the errorless 400 is
+/// answered. The two validator headers RFC 9110 requires with it ("MUST generate … ETag,
+/// Last-Modified") come off the version the read resolved, which only the handler sees, so it
+/// records them ([`note_not_modified`]) and they are written here.
+pub const NOT_MODIFIED_STATUS: u16 = 304;
+
+/// The header a 304 reports the entity tag of the current representation in.
+const ETAG_HEADER: &str = "etag";
+/// The header it reports that representation's modification date in, in HTTP's own date
+/// format (`GetObjectOutput$LastModified` is bound to it).
+const LAST_MODIFIED_HEADER: &str = "last-modified";
+
+::std::thread_local! {
+    /// The validator pair of the version a read of this thread's request answered NOT
+    /// MODIFIED for, or `None`.
+    ///
+    /// A request-scoped note, held under the same discipline as the delete-marker note: the
+    /// handler records it as the last thing it does before refusing, the serializer TAKES it
+    /// before anything that can fail, and every request this service deserializes clears
+    /// whatever this thread may still hold.
+    static NOT_MODIFIED_VALIDATORS: ::std::cell::RefCell<Option<(String, String)>> =
+        const { ::std::cell::RefCell::new(None) };
+}
+
+/// Record the validators of the representation a read answers [`NOT_MODIFIED_STATUS`] for:
+/// its entity tag as the object reports it, and its modification instant.
+pub fn note_not_modified(etag: &str, last_modified: ::std::time::SystemTime) {
+    let rendered = DateTime::from(last_modified)
+        .fmt(aws_smithy_types::date_time::Format::HttpDate)
+        .unwrap_or_default();
+    NOT_MODIFIED_VALIDATORS.with(|slot| slot.replace(Some((etag.to_string(), rendered))));
+}
+
+/// The note for the response now being serialized, TAKEN rather than read.
+fn not_modified_validators() -> Option<(String, String)> {
+    NOT_MODIFIED_VALIDATORS.with(|slot| slot.take())
+}
+
+/// Drop whatever note this thread may still hold, called at the START of every request this
+/// service deserializes.
+fn forget_any_unanswered_validators() {
+    let _ = not_modified_validators();
+}
+
+/// The header a 405 names the methods the addressed resource DOES allow in: "the origin
+/// server MUST generate an `Allow` header field in a 405 response containing a list of the
+/// target resource's currently supported methods" (RFC 9110 §15.5.6).
+///
+/// It is the only thing in such a response that says what a client may do instead — the
+/// `MethodNotAllowed` document states the method that was refused and the kind of resource it
+/// was refused against, not what would work. The set belongs to the RESOURCE, so the refusal
+/// that names the resource type is what records it
+/// ([`crate::scaffolded::Scaffolded::method_not_allowed`]) and it is written here, the way the
+/// delete-marker headers are.
+const ALLOW_HEADER: &str = "allow";
+
+::std::thread_local! {
+    /// The methods the resource this thread's request addressed allows, as the `Allow`
+    /// header's comma-separated list, or `None`.
+    static ALLOWED_METHODS: ::std::cell::RefCell<Option<String>> =
+        const { ::std::cell::RefCell::new(None) };
+}
+
+/// Record the methods the addressed resource allows — see [`ALLOW_HEADER`].
+pub fn note_allowed_methods(methods: &str) {
+    ALLOWED_METHODS.with(|slot| slot.replace(Some(methods.to_string())));
+}
+
+/// The note for the response now being serialized, TAKEN rather than read.
+fn allowed_methods() -> Option<String> {
+    ALLOWED_METHODS.with(|slot| slot.take())
+}
+
+/// Drop whatever note this thread may still hold, called at the START of every request this
+/// service deserializes.
+fn forget_any_unanswered_allowed_methods() {
+    let _ = allowed_methods();
+}
+
+/// `response` with the `Allow` header naming what the addressed resource permits, for a
+/// refusal whose handler recorded a set, and unchanged for every other.
+fn with_allow_header(mut response: Response, methods: Option<String>) -> Response {
+    let Some(methods) = methods else {
+        return response;
+    };
+    // A value a header map refuses is dropped rather than turning a served response into a
+    // transport failure; a method list never is.
+    let _ = response.headers_mut().try_insert(ALLOW_HEADER, methods);
+    response
+}
 
 /// `response` re-sent with `status`, keeping every header the serializer wrote, or unchanged
 /// for a status no HTTP response can carry (neither of this module's two ever is) or a
@@ -2294,6 +2406,11 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // And the delete-marker note, under the same discipline (see
         // [`DELETE_MARKER_HEADER`]).
         forget_any_unanswered_delete_marker();
+        // And the two notes a refusal of its own carries: the validators of a not-modified
+        // answer (see [`NOT_MODIFIED_STATUS`]) and the methods a 405 advertises (see
+        // [`ALLOW_HEADER`]).
+        forget_any_unanswered_validators();
+        forget_any_unanswered_allowed_methods();
         // The BUCKET this request addresses, recorded for the one thing that needs it once
         // the handler has returned: the `BucketName` a bucket-scoped error document names
         // the bucket by when the refusal did not name one itself
@@ -2511,6 +2628,9 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // And for the delete-marker note, which a SUCCESS never carries: taking it here is
         // what keeps a note an earlier refusal left from naming this response.
         let _ = addressed_delete_marker();
+        // The same for the two notes only a refusal carries.
+        let _ = not_modified_validators();
+        let _ = allowed_methods();
         if UNWRAPPED_XML_OUTPUT_OPERATIONS.contains(&operation_name) {
             if let Some(body) =
                 unwrapped_document(output, output_schema).map_err(ProtocolError::Serde)?
@@ -2575,6 +2695,28 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // headers an answer about a key whose current version is a delete marker carries
         // (see [`DELETE_MARKER_HEADER`]).
         let marker = addressed_delete_marker();
+        // The same for the two notes a refusal of its own carries.
+        let validators = not_modified_validators();
+        let allowed = allowed_methods();
+        // A read whose caller already holds the current representation is answered with the
+        // bare status and the validators of that representation, and NO document: see
+        // [`NOT_MODIFIED_STATUS`].
+        if http_status == NOT_MODIFIED_STATUS {
+            let status = StatusCode::try_from(http_status).map_err(|_| {
+                ProtocolError::Malformed(format!("the unusable refusal status {http_status}"))
+            })?;
+            let mut response = Response::new(status, SdkBody::empty());
+            if let Some((etag, last_modified)) = validators {
+                let _ = response.headers_mut().try_insert(ETAG_HEADER, etag);
+                let _ = response
+                    .headers_mut()
+                    .try_insert(LAST_MODIFIED_HEADER, last_modified);
+            }
+            return Ok(with_request_correlation(
+                response,
+                crate::state::request_ids::RequestCorrelation::mint(),
+            ));
+        }
         // One refusal of this service carries NO error document: a request S3 rejects before
         // its API layer answers the bare status and an empty body, which is what an SDK
         // reports the status itself as the code it saw. The handler names it by
@@ -2596,14 +2738,17 @@ impl ServerProtocol for UnwrappedXmlRestXml {
         // shape S3's ids have. A refusal publishes no event notification and so records no
         // pair, so the pair is minted here and written over the one the envelope carries,
         // keeping the body and the headers in agreement.
-        Ok(with_delete_marker_headers(
-            with_envelope_request_correlation(self.inner.serialize_error(
-                error,
-                error_schema,
-                error_code,
-                http_status,
-            )?),
-            marker,
+        Ok(with_allow_header(
+            with_delete_marker_headers(
+                with_envelope_request_correlation(self.inner.serialize_error(
+                    error,
+                    error_schema,
+                    error_code,
+                    http_status,
+                )?),
+                marker,
+            ),
+            allowed,
         ))
     }
 

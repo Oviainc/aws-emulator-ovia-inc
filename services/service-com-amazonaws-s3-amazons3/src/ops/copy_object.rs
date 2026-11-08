@@ -621,7 +621,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // this was called, so that in-process hop is never made while this service's own
         // guard is held — the copies this write owes are made by S3 assuming it.
 
-        let mut store = state.lock();
+        // Taken for the READS this copy makes of the destination and the source; the guard is
+        // released again before the cross-service decision below and taken afresh for the
+        // write.
+        let store = state.lock();
 
         // The DESTINATION bucket decides the encryption of a copy that named none of it,
         // so it is resolved from the same accessor `GetBucketEncryption` answers from —
@@ -800,6 +803,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
                 {
                     crate::service::wire::note_addressed_delete_marker(
                         marker.version_id.as_deref(),
+                        marker.last_modified,
                     );
                 }
             }
@@ -855,6 +859,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
         // one every read of such an object's bytes is made with
         // ([`crate::state::sse_kms`]), about the SOURCE object, and a caller it refuses is
         // answered S3's `AccessDenied` carrying KMS's sentence instead of the copy.
+        //
+        // The guard is RELEASED for it, the way the replication role above is resolved before
+        // the guard is taken at all: a request must never hold this service's state while it
+        // reaches another service's store through the shared engine, because two services
+        // locked in opposite orders would wedge both. Nothing from here to the write below
+        // borrows the store — the source object is a clone — so the guard is given up here
+        // and taken again for the write.
+        drop(store);
         if let Some(denial) = crate::state::sse_kms::decrypt_refusal(
             &*self.engine,
             ctx,
@@ -871,6 +883,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CopyObject<Eng> {
                 denial,
             ));
         }
+
+        // Taken again for the write, now that the cross-service decision above is made.
+        let mut store = state.lock();
 
         // S3 refuses a copy of an object onto ITSELF that would change nothing about it:
         // the request names no new metadata, no new tag set, no storage class, no website

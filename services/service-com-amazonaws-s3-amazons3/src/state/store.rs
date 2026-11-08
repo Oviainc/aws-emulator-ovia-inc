@@ -1017,7 +1017,9 @@ impl ComAmazonawsS3Amazons3State {
             }
         }
 
-        self.buckets.get_mut(bucket)?.notification = configuration;
+        let held = self.buckets.get_mut(bucket)?;
+        held.record_configuration_write();
+        held.notification = configuration;
         Some(())
     }
 
@@ -1055,7 +1057,9 @@ impl ComAmazonawsS3Amazons3State {
             }
         }
 
-        self.buckets.get_mut(bucket)?.lifecycle = Some(BucketLifecycle {
+        let held = self.buckets.get_mut(bucket)?;
+        held.record_configuration_write();
+        held.lifecycle = Some(BucketLifecycle {
             rules,
             transition_default_minimum_object_size,
         });

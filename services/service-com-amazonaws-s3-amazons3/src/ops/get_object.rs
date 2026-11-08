@@ -347,19 +347,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // changes the status or the body of a successful GET in a way an operation that
         // renders ONE success status cannot express:
         //
-        // * `If-None-Match` and `If-Modified-Since` are answered with HTTP 304 and NO body
-        //   when the condition fails, which is not a response this operation can serialize
-        //   (its one success status is 200, and a 304 carries no document at all).
         // * `Range`, `partNumber`, `If-Match` and `If-Unmodified-Since` are SERVED below: a
         //   partial read answers 206 with a `Content-Range` (the status follows from that
         //   header — see `crate::service::wire`), and a precondition that does not hold is a
         //   refusal with the documented code and status.
+        // * `If-None-Match` and `If-Modified-Since` are SERVED below too: a caller whose
+        //   copy is the current one is answered 304 with no document
+        //   ([`crate::scaffolded::Scaffolded::not_modified`]).
         // * `versionId` is SERVED (below): it names one stored version of the key.
         // * the SSE-C members are the key an encrypted object would be decrypted with;
         //   `PutObject` refuses to store one, so no object here was encrypted with it.
         for (member, present) in [
-            ("If-None-Match", input.if_none_match.is_some()),
-            ("If-Modified-Since", input.if_modified_since.is_some()),
             (
                 "x-amz-server-side-encryption-customer-algorithm",
                 input.sse_customer_algorithm.is_some(),
@@ -482,8 +480,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // "If the specified version is a delete marker, the response returns a 405
                 // Method Not Allowed error" (`GetObject`'s documentation): a delete marker
                 // holds no bytes, so a read of it is not something this method can do —
-                // and `MethodNotAllowed` is not a shape in this model either.
-                if held.as_delete_marker().is_some() {
+                // and `MethodNotAllowed` is not a shape in this model either. The answer
+                // names the marker in its headers, the way the 404 for a key a marker
+                // hides does (see `crate::service::wire`'s delete-marker note).
+                if let Some(marker) = held.as_delete_marker() {
+                    crate::service::wire::note_addressed_delete_marker(
+                        marker.version_id.as_deref(),
+                        marker.last_modified,
+                    );
                     return Err(crate::scaffolded::Scaffolded::method_not_allowed(
                         GET_METHOD,
                         crate::state::DELETE_MARKER_RESOURCE_TYPE,
@@ -504,6 +508,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 {
                     crate::service::wire::note_addressed_delete_marker(
                         marker.version_id.as_deref(),
+                        marker.last_modified,
                     );
                 }
             }
@@ -525,6 +530,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.if_unmodified_since.as_ref().and_then(crate::state::instant_of),
         ) {
             return Err(crate::scaffolded::Scaffolded::precondition_failed(condition));
+        }
+
+        // And the two conditions a read states about a copy the caller ALREADY HOLDS, judged
+        // against the same version ([`crate::state::read_is_not_modified`] carries the rule
+        // and the precedence between the two, and the refusals above come first because a
+        // precondition that does not hold is answered whatever the cached copy is). Nothing
+        // about the object is reported: the answer is the bare 304 and the validators of the
+        // representation the caller holds.
+        if crate::state::read_is_not_modified(
+            &object.etag,
+            object.last_modified,
+            input.if_none_match.as_deref(),
+            input
+                .if_modified_since
+                .as_ref()
+                .and_then(crate::state::instant_of),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::not_modified(
+                &object.etag,
+                object.last_modified,
+            ));
         }
 
         // "Before you can retrieve the object you must first restore a copy using

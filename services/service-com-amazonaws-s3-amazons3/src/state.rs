@@ -1718,6 +1718,21 @@ pub const TORRENT_RESOURCE_TYPE: &str = "TORRENT";
 /// shares), so the resource the method was refused against is the marker.
 pub const DELETE_MARKER_RESOURCE_TYPE: &str = "DeleteMarker";
 
+/// The methods the resource type `resource_type` DOES allow, as the `Allow` header's list,
+/// or `None` for a resource type nothing is published about.
+///
+/// A delete marker allows exactly one: "to permanently delete a delete marker, you must
+/// include its version ID in a DeleteObject request" (Amazon S3 User Guide, *Managing delete
+/// markers*) — a marker holds no bytes, so every other object-level method is refused
+/// against it, and removing it is what brings the object back. The `?torrent` subresource
+/// publishes no such set, so a refusal against it advertises none rather than inventing one.
+pub fn methods_allowed_on(resource_type: &str) -> Option<&'static str> {
+    match resource_type {
+        DELETE_MARKER_RESOURCE_TYPE => Some("DELETE"),
+        _ => None,
+    }
+}
+
 /// The `ObjectOwnership` value that DISABLES ACLs on a bucket: "ACLs are disabled and no
 /// longer affect permissions" (`PutBucketAcl`'s documentation), so a request to set one is
 /// refused with [`ACL_NOT_SUPPORTED_CODE`] while a request to read one still answers.

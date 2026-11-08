@@ -400,6 +400,40 @@ pub fn unmet_read_precondition(
         .then_some(IF_UNMODIFIED_SINCE_CONDITION)
 }
 
+/// Whether a READ of an object whose entity tag is `etag` and which was last modified at
+/// `last_modified` is answered NOT MODIFIED under the two conditions a read states for a
+/// cached copy, or `false` when the read is to be served.
+///
+/// The two conditions as `GetObjectRequest` documents them: "Return the object only if its
+/// entity tag (ETag) is different from the one specified in this header; otherwise, return a
+/// 304 Not Modified error" (`$IfNoneMatch`), and "Return the object only if it has been
+/// modified since the specified time; otherwise, return a 304 Not Modified error"
+/// (`$IfModifiedSince`). The same member documents the precedence when both are present:
+/// "If-None-Match condition evaluates to false, and; If-Modified-Since condition evaluates
+/// to true; then, S3 returns 304 Not Modified" — so an `If-None-Match` decides the read on
+/// its own, exactly as an `If-Match` decides [`unmet_read_precondition`] on its own.
+///
+/// `If-None-Match` is judged the way every other entity-tag condition in this module is
+/// ([`entity_tag_matches`]: by value, with the wildcard, the weak marker and the
+/// comma-separated list), and `If-Modified-Since` at the one-second resolution an HTTP date
+/// has (RFC 9110 §5.6.7), so an object stored within the same second as the date it is
+/// judged against counts as not modified since it.
+///
+/// ONE place for the rule, so a GET and a HEAD of the same object cannot disagree about
+/// whether the caller's copy is current.
+pub fn read_is_not_modified(
+    etag: &str,
+    last_modified: SystemTime,
+    if_none_match: Option<&str>,
+    if_modified_since: Option<SystemTime>,
+) -> bool {
+    if let Some(expected) = if_none_match {
+        return entity_tag_matches(expected, etag);
+    }
+    if_modified_since
+        .is_some_and(|since| whole_seconds(last_modified) <= whole_seconds(since))
+}
+
 /// `instant` truncated to whole seconds since the epoch, the resolution an HTTP date carries
 /// — `None` for an instant before the epoch, which no object this store holds was written
 /// at.

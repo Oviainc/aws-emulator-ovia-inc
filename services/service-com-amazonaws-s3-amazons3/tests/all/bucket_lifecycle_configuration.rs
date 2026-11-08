@@ -668,15 +668,24 @@ fn refusal_rows() -> Vec<RefusalRow> {
             message: None,
         },
         RefusalRow {
-            case: "a transition to an infrequent-access class inside the first 30 days",
+            // `TransitionStorageClass` names the six classes a rule may move an object INTO
+            // (`smithy_query(query="shape",shape="TransitionStorageClass")`), and STANDARD is
+            // not among them: an object is already in it. There is NO minimum-days floor
+            // beside it — a transition to an infrequent-access class one day after creation
+            // is accepted (see [`a_short_transition_round_trips`]), because the minimum
+            // storage duration is what the object is charged for, not a bound on the
+            // configuration ("the value can be 0 or any positive integer … some storage
+            // classes have a minimum storage duration and … you're charged for transitioning
+            // objects before their minimum storage duration", `Transition$Days`).
+            case: "a transition whose target storage class is STANDARD",
             document: configuration(&[rule(
-                "<ID>too-soon</ID><Filter><Prefix>a/</Prefix></Filter><Status>Enabled</Status>\
-                 <Transition><Days>10</Days><StorageClass>STANDARD_IA</StorageClass>\
+                "<ID>not-a-target</ID><Filter><Prefix>a/</Prefix></Filter><Status>Enabled</Status>\
+                 <Transition><Days>30</Days><StorageClass>STANDARD</StorageClass>\
                  </Transition>",
             )]),
             code: "InvalidArgument",
             status: 400,
-            message: None,
+            message: Some("Invalid target Storage class for Transition action".to_string()),
         },
         RefusalRow {
             case: "a transition chain running from a colder class to a warmer one",

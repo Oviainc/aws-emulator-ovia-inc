@@ -441,6 +441,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     if !tags.is_empty() {
                         bucket.replace_tags(tags);
                     }
+                    // Everything above came into being WITH the bucket, so nothing has
+                    // configured it since it was created — which is what keeps the
+                    // `CreationDate` every endpoint reports for a fresh bucket the one
+                    // instant it was created at
+                    // ([`crate::state::Bucket::creation_date_reported_in`]).
+                    bucket.forget_configuration_writes();
                 }
                 Ok(CreateBucketOutput {
                     location: Some(location_of(

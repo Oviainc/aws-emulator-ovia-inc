@@ -283,10 +283,13 @@ async fn a_written_object_reads_back_with_the_etag_size_and_metadata_it_was_writ
             "case {case:?}: every stored metadata entry must read back, got {:?}",
             read.header("x-amz-meta-purpose")
         );
+        // "Amazon S3 returns this header for all objects except for S3 Standard storage
+        // class objects" (`HeadObjectOutput$StorageClass`): a write naming no class stores
+        // STANDARD, which the read reports by carrying no storage-class header at all.
         assert_eq!(
-            read.header("x-amz-storage-class").as_deref(),
-            Some("STANDARD"),
-            "case {case:?}: a write naming no storage class stores STANDARD, got {:?}",
+            read.header("x-amz-storage-class"),
+            None,
+            "case {case:?}: a read of a STANDARD object must carry no storage class, got {:?}",
             read.header("x-amz-storage-class")
         );
         assert_eq!(

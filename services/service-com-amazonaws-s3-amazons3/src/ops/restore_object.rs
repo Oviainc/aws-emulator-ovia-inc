@@ -344,51 +344,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreObject<Eng
             ));
         }
 
-        // The restore IN PROGRESS on the addressed version, judged against the clock: a
-        // retrieval that has fallen due is not in progress, and one whose temporary copy has
-        // since expired left the version archived again — both are versions a fresh restore
-        // may be initiated on.
         let now = ::std::time::SystemTime::now();
-        if object
-            .restore
-            .as_ref()
-            .is_some_and(|restore| restore.in_progress_at(now))
-        {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::RESTORE_ALREADY_IN_PROGRESS_CODE,
-                crate::state::RESTORE_ALREADY_IN_PROGRESS_STATUS,
-                crate::state::RESTORE_ALREADY_IN_PROGRESS_MESSAGE,
-            ));
-        }
-
-        // "The Days element is required for regular restores"
-        // (`RestoreRequest$Days`) — a regular restore is one that names no
-        // `OutputLocation`, which is every restore that reaches here, and without a lifetime
-        // the request describes no job. A document the API's published schema rejects is
-        // `MalformedXML`, the code and 400 this service already answers a schema refusal
-        // with.
-        let Some(days) = input
-            .restore_request
-            .as_ref()
-            .and_then(|request| request.days)
-        else {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::MALFORMED_XML_CODE,
-                400,
-                crate::state::MALFORMED_XML_MESSAGE,
-            ));
-        };
-        // `Days` is a plain integer in the model (`RestoreRequest$Days` carries no `@range`,
-        // `smithy_query(query="shape",shape="RestoreRequest")`), so nothing before this
-        // handler refuses a lifetime of zero or fewer days — which is not a lifetime, and
-        // is a value that is not valid for the parameter carrying it.
-        if days < 1 {
-            return Err(crate::scaffolded::Scaffolded::unmodeled(
-                crate::state::INVALID_ARGUMENT_CODE,
-                crate::state::INVALID_ARGUMENT_STATUS,
-                format!("Days must be a positive number of days, got {days}"),
-            ));
-        }
 
         // "When restoring an archived object, you can specify one of the following data
         // access tier options in the Tier element of the request body", and
@@ -426,6 +382,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreObject<Eng
             ));
         }
 
+        // The restore IN PROGRESS on the addressed version, judged against the clock: a
+        // retrieval that has fallen due is not in progress, and one whose temporary copy has
+        // since expired left the version archived again — both are versions a fresh restore
+        // may be initiated on.
+        //
+        // A retrieval that IS running may still be moved to a FASTER tier: "you can upgrade
+        // the speed of your restore while it is in progress" by issuing a second restore
+        // request naming a faster tier (Amazon S3 User Guide, *Upgrading the speed of an
+        // in-progress restore*), and only Expedited over Standard over Bulk is faster
+        // ([`RETRIEVAL_TIERS_FASTEST_FIRST`]). So a request for the same tier or a slower one
+        // asks for the retrieval that is already running, which is what
+        // `RestoreAlreadyInProgress` reports, and one for a faster tier is served: it states
+        // the retrieval afresh at that tier.
+        let running = object
+            .restore
+            .as_ref()
+            .filter(|restore| restore.in_progress_at(now));
+        if let Some(running) = running {
+            if !is_faster_retrieval(&tier, &running.tier) {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::RESTORE_ALREADY_IN_PROGRESS_CODE,
+                    crate::state::RESTORE_ALREADY_IN_PROGRESS_STATUS,
+                    crate::state::RESTORE_ALREADY_IN_PROGRESS_MESSAGE,
+                ));
+            }
+        }
+        // What the retrieval this call UPGRADES was stated with: the lifetime it was asked
+        // for and the instant its copy is due. Copied out of the version here, so the two
+        // reads below do not borrow it.
+        let upgrading = running.map(|running| (running.days, running.available_at));
+
+        // "The Days element is required for regular restores"
+        // (`RestoreRequest$Days`) — a regular restore is one that names no
+        // `OutputLocation`, which is every restore that reaches here, and without a lifetime
+        // the request describes no job. A document the API's published schema rejects is
+        // `MalformedXML`, the code and 400 this service already answers a schema refusal
+        // with. A request that UPGRADES the tier of a running retrieval is the exception: it
+        // changes how fast the copy arrives rather than how long it lives, so one naming no
+        // lifetime keeps the lifetime the restore it upgrades was stated with.
+        let stated_days = input
+            .restore_request
+            .as_ref()
+            .and_then(|request| request.days);
+        let Some(days) = stated_days.or(upgrading.map(|(days, _)| days)) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::MALFORMED_XML_CODE,
+                400,
+                crate::state::MALFORMED_XML_MESSAGE,
+            ));
+        };
+        // `Days` is a plain integer in the model (`RestoreRequest$Days` carries no `@range`,
+        // `smithy_query(query="shape",shape="RestoreRequest")`), so nothing before this
+        // handler refuses a lifetime of zero or fewer days — which is not a lifetime, and
+        // is a value that is not valid for the parameter carrying it. The sentence states
+        // the LIMIT the value broke — fixed text but for the limit itself — and the
+        // `<ArgumentName>` / `<ArgumentValue>` pair beside it names the member and echoes what
+        // the request sent, the way every other refused field of this service names itself.
+        if days < MINIMUM_RESTORE_DAYS {
+            return Err(crate::scaffolded::Scaffolded::invalid_argument(
+                "Days",
+                Some(&days.to_string()),
+                format!("Days must be at least {MINIMUM_RESTORE_DAYS}"),
+            ));
+        }
+
         // Whether this version was PREVIOUSLY restored, which is what decides the status the
         // caller is answered with: "if the object is not previously restored, then Amazon S3
         // returns 202 Accepted in the response. If the object is previously restored, Amazon
@@ -436,16 +457,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreObject<Eng
         // has since expired, is the first: it is archived again and this call initiates the
         // retrieval. Read BEFORE the write, off the version as it stands.
         //
-        // A retrieval still running was refused above, so neither status is answered for one.
+        // A retrieval still RUNNING is one no copy is available for, so an upgrade of one is
+        // the first case too: this call restates the retrieval at a faster tier and the
+        // caller is told it was accepted.
         let previously_restored = !object.archived_at(now);
 
-        // The retrieval starts now and falls due a span later: "you must first initiate a
-        // restore request, and then wait until a temporary copy of the object is available",
-        // so the instant it becomes available is recorded and nothing waits for it here.
+        // The retrieval falls due a span after the call that started it: "you must first
+        // initiate a restore request, and then wait until a temporary copy of the object is
+        // available", so the instant it becomes available is recorded and nothing waits for it
+        // here. An UPGRADE keeps the instant the retrieval it upgrades was already due at: a
+        // faster tier is asked for to get the copy sooner, so it can never push the copy out.
         let restore = crate::state::ObjectRestore {
             tier,
             days,
-            available_at: now + crate::state::RESTORE_COMPLETION_DELAY,
+            available_at: upgrading
+                .map(|(_, available_at)| available_at)
+                .unwrap_or(now + crate::state::RESTORE_COMPLETION_DELAY),
         };
         // A lifetime so long that the expiry of the copy falls on no date a reader could
         // report is a value that is not valid for the parameter carrying it: every reader
@@ -581,6 +608,36 @@ const INVALID_TIER_STATUS: u16 = 400;
 /// whole answer.
 const RETRIEVAL_OPTION_UNSUPPORTED_MESSAGE: &str =
     "Retrieval option is not supported by this storage class.";
+
+/// The shortest lifetime a temporary copy may be asked for: one day.
+///
+/// `RestoreRequest$Days` is the "lifetime of the active copy in days", so a copy has to live
+/// for at least one of them — a request for fewer states no lifetime at all. The member
+/// carries no `@range` in the model, so this handler is what refuses a value below it.
+const MINIMUM_RESTORE_DAYS: i32 = 1;
+
+/// The retrieval tiers, FASTEST FIRST.
+///
+/// Amazon S3 User Guide, *Archive retrieval options*: an Expedited retrieval makes data
+/// available in 1–5 minutes, a Standard one in 3–5 hours and a Bulk one in 5–12 hours — so
+/// this is the order of their speeds, which is what decides whether a second restore request
+/// UPGRADES the retrieval already running.
+const RETRIEVAL_TIERS_FASTEST_FIRST: [&str; 3] = ["Expedited", "Standard", "Bulk"];
+
+/// Whether `tier` is a STRICTLY faster retrieval than `than` — see
+/// [`RETRIEVAL_TIERS_FASTEST_FIRST`]. A value outside that list is no retrieval speed, so it
+/// is faster than nothing.
+fn is_faster_retrieval(tier: &str, than: &str) -> bool {
+    let rank = |named: &str| {
+        RETRIEVAL_TIERS_FASTEST_FIRST
+            .iter()
+            .position(|offered| *offered == named)
+    };
+    match (rank(tier), rank(than)) {
+        (Some(asked), Some(running)) => asked < running,
+        _ => false,
+    }
+}
 
 /// The retrieval tiers the storage class `storage_class` OFFERS, empty for a class no
 /// retrieval can be asked of at all.

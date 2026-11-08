@@ -423,6 +423,19 @@ pub struct Bucket {
     /// Private, like `tags` and `encryption`, so the accessor pair below is the only way
     /// in or out.
     pub(super) metadata_configuration: Option<BucketMetadataConfiguration>,
+
+    /// When one of the bucket's CONFIGURATIONS was last written, or `None` while nothing
+    /// has been configured on it since it was created.
+    ///
+    /// Recorded by every mutator of a bucket subresource
+    /// ([`Bucket::record_configuration_write`]) and read by the one thing that reports it:
+    /// the REGIONAL view of `ListBuckets`, whose `CreationDate` is the instant the Region's
+    /// record of the bucket was last written rather than the instant the bucket came into
+    /// being ([`Bucket::creation_date_reported_in`]).
+    ///
+    /// Private, like `tags` and `encryption`, so the pair of accessors is the only way in or
+    /// out.
+    pub(super) configured_at: Option<SystemTime>,
 }
 
 impl Bucket {
@@ -450,6 +463,40 @@ impl Bucket {
         &self.tags
     }
 
+    /// Record that one of the bucket's configurations was written NOW — see the
+    /// `configured_at` field.
+    pub(super) fn record_configuration_write(&mut self) {
+        self.configured_at = Some(SystemTime::now());
+    }
+
+    /// Forget that anything has configured the bucket, leaving the instant it was created
+    /// as the only one any endpoint reports.
+    ///
+    /// What a CREATE settles with once it has applied what the request asked for: the
+    /// subresources a create installs — the Object Ownership setting, the ACL, an Object Lock
+    /// configuration — come into being WITH the bucket rather than being written onto it
+    /// afterwards, so nothing has configured it since it was created.
+    pub fn forget_configuration_writes(&mut self) {
+        self.configured_at = None;
+    }
+
+    /// The `CreationDate` a `ListBuckets` served by the endpoint of `region` reports for this
+    /// bucket.
+    ///
+    /// Recorded behavior: the endpoint of [`DEFAULT_BUCKET_REGION`] — the Region a request
+    /// that names none is signed for, and the one the global endpoint is — reports the
+    /// instant the bucket was created, and every OTHER Region's endpoint reports the instant
+    /// that Region's record of the bucket was last written, so writing a bucket configuration
+    /// advances the date the regional view reports while leaving the global one where it is.
+    /// A bucket nothing has been configured on has only the one instant to report, whichever
+    /// endpoint asks.
+    pub fn creation_date_reported_in(&self, region: &str) -> Option<SystemTime> {
+        if region == DEFAULT_BUCKET_REGION {
+            return self.created_at;
+        }
+        self.configured_at.or(self.created_at)
+    }
+
     /// Replace the whole tag set with `tags`.
     ///
     /// A replacement, not a merge: "When this operation sets the tags for a bucket, it
@@ -457,6 +504,7 @@ impl Bucket {
     /// operation to add tags to an existing list of tags" (`PutBucketTagging`'s own
     /// documentation).
     pub fn replace_tags(&mut self, tags: Vec<ResourceTag>) {
+        self.record_configuration_write();
         self.tags = tags;
     }
 
@@ -469,6 +517,7 @@ impl Bucket {
     /// carries afterwards is exactly what this request carried and nothing of the
     /// configuration before it.
     pub fn set_versioning(&mut self, status: &str, mfa_delete: Option<&str>) {
+        self.record_configuration_write();
         self.versioning = Some(BucketVersioning {
             status: status.to_string(),
             mfa_delete: mfa_delete.map(str::to_string),
@@ -498,6 +547,7 @@ impl Bucket {
     ///
     /// One place, so no caller can record half of that pair.
     pub fn enable_object_lock(&mut self) {
+        self.record_configuration_write();
         self.object_lock_enabled = true;
         // A bucket already in that state keeps the versioning configuration it carries, MFA
         // delete included: there is nothing to set.
@@ -530,6 +580,7 @@ impl Bucket {
         default_retention: Option<BucketDefaultRetention>,
     ) {
         self.enable_object_lock();
+        self.record_configuration_write();
         self.object_lock_rule = default_retention;
     }
 
@@ -686,6 +737,7 @@ impl Bucket {
     /// transfer acceleration state" the request carries as its whole payload, so the state
     /// the bucket is in afterwards is the one it names.
     pub fn set_accelerate_status(&mut self, status: &str) {
+        self.record_configuration_write();
         self.accelerate = Some(status.to_string());
     }
 
@@ -707,6 +759,7 @@ impl Bucket {
     /// so what the request names becomes the bucket's configuration in full — the way
     /// [`Bucket::set_versioning`] replaces the versioning state.
     pub fn set_payer(&mut self, payer: &str) {
+        self.record_configuration_write();
         self.request_payment = Some(payer.to_string());
     }
 
@@ -726,6 +779,7 @@ impl Bucket {
     /// the versioning state: the request carries the complete `AbacStatus` container as
     /// its payload, so the state the bucket is in afterwards is the one it names.
     pub fn set_abac_status(&mut self, status: &str) {
+        self.record_configuration_write();
         self.abac = Some(status.to_string());
     }
 
@@ -744,6 +798,7 @@ impl Bucket {
     /// payload, so what the request names becomes the bucket's configuration in full — the
     /// way [`Bucket::set_ownership_controls`] replaces the ownership controls.
     pub fn set_public_access_block(&mut self, configuration: BucketPublicAccessBlock) {
+        self.record_configuration_write();
         self.public_access_block = Some(configuration);
     }
 
@@ -756,11 +811,13 @@ impl Bucket {
     /// the bucket was created in: a create installs
     /// [`BucketPublicAccessBlock::all_enabled`].
     pub fn clear_public_access_block(&mut self) -> bool {
+        self.record_configuration_write();
         self.public_access_block.take().is_some()
     }
 
     /// Remove the bucket's tag set, leaving no tags associated with it.
     pub fn clear_tags(&mut self) {
+        self.record_configuration_write();
         self.tags.clear();
     }
 
@@ -783,6 +840,7 @@ impl Bucket {
         if let Some(last) = rules.last() {
             self.object_ownership = Some(last.clone());
         }
+        self.record_configuration_write();
         self.ownership_controls = Some(rules);
     }
 
@@ -800,6 +858,7 @@ impl Bucket {
     /// and withdrawing the controls is the documented way back to ACLs that affect
     /// permissions.
     pub fn clear_ownership_controls(&mut self) {
+        self.record_configuration_write();
         self.ownership_controls = None;
         self.object_ownership = Some(OBJECT_WRITER.to_string());
     }
@@ -816,6 +875,7 @@ impl Bucket {
     /// `x-amz-object-ownership` header names, and what the last rule of a
     /// `PutBucketOwnershipControls` payload applies.
     pub fn set_object_ownership(&mut self, ownership: &str) {
+        self.record_configuration_write();
         self.object_ownership = Some(ownership.to_string());
     }
 
@@ -943,6 +1003,7 @@ impl Bucket {
     /// `AccessControlPolicy` body — so what the request names becomes the bucket's ACL in
     /// full, the way [`Bucket::set_ownership_controls`] replaces the ownership controls.
     pub fn set_acl_grants(&mut self, grants: Vec<AclGrant>) {
+        self.record_configuration_write();
         self.acl = Some(grants);
     }
 
@@ -1113,6 +1174,7 @@ impl Bucket {
     /// `ServerSideEncryptionConfiguration` it carries as its payload, so what the request
     /// names becomes the bucket's configuration in full.
     pub fn set_encryption(&mut self, rules: Vec<BucketEncryptionRule>) {
+        self.record_configuration_write();
         self.encryption = Some(rules);
     }
 
@@ -1131,6 +1193,7 @@ impl Bucket {
     /// replication one: every other configuration the bucket holds, and its objects, are
     /// left exactly as they were.
     pub fn clear_encryption(&mut self) -> bool {
+        self.record_configuration_write();
         self.encryption.take().is_some()
     }
 
@@ -1153,6 +1216,7 @@ impl Bucket {
     /// than overwrites, so this is reached only once per configuration — with
     /// `GetBucketMetadataConfiguration` reporting it from then on.
     pub fn set_metadata_configuration(&mut self, configuration: BucketMetadataConfiguration) {
+        self.record_configuration_write();
         self.metadata_configuration = Some(configuration);
     }
 
@@ -1169,7 +1233,13 @@ impl Bucket {
     /// takes the configuration off the bucket and settles what its tables leave in that
     /// namespace in one step, so the two records cannot be written apart.
     pub(super) fn take_metadata_configuration(&mut self) -> Option<BucketMetadataConfiguration> {
-        self.metadata_configuration.take()
+        // Only a delete that took a configuration OFF the bucket configured it — see
+        // [`Self::delete_metrics_configuration`].
+        let taken = self.metadata_configuration.take();
+        if taken.is_some() {
+            self.record_configuration_write();
+        }
+        taken
     }
 
     /// Record `configuration_state` as the inventory table state of the bucket's S3 Metadata
@@ -1298,6 +1368,7 @@ impl Bucket {
         &mut self,
         configuration: crate::ops::types::ReplicationConfiguration,
     ) {
+        self.record_configuration_write();
         self.replication = Some(configuration);
     }
 
@@ -1311,6 +1382,7 @@ impl Bucket {
     /// left exactly as they were, the way [`Self::clear_lifecycle`] is scoped to the
     /// lifecycle one.
     pub fn clear_replication(&mut self) -> bool {
+        self.record_configuration_write();
         self.replication.take().is_some()
     }
 
@@ -1327,6 +1399,7 @@ impl Bucket {
     /// documentation), which leaves the bucket in the state it was created in — so a bucket
     /// that carried none is already there and nothing changes.
     pub fn clear_lifecycle(&mut self) -> bool {
+        self.record_configuration_write();
         self.lifecycle.take().is_some()
     }
 
@@ -1433,7 +1506,14 @@ impl Bucket {
     /// means the bucket carried none under that id, which is what makes a delete answer
     /// [`NO_SUCH_CONFIGURATION_CODE`] rather than report a removal it did not make.
     pub fn delete_metrics_configuration(&mut self, id: &str) -> bool {
-        self.metrics_configurations.remove(id).is_some()
+        // Only a delete that REMOVED a configuration configured the bucket: a call naming an
+        // id the bucket does not carry is refused ([`NO_SUCH_CONFIGURATION_CODE`]) and wrote
+        // nothing.
+        let removed = self.metrics_configurations.remove(id).is_some();
+        if removed {
+            self.record_configuration_write();
+        }
+        removed
     }
 
     /// Every metrics configuration the bucket carries, in ascending id order — empty for a
@@ -1466,12 +1546,18 @@ impl Bucket {
         id: String,
         configuration: crate::ops::types::MetricsConfiguration,
     ) -> BucketConfigurationWrite {
-        put_keyed_configuration(
+        let written = put_keyed_configuration(
             &mut self.metrics_configurations,
             id,
             configuration,
             MAX_METRICS_CONFIGURATIONS_PER_BUCKET,
-        )
+        );
+        // Only a put that was TAKEN configured the bucket: one refused at the ceiling wrote
+        // nothing, so it left the bucket's configuration exactly as it was.
+        if written != BucketConfigurationWrite::QuotaReached {
+            self.record_configuration_write();
+        }
+        written
     }
 
     /// The analytics configuration the bucket carries under `id`, or `None` when it carries
@@ -1496,7 +1582,13 @@ impl Bucket {
     /// carried none under that id, which is what makes a delete answer
     /// [`NO_SUCH_CONFIGURATION_CODE`] rather than report a removal it did not make.
     pub fn delete_analytics_configuration(&mut self, id: &str) -> bool {
-        self.analytics_configurations.remove(id).is_some()
+        // Only a delete that REMOVED a configuration configured the bucket — see
+        // [`Self::delete_metrics_configuration`].
+        let removed = self.analytics_configurations.remove(id).is_some();
+        if removed {
+            self.record_configuration_write();
+        }
+        removed
     }
 
     /// Every analytics configuration the bucket carries, in ascending id order — empty for a
@@ -1529,12 +1621,18 @@ impl Bucket {
         id: String,
         configuration: crate::ops::types::AnalyticsConfiguration,
     ) -> BucketConfigurationWrite {
-        put_keyed_configuration(
+        let written = put_keyed_configuration(
             &mut self.analytics_configurations,
             id,
             configuration,
             MAX_ANALYTICS_CONFIGURATIONS_PER_BUCKET,
-        )
+        );
+        // Only a put that was TAKEN configured the bucket — see
+        // [`Self::put_metrics_configuration`].
+        if written != BucketConfigurationWrite::QuotaReached {
+            self.record_configuration_write();
+        }
+        written
     }
 
     /// The S3 Inventory configuration the bucket carries under `id`, or `None` when it
@@ -1581,12 +1679,18 @@ impl Bucket {
         id: String,
         configuration: crate::ops::types::InventoryConfiguration,
     ) -> BucketConfigurationWrite {
-        put_keyed_configuration(
+        let written = put_keyed_configuration(
             &mut self.inventory_configurations,
             id,
             configuration,
             MAX_INVENTORY_CONFIGURATIONS_PER_BUCKET,
-        )
+        );
+        // Only a put that was TAKEN configured the bucket — see
+        // [`Self::put_metrics_configuration`].
+        if written != BucketConfigurationWrite::QuotaReached {
+            self.record_configuration_write();
+        }
+        written
     }
 
     /// Drop the S3 Inventory configuration the bucket carries under `id`, reporting whether
@@ -1599,7 +1703,13 @@ impl Bucket {
     /// delete answer [`NO_SUCH_CONFIGURATION_CODE`] rather than report a removal it did not
     /// make.
     pub fn delete_inventory_configuration(&mut self, id: &str) -> bool {
-        self.inventory_configurations.remove(id).is_some()
+        // Only a delete that REMOVED a configuration configured the bucket — see
+        // [`Self::delete_metrics_configuration`].
+        let removed = self.inventory_configurations.remove(id).is_some();
+        if removed {
+            self.record_configuration_write();
+        }
+        removed
     }
 
     /// Every S3 Intelligent-Tiering configuration the bucket carries, in ascending id
@@ -1638,6 +1748,7 @@ impl Bucket {
         {
             return IntelligentTieringWrite::ConfigurationCountReached;
         }
+        self.record_configuration_write();
         self.intelligent_tiering.insert(id, configuration);
         IntelligentTieringWrite::Stored
     }
@@ -1661,7 +1772,13 @@ impl Bucket {
     /// other configuration the bucket carries stays exactly as it was, so a bucket whose
     /// last configuration is removed carries none again.
     pub fn delete_intelligent_tiering_configuration(&mut self, id: &str) -> bool {
-        self.intelligent_tiering.remove(id).is_some()
+        // Only a delete that REMOVED a configuration configured the bucket — see
+        // [`Self::delete_metrics_configuration`].
+        let removed = self.intelligent_tiering.remove(id).is_some();
+        if removed {
+            self.record_configuration_write();
+        }
+        removed
     }
 
     /// The default encryption rules IN FORCE on the bucket: the ones a
@@ -1752,6 +1869,7 @@ impl Bucket {
     /// documentation), so what the request names becomes the bucket's configuration in
     /// full — the way [`Bucket::set_ownership_controls`] replaces the ownership controls.
     pub fn set_website(&mut self, configuration: BucketWebsite) {
+        self.record_configuration_write();
         self.website = Some(configuration);
     }
 
@@ -1764,6 +1882,7 @@ impl Bucket {
     /// configuration: nothing else on the record is touched, the way [`Bucket::clear_cors`]
     /// is scoped to the cors configuration.
     pub fn clear_website(&mut self) {
+        self.record_configuration_write();
         self.website = None;
     }
 
@@ -1780,6 +1899,7 @@ impl Bucket {
     /// documentation), so what the request names becomes the bucket's configuration in full
     /// — the way [`Bucket::set_website`] replaces the website configuration.
     pub fn set_cors(&mut self, rules: Vec<BucketCorsRule>) {
+        self.record_configuration_write();
         self.cors = Some(rules);
     }
 
@@ -1792,6 +1912,7 @@ impl Bucket {
     /// configuration: nothing else on the record is touched, the way
     /// [`Bucket::clear_ownership_controls`] is scoped to the ownership controls.
     pub fn clear_cors(&mut self) {
+        self.record_configuration_write();
         self.cors = None;
     }
 
@@ -1811,6 +1932,7 @@ impl Bucket {
     /// `LoggingEnabled` is how logging is turned off again ("To disable logging, you use an
     /// empty `BucketLoggingStatus` request element", that operation's own documentation).
     pub fn set_logging(&mut self, logging: Option<crate::ops::types::LoggingEnabled>) {
+        self.record_configuration_write();
         self.logging = logging;
     }
 

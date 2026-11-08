@@ -22,13 +22,20 @@ pub const MAX_LIFECYCLE_RULE_ID_CHARS: usize = 255;
 /// (`NoncurrentVersionExpiration$NewerNoncurrentVersions`'s own documentation).
 pub const MAX_NEWER_NONCURRENT_VERSIONS: i32 = 100;
 
-/// Days an object must spend in its current class before a rule may transition it to one of
-/// the infrequent-access classes.
+/// The action a current-version transition is named by in a refusal, and the member of it
+/// that carries the day count — the two names S3's transition refusals are built from.
 ///
-/// From the Amazon S3 User Guide's transition constraints: objects must be stored at least
-/// 30 days in the current storage class before Amazon S3 transitions them to
-/// `STANDARD_IA` or `ONEZONE_IA`.
-pub const MINIMUM_DAYS_BEFORE_INFREQUENT_ACCESS: i32 = 30;
+/// `Transition$Days` is "indicates the number of days after creation when objects are
+/// transitioned to the specified storage class"
+/// (`smithy_query(query="shape",shape="Transition")`), and a refusal about it names the
+/// action and that member, so both come from the model rather than from one request.
+pub const TRANSITION_ACTION: (&str, &str) = ("Transition", "Days");
+
+/// The same pair for a NONCURRENT-version transition: the action
+/// `NoncurrentVersionTransition` and its own day member `NoncurrentDays`
+/// (`smithy_query(query="shape",shape="NoncurrentVersionTransition")`).
+pub const NONCURRENT_VERSION_TRANSITION_ACTION: (&str, &str) =
+    ("NoncurrentVersionTransition", "NoncurrentDays");
 
 /// The default minimum-object-size behaviour a lifecycle configuration carries when the
 /// request names no `TransitionDefaultMinimumObjectSize`.
@@ -262,36 +269,29 @@ pub enum LifecycleConfigurationRejection {
     /// A transition to a WARMER class than the one an earlier transition of the same rule
     /// already moved the object to. See [`TRANSITION_STORAGE_CLASS_CHAIN`].
     TransitionToWarmerClass {
-        /// Which rule carries them.
-        rule: usize,
-        /// The class the earlier transition names.
-        earlier: String,
-        /// The warmer class the later transition names.
-        later: String,
+        /// The action both transitions belong to and the member carrying their day counts
+        /// ([`TRANSITION_ACTION`] or [`NONCURRENT_VERSION_TRANSITION_ACTION`]).
+        action: (&'static str, &'static str),
+        /// The scope of the rule carrying them, as S3 describes a filter.
+        filter: String,
+        /// The COLDER class, the one the earlier transition names.
+        colder: String,
+        /// The WARMER class, the one the later transition names.
+        warmer: String,
     },
     /// A transition due before the class the object is in has been held for its minimum
     /// storage duration. See [`TRANSITION_STORAGE_CLASS_CHAIN`].
     TransitionBeforeMinimumDuration {
-        /// Which rule carries them.
-        rule: usize,
-        /// The class the object is in.
+        /// The action both transitions belong to and the member carrying their day counts.
+        action: (&'static str, &'static str),
+        /// The scope of the rule carrying them, as S3 describes a filter.
+        filter: String,
+        /// The class the object is in, whose minimum storage duration is the gap.
         earlier: String,
         /// The class the later transition names.
         later: String,
-        /// How many days apart the two transitions are.
-        gap: i64,
         /// How many days apart they have to be.
         minimum: i32,
-    },
-    /// A transition to an infrequent-access class due before
-    /// [`MINIMUM_DAYS_BEFORE_INFREQUENT_ACCESS`] days after the object was created.
-    TransitionBeforeInfrequentAccessMinimum {
-        /// Which rule carries it.
-        rule: usize,
-        /// The infrequent-access class it names.
-        storage_class: String,
-        /// The day count it names.
-        days: i32,
     },
     /// A rule asking to retain more noncurrent versions than
     /// [`MAX_NEWER_NONCURRENT_VERSIONS`].
@@ -333,7 +333,6 @@ impl LifecycleConfigurationRejection {
             | Self::NegativeObjectSize { .. }
             | Self::TransitionToWarmerClass { .. }
             | Self::TransitionBeforeMinimumDuration { .. }
-            | Self::TransitionBeforeInfrequentAccessMinimum { .. }
             | Self::TooManyNewerNoncurrentVersions { .. } => INVALID_ARGUMENT_CODE,
             Self::MixedPrefixAndFilterRules { .. }
             | Self::ObjectSizeRangeEmpty { .. }
@@ -465,39 +464,27 @@ impl std::fmt::Display for LifecycleConfigurationRejection {
                 "Rule {rule}: two transitions name storage class {storage_class:?}"
             ),
             Self::TransitionToWarmerClass {
-                rule,
-                earlier,
-                later,
+                action: (action, days),
+                filter,
+                colder,
+                warmer,
             } => write!(
                 f,
-                "Rule {rule}: transitions to {earlier:?} and then to the warmer class \
-                 {later:?}; transitions follow the order {}",
-                TRANSITION_STORAGE_CLASS_CHAIN
-                    .iter()
-                    .map(|(class, _)| *class)
-                    .collect::<Vec<_>>()
-                    .join(" -> ")
+                "'{days}' in the '{action}' action for StorageClass '{colder}' for filter \
+                 '{filter}' must be greater than '{days}' in the '{action}' action for \
+                 StorageClass '{warmer}' for filter '{filter}'"
             ),
             Self::TransitionBeforeMinimumDuration {
-                rule,
+                action: (action, days),
+                filter,
                 earlier,
                 later,
-                gap,
                 minimum,
             } => write!(
                 f,
-                "Rule {rule}: transitions to {later:?} {gap} days after the transition to \
-                 {earlier:?}, which has a minimum storage duration of {minimum} days"
-            ),
-            Self::TransitionBeforeInfrequentAccessMinimum {
-                rule,
-                storage_class,
-                days,
-            } => write!(
-                f,
-                "Rule {rule}: transitions to {storage_class:?} after {days} days, before \
-                 the {MINIMUM_DAYS_BEFORE_INFREQUENT_ACCESS} days an object is stored in \
-                 its current class first"
+                "'{days}' in the '{action}' action for StorageClass '{later}' for filter \
+                 '{filter}' must be {minimum} days more than 'filter '{filter}'' '{days}' \
+                 in the '{action}' action for StorageClass '{earlier}' for filter '{filter}'"
             ),
             Self::TooManyNewerNoncurrentVersions { rule, count } => write!(
                 f,
@@ -739,15 +726,13 @@ pub(super) fn validate_lifecycle_actions(
                         action: "Transition",
                     });
                 }
-                if days < MINIMUM_DAYS_BEFORE_INFREQUENT_ACCESS
-                    && matches!(storage_class, "STANDARD_IA" | "ONEZONE_IA")
-                {
-                    return Err(Rejection::TransitionBeforeInfrequentAccessMinimum {
-                        rule: position,
-                        storage_class: storage_class.to_string(),
-                        days,
-                    });
-                }
+                // No FLOOR is checked here. A transition's `Days` "can be 0 or any
+                // positive integer" (`Transition$Days`), and the 30-day minimum storage
+                // duration of the infrequent-access classes is what an object already IN
+                // one of them is charged for, not a bound on when a rule may move an object
+                // into it — so a transition to `STANDARD_IA` one day after creation is a
+                // configuration S3 stores. The duration is still what separates one
+                // transition from the NEXT ([`validate_transition_order`]).
                 days_based = true;
                 transitions.push((i64::from(days), storage_class));
             }
@@ -857,10 +842,47 @@ pub(super) fn validate_lifecycle_actions(
         return Err(Rejection::MixedDateAndDays { rule: position });
     }
 
-    validate_transition_order(position, transitions)?;
-    validate_transition_order(position, noncurrent_transitions)?;
+    let filter = lifecycle_rule_scope(rule);
+    validate_transition_order(position, TRANSITION_ACTION, &filter, transitions)?;
+    validate_transition_order(
+        position,
+        NONCURRENT_VERSION_TRANSITION_ACTION,
+        &filter,
+        noncurrent_transitions,
+    )?;
 
     Ok(())
+}
+
+/// How S3 describes the set of objects one lifecycle rule applies to, which is what its
+/// transition refusals name the rule by.
+///
+/// Recorded behavior: a rule filtering on the prefix `tiered/` is reported as
+/// `(prefix=tiered/)`, so the description is the rule's predicates inside one pair of
+/// parentheses, the prefix first and named even when the rule carries none (a rule with an
+/// empty filter "applies to all objects in the bucket", `LifecycleRuleFilter`). The prefix
+/// is wherever the rule states it — the legacy `Prefix` member, the `Filter`'s own `Prefix`,
+/// or the `Prefix` inside its `And` — and each tag the filter names follows it, since a
+/// tag-filtered rule applies to a different set than the prefix alone describes.
+pub(super) fn lifecycle_rule_scope(rule: &crate::ops::types::LifecycleRule) -> String {
+    let filter = rule.filter.as_ref();
+    let and = filter.and_then(|filter| filter.and.as_ref());
+    let prefix = rule
+        .prefix
+        .as_deref()
+        .or_else(|| filter.and_then(|filter| filter.prefix.as_deref()))
+        .or_else(|| and.and_then(|and| and.prefix.as_deref()))
+        .unwrap_or_default();
+    let mut described = format!("(prefix={prefix}");
+    let tags = filter
+        .and_then(|filter| filter.tag.as_ref())
+        .into_iter()
+        .chain(and.and_then(|and| and.tags.as_ref()).into_iter().flatten());
+    for tag in tags {
+        described.push_str(&format!(", tag={}={}", tag.key, tag.value));
+    }
+    described.push(')');
+    described
 }
 
 /// Whether `transitions` — each as (the day it is due, the class it moves the object to) —
@@ -870,6 +892,8 @@ pub(super) fn validate_lifecycle_actions(
 /// See [`TRANSITION_STORAGE_CLASS_CHAIN`] for both published rules.
 pub(super) fn validate_transition_order(
     position: usize,
+    action: (&'static str, &'static str),
+    filter: &str,
     mut transitions: Vec<(i64, &str)>,
 ) -> Result<(), LifecycleConfigurationRejection> {
     use LifecycleConfigurationRejection as Rejection;
@@ -899,19 +923,20 @@ pub(super) fn validate_transition_order(
         };
         if later_rank < earlier_rank {
             return Err(Rejection::TransitionToWarmerClass {
-                rule: position,
-                earlier: earlier_class.to_string(),
-                later: later_class.to_string(),
+                action,
+                filter: filter.to_string(),
+                colder: earlier_class.to_string(),
+                warmer: later_class.to_string(),
             });
         }
         let minimum = minimum_storage_duration_days(earlier_class).unwrap_or_default();
         let gap = later_day.saturating_sub(*earlier_day);
         if gap < i64::from(minimum) {
             return Err(Rejection::TransitionBeforeMinimumDuration {
-                rule: position,
+                action,
+                filter: filter.to_string(),
                 earlier: earlier_class.to_string(),
                 later: later_class.to_string(),
-                gap,
                 minimum,
             });
         }

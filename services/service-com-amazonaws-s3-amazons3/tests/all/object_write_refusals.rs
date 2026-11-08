@@ -41,7 +41,9 @@ use service_com_amazonaws_s3_amazons3::ops::types::{STORAGE_CLASS_VALUES, TIER_V
 use service_com_amazonaws_s3_amazons3::service::object_write::{
     DIRECTORY_BUCKET_STORAGE_CLASSES, GENERAL_PURPOSE_STORAGE_CLASSES,
 };
-use service_com_amazonaws_s3_amazons3::state::{ARCHIVED_STORAGE_CLASSES, MAX_OBJECT_KEY_BYTES};
+use service_com_amazonaws_s3_amazons3::state::{
+    ARCHIVED_STORAGE_CLASSES, DEFAULT_STORAGE_CLASS, MAX_OBJECT_KEY_BYTES,
+};
 use smithy_server_runtime::MultiServiceRouter;
 
 use super::bucket_lifecycle::{router, send, send_bytes, Answer};
@@ -126,11 +128,18 @@ async fn a_write_is_refused_a_storage_class_the_bucket_cannot_host() {
                     written.status,
                     text(&written)
                 );
-                // Stored UNDER that class: a later read reports the class the write named.
+                // Stored UNDER that class: a later read reports the class the write named —
+                // except for STANDARD, which "Amazon S3 returns this header for all objects
+                // except for" (`HeadObjectOutput$StorageClass`), so the commonest class is
+                // reported by the absence of the header.
                 let head = head_object(&router, name, &key, "").await;
+                let reported = match *storage_class == DEFAULT_STORAGE_CLASS {
+                    true => None,
+                    false => Some(*storage_class),
+                };
                 assert_eq!(
                     head.header("x-amz-storage-class").as_deref(),
-                    Some(*storage_class),
+                    reported,
                     "case {case:?}: the stored object must report the class it was written \
                      in, got {:?}",
                     head.header("x-amz-storage-class")

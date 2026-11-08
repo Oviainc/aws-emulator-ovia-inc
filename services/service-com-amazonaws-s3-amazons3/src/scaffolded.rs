@@ -1565,8 +1565,14 @@ impl<E> Scaffolded<E> {
     /// the request used and what it was refused against, since the sentence names neither.
     ///
     /// `method` is the HTTP method the operation is bound to and `resource_type` one of
-    /// `crate::state`'s `*_RESOURCE_TYPE` constants.
+    /// `crate::state`'s `*_RESOURCE_TYPE` constants. What the resource DOES allow is
+    /// recorded for the response's `Allow` header
+    /// ([`crate::service::wire::note_allowed_methods`]), which RFC 9110 §15.5.6 requires a
+    /// 405 to carry: the document's own fixed sentence says nothing about it.
     pub fn method_not_allowed(method: &str, resource_type: &str) -> Self {
+        if let Some(allowed) = crate::state::methods_allowed_on(resource_type) {
+            crate::service::wire::note_allowed_methods(allowed);
+        }
         Self::unmodeled(
             crate::state::METHOD_NOT_ALLOWED_CODE,
             crate::state::METHOD_NOT_ALLOWED_STATUS,
@@ -1576,6 +1582,24 @@ impl<E> Scaffolded<E> {
             method: method.to_string(),
             resource_type: resource_type.to_string(),
         })
+    }
+
+    /// The answer a READ gets when the representation the caller already holds is the
+    /// current one: HTTP 304 with no document at all
+    /// ([`crate::service::wire::NOT_MODIFIED_STATUS`] carries the rule), and the validators
+    /// of that representation — the entity tag and the modification instant the read
+    /// resolved — in the two headers RFC 9110 requires a 304 to carry.
+    ///
+    /// Not an error class: there is no `<Code>` and no `<Message>`, because S3 sends neither
+    /// with a 304. It travels on the refusal channel because that is how a handler whose one
+    /// success status is 200 answers any other status.
+    pub fn not_modified(etag: &str, last_modified: ::std::time::SystemTime) -> Self {
+        crate::service::wire::note_not_modified(etag, last_modified);
+        Self::unmodeled(
+            crate::service::object_write::ERRORLESS_REFUSAL_CODE,
+            crate::service::wire::NOT_MODIFIED_STATUS,
+            String::new(),
+        )
     }
 
     /// The refusal S3 answers a request field carrying a value it cannot accept with:

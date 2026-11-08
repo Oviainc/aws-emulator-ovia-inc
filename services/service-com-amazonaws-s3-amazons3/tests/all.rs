@@ -31,6 +31,8 @@ mod bucket_configuration_id_addressing;
 mod bucket_cors;
 #[path = "all/bucket_cors_delete.rs"]
 mod bucket_cors_delete;
+#[path = "all/bucket_creation_date_views.rs"]
+mod bucket_creation_date_views;
 #[path = "all/bucket_create_list_and_tagging_contracts.rs"]
 mod bucket_create_list_and_tagging_contracts;
 #[path = "all/bucket_deletion_emptiness.rs"]
@@ -125,6 +127,8 @@ mod cli_download_legs;
 mod copy_source_header_envelopes;
 #[path = "all/directory_bucket_conditional_deletes.rs"]
 mod directory_bucket_conditional_deletes;
+#[path = "all/delete_marker_refusal_headers.rs"]
+mod delete_marker_refusal_headers;
 #[path = "all/directory_bucket_sessions_and_appends.rs"]
 mod directory_bucket_sessions_and_appends;
 #[path = "all/error_message_envelope.rs"]
@@ -147,6 +151,8 @@ mod json_payload_media_type;
 mod list_buckets;
 #[path = "all/listing_encoding_type.rs"]
 mod listing_encoding_type;
+#[path = "all/lifecycle_transition_rules.rs"]
+mod lifecycle_transition_rules;
 #[path = "all/listing_optional_members.rs"]
 mod listing_optional_members;
 #[path = "all/listing_resume_markers.rs"]
@@ -197,6 +203,8 @@ mod object_copy;
 mod object_content_type;
 #[path = "all/object_conditional_deletes.rs"]
 mod object_conditional_deletes;
+#[path = "all/object_conditional_reads.rs"]
+mod object_conditional_reads;
 #[path = "all/object_conditional_writes.rs"]
 mod object_conditional_writes;
 #[path = "all/object_default_encryption.rs"]

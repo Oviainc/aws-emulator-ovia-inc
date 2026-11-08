@@ -205,17 +205,10 @@ async fn a_read_asking_for_a_member_this_operation_cannot_answer_is_refused() {
     create_bucket(&router, bucket).await;
     put_object(&router, bucket, "held.txt", b"abc").await;
 
-    // Each bound header below decides something about the answer that a 200 full-metadata
-    // read could not report: a condition that does not hold is answered with HTTP 304 and no
-    // body, which an operation rendering one success status cannot express, and the rest name
-    // a feature no object here has.
+    // Each bound header below names a feature no object here has: a 200 full-metadata read
+    // could not report it. The two conditional headers that answer 304 are NOT here — they
+    // are served (see [`super::object_conditional_reads`]).
     for (case, header, value) in [
-        ("a conditional non-match", "if-none-match", "\"abc\""),
-        (
-            "a modified-since condition",
-            "if-modified-since",
-            "2026-10-21T07:28:00Z",
-        ),
         (
             "customer-provided encryption",
             "x-amz-server-side-encryption-customer-algorithm",

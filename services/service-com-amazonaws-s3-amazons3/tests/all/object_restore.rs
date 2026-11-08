@@ -714,7 +714,7 @@ async fn a_restore_this_emulator_cannot_serve_answers_what_is_wrong_with_it() {
             payload: restore_payload(Some(0), TierNamedIn::Request("Standard")),
             status: 400,
             code: "InvalidArgument",
-            message: Some("Days must be a positive number of days, got 0"),
+            message: Some("Days must be at least 1"),
         },
         RefusalRow {
             case: "a lifetime of negative days",
@@ -725,7 +725,7 @@ async fn a_restore_this_emulator_cannot_serve_answers_what_is_wrong_with_it() {
             payload: restore_payload(Some(-5), TierNamedIn::Request("Standard")),
             status: 400,
             code: "InvalidArgument",
-            message: Some("Days must be a positive number of days, got -5"),
+            message: Some("Days must be at least 1"),
         },
         RefusalRow {
             // The largest `Days` the member can carry: its expiry falls on no date this
@@ -813,5 +813,196 @@ async fn a_restore_this_emulator_cannot_serve_answers_what_is_wrong_with_it() {
         "NotImplemented",
         "case a select restore: expected NotImplemented, got {:?}",
         select.error_code()
+    );
+}
+
+/// One row of the second-request table: the case, the tier the restore already running was
+/// asked at, the tier the second request names, and what that second request must answer.
+///
+/// `Some(status)` is a request S3 SERVES — the documented tier upgrade — and `None` one it
+/// refuses with `RestoreAlreadyInProgress`.
+type UpgradeRow = (&'static str, &'static str, &'static str, Option<u16>);
+
+/// A second restore request over a retrieval that is still running is an UPGRADE when it
+/// names a strictly faster tier, and the same request again when it does not.
+///
+/// "You can upgrade the speed of your restore while it is in progress" by issuing another
+/// restore request naming a faster tier (Amazon S3 User Guide, *Upgrading the speed of an
+/// in-progress restore*), and the speeds are Expedited, then Standard, then Bulk (the same
+/// guide's *Archive retrieval options*: 1–5 minutes, 3–5 hours, 5–12 hours). An upgrade is
+/// accepted with the `202 Accepted` a retrieval that is not previously restored answers,
+/// leaves the copy unavailable and the object in its archive class; every other second
+/// request asks for the retrieval already under way, which is what
+/// `RestoreAlreadyInProgress` reports.
+///
+/// The rows differ along the pair of tiers: every ordered pair of the three the GLACIER class
+/// offers, so each of the three is tried as the running tier and as the requested one.
+fn upgrade_rows() -> Vec<UpgradeRow> {
+    vec![
+        ("bulk upgraded to standard", "Bulk", "Standard", Some(202)),
+        ("bulk upgraded to expedited", "Bulk", "Expedited", Some(202)),
+        (
+            "standard upgraded to expedited",
+            "Standard",
+            "Expedited",
+            Some(202),
+        ),
+        ("bulk asked for again", "Bulk", "Bulk", None),
+        ("standard asked for again", "Standard", "Standard", None),
+        ("expedited asked for again", "Expedited", "Expedited", None),
+        ("standard downgraded to bulk", "Standard", "Bulk", None),
+        ("expedited downgraded to standard", "Expedited", "Standard", None),
+        ("expedited downgraded to bulk", "Expedited", "Bulk", None),
+    ]
+}
+
+#[tokio::test]
+async fn a_second_restore_is_served_only_for_a_faster_tier() {
+    let router = router();
+    bucket(&router, "restore-upgrades").await;
+
+    for (case, running, asked, served) in upgrade_rows() {
+        // One key per row, so each row starts from a version with no retrieval of its own.
+        let key = format!("{}-to-{}", running.to_ascii_lowercase(), asked.to_ascii_lowercase());
+        object_in(&router, "restore-upgrades", &key, "GLACIER").await;
+
+        let initiated = restore_object(
+            &router,
+            "restore-upgrades",
+            &key,
+            "",
+            &[],
+            &restore_payload(Some(1), TierNamedIn::Request(running)),
+        )
+        .await;
+        assert_eq!(
+            initiated.status, 202,
+            "case {case:?}: the first restore initiates the retrieval and is accepted with \
+             202, got {} with body {:?}",
+            initiated.status,
+            text(&initiated)
+        );
+
+        // The second request, while the first retrieval is still running: it names no
+        // lifetime, because an upgrade changes how fast the copy arrives rather than how
+        // long it lives.
+        let second = restore_object(
+            &router,
+            "restore-upgrades",
+            &key,
+            "",
+            &[],
+            &restore_payload(None, TierNamedIn::Request(asked)),
+        )
+        .await;
+        match served {
+            Some(status) => assert_eq!(
+                second.status, status,
+                "case {case:?}: a faster tier upgrades the retrieval and is accepted with \
+                 {status}, got {} with body {:?}",
+                second.status,
+                text(&second)
+            ),
+            None => {
+                assert_eq!(
+                    second.status, 409,
+                    "case {case:?}: the retrieval already running is reported with 409, got \
+                     {} with body {:?}",
+                    second.status,
+                    text(&second)
+                );
+                assert_eq!(
+                    second.error_code(),
+                    "RestoreAlreadyInProgress",
+                    "case {case:?}: expected the RestoreAlreadyInProgress code, got {:?}",
+                    second.error_code()
+                );
+                assert_eq!(
+                    second.error_message(),
+                    RESTORE_ALREADY_IN_PROGRESS_MESSAGE,
+                    "case {case:?}: expected the message {RESTORE_ALREADY_IN_PROGRESS_MESSAGE:?}, \
+                     got {:?}",
+                    second.error_message()
+                );
+            }
+        }
+
+        // Either way the retrieval is still running and the object is still archived: the
+        // copy is not there yet, so a reader reports an ongoing request and the class the
+        // object is stored in.
+        let read = head_object(&router, "restore-upgrades", &key, "").await;
+        assert_eq!(
+            read.header("x-amz-restore").as_deref(),
+            Some("ongoing-request=\"true\""),
+            "case {case:?}: the retrieval must still be reported as ongoing, got {:?}",
+            read.header("x-amz-restore")
+        );
+        assert_eq!(
+            read.header("x-amz-storage-class").as_deref(),
+            Some("GLACIER"),
+            "case {case:?}: the object must keep its archive storage class, got {:?}",
+            read.header("x-amz-storage-class")
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_upgraded_retrieval_is_not_due_later_than_the_one_it_upgrades() {
+    let router = router();
+    bucket(&router, "restore-upgrade-timing").await;
+    object_in(&router, "restore-upgrade-timing", "archived", "GLACIER").await;
+
+    // A faster tier is asked for to get the copy SOONER, so the upgrade cannot push the
+    // instant the copy falls due any further out than the retrieval it replaces: the copy is
+    // there one span after the FIRST request, not one span after the second.
+    let initiated = restore_object(
+        &router,
+        "restore-upgrade-timing",
+        "archived",
+        "",
+        &[],
+        &restore_payload(Some(1), TierNamedIn::Request("Bulk")),
+    )
+    .await;
+    assert_eq!(
+        initiated.status, 202,
+        "the first restore must be accepted with 202, got {} with body {:?}",
+        initiated.status,
+        text(&initiated)
+    );
+    let upgraded = restore_object(
+        &router,
+        "restore-upgrade-timing",
+        "archived",
+        "",
+        &[],
+        &restore_payload(None, TierNamedIn::Request("Standard")),
+    )
+    .await;
+    assert_eq!(
+        upgraded.status, 202,
+        "the upgrade must be accepted with 202, got {} with body {:?}",
+        upgraded.status,
+        text(&upgraded)
+    );
+
+    wait_for_the_copy();
+    let read = head_object(&router, "restore-upgrade-timing", "archived", "").await;
+    let reported = read
+        .header("x-amz-restore")
+        .expect("a restored version must report its restore state");
+    assert!(
+        reported.contains("ongoing-request=\"false\""),
+        "one span after the FIRST request the copy must be available, got {reported:?}"
+    );
+    // And the lifetime is the one the restore it upgrades was stated with: an upgrade changes
+    // how fast the copy arrives, not how long it lives.
+    let expiry = expiry_seconds(&reported);
+    let a_day_out = now_seconds() + SECONDS_PER_DAY;
+    assert!(
+        expiry >= a_day_out && expiry < a_day_out + SECONDS_PER_DAY,
+        "the copy must live for the one day the first request asked for (an expiry in \
+         [{a_day_out}, {})), got {expiry}",
+        a_day_out + SECONDS_PER_DAY
     );
 }

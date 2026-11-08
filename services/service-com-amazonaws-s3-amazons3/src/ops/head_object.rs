@@ -345,14 +345,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Beyond its deserialized input this read needs only WHO is asking, which decides
         // whether the bucket's public grants are what admits it (below).
 
-        // What this read cannot answer faithfully: `If-None-Match` and `If-Modified-Since`
-        // are answered with HTTP 304 and no body when the condition fails, which an
-        // operation rendering one success status cannot express. Everything else is served:
-        // `Range` and `PartNumber` select a span of the object (answered 206 with a
-        // `Content-Range`), `If-Match` and `If-Unmodified-Since` are judged against the
-        // version the read resolves, and `VersionId` names one stored version of the key.
-        // The customer-key encryption nothing here performs is refused as `PutObject`
-        // refuses it.
+        // What this read cannot answer faithfully: nothing here encrypts with a
+        // customer-provided key, so a read presenting one is refused as `PutObject` refuses
+        // it. Everything else is served: `Range` and `PartNumber` select a span of the object
+        // (answered 206 with a `Content-Range`), `If-Match` and `If-Unmodified-Since` are
+        // judged against the version the read resolves, `If-None-Match` and
+        // `If-Modified-Since` answer 304 for a caller whose copy is the current one, and
+        // `VersionId` names one stored version of the key.
         if let Some(unserved) = unserved_feature(&input) {
             return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
                 "HeadObject with {unserved}"
@@ -418,8 +417,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // nothing for a HEAD to report, and a read that names NO version is answered as if
         // the object were deleted — `NoSuchKey`, through the `None` below, because
         // `Bucket::object` reports no current object behind a marker.
-        if input.version_id.is_some() && held.is_some_and(|held| held.as_delete_marker().is_some())
+        //
+        // Either answer names the MARKER in the two headers S3's answer about one carries
+        // (see `crate::service::wire`'s delete-marker note), because "whether the specified
+        // object is (true) or is not (false) a delete marker"
+        // (`HeadObjectOutput$DeleteMarker`) is what separates a version that is a marker
+        // from one that holds bytes, and the answer carries no member for it.
+        if let Some(marker) = held
+            .filter(|_| input.version_id.is_some())
+            .and_then(crate::state::StoredVersion::as_delete_marker)
         {
+            crate::service::wire::note_addressed_delete_marker(
+                marker.version_id.as_deref(),
+                marker.last_modified,
+            );
             return Err(crate::scaffolded::Scaffolded::method_not_allowed(
                 HEAD_METHOD,
                 crate::state::DELETE_MARKER_RESOURCE_TYPE,
@@ -476,6 +487,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if let Some(marker) = held.and_then(crate::state::StoredVersion::as_delete_marker) {
                     crate::service::wire::note_addressed_delete_marker(
                         marker.version_id.as_deref(),
+                        marker.last_modified,
                     );
                 }
             }
@@ -516,6 +528,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .and_then(crate::state::instant_of),
         ) {
             return Err(crate::scaffolded::Scaffolded::precondition_failed(condition));
+        }
+
+        // And the two conditions about a copy the caller ALREADY HOLDS, through the one rule
+        // `GetObject` judges its own by ([`crate::state::read_is_not_modified`]): a HEAD "has
+        // the same options as a GET operation on an object", so the two cannot disagree about
+        // whether the caller's copy is current.
+        if crate::state::read_is_not_modified(
+            &object.etag,
+            object.last_modified,
+            input.if_none_match.as_deref(),
+            input
+                .if_modified_since
+                .as_ref()
+                .and_then(crate::state::instant_of),
+        ) {
+            return Err(crate::scaffolded::Scaffolded::not_modified(
+                &object.etag,
+                object.last_modified,
+            ));
         }
 
         // WHICH SPAN of the object this HEAD describes: "a HEAD request has the same options
@@ -597,7 +628,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
             ),
-            storage_class: Some(object.storage_class.clone()),
+            // "Amazon S3 returns this header for all objects except for S3 Standard
+            // storage class objects" (`HeadObjectOutput$StorageClass`), so the commonest
+            // class is reported by the ABSENCE of the header rather than by its value — the
+            // same rule `GetObject` reports it by.
+            storage_class: Some(object.storage_class.clone())
+                .filter(|class| class != crate::state::DEFAULT_STORAGE_CLASS),
             // "Indicates that a range of bytes was specified" — S3 reports that an
             // object read supports range requests whether or not one was made.
             accept_ranges: Some(crate::state::ACCEPT_RANGES_BYTES.to_string()),
@@ -682,8 +718,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// 501 that refuses it.
 fn unserved_feature(input: &HeadObjectInput) -> Option<&'static str> {
     [
-        (input.if_none_match.is_some(), "IfNoneMatch"),
-        (input.if_modified_since.is_some(), "IfModifiedSince"),
         (
             input.sse_customer_algorithm.is_some(),
             "SSECustomerAlgorithm",
