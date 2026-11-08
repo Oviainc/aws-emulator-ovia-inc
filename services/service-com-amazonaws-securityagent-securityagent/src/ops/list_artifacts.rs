@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListArtifacts
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListArtifacts`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListArtifacts::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports a page of the artifact summaries of one agent space: walks the artifacts the
+//! store holds for the named space, in the stable order their ids were minted in, and
+//! answers that page with the cursor the next page resumes at — so a listing reports
+//! exactly what the uploads persisted and what the deletes removed.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +151,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListArtifacts` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListArtifactsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListArtifacts"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListArtifactsErrorModeled::InternalServerException(InternalServerException {
+                message: "the artifact store is unavailable".to_string(),
+            })
+        })?;
+
+        // `agentSpaceId` is `@required` but carries no `@length` in the model, so an empty
+        // one reaches the handler. It names no agent space and never could, so it is a bad
+        // request rather than a missing resource — the same split every operation of this
+        // service that looks an id up applies.
+        if input.agent_space_id.is_empty() {
+            return Err(refused("agentSpaceId", "member must not be empty"));
+        }
+
+        // Where this page starts. An absent token starts at the first artifact of the
+        // space; a token THIS listing minted names the `artifactId` to resume at. A token
+        // another listing of this service minted names a resume point in another key
+        // space, so it is refused here exactly as a token nothing minted is, rather than
+        // read as a resume point among the artifacts.
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => match crate::state::decode_artifact_page_token(token) {
+                Some(artifact_id) => Some(artifact_id),
+                None => {
+                    return Err(refused(
+                        "nextToken",
+                        "must be a nextToken returned by a previous ListArtifacts call",
+                    ))
+                }
+            },
+        };
+
+        // `MaxResults` carries no `@default` and no `@range` in the model, so an absent
+        // page size takes this service's own default, exactly as every other paginated
+        // listing of this service takes it. A non-positive one is refused rather than
+        // clamped: a zero-item page that still carried a cursor would be a client loop
+        // that never terminates. A page size above the service's ceiling is clamped rather
+        // than refused, so the caller still reaches every artifact — one page at a time —
+        // while the work and the response one call can demand stay bounded.
+        let requested = input.max_results.unwrap_or(crate::state::DEFAULT_MAX_RESULTS);
+        let page_size = match usize::try_from(requested) {
+            Ok(size) if size >= 1 => size.min(crate::state::MAX_PAGE_SIZE as usize),
+            _ => {
+                return Err(refused(
+                    "maxResults",
+                    "must have value greater than or equal to 1",
+                ))
+            }
+        };
+
+        // A read (`@readonly`): it walks the stored artifacts and writes nothing.
+        let state = state.lock();
+
+        // Artifacts are listed FOR an agent space, so a space the account does not hold
+        // has no artifacts to list: refused with the service's fixed sentence for an agent
+        // space it cannot resolve, rather than answered with an empty page.
+        if !state.agent_spaces.contains_key(&input.agent_space_id) {
+            return Err(ListArtifactsErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::AGENT_SPACE_NOT_FOUND.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // Borrowed bounds, so resuming copies no id.
+        let start = match resume_from.as_deref() {
+            Some(artifact_id) => ::std::ops::Bound::Included(artifact_id),
+            None => ::std::ops::Bound::Unbounded,
+        };
+        // Only the artifacts of THIS agent space: an artifact is reachable only through
+        // the space that holds it, so another space's record is not in this listing even
+        // though both live in the one store.
+        let mut remaining = state
+            .artifacts
+            .range::<str, _>((start, ::std::ops::Bound::Unbounded))
+            .filter(|(_, artifact)| artifact.agent_space_id == input.agent_space_id);
+
+        let mut artifact_summaries = Vec::new();
+        for (_, artifact) in remaining.by_ref().take(page_size) {
+            artifact_summaries.push(artifact.summary());
+        }
+        // The cursor is the first artifact of this space AFTER this page, so `nextToken`
+        // is present exactly when one remains.
+        let next_token = remaining
+            .next()
+            .map(|(artifact_id, _)| crate::state::encode_artifact_page_token(artifact_id));
+
+        Ok(ListArtifactsOutput {
+            artifact_summaries,
+            next_token,
+        })
     }
+}
+
+/// The operation's `ValidationException` (HTTP 400) for a request member this service
+/// refuses, naming the member and the constraint it failed — the form every client-input
+/// refusal of this service takes.
+fn refused(path: &str, violation: &str) -> ListArtifactsError {
+    ListArtifactsErrorModeled::ValidationException(ValidationException {
+        message: format!(
+            "1 validation error detected: value for '{path}' failed to satisfy \
+             constraint: {violation}"
+        ),
+        field_list: Some(vec![ValidationExceptionField {
+            path: path.to_string(),
+            message: violation.to_string(),
+        }]),
+    })
+    .into()
 }

@@ -63,9 +63,37 @@ const PROVIDERS: [&str; 6] = [
     "JIRA",
 ];
 
+/// The `ArtifactType` value set as a refusal LISTS it, which is not the order the public
+/// model declares the enum in (`smithy_query(query="shape", shape="ArtifactType")` gives
+/// `[TXT, PNG, JPEG, MD, PDF, DOCX, DOC, JSON, YAML]`). Source: the recorded refusal of an
+/// `artifactType` outside the enum.
+const ARTIFACT_TYPE_VALUE_SET: &str = "DOCX, YAML, JSON, JPEG, PNG, TXT, PDF, MD, DOC";
+
+/// Every value the `ArtifactType` enum admits
+/// (`smithy_query(query="shape", shape="ArtifactType")`), so the rows that must NOT be
+/// refused span the whole value set rather than the one the recording used.
+const ARTIFACT_TYPES: [&str; 9] = [
+    "TXT", "PNG", "JPEG", "MD", "PDF", "DOCX", "DOC", "JSON", "YAML",
+];
+
 /// The sentence a refusal of a private connection the account does not hold states.
 /// Source: the recorded 404 for an unknown `privateConnectionName`.
 const PRIVATE_CONNECTION_NOT_FOUND: &str = "Private Connection not found: null";
+
+/// The sentence a `CreatePrivateConnection` that cannot resolve a resource its `mode`
+/// references states, for the connection the request asked to create.
+///
+/// Source: the recorded 404 for a self-managed create naming a resource configuration the
+/// account does not hold. Everything outside the quoted name is FIXED: the sentence names
+/// neither the member that carried the reference nor the identifier itself, and its closing
+/// sentence is not the documentation of the `ResourceNotFoundException` class. Written out
+/// here independently of the handler that reports it.
+fn reference_not_found(private_connection_name: &str) -> String {
+    format!(
+        "A resource referenced by private connection '{private_connection_name}' was not \
+         found. Verify the resource configuration exists and try again."
+    )
+}
 
 /// The sentence a refusal of a target domain the account does not hold states.
 /// Source: the recorded 404 for an unknown `targetDomainId`.
@@ -276,6 +304,232 @@ async fn an_enum_refusal_lists_the_value_set_in_the_services_order() {
             answer.status, answer.error_code, answer.body
         );
     }
+}
+
+/// `CreateAgentSpace`, as the id of the record it minted — the space an upload goes into.
+async fn create_agent_space(router: &MultiServiceRouter, name: &str, case: &str) -> String {
+    let created = ok(router, "CreateAgentSpace", &json!({"name": name}), case).await;
+    member(&created, "agentSpaceId")
+        .unwrap_or_else(|| panic!("case {case:?}: CreateAgentSpace minted no id: {created}"))
+}
+
+/// `AddArtifact` for one declared type, over content of no consequence to the rule.
+async fn add_artifact(
+    router: &MultiServiceRouter,
+    agent_space_id: &str,
+    artifact_type: &str,
+) -> crate::support::Answer {
+    call(
+        router,
+        "AddArtifact",
+        &json!({
+            "agentSpaceId": agent_space_id,
+            "fileName": "upload.bin",
+            "artifactType": artifact_type,
+            // A blob travels as base64 on this protocol, with the codec the wire
+            // serializer uses.
+            "artifactContent": aws_smithy_types::base64::encode(b"artifact bytes"),
+        }),
+    )
+    .await
+}
+
+/// RULE: the same order rule holds for every enum this service publishes an order for, so
+/// an `artifactType` outside its value set is refused with the set in the SERVICE's order
+/// inside the framework's validation envelope, whose variable parts are the error count,
+/// the rejected value and the member path; a value the enum does admit is not refused by
+/// that constraint at all.
+#[tokio::test]
+async fn an_artifact_type_refusal_lists_the_value_set_in_the_services_order() {
+    let router = emulator();
+    let agent_space_id = create_agent_space(&router, "wording-space", "the space uploads go into").await;
+
+    // (case, the artifactType the request carries) — the rows differ along HOW the value
+    // misses the set: an unmodelled extension, the right value in the wrong case, a value
+    // with surrounding whitespace, a near miss of a member's spelling, a file extension
+    // spelled with its dot, and no value at all.
+    let rows: Vec<(&str, String)> = vec![
+        ("an unmodelled file type", "EXE".to_string()),
+        ("a lower-cased member", "pdf".to_string()),
+        ("a mixed-case member", "Docx".to_string()),
+        ("an empty value", String::new()),
+        ("a member with a trailing space", "PNG ".to_string()),
+        ("a member spelled with its dot", ".JSON".to_string()),
+        ("a near miss of a member", "YML".to_string()),
+    ];
+
+    for (case, artifact_type) in rows {
+        let answer = add_artifact(&router, &agent_space_id, &artifact_type).await;
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (400, "ValidationException"),
+            "case {case:?}: expected 400 ValidationException for {artifact_type:?}, got {} \
+             ({}) with {}",
+            answer.status,
+            answer.error_code,
+            answer.body
+        );
+        let expected = format!(
+            "1 validation error detected: Value '{artifact_type}' at 'artifactType' failed \
+             to satisfy constraint: Member must satisfy enum value set: \
+             [{ARTIFACT_TYPE_VALUE_SET}]"
+        );
+        let actual = refusal_message(&answer.body, case);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected {expected:?}, got {actual:?}"
+        );
+    }
+
+    // Every value the enum DOES admit passes that constraint, so the refusals above are
+    // about the value set and nothing else.
+    for artifact_type in ARTIFACT_TYPES {
+        let answer = add_artifact(&router, &agent_space_id, artifact_type).await;
+        assert_eq!(
+            answer.status, 201,
+            "case {artifact_type:?}: a value the enum admits must be stored, got {} ({}) \
+             with {}",
+            answer.status, answer.error_code, answer.body
+        );
+    }
+}
+
+/// Every reference a create can carry that the account does not hold, each paired with the
+/// identifier the request named, so a case can assert the refusal echoes none of it.
+///
+/// The rows differ along WHICH member carries the reference (the self-managed resource
+/// configuration, the service-managed VPC, a service-managed subnet) and along the FORM of
+/// the reference (bare id, this account's ARN, another region's, another account's).
+fn unresolvable_references() -> Vec<(&'static str, Value, String)> {
+    let subnet = region_subnets(REGION)
+        .into_iter()
+        .map(|subnet| subnet.subnet_id)
+        .next()
+        .expect("the account's region has a subnet");
+    let unknown = "rcfg-0a1b2c3d4e5f60718";
+    let rows: Vec<(&'static str, String)> = vec![
+        ("a bare resource configuration id", unknown.to_string()),
+        (
+            "its ARN in this account and region",
+            format!("arn:aws:vpc-lattice:{REGION}:000000000000:resourceconfiguration/{unknown}"),
+        ),
+        (
+            "an ARN naming another region",
+            format!("arn:aws:vpc-lattice:eu-west-1:000000000000:resourceconfiguration/{unknown}"),
+        ),
+        (
+            "an ARN naming another account",
+            format!("arn:aws:vpc-lattice:{REGION}:111122223333:resourceconfiguration/{unknown}"),
+        ),
+    ];
+    let mut cases: Vec<(&'static str, Value, String)> = rows
+        .into_iter()
+        .map(|(case, identifier)| {
+            (
+                case,
+                json!({"selfManaged": {"resourceConfigurationId": identifier.clone()}}),
+                identifier,
+            )
+        })
+        .collect();
+    cases.push((
+        "a service-managed VPC the account does not have",
+        json!({"serviceManaged": {
+            "hostAddress": "provider.internal.example",
+            "vpcId": "vpc-00000000000000bad",
+            "subnetIds": [subnet.clone()],
+        }}),
+        "vpc-00000000000000bad".to_string(),
+    ));
+    cases.push((
+        "a service-managed subnet the account does not have",
+        json!({"serviceManaged": {
+            "hostAddress": "provider.internal.example",
+            "vpcId": default_vpc_id(REGION),
+            "subnetIds": ["subnet-00000000000000bad"],
+        }}),
+        "subnet-00000000000000bad".to_string(),
+    ));
+    cases
+}
+
+/// RULE: a create whose `mode` references a resource the account does not hold is refused
+/// with this operation's own fixed sentence pair, whose ONLY variable part is the
+/// `privateConnectionName` the request carried — it names neither the member that carried
+/// the reference nor the identifier itself — while a reference the account does hold is
+/// still created.
+#[tokio::test]
+async fn an_unresolvable_reference_states_the_operations_own_sentence() {
+    let router = emulator();
+
+    // The names differ too: the sentence's one variable part is the name the request
+    // carried, whatever that name looks like.
+    let names = [
+        "privconn",
+        "Priv-Conn-2",
+        "private.connection.with.dots",
+        "private connection with spaces",
+        "privconn-ünïcode",
+        "p",
+    ];
+
+    for (index, (case, mode, identifier)) in unresolvable_references().into_iter().enumerate() {
+        let name = names[index % names.len()];
+        let answer = call(
+            &router,
+            "CreatePrivateConnection",
+            &json!({"privateConnectionName": name, "mode": mode}),
+        )
+        .await;
+        assert_eq!(
+            (answer.status, answer.error_code.as_str()),
+            (404, "ResourceNotFoundException"),
+            "case {case:?}: expected 404 ResourceNotFoundException for {identifier:?}, got \
+             {} ({}) with {}",
+            answer.status,
+            answer.error_code,
+            answer.body
+        );
+        let expected = reference_not_found(name);
+        let actual = refusal_message(&answer.body, case);
+        assert_eq!(
+            actual, expected,
+            "case {case:?}: expected {expected:?}, got {actual:?}"
+        );
+        assert!(
+            !actual.contains(&identifier),
+            "case {case:?}: the refusal must not echo the identifier {identifier:?}, got \
+             {actual:?}"
+        );
+
+        // A refused create persists nothing, so the name it asked for still resolves to
+        // the service's own not-found sentence for the resource class.
+        let read = call(
+            &router,
+            "DescribePrivateConnection",
+            &json!({"privateConnectionName": name}),
+        )
+        .await;
+        let read_message = refusal_message(&read.body, case);
+        assert_eq!(
+            (read.status, read_message.as_str()),
+            (404, PRIVATE_CONNECTION_NOT_FOUND),
+            "case {case:?}: a refused create must persist nothing, got {} ({}) with {}",
+            read.status,
+            read.error_code,
+            read.body
+        );
+    }
+
+    // A create whose references the account DOES hold is still served, so the refusals
+    // above are about the unresolved reference and nothing else.
+    let created = create_connection(&router, "resolvable", "the references the account holds").await;
+    assert_eq!(
+        member(&created, "name").as_deref(),
+        Some("resolvable"),
+        "case \"the references the account holds\": expected the create to report its \
+         name, got {created}"
+    );
 }
 
 /// RULE: a lookup that resolves no private connection is refused with the service's own

@@ -279,22 +279,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 let vpc_id = &configuration.vpc_id;
                 if *vpc_id != crate::state::default_vpc_id(&region) {
-                    return Err(not_found(
-                        &name,
-                        "mode.serviceManaged.vpcId",
-                        vpc_id,
-                        "VPC",
-                    ));
+                    return Err(not_found(&name));
                 }
                 for subnet_id in &configuration.subnet_ids {
                     let resolved = crate::state::resolve_subnet(&region, subnet_id);
                     if resolved.is_none_or(|subnet| subnet.vpc_id != *vpc_id) {
-                        return Err(not_found(
-                            &name,
-                            "mode.serviceManaged.subnetIds",
-                            subnet_id,
-                            "subnet",
-                        ));
+                        return Err(not_found(&name));
                     }
                 }
                 check_certificate_chain(
@@ -341,14 +331,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         &region,
                         &configuration.resource_configuration_id,
                     )
-                    .ok_or_else(|| {
-                        not_found(
-                            &name,
-                            "mode.selfManaged.resourceConfigurationId",
-                            &configuration.resource_configuration_id,
-                            "VPC Lattice resource configuration",
-                        )
-                    })?;
+                    .ok_or_else(|| not_found(&name))?;
                 check_certificate_chain(
                     "mode.selfManaged.certificate",
                     configuration.certificate.as_deref(),
@@ -413,23 +396,18 @@ fn invalid(path: &str, requirement: &str, message: &str) -> CreatePrivateConnect
 
 /// The modelled `ResourceNotFoundException` for a reference the account cannot resolve.
 ///
-/// The message is built from the request: which private connection was being created,
-/// which member carried the reference, the identifier itself, and what kind of resource
-/// it failed to name — then the documented tail of the modelled shape ("Verify that the
-/// resource identifier is correct and that the resource exists in the specified agent
-/// space or account.").
-fn not_found(
-    name: &str,
-    path: &str,
-    identifier: &str,
-    kind: &str,
-) -> CreatePrivateConnectionError {
+/// RECORDED, not modelled: the sentence pair below is what the service answers when a
+/// reference the requested `mode` carries resolves to nothing, and the whole of it is
+/// FIXED except the `privateConnectionName` the request asked to create. It names
+/// neither the member that carried the reference nor the identifier itself — a refusal
+/// echoes back no resource identifier a caller sent — and it is not the documentation of
+/// the `ResourceNotFoundException` CLASS ("The specified resource was not found. …"),
+/// which is the shape's doc rather than this operation's sentence.
+fn not_found(name: &str) -> CreatePrivateConnectionError {
     CreatePrivateConnectionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
         message: format!(
-            "A resource referenced by private connection '{name}' was not found: {path} \
-             '{identifier}' does not name a {kind} in this account. Verify that the \
-             resource identifier is correct and that the resource exists in the \
-             specified agent space or account."
+            "A resource referenced by private connection '{name}' was not found. Verify \
+             the resource configuration exists and try again."
         ),
     })
     .into()

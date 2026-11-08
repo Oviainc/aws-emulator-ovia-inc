@@ -43,7 +43,7 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AWSResources, AgentSpace, ApplicationSummary, Artifact,
+    AWSResources, AgentSpace, ApplicationSummary, Artifact, ArtifactSummary,
     BatchCreateSecurityRequirementResult, BatchGetSecurityRequirementResult, CodeReviewSettings,
     DnsVerification, HttpVerification, IdCConfiguration, PrivateConnectionSummary,
     SecurityRequirementPackSummary, SecurityRequirementSummary, TargetDomain,
@@ -420,6 +420,10 @@ const PACK_PAGE_TOKEN_PREFIX: &str = "pack-v1:";
 /// and a cursor taken from the wrong one is refused.
 const PRIVATE_CONNECTION_PAGE_TOKEN_PREFIX: &str = "privconn-v1:";
 
+/// The same, for `ListArtifacts`. Distinct from every prefix above, so a cursor another
+/// listing minted is not read as a resume point in the artifact key space.
+const ARTIFACT_PAGE_TOKEN_PREFIX: &str = "artifact-v1:";
+
 /// The same, for `ListSecurityRequirements`: its cursor names the security requirement
 /// NAME the next page resumes at, within the pack the request names, so it is its own
 /// key space and carries its own prefix.
@@ -635,6 +639,19 @@ impl ArtifactRecord {
         Artifact {
             contents: self.contents(),
             r#type: self.artifact_type.clone(),
+        }
+    }
+
+    /// This artifact projected onto the [`ArtifactSummary`] shape a listing of the agent
+    /// space's artifacts answers: the three members the shape declares
+    /// (`smithy_query(query="shape",shape="ArtifactSummary")` — `artifactId`, `fileName`
+    /// and `artifactType`, each `@required`), read off this stored record. A summary
+    /// carries no content: the bytes are reported by a read of the artifact itself.
+    pub fn summary(&self) -> ArtifactSummary {
+        ArtifactSummary {
+            artifact_id: self.artifact_id.clone(),
+            file_name: self.file_name.clone(),
+            artifact_type: self.artifact_type.clone(),
         }
     }
 
@@ -1967,6 +1984,18 @@ pub fn encode_connection_page_token(name: &str) -> String {
 /// `None` when the token is not one this listing minted.
 pub fn decode_connection_page_token(token: &str) -> Option<String> {
     decode_cursor(PRIVATE_CONNECTION_PAGE_TOKEN_PREFIX, token)
+}
+
+/// Encode the `artifactId` a `ListArtifacts` page resumes at as an opaque `nextToken`,
+/// on [`encode_page_token`]'s resume-AT rule.
+pub fn encode_artifact_page_token(artifact_id: &str) -> String {
+    encode_cursor(ARTIFACT_PAGE_TOKEN_PREFIX, artifact_id)
+}
+
+/// The `artifactId` a `ListArtifacts` `nextToken` resumes at, or `None` when the token is
+/// not one this listing minted.
+pub fn decode_artifact_page_token(token: &str) -> Option<String> {
+    decode_cursor(ARTIFACT_PAGE_TOKEN_PREFIX, token)
 }
 
 /// Encode the pack and the security requirement name a `ListSecurityRequirements` page
