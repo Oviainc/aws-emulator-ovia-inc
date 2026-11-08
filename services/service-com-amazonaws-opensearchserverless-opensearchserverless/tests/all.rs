@@ -31,6 +31,8 @@ mod batch_selector_rule;
 mod client_error_status;
 #[path = "all/client_token_scope.rs"]
 mod client_token_scope;
+#[path = "all/collection_data_plane.rs"]
+mod collection_data_plane;
 #[path = "all/collection_group_capacity.rs"]
 mod collection_group_capacity;
 #[path = "all/collection_group_collection_count.rs"]

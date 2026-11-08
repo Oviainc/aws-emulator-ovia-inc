@@ -538,6 +538,36 @@ pub fn fips_dashboard_endpoint(collection_id: &str, region: &str) -> String {
     )
 }
 
+/// The HOST of a published endpoint — the value a client puts in the `Host` header of the
+/// request it signs, which is what a request addressed to a collection's data plane is
+/// resolved by.
+///
+/// A published endpoint is a URL (`https://<host>[/<path>]`), and the host of one is the
+/// authority `service_common::data_plane_addressing::addressed_host` reads — the ONE
+/// reading of that in this repository, called rather than re-implemented. Any `:port`
+/// stays part of the host, since that is what the client addressed.
+pub fn endpoint_host(endpoint: &str) -> String {
+    ::service_common::data_plane_addressing::addressed_host(endpoint, None).unwrap_or_default()
+}
+
+/// A fresh document id, for a write that named none — the id OpenSearch mints for a
+/// `POST /<index>/_doc` and for a `_bulk` action that carries no `_id`.
+///
+/// Drawn from [`random_bytes`], exactly as the identifiers above are, so the id carries
+/// no structure a caller can read and no two writes take the same one. Rendered in the
+/// URL-safe base64 alphabet OpenSearch's own auto-generated ids are drawn from, so it is
+/// a value that travels in a URI path unescaped.
+pub fn mint_document_id() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    /// The length of an OpenSearch auto-generated document id.
+    const ID_CHARS: usize = 20;
+    random_bytes()
+        .iter()
+        .take(ID_CHARS)
+        .map(|byte| char::from(ALPHABET[usize::from(*byte) % ALPHABET.len()]))
+        .collect()
+}
+
 /// Now, as the epoch milliseconds `createdDate` / `lastModifiedDate` are modelled with
 /// (`Long`, documented as "The Epoch time when the collection was created").
 pub fn now_epoch_millis() -> i64 {
@@ -667,15 +697,102 @@ pub struct PendingStatus {
 /// collection's `id` plus the index name), so it is held ON the collection record: a
 /// purged collection takes its indexes with it and no second map can outlive it.
 ///
-/// Only the members an operation of this slice REPORTS are held: `GetIndex` answers
-/// `indexSchema`, the index's name is the key it is stored under, and the model gives an
-/// index no timestamps.
-#[derive(Debug, Clone)]
+/// The control plane reports the schema (`GetIndex` answers `indexSchema`) and the
+/// collection's own data plane reports the documents, so ONE record carries both: an index
+/// created through either plane is the index the other one reads.
+#[derive(Debug, Clone, Default)]
 pub struct IndexRecord {
     /// `IndexSchema`, held as the document the create carried — `GetIndex` reports it
     /// back. `None` for an index created without one, which the model allows
     /// (`indexSchema` is not `@required`).
     pub index_schema: Option<::aws_smithy_types::Document>,
+    /// The epoch-millisecond instant the index was created, which the data plane reports
+    /// as the index setting `index.creation_date`.
+    pub created_date: i64,
+    /// The documents this index holds, by document id — what the collection's OpenSearch
+    /// REST data plane writes, reads and searches. Bounded by
+    /// [`MAX_DOCUMENTS_PER_INDEX`].
+    pub documents: BTreeMap<String, DocumentRecord>,
+    /// The sequence number the next write to this index takes, which is how OpenSearch
+    /// numbers the writes of one index (`_seq_no`). Monotonic per index and never reused,
+    /// so a client can order two writes it made.
+    pub next_seq_no: i64,
+}
+
+impl IndexRecord {
+    /// A fresh index carrying `index_schema`, created at `created_date` and holding no
+    /// document yet — the one place this crate builds the record, so an index created
+    /// through the control plane and one created through the data plane start alike.
+    pub fn new(index_schema: Option<::aws_smithy_types::Document>, created_date: i64) -> Self {
+        Self {
+            index_schema,
+            created_date,
+            documents: BTreeMap::new(),
+            next_seq_no: 0,
+        }
+    }
+
+    /// The sequence number the next write of this index takes, advancing the counter.
+    ///
+    /// A DELETE is a write of the id it addresses, so it takes a sequence number too —
+    /// which is what lets a client order a delete against the write before it.
+    pub fn take_seq_no(&mut self) -> i64 {
+        let seq_no = self.next_seq_no;
+        self.next_seq_no = self.next_seq_no.saturating_add(1);
+        seq_no
+    }
+
+    /// Store `source` under `id`, as one write of this index: the version the id is now at
+    /// and the sequence number this write took, which is what the answer reports.
+    ///
+    /// A write to an id the index already holds replaces that document and advances its
+    /// version, the way OpenSearch versions a document per id; the sequence number comes
+    /// from the index and advances on every write.
+    pub fn write_document(
+        &mut self,
+        id: &str,
+        source: ::aws_smithy_types::Document,
+    ) -> DocumentRecord {
+        let version = self
+            .documents
+            .get(id)
+            .map_or(1, |held| held.version.saturating_add(1));
+        let seq_no = self.take_seq_no();
+        let written = DocumentRecord {
+            source,
+            version,
+            seq_no,
+        };
+        self.documents.insert(id.to_string(), written.clone());
+        written
+    }
+}
+
+/// The most documents ONE index of a collection holds.
+///
+/// EMULATOR RESOURCE GUARD, not an AWS limit: the data plane adds one caller-supplied
+/// document per write to an index that may live as long as its collection, and nothing
+/// reclaims a document until its index or collection is removed — so this cap, with
+/// [`MAX_DOCUMENTS_PER_INDEX`]'s companion [`MAX_DOCUMENT_SOURCE_NODES`] on the size of
+/// one document and [`MAX_INDEXES_PER_COLLECTION`] on how many indexes a collection
+/// holds, is what keeps the store finite. A write past it is refused rather than stored.
+pub const MAX_DOCUMENTS_PER_INDEX: usize = 1_000;
+
+/// The most values ONE stored document source may carry; see [`MAX_DOCUMENTS_PER_INDEX`]
+/// for why the size of one document is bounded, and [`document_within_bounds`] for the
+/// walk that enforces it.
+pub const MAX_DOCUMENT_SOURCE_NODES: usize = 1_000;
+
+/// One document an index holds, as its data plane stores and reports it.
+#[derive(Debug, Clone)]
+pub struct DocumentRecord {
+    /// The document body the write carried, held PARSED so a read answers the document
+    /// rather than the caller's own formatting.
+    pub source: ::aws_smithy_types::Document,
+    /// `_version`: how many times this id has been written, starting at 1.
+    pub version: i64,
+    /// `_seq_no`: this write's place in the index's own write order.
+    pub seq_no: i64,
 }
 
 /// One stored collection. Every field a reader reports is held here; nothing is
@@ -717,6 +834,25 @@ pub struct CollectionRecord {
 }
 
 impl CollectionRecord {
+    /// Whether this collection PUBLISHES `host`: the collection endpoint "used to submit
+    /// index, search, and data upload requests" (`CollectionDetail$collectionEndpoint`),
+    /// the FIPS endpoint beside it, or either Dashboards endpoint — every host a reader of
+    /// this record hands a client as an address of this collection.
+    ///
+    /// Every published host is resolved, because each of them is an address the service
+    /// told a caller to send requests to: one that resolved to nothing would be an address
+    /// this service announced and then did not serve.
+    pub fn publishes_host(&self, host: &str) -> bool {
+        [
+            &self.collection_endpoint,
+            &self.fips_collection_endpoint,
+            &self.dashboard_endpoint,
+            &self.fips_dashboard_endpoint,
+        ]
+        .into_iter()
+        .any(|published| endpoint_host(published) == host)
+    }
+
     /// Report `transient` from now, and owe `settled` from [`SETTLE_AFTER`] onwards.
     pub fn begin_transition(&mut self, transient: &str, settled: &'static str) {
         self.status = transient.to_string();

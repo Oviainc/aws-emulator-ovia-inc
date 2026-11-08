@@ -26,6 +26,16 @@ hex = { workspace = true }
 # Spreads the seed behind a minted `CollectionId` and `PolicyVersion`
 # (see `state::random_bytes`).
 sha2 = { workspace = true }
+# The version-5 (name-based) UUID an index of a collection's data plane reports as
+# its `uuid` (`service::collection_rest`): derived from the index's own ARN and
+# name, so the maintained crate states the UUID form rather than this crate.
+uuid = { version = "1", features = ["v5"] }
+# `data_plane_addressing`: the ONE reading of how a client ADDRESSES an emulated
+# service's data plane — the reserved path namespace, the host a request addressed
+# and the host without its port — which the collection REST data plane
+# (`service::collection_rest`) resolves a request by rather than re-implementing.
+# Declared as a path dependency, the way the other consumers do.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

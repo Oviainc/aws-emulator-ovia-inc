@@ -255,9 +255,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         collection.indexes.insert(
             input.index_name.clone(),
-            crate::state::IndexRecord {
-                index_schema: input.index_schema,
-            },
+            crate::state::IndexRecord::new(input.index_schema, crate::state::now_epoch_millis()),
         );
         // `CreateIndexResponse` models no members: the index is what the call produced,
         // and `GetIndex` is where it is read back.

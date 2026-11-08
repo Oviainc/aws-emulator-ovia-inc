@@ -17,9 +17,8 @@
 //! own behaviour, so an unedited service still routes and answers correctly:
 //!
 //! - `can_handle` — which requests this service claims. The default matches the
-//!   request's resolved route key against this service's signing name. Edit it
-//!   for anything the model does not express: a signing name shared by several
-//!   services, or routing that keys on the access-key id.
+//!   request's resolved route key against this service's signing name; EDITED HERE to
+//!   claim a COLLECTION's own data-plane traffic too (see [`collection_rest`]).
 //! - `override_operation` — EDITED HERE for the operations whose input carries a
 //!   `CollectionName`: the key and the handler stay the generated table's, but the
 //!   operation is served through [`CollectionNameRefusal`] so a `@pattern` refusal of a
@@ -65,6 +64,17 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! Two of those seams are taken for a second reason: a COLLECTION this service creates
+//! publishes the endpoint "used to submit index, search, and data upload requests"
+//! (`CollectionDetail$collectionEndpoint`), and the protocol spoken there is the OpenSearch
+//! REST API, which this model does not describe — so a REST request to that host reached
+//! this service's `awsJson1_0` front door and was refused for carrying no `x-amz-target`.
+//! [`can_handle`](Service::can_handle) also claims a request addressed to a collection this
+//! service HOLDS, and [`collection_rest`] is what resolves and serves it: as an OPERATION
+//! for a request presenting a SigV4 credential, so the emulator verifies the signature, and
+//! from [`override_routing_error`](Service::override_routing_error) for one presenting
+//! none.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use aws_smithy_schema_server::constraints::{envelope, Violation, ViolationKind};
@@ -74,6 +84,12 @@ use smithy_server_runtime::{
     OperationRoutingTable, Refusal, Refused, Service,
 };
 use std::sync::Arc;
+
+/// The COLLECTION's own OpenSearch REST data plane: the surface served at the host a
+/// collection publishes as its `collectionEndpoint`, which this service's model does not
+/// describe and which no RPC target names. See that module for why two of the seams below
+/// take it into account.
+pub mod collection_rest;
 
 /// The wire error code a boundary refusal carries, which is also this service's own
 /// modelled `ValidationException` (`smithy_query(query="shape", shape="ValidationException")`:
@@ -284,6 +300,19 @@ fn operation_stated_refusal<O: Operation>(
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The SAME shared engine the generated entry threads into every operation.
+    ///
+    /// Held here because a COLLECTION's own data-plane traffic ([`collection_rest`]) is
+    /// claimed by `can_handle` and served from `override_operation` /
+    /// `override_routing_error`, none of which is an operation with a `self.engine` of its
+    /// own: all of them must read the one store the control-plane operations write, not a
+    /// second copy.
+    engine: Arc<Eng>,
+    /// The collection REST data plane as an [`ErasedOperation`], so the router verifies the
+    /// SigV4 credential a signed data-plane request carries before anything is served.
+    /// Held in a field, built once, because `override_operation` hands back a reference
+    /// borrowed from `&self`.
+    credentialed_data_plane: CredentialedDataPlane<Eng>,
     /// The operations named in [`COLLECTION_NAME_MEMBERS`], each the generated table's own
     /// operation wrapped in [`CollectionNameRefusal`] and built from the SAME shared
     /// engine, so a wrapped operation reads and writes the one store. Keyed by the routing
@@ -316,9 +345,57 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             )) as Box<dyn ErasedOperation>,
         );
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            credentialed_data_plane: CredentialedDataPlane {
+                engine: Arc::clone(&engine),
+            },
+            engine,
             collection_name_refusals,
         }
+    }
+}
+
+/// The auth schemes a credentialed data-plane request is verified under.
+///
+/// SigV4 is the only scheme this service's model declares, and it is the one a client signs
+/// a request to a collection's endpoint with, so a data-plane request arrives either signed
+/// — which this names so the router's own authenticator verifies it — or unsigned, which
+/// the routing-error seam answers without the router authenticating anything.
+const DATA_PLANE_AUTH_SCHEMES: &[&str] = &[::emulator_server::aws_credentials::SIGV4_SCHEME];
+
+/// The collection REST data plane for a request that PRESENTS a SigV4 credential.
+///
+/// It holds the SAME shared engine the generated entry threads into every operation, and
+/// serves the request through exactly the function the routing-error seam uses
+/// ([`collection_rest::serve`]), so the credentialed and the anonymous path cannot diverge
+/// in what they serve — only in whether a signature was verified on the way in.
+struct CredentialedDataPlane<Eng> {
+    engine: Arc<Eng>,
+}
+
+impl<Eng: Send + Sync + 'static> ErasedOperation for CredentialedDataPlane<Eng> {
+    fn run<'r>(
+        &'r self,
+        svc: &'r dyn Service,
+        req: &'r RtRequest,
+        ctx: &'r OperationContext<'r>,
+    ) -> BoxFuture<'r, RtResponse> {
+        let _ = ctx;
+        Box::pin(async move {
+            if collection_rest::claims_request(&*self.engine, req) {
+                return collection_rest::serve(&*self.engine, req);
+            }
+            // Unreachable: `override_operation` names this only for a request this data
+            // plane claims.
+            svc.definition().routing_error_response(req)
+        })
+    }
+
+    /// This is NOT a modelled operation, so there is no modelled operation for the router
+    /// to read schemes off: without this the router would find no scheme for a data-plane
+    /// request and could not verify the credential it carries.
+    fn auth_schemes(&self) -> Option<&'static [&'static str]> {
+        Some(DATA_PLANE_AUTH_SCHEMES)
     }
 }
 
@@ -334,10 +411,23 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
+        let claims_control_plane = match smithy_server_runtime::resolve_route_key(parts) {
             Some(key) => key == self.entry.identity().signing_name(),
             None => false,
-        }
+        };
+        claims_control_plane
+            // And a COLLECTION's own data-plane traffic: a request addressed to the
+            // endpoint host a collection this service holds published
+            // ([`collection_rest::claims_parts`]). Such a request names no modelled
+            // operation — its path is an OpenSearch REST path and it carries no RPC target
+            // — so an unsigned one could resolve no claimant at all, for the one address
+            // this service told the caller to send index, search and data-upload requests
+            // to.
+            //
+            // The claim is narrowed to a collection this service HOLDS, read from the one
+            // shared store, rather than to a host or a path shape alone, so one request
+            // keeps one claimant.
+            || collection_rest::claims_parts(&*self.engine, parts)
     }
 
     fn override_operation(
@@ -351,6 +441,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // this service's name validator reports rather than the member's trait. A key that
         // names no wrapped operation answers `None` here, exactly as it does for a key the
         // model does not name, and the generated table serves it unchanged.
+        //
+        // A data-plane request that PRESENTS a SigV4 credential is named as an operation
+        // first, so the router verifies that credential's signature before anything is
+        // served — the router authenticates only what it names an operation for. One
+        // carrying no credential is left unnamed on purpose: it is answered by
+        // `override_routing_error` below, which the router reaches before authentication.
+        if collection_rest::claims_request(&*self.engine, req)
+            && collection_rest::carries_sigv4_credential(req)
+        {
+            return Some(&self.credentialed_data_plane);
+        }
         let key = self.entry.protocol().routing_key(req).ok()?;
         self.collection_name_refusals.get(key)
     }
@@ -386,7 +487,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
         // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
         // word that routing failure in your own envelope instead.
-        let _ = req;
+        //
+        // A request to a COLLECTION's own endpoint carrying no SigV4 credential is exactly
+        // that case by construction, so this is where it is served — BEFORE
+        // authentication, which is what lets a client carrying no AWS credential be
+        // answered at all rather than told its REST request named no RPC target.
+        if collection_rest::claims_request(&*self.engine, req) {
+            return Some(collection_rest::serve(&*self.engine, req));
+        }
         None
     }
 
