@@ -3,8 +3,9 @@
 //! @op UpdateScope
 //!
 //! Edits a stored scope's `targets` ([`crate::state`]) and answers with the stored
-//! record. `@idempotent`: the add and delete lists are applied as a SET, so a
-//! replay of one update lands on the same targets.
+//! record: the delete list is applied as a SET — removing what the scope does not
+//! hold is a no-op — while an addition the scope ALREADY holds is a request fault,
+//! refused with the modelled `ValidationException` before anything is written.
 //!
 //! ## Shape of an operation
 //!
@@ -234,6 +235,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // An addition the scope ALREADY holds asks for something already true, so
+        // the request is a fault rather than a no-op: it is refused with every
+        // already-present pair named, and nothing is written.
+        let already_present = crate::state::targets_already_present(&scope.targets, &to_add);
+        if !already_present.is_empty() {
+            return Err(UpdateScopeErrorModeled::ValidationException(
+                targets_already_in_scope(&already_present),
+            )
+            .into());
+        }
+
         // Whatever the lists say, the scope the update leaves behind has to keep
         // the account that owns it — a scope is "all the resources for a specific
         // root account", so dropping that account's own target would leave a scope
@@ -303,6 +315,32 @@ fn owner_not_removable(account_id: &str) -> ValidationException {
     ValidationException {
         message: Some(format!(
             "invalid input -> (owner [{account_id}] cannot be removed from scope.)"
+        )),
+    }
+}
+
+/// The modelled 400 for an update that would add account/Region pairs the scope
+/// already holds, naming every such pair the request carried.
+///
+/// The variable part is built FROM THE REQUEST: each already-present pair as
+/// `<accountId>#<region>`, in the order the request listed them, so a caller
+/// learns which entries of its own list were already in scope.
+fn targets_already_in_scope(present: &[&TargetResource]) -> ValidationException {
+    let pairs: Vec<String> = present
+        .iter()
+        .map(|target| {
+            format!(
+                "{}#{}",
+                crate::state::target_account_id(&target.target_identifier.target_id),
+                target.region
+            )
+        })
+        .collect();
+    ValidationException {
+        message: Some(format!(
+            "invalid input -> (cannot add account/region pairs=[[{}]] as they are already in \
+             scope.)",
+            pairs.join(", ")
         )),
     }
 }

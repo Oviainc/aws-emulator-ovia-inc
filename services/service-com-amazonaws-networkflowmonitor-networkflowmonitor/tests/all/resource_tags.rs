@@ -21,7 +21,10 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::harness::{client_token, targets, Answer, Emulator, ACCOUNT_ID, REGION, SIGNING_NAME};
+use crate::harness::{
+    client_token, extra_region, targets, Answer, Emulator, ACCOUNT_ID, EXTRA_REGIONS, REGION,
+    SIGNING_NAME,
+};
 
 /// `TagKey`'s own `@length` maximum, from the model
 /// (`smithy_query(query="shape",shape="TagMap")`: key target `TagKey`, len 1..128).
@@ -114,6 +117,9 @@ pub(crate) const KINDS: &[Kind] = &[Kind::Scope, Kind::Monitor];
 
 /// Create a resource of `kind` carrying `tags` (absent when `None`), and answer
 /// with what addresses and reads it.
+///
+/// A scope is signed for the Region `seed` names ([`extra_region`]): the account
+/// holds one scope per Region, so distinct seeds give one store distinct scopes.
 pub(crate) async fn create(
     emulator: &Emulator,
     kind: Kind,
@@ -129,7 +135,9 @@ pub(crate) async fn create(
             if let Some(tags) = tags {
                 body["tags"] = tags.clone();
             }
-            let created = emulator.create_scope(body).await;
+            let created = emulator
+                .create_scope_in(extra_region(seed as usize % EXTRA_REGIONS.len()), body)
+                .await;
             assert_eq!(
                 created.status, 200,
                 "case scope/{seed}: the scope must be created, got {} with body {}",
@@ -434,7 +442,17 @@ async fn an_arn_the_store_does_not_hold_is_404_for_every_tagging_operation() {
     );
     let unknown_monitor =
         format!("arn:aws:{SIGNING_NAME}:{REGION}:{ACCOUNT_ID}:monitor/never-created");
-    let other_region = known.arn().replace(REGION, "eu-central-1");
+    // The real resource's own ARN with its Region segment swapped for another: an
+    // ARN this store minted nothing under.
+    let other_region = {
+        let mut segments: Vec<&str> = known.arn().split(':').collect();
+        segments[3] = if segments[3] == "eu-central-1" {
+            "us-east-2"
+        } else {
+            "eu-central-1"
+        };
+        segments.join(":")
+    };
     let other_service = format!("arn:aws:ec2:{REGION}:{ACCOUNT_ID}:vpc/vpc-123");
 
     for (case, arn) in [

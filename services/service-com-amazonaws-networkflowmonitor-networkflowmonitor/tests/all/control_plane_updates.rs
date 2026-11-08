@@ -10,7 +10,9 @@
 //! * RULE A (an update edits a list as a SET): `UpdateScope` applies
 //!   `resourcesToDelete` and then `resourcesToAdd` to the scope's `targets` keyed
 //!   by Region + target type + account, so the next `GetScope` reports the result,
-//!   a replay lands on it again, and nothing else about the record moves.
+//!   a deletion of what the scope does not hold is a no-op, and nothing else about
+//!   the record moves. (An ADD of a pair the scope already holds is refused
+//!   instead — `scope_quota.rs`.)
 //! * RULE B (a target an update adds belongs to the Region the request is made in):
 //!   `resourcesToAdd` naming any other Region is the modelled `ValidationException`
 //!   (400), and the scope is left as it was.
@@ -27,7 +29,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{targets, Answer, Emulator, ACCOUNT_ID, REGION, SIGNING_NAME};
+use crate::harness::{extra_region, targets, Answer, Emulator, ACCOUNT_ID, REGION, SIGNING_NAME};
 
 /// Accounts that are NOT the emulator's own, so a row that removes a target is
 /// about the target and not about the scope's owner.
@@ -218,12 +220,6 @@ fn scope_update_rows() -> Vec<ScopeUpdate> {
             ],
         },
         ScopeUpdate {
-            case: "add a target the scope already holds: a set, so it is held once",
-            initial: vec![(first, REGION), (second, REGION)],
-            body: json!({ "resourcesToAdd": targets(&[(second, REGION)]) }),
-            expected: vec![(first, REGION), (second, REGION)],
-        },
-        ScopeUpdate {
             case: "remove one of two targets",
             initial: vec![(first, REGION), (second, REGION)],
             body: json!({ "resourcesToDelete": targets(&[(second, REGION)]) }),
@@ -261,9 +257,10 @@ fn scope_update_rows() -> Vec<ScopeUpdate> {
 
 #[tokio::test]
 async fn update_scope_edits_the_targets_and_get_scope_reflects_it() {
-    let emulator = Emulator::new();
-
     for row in scope_update_rows() {
+        // A store per row: the account holds one scope per Region, so each row's
+        // scope is the only one its store needs.
+        let emulator = Emulator::new();
         let scope_id = scope_with(&emulator, &row.initial).await;
         let before = emulator.get_scope(&scope_id).await;
 
@@ -308,13 +305,26 @@ async fn update_scope_edits_the_targets_and_get_scope_reflects_it() {
             target_keys(read.member("targets"))
         );
 
-        // `@idempotent`: replaying the same edit lands on the same targets.
+        // Replaying the edit: a deletion the scope no longer holds is a no-op, so
+        // an update that only deletes (or asks for nothing) lands on the same
+        // targets again — while re-adding a target the first call put IN scope is
+        // refused, because the scope already holds it. Either way the targets are
+        // what the first call left.
         let replay = emulator.update_scope(&scope_id, row.body.clone()).await;
-        assert_eq!(
-            replay.status, 200,
-            "case {:?}: the replay must succeed, got {} with body {}",
-            row.case, replay.status, replay.body
-        );
+        let adds_again = row
+            .body
+            .get("resourcesToAdd")
+            .and_then(Value::as_array)
+            .is_some_and(|list| !list.is_empty());
+        if adds_again {
+            assert_refused(&format!("{}: the replayed add", row.case), &replay);
+        } else {
+            assert_eq!(
+                replay.status, 200,
+                "case {:?}: the replay must succeed, got {} with body {}",
+                row.case, replay.status, replay.body
+            );
+        }
         let reread = emulator.get_scope(&scope_id).await;
         assert_eq!(
             target_keys(reread.member("targets")),
@@ -415,7 +425,6 @@ struct RemovalRefusal {
 
 #[tokio::test]
 async fn update_scope_keeps_the_owner_and_at_least_one_target() {
-    let emulator = Emulator::new();
     let [first, second, third, _] = OTHER_ACCOUNTS;
 
     let rows = vec![
@@ -455,6 +464,8 @@ async fn update_scope_keeps_the_owner_and_at_least_one_target() {
             initial,
             body,
         } = row;
+        // A store per row: one scope per account and Region.
+        let emulator = Emulator::new();
         let scope_id = scope_with(&emulator, &initial).await;
         let answer = emulator.update_scope(&scope_id, body).await;
         assert_refused(case, &answer);
@@ -469,6 +480,7 @@ async fn update_scope_keeps_the_owner_and_at_least_one_target() {
 
     // Removing all but one target IS accepted, so the refusals above are about
     // what the scope would be left with and not about removing at all.
+    let emulator = Emulator::new();
     let scope_id = scope_with(&emulator, &[(first, REGION), (second, REGION)]).await;
     let accepted = emulator
         .update_scope(
@@ -487,7 +499,6 @@ async fn update_scope_keeps_the_owner_and_at_least_one_target() {
 async fn update_scope_refuses_a_target_in_both_lists() {
     // RULE D over `UpdateScope`'s two target lists: the contradiction is refused
     // whichever entry carries it and wherever in the lists it sits.
-    let emulator = Emulator::new();
     let [first, second, third, _] = OTHER_ACCOUNTS;
     let initial = [(first, REGION), (second, REGION)];
 
@@ -523,6 +534,8 @@ async fn update_scope_refuses_a_target_in_both_lists() {
     ];
 
     for (case, body) in rows {
+        // A store per row: one scope per account and Region.
+        let emulator = Emulator::new();
         let scope_id = scope_with(&emulator, &initial).await;
         let answer = emulator.update_scope(&scope_id, body).await;
         assert_refused(case, &answer);
@@ -536,6 +549,7 @@ async fn update_scope_refuses_a_target_in_both_lists() {
     }
 
     // The same edit with the two lists disjoint is accepted.
+    let emulator = Emulator::new();
     let scope_id = scope_with(&emulator, &initial).await;
     let accepted = emulator
         .update_scope(
@@ -871,7 +885,10 @@ async fn an_unissued_next_token_carries_the_constant_invalid_token_text() {
             created.status, created.body
         );
         let scope = emulator
-            .create_scope(json!({ "targets": targets(&[(OTHER_ACCOUNTS[0], REGION)]) }))
+            .create_scope_in(
+                extra_region(index),
+                json!({ "targets": targets(&[(OTHER_ACCOUNTS[0], extra_region(index))]) }),
+            )
             .await;
         assert_eq!(
             scope.status, 200,

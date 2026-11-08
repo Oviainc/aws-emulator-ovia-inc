@@ -40,7 +40,7 @@
 use serde_json::{json, Value};
 use service_com_amazonaws_networkflowmonitor_networkflowmonitor as nfm;
 
-use crate::harness::{targets, Answer, Emulator, ACCOUNT_ID, REGION, SIGNING_NAME};
+use crate::harness::{extra_region, targets, Answer, Emulator, ACCOUNT_ID, REGION, SIGNING_NAME};
 use crate::resource_tags::{create, KINDS};
 
 /// The status a success that reports content answers with (the protocol default the
@@ -397,9 +397,13 @@ async fn an_unresolvable_scope_or_monitor_reference_is_the_modelled_refusal() {
     let monitor_arn = created.text("monitorArn");
 
     // A scope that existed and is gone: its ARN is still well formed, so the refusal
-    // is the store answering rather than the ARN's shape.
+    // is the store answering rather than the ARN's shape. It claims another Region's
+    // scope slot, so the anchor scope above stays live.
     let retired = emulator
-        .create_scope(json!({ "targets": targets(&[("210987654321", "eu-west-1")]) }))
+        .create_scope_in(
+            extra_region(0),
+            json!({ "targets": targets(&[("210987654321", "eu-west-1")]) }),
+        )
         .await;
     let retired_arn = retired.text("scopeArn");
     assert_eq!(

@@ -5,7 +5,10 @@
 //! Mints a scope into this service's store ([`crate::state`]) and answers with the
 //! stored record. `@idempotent` with an `@idempotencyToken`: a replay carrying a
 //! `clientToken` this store has already seen answers with the scope that token
-//! minted, never a second one.
+//! minted, never a second one. A scope is a per-account/Region singleton
+//! ([`crate::state::SCOPE_QUOTA`]), so a create that would claim a second slot in
+//! the Region the request is made in is refused with the modelled
+//! `ServiceQuotaExceededException`.
 //!
 //! ## Shape of an operation
 //!
@@ -202,8 +205,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Not a replay, so this request would add a scope: refuse it when the store
-        // is already at its ceiling, rather than growing without limit.
+        // Not a replay, so this request would claim a scope slot: a scope is a
+        // per-account/Region singleton, so the request is refused when this
+        // account already holds one in the Region the request is made in. The
+        // check runs under the SAME lock that mints below, so two concurrent
+        // creates serialize into one winner and every later one is refused.
+        if state.scopes_in_region(&region) >= crate::state::SCOPE_QUOTA {
+            return Err(CreateScopeErrorModeled::ServiceQuotaExceededException(
+                crate::state::quota_exceeded(
+                    crate::state::SCOPE_RESOURCE,
+                    crate::state::SCOPE_QUOTA,
+                ),
+            )
+            .into());
+        }
+
+        // The Region a request claims a slot in is the Region its own credential
+        // scope names, so the store is also held to a ceiling across Regions
+        // rather than growing one record per Region a caller names.
         if state.scopes.len() >= crate::state::MAX_SCOPES {
             return Err(CreateScopeErrorModeled::ServiceQuotaExceededException(
                 crate::state::quota_exceeded(
@@ -221,6 +240,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let scope = crate::state::Scope {
             scope_id: scope_id.clone(),
             scope_arn: scope_arn.clone(),
+            region,
             // A scope is being set up — permissions are enabled and the topology
             // is discovered — so it reports the model's non-terminal IN_PROGRESS
             // until the clock owes it SUCCEEDED.

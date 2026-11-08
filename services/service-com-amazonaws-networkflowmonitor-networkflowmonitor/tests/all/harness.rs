@@ -27,6 +27,57 @@ pub const ACCOUNT_ID: &str = "000000000000";
 /// request's scope is distinguishable from a hardcoded one.
 pub const REGION: &str = "us-west-2";
 
+/// Regions OTHER than [`REGION`] a test signs for when ONE store has to hold more
+/// than one scope: a scope is a per-account/Region resource and the account holds
+/// at most `state::SCOPE_QUOTA` of them per Region, so every extra scope of a
+/// store is created under its own credential scope. The codes are AWS commercial
+/// Region codes, and none of them is [`REGION`].
+pub const EXTRA_REGIONS: &[&str] = &[
+    "us-east-1",
+    "us-east-2",
+    "us-west-1",
+    "af-south-1",
+    "ap-east-1",
+    "ap-south-1",
+    "ap-south-2",
+    "ap-northeast-1",
+    "ap-northeast-2",
+    "ap-northeast-3",
+    "ap-southeast-1",
+    "ap-southeast-2",
+    "ap-southeast-3",
+    "ap-southeast-4",
+    "ca-central-1",
+    "ca-west-1",
+    "eu-central-1",
+    "eu-central-2",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-west-3",
+    "eu-north-1",
+    "eu-south-1",
+    "eu-south-2",
+    "il-central-1",
+    "me-central-1",
+    "me-south-1",
+    "sa-east-1",
+    "ap-southeast-5",
+    "ap-southeast-7",
+];
+
+/// The Region the `index`-th extra scope of a store is created in. Two scopes of
+/// one store must not share a Region (they would share a quota slot), so an index
+/// past the catalog fails here rather than in a confusing refusal later.
+pub fn extra_region(index: usize) -> &'static str {
+    assert!(
+        index < EXTRA_REGIONS.len(),
+        "case index {index}: this catalog names {} Regions, so a store cannot hold more \
+         scopes than that",
+        EXTRA_REGIONS.len()
+    );
+    EXTRA_REGIONS[index]
+}
+
 /// Longer than `state::PROVISIONING_DELAY`, so a call after this wait is one the
 /// clock already owes the terminal status to.
 pub const PAST_PROVISIONING: Duration = Duration::from_millis(900);
@@ -84,7 +135,19 @@ impl Emulator {
     }
 
     pub async fn call(&self, method: &str, path: &str, body: Option<Value>) -> Answer {
-        let region = &self.region;
+        self.call_signed_for(&self.region, method, path, body).await
+    }
+
+    /// The same dispatch with the request signed for `region` instead of this
+    /// emulator's own: how one store comes to hold a scope in more than one
+    /// Region.
+    pub async fn call_signed_for(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> Answer {
         let authorization = format!(
             "AWS4-HMAC-SHA256 Credential=AKIDEMULATOR/20260101/{region}/{SIGNING_NAME}/aws4_request, \
              SignedHeaders=host;x-amz-date, Signature=0000000000000000000000000000000000000000000000000000000000000000"
@@ -122,6 +185,13 @@ impl Emulator {
 
     pub async fn create_scope(&self, body: Value) -> Answer {
         self.call("POST", "/scopes", Some(body)).await
+    }
+
+    /// `CreateScope` signed for `region`: the account's scope slot in THAT Region,
+    /// so a store can hold one scope per Region without passing the quota.
+    pub async fn create_scope_in(&self, region: &str, body: Value) -> Answer {
+        self.call_signed_for(region, "POST", "/scopes", Some(body))
+            .await
     }
 
     pub async fn get_scope(&self, scope_id: &str) -> Answer {
@@ -171,9 +241,16 @@ impl Emulator {
 
     /// A scope holding one target, and the `scopeArn` it was minted with — the
     /// parent every monitor test needs.
+    ///
+    /// It carries a fixed `clientToken`, so a test that needs the parent scope
+    /// more than once is answered with the SAME scope (the `@idempotent` replay)
+    /// rather than asking for a second one the account's quota has no slot for.
     pub async fn scope_for_monitors(&self) -> String {
         let created = self
-            .create_scope(json!({ "targets": targets(&[("123456789012", "us-east-1")]) }))
+            .create_scope(json!({
+                "targets": targets(&[("123456789012", "us-east-1")]),
+                "clientToken": client_token(0),
+            }))
             .await;
         assert_eq!(
             created.status, 200,

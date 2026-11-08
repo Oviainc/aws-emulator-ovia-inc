@@ -16,8 +16,8 @@ use serde_json::{json, Value};
 // The ONE harness every suite in this crate dispatches through
 // (`tests/all/harness.rs`).
 use crate::harness::{
-    client_token, is_uuid_shaped, targets, Emulator, ACCOUNT_ID, PAST_PROVISIONING, REGION,
-    SIGNING_NAME,
+    client_token, extra_region, is_uuid_shaped, targets, Emulator, ACCOUNT_ID, PAST_PROVISIONING,
+    REGION, SIGNING_NAME,
 };
 
 /// The statuses `MonitorStatus` declares, from the model
@@ -86,8 +86,12 @@ async fn a_created_scope_is_read_back_member_for_member() {
     let emulator = Emulator::new();
     let mut seen_ids: BTreeSet<String> = BTreeSet::new();
 
-    for row in scope_rows() {
-        let created = emulator.create_scope(row.body.clone()).await;
+    // One store, one scope per Region: the account's scope quota is per Region
+    // (`state::SCOPE_QUOTA`), so each row claims its own Region's slot and every
+    // row's record still lives in the same store.
+    for (index, row) in scope_rows().into_iter().enumerate() {
+        let region = extra_region(index);
+        let created = emulator.create_scope_in(region, row.body.clone()).await;
         assert_eq!(
             created.status, 200,
             "case {:?}: expected 200, got {} with body {}",
@@ -107,7 +111,7 @@ async fn a_created_scope_is_read_back_member_for_member() {
         );
         assert_eq!(
             created.text("scopeArn"),
-            format!("arn:aws:{SIGNING_NAME}:{REGION}:{ACCOUNT_ID}:scope/{scope_id}"),
+            format!("arn:aws:{SIGNING_NAME}:{region}:{ACCOUNT_ID}:scope/{scope_id}"),
             "case {:?}: expected the ARN of {scope_id}, got {:?}",
             row.case,
             created.text("scopeArn")
@@ -305,13 +309,34 @@ async fn one_client_token_creates_one_scope() {
         );
     }
 
-    // A DIFFERENT token asks for another scope, so another one is minted.
-    let other = emulator
+    // A DIFFERENT token asks for ANOTHER scope, which the account's per-Region
+    // quota has no slot for: the modelled 402. In another Region the same request
+    // claims that Region's own slot and mints a second scope.
+    let refused = emulator
         .create_scope(json!({
             "targets": targets(&[("444444444444", "us-east-1")]),
             "clientToken": client_token(8)
         }))
         .await;
+    assert_eq!(
+        refused.status, 402,
+        "a second scope in one Region is past the quota, got {} with body {}",
+        refused.status, refused.body
+    );
+    let other = emulator
+        .create_scope_in(
+            extra_region(0),
+            json!({
+                "targets": targets(&[("444444444444", "us-east-1")]),
+                "clientToken": client_token(8)
+            }),
+        )
+        .await;
+    assert_eq!(
+        other.status, 200,
+        "another Region's slot must take the scope, got {} with body {}",
+        other.status, other.body
+    );
     assert_ne!(
         other.text("scopeId"),
         first.text("scopeId"),
@@ -1098,52 +1123,18 @@ async fn every_local_resource_type_the_model_declares_round_trips() {
     }
 }
 
-/// The store's own ceilings (`state::MAX_SCOPES` / `state::MAX_MONITORS`), so the
-/// test asserts the bound the code states rather than a number of its own.
-const MAX_SCOPES: usize = 100;
+/// The store's own monitor ceiling (`state::MAX_MONITORS`), so the test asserts
+/// the bound the code states rather than a number of its own. (The SCOPE bound is
+/// AWS's published per-account/Region quota, pinned in `scope_quota.rs`.)
 const MAX_MONITORS: usize = 100;
 
 #[tokio::test]
 async fn a_create_past_the_store_s_ceiling_is_refused() {
     let emulator = Emulator::new();
+    let scope_arn = emulator.scope_for_monitors().await;
 
-    // Fill the scope store exactly to its ceiling: every create up to it succeeds.
-    let mut scope_arn = String::new();
-    for index in 0..MAX_SCOPES {
-        let created = emulator
-            .create_scope(json!({ "targets": targets(&[("123456789012", "us-east-1")]) }))
-            .await;
-        assert_eq!(
-            created.status, 200,
-            "scope {index}: every create up to the ceiling succeeds, got {} with body {}",
-            created.status, created.body
-        );
-        scope_arn = created.text("scopeArn");
-    }
-
-    // One more is the modelled quota refusal (HTTP 402), not a success and not a
-    // 500: the store never grows past its bound.
-    let refused = emulator
-        .create_scope(json!({ "targets": targets(&[("123456789012", "us-east-1")]) }))
-        .await;
-    assert_eq!(
-        refused.status, 402,
-        "scope {MAX_SCOPES} is past the ceiling: expected 402, got {} with body {}",
-        refused.status, refused.body
-    );
-    assert!(
-        refused
-            .error_type
-            .contains("ServiceQuotaExceededException")
-            || refused
-                .text("__type")
-                .contains("ServiceQuotaExceededException"),
-        "expected ServiceQuotaExceededException, got {:?} / body {}",
-        refused.error_type,
-        refused.body
-    );
-
-    // The same rule holds for monitors, under a scope that does exist.
+    // Fill the monitor store exactly to its ceiling: every create up to it
+    // succeeds.
     for index in 0..MAX_MONITORS {
         let created = emulator
             .create_monitor(json!({
@@ -1169,6 +1160,18 @@ async fn a_create_past_the_store_s_ceiling_is_refused() {
         refused.status, 402,
         "monitor {MAX_MONITORS} is past the ceiling: expected 402, got {} with body {}",
         refused.status, refused.body
+    );
+    assert!(
+        refused.is_error("ServiceQuotaExceededException"),
+        "expected ServiceQuotaExceededException, got {:?} / body {}",
+        refused.error_type,
+        refused.body
+    );
+    assert_eq!(
+        refused.text("message"),
+        format!("Maximum limit of [{MAX_MONITORS}] for resource [monitor] exceeded for account [{ACCOUNT_ID}]."),
+        "a quota refusal names the limit, the resource and the account, got {:?}",
+        refused.text("message")
     );
     // The refusal stored nothing, and deleting a monitor frees a slot again.
     let read = emulator.get_monitor("one-too-many").await;
@@ -1210,8 +1213,12 @@ async fn a_deleted_scope_is_gone_for_every_later_reader() {
     let emulator = Emulator::new();
     let rows = scope_rows();
     let mut live: Vec<(String, String)> = Vec::new();
-    for row in &rows {
-        let created = emulator.create_scope(row.body.clone()).await;
+    for (index, row) in rows.iter().enumerate() {
+        // One scope per Region, so every row's scope is live in one store at once
+        // (the account's scope quota is per Region).
+        let created = emulator
+            .create_scope_in(extra_region(index), row.body.clone())
+            .await;
         assert_eq!(
             created.status, 200,
             "case {:?}: the scope must be created, got {} with body {}",
@@ -1314,9 +1321,13 @@ async fn delete_scope_on_an_id_the_store_does_not_hold_is_404() {
     let live_id = created.text("scopeId");
 
     // A scope this store did mint and that is already gone, so the table covers
-    // both "never existed" and "deleted earlier".
+    // both "never existed" and "deleted earlier". It claims another Region's quota
+    // slot, so the anchor scope above stays live.
     let deleted_once = emulator
-        .create_scope(json!({ "targets": targets(&[("210987654321", "eu-west-1")]) }))
+        .create_scope_in(
+            extra_region(0),
+            json!({ "targets": targets(&[("210987654321", "eu-west-1")]) }),
+        )
         .await;
     let deleted_id = deleted_once.text("scopeId");
     assert_eq!(
@@ -1373,8 +1384,6 @@ async fn delete_scope_on_an_id_the_store_does_not_hold_is_404() {
 /// the deleted one.
 #[tokio::test]
 async fn deleting_a_scope_retires_its_arn_and_frees_its_client_token() {
-    let emulator = Emulator::new();
-
     for (index, pairs) in [
         vec![("123456789012", "us-east-1")],
         vec![("111111111111", "eu-west-1"), ("222222222222", "us-east-2")],
@@ -1382,6 +1391,9 @@ async fn deleting_a_scope_retires_its_arn_and_frees_its_client_token() {
     .into_iter()
     .enumerate()
     {
+        // A store per row: each row ends holding the scope it recreated, and the
+        // account's Region slot is for exactly one scope.
+        let emulator = Emulator::new();
         let case = format!("{} target(s)", pairs.len());
         let token = client_token(900 + index as u32);
         let body = json!({ "targets": targets(&pairs), "clientToken": token });

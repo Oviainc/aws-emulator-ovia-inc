@@ -13,7 +13,7 @@
 use serde_json::{json, Value};
 
 use crate::harness::{
-    is_uuid_shaped, targets, Emulator, ACCOUNT_ID, PAST_PROVISIONING, REGION, SIGNING_NAME,
+    extra_region, is_uuid_shaped, targets, Emulator, ACCOUNT_ID, PAST_PROVISIONING, SIGNING_NAME,
 };
 
 /// One `ScopeSummary` as the test compares it: the three `@required` members of
@@ -49,27 +49,30 @@ fn text(value: &Value, member: &str) -> String {
 }
 
 /// Create `count` scopes, each with a distinct target so no two are the same
-/// resource, and answer their `scopeId`s in creation order.
-async fn create_scopes(emulator: &Emulator, count: usize) -> Vec<String> {
-    let mut ids = Vec::new();
+/// resource, and answer their `scopeId`s with the Region each was created in.
+///
+/// The account holds one scope per Region (`state::SCOPE_QUOTA`), so each scope
+/// is signed for its own Region and the listing walks a store holding all of
+/// them.
+async fn create_scopes(emulator: &Emulator, count: usize) -> Vec<(String, &'static str)> {
+    let mut created = Vec::new();
     for index in 0..count {
         let account = format!("{:012}", 100_000_000_000u64 + index as u64);
-        let region = if index % 2 == 0 {
-            "us-east-1"
-        } else {
-            "eu-west-1"
-        };
-        let created = emulator
-            .create_scope(json!({ "targets": targets(&[(account.as_str(), region)]) }))
+        let signed = extra_region(index);
+        let answer = emulator
+            .create_scope_in(
+                signed,
+                json!({ "targets": targets(&[(account.as_str(), signed)]) }),
+            )
             .await;
         assert_eq!(
-            created.status, 200,
-            "case scope #{index}: the scope must be created, got {} with body {}",
-            created.status, created.body
+            answer.status, 200,
+            "case scope #{index} in {signed}: the scope must be created, got {} with body {}",
+            answer.status, answer.body
         );
-        ids.push(created.text("scopeId"));
+        created.push((answer.text("scopeId"), signed));
     }
-    ids
+    created
 }
 
 /// Every scope `ListScopes` reports, walked page by page with `max_results`: the
@@ -124,10 +127,15 @@ async fn list_scopes_reports_every_created_scope_once_per_page_size() {
     // one page's worth of the largest page `maxResults` allows.
     for store_size in [0usize, 1, 3, 25, 27] {
         let emulator = Emulator::new();
-        let mut expected = create_scopes(&emulator, store_size).await;
+        let created = create_scopes(&emulator, store_size).await;
         // A scope's key in the store is its `scopeId`, so the listing order is
         // id order whatever order the creates came in.
+        let mut expected: Vec<String> = created.iter().map(|(id, _)| id.clone()).collect();
         expected.sort();
+        let regions: std::collections::HashMap<String, &str> = created
+            .iter()
+            .map(|(id, region)| (id.clone(), *region))
+            .collect();
 
         // The page-size dimension: both published bounds of `maxResults` (1..25),
         // a size in between, and an absent one.
@@ -151,10 +159,13 @@ async fn list_scopes_reports_every_created_scope_once_per_page_size() {
                     "case store {store_size}, maxResults {max_results:?}: expected a UUID-shaped scopeId, got {:?}",
                     item.scope_id
                 );
+                let region = regions
+                    .get(&item.scope_id)
+                    .expect("every listed scope is one this test created");
                 assert_eq!(
                     item.scope_arn,
                     format!(
-                        "arn:aws:{SIGNING_NAME}:{REGION}:{ACCOUNT_ID}:scope/{}",
+                        "arn:aws:{SIGNING_NAME}:{region}:{ACCOUNT_ID}:scope/{}",
                         item.scope_id
                     ),
                     "case store {store_size}, maxResults {max_results:?}: expected the ARN of {}, got {:?}",
@@ -170,7 +181,6 @@ async fn list_scopes_reports_every_created_scope_once_per_page_size() {
 async fn every_summary_matches_what_get_scope_reports() {
     let emulator = Emulator::new();
     let created = create_scopes(&emulator, 4).await;
-
     // Before the provisioning span every scope is still IN_PROGRESS; after it the
     // clock owes each one SUCCEEDED. Both are read through the listing and
     // through `GetScope`, so a summary reports the status a reader sees at that
@@ -217,7 +227,11 @@ async fn every_summary_matches_what_get_scope_reports() {
 #[tokio::test]
 async fn a_deleted_scope_leaves_the_listing() {
     let emulator = Emulator::new();
-    let mut remaining = create_scopes(&emulator, 5).await;
+    let mut remaining: Vec<String> = create_scopes(&emulator, 5)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
     remaining.sort();
 
     while let Some(gone) = remaining.first().cloned() {
@@ -241,7 +255,11 @@ async fn a_deleted_scope_leaves_the_listing() {
 #[tokio::test]
 async fn list_scopes_refuses_a_next_token_it_never_issued() {
     let emulator = Emulator::new();
-    let ids = create_scopes(&emulator, 3).await;
+    let ids: Vec<String> = create_scopes(&emulator, 3)
+        .await
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
 
     // A token THIS listing issued resumes the walk.
     let issued = emulator.list_scopes("?maxResults=1").await;

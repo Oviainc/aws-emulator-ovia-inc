@@ -29,6 +29,8 @@ mod resource_tags;
 mod scope_listing;
 #[path = "all/scope_monitor_lifecycle.rs"]
 mod scope_monitor_lifecycle;
+#[path = "all/scope_quota.rs"]
+mod scope_quota;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/wire_status_and_error_classes.rs"]

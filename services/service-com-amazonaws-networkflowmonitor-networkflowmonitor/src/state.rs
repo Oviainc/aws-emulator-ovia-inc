@@ -73,24 +73,40 @@ pub const MAX_TAGS: usize = 200;
 /// taggable resource rather than either store.
 pub const TAGGED_RESOURCE: &str = "resource";
 
-/// The most scopes this emulator holds at once.
+/// The most scopes one account holds in one Region — Network Flow Monitor's
+/// published quota for the `scope` resource, which is ONE.
 ///
-/// A bound on how far the store can grow under repeated creates: a create past it
-/// is refused with the modelled `ServiceQuotaExceededException` (HTTP 402) rather
-/// than accepted, so an unauthenticated caller cannot grow the process's memory
-/// without limit. AWS publishes its own quota and it is not this number; this is
-/// the emulator's own ceiling, chosen well above what a client script needs.
+/// A scope is "all the resources for a specific root account" (`ScopeId`'s own
+/// documentation), and the service holds a single one of them per account and
+/// Region: a `CreateScope` that would claim a second slot in the Region the
+/// request is made in is refused with the modelled
+/// `ServiceQuotaExceededException` (HTTP 402, [`quota_exceeded`]) rather than
+/// minting another topology for the same account. Deleting the scope frees the
+/// slot again, so the quota bounds what the store holds rather than how many
+/// creates a caller may make.
+pub const SCOPE_QUOTA: usize = 1;
+
+/// The most scopes this emulator holds at once ACROSS Regions.
+///
+/// [`SCOPE_QUOTA`] bounds what one Region's slot holds, and the Region comes from
+/// the request's own credential scope, so without this the store would still grow
+/// one record per Region a caller names. It is the emulator's own ceiling rather
+/// than a published quota — chosen well above the number of Regions a client
+/// script uses — and a create past it is refused with the same modelled
+/// `ServiceQuotaExceededException` (HTTP 402). Deleting a scope frees its slot.
 pub const MAX_SCOPES: usize = 100;
 
-/// The most monitors this emulator holds at once, for the same reason and with the
-/// same refusal. Deleting a monitor frees its slot (and the idempotency record
-/// that named it), so the store's size is bounded by the live resources: at most
-/// `MAX_MONITORS` records, each holding at most [`MAX_MONITOR_RESOURCES`] entries
-/// per resource list and [`MAX_UPDATE_TOKENS`] remembered client tokens.
+/// The most monitors this emulator holds at once, refused with the same modelled
+/// `ServiceQuotaExceededException` (HTTP 402). Deleting a monitor frees its slot
+/// (and the idempotency record that named it), so the store's size is bounded by
+/// the live resources: at most `MAX_MONITORS` records, each holding at most
+/// [`MAX_MONITOR_RESOURCES`] entries per resource list and [`MAX_UPDATE_TOKENS`]
+/// remembered client tokens. Unlike [`SCOPE_QUOTA`] this number is the emulator's
+/// own ceiling rather than a published quota.
 pub const MAX_MONITORS: usize = 100;
 
 /// The most top-contributors queries this emulator holds at once, for the same
-/// reason and with the same refusal as [`MAX_SCOPES`]: a `StartQuery*` past it is
+/// reason and with the same refusal as [`MAX_MONITORS`]: a `StartQuery*` past it is
 /// refused with the modelled `ServiceQuotaExceededException` (HTTP 402), which all
 /// three `StartQuery*` operations declare, rather than letting an unauthenticated
 /// caller grow this process's memory one query record at a time. A query record is
@@ -241,6 +257,11 @@ pub struct Scope {
     pub scope_id: String,
     /// `scopeArn`.
     pub scope_arn: String,
+    /// The Region this scope lives in: the one the create request was made in,
+    /// which is also its ARN's Region segment. A scope is a per-account/Region
+    /// resource, so this is what [`SCOPE_QUOTA`] is counted per
+    /// ([`ComAmazonawsNetworkflowmonitorNetworkflowmonitorState::scopes_in_region`]).
+    pub region: String,
     /// `status`.
     pub status: ScopeStatus,
     /// `targets` — exactly the Region/account pairs the create request carried.
@@ -898,6 +919,24 @@ pub fn overlapping_targets<'a>(
         .find(|target| deleted.contains(&target_identity(target)))
 }
 
+/// The targets of `to_add` that `stored` ALREADY holds, in the order the request
+/// named them, keyed by [`target_identity`] the way [`merged_targets`] keys them.
+///
+/// Empty when every addition is new. An update that asks to add a Region/account
+/// pair the scope already holds is asking for something already true, so the
+/// handler refuses the request with these pairs named rather than folding them
+/// away.
+pub fn targets_already_present<'a>(
+    stored: &[TargetResource],
+    to_add: &'a [TargetResource],
+) -> Vec<&'a TargetResource> {
+    let present: BTreeSet<(String, String, String)> = stored.iter().map(target_identity).collect();
+    to_add
+        .iter()
+        .filter(|target| present.contains(&target_identity(target)))
+        .collect()
+}
+
 /// The `targets` list a scope ends with once an update's deletions and then its
 /// additions are applied: the target counterpart of [`merged_resources`], as a set
 /// keyed by [`target_identity`], so a replay of one update lands on the same
@@ -967,6 +1006,16 @@ impl ComAmazonawsNetworkflowmonitorNetworkflowmonitorState {
         for query in self.queries.values_mut() {
             query.settle(now);
         }
+    }
+
+    /// How many scopes this account holds in `region` — what [`SCOPE_QUOTA`] is
+    /// counted against, so a create claims a slot in the Region its request was
+    /// made in and leaves every other Region's slot alone.
+    pub fn scopes_in_region(&self, region: &str) -> usize {
+        self.scopes
+            .values()
+            .filter(|scope| scope.region == region)
+            .count()
     }
 
     /// The next sequence number: unique within this store for the life of the
@@ -1290,12 +1339,20 @@ pub fn idempotency_conflict(resource_type: &str, id: &str) -> ConflictException 
     }
 }
 
-/// The modelled 402 for a create this store has no room for, naming the ceiling it
-/// would pass.
+/// The modelled 402 for a create that would pass a quota, in the fixed wording the
+/// real service answers an exceeded quota with.
+///
+/// The variable parts are the limit that was reached, the resource type it is a
+/// limit on and the account the limit applies to — the caller's, which is the one
+/// account this emulator holds resources for ([`owner_account_id`]) — so a client
+/// that parses or logs the refusal reads the limit, what it limits and whose it is.
+/// Every quota refusal of this service renders through here, whichever resource's
+/// limit was reached.
 pub fn quota_exceeded(resource_type: &str, limit: usize) -> ServiceQuotaExceededException {
     ServiceQuotaExceededException {
         message: Some(format!(
-            "this emulator holds at most {limit} {resource_type} resources"
+            "Maximum limit of [{limit}] for resource [{resource_type}] exceeded for account [{}].",
+            owner_account_id()
         )),
     }
 }
