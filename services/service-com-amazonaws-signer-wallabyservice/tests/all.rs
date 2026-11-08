@@ -38,6 +38,9 @@ mod no_content_class_is_framed_alike;
 #[path = "all/paginated_page_size.rs"]
 mod paginated_page_size;
 
+#[path = "all/payload_signing.rs"]
+mod payload_signing;
+
 #[path = "all/platform_id_character_class.rs"]
 mod platform_id_character_class;
 

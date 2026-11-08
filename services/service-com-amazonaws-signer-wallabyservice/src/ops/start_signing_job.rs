@@ -267,18 +267,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // no profile at all.
         if let Some(owner) = input.profile_owner.as_deref() {
             if owner != ::engine::emulator_account_id() {
-                return Err(profile_not_found(format!(
-                    "Signing profile {} owned by account {owner} not found",
-                    input.profile_name
-                )));
+                return Err(profile_not_found(
+                    crate::state::signing_profile_owner_not_found_message(
+                        &input.profile_name,
+                        owner,
+                    ),
+                ));
             }
         }
 
         let Some(profile) = store.profile(&region, &input.profile_name).cloned() else {
-            return Err(profile_not_found(format!(
-                "Signing profile {} not found",
-                input.profile_name
-            )));
+            return Err(profile_not_found(
+                crate::state::signing_profile_not_found_message(&input.profile_name),
+            ));
         };
         if !profile.can_sign() {
             return Err(profile_cannot_sign(
@@ -332,8 +333,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             signature_validity_period: profile.signature_validity_period,
             signing_parameters: profile.signing_parameters,
             overrides: profile.overrides,
-            source: input.source,
-            destination: input.destination,
+            source: Some(input.source),
+            destination: Some(input.destination),
             // The signed object exists once the signing finishes, so it is
             // written by the completion the clock owes this job.
             signed_object: None,
@@ -345,13 +346,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             requested_by,
             job_owner: ::engine::emulator_account_id().to_string(),
             job_invoker,
-            client_request_token: input.client_request_token.clone(),
+            client_request_token: Some(input.client_request_token.clone()),
             // A freshly started job's signature is trusted: the revocation record
             // is what `RevokeSignature` writes, and only when it is called.
             revocation_record: None,
         };
 
-        store.jobs.insert(job_id.clone(), job);
+        store.insert_job(job);
         store.record_job_token(&region, &input.client_request_token, job_id.clone());
 
         // Reported out of the stored record, so this answer is what

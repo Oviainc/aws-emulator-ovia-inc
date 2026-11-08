@@ -28,6 +28,10 @@ tracing = { workspace = true }
 # Hex codec and digest for the opaque `nextToken` the profile listing hands out.
 hex = { workspace = true }
 sha2 = { workspace = true }
+# ECDSA key generation and signing for the payload-signing data plane: the
+# signature `SignPayload` answers with is made by this library, over the caller's
+# payload, under the signing profile version's key pair.
+aws-lc-rs = "1"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

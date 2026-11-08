@@ -95,6 +95,19 @@ pub const JOB_STATUS_IN_PROGRESS: &str = "InProgress";
 /// The status a signing job reports once the clock has made its completion due.
 pub const JOB_STATUS_SUCCEEDED: &str = "Succeeded";
 
+/// The most signing jobs this store keeps.
+///
+/// NOT an AWS limit — AWS Signer publishes none — and not a rule a client can
+/// observe in any realistic run: it is the ceiling on what THIS process spends on
+/// signing jobs, which is the one store a signing call adds to on every accepted
+/// request. Once the store holds more than this, the job started longest ago is
+/// dropped ([`ComAmazonawsSignerWallabyserviceState::insert_job`]), so the memory
+/// the jobs of one process occupy is bounded by this count times one small,
+/// fixed-shape record — neither the payload that was signed nor the signature is
+/// kept on it. Set far above the number of jobs a client plausibly starts against
+/// one emulator, so a job is still reported for as long as anybody is following it.
+pub const MAX_RETAINED_JOBS: usize = 10_000;
+
 /// The largest page `ListSigningProfiles` serves, and the page size it uses when
 /// the request names no `maxResults`: `ListSigningProfilesRequest$maxResults` is
 /// modelled `@range(min: 1, max: 25)`.
@@ -300,6 +313,15 @@ pub struct SigningProfileRecord {
     pub revocation_record: Option<SigningProfileRevocationRecord>,
     pub tags: BTreeMap<String, String>,
     pub created_at: SystemTime,
+    /// The key pair every payload signature made under THIS version of the profile
+    /// is produced with, or `None` while this version has signed no payload yet.
+    ///
+    /// It lives on the version's own record, so it exists exactly as long as the
+    /// version a signature was made under does and nothing else has to be kept in
+    /// step with it: a `PutSigningProfile` that re-versions this name stores a new
+    /// record, whose first payload signature mints the pair of that version (see
+    /// [`payload_signing::PayloadSigningKey`] and [`Self::payload_signing_key`]).
+    pub payload_signing_key: Option<payload_signing::PayloadSigningKey>,
     /// Every version this profile has had, oldest first; the last is
     /// [`Self::profile_version`].
     pub versions: Vec<String>,
@@ -505,8 +527,18 @@ pub struct SigningJobRecord {
     pub profile_version: String,
     pub platform_id: String,
     pub platform_display_name: Option<String>,
-    pub source: Source,
-    pub destination: Destination,
+    /// The S3 object this job signs, for a job of the code-signing-job workflow —
+    /// and `None` for one of the payload workflow, which hands the payload over in
+    /// the request and reads no object at all (see
+    /// [`SigningWorkflow::ContainerImage`]).
+    pub source: Option<Source>,
+    /// The S3 bucket the signed image is written to, with the same split as
+    /// [`Self::source`]: a payload-signed job writes no object, so it names no
+    /// destination.
+    pub destination: Option<Destination>,
+    /// The signed image this job wrote, which exists only for a job that has a
+    /// destination to write one to and has finished writing it (see
+    /// [`Self::settle`]).
     pub signed_object: Option<SignedObject>,
     pub signing_material: Option<SigningMaterial>,
     pub signing_parameters: BTreeMap<String, String>,
@@ -537,7 +569,11 @@ pub struct SigningJobRecord {
     /// invoker filter is compared against. `None` only for a job no credential
     /// was resolved for.
     pub job_invoker: Option<String>,
-    pub client_request_token: String,
+    /// The `clientRequestToken` the `StartSigningJob` that started this job
+    /// carried, which a replay of that token answers with this job instead of
+    /// starting a second one. `None` for a job started by an operation that takes
+    /// no idempotency token.
+    pub client_request_token: Option<String>,
     /// The revocation of the signature this job produced, once somebody has
     /// revoked it; `None` while the signature is still trusted. `SigningStatus`
     /// is `InProgress | Failed | Succeeded` and cannot say "revoked", so this
@@ -563,7 +599,14 @@ impl SigningJobRecord {
         }
         self.status = JOB_STATUS_SUCCEEDED.to_string();
         self.completed_at = Some(due);
-        self.signed_object = Some(signed_object_of(&self.destination, &self.job_id));
+        // The signed image is written to the destination the job names, so a job
+        // that names none wrote none: its signature went back to the caller
+        // instead.
+        let signed_object = self
+            .destination
+            .as_ref()
+            .map(|destination| signed_object_of(destination, &self.job_id));
+        self.signed_object = signed_object;
         self.completion_due = None;
     }
 
@@ -631,7 +674,7 @@ impl SigningJobRecord {
     pub fn to_summary(&self) -> SigningJob {
         SigningJob {
             job_id: Some(self.job_id.clone()),
-            source: Some(self.source.clone()),
+            source: self.source.clone(),
             signed_object: self.signed_object.clone(),
             signing_material: self.signing_material.clone(),
             created_at: Some(to_timestamp(self.created_at)),
@@ -654,6 +697,10 @@ impl SigningJobRecord {
 /// `AddProfilePermission` writes, the revision chain they move along and the
 /// document whose size `ListProfilePermissions` reports.
 pub mod permissions;
+
+/// The key pair a signing profile's payload signatures are made under, and the
+/// signature `SignPayload` answers with.
+pub mod payload_signing;
 
 /// Per-service state for com-amazonaws-signer-wallabyservice. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -895,6 +942,26 @@ impl ComAmazonawsSignerWallabyserviceState {
     pub fn record_job_token(&mut self, region: &str, client_request_token: &str, job_id: String) {
         self.job_tokens
             .insert((region.to_string(), client_request_token.to_string()), job_id);
+    }
+
+    /// Store `job` as one of this store's signing jobs, keeping the store within
+    /// [`MAX_RETAINED_JOBS`].
+    ///
+    /// The ONE writer both signing operations insert a job through, so the memory
+    /// this process gives to signing jobs is bounded in one place rather than per
+    /// operation. Eviction is oldest-first: job ids are minted in order and this is
+    /// a `BTreeMap` keyed by them, so the first key is the job started longest ago.
+    /// The idempotency tokens that resolved to an evicted job go with it, so no
+    /// token resolves to a job the store no longer holds.
+    pub fn insert_job(&mut self, job: SigningJobRecord) {
+        self.jobs.insert(job.job_id.clone(), job);
+        while self.jobs.len() > MAX_RETAINED_JOBS {
+            let Some(oldest) = self.jobs.keys().next().cloned() else {
+                break;
+            };
+            self.jobs.remove(&oldest);
+            self.job_tokens.retain(|_, started| started != &oldest);
+        }
     }
 
     /// The profile a tagging call's `resourceArn` names, as served by `region`'s
@@ -1291,6 +1358,27 @@ pub fn too_many_tags_message(resulting: usize) -> String {
         "a signing profile holds at most {MAX_TAGS_PER_PROFILE} tags; this request would leave \
          it holding {resulting}"
     )
+}
+
+/// The refusal prose for a `profileName` the region's endpoint holds no signing
+/// profile of.
+///
+/// One sentence for every signing operation that resolves a profile by name, so a
+/// client reading it from `StartSigningJob` and from `SignPayload` reads the same
+/// one. `profileName` is bounded by its modelled shape (`ProfileName`,
+/// `@length(2..64)`), so it is stated as it arrived.
+pub fn signing_profile_not_found_message(profile_name: &str) -> String {
+    format!("Signing profile {profile_name} not found")
+}
+
+/// The refusal prose for a signing call that named an account OTHER than the one
+/// this emulator presents as the profile's owner: that account holds no profile of
+/// that name.
+///
+/// `profileOwner` is bounded by `AccountId`'s `@length(12, 12)`, so it too is
+/// stated as it arrived.
+pub fn signing_profile_owner_not_found_message(profile_name: &str, profile_owner: &str) -> String {
+    format!("Signing profile {profile_name} owned by account {profile_owner} not found")
 }
 
 /// The refusal prose for a cancel of a profile whose signatures have already

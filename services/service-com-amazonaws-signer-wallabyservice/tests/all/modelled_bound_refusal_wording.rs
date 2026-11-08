@@ -47,6 +47,17 @@ const REGION: &str = "us-west-2";
 /// the platform catalog instead of being refused for something else.
 const PLATFORM_ID: &str = "AWSLambda-SHA384-ECDSA";
 
+/// The published `platformId` whose profiles sign a PAYLOAD — the workflow
+/// `SignPayload` serves, so a request of that operation that is admitted is
+/// answered by the signing itself.
+const PAYLOAD_PLATFORM_ID: &str = "Notation-OCI-SHA384-ECDSA";
+
+/// The one `payloadFormat` `SignPayload` signs: "The single valid type is
+/// application/vnd.cncf.notary.payload.v1+json"
+/// (`smithy_query(query="doc", shape="SignPayloadRequest",
+/// member="payloadFormat")`).
+const PAYLOAD_FORMAT: &str = "application/vnd.cncf.notary.payload.v1+json";
+
 /// An ACM certificate ARN a create names as its signing material, for the same
 /// reason.
 const CERTIFICATE_ARN: &str =
@@ -439,9 +450,8 @@ async fn a_payload_outside_the_modelled_window_is_refused_with_that_window() {
 }
 
 /// A payload ON either published bound is not refused for its size: the request
-/// gets past the boundary validator and is answered by the operation itself
-/// (`SignPayload` is still a scaffold, so that answer is its 501 — never the
-/// size refusal, and never a 400).
+/// gets past the boundary validator and is SERVED by the operation, which signs a
+/// payload of either bound under a profile of a platform that signs payloads.
 #[tokio::test]
 async fn a_payload_on_a_published_bound_is_not_refused_for_its_size() {
     let router = emulator();
@@ -451,6 +461,22 @@ async fn a_payload_on_a_published_bound_is_not_refused_for_its_size() {
         usize::try_from(max).expect("the modelled maximum is a byte count"),
     ];
 
+    // A profile the operation can sign with, so a row that is admitted is answered
+    // by the signing itself rather than refused for anything else about it.
+    let profile = "Payload_Window_Profile";
+    let seeded = call(
+        &router,
+        "PUT",
+        &format!("/signing-profiles/{profile}"),
+        Some(json!({ "platformId": PAYLOAD_PLATFORM_ID })),
+    )
+    .await;
+    assert_eq!(
+        seeded.status, 200,
+        "seeding the profile: got {} {:?}",
+        seeded.status, seeded.body
+    );
+
     for size in bounds {
         let case = format!("a {size}-byte payload, on a published bound");
         let answer = call(
@@ -458,15 +484,15 @@ async fn a_payload_on_a_published_bound_is_not_refused_for_its_size() {
             "POST",
             "/signing-jobs/with-payload",
             Some(json!({
-                "profileName": "Payload_Window_Profile",
+                "profileName": profile,
                 "payload": base64::encode(vec![7_u8; size].as_slice()),
-                "payloadFormat": "application/octet-stream",
+                "payloadFormat": PAYLOAD_FORMAT,
             })),
         )
         .await;
-        assert_ne!(
-            answer.status, 400,
-            "case {case:?}: expected a published bound admitted, got {} {:?}",
+        assert_eq!(
+            answer.status, 200,
+            "case {case:?}: expected a published bound admitted and signed, got {} {:?}",
             answer.status, answer.body
         );
         assert_ne!(

@@ -379,6 +379,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             created_at,
             versions,
+            // The key pair this version's payload signatures are made under is
+            // minted by the first `SignPayload` that signs with it, and nothing
+            // this call stores is signed with it yet.
+            payload_signing_key: None,
         };
 
         // The answer is read back out of the store, so what this call reports is

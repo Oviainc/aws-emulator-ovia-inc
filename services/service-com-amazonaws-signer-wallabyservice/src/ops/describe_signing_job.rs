@@ -214,9 +214,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(DescribeSigningJobOutput {
             job_id: Some(job.job_id.clone()),
-            // The source and destination the job was STARTED with, not whatever a
-            // later request carried.
-            source: Some(job.source.clone()),
+            // The source the job was STARTED with, not whatever a later request
+            // carried — and nothing for a job that signed a payload the request
+            // handed over rather than an object in S3.
+            source: job.source.clone(),
             signed_object: job.signed_object.clone(),
             signing_material: job.signing_material.clone(),
             platform_id: Some(job.platform_id.clone()),

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SignPayload
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SignPayload`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SignPayload::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: signs the payload the request carries under the named signing
+//! profile's current version, records the signing job that made the signature, and
+//! answers with that signature. A profile whose lifecycle status is not `Active`,
+//! or whose platform is published for the S3 signing-job workflow rather than this
+//! payload one, is refused instead and nothing is signed.
 //!
 //! ## Shape of an operation
 //!
@@ -120,6 +117,44 @@ impl From<SignPayloadErrorModeled> for SignPayloadError {
     }
 }
 
+/// The modelled 400 for a request this operation cannot sign: the condition it
+/// refused, stated in `message`.
+///
+/// `code` names the modelled shape, which is the error code a client of this
+/// operation branches on; WHICH condition it was is the message's job, and for a
+/// profile refused for its lifecycle status the message names that status.
+fn validation(detail: String) -> SignPayloadError {
+    SignPayloadErrorModeled::ValidationException(ValidationException {
+        message: Some(detail),
+        code: Some(crate::state::ERROR_CODE_VALIDATION.to_string()),
+    })
+    .into()
+}
+
+/// The modelled 404 for a `profileName` this account holds no profile for in the
+/// region the request addressed.
+///
+/// `code` is the profile-specific one, so a client can tell "no such profile" from
+/// every other 404 this service answers.
+fn profile_not_found(detail: String) -> SignPayloadError {
+    SignPayloadErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(detail),
+        code: Some(crate::state::ERROR_CODE_PROFILE_NOT_FOUND.to_string()),
+    })
+    .into()
+}
+
+/// The modelled 500 for a signature this emulator could not produce — its own
+/// fault, not the request's. Nothing is signed and no job is recorded, so the
+/// caller is never handed bytes that are not a signature of its payload.
+fn internal_service_error(detail: String) -> SignPayloadError {
+    SignPayloadErrorModeled::InternalServiceErrorException(InternalServiceErrorException {
+        message: Some(detail),
+        code: Some(crate::state::ERROR_CODE_INTERNAL_SERVICE_ERROR.to_string()),
+    })
+    .into()
+}
+
 /// The `SignPayload` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -156,18 +191,158 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SignPayload` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SignPayloadErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(internal_service_error(
+                "the signer job store is unavailable".to_string(),
+            ));
+        };
+
+        // `payloadFormat` is a bare string the model puts no enumeration on while
+        // documenting the single type it admits, so the value is held to that type
+        // here ([`crate::state::payload_signing::PAYLOAD_FORMAT`]): a payload in
+        // any other format is not one this operation signs.
+        if input.payload_format != crate::state::payload_signing::PAYLOAD_FORMAT {
+            return Err(validation(
+                crate::state::payload_signing::unsupported_payload_format_message(
+                    &input.payload_format,
+                ),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        // Signer is regional: the profile that signs is the one held by the region
+        // whose endpoint this request was signed for, and so is the job.
+        let region = crate::state::request_region(ctx.parts());
+        let requested_by = crate::state::caller_principal_arn(ctx.parts());
+        let job_invoker = crate::state::caller_account_id(ctx.parts());
+        let mut store = state.lock();
+
+        // `profileOwner` names the account that owns the profile. This emulator
+        // presents exactly one account, so any other owner's profile resolves to
+        // no profile at all.
+        if let Some(owner) = input.profile_owner.as_deref() {
+            if owner != ::engine::emulator_account_id() {
+                return Err(profile_not_found(
+                    crate::state::signing_profile_owner_not_found_message(
+                        &input.profile_name,
+                        owner,
+                    ),
+                ));
+            }
+        }
+
+        // Resolved mutably: the key pair this profile version's signatures are made
+        // under is minted by the first signature it makes and then kept on the
+        // version's own record, so every later signature of that version is made
+        // under the same pair.
+        let Some(profile) = store.profile_mut(&region, &input.profile_name) else {
+            return Err(profile_not_found(
+                crate::state::signing_profile_not_found_message(&input.profile_name),
+            ));
+        };
+
+        // A signing profile signs only while it is `Active`: `CancelSigningProfile`
+        // moves it to `Canceled` and `RevokeSigningProfile` to `Revoked`, and
+        // neither status signs anything again
+        // ([`crate::state::SigningProfileRecord::can_sign`]). The refusal names the
+        // status the store holds NOW, so what forbade the call is what a read of
+        // the profile reports, and nothing is signed or recorded.
+        if !profile.can_sign() {
+            return Err(validation(
+                crate::state::payload_signing::signing_refused_message(
+                    &input.profile_name,
+                    &profile.status,
+                ),
+            ));
+        }
+
+        // This operation runs ONE of AWS Signer's two signing workflows — the
+        // payload (container-image) one — and a signing platform is published for
+        // one workflow only ([`crate::state::SigningWorkflow`]): a profile on a
+        // platform published for the S3 signing-job workflow is signed through
+        // `StartSigningJob` instead. Judged after the profile's status, which
+        // refuses a profile that could sign on no workflow at all.
+        const WORKFLOW: crate::state::SigningWorkflow =
+            crate::state::SigningWorkflow::ContainerImage;
+        if !crate::state::platform_signs_through(&profile.platform_id, WORKFLOW) {
+            return Err(validation(crate::state::workflow_unsupported_message(
+                WORKFLOW,
+                &profile.platform_id,
+            )));
+        }
+
+        // The signature is made over the caller's own payload bytes, under the key
+        // pair of the profile VERSION that is current now — the same version the
+        // job below records, so a later `PutSigningProfile` on this name cannot
+        // change what this signature was made with.
+        let Some(signature) = profile
+            .payload_signing_key()
+            .and_then(|key| key.signature(&input.payload))
+        else {
+            return Err(internal_service_error(format!(
+                "no signature could be produced for signing profile {} on platform {}",
+                input.profile_name, profile.platform_id
+            )));
+        };
+        // What the job reports it signed WITH is fixed now, member by member: a
+        // later `PutSigningProfile` on this name mints another version, and this
+        // job keeps reporting the one it signed under. Taken field by field rather
+        // than by cloning the profile, so the version's key material is never
+        // copied out of the record that holds it.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SignPayload"))
+        // The signature exists by the time this call answers, so the job that made
+        // it is already terminal: nothing is owed to it by the clock, and the signed
+        // object a code-signing job writes to S3 has no counterpart here — the
+        // signature went back to the caller instead.
+        let profile_version_arn = profile.profile_version_arn.clone();
+        let mut job = crate::state::SigningJobRecord {
+            // Minted below, once the borrow on the profile this snapshots has
+            // ended; nothing reads the record before it is set.
+            job_id: String::new(),
+            region: region.clone(),
+            profile_name: profile.profile_name.clone(),
+            profile_version: profile.profile_version.clone(),
+            platform_id: profile.platform_id.clone(),
+            platform_display_name: profile.platform_display_name.clone(),
+            signing_material: profile.signing_material.clone(),
+            signature_validity_period: profile.signature_validity_period.clone(),
+            signing_parameters: profile.signing_parameters.clone(),
+            overrides: profile.overrides.clone(),
+            source: None,
+            destination: None,
+            signed_object: None,
+            status: crate::state::JOB_STATUS_SUCCEEDED.to_string(),
+            status_reason: None,
+            created_at: now,
+            completed_at: Some(now),
+            completion_due: None,
+            requested_by,
+            job_owner: ::engine::emulator_account_id().to_string(),
+            job_invoker,
+            client_request_token: None,
+            // A fresh signature is trusted: the revocation record is what
+            // `RevokeSignature` writes, and only when it is called.
+            revocation_record: None,
+        };
+
+        let job_id = store.mint_job_id();
+        job.job_id = job_id.clone();
+        store.insert_job(job);
+
+        // Reported out of the stored record, so this answer is what
+        // `DescribeSigningJob` and `ListSigningJobs` resolve.
+        let stored = store
+            .jobs
+            .get(&job_id)
+            .expect("the job just inserted is in the store");
+        Ok(SignPayloadOutput {
+            job_id: Some(stored.job_id.clone()),
+            job_owner: Some(stored.job_owner.clone()),
+            metadata: Some(crate::state::payload_signing::signature_metadata(
+                &profile_version_arn,
+                &stored.job_id,
+            )),
+            signature: Some(signature),
+        })
     }
 }
