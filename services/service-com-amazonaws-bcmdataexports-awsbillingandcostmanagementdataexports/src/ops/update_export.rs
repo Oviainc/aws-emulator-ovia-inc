@@ -253,23 +253,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(UpdateExportErrorModeled::ValidationException)?;
 
-        // SECOND critical section: the mutation. The export is resolved again, because a
-        // `DeleteExport` may have removed it while the definition above was being read.
-        let mut store = state.lock();
+        // SECOND critical section: the mutation.
         // ONE instant answers the rest of the request: the `LastUpdatedAt` this update
         // reports, the instant it materialises what the clock already owed, and the instant
         // the delivery it owes is scheduled from are all this one, so the stored schedule
-        // cannot disagree with the reported status. It is read HERE, once the store is
-        // held, and never before the lock-free reading of the submitted definition above:
-        // an instant taken earlier would be older than the store this call is about to
-        // change, so a delivery that fell due in between would be judged not yet owed
-        // and then destroyed by the replacement below.
+        // cannot disagree with the reported status. It is read HERE, after the lock-free
+        // reading of the submitted definition above, and the clock's own work is applied at
+        // exactly this instant: a delivery owed at `at` is therefore performed and recorded
+        // for the definition it was owed for, and only one owed AFTER `at` — which this
+        // update supersedes — is replaced below.
         let at = ::std::time::SystemTime::now();
         let updated_at = crate::state::timestamp(at);
-        // Whatever the clock already owes is materialised BEFORE the definition is
+        // Whatever the clock already owes is performed and recorded BEFORE the definition is
         // replaced, so a delivery that fell due while this request was being validated
-        // records the definition it was owed for rather than the one replacing it.
-        store.materialize_due(at);
+        // records the definition it was owed for rather than the one replacing it. It runs
+        // before this service's store is locked, because performing a due delivery writes
+        // through the object store too (see `crate::state::materialize_due_deliveries`).
+        crate::state::materialize_due_deliveries(&*self.engine, at);
+        // The export is resolved again, because a `DeleteExport` may have removed it while
+        // the definition above was being read.
+        let mut store = state.lock();
         let stored = store.exports.get_mut(&input.export_arn).ok_or_else(|| {
             crate::state::export_not_found_error(
                 &input.export_arn,
@@ -301,6 +304,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ));
         stored.deliveries_owed += 1;
         drop(store);
+
+        // The delivery just owed is the SERVICE's work, so nothing a caller does has to make
+        // it happen: one short task applies it when the stored instants make it due. It does
+        // not change when that is — see `crate::state::drive_delivery_clock`.
+        crate::state::drive_delivery_clock(
+            &self.engine,
+            crate::state::DELIVERY_INITIATION_DELAY + crate::state::DELIVERY_SETTLES_AFTER,
+        );
 
         Ok(UpdateExportOutput {
             export_arn: Some(input.export_arn),

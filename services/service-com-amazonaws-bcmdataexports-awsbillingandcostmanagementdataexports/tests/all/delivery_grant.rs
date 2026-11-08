@@ -51,12 +51,19 @@ const ACCOUNT_KEY: &str = "AKIDEXAMPLE";
 
 /// This emulator: this service and Amazon S3 over ONE shared engine, so the policy this
 /// service reads is the document S3's own `PutBucketPolicy` wrote.
-struct Deliveries {
+///
+/// `pub(crate)` so the suite that asserts on the delivery ITSELF
+/// (`tests/all/export_file_delivery.rs`) drives the same two services over the same engine
+/// through this ONE harness instead of growing a second copy of it.
+pub(crate) struct Deliveries {
     router: MultiServiceRouter,
+    /// The engine both services are mounted on, so a suite can read the object store back
+    /// and move a stored due instant the service itself reads.
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 impl Deliveries {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The signature itself is not under test: routing, the stored policy and the
@@ -67,12 +74,19 @@ impl Deliveries {
                 Arc::clone(&engine),
             ),
         );
-        router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(engine));
-        Self { router }
+        router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+            Arc::clone(&engine),
+        ));
+        Self { router, engine }
+    }
+
+    /// The engine both services are mounted on.
+    pub(crate) fn engine(&self) -> &Arc<engine::InMemoryEngine> {
+        &self.engine
     }
 
     /// One call to this service, signed for `region`.
-    async fn call_in(&self, region: &str, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call_in(&self, region: &str, operation: &str, body: &Value) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
@@ -103,12 +117,12 @@ impl Deliveries {
     }
 
     /// One call to this service, signed for the pinned Region.
-    async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
+    pub(crate) async fn call(&self, operation: &str, body: &Value) -> (u16, Value) {
         self.call_in(PINNED_REGION, operation, body).await
     }
 
     /// One call to this service, requiring HTTP 200.
-    async fn ok(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn ok(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call(operation, body).await;
         assert_eq!(
             status, 200,
@@ -118,8 +132,9 @@ impl Deliveries {
     }
 
     /// One request to the object-storage front door, path-style (the emulator serves one
-    /// endpoint per Region, so the bucket travels in the path).
-    async fn s3(&self, method: &str, path: &str, body: &[u8]) -> u16 {
+    /// endpoint per Region, so the bucket travels in the path), answering the status and the
+    /// body Amazon S3 served.
+    pub(crate) async fn s3_request(&self, method: &str, path: &str, body: &[u8]) -> (u16, Vec<u8>) {
         let host = format!("s3.{PINNED_REGION}.amazonaws.com");
         let request = http::Request::builder()
             .method(method)
@@ -129,11 +144,17 @@ impl Deliveries {
             .header("content-type", "application/octet-stream")
             .body(Bytes::copy_from_slice(body))
             .expect("a well-formed S3 request");
-        self.router.dispatch(request).await.status().as_u16()
+        let response = self.router.dispatch(request).await;
+        (response.status().as_u16(), response.body().to_vec())
+    }
+
+    /// One request to the object-storage front door, answering its status alone.
+    async fn s3(&self, method: &str, path: &str, body: &[u8]) -> u16 {
+        self.s3_request(method, path, body).await.0
     }
 
     /// `PUT /<bucket>` — `CreateBucket`.
-    async fn create_bucket(&self, bucket: &str) {
+    pub(crate) async fn create_bucket(&self, bucket: &str) {
         let status = self.s3("PUT", &format!("/{bucket}"), &[]).await;
         assert_eq!(
             status, 200,
@@ -142,7 +163,7 @@ impl Deliveries {
     }
 
     /// `PUT /<bucket>?policy` — `PutBucketPolicy`.
-    async fn put_bucket_policy(&self, bucket: &str, policy: &Value) {
+    pub(crate) async fn put_bucket_policy(&self, bucket: &str, policy: &Value) {
         let document = serde_json::to_vec(policy).expect("a policy document serializes");
         let status = self.s3("PUT", &format!("/{bucket}?policy"), &document).await;
         assert_eq!(
@@ -152,7 +173,7 @@ impl Deliveries {
     }
 
     /// A bucket of this account carrying `policy`, or carrying none for `None`.
-    async fn bucket_with(&self, bucket: &str, policy: Option<&Value>) {
+    pub(crate) async fn bucket_with(&self, bucket: &str, policy: Option<&Value>) {
         self.create_bucket(bucket).await;
         if let Some(policy) = policy {
             self.put_bucket_policy(bucket, policy).await;
@@ -162,17 +183,22 @@ impl Deliveries {
 
 /// The ARN of the bucket's objects, as a bucket policy names them: a bucket is global to
 /// the partition, so the ARN carries neither Region nor account.
-fn objects_of(bucket: &str) -> String {
+pub(crate) fn objects_of(bucket: &str) -> String {
     format!("arn:aws:s3:::{bucket}/*")
 }
 
 /// One bucket-policy statement, as a document.
-fn policy(statement: Value) -> Value {
+pub(crate) fn policy(statement: Value) -> Value {
     json!({ "Version": "2012-10-17", "Statement": [statement] })
 }
 
 /// An `Allow` of `actions` to `principal` on `resources`, optionally conditioned.
-fn grant(principal: Value, actions: Value, resources: Value, condition: Option<Value>) -> Value {
+pub(crate) fn grant(
+    principal: Value,
+    actions: Value,
+    resources: Value,
+    condition: Option<Value>,
+) -> Value {
     let mut statement = json!({
         "Sid": "DataExportsDelivery",
         "Effect": "Allow",
@@ -196,7 +222,7 @@ fn grant(principal: Value, actions: Value, resources: Value, condition: Option<V
 /// `region` is the Region segment of the export ARNs the condition covers — this service's
 /// pinned Region for a policy that is to match, since that is the Region every ARN it mints
 /// carries.
-fn source_condition(region: &str) -> Value {
+pub(crate) fn source_condition(region: &str) -> Value {
     json!({
         "StringLike": {
             "aws:SourceAccount": ::engine::emulator_account_id(),
@@ -209,7 +235,7 @@ fn source_condition(region: &str) -> Value {
 }
 
 /// The delivery grant AWS publishes for a data-export destination bucket.
-fn published_grant(bucket: &str) -> Value {
+pub(crate) fn published_grant(bucket: &str) -> Value {
     policy(grant(
         json!({ "Service": [DELIVERY_SERVICE_PRINCIPAL] }),
         json!([DELIVERY_ACTION]),

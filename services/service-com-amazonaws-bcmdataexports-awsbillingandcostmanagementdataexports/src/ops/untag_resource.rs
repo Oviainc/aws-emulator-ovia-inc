@@ -191,12 +191,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::validate_taggable_resource_arn(&input.resource_arn)
             .map_err(UntagResourceErrorModeled::ValidationException)?;
 
-        let mut store = state.lock();
         // Every handler of this service applies what the clock already owes before it
         // answers, so a delivery falls due at its stored instant whichever operation a
         // caller happens to use. Untagging an export neither owes a delivery nor cancels
-        // one: it does not change the definition that gets delivered.
-        store.materialize_due(::std::time::SystemTime::now());
+        // one: it does not change the definition that gets delivered. It runs before this
+        // service's store is locked, because performing a due delivery writes through the
+        // object store too (see `crate::state::materialize_due_deliveries`).
+        crate::state::materialize_due_deliveries(&*self.engine, ::std::time::SystemTime::now());
+        let mut store = state.lock();
         let stored = store.exports.get_mut(&input.resource_arn).ok_or_else(|| {
             crate::state::tagged_resource_not_found_error(
                 &input.resource_arn,

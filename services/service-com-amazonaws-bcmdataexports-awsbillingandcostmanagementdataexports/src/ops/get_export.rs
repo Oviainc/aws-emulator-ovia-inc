@@ -3,8 +3,10 @@
 //! @op GetExport
 //!
 //! Returns the stored definition and status of the export the ARN names. A reporting
-//! operation: it writes nothing, so two `GetExport` calls on one export answer
-//! identically.
+//! operation: the only thing it writes is what the CLOCK already owed at the instant it ran
+//! — a delivery that had fallen due, which it performs and records before it answers (see
+//! `crate::state::materialize_due_deliveries`) — so two `GetExport` calls on one export
+//! answer identically once the clock owes nothing.
 //!
 //! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
 //! reaching this service's state and the modelled contract still apply.
@@ -151,13 +153,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
-        let mut store = state.lock();
         // Every handler of this service applies what the clock already owes before it
-        // answers, so a delivery falls due at its stored instant whichever operation a
-        // caller happens to use. It changes nothing this read reports: an export's
-        // `ExportStatus` is not a verdict on its deliveries (see
-        // `crate::state::fresh_status`).
-        store.materialize_due(::std::time::SystemTime::now());
+        // answers, so a delivery falls due — and its file is written to the destination —
+        // at its stored instant whichever operation a caller happens to use. It is applied
+        // before the store is locked, because performing a due delivery writes through the
+        // object store too and the two stores are never held at once (see
+        // `crate::state::materialize_due_deliveries`).
+        crate::state::materialize_due_deliveries(&*self.engine, ::std::time::SystemTime::now());
+        let store = state.lock();
         let stored = store.exports.get(&input.export_arn).ok_or_else(|| {
             crate::state::export_not_found_error(
                 &input.export_arn,

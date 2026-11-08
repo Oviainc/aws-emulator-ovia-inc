@@ -15,7 +15,11 @@ smithy-server-runtime = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+# The delivery an export is owed is applied when the clock makes it due, by one short task
+# on the ambient runtime as well as by the next request: `tokio`'s timer is what that task
+# waits on, so this crate names the `time` feature it needs rather than relying on another
+# crate of the workspace enabling it.
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
@@ -43,8 +47,18 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 # The destination of an export is an S3 bucket, and the delivery grant a create checks is
 # the POLICY that bucket carries: read through Amazon S3's own state accessor, so this
-# service judges the document that service's `PutBucketPolicy` wrote.
+# service judges the document that service's `PutBucketPolicy` wrote. A delivery also
+# WRITES the export's file through that same store.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The export file a delivery writes, in the encodings `S3OutputConfigurations` publishes:
+# `csv` lays out the delimited text (so quoting is the maintained implementation's),
+# `flate2` is the GZIP stream, `zip` the ZIP archive, and `parquet` the Apache
+# implementation of the Parquet format, used through its row-group writer with the Snappy
+# codec those objects carry.
+csv = "1.3"
+flate2 = "1"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+parquet = { version = "60", default-features = false, features = ["snap"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -59,6 +73,12 @@ service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true 
 # The delivery-grant suite creates its destination buckets and puts their policies through
 # Amazon S3's own operations.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The delivery suite READS BACK the export file a delivery wrote, so it decodes the object
+# with the same maintained implementations the delivery encoded it with.
+csv = "1.3"
+flate2 = "1"
+zip = { version = "9", default-features = false, features = ["deflate"] }
+parquet = { version = "60", default-features = false, features = ["snap"] }
 
 [lints]
 workspace = true

@@ -41,6 +41,8 @@ mod execution_listing;
 mod execution_lookup;
 #[path = "all/export_definition_validation.rs"]
 mod export_definition_validation;
+#[path = "all/export_file_delivery.rs"]
+mod export_file_delivery;
 #[path = "all/export_lifecycle.rs"]
 mod export_lifecycle;
 #[path = "all/front_door_authorization.rs"]

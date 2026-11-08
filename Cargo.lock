@@ -5551,6 +5551,7 @@ dependencies = [
  "num-integer",
  "num-traits",
  "seq-macro",
+ "snap",
  "twox-hash",
 ]
 
@@ -8591,8 +8592,11 @@ dependencies = [
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
  "bytes",
+ "csv",
+ "flate2",
  "hex",
  "http",
+ "parquet",
  "serde_json",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-s3-amazons3",
@@ -8602,6 +8606,7 @@ dependencies = [
  "sqlparser",
  "tokio",
  "tracing",
+ "zip",
 ]
 
 [[package]]

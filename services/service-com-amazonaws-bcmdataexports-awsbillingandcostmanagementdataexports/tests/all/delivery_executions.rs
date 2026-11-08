@@ -7,17 +7,20 @@
 //! "The cadence for Amazon Web Services to update the data export in your S3 bucket"
 //! (smithy_query shape `RefreshCadence`) — so the service owes every export a delivery for
 //! each definition it persists (one when `CreateExport` stores it, one for each
-//! `UpdateExport` that replaces it), and records that delivery as an execution ON THE CLOCK
-//! with no caller call: once the delivery's instant has passed, `ListExecutions` reports an
-//! `ExecutionReference` for it and `GetExecution` reports it by id, with an
-//! `ExecutionStatus` whose `StatusCode` is one of the modelled `ExecutionStatusCode` values
-//! and with the snapshot of the definition that delivery runs. Because this emulator holds
-//! no billing data and writes no file to the caller's bucket, the delivery it records
-//! cannot succeed and ends in the service's own modelled failure state — `QUERY_FAILURE`
-//! with the `ExecutionStatusReason` for a failure on the service's side, `INTERNAL_FAILURE`
-//! — rather than reporting a `DELIVERY_SUCCESS` for a file nothing wrote; nothing is
-//! claimed for work nothing ran, so `ExportStatus.LastRefreshedAt` ("The timestamp of when
-//! the export was last generated") stays absent.
+//! `UpdateExport` that replaces it), and performs and records that delivery as an execution
+//! ON THE CLOCK with no caller call: once the delivery's instant has passed,
+//! `ListExecutions` reports an `ExecutionReference` for it and `GetExecution` reports it by
+//! id, with an `ExecutionStatus` whose `StatusCode` is one of the modelled
+//! `ExecutionStatusCode` values and with the snapshot of the definition that delivery runs.
+//!
+//! The destinations in this suite are buckets the object store does not hold, so the write
+//! a delivery performs cannot be made: each delivery here therefore ends in the modelled
+//! `DELIVERY_FAILURE` with the modelled reason for a destination this service is not
+//! permitted to write (`INSUFFICIENT_PERMISSION`), and — because no export file was
+//! generated — `ExportStatus.LastRefreshedAt` ("The timestamp of when the export was last
+//! generated") stays absent. The delivery that DOES land a file in a bucket, with every
+//! encoding and both `Overwrite` dispositions, is asserted in
+//! `tests/all/export_file_delivery.rs`.
 //!
 //! It is asserted over a TABLE that differs along what the rule generalises over: every
 //! export definition `export_lifecycle::cases` publishes (lean and fully populated
@@ -42,8 +45,8 @@ use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports:
     EXECUTION_STATUS_CODE_VALUES, EXECUTION_STATUS_REASON_VALUES, FREQUENCY_OPTION_VALUES,
 };
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::state::{
-    DELIVERY_INITIATION_DELAY, DELIVERY_SETTLES_AFTER, EXECUTION_STATUS_INITIATION_IN_PROCESS,
-    EXECUTION_STATUS_QUERY_FAILURE, EXECUTION_STATUS_REASON_INTERNAL_FAILURE,
+    DELIVERY_INITIATION_DELAY, DELIVERY_SETTLES_AFTER, EXECUTION_STATUS_DELIVERY_FAILURE,
+    EXECUTION_STATUS_INITIATION_IN_PROCESS, EXECUTION_STATUS_REASON_INSUFFICIENT_PERMISSION,
     EXPORT_STATUS_HEALTHY, MAX_EXECUTIONS_PER_EXPORT,
 };
 use service_com_amazonaws_bcmdataexports_awsbillingandcostmanagementdataexports::ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState as State;
@@ -66,7 +69,10 @@ const CLOCK_MARGIN: Duration = Duration::from_millis(250);
 /// Both instants are state the service itself reads, so moving them is how a test puts a
 /// clock-owed transition in the past (or holds it in the future) without sleeping — the
 /// service applies it on the next request exactly as it would have applied it on time.
-fn reschedule_delivery(
+///
+/// `pub(crate)` so the suite that asserts on the delivery's own file
+/// (`tests/all/export_file_delivery.rs`) moves a due instant the same ONE way.
+pub(crate) fn reschedule_delivery(
     engine: &Arc<engine::InMemoryEngine>,
     export_arn: &str,
     initiate_at: SystemTime,
@@ -199,9 +205,9 @@ fn assert_modelled_status(case: &str, status: &Value) {
     }
 }
 
-/// The export's own status members a delivery must not invent: an export file was never
-/// generated, so `LastRefreshedAt` is absent, and the failure of a delivery on the
-/// SERVICE's side is not a verdict on the definition, so the export stays healthy.
+/// The export's own status members a delivery that wrote nothing must not invent: no export
+/// file was generated, so `LastRefreshedAt` is absent, and a destination this service could
+/// not write to is not a verdict on the definition, so the export stays healthy.
 async fn assert_export_reports_no_generated_file(case: &str, client: &Client, export_arn: &str) {
     let status = client
         .ok("GetExport", &json!({ "ExportArn": export_arn }))
@@ -214,7 +220,7 @@ async fn assert_export_reports_no_generated_file(case: &str, client: &Client, ex
     assert_eq!(
         status["StatusCode"].as_str(),
         Some(EXPORT_STATUS_HEALTHY),
-        "case {case:?}: a delivery that failed on the service's own side is not a verdict on the definition, got {status}"
+        "case {case:?}: a delivery the destination would not take is not a verdict on the definition, got {status}"
     );
 }
 
@@ -305,9 +311,10 @@ async fn an_export_accrues_the_delivery_the_service_owes_it() {
             "case {label:?}: the execution reports the definition it was generated from, got {described}"
         );
 
-        // THE TERMINAL STATUS the clock owes it: this emulator runs no query against
-        // billing data and writes no file, so the delivery fails where the query would
-        // have run, with the modelled reason for a failure on the service's side.
+        // THE TERMINAL STATUS the clock owes it: the destination of this definition is a
+        // bucket the object store does not hold, so the write the delivery performs cannot
+        // be made and the delivery fails with the modelled reason for a destination this
+        // service may not write.
         let completed_at = settle_completions(&engine, &arn, Duration::from_secs(1));
         let (terminal_id, terminal) = only_execution(&label, &client, &arn).await;
         assert_eq!(
@@ -321,10 +328,10 @@ async fn an_export_accrues_the_delivery_the_service_owes_it() {
                 terminal["StatusReason"].as_str(),
             ),
             (
-                Some(EXECUTION_STATUS_QUERY_FAILURE),
-                Some(EXECUTION_STATUS_REASON_INTERNAL_FAILURE),
+                Some(EXECUTION_STATUS_DELIVERY_FAILURE),
+                Some(EXECUTION_STATUS_REASON_INSUFFICIENT_PERMISSION),
             ),
-            "case {label:?}: a delivery this emulator cannot perform ends in the modelled failure state, got {terminal}"
+            "case {label:?}: a delivery the destination would not take ends in the modelled failure state, got {terminal}"
         );
         assert_eq!(
             timestamp(&label, &terminal, "CompletedAt").secs(),
@@ -503,8 +510,8 @@ async fn each_persisted_definition_is_owed_a_delivery_of_itself() {
                     described["ExecutionStatus"]["StatusReason"].as_str(),
                 ),
                 (
-                    Some(EXECUTION_STATUS_QUERY_FAILURE),
-                    Some(EXECUTION_STATUS_REASON_INTERNAL_FAILURE),
+                    Some(EXECUTION_STATUS_DELIVERY_FAILURE),
+                    Some(EXECUTION_STATUS_REASON_INSUFFICIENT_PERMISSION),
                 ),
                 "case {label:?}: every delivery ends in the modelled failure state, got {described}"
             );
@@ -557,10 +564,10 @@ async fn the_clock_alone_records_the_delivery() {
             terminal["StatusReason"].as_str(),
         ),
         (
-            Some(EXECUTION_STATUS_QUERY_FAILURE),
-            Some(EXECUTION_STATUS_REASON_INTERNAL_FAILURE),
+            Some(EXECUTION_STATUS_DELIVERY_FAILURE),
+            Some(EXECUTION_STATUS_REASON_INSUFFICIENT_PERMISSION),
         ),
-        "case {label:?}: a delivery this emulator cannot perform ends in the modelled failure state, got {terminal}"
+        "case {label:?}: a delivery the destination would not take ends in the modelled failure state, got {terminal}"
     );
     assert!(
         terminal.get("CompletedAt").is_some(),

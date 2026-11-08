@@ -4,7 +4,8 @@
 //!
 //! Lists one `ExportReference` per persisted export, in a stable ARN order, honouring
 //! `MaxResults` and resuming exactly where a previous page ended. A reporting operation:
-//! it writes nothing.
+//! the only thing it writes is what the CLOCK already owed at the instant it ran (see
+//! `crate::state::materialize_due_deliveries`).
 //!
 //! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
 //! reaching this service's state and the modelled contract still apply.
@@ -151,15 +152,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // Every handler of this service applies what the clock already owes before it
+        // answers, so a delivery falls due — and its file is written to the destination —
+        // at its stored instant whichever operation a caller happens to use. Reporting, not
+        // mutating: the deliveries it performs and the executions it records were owed at
+        // this instant whether or not anybody called. It runs before this service's store
+        // is locked, because performing a due delivery writes through the object store too
+        // (see `crate::state::materialize_due_deliveries`).
+        crate::state::materialize_due_deliveries(&*self.engine, ::std::time::SystemTime::now());
         let references: Vec<(String, ExportReference)> = {
-            let mut store = state.lock();
-            // Every handler of this service applies what the clock already owes before it
-            // answers, so a delivery falls due at its stored instant whichever operation a
-            // caller happens to use. Reporting, not mutating: this listing's own answer
-            // does not depend on it — an export's `ExportStatus` is not a verdict on its
-            // deliveries (see `crate::state::fresh_status`) — and the executions it
-            // records were owed at this instant whether or not anybody called.
-            store.materialize_due(::std::time::SystemTime::now());
+            let store = state.lock();
             store
                 .exports
                 .iter()

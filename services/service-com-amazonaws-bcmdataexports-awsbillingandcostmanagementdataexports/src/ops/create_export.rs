@@ -254,20 +254,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The definition is persisted with the configuration the pass above read in force.
         export.data_query.table_configurations = table_configurations;
-        let mut store = state.lock();
         // ONE instant answers the rest of the request: the `CreatedAt`/`LastUpdatedAt` this
         // create reports, the instant it materialises what the clock already owed, and the
         // instant the delivery it owes is scheduled from are all this one, so the stored
-        // schedule cannot disagree with the reported status. Like every other handler of
-        // this service, it is read once the store is HELD, so it is never older than the
-        // store it is about to answer for and nothing the clock owed by then is passed
-        // over as not yet due.
+        // schedule cannot disagree with the reported status.
         let at = ::std::time::SystemTime::now();
         let created_at = crate::state::timestamp(at);
-        // Whatever the clock already owes is materialised before this create is judged, so
-        // a delivery owed to an EARLIER export is recorded at the instant it fell due
-        // rather than waiting for a reader of it.
-        store.materialize_due(at);
+        // Whatever the clock already owes is performed and recorded before this create is
+        // judged, so a delivery owed to an EARLIER export is recorded at the instant it
+        // fell due rather than waiting for a reader of it. It runs before this service's
+        // store is locked, because performing a due delivery writes through the object
+        // store too (see `crate::state::materialize_due_deliveries`), and nothing the clock
+        // owed by `at` is passed over as not yet due.
+        crate::state::materialize_due_deliveries(&*self.engine, at);
+        let mut store = state.lock();
         // The request is validated BEFORE the store bound is applied: a name already in
         // use is owed the 400, not the quota 402, even when the store happens to be full.
         //
@@ -330,6 +330,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         store.exports.insert(arn.clone(), stored);
         drop(store);
+
+        // The delivery just owed is the SERVICE's work, so nothing a caller does has to make
+        // it happen: one short task applies it when the stored instants make it due. It does
+        // not change when that is — see `crate::state::drive_delivery_clock`.
+        crate::state::drive_delivery_clock(
+            &self.engine,
+            crate::state::DELIVERY_INITIATION_DELAY + crate::state::DELIVERY_SETTLES_AFTER,
+        );
 
         Ok(CreateExportOutput {
             export_arn: Some(arn),

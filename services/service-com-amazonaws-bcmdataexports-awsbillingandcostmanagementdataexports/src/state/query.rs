@@ -261,6 +261,10 @@ fn nesting_depth(statement: &str) -> usize {
 pub struct QueryShape {
     /// Every relation the statement names, in walk order, each once.
     pub tables: Vec<String>,
+    /// What the statement's OUTERMOST select list projects, in the order it writes it: the
+    /// columns a delivery of this definition writes into the export file (see
+    /// [`delivered_columns`]).
+    pub projection: Vec<Projected>,
     /// Every column reference the statement makes, in walk order: each once per scope it
     /// was read in, so a reference written in a select list is kept both as that list reads
     /// it and as the statement at large does.
@@ -291,6 +295,25 @@ impl QueryShape {
             .get(list)
             .is_none_or(|defined| !defined.contains(name))
     }
+}
+
+/// ONE item of a statement's outermost select list: what the export file carries in that
+/// position.
+///
+/// Read off the PARSED statement, like everything else here, so a column selected behind an
+/// alias or a qualifier is reported as the statement selects it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Projected {
+    /// A wildcard (`*`, or one qualified by a relation): every column in force for the
+    /// tables the statement reads.
+    AllColumns,
+    /// A reference to a name, by its identifier parts: the part that resolves to a
+    /// published column is the column this position carries (see [`resolve_data_query`]
+    /// for why a reference's other parts are not columns).
+    Reference(Vec<String>),
+    /// A position whose name the statement itself states: the alias of a select item, or an
+    /// unaliased expression, named as the statement writes it.
+    Named(String),
 }
 
 /// One column reference a statement makes.
@@ -388,7 +411,149 @@ fn shape_of(statement: &str) -> Result<QueryShape, QueryRefusal> {
     if walk.shape.tables.is_empty() {
         return Err(reads_no_table(statement).into());
     }
+    // WHAT THE STATEMENT PROJECTS, read off the outermost query body rather than off the
+    // walk: the walk reports every select list the statement writes, while the file a
+    // delivery produces carries the columns of the one the statement ANSWERS with.
+    walk.shape.projection = projection_of(&query.body);
     Ok(walk.shape)
+}
+
+/// What the outermost select list of `body` projects.
+///
+/// A set operation projects what its first arm does: every arm of a `UNION` answers the
+/// same columns, so the first one names them. A body this parse reads as neither a select
+/// nor a set operation names no position of its own, so the whole of the published columns
+/// is what it answers with.
+fn projection_of(body: &SetExpr) -> Vec<Projected> {
+    match body {
+        SetExpr::Select(select) => select.projection.iter().map(projected_item).collect(),
+        SetExpr::Query(query) => projection_of(&query.body),
+        SetExpr::SetOperation { left, .. } => projection_of(left),
+        _ => vec![Projected::AllColumns],
+    }
+}
+
+/// One select item as the position it projects.
+fn projected_item(item: &SelectItem) -> Projected {
+    match item {
+        // A wildcard, qualified or not, selects the columns themselves.
+        SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..) => Projected::AllColumns,
+        // An alias NAMES the position: "SELECT c AS total" answers a column called `total`.
+        SelectItem::ExprWithAlias { alias, .. } => Projected::Named(alias.value.clone()),
+        SelectItem::UnnamedExpr(expr) => match identifier_parts(expr) {
+            Some(parts) => Projected::Reference(parts),
+            // An unaliased EXPRESSION — `SUM(c)`, `a + b` — is a position the statement
+            // names only by writing it, which is also how SQL labels such a column, so that
+            // is what the delivered file calls it. It is not refused: the definition
+            // carrying it was accepted (every column reference inside it resolves, which is
+            // what [`resolve_data_query`] judges), and a definition this service persisted
+            // has to be deliverable.
+            None => Projected::Named(expr.to_string()),
+        },
+    }
+}
+
+/// The most columns one delivered export file carries.
+///
+/// A BOUND ON THE AMPLIFICATION, not on either factor: the select list is the caller's and
+/// a single `*` in it expands to the whole published column set of every table the statement
+/// reads, so the names a delivery builds are the PRODUCT of the two — a statement inside
+/// `QueryStatement`'s own `@length 1..36000` can write enough wildcards to multiply the
+/// catalog into hundreds of thousands of columns, each of which would become a header field
+/// and (for Parquet) a schema leaf. This caps that product, so the file one delivery encodes
+/// is bounded whatever the statement says. It is set well above the widest schema the
+/// catalog publishes, so every wildcard over a real table still delivers that table's whole
+/// schema; what it refuses is a projection no export file could carry.
+pub const MAX_DELIVERED_COLUMNS: usize = 1024;
+
+/// The columns a delivery of `query` writes into the export file, in the order the
+/// statement projects them.
+///
+/// A data export delivers the ROWS a `DataQuery` selects from the tables the catalog
+/// publishes, so the file's columns are that statement's own select list — resolved against
+/// the columns in force for the tables it reads, under the table configuration the
+/// definition is stored with ([`TableSpec::columns_in_force`], the same filter `GetTable`
+/// reports a schema through). A wildcard therefore answers the published columns of those
+/// tables, in catalog order, and a named position answers the one name it states.
+///
+/// `Err` is what [`query_shape`] refuses — the statement is read here exactly as it was read
+/// when the definition was accepted, under the same bounds, so a definition this service
+/// persisted resolves and nothing else does — and the modelled 400 for a projection past
+/// [`MAX_DELIVERED_COLUMNS`], which is refused BEFORE the names are built rather than after.
+pub fn delivered_columns(query: &DataQuery) -> Result<Vec<String>, QueryRefusal> {
+    let shape = query_shape(&query.query_statement)?;
+    // The columns in force for the tables the statement reads, in catalog order, each once:
+    // what a wildcard projects, and the set a reference resolves against.
+    let mut published: Vec<&'static str> = Vec::new();
+    for table in &shape.tables {
+        let Some(spec) = table_spec(table) else {
+            continue;
+        };
+        let requested = query
+            .table_configurations
+            .as_ref()
+            .and_then(|configured| configured.get(table));
+        // The stored configuration was judged when the definition was accepted, so the
+        // properties in force are the ones it carries; a map this read cannot resolve
+        // leaves the table's gated columns out rather than failing the delivery.
+        let properties = spec
+            .effective_properties(requested, QUERY_STATEMENT_FIELD)
+            .unwrap_or_default();
+        for column in spec.columns_in_force(&properties) {
+            if !published.contains(&column.name) {
+                published.push(column.name);
+            }
+        }
+    }
+
+    let mut columns: Vec<String> = Vec::new();
+    for projected in &shape.projection {
+        // How many positions THIS item contributes, decided before any of them is built: a
+        // wildcard contributes the whole published set and every other item exactly one. The
+        // bound is therefore applied to the product of the select list and the catalog, and
+        // the walk stops at the first item that would pass it.
+        let contributes = match projected {
+            Projected::AllColumns => published.len(),
+            Projected::Named(_) | Projected::Reference(_) => 1,
+        };
+        if columns.len() + contributes > MAX_DELIVERED_COLUMNS {
+            return Err(too_many_delivered_columns().into());
+        }
+        match projected {
+            Projected::AllColumns => {
+                columns.extend(published.iter().map(|column| (*column).to_string()));
+            }
+            Projected::Named(name) => columns.push(name.clone()),
+            Projected::Reference(parts) => columns.push(
+                parts
+                    .iter()
+                    .find(|part| published.contains(&part.as_str()))
+                    .cloned()
+                    // A reference the published set does not resolve is carried as the
+                    // statement writes it; such a statement is refused before it is ever
+                    // stored, so this is the form a reference takes nowhere else.
+                    .unwrap_or_else(|| parts.join(".")),
+            ),
+        }
+    }
+    Ok(columns)
+}
+
+/// The modelled 400 for a select list that projects more columns than an export file
+/// carries.
+///
+/// The sentence states the bound rather than echoing the statement: what the caller has to
+/// change is how many positions the select list names, and the statement itself is already
+/// what they sent.
+fn too_many_delivered_columns() -> ValidationException {
+    field_validation_failed(
+        QUERY_STATEMENT_FIELD,
+        format!(
+            "The query statement projects more than {MAX_DELIVERED_COLUMNS} columns, which is \
+             more than a data export file carries."
+        ),
+        format!("Must project at most {MAX_DELIVERED_COLUMNS} columns."),
+    )
 }
 
 /// The walk that reads a parsed query's shape.

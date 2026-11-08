@@ -7,7 +7,7 @@
 //! `MaxResults` and resuming exactly where a previous page ended. A reporting operation
 //! (`@readonly` — smithy_query operation `ListExecutions`): the only thing it writes is
 //! what the CLOCK already owed at the instant it ran (see
-//! `crate::state::ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState::materialize_due`),
+//! `crate::state::materialize_due_deliveries`),
 //! so it reports no state of its own making and no later caller sees a different answer
 //! for having been second.
 //!
@@ -184,15 +184,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // The deliveries the clock already owes are performed and recorded first, so this
+        // listing reports the executions the service had recorded by now rather than
+        // only the ones some earlier call happened to materialise. Reporting, not
+        // mutating: every execution this writes was owed at this instant whether or
+        // not anybody called, and is dated from the instant stored when it was owed —
+        // see `crate::state::materialize_due_deliveries`, which is also why it runs
+        // before this service's store is locked.
+        crate::state::materialize_due_deliveries(&*self.engine, ::std::time::SystemTime::now());
         let references: Vec<(String, ExecutionReference)> = {
-            let mut store = state.lock();
-            // The deliveries the clock already owes are materialised first, so this
-            // listing reports the executions the service had recorded by now rather than
-            // only the ones some earlier call happened to materialise. Reporting, not
-            // mutating: every execution this writes was owed at this instant whether or
-            // not anybody called, and is dated from the instant stored when it was owed —
-            // see `crate::state::ComAmazonawsBcmdataexportsAwsbillingandcostmanagementdataexportsState::materialize_due`.
-            store.materialize_due(::std::time::SystemTime::now());
+            let store = state.lock();
             // The ARN is NOT resolved against the export store: RECORDED AWS behaviour is
             // that this listing answers 200 with an empty `Executions` list for an
             // `ExportArn` that names no export (the recording for the export-not-found

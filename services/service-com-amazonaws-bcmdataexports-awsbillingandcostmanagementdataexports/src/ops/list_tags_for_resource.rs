@@ -4,7 +4,8 @@
 //!
 //! Lists the tags persisted for the export the ARN names, in a stable key order,
 //! honouring `MaxResults` and resuming where a previous page ended. A reporting
-//! operation: it writes nothing.
+//! operation: the only thing it writes is what the CLOCK already owed at the instant it
+//! ran (see `crate::state::materialize_due_deliveries`), which no tag depends on.
 //!
 //! IMPLEMENTED. This is the ONLY file to touch for this operation; the notes below on
 //! reaching this service's state and the modelled contract still apply.
@@ -183,12 +184,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::validate_taggable_resource_arn(&input.resource_arn)
             .map_err(ListTagsForResourceErrorModeled::ValidationException)?;
 
+        // Tags do not depend on an export's deliveries, but every handler of this
+        // service applies what the clock already owes before it answers, so a delivery
+        // falls due at its stored instant whichever operation a caller happens to use. It
+        // runs before this service's store is locked, because performing a due delivery
+        // writes through the object store too (see
+        // `crate::state::materialize_due_deliveries`).
+        crate::state::materialize_due_deliveries(&*self.engine, ::std::time::SystemTime::now());
         let tags: Vec<(String, ResourceTag)> = {
-            let mut store = state.lock();
-            // Tags do not depend on an export's deliveries, but every handler of this
-            // service applies what the clock already owes before it answers, so a delivery
-            // falls due at its stored instant whichever operation a caller happens to use.
-            store.materialize_due(::std::time::SystemTime::now());
+            let store = state.lock();
             let stored = store.exports.get(&input.resource_arn).ok_or_else(|| {
                 crate::state::tagged_resource_not_found_error(
                     &input.resource_arn,

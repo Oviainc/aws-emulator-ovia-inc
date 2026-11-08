@@ -74,6 +74,16 @@ const PROBE: &str = "PROBE";
 const MIN_EXPIRY_SECONDS: i64 = 5 * 60;
 const MAX_EXPIRY_SECONDS: i64 = 24 * 60 * 60;
 
+/// How far INSIDE a bound a row that must be served probes it.
+///
+/// The service measures the window from the instant it serves the request, which is after
+/// the instant a test reads the clock; normally by a fraction of a second, but by whole
+/// seconds whenever the machine running the suite stalls in between. A margin wider than any
+/// such stall is what makes "inside the bound" mean the same thing to the test and to the
+/// service, while staying far from the bound's own value, which the refusing rows probe to
+/// the second.
+const SERVED_MARGIN_SECONDS: i64 = 30;
+
 /// A router with just this service mounted on a fresh engine.
 fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -1108,16 +1118,19 @@ async fn expires_at_follows_the_documented_window() {
 
     // The window `ExpiresAt`'s doc publishes for BREAKPOINT ("must be between 5 min and 24
     // hours"): each published bound and one second past it, plus the absent member. The
-    // window is measured from the instant the create is SERVED, a fraction of a second after
-    // this test reads the clock, so each bound is probed one second INSIDE it rather than
-    // exactly on it — an exact-bound row would race with that drift. PROBE supports no
+    // window is measured from the instant the create is SERVED, which is AFTER this test
+    // reads the clock — by a fraction of a second normally, and by whole seconds when the
+    // machine running the suite stalls between the two — so a row that must be SERVED is
+    // probed [`SERVED_MARGIN_SECONDS`] inside the floor rather than one second inside it,
+    // which is the same probe without the race. A row that must be REFUSED needs no such
+    // margin: drift moves the floor further above it, so it stays refused. PROBE supports no
     // expiry at all.
     let rows: Vec<(&str, &str, Option<i64>, u16)> = vec![
         ("breakpoint, no expiry", BREAKPOINT, None, 200),
         (
             "breakpoint, just inside the 5 minute floor",
             BREAKPOINT,
-            Some(MIN_EXPIRY_SECONDS + 1),
+            Some(MIN_EXPIRY_SECONDS + SERVED_MARGIN_SECONDS),
             200,
         ),
         (
