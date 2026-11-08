@@ -189,9 +189,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let cursor = input.next_token.as_deref().map(decode_token).transpose()?;
 
         let store = state.lock();
-        // A reporting operation, and one that reports nothing a transition could change:
-        // an export record is fixed once written, and whether it still falls inside the
-        // documented window is derived from the clock on each read. So this reads only.
+        // A reporting operation, and one whose own records need no transition written: an
+        // export record is fixed once written, and both its status and whether it still
+        // falls inside the documented window are derived from the clock on each read. So
+        // this reads only.
         let mut summaries: Vec<ExportSummary> = store
             // Exports are recorded per region, so a listing answers with the ones this
             // request's own region holds, in the reverse ARN order the operation reports.
@@ -212,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_deref()
                     .is_none_or(|start| export.arn.as_str() < start)
             })
-            .map(crate::state::Export::summary)
+            .map(|export| export.summary(now))
             .collect();
         drop(store);
 

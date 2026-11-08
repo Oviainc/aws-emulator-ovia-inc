@@ -494,13 +494,14 @@ fn limit_exceeded(message: String) -> RestoreTableToPointInTimeError {
 
 /// The modelled refusal of a restore from a table that has nothing to restore from:
 /// "Point in time recovery has not yet been enabled for this source table"
-/// (`PointInTimeRecoveryUnavailableException`). The message is built from the request: the
-/// source table it asked for.
+/// (`PointInTimeRecoveryUnavailableException`), worded as DynamoDB words that refusal —
+/// one wording for the one error class, wherever an operation needs a point in time the
+/// source table has none of. The table it names comes from the request.
 fn recovery_unavailable(source: &str) -> RestoreTableToPointInTimeError {
     RestoreTableToPointInTimeErrorModeled::PointInTimeRecoveryUnavailableException(
         PointInTimeRecoveryUnavailableException {
             message: Some(format!(
-                "Point in time recovery has not yet been enabled for this source table: {source}"
+                "Point in time recovery is not enabled for table '{source}'"
             )),
         },
     )

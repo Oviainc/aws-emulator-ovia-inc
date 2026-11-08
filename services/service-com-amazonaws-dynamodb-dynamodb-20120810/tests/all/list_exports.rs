@@ -14,11 +14,11 @@
 //! region, the page size (on each bound the member publishes and one past it), the age of
 //! a record, the status and type of a record, and the cursor.
 //!
-//! `ExportTableToPointInTime` — the operation that WRITES an export record — is still a
-//! scaffold tracked by its own stub issue, so the suites below seed the records through
-//! the same per-service store the handler reads (the shared engine `emulator_and_engine`
-//! hands back), and drive every read over the wire through the router the emulator's
-//! front doors use.
+//! The records are seeded through the same per-service store `ExportTableToPointInTime`
+//! writes and this handler reads (the shared engine `emulator_and_engine` hands back),
+//! because a listing's rules are about records of a given AGE, status and region that no
+//! single request can produce; every read is driven over the wire through the router the
+//! emulator's front doors use. The write path has its own suite (`table_exports`).
 
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -62,16 +62,54 @@ fn record_export(engine: &Arc<engine::InMemoryEngine>, export: Export) -> String
     arn
 }
 
-/// One finished full export of `table` in `region`, begun at `started_at`.
-fn completed_export(region: &str, table: &str, started_at: SystemTime) -> Export {
+/// One export record of `table` in `region`, begun at `started_at` and due to finish one
+/// `span` later, in the form `ExportTableToPointInTime` records one.
+fn export_record(
+    region: &str,
+    table: &str,
+    started_at: SystemTime,
+    span: Duration,
+    export_type: &str,
+) -> Export {
     Export {
         arn: state::new_export_arn(region, table, started_at),
         region: region.to_string(),
         table_name: table.to_string(),
-        status: "COMPLETED".to_string(),
-        export_type: "FULL_EXPORT".to_string(),
+        table_id: state::new_table_id(),
+        client_token: None,
+        request: state::ExportRequest {
+            export_time: None,
+            export_format: "DYNAMODB_JSON".to_string(),
+            export_type: export_type.to_string(),
+            s3_bucket: "exported-tables".to_string(),
+            s3_bucket_owner: None,
+            s3_prefix: None,
+            s3_sse_algorithm: None,
+            s3_sse_kms_key_id: None,
+        },
+        export_time: started_at,
         started_at,
-        ended_at: Some(started_at + Duration::from_secs(30)),
+        completes_at: started_at + span,
+        item_count: 0,
+        billed_size_bytes: 0,
+        // These records stand for exports whose task wrote its data, which is what a
+        // listing reports as `COMPLETED`.
+        failure: None,
+    }
+}
+
+/// One FINISHED full export of `table` in `region`, begun at `started_at`: its span ended
+/// in the past, so every read reports it `COMPLETED`.
+fn completed_export(region: &str, table: &str, started_at: SystemTime) -> Export {
+    export_record(region, table, started_at, Duration::from_secs(30), "FULL_EXPORT")
+}
+
+/// The same record still RUNNING: its span ends far enough ahead that a read reports it
+/// `IN_PROGRESS` however slow the machine is.
+fn running_export(region: &str, table: &str, started_at: SystemTime, export_type: &str) -> Export {
+    Export {
+        completes_at: SystemTime::now() + Duration::from_secs(3_600),
+        ..export_record(region, table, started_at, Duration::from_secs(30), export_type)
     }
 }
 
@@ -181,24 +219,30 @@ async fn every_member_of_a_recorded_export_is_reported() {
     // catalogues this service exposes as `EXPORT_STATUS_VALUES` and `EXPORT_TYPE_VALUES`
     // (the `ExportStatus` and `ExportType` enums;
     // `smithy_query(query="shape",shape="ExportStatus,ExportType")`) — so no status or
-    // type the API admits goes untested. An export that has not finished carries no end
-    // instant, so a record is pinned both with and without one.
-    let mut recorded: Vec<Export> = Vec::new();
+    // type the API admits goes untested: work still running, work that finished, and work
+    // whose task could not write what it read.
+    let mut recorded: Vec<(String, Export)> = Vec::new();
     for (index, status) in EXPORT_STATUS_VALUES.iter().enumerate() {
         for kind in EXPORT_TYPE_VALUES {
             let started = seconds_ago(Duration::from_secs(
                 3_600 * (recorded.len() as u64 + 1) + index as u64,
             ));
-            let finished = *status != "IN_PROGRESS";
-            recorded.push(Export {
-                status: (*status).to_string(),
-                export_type: (*kind).to_string(),
-                ended_at: finished.then_some(started + Duration::from_secs(45)),
-                ..completed_export(REGION, "Exported", started)
-            });
+            let finished = export_record(REGION, "Exported", started, Duration::from_secs(30), kind);
+            let export = match *status {
+                "IN_PROGRESS" => running_export(REGION, "Exported", started, kind),
+                "FAILED" => Export {
+                    failure: Some(state::ExportFailure {
+                        code: state::EXPORT_FAILURE_NO_SUCH_BUCKET.to_string(),
+                        message: state::EXPORT_FAILURE_NO_SUCH_BUCKET_MESSAGE.to_string(),
+                    }),
+                    ..finished
+                },
+                _ => finished,
+            };
+            recorded.push(((*status).to_string(), export));
         }
     }
-    for export in &recorded {
+    for (_, export) in &recorded {
         record_export(&engine, export.clone());
     }
 
@@ -209,20 +253,20 @@ async fn every_member_of_a_recorded_export_is_reported() {
         "every recorded export must be reported, got {answered}"
     );
 
-    for export in &recorded {
-        let case = format!("{} / {}", export.status, export.export_type);
+    for (status, export) in &recorded {
+        let case = format!("{status} / {}", export.request.export_type);
         let reported = summaries(&answered)
             .into_iter()
             .find(|summary| summary["ExportArn"] == json!(export.arn))
             .unwrap_or(Value::Null);
         assert_eq!(
             reported["ExportStatus"],
-            json!(export.status),
-            "case {case:?}: the reported status is the one recorded, got {reported}"
+            json!(status),
+            "case {case:?}: the reported status is the one the record stands in, got {reported}"
         );
         assert_eq!(
             reported["ExportType"],
-            json!(export.export_type),
+            json!(export.request.export_type),
             "case {case:?}: the reported type is the one recorded, got {reported}"
         );
         // `ExportSummary` models exactly these three members, so a summary reports
@@ -424,10 +468,14 @@ async fn a_record_outside_the_documented_window_is_not_reported() {
     for (case, age, finished, reported) in cases {
         let marker = seconds_ago(age);
         let started = marker - Duration::from_secs(60);
-        let export = Export {
-            ended_at: finished.then_some(marker),
-            status: if finished { "COMPLETED" } else { "IN_PROGRESS" }.to_string(),
-            ..completed_export(REGION, "Aged", started)
+        let export = if finished {
+            // A finished record's age is measured from the instant its span ended.
+            Export {
+                completes_at: marker,
+                ..completed_export(REGION, "Aged", started)
+            }
+        } else {
+            running_export(REGION, "Aged", started, "FULL_EXPORT")
         };
         let arn = record_export(&engine, export);
         if reported {

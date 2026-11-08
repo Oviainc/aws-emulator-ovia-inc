@@ -181,6 +181,8 @@ mod table_description_members;
 #[path = "all/table_description_shape.rs"]
 mod table_description_shape;
 
+#[path = "all/table_exports.rs"]
+mod table_exports;
 #[path = "all/table_encryption_and_ceilings.rs"]
 mod table_encryption_and_ceilings;
 

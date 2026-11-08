@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ExportTableToPointInTime
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ExportTableToPointInTime`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ExportTableToPointInTime::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts an export of one table's data to an S3 bucket and reports the export it
+//! recorded. The table must have point-in-time recovery enabled — a table whose recovery
+//! is off has no point in time to export from, which is the modelled
+//! `PointInTimeRecoveryUnavailableException` — and a named `ExportTime` must lie inside
+//! that table's restorable window, which is `InvalidExportTimeException`. The record
+//! (`crate::state::Export`) is the export catalogue's, so `DescribeExport` and
+//! `ListExports` report the very export this started.
 //!
 //! ## Shape of an operation
 //!
@@ -195,18 +194,371 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ExportTableToPointInTime` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ExportTableToPointInTimeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ExportTableToPointInTime"))
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
+        // "The Amazon Resource Name (ARN) associated with the table to export"
+        // (`$TableArn`): an ARN-only member, so it is held to the form and the scope such
+        // an ARN takes rather than taken for a table name.
+        let name = crate::state::check_table_arn(&input.table_arn, &region).map_err(bad_request)?;
+        // The members this export is taken with, each enumerated one held to the value
+        // set the model declares for it and resolved to what the operation documents for
+        // a request that names none ([`requested_members`]).
+        let request = requested_members(&input)?;
+
+        // Everything this call decides about the table is decided under the store's own
+        // guard, and the guard is released at the end of this block: the rendering below
+        // must run with no lock held.
+        let (description, export_arn, export_status, bucket, rendering, items) = {
+            let mut store = state.lock();
+            store.apply_due_transitions(now);
+            let table = store
+                .table(&region, &name)
+                .map_err(|error| lift(&name, error))?;
+            // "The table must have point in time recovery enabled, and you can export data
+            // from any time within the point in time recovery window" (this operation's
+            // doc): a table whose recovery is off has no such window, so there is no point
+            // in time to export from — "Point in time recovery has not yet been enabled for
+            // this source table" (`PointInTimeRecoveryUnavailableException`).
+            let Some((earliest, latest)) = table.point_in_time_recovery.restorable_window(now)
+            else {
+                return Err(recovery_unavailable(&name));
+            };
+            // The point in time this export reads the table at: the one the request named,
+            // held inside that window, or the newest exportable one where it named none.
+            let export_time = export_point(input.export_time.as_ref(), earliest, latest)?;
+            // A capability this emulator cannot write real exported data for is refused as
+            // "not written yet" rather than accepted and answered with a record of the
+            // export the caller did not ask for. AFTER the modelled refusals above: what
+            // the request asks of a table with no point in time to export from is beside
+            // the point.
+            if let Some(capability) = unsupported_capability(&input, &request) {
+                return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+                    "ExportTableToPointInTime with {capability}"
+                )));
+            }
+
+            // "Providing a ClientToken makes the call to ExportTableToPointInTimeInput
+            // idempotent, meaning that multiple identical calls have the same effect as one
+            // single call" (`$ClientToken`): a token that still stands for an export
+            // answers with that export rather than starting a second one, and the same
+            // token with any other parameters is the conflict the operation models.
+            if let Some(token) = input.client_token.as_deref() {
+                if let Some(started) = store.export_for_client_token(&region, token, now) {
+                    if started.table_name == name && started.request == request {
+                        return Ok(ExportTableToPointInTimeOutput {
+                            export_description: Some(started.describe(now)),
+                        });
+                    }
+                    return Err(export_conflict(token));
+                }
+            }
+            // The catalogue is budgeted like every other growth site in this store, by the
+            // records it holds ([`crate::state::MAX_EXPORTS_PER_REGION`]).
+            if store.export_count_in(&region) >= crate::state::MAX_EXPORTS_PER_REGION {
+                return Err(ExportTableToPointInTimeErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(format!(
+                            "Subscriber limit exceeded: this account already holds the maximum \
+                             of {} exports in {region}",
+                            crate::state::MAX_EXPORTS_PER_REGION
+                        )),
+                    },
+                )
+                .into());
+            }
+            // Everything this export reports of the table is read off it HERE, at the
+            // instant of the request, so the record stands on its own once the table moves
+            // on.
+            let export = crate::state::Export::started(
+                table,
+                request,
+                export_time,
+                input.client_token.clone(),
+                now,
+            );
+            // What ONE export renders is bounded before anything is rendered: the items it
+            // would read and the item data they hold, against this emulator's own
+            // per-export ceilings ([`crate::state::MAX_EXPORTED_ITEMS`],
+            // [`crate::state::MAX_EXPORTED_BYTES`]). A table larger than that is not
+            // refused by DynamoDB, so the refusal says whose ceiling it is.
+            if export.item_count > crate::state::MAX_EXPORTED_ITEMS
+                || export.billed_size_bytes > crate::state::MAX_EXPORTED_BYTES
+            {
+                return Err(ExportTableToPointInTimeErrorModeled::LimitExceededException(
+                    LimitExceededException {
+                        message: Some(crate::state::export_too_large_message(&name)),
+                    },
+                )
+                .into());
+            }
+            // The items this export reads, copied out HERE so the rendering below runs with
+            // no lock held: an export reports the table as it stood at this instant.
+            let items: Vec<crate::state::Item> = table.items.values().cloned().collect();
+            let description = export.describe(now);
+            let export_arn = export.arn.clone();
+            let export_status = export.status(now).to_string();
+            let bucket = export.request.s3_bucket.clone();
+            let rendering = export.clone();
+            store.insert_export(export);
+            (
+                description,
+                export_arn,
+                export_status,
+                bucket,
+                rendering,
+                items,
+            )
+        };
+
+        // The objects this export WRITES: the data file, the manifests that say what is in
+        // it and the digests that cover them ([`crate::state::exported_objects`]).
+        // Rendering and compressing them is CPU-bound and sized by the table, so it runs
+        // on a BLOCKING task rather than on a runtime worker a large export would starve.
+        let objects = match ::tokio::task::spawn_blocking(move || {
+            crate::state::exported_objects(&rendering, &items)
+        })
+        .await
+        {
+            Ok(objects) => objects,
+            Err(error) => {
+                return Err(ExportTableToPointInTimeErrorModeled::InternalServerError(
+                    InternalServerError {
+                        message: Some(format!(
+                            "the export could not render the table's items: {error}"
+                        )),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // The export RUNS: its objects are recorded in Amazon S3's own store on this same
+        // engine, so what it writes is what that service's `ListObjectsV2` and
+        // `GetObject` then serve. A destination the object store holds no bucket for is a
+        // destination nothing can be written to, which fails the task — the export was
+        // accepted, so the failure is reported on the record rather than answered here.
+        let failure = match crate::state::write_exported_objects(&*self.engine, &bucket, &objects) {
+            Some(written) if written.objects == objects.len() => None,
+            Some(_) => Some(crate::state::ExportFailure {
+                code: crate::state::EXPORT_FAILURE_WRITE_REFUSED.to_string(),
+                message: crate::state::EXPORT_FAILURE_WRITE_REFUSED_MESSAGE.to_string(),
+            }),
+            None => Some(crate::state::ExportFailure {
+                code: crate::state::EXPORT_FAILURE_NO_SUCH_BUCKET.to_string(),
+                message: crate::state::EXPORT_FAILURE_NO_SUCH_BUCKET_MESSAGE.to_string(),
+            }),
+        };
+        if let Some(failure) = failure {
+            let mut store = state.lock();
+            // The record this call inserted, read back under the new guard: it is where
+            // the task's own outcome belongs, so every reader reports the same reason.
+            if let Ok(recorded) = store.export_mut(&region, &export_arn) {
+                recorded.failure = Some(failure);
+            }
+        }
+        // The audit record for a state-changing call: who asked, what was started and
+        // that it succeeded. Never a credential — only the access key id the caller
+        // presented.
+        ::tracing::info!(
+            operation = Self::NAME,
+            akid = %::emulator_server::extract_akid(&ctx.parts().headers),
+            table_name = %name,
+            export_arn = %export_arn,
+            export_status = %export_status,
+            "table export started"
+        );
+        Ok(ExportTableToPointInTimeOutput {
+            export_description: Some(description),
+        })
+    }
+}
+
+/// The members this request asks the export to be taken with, each enumerated one held to
+/// the value set the model declares for it and resolved to what the operation documents
+/// for a request that names none.
+///
+/// The three enumerated members are modelled enums, so the request validator has already
+/// refused every value outside their sets; the refusals here are what keeps that true of
+/// what reaches the store, and they are worded the way that validator words a value
+/// outside an enumerated member's set.
+fn requested_members(
+    input: &ExportTableToPointInTimeInput,
+) -> Result<crate::state::ExportRequest, ExportTableToPointInTimeError> {
+    let checked = |path: &str, value: Option<&str>, values: &[&str]| match value {
+        Some(value) if !values.contains(&value) => Err(bad_request(crate::state::invalid_member(
+            path,
+            Some(value),
+            &crate::state::enum_value_requirement(values),
+        ))),
+        other => Ok(other.map(str::to_string)),
+    };
+    Ok(crate::state::ExportRequest {
+        // The REQUESTED instant, not the one it resolves to: two calls that both leave
+        // the member out ask for the same export, while the instant each resolves to
+        // moves with the clock.
+        export_time: input
+            .export_time
+            .as_ref()
+            .and_then(|time| ::std::time::SystemTime::try_from(*time).ok()),
+        // "The format for the exported data. Valid values for ExportFormat are
+        // DYNAMODB_JSON or ION" (`$ExportFormat`).
+        export_format: checked(
+            "exportFormat",
+            input.export_format.as_deref(),
+            EXPORT_FORMAT_VALUES,
+        )?
+        .unwrap_or_else(|| crate::state::DEFAULT_EXPORT_FORMAT.to_string()),
+        // "Valid values are FULL_EXPORT or INCREMENTAL_EXPORT. The default value is
+        // FULL_EXPORT" (`$ExportType`).
+        export_type: checked("exportType", input.export_type.as_deref(), EXPORT_TYPE_VALUES)?
+            .unwrap_or_else(|| crate::state::EXPORT_TYPE_FULL.to_string()),
+        s3_bucket: input.s3_bucket.clone(),
+        s3_bucket_owner: input.s3_bucket_owner.clone(),
+        s3_prefix: input.s3_prefix.clone(),
+        s3_sse_algorithm: checked(
+            "s3SseAlgorithm",
+            input.s3_sse_algorithm.as_deref(),
+            S3_SSE_ALGORITHM_VALUES,
+        )?,
+        s3_sse_kms_key_id: input.s3_sse_kms_key_id.clone(),
+    })
+}
+
+/// The capability this request asks for that no stored export record carries yet, if any.
+///
+/// An INCREMENTAL export reports what changed between two points in time, and a
+/// `FilterSpecification` reports only the items a condition selects — both of which are
+/// facts about a table's data over time that this store does not keep, so neither can be
+/// reported from it. A request asking for either is refused as unimplemented rather than
+/// answered with a record of the FULL, unfiltered export it did not ask for.
+fn unsupported_capability(
+    input: &ExportTableToPointInTimeInput,
+    request: &crate::state::ExportRequest,
+) -> Option<&'static str> {
+    if request.export_type == crate::state::EXPORT_TYPE_INCREMENTAL {
+        return Some("ExportType INCREMENTAL_EXPORT");
+    }
+    if input.incremental_export_specification.is_some() {
+        return Some("IncrementalExportSpecification");
+    }
+    if input.filter_specification.is_some() {
+        return Some("FilterSpecification");
+    }
+    // An export writes the items it read in the format the request names, and the Amazon
+    // Ion encoding of an item is not written yet — so an export that would be answered
+    // with data in the OTHER format it did not ask for is refused instead.
+    if request.export_format == crate::state::EXPORT_FORMAT_ION {
+        return Some("ExportFormat ION");
+    }
+    None
+}
+
+/// The point in time this export reads the table at.
+///
+/// "Time in the past from which to export table data ... The table export will be a
+/// snapshot of the table's state at this point in time" (`$ExportTime`), and "you can
+/// export data from any time within the point in time recovery window" (this operation's
+/// doc) — so a named instant must lie inside that window, which is what
+/// `InvalidExportTimeException` states. A request that names none exports the newest point
+/// the window reaches.
+fn export_point(
+    requested: Option<&::aws_smithy_types::DateTime>,
+    earliest: ::std::time::SystemTime,
+    latest: ::std::time::SystemTime,
+) -> Result<::std::time::SystemTime, ExportTableToPointInTimeError> {
+    let Some(requested) = requested else {
+        return Ok(latest);
+    };
+    let point = ::std::time::SystemTime::try_from(*requested).map_err(|_| invalid_export_time())?;
+    // The window's bounds are reported at the precision a timestamp carries on the wire,
+    // and the point is read back at that same precision
+    // ([`crate::state::at_nearest_timestamp_precision`]), so a client that sends back a
+    // bound this service reported names exactly that bound rather than landing a fraction
+    // outside it.
+    let point = crate::state::at_nearest_timestamp_precision(point);
+    if point < earliest || point > latest {
+        return Err(invalid_export_time());
+    }
+    Ok(point)
+}
+
+/// The modelled refusal of an export from a table that has no point in time to export
+/// from: "Point in time recovery has not yet been enabled for this source table"
+/// (`PointInTimeRecoveryUnavailableException`), worded as DynamoDB words that refusal —
+/// the table it names comes from the request.
+fn recovery_unavailable(table: &str) -> ExportTableToPointInTimeError {
+    ExportTableToPointInTimeErrorModeled::PointInTimeRecoveryUnavailableException(
+        PointInTimeRecoveryUnavailableException {
+            message: Some(format!(
+                "Point in time recovery is not enabled for table '{table}'"
+            )),
+        },
+    )
+    .into()
+}
+
+/// The modelled refusal of an `ExportTime` outside the table's recovery window, worded as
+/// the model states the error: "The specified ExportTime is outside of the point in time
+/// recovery window" (`InvalidExportTimeException`).
+///
+/// The window's own bounds are NOT echoed: they move with the clock, and
+/// `DescribeContinuousBackups` is where a caller reads them.
+fn invalid_export_time() -> ExportTableToPointInTimeError {
+    ExportTableToPointInTimeErrorModeled::InvalidExportTimeException(InvalidExportTimeException {
+        message: Some(
+            "The specified ExportTime is outside of the point in time recovery window".to_string(),
+        ),
+    })
+    .into()
+}
+
+/// The modelled refusal of a `ClientToken` that already stands for a DIFFERENT export:
+/// "If you submit a request with the same client token but a change in other parameters
+/// within the 8-hour idempotency window, DynamoDB returns an ExportConflictException"
+/// (`$ClientToken`). The message is built from the request: the token it reused.
+fn export_conflict(client_token: &str) -> ExportTableToPointInTimeError {
+    ExportTableToPointInTimeErrorModeled::ExportConflictException(ExportConflictException {
+        message: Some(format!(
+            "There is already an in progress or completed export with the same client token \
+             and different parameters: {client_token}"
+        )),
+    })
+    .into()
+}
+
+/// The modelled server error for a request that cannot reach this service's store.
+fn store_unavailable() -> ExportTableToPointInTimeError {
+    ExportTableToPointInTimeErrorModeled::InternalServerError(InternalServerError {
+        message: Some("the DynamoDB table store is unavailable".to_string()),
+    })
+    .into()
+}
+
+/// A bad member of this request, which this operation models no error for: the
+/// `ValidationException` such an input is.
+fn bad_request(error: crate::state::RequestError) -> ExportTableToPointInTimeError {
+    crate::scaffolded::Scaffolded::validation(error.message())
+}
+
+/// Lift a store refusal into this operation's error channel.
+///
+/// A table this operation cannot find is reported as `TableNotFoundException` — "A source
+/// table with the name TableName does not currently exist within the subscriber's account
+/// or the subscriber is operating in the wrong Amazon Web Services Region" — which is the
+/// miss this operation models, rather than the control plane's
+/// `ResourceNotFoundException`, which it does not. The message is built from the request:
+/// the table it asked for.
+fn lift(table_name: &str, error: crate::state::RequestError) -> ExportTableToPointInTimeError {
+    match error {
+        crate::state::RequestError::NotFound(_) => {
+            ExportTableToPointInTimeErrorModeled::TableNotFoundException(TableNotFoundException {
+                message: Some(format!("Table not found: {table_name}")),
+            })
+            .into()
+        }
+        crate::state::RequestError::Validation(message) => {
+            crate::scaffolded::Scaffolded::validation(message)
+        }
     }
 }

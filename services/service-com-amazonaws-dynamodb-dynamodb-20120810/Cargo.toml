@@ -38,6 +38,13 @@ hex = { workspace = true }
 # enabling a stream on CreateTable/UpdateTable registers it through that crate's
 # `state::register_stream` seam, which is what its own consumers then read.
 service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810 = { workspace = true }
+# `ExportTableToPointInTime` writes the exported items into the destination bucket through
+# Amazon S3's OWN store on the same engine, so a caller lists and reads those objects
+# where S3 holds them (`state::export_objects`).
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The data file an export writes is GZIP-compressed (`.json.gz`), which is the encoder for
+# it; the pure-Rust backend, so nothing links a system library.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # The KMS service owns the keys a table's `SSESpecification` names: resolving the key id,
 # ARN, alias name or alias ARN a request carries into the key ARN `SSEDescription` reports
 # is that service's answer, read through its `state` seam (`state::encryption`).
@@ -60,6 +67,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The objects an export writes are asserted where Amazon S3 holds them, through that
+# service's OWN client over the emulator's in-process callback (`tests/all/table_exports`).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [lints]
 workspace = true

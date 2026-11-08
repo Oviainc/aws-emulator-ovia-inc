@@ -21,6 +21,7 @@ use crate::ops::types::{
     BackupSummary, BillingModeSummary, CancellationReason, Capacity, Condition,
     ConsumedCapacity, ContinuousBackupsDescription, ContributorInsightsSummary,
     ExpectedAttributeValue,
+    ExportDescription,
     ExportSummary,
     GlobalSecondaryIndexDescription, GlobalSecondaryIndexInfo,
     GlobalSecondaryIndexWarmThroughputDescription,
@@ -2652,97 +2653,6 @@ impl Import {
 // Exports of table data: the records the export surface reports
 // =============================================================================
 
-/// How far back a listing of exports reaches: "Lists completed exports within the past
-/// 90 days" (the `ListExports` doc). The same span [`IMPORT_HISTORY_WINDOW`] carries,
-/// named once and shared, so the two listings of this service cannot drift apart.
-/// Measured on every read from the instant the export finished, and from the instant it
-/// began while it is still running, so nothing sleeps and no read writes.
-pub const EXPORT_HISTORY_WINDOW: Duration = IMPORT_HISTORY_WINDOW;
-
-/// A new export's `ExportArn`:
-/// `arn:aws:dynamodb:<region>:<account>:table/<table>/export/<millis>-<id>`, built
-/// through the same core ARN helper every other identifier here is minted with
-/// ([`table_arn`]), in the same construction as [`new_import_arn`].
-///
-/// The last segment is the instant the export was requested, in zero-padded epoch
-/// milliseconds, followed by a unique suffix: the instant alone does not identify an
-/// export, because two calls can land in the same millisecond. Minted ONCE, when the
-/// export is recorded, and stored on it — and because the fixed-width instant sits
-/// inside it, descending ARN order IS descending (table, request instant) order, which
-/// is the "reverse alphanumeric order of ExportArn" a listing reports (the
-/// `ListExports` doc) and the order its `NextToken` cursor pages through.
-pub fn new_export_arn(region: &str, table: &str, requested_at: SystemTime) -> String {
-    let millis = requested_at
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |since| since.as_millis());
-    let unique = ::uuid::Uuid::new_v4().simple().to_string();
-    ::engine::emulator_arn(
-        "dynamodb",
-        region,
-        &format!(
-            "table/{table}/export/{millis:014}-{}",
-            unique.get(..8).unwrap_or(unique.as_str())
-        ),
-    )
-}
-
-/// One recorded export of a table's data: the table it read, what kind of export it
-/// was, and how far it got.
-///
-/// An export is a RESOURCE OF ITS OWN rather than part of a table, for the reason
-/// [`Import`] is: it is addressed by its own ARN, it outlives the table it was taken
-/// from, and every member the export readers report is read from here.
-#[derive(Debug, Clone)]
-pub struct Export {
-    /// The `ExportArn` minted for this export when it was recorded
-    /// ([`new_export_arn`]), which is also the key the store holds it under.
-    pub arn: String,
-    /// The region this export lives in — the one the table it read lives in, which is
-    /// the scope every export operation resolves inside.
-    pub region: String,
-    /// The name of the table this export read. The `TableArn` an export request selects
-    /// by is minted from it and this region ([`table_arn`]), so one stored table
-    /// identity cannot drift from the ARN the table reports for itself.
-    pub table_name: String,
-    /// Where this export stands: one of the `ExportStatus` values the model declares.
-    /// "Export can be in one of the following states: IN_PROGRESS, COMPLETED, or FAILED"
-    /// (`ExportSummary$ExportStatus`), so a record that has not finished is still a
-    /// record a reader reports.
-    pub status: String,
-    /// "The type of export that was performed" (`ExportSummary$ExportType`): one of the
-    /// `ExportType` values the model declares.
-    pub export_type: String,
-    /// The instant this export task began (`ExportDescription$StartTime`).
-    pub started_at: SystemTime,
-    /// The instant this export task ended (`ExportDescription$EndTime`) — `None` while
-    /// the export is still running, so no reader reports an end for work that has not
-    /// finished.
-    pub ended_at: Option<SystemTime>,
-}
-
-impl Export {
-    /// This export as `ListExports` reports it: every member read from the record.
-    pub fn summary(&self) -> ExportSummary {
-        ExportSummary {
-            export_arn: Some(self.arn.clone()),
-            export_status: Some(self.status.clone()),
-            export_type: Some(self.export_type.clone()),
-        }
-    }
-
-    /// Whether this record still falls inside the window a listing reaches back over
-    /// ([`EXPORT_HISTORY_WINDOW`]), measured at `now` against the instant the export
-    /// finished — or, while it is still running, the instant it began.
-    pub fn within_history_window(&self, now: SystemTime) -> bool {
-        let marker = self.ended_at.unwrap_or(self.started_at);
-        match now.duration_since(marker) {
-            Ok(age) => age < EXPORT_HISTORY_WINDOW,
-            // Recorded at or after `now`: inside any window measured back from it.
-            Err(_) => true,
-        }
-    }
-}
-
 /// Hold an ARN-addressed TABLE member to the form such an ARN takes in the scope the
 /// request itself was made in, answering the table it names.
 ///
@@ -3054,10 +2964,9 @@ pub struct ComAmazonawsDynamodbDynamodb20120810State {
     /// listing reports, and the `NextToken` cursor it pages through, are a walk back over
     /// the keys rather than a sort per request ([`new_export_arn`]).
     ///
-    /// A record is written by the EXPORT surface — `ExportTableToPointInTime` — which
-    /// this slice does not serve yet (it answers the scaffold's 501), so a store driven
-    /// through this slice's own API holds no export and the listing reports none, exactly
-    /// as it does for an account that has run no export.
+    /// A record is written by the EXPORT surface — `ExportTableToPointInTime` — and read
+    /// by `DescribeExport` and `ListExports`, so an account that has started no export
+    /// holds none and the listing reports none.
     pub exports: BTreeMap<String, Export>,
     /// The item-level changes landed writes owe their tables' streams, in the order
     /// they were made.
@@ -3642,21 +3551,6 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
     /// Record one import under the ARN minted for it.
     pub fn insert_import(&mut self, import: Import) {
         self.imports.insert(import.arn.clone(), import);
-    }
-
-    /// Every export of one region, in DESCENDING `ExportArn` order — "in reverse
-    /// alphanumeric order of ExportArn" (the `ListExports` doc), which is the scope a
-    /// listing reports and the order it pages through.
-    pub fn exports_in<'s>(&'s self, region: &'s str) -> impl Iterator<Item = &'s Export> + 's {
-        self.exports
-            .values()
-            .rev()
-            .filter(move |export| export.region == region)
-    }
-
-    /// Record one export under the ARN minted for it.
-    pub fn insert_export(&mut self, export: Export) {
-        self.exports.insert(export.arn.clone(), export);
     }
 
     /// The backup that `BackupArn` names, inside the region the request reached.
@@ -4942,6 +4836,18 @@ mod table;
 mod table_settings;
 pub use table_settings::*;
 mod kinesis;
+
+/// The export catalogue: the records `ExportTableToPointInTime` writes, their ARNs and
+/// the status every export reader derives from the clock. Re-exported below, so every
+/// caller still names them `crate::state::…`.
+mod exports;
+pub use exports::*;
+
+/// The objects one export writes into Amazon S3, and the write into that service's own
+/// store on this engine. Re-exported below, so every caller still names them
+/// `crate::state::…`.
+mod export_objects;
+pub use export_objects::*;
 pub use kinesis::*;
 
 pub use authorization::request_caller;
