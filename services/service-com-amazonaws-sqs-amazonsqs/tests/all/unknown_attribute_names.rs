@@ -8,14 +8,18 @@
 //! attribute — error code `InvalidAttributeName` at HTTP 400 with the message `Unknown
 //! Attribute <name>.`, the name exactly as the request spelled it — whatever puts the name
 //! out of that call's reach: a name the model declares nowhere, the selector that stands for
-//! every attribute, an attribute the service only ever reports, one only a create may
-//! supply, or one that applies only to the other kind of queue. Nothing about the queue
-//! changes.**
+//! every attribute, an attribute the service only ever reports, or one that applies only to
+//! the other kind of queue. Nothing about the queue changes.**
 //!
 //! The set of names a call accepts depends on the call and on the queue it addresses, so a
 //! name outside that set is simply not an attribute THAT call has — which is why one sentence
 //! covers every way of being outside it, and why a client classifying a refusal by its
 //! message is not told that an attribute exists-but-is-read-only.
+//!
+//! The attribute only a create may supply is the one name OUTSIDE this rule: the service has
+//! it and publishes it, so a later call naming it is refused for the change it asks for
+//! rather than as a name that does not exist — [`super::queue_type_immutability`] owns that
+//! rule, and the rows here assert only that it is not answered as an unknown name.
 //!
 //! The table spans the class the rule generalises over rather than one example: every name
 //! the model's `QueueAttributeName` enum declares is driven against a standard queue and a
@@ -91,10 +95,20 @@ const REPORTED_ONLY_NAMES: &[&str] = &[
 /// The refusal class every unacceptable attribute NAME carries.
 const INVALID_ATTRIBUTE_NAME: &str = "InvalidAttributeName";
 
+/// The refusal class an attribute the service HAS but this call may not CHANGE carries
+/// instead — the sibling class, held apart here and asserted in full by
+/// [`super::queue_type_immutability`].
+const INVALID_ATTRIBUTE_VALUE: &str = "InvalidAttributeValue";
+
 /// The one sentence Amazon SQS refuses an unacceptable attribute name with, spelled out here
 /// rather than imported.
 fn unknown_attribute_message(name: &str) -> String {
     format!("Unknown Attribute {name}.")
+}
+
+/// The one sentence it refuses a change to the queue's type with, spelled out the same way.
+fn not_modifiable_message(name: &str) -> String {
+    format!("Invalid value for the parameter {name}. Reason: Modifying queue type is not supported.")
 }
 
 /// The `message` member of a refusal, as awsJson renders it.
@@ -152,8 +166,10 @@ fn settable_on(name: &str, fifo: bool) -> bool {
     true
 }
 
-/// `SetQueueAttributes` answers every name it cannot accept with the one unknown-attribute
-/// sentence, on a standard queue and on a FIFO queue, and leaves the queue untouched.
+/// `SetQueueAttributes` answers every name the service does not have for it with the one
+/// unknown-attribute sentence, on a standard queue and on a FIFO queue, and leaves the queue
+/// untouched — the create-only attribute being the one name refused for the change it asks
+/// for instead.
 #[tokio::test]
 async fn set_queue_attributes_refuses_every_name_it_cannot_accept_as_an_unknown_attribute() {
     for fifo in [false, true] {
@@ -186,15 +202,19 @@ async fn set_queue_attributes_refuses_every_name_it_cannot_accept_as_an_unknown_
                 );
                 continue;
             }
+            // The create-only attribute is one the service HAS, so a call that may not
+            // change it is refused for the change its value asks for rather than as a name
+            // that does not exist: the two classes are held apart here and the rule behind
+            // the second is asserted in full by the sibling suite.
+            let expected = if *name == CREATE_ONLY_NAME {
+                (400, INVALID_ATTRIBUTE_VALUE, not_modifiable_message(name))
+            } else {
+                (400, INVALID_ATTRIBUTE_NAME, unknown_attribute_message(name))
+            };
             assert_eq!(
                 (status, error_code(&parsed).as_str(), message_of(&parsed)),
-                (
-                    400,
-                    INVALID_ATTRIBUTE_NAME,
-                    unknown_attribute_message(name)
-                ),
-                "case {name} on {kind}: expected the unknown-attribute sentence, got {status} \
-                 with {parsed}"
+                expected,
+                "case {name} on {kind}: expected {expected:?}, got {status} with {parsed}"
             );
             let after = all_attributes(&router, &url).await;
             assert_eq!(

@@ -522,9 +522,11 @@ async fn an_unbounded_attribute_value_is_refused_past_the_documented_ceiling() {
     }
 }
 
-/// An attribute name that does not exist, one that is reported rather than set, one
-/// that may be supplied only at create, and one that applies only to FIFO queues are
-/// all refused as `InvalidAttributeName` — on whichever call supplied it.
+/// An attribute name that does not exist, one that is reported rather than set, and one
+/// that applies only to FIFO queues are all refused as `InvalidAttributeName` — on
+/// whichever call supplied it. (An attribute the service HAS and only a create may supply
+/// is a refusal of the change rather than of the name: see
+/// [`super::queue_type_immutability`].)
 #[tokio::test]
 async fn an_attribute_name_a_call_may_not_supply_is_refused_as_invalid_attribute_name() {
     let router = emulator();
@@ -567,10 +569,9 @@ async fn an_attribute_name_a_call_may_not_supply_is_refused_as_invalid_attribute
         );
     }
 
-    // Refused by SetQueueAttributes: the same names, plus the create-only one.
+    // Refused by SetQueueAttributes: the same names.
     let on_set: &[(&str, &str, &str)] = &[
         ("a name the model does not declare", "NotAnAttribute", "1"),
-        ("a create-only attribute", "FifoQueue", "true"),
         ("a derived attribute", "QueueArn", "arn:aws:sqs:us-east-1:000000000000:names"),
         (
             "a FIFO-only attribute on a standard queue",
