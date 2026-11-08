@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateConfiguredTableAssociationAnalysisRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateConfiguredTableAssociationAnalysisRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Mints the analysis rule of one configured table association and persists it, so a
+//! later `GetConfiguredTableAssociationAnalysisRule` reports exactly what was created and
+//! the association itself reports the rule's type in `analysisRuleTypes`.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateConfiguredTableAssociationAnalysisRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Every member the SERVICE decides is computed from the STORED association, never
+//! echoed: `configuredTableAssociationId` and `configuredTableAssociationArn` come from
+//! the persisted association the identifier resolves to, `membershipIdentifier` from the
+//! membership that holds it, and `createTime` / `updateTime` are the creation instant.
+//! The caller decides only the rule's `type` and its `policy`.
+//!
+//! The rules the model cannot express are enforced here with the errors the operation
+//! declares:
+//!
+//! * an association is a sub-resource of ONE membership (the path addresses it as
+//!   `/memberships/{membershipIdentifier}/configuredTableAssociations/{configuredTableAssociationIdentifier}`),
+//!   so an unknown membership, and an association another membership holds, are both a
+//!   `ResourceNotFoundException`;
+//! * each member of the `ConfiguredTableAssociationAnalysisRulePolicyV1` union is the
+//!   policy of exactly one rule type, so a request whose `analysisRuleType` names another
+//!   type is a `ValidationException`
+//!   (`crate::state::configured_table_association_analysis_rule_policy_type`);
+//! * a rule is identified by the `(configured table association, analysis rule type)`
+//!   pair, so a second create under a type the association already holds a rule for is a
+//!   `ConflictException` with reason `ALREADY_EXISTS` —
+//!   `UpdateConfiguredTableAssociationAnalysisRule` is what replaces a stored policy.
 //!
 //! ## Shape of an operation
 //!
@@ -159,20 +175,149 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateConfiguredTableAssociationAnalysisRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateConfiguredTableAssociationAnalysisRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateConfiguredTableAssociationAnalysisRule"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                CreateConfiguredTableAssociationAnalysisRuleErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("cleanrooms state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let mut store = state.lock();
+
+        // The membership the association is addressed under is resolved first, the same
+        // way every other membership-scoped operation resolves it.
+        if !store.memberships.contains_key(&input.membership_identifier) {
+            return Err(
+                CreateConfiguredTableAssociationAnalysisRuleErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: st::membership_not_found_message(
+                            &input.membership_identifier,
+                            st::caller_account_id(),
+                        ),
+                        resource_id: input.membership_identifier,
+                        resource_type: st::RESOURCE_TYPE_MEMBERSHIP.to_string(),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The rule belongs to a stored association of THIS membership, so an identifier
+        // the membership does not hold is a 404 before anything about the policy is
+        // considered.
+        let Some(association) = store
+            .configured_table_association_in(
+                &input.membership_identifier,
+                &input.configured_table_association_identifier,
+            )
+            .cloned()
+        else {
+            return Err(
+                CreateConfiguredTableAssociationAnalysisRuleErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: st::configured_table_association_not_found_message(
+                            &input.configured_table_association_identifier,
+                            &input.membership_identifier,
+                        ),
+                        resource_id: input.configured_table_association_identifier,
+                        resource_type: st::RESOURCE_TYPE_CONFIGURED_TABLE_ASSOCIATION.to_string(),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        // Each member of the policy union carries the policy of exactly one analysis rule
+        // type, so an `analysisRuleType` naming another type is a combination the model
+        // cannot refuse at the boundary but the service can.
+        let policy_type =
+            st::configured_table_association_analysis_rule_policy_type(&input.analysis_rule_policy);
+        if input.analysis_rule_type != policy_type {
+            return Err(
+                CreateConfiguredTableAssociationAnalysisRuleErrorModeled::ValidationException(
+                    ValidationException {
+                        message: Some(format!(
+                            "analysisRulePolicy carries a {policy_type} policy, which does not match analysisRuleType {}",
+                            input.analysis_rule_type
+                        )),
+                        reason: Some(st::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
+                        field_list: Some(vec![ValidationExceptionField {
+                            name: "analysisRulePolicy".to_string(),
+                            message: format!(
+                                "must carry the policy of analysisRuleType {}",
+                                input.analysis_rule_type
+                            ),
+                        }]),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The `(association, analysis rule type)` pair is the rule's identity, so a
+        // second create under a type the association already holds a rule for collides
+        // with the stored rule; the update operation is what replaces its policy.
+        if store
+            .configured_table_association_analysis_rule(&association.id, &input.analysis_rule_type)
+            .is_some()
+        {
+            return Err(
+                CreateConfiguredTableAssociationAnalysisRuleErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "configured table association {} already has a {} analysis rule",
+                            association.id, input.analysis_rule_type
+                        )),
+                        resource_id: Some(association.id.clone()),
+                        resource_type: Some(
+                            st::RESOURCE_TYPE_CONFIGURED_TABLE_ASSOCIATION.to_string(),
+                        ),
+                        reason: Some(st::CONFLICT_REASON_ALREADY_EXISTS.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let created_at = st::now();
+        store.insert_configured_table_association_analysis_rule(
+            ConfiguredTableAssociationAnalysisRule {
+                membership_identifier: association.membership_id.clone(),
+                configured_table_association_id: association.id.clone(),
+                configured_table_association_arn: association.arn.clone(),
+                policy: input.analysis_rule_policy,
+                r#type: input.analysis_rule_type.clone(),
+                create_time: created_at,
+                update_time: created_at,
+            },
+        );
+
+        // Answer from the store, so the response is the persisted rule rather than a
+        // value computed beside it.
+        let Some(analysis_rule) = store
+            .configured_table_association_analysis_rule(&association.id, &input.analysis_rule_type)
+            .cloned()
+        else {
+            return Err(
+                CreateConfiguredTableAssociationAnalysisRuleErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some(format!(
+                            "the {} analysis rule of configured table association {} was not persisted",
+                            input.analysis_rule_type, association.id
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        Ok(CreateConfiguredTableAssociationAnalysisRuleOutput { analysis_rule })
     }
 }

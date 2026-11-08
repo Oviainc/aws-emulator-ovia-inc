@@ -40,7 +40,12 @@
 //!
 //! A configured table association is stored the same way, under the membership it was
 //! created for, with `configured_table_association_by_name` as the index that makes a
-//! repeat create under one table alias a conflict rather than a second resource.
+//! repeat create under one table alias a conflict rather than a second resource. The
+//! analysis rule an association holds is stored the same way the configured table's is —
+//! as the modelled [`ConfiguredTableAssociationAnalysisRule`], keyed by the `(configured
+//! table association id, analysis rule type)` pair the association analysis-rule
+//! operations address it by — and which types an association holds a rule for stays on
+//! the association, in `ConfiguredTableAssociation$analysisRuleTypes`.
 //!
 //! A collaboration change request is likewise stored as the modelled
 //! [`CollaborationChangeRequest`]; what the service COMPUTES about one — the change
@@ -71,7 +76,9 @@ use crate::ops::types::{
     Collaboration, CollaborationChangeRequest, CollaborationSummary, ComputeConfiguration,
     ConfiguredTable, ConfiguredTableAnalysisRule, ConfiguredTableAnalysisRulePolicy,
     ConfiguredTableAnalysisRulePolicyV1, ConfiguredTableAssociation,
-    ConfiguredTableAssociationSummary, DataEncryptionMetadata,
+    ConfiguredTableAssociationAnalysisRule, ConfiguredTableAssociationAnalysisRulePolicy,
+    ConfiguredTableAssociationAnalysisRulePolicyV1, ConfiguredTableAssociationSummary,
+    DataEncryptionMetadata,
     DifferentialPrivacyTemplateParametersOutput, ErrorMessageConfiguration, MLMemberAbilities,
     MemberChangeSpecification, MemberSpecification, Membership, MembershipJobComputePaymentConfig,
     MembershipMLPaymentConfig, MembershipModelInferencePaymentConfig,
@@ -741,6 +748,19 @@ pub struct ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
     /// (`CreateConfiguredTableAssociationInput$name`), so two associations of one
     /// membership cannot share one.
     pub configured_table_association_by_name: HashMap<(String, String), String>,
+    /// Configured table association analysis rules by `(configured table association id,
+    /// analysis rule type)`.
+    ///
+    /// The modelled `ConfiguredTableAssociationAnalysisRule` is stored as-is, like the
+    /// [`ConfiguredTableAssociation`] it belongs to: every one of its members is
+    /// absolute. The key is the pair the association analysis-rule operations address a
+    /// rule by
+    /// (`/memberships/{membershipIdentifier}/configuredTableAssociations/{configuredTableAssociationIdentifier}/analysisRule/{analysisRuleType}`),
+    /// so a read is a lookup and not a scan, and which types an association holds a rule
+    /// for stays on the association itself, in
+    /// `ConfiguredTableAssociation$analysisRuleTypes`.
+    pub configured_table_association_analysis_rules:
+        HashMap<(String, String), ConfiguredTableAssociationAnalysisRule>,
     /// Protected queries by `ProtectedQuery.id`.
     pub protected_queries: HashMap<String, ProtectedQueryRecord>,
     /// Protected query ids in start order — the order a listing pages in.
@@ -1066,6 +1086,44 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
             .filter(|association| association.membership_id == membership_id)
     }
 
+    /// The analysis rule of `analysis_rule_type` stored for the configured table
+    /// association `association_id`, if any.
+    ///
+    /// The pair is the rule's identity — every association analysis-rule operation
+    /// addresses one through it — so this is a lookup rather than a scan.
+    pub fn configured_table_association_analysis_rule(
+        &self,
+        association_id: &str,
+        analysis_rule_type: &str,
+    ) -> Option<&ConfiguredTableAssociationAnalysisRule> {
+        self.configured_table_association_analysis_rules
+            .get(&(association_id.to_string(), analysis_rule_type.to_string()))
+    }
+
+    /// Persist `rule` and record its type on the configured table association it belongs
+    /// to.
+    ///
+    /// `ConfiguredTableAssociation$analysisRuleTypes` is "the analysis rule types for the
+    /// configured table association", so it is maintained here rather than recomputed by
+    /// every reader, and the association's `updateTime` moves to the rule's instant
+    /// because that member of it has changed.
+    pub fn insert_configured_table_association_analysis_rule(
+        &mut self,
+        rule: ConfiguredTableAssociationAnalysisRule,
+    ) {
+        let association_id = rule.configured_table_association_id.clone();
+        let rule_type = rule.r#type.clone();
+        if let Some(association) = self.configured_table_associations.get_mut(&association_id) {
+            let held = association.analysis_rule_types.get_or_insert_with(Vec::new);
+            if !held.contains(&rule_type) {
+                held.push(rule_type.clone());
+            }
+            association.update_time = rule.update_time;
+        }
+        self.configured_table_association_analysis_rules
+            .insert((association_id, rule_type), rule);
+    }
+
     /// The stored template `template_id`, but only when it belongs to
     /// `collaboration_id`.
     ///
@@ -1118,12 +1176,13 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
     }
 
     /// Drop every configured table association of `membership_id` — the records, their
-    /// order entries, their name index entries and their tags.
+    /// order entries, their name index entries, their analysis rules and their tags.
     ///
     /// An association is a sub-resource of ONE membership (both of its operations address
     /// it under that membership), so it is not reachable once the membership is gone: it
     /// goes with it rather than staying behind, counting against the store's cap and
-    /// holding its tags alive.
+    /// holding its tags alive. An analysis rule is a sub-resource of ONE association, so
+    /// it goes the same way.
     pub fn remove_configured_table_associations_of(&mut self, membership_id: &str) {
         let ids: Vec<String> = self
             .configured_table_associations
@@ -1136,6 +1195,8 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
                 self.tags.remove(&association.arn);
             }
             self.configured_table_association_order.retain(|held| held != &id);
+            self.configured_table_association_analysis_rules
+                .retain(|(association, _), _| association != &id);
         }
         self.configured_table_association_by_name
             .retain(|(membership, _), _| membership != membership_id);
@@ -2031,6 +2092,55 @@ pub fn configured_table_analysis_rule_policy_type(
             ConfiguredTableAnalysisRulePolicyV1::Custom(_) => ANALYSIS_RULE_TYPE_CUSTOM,
         },
     }
+}
+
+/// The `ConfiguredTableAssociationAnalysisRuleType` a
+/// `ConfiguredTableAssociationAnalysisRulePolicy` carries: each member of the
+/// `ConfiguredTableAssociationAnalysisRulePolicyV1` union is the policy of exactly one
+/// rule type, so the pair is what makes an `analysisRuleType` naming another type
+/// detectable.
+pub fn configured_table_association_analysis_rule_policy_type(
+    policy: &ConfiguredTableAssociationAnalysisRulePolicy,
+) -> &'static str {
+    match policy {
+        ConfiguredTableAssociationAnalysisRulePolicy::V1(v1) => match v1 {
+            ConfiguredTableAssociationAnalysisRulePolicyV1::Aggregation(_) => {
+                ANALYSIS_RULE_TYPE_AGGREGATION
+            }
+            ConfiguredTableAssociationAnalysisRulePolicyV1::List(_) => ANALYSIS_RULE_TYPE_LIST,
+            ConfiguredTableAssociationAnalysisRulePolicyV1::Custom(_) => ANALYSIS_RULE_TYPE_CUSTOM,
+        },
+    }
+}
+
+/// What the service says when the configured table association a request addresses is not
+/// one the membership in its path holds.
+///
+/// The two variable parts are the identifiers the REQUEST carried: an association is a
+/// sub-resource of one membership, so the refusal names the pair that resolved to
+/// nothing.
+pub fn configured_table_association_not_found_message(
+    association_id: &str,
+    membership_id: &str,
+) -> String {
+    format!("configured table association {association_id} not found in membership {membership_id}")
+}
+
+/// What the service says when the `(configured table association, analysis rule type)`
+/// pair a request addresses holds no analysis rule.
+///
+/// The two variable parts are the identifier and the type the REQUEST carried, echoed as
+/// sent: the pair is the rule's identity, so the refusal names the pair that resolved to
+/// nothing rather than describing the association. Worded like the configured-table
+/// refusal ([`no_such_configured_table_analysis_rule_message`]) because the two name the
+/// same kind of miss.
+pub fn no_such_configured_table_association_analysis_rule_message(
+    configured_table_association_identifier: &str,
+    analysis_rule_type: &str,
+) -> String {
+    format!(
+        "No such analysis rule with configuredTableAssociationId: {configured_table_association_identifier} and type {analysis_rule_type}"
+    )
 }
 
 /// The columns a configured table's analysis rule policy references that the table's

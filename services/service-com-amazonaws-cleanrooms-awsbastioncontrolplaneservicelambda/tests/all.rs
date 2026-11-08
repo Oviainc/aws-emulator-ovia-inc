@@ -39,6 +39,8 @@ mod configured_table_analysis_rule_reads;
 mod configured_table_analysis_rule_round_trip;
 #[path = "all/configured_table_analysis_rules.rs"]
 mod configured_table_analysis_rules;
+#[path = "all/configured_table_association_analysis_rules.rs"]
+mod configured_table_association_analysis_rules;
 #[path = "all/configured_table_associations.rs"]
 mod configured_table_associations;
 #[path = "all/configured_table_updates.rs"]
