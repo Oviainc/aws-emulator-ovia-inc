@@ -10,7 +10,10 @@
 //!
 //! What it refuses is a matter of FORM: "CloudFormation first checks if the template is
 //! valid JSON. If it isn't, CloudFormation checks if the template is valid YAML. If both
-//! these checks fail, CloudFormation returns a template validation error" — that, a body
+//! these checks fail, CloudFormation returns a template validation error" — that, a body it
+//! DOES read but that states no mapping of template sections (whose structure the template
+//! format does not have, reported for that structure rather than for a section it was never
+//! read to have), a body
 //! declaring no resource, a `Description` past its documented maximum, and a resource type
 //! CloudFormation does not recognise, which is a template-format error here exactly as it is
 //! for every other operation that reads a body ([`crate::state::resource_types`]).
@@ -205,8 +208,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // same verdict the operations that SUBMIT a template for deployment give it.
         crate::state::validate_template_quotas(template_body)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
-        // A body this service's reader will not read at all, refused with the one wording
-        // every operation that reads a body gives it.
+        // A body this service's reader will not read at all, and one it reads into something
+        // that is no mapping of template sections, refused with the one wording every
+        // operation that reads a body gives it — the structural fault FIRST, so a document
+        // the format cannot carry is reported for its structure rather than for a section it
+        // was never read to have.
+        if let Err(refusal) = template::section_map(template_body) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
+        }
         let Some(template) = template::parse(template_body) else {
             return Err(crate::scaffolded::Scaffolded::validation_error(
                 template::not_well_formed(template_body),

@@ -147,9 +147,14 @@ fn violation(
 ) -> Option<String> {
     if is_number(parameter) {
         // "Number: an integer or float. CloudFormation validates the parameter value as a
-        // number."
-        let Ok(number) = value.trim().parse::<f64>() else {
-            return Some(refused(parameter, "must be a number".to_string()));
+        // number." The clause is a TERMINATED sentence, as the service words this one
+        // (recorded behaviour): the declared type is not a bound the clause has to name, so
+        // the sentence ends there.
+        // A spelling that is NEITHER an integer nor a float — a word, or one of the
+        // non-finite spellings a float syntax admits — is no value of that parameter.
+        let number = match value.trim().parse::<f64>() {
+            Ok(number) if number.is_finite() => number,
+            _ => return Some(refused(parameter, "must be a number.".to_string())),
         };
         if let Some(min) = parameter.min_value {
             if number < min {
@@ -304,7 +309,7 @@ mod tests {
                 "a Number parameter given no number at all",
                 r#"{"Type":"Number"}"#,
                 "eight",
-                Some("Parameter 'P' must be a number"),
+                Some("Parameter 'P' must be a number."),
             ),
             (
                 "a float bound stated in a quoted spelling",

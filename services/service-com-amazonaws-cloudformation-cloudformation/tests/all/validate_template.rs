@@ -463,11 +463,14 @@ async fn validate_template_refuses_a_body_it_cannot_report_on() {
             message: "Template format error".to_string(),
         },
         RefusalCase {
-            case: "a valid YAML scalar, which declares no section at all",
+            case: "a valid YAML scalar, which is no mapping of template sections",
             members: vec![member("TemplateBody", "not-a-template")],
             status: 400,
             code: "ValidationError",
-            message: "At least one Resources member must be defined".to_string(),
+            // A document the reader READS but that states no section at all has a structure
+            // the template format does not have, which is a different fault from a template
+            // whose `Resources` section is empty.
+            message: "unsupported structure".to_string(),
         },
         RefusalCase {
             case: "a template whose Resources section is empty",

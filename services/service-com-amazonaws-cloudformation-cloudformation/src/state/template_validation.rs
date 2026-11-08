@@ -17,7 +17,10 @@
 //! rule about the request rather than about the deployment:
 //!
 //! * a body the reader will not read at all is a template-FORM error
-//!   ([`super::template::not_well_formed`]);
+//!   ([`super::template::not_well_formed`]), and so is one it DOES read that states no
+//!   mapping of template sections — a sequence or a scalar at the top level, or a section
+//!   stated as something other than the mapping that section is
+//!   ([`super::template::section_map`]);
 //! * the `AWS::LanguageExtensions` directives are functions only that transform defines, so
 //!   a template using one without declaring it is refused — and `Fn::ForEach` is refused in
 //!   a section the transform does not define it for;
@@ -94,9 +97,14 @@ pub fn refusal(
     supplied: &BTreeMap<String, String>,
     region: &str,
 ) -> Option<String> {
-    let Some(document) = template::document(body) else {
-        // "If both these checks fail, CloudFormation returns a template validation error."
-        return Some(template::not_well_formed(body));
+    // A body that is no template DOCUMENT at all is refused for its FORM, in the one place
+    // that verdict lives: "CloudFormation first checks if the template is valid JSON ... if
+    // both these checks fail, CloudFormation returns a template validation error", and a body
+    // it DOES read but that states no mapping of template sections has a structure the format
+    // does not have ([`template::section_map`]).
+    let document = match template::section_map(body) {
+        Ok(document) => document,
+        Err(message) => return Some(message),
     };
     // A parameter is named by its own section key, and the names a parameter may be given
     // are the alphanumeric ones — which is also what a template using a DIRECTIVE as a

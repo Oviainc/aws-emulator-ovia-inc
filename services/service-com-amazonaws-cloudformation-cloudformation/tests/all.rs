@@ -423,6 +423,8 @@ mod template_quotas;
 mod template_refusal_wording;
 #[path = "all/template_stages_and_resource_events.rs"]
 mod template_stages_and_resource_events;
+#[path = "all/template_structure_refusals.rs"]
+mod template_structure_refusals;
 #[path = "all/template_summary.rs"]
 mod template_summary;
 #[path = "all/template_validation.rs"]

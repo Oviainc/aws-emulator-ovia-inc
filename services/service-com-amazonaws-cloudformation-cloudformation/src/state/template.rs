@@ -774,6 +774,63 @@ pub fn not_well_formed(body: &str) -> String {
     }
 }
 
+/// How a body this reader DOES read but that is no template document is refused — the ONE
+/// wording for it, for the same reason [`NOT_WELL_FORMED`] is worded once.
+///
+/// A template is "a JSON- or YAML-formatted text file" whose top level is the template's
+/// SECTIONS, each named by its own key and holding what that section declares. A document
+/// that is anything else states no section at all — a sequence, a scalar — and so does one
+/// whose section key holds something other than the mapping that section is; neither is a
+/// structure the template format has, which is what the service says about it rather than
+/// giving a verdict on sections it never read.
+pub const UNSUPPORTED_STRUCTURE: &str = "Template format error: unsupported structure.";
+
+/// The sections whose value IS a mapping of what they declare: "Parameters: the values to
+/// pass to your template at runtime", "Mappings: a mapping of keys and associated values",
+/// "Conditions", "Metadata", "Rules", "Resources: the stack resources and their properties"
+/// and "Outputs" are each an object keyed by the name of what it declares.
+///
+/// The sections left out are the ones whose value is not a mapping — the format version and
+/// the description are text, `Transform` is a name or a list of them — so nothing here says
+/// anything about their spelling.
+const MAPPING_SECTIONS: [&str; 7] = [
+    "Conditions",
+    "Mappings",
+    "Metadata",
+    "Outputs",
+    "Parameters",
+    "Resources",
+    "Rules",
+];
+
+/// The template DOCUMENT a body states — the mapping of template sections — or how its FORM
+/// is refused.
+///
+/// The ONE place that verdict lives, so every operation that reads a body refuses the same
+/// body the same way: a body this reader will not read at all is not well-formed
+/// ([`not_well_formed`]), and a body it DOES read into something that is not a mapping of
+/// sections — or whose section holds something other than the mapping that section is — has a
+/// structure the format does not have ([`UNSUPPORTED_STRUCTURE`]). A section whose value is
+/// EMPTY (a YAML key with nothing under it) states no entry rather than a wrong structure, so
+/// it is left to the rule about that section's own content.
+pub fn section_map(body: &str) -> Result<Value, String> {
+    let Some(document) = document(body) else {
+        return Err(not_well_formed(body));
+    };
+    let Some(sections) = document.as_object() else {
+        return Err(UNSUPPORTED_STRUCTURE.to_string());
+    };
+    let misspelled = MAPPING_SECTIONS.iter().any(|section| {
+        sections
+            .get(*section)
+            .is_some_and(|stated| !stated.is_object() && !stated.is_null())
+    });
+    if misspelled {
+        return Err(UNSUPPORTED_STRUCTURE.to_string());
+    }
+    Ok(document)
+}
+
 /// The line and column the YAML reader stopped at, both counted from 1 as a template
 /// format error reports them, or `None` when the body carries no YAML syntax error (it is
 /// refused for one of the bounds instead).

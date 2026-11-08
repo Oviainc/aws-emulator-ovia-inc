@@ -196,7 +196,7 @@ fn parameter_cases() -> Vec<ParameterCase> {
             case: "a Number parameter passed something that is no number",
             declaration: r#"{"Type":"Number"}"#,
             value: "eight",
-            refused: Some("Parameter 'P' must be a number"),
+            refused: Some("Parameter 'P' must be a number."),
         },
         ParameterCase {
             case: "a value outside AllowedValues",
