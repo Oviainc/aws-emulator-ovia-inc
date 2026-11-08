@@ -21,6 +21,8 @@ mod block_public_access;
 mod cluster_id_refusal_code;
 #[path = "all/cluster_placement.rs"]
 mod cluster_placement;
+#[path = "all/cluster_step_execution.rs"]
+mod cluster_step_execution;
 #[path = "all/created_window.rs"]
 mod created_window;
 #[path = "all/emr_control_plane.rs"]
@@ -47,10 +49,16 @@ mod malformed_input_refusals;
 mod managed_scaling_policy;
 #[path = "all/modify_instance_groups.rs"]
 mod modify_instance_groups;
+#[path = "all/multi_primary_termination_protection.rs"]
+mod multi_primary_termination_protection;
+#[path = "all/notebook_execution_progression.rs"]
+mod notebook_execution_progression;
 #[path = "all/notebook_executions.rs"]
 mod notebook_executions;
 #[path = "all/persistent_app_ui.rs"]
 mod persistent_app_ui;
+#[path = "all/presigned_url_freshness.rs"]
+mod presigned_url_freshness;
 #[path = "all/refusal_messages.rs"]
 mod refusal_messages;
 #[path = "all/refusal_wording.rs"]

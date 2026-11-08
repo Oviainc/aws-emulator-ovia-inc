@@ -345,6 +345,8 @@ mod delete_volume;
 // The endpoint services a caller can create a VPC endpoint to: the Region's catalogue and the
 // account's own service configurations. Declared beside `prefix_lists` for the reason the note
 // above gives — the sorted neighbourhood is where every new ec2 suite inserts its two lines.
+#[path = "all/vpc_endpoint_service_name_families.rs"]
+mod vpc_endpoint_service_name_families;
 #[path = "all/vpc_endpoint_services.rs"]
 mod vpc_endpoint_services;
 // The `domain-name` attribute of an Elastic IP address: what `ResetAddressAttribute` starts

@@ -14,13 +14,24 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_emr_elasticmapreduce::state::MAX_CLUSTERS;
+use service_com_amazonaws_emr_elasticmapreduce::state::{CLUSTER_PHASE_SPAN, MAX_CLUSTERS};
 use service_com_amazonaws_emr_elasticmapreduce::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 /// Longer than the service's clock-owed transition span (500 ms), so a cluster that was
-/// `STARTING` or `TERMINATING` has reached its next state by the time we look.
+/// `TERMINATING`, or a step that was `PENDING` on a live cluster, has reached its next
+/// state by the time we look.
 const PAST_TRANSITION: Duration = Duration::from_millis(900);
+
+/// Longer than the TWO phases a new cluster comes up over — one
+/// [`CLUSTER_PHASE_SPAN`] in `STARTING` and one in `BOOTSTRAPPING` — so a cluster has
+/// reached its ready state by the time we look.
+///
+/// `pub(crate)` so a sibling suite waits out the same span through one constant rather
+/// than its own copy.
+pub(crate) const PAST_CLUSTER_READY: Duration = CLUSTER_PHASE_SPAN
+    .saturating_mul(2)
+    .saturating_add(PAST_TRANSITION);
 
 /// `ListClusters` / `ListSteps` page size, documented on both operations ("a maximum of
 /// 50 clusters … per call", "a list greater than 50 steps").
@@ -475,9 +486,10 @@ async fn run_job_flow_persists_each_cluster_and_describe_cluster_reads_it_back()
 }
 
 /// THE RULE: a cluster AWS answers in a non-terminal state reaches its next state once
-/// the clock makes the transition due — `STARTING` becomes `WAITING` for a cluster kept
-/// alive with no steps, and `RUNNING` otherwise — and that is recorded as
-/// `Timeline.ReadyDateTime`. A read never moves it anywhere else.
+/// the clock makes the transition due — a new cluster provisions its capacity (`STARTING`)
+/// and then runs its bootstrap actions (`BOOTSTRAPPING`) before it is ready, which is
+/// `WAITING` for a cluster kept alive with no steps and `RUNNING` otherwise — and that is
+/// recorded as `Timeline.ReadyDateTime`. A read never moves it anywhere else.
 #[tokio::test]
 async fn a_starting_cluster_reaches_its_ready_state_when_the_clock_makes_it_due() {
     struct Case {
@@ -518,7 +530,7 @@ async fn a_starting_cluster_reaches_its_ready_state_when_the_clock_makes_it_due(
         ids.push(id);
     }
 
-    tokio::time::sleep(PAST_TRANSITION).await;
+    tokio::time::sleep(PAST_CLUSTER_READY).await;
 
     for (case, id) in cases.iter().zip(&ids) {
         let cluster = emr.describe_cluster(id).await;
@@ -967,7 +979,7 @@ async fn list_clusters_filters_by_state_and_creation_window() {
         );
     }
 
-    tokio::time::sleep(PAST_TRANSITION).await;
+    tokio::time::sleep(PAST_CLUSTER_READY).await;
     emr.ok("TerminateJobFlows", json!({ "JobFlowIds": [&to_terminate] }))
         .await;
     tokio::time::sleep(PAST_TRANSITION).await;
@@ -1198,11 +1210,12 @@ async fn terminate_job_flows_shuts_each_named_cluster_down() {
         "case \"terminated cluster\": EndDateTime {ended} must follow CreationDateTime {created}"
     );
 
-    // Terminating one cluster leaves the others alone.
+    // Terminating one cluster leaves the others alone: the survivor is still coming up,
+    // which is where the clock had it when this batch named another cluster.
     let untouched = emr.describe_cluster(&survivor).await;
     assert_eq!(
         at(&untouched, &["Status", "State"]).as_str(),
-        Some("WAITING"),
+        Some("STARTING"),
         "case \"survivor\": an unnamed cluster must not be terminated, got {untouched}"
     );
 

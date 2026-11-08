@@ -23,23 +23,29 @@
 //! value the status enum declares. The paging rows span the count: a page exactly at the
 //! documented maximum, the remainder behind its marker, and a marker that names nothing.
 //!
-//! The status a recorded execution carries is the other half: this emulator runs no
-//! notebook, so an execution is `START_PENDING` when the request has just been received
-//! and the clock then owes it the modelled failure status with the reason that says so —
-//! never `FINISHED`, which would be a success for work nothing ran.
+//! The status a recorded execution carries is the other half: an execution is
+//! `START_PENDING` when the request has just been received, and the clock then owes it
+//! each status of the modelled progression in turn — or the stop progression when a caller
+//! asks it to stop. This emulator runs no notebook, so the progression ends in the
+//! modelled failure statuses carrying the reason that says exactly that, rather than in
+//! `FINISHED`, which would be a success for work nothing performed.
 
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_emr_elasticmapreduce::state::NOTEBOOK_PHASE_SPAN;
 
 use crate::job_flow_lifecycle::{
     assert_minted_id, assert_refused, at, epoch_secs, kept_alive_request, Emr,
 };
 use crate::refusal_messages::message;
 
-/// Longer than the service's clock-owed transition span (500 ms), so an execution that
-/// was `START_PENDING` or `STOP_PENDING` has reached its next status by the time we look.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
+/// Longer than the whole status progression a notebook execution walks (one
+/// [`NOTEBOOK_PHASE_SPAN`] per phase), so an execution that was `START_PENDING` or
+/// `STOP_PENDING` has reached the status it ends in by the time we look.
+const PAST_TRANSITION: Duration = NOTEBOOK_PHASE_SPAN
+    .saturating_mul(5)
+    .saturating_add(Duration::from_millis(400));
 
 /// `ListNotebookExecutions` page size, documented on the operation: "Returns a maximum
 /// of 50 notebook executions and a marker to track the paging of a longer notebook
@@ -91,7 +97,9 @@ const NOTEBOOK_EXECUTION_STATUSES: [&str; 10] = [
 /// cluster has received the execution request but execution has not begun."
 const START_PENDING: &str = "START_PENDING";
 
-/// The status the clock owes an execution this emulator never runs.
+/// The status the clock owes an execution whose notebook this service never ran: "`FAILED`
+/// indicates that the execution failed", reached with the reason that says the failure is
+/// this emulator's own.
 const NOT_EXECUTED: &str = "FAILED";
 
 /// The smallest `StartNotebookExecution` request that satisfies the operation's required
@@ -251,7 +259,7 @@ async fn a_started_notebook_execution_round_trips_and_then_ends_without_running(
         at(&execution, &["EndTime"]).is_null(),
         "case {case:?}: an execution that has not ended reports no EndTime, got {execution}"
     );
-    // Nothing ran, so there is no output notebook in Amazon S3 to point at.
+    // No cell has run yet, so there is no output notebook in Amazon S3 to point at.
     assert!(
         at(&execution, &["OutputNotebookURI"]).is_null(),
         "case {case:?}: expected no OutputNotebookURI, got {execution}"
@@ -284,9 +292,8 @@ async fn a_started_notebook_execution_round_trips_and_then_ends_without_running(
         "case {case:?}: the summary carries the notebook location, got {summary}"
     );
 
-    // Past the span the clock owes the execution its next status. This emulator runs no
-    // notebook, so that status is the modelled failure one, with the reason that says
-    // exactly that and the instant it ended.
+    // Past the span the clock owes the execution each status of the progression in turn,
+    // up to the terminal one, with the instant it ended and the reason it ended for.
     tokio::time::sleep(PAST_TRANSITION).await;
     let ended = describe(&emr, &id).await;
     assert_eq!(
@@ -294,11 +301,10 @@ async fn a_started_notebook_execution_round_trips_and_then_ends_without_running(
         Some(NOT_EXECUTED),
         "case {case:?}: expected the execution to end without running, got {ended}"
     );
-    let reason = at(&ended, &["LastStateChangeReason"])
-        .as_str()
-        .unwrap_or_default();
     assert!(
-        !reason.is_empty(),
+        at(&ended, &["LastStateChangeReason"])
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty()),
         "case {case:?}: an ended execution says why, got {ended}"
     );
     let end_time = at(&ended, &["EndTime"]).as_f64().unwrap_or_default();

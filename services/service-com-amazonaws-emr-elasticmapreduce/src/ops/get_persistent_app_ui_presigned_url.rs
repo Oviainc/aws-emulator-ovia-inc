@@ -128,7 +128,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let now = ::std::time::SystemTime::now();
 
         // A rejected input on this operation is answered with HTTP 400
@@ -194,7 +193,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`GetPersistentAppUIPresignedURLOutput$PresignedURLReady` doc.) A UI the
         // service has not attached to its target resource yet serves nothing, so there
         // is no URL to answer — that is what the member reports, rather than a URL that
-        // opens nothing.
+        // opens nothing. Nothing is minted for it either.
         if !record.is_attached() {
             return Ok(GetPersistentAppUIPresignedURLOutput {
                 presigned_url_ready: Some(false),
@@ -202,9 +201,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
+        // Every call PRESIGNS the URL afresh: the session token in it is minted for this
+        // call, so two calls for one user interface never hand back the same credential
+        // and a URL that was cached or shared carries a token of its own. The record is
+        // read-only here — nothing about the token is stored, which is what keeps the
+        // answer un-cacheable by construction.
+        let Some(session_token) = crate::state::mint_presigned_url_token(ctx.credential_store())
+        else {
+            return Err(GetPersistentAppUIPresignedURLErrorModeled::InternalServerError(
+                InternalServerError {},
+            )
+            .into());
+        };
+        let url = record.presigned_url(&ui_type, input.application_id.as_deref(), &session_token);
+        drop(store);
+
         Ok(GetPersistentAppUIPresignedURLOutput {
             presigned_url_ready: Some(true),
-            presigned_url: Some(record.presigned_url(&ui_type, input.application_id.as_deref())),
+            presigned_url: Some(url),
         })
     }
 }

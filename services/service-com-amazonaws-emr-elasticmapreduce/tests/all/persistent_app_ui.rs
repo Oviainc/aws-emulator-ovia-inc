@@ -37,6 +37,15 @@ const PROFILER_TO_UI_TYPE: [(&str, &str); 3] = [("SHS", "SHS"), ("TEZUI", "TEZ")
 /// The UI a create that names no profiler publishes.
 const DEFAULT_UI_TYPE: &str = "SHS";
 
+/// The interface a presigned URL opens, without the session token the answering call
+/// minted into it: everything before the query string.
+///
+/// `pub(crate)` so the suite that spans the per-call freshness of that token reads one URL
+/// the same way.
+pub(crate) fn opened_interface(url: &str) -> &str {
+    url.split('?').next().unwrap_or(url)
+}
+
 /// The status a freshly created UI carries, and the one the clock owes it.
 const STARTING: &str = "STARTING";
 const ATTACHED: &str = "ATTACHED";
@@ -474,15 +483,23 @@ async fn a_starting_ui_is_attached_when_the_clock_makes_it_due_and_its_url_follo
             "case {profiler:?}: the URL must name the {ui_type} interface, got {url}"
         );
 
-        // Asking for the type the UI publishes, by name, answers the same URL; a read
-        // changes nothing.
+        // Asking for the type the UI publishes, by name, opens the same interface — and
+        // the URL is presigned afresh, so the token in it is not the first call's.
         let named = uis
             .presigned_ok(json!({ "PersistentAppUIId": id, "PersistentAppUIType": ui_type }))
             .await;
+        let named_url = at(&named, &["PresignedURL"])
+            .as_str()
+            .unwrap_or_else(|| panic!("case {profiler:?}: no PresignedURL in {named}"))
+            .to_string();
         assert_eq!(
-            at(&named, &["PresignedURL"]).as_str(),
-            Some(url.as_str()),
-            "case {profiler:?}: naming the published type answers the same URL, got {named}"
+            opened_interface(&named_url),
+            opened_interface(&url),
+            "case {profiler:?}: naming the published type opens the same interface, got {named}"
+        );
+        assert_ne!(
+            named_url, url,
+            "case {profiler:?}: each call presigns the URL afresh, got {named_url} twice"
         );
 
         // "The application ID associated with the presigned URL": it selects which
@@ -497,7 +514,7 @@ async fn a_starting_ui_is_attached_when_the_clock_makes_it_due_and_its_url_follo
             .as_str()
             .unwrap_or_else(|| panic!("case {profiler:?}: no PresignedURL in {for_application}"));
         assert!(
-            application_url.starts_with(&url)
+            application_url.starts_with(opened_interface(&url))
                 && application_url.contains("application_1700000000000_0001"),
             "case {profiler:?}: expected the application's own URL under {url}, got {application_url}"
         );

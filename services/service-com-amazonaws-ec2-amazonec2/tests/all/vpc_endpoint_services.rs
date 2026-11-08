@@ -417,9 +417,16 @@ async fn a_regions_report_is_stable_and_its_services_are_distinct() {
         "case {case:?}: two services of one Region must not share an id, got {services:?}"
     );
     for service in &services {
-        let expected_prefix = format!("com.amazonaws.{REGION}.");
+        // Every service of the report is a service of the Region asked about, under one of
+        // the prefixes an endpoint service name of Amazon Web Services is published with.
+        let expected_prefixes = [
+            format!("com.amazonaws.{REGION}."),
+            format!("aws.api.{REGION}."),
+        ];
         assert!(
-            service.name.starts_with(&expected_prefix),
+            expected_prefixes
+                .iter()
+                .any(|prefix| service.name.starts_with(prefix)),
             "case {case:?}: expected a service of {REGION}, got {:?}",
             service.name
         );
@@ -593,9 +600,16 @@ async fn service_regions_selects_the_regions_asked_about() {
             "case {case:?}: expected the services of {wanted:?}, got {regions:?}"
         );
         for service in &services {
-            let prefix = format!("com.amazonaws.{}.", service.region);
+            // A name of either published family carries the Region hosting the service:
+            // `com.amazonaws.<region>.<label>` and `aws.api.<region>.<label>`.
+            let prefixes = [
+                format!("com.amazonaws.{}.", service.region),
+                format!("aws.api.{}.", service.region),
+            ];
             assert!(
-                service.name.starts_with(&prefix),
+                prefixes
+                    .iter()
+                    .any(|prefix| service.name.starts_with(prefix)),
                 "case {case:?}: a service's name carries its Region, got {:?}",
                 service.name
             );

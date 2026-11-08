@@ -17,8 +17,9 @@
 //! `GetBlockPublicAccessConfiguration` reports it.
 //!
 //! The one concern split out of this root is the instance-type catalog
-//! ([`instance_catalog`]), a fact about the service rather than account state; its names
-//! are re-exported here, so every caller keeps reaching them through `crate::state`.
+//! ([`instance_catalog`]), a fact about the service rather than account state, and the
+//! notebook-execution lifecycle ([`notebook_executions`]); the names of both are
+//! re-exported here, so every caller keeps reaching them through `crate::state`.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::{Duration, SystemTime};
@@ -28,22 +29,28 @@ use crate::ops::types::{
     AutoTerminationPolicy, BlockPublicAccessConfiguration, BlockPublicAccessConfigurationMetadata,
     BootstrapActionConfig,
     Cluster, ClusterStateChangeReason, ClusterStatus, ClusterSummary, ClusterTimeline,
-    Configuration, EbsBlockDevice, EbsConfiguration, Ec2InstanceAttributes, HadoopStepConfig,
-    InstanceFleet, InstanceFleetConfig, InstanceFleetStateChangeReason, InstanceFleetStatus,
-    InstanceFleetTimeline, InstanceGroup, InstanceGroupConfig, InstanceGroupStateChangeReason,
-    InstanceGroupStatus, InstanceGroupTimeline, InstanceTypeConfig, InstanceTypeSpecification,
-    InvalidRequestException, JobFlowInstancesConfig, KerberosAttributes,
-    ManagedScalingPolicy, MonitoringConfiguration, NotebookExecution, NotebookExecutionSummary,
-    NotebookS3LocationForOutput, OSRelease, OutputNotebookS3LocationForOutput, PersistentAppUI,
-    PlacementGroupConfig, PortRange, Session, SessionMappingDetail, ShrinkPolicy,
-    SimplifiedApplication, StartNotebookExecutionInput, Step, StepConfig, StepStatus, StepSummary,
-    StepTimeline, Studio, SupportedInstanceType, Tag,
+    Configuration, EbsBlockDevice, EbsConfiguration, Ec2InstanceAttributes, FailureDetails,
+    HadoopStepConfig, InstanceFleet, InstanceFleetConfig, InstanceFleetStateChangeReason,
+    InstanceFleetStatus, InstanceFleetTimeline, InstanceGroup, InstanceGroupConfig,
+    InstanceGroupStateChangeReason, InstanceGroupStatus, InstanceGroupTimeline,
+    InstanceTypeConfig, InstanceTypeSpecification, InvalidRequestException,
+    JobFlowInstancesConfig, KerberosAttributes, ManagedScalingPolicy, MonitoringConfiguration,
+    NotebookExecution, NotebookExecutionSummary, NotebookS3LocationForOutput, OSRelease,
+    OutputNotebookS3LocationForOutput, PersistentAppUI, PlacementGroupConfig, PortRange, Session,
+    SessionMappingDetail, ShrinkPolicy, SimplifiedApplication, StartNotebookExecutionInput, Step,
+    StepConfig, StepStateChangeReason, StepStatus, StepSummary, StepTimeline, Studio,
+    SupportedInstanceType, Tag,
 };
 
 /// The instance-type catalog, split out of this root as its own concern; its names are
 /// re-exported so every caller keeps reaching them through `crate::state`.
 mod instance_catalog;
 pub use instance_catalog::*;
+
+/// The notebook-execution lifecycle, split out of this root as its own concern for the
+/// same reason, and re-exported the same way.
+mod notebook_executions;
+pub use notebook_executions::*;
 
 /// `com.amazonaws.emr#ClusterState`, as the wire carries it.
 pub mod cluster_state {
@@ -173,9 +180,21 @@ pub mod notebook_execution_status {
     /// "`START_PENDING` indicates that the cluster has received the execution request
     /// but execution has not begun."
     pub const START_PENDING: &str = "START_PENDING";
+    /// "`STARTING` indicates that the execution is starting on the cluster."
+    pub const STARTING: &str = "STARTING";
+    /// "`RUNNING` indicates that the execution is being processed by the cluster."
+    pub const RUNNING: &str = "RUNNING";
+    /// "`FINISHING` indicates that execution processing is in the final stages."
+    pub const FINISHING: &str = "FINISHING";
+    /// "`FAILING` indicates that the execution is failing and will not finish
+    /// successfully."
+    pub const FAILING: &str = "FAILING";
     /// "`STOP_PENDING` indicates that the cluster has received a
     /// `StopNotebookExecution` request and the stop is pending."
     pub const STOP_PENDING: &str = "STOP_PENDING";
+    /// "`STOPPING` indicates that the cluster is in the process of stopping the
+    /// execution as a result of a `StopNotebookExecution` request."
+    pub const STOPPING: &str = "STOPPING";
     /// "`STOPPED` indicates that the execution stopped because of a
     /// `StopNotebookExecution` request."
     pub const STOPPED: &str = "STOPPED";
@@ -213,6 +232,12 @@ pub mod auth_mode {
 /// `com.amazonaws.emr#ClusterStateChangeReasonCode`, for the codes this emulator sets.
 pub mod cluster_state_change_reason_code {
     pub const USER_REQUEST: &str = "USER_REQUEST";
+
+    /// The cluster shut itself down because it had run every step it was given: "after the
+    /// steps complete, the cluster stops" for a cluster whose
+    /// `KeepJobFlowAliveWhenNoSteps` is false (`RunJobFlow` doc), which is what
+    /// `Cluster$AutoTerminate` reports.
+    pub const ALL_STEPS_COMPLETED: &str = "ALL_STEPS_COMPLETED";
 }
 
 /// `com.amazonaws.emr#InvalidRequestException$ErrorCode` — "the error code associated
@@ -1080,6 +1105,69 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// observes the transient state, and it is stored as a due instant — nothing sleeps.
 pub const TRANSITION_SPAN: Duration = Duration::from_millis(500);
 
+/// How long a new cluster spends in EACH phase of coming up: `STARTING` while the cluster's
+/// Amazon EC2 capacity is provisioned, and then `BOOTSTRAPPING` while its bootstrap actions
+/// run — "a list of bootstrap actions to run before Hadoop starts on the cluster nodes"
+/// (`RunJobFlow$BootstrapActions` doc, Smithy model) — after which the cluster is ready and
+/// its steps can run.
+///
+/// CHOSEN, not documented: the real service spends minutes on each phase, since it acquires
+/// real instances. It is one span PER PHASE rather than one for the whole launch because
+/// each phase is a state of its own a client reads and waits on, and it is deliberately
+/// long enough that a client polling `DescribeCluster` right after `RunJobFlow` observes
+/// the cluster before it is ready. Stored as a due instant — nothing sleeps.
+pub const CLUSTER_PHASE_SPAN: Duration = Duration::from_secs(3);
+
+/// How long a step occupies one of its cluster's concurrency slots: the span between the
+/// `Status.Timeline.StartDateTime` and the `EndDateTime` of a step this service ran the
+/// lifecycle of.
+///
+/// CHOSEN, not documented: a real step takes as long as the application it submits does.
+/// Long enough that a client polling `DescribeStep` observes the step `RUNNING` before it
+/// ends, which is the phase the runner exists to make observable.
+pub const STEP_RUN_SPAN: Duration = Duration::from_secs(2);
+
+/// `FailureDetails$Reason` — and `StepStateChangeReason$Message` — of a step whose
+/// lifecycle this service ran and whose application it did not.
+///
+/// This emulator is a control plane: it accepts a step, queues it behind whatever its
+/// cluster is already running, starts it when a concurrency slot frees and records its
+/// timeline — but it executes no Hadoop jar, no `spark-submit` and no `s3-dist-cp`, so the
+/// application the step submitted produced no outcome. The step therefore ENDS in the
+/// modelled failure state, with this reason saying exactly why, rather than reporting
+/// `COMPLETED` for work nothing performed.
+pub const STEP_NOT_EXECUTED_REASON: &str =
+    "This emulator runs the step lifecycle but executes no Hadoop jar, so the step ended \
+     without running its application.";
+
+/// `FailureDetails$Message` for the same step: "the descriptive message including the
+/// error the Amazon EMR service has identified as the cause of step failure"
+/// (`FailureDetails$Message` doc), which here is what was not run.
+pub const STEP_NOT_EXECUTED_MESSAGE: &str =
+    "No application was started for this step: this emulator holds the cluster's step \
+     state and runs no Hadoop, Spark or MapReduce runtime, so the step's own side effects \
+     did not happen.";
+
+/// `ClusterStatus$StateChangeReason.Message` for the shutdown a cluster that does not stay
+/// up takes once its step queue has emptied.
+///
+/// The CODE is the modelled one for that shutdown (`ALL_STEPS_COMPLETED`), but the message
+/// states what became of those steps rather than claiming a completion the step records
+/// contradict: each of them ended without its application running
+/// ([`STEP_NOT_EXECUTED_REASON`]).
+pub const CLUSTER_QUEUE_DRAINED_REASON: &str =
+    "Shut down with no step left to run: this emulator ran no application for the \
+     cluster's steps, so none of them completed.";
+
+/// How long each phase of a notebook execution's status progression lasts
+/// ([`NOTEBOOK_EXECUTION_PROGRESSION`]).
+///
+/// CHOSEN, not documented: a real execution takes as long as its notebook does. Two
+/// seconds per phase, so a client that polls `DescribeNotebookExecution` observes the
+/// phases the model names on the way rather than only the status the execution ended in.
+/// Stored as a due instant — nothing sleeps.
+pub const NOTEBOOK_PHASE_SPAN: Duration = Duration::from_secs(2);
+
 /// `ListClusters` page size: "This call returns a maximum of 50 clusters in unsorted
 /// order per call, but returns a marker to track the paging of the cluster list across
 /// multiple ListClusters calls." (`ListClusters` doc, Smithy model.)
@@ -1197,6 +1285,18 @@ pub const MAX_CANCEL_STEP_IDS: usize = 256;
 /// and later, you can cancel steps that are in a `PENDING` or `RUNNING` state."
 /// (`CancelSteps` doc, Smithy model.)
 pub const CANCELLABLE_STEP_STATES: &[&str] = &[step_state::PENDING, step_state::RUNNING];
+
+/// The step states a step never leaves: the step has run, or it never will.
+///
+/// `StepState` is `PENDING | CANCEL_PENDING | RUNNING | COMPLETED | CANCELLED | FAILED |
+/// INTERRUPTED` (`smithy_query(query="shape", shape="StepState")`); the three before
+/// `COMPLETED` are the ones a step is still moving through, so the rest are terminal.
+pub const TERMINAL_STEP_STATES: &[&str] = &[
+    step_state::COMPLETED,
+    step_state::CANCELLED,
+    step_state::FAILED,
+    step_state::INTERRUPTED,
+];
 
 /// "A Studio can have a maximum of 5 subnets." (`CreateStudio$SubnetIds` doc, Smithy
 /// model.)
@@ -1924,188 +2024,6 @@ pub async fn instance_profile_violation(
     }
 }
 
-/// The ARN of a notebook execution:
-/// `arn:aws:elasticmapreduce:<region>:<account>:notebook-execution/<id>`.
-pub fn notebook_execution_arn(region: &str, execution_id: &str) -> String {
-    ::engine::emulator_arn(
-        "elasticmapreduce",
-        region,
-        &format!("notebook-execution/{execution_id}"),
-    )
-}
-
-/// `ListNotebookExecutions` page size: "Returns a maximum of 50 notebook executions and
-/// a marker to track the paging of a longer notebook execution list across multiple
-/// `ListNotebookExecutions` calls." (`ListNotebookExecutions` doc, Smithy model.)
-pub const LIST_NOTEBOOK_EXECUTIONS_PAGE_SIZE: usize = 50;
-
-/// How far back `ListNotebookExecutions` looks when the request names no `From`: "The
-/// beginning of time range filter for listing notebook executions. The default is the
-/// timestamp of 30 days ago." (`ListNotebookExecutionsInput$From` doc, Smithy model.)
-pub const NOTEBOOK_EXECUTION_DEFAULT_FROM: Duration = Duration::from_secs(30 * 24 * 60 * 60);
-
-/// `NotebookExecution$LastStateChangeReason` for an execution this service recorded and
-/// then never ran.
-///
-/// This emulator is a control plane: it records a notebook execution faithfully — its
-/// engine, its notebook location, its parameters — but it runs no notebook, so an
-/// execution can never reach `FINISHED`. Once the request has been received the clock
-/// owes it the modelled failure status, with a reason that says exactly that, rather
-/// than a success for work nothing ran.
-pub const NOTEBOOK_NOT_EXECUTED_REASON: &str =
-    "This emulator records notebook executions but runs no notebook, so the execution \
-     ended without running.";
-
-/// `NotebookExecution$LastStateChangeReason` for an execution a caller stopped.
-pub const NOTEBOOK_STOPPED_REASON: &str = "Stopped by a StopNotebookExecution request";
-
-/// The status a notebook execution's clock owes it, and when that comes due.
-#[derive(Debug, Clone)]
-pub struct PendingNotebookExecutionStatus {
-    /// The instant the status below was owed, stored rather than slept for.
-    pub due: SystemTime,
-    pub status: String,
-    pub reason: String,
-}
-
-/// A persisted notebook execution: the wire `NotebookExecution` that
-/// `DescribeNotebookExecution` reports, plus the status the clock still owes it.
-///
-/// `ListNotebookExecutions` reports a PROJECTION of this record
-/// ([`NotebookExecutionRecord::to_summary`]); no handler builds that summary from its
-/// own input.
-#[derive(Debug, Clone)]
-pub struct NotebookExecutionRecord {
-    pub execution: NotebookExecution,
-    pub pending_status: Option<PendingNotebookExecutionStatus>,
-}
-
-impl NotebookExecutionRecord {
-    /// The execution `StartNotebookExecution` records for `input`, under the id and ARN
-    /// EMR minted for it.
-    pub fn from_request(
-        id: String,
-        arn: String,
-        input: StartNotebookExecutionInput,
-        now: SystemTime,
-    ) -> Self {
-        Self {
-            execution: NotebookExecution {
-                notebook_execution_id: Some(id),
-                editor_id: input.editor_id,
-                execution_engine: Some(input.execution_engine),
-                notebook_execution_name: input.notebook_execution_name,
-                notebook_params: input.notebook_params,
-                // "START_PENDING indicates that the cluster has received the execution
-                // request but execution has not begun." (`NotebookExecution$Status`
-                // doc.) That is exactly where a just-recorded execution stands.
-                status: Some(notebook_execution_status::START_PENDING.to_string()),
-                start_time: Some(timestamp(now)),
-                end_time: None,
-                arn: Some(arn),
-                // No notebook ran, so there is no output file in Amazon S3 to point at.
-                output_notebook_uri: None,
-                last_state_change_reason: None,
-                notebook_instance_security_group_id: input.notebook_instance_security_group_id,
-                tags: input.tags,
-                notebook_s3_location: input.notebook_s3_location.map(|location| {
-                    NotebookS3LocationForOutput {
-                        bucket: location.bucket,
-                        key: location.key,
-                    }
-                }),
-                output_notebook_s3_location: input.output_notebook_s3_location.map(|location| {
-                    OutputNotebookS3LocationForOutput {
-                        bucket: location.bucket,
-                        key: location.key,
-                    }
-                }),
-                output_notebook_format: input.output_notebook_format,
-                environment_variables: input.environment_variables,
-            },
-            pending_status: Some(PendingNotebookExecutionStatus {
-                due: now + TRANSITION_SPAN,
-                status: notebook_execution_status::FAILED.to_string(),
-                reason: NOTEBOOK_NOT_EXECUTED_REASON.to_string(),
-            }),
-        }
-    }
-
-    /// Materialise the status the clock already made due, and nothing else.
-    pub fn advance_to(&mut self, now: SystemTime) {
-        let due = self
-            .pending_status
-            .as_ref()
-            .is_some_and(|pending| now >= pending.due);
-        if !due {
-            return;
-        }
-        let Some(pending) = self.pending_status.take() else {
-            return;
-        };
-        self.execution.status = Some(pending.status.clone());
-        self.execution.last_state_change_reason = Some(pending.reason);
-        // A status the execution never leaves is where it ended, and the instant it
-        // ended is the one the transition was owed at — not the instant somebody looked.
-        if notebook_execution_status::TERMINAL.contains(&pending.status.as_str()) {
-            self.execution.end_time = Some(timestamp(pending.due));
-        }
-    }
-
-    /// Begin stopping this execution on the caller's request, answering whether there
-    /// was anything to stop.
-    ///
-    /// "STOP_PENDING indicates that the cluster has received a `StopNotebookExecution`
-    /// request and the stop is pending" (`NotebookExecution$Status` doc), so the stop is
-    /// asynchronous: the execution goes `STOP_PENDING` now and the clock owes it
-    /// `STOPPED`. An execution already stopping was accepted once, so repeating the
-    /// request does not push that due instant out.
-    pub fn begin_stop(&mut self, now: SystemTime) -> bool {
-        let status = self.execution.status.as_deref().unwrap_or_default();
-        if notebook_execution_status::TERMINAL.contains(&status) {
-            return false;
-        }
-        if status == notebook_execution_status::STOP_PENDING {
-            return true;
-        }
-        self.execution.status = Some(notebook_execution_status::STOP_PENDING.to_string());
-        self.execution.last_state_change_reason = Some(NOTEBOOK_STOPPED_REASON.to_string());
-        self.pending_status = Some(PendingNotebookExecutionStatus {
-            due: now + TRANSITION_SPAN,
-            status: notebook_execution_status::STOPPED.to_string(),
-            reason: NOTEBOOK_STOPPED_REASON.to_string(),
-        });
-        true
-    }
-
-    /// The wire `NotebookExecutionSummary` for this record.
-    pub fn to_summary(&self) -> NotebookExecutionSummary {
-        NotebookExecutionSummary {
-            notebook_execution_id: self.execution.notebook_execution_id.clone(),
-            editor_id: self.execution.editor_id.clone(),
-            notebook_execution_name: self.execution.notebook_execution_name.clone(),
-            status: self.execution.status.clone(),
-            start_time: self.execution.start_time,
-            end_time: self.execution.end_time,
-            notebook_s3_location: self.execution.notebook_s3_location.clone(),
-            execution_engine_id: self
-                .execution
-                .execution_engine
-                .as_ref()
-                .map(|engine| engine.id.clone()),
-        }
-    }
-
-    /// The id of the execution engine this execution names, which
-    /// `ListNotebookExecutions$ExecutionEngineId` filters on.
-    pub fn execution_engine_id(&self) -> Option<&str> {
-        self.execution
-            .execution_engine
-            .as_ref()
-            .map(|engine| engine.id.as_str())
-    }
-}
-
 /// The account's block public access configuration, with the metadata EMR keeps beside
 /// it: "Properties that describe the Amazon Web Services principal that created the
 /// `BlockPublicAccessConfiguration` using the `PutBlockPublicAccessConfiguration` action
@@ -2736,6 +2654,59 @@ impl InstancesRecord {
     }
 }
 
+/// How many primary nodes a cluster's requested instance configuration provisions.
+///
+/// A launch states its primary nodes in one of the two forms `RunJobFlow` takes: instance
+/// GROUPS, where "valid values are MASTER, CORE or TASK"
+/// (`InstanceGroupConfig$InstanceRole` doc) and the `MASTER` groups' `InstanceCount`s are
+/// the primaries, or instance FLEETS, where the `MASTER` fleet's target capacity is — "the
+/// target capacity of On-Demand units for the instance fleet" plus the Spot equivalent
+/// (`InstanceFleetConfig$TargetOnDemandCapacity` / `$TargetSpotCapacity` docs). Both
+/// vocabularies spell the primary role `MASTER` (`InstanceRoleType`, `InstanceFleetType`),
+/// so one reading serves both.
+///
+/// The counts are the ones the cluster is actually created with, which for a launch stating
+/// its instances the uniform way are the groups that form implies
+/// ([`implied_instance_group_configs`]) — one primary.
+///
+/// Every count comes straight off the request, which bounds none of them (`InstanceCount`
+/// and the two target capacities are plain integers), so the arithmetic is TOTAL: each
+/// count widens to `i64` and every accumulation saturates, and a request naming absurd
+/// capacities is answered rather than overflowing.
+pub fn primary_node_count(groups: &[InstanceGroupConfig], fleets: &[InstanceFleetConfig]) -> i64 {
+    let in_groups = groups
+        .iter()
+        .filter(|group| group.instance_role == instance_group_type::MASTER)
+        .fold(0i64, |total, group| {
+            total.saturating_add(i64::from(group.instance_count.max(0)))
+        });
+    let in_fleets = fleets
+        .iter()
+        .filter(|fleet| fleet.instance_fleet_type == instance_group_type::MASTER)
+        .fold(0i64, |total, fleet| {
+            total
+                .saturating_add(i64::from(fleet.target_on_demand_capacity.unwrap_or(0).max(0)))
+                .saturating_add(i64::from(fleet.target_spot_capacity.unwrap_or(0).max(0)))
+        });
+    in_groups.saturating_add(in_fleets)
+}
+
+/// The fewest primary nodes that make a cluster highly available, which is what forces its
+/// termination protection on ([`forces_termination_protection`]).
+pub const MIN_HIGHLY_AVAILABLE_PRIMARY_NODES: i64 = 2;
+
+/// Whether a cluster with `primary_nodes` primaries has termination protection forced on.
+///
+/// A cluster with more than one primary node is a highly available cluster, and Amazon EMR
+/// locks one against a shutdown it did not mean: the launch turns termination protection on
+/// whatever `JobFlowInstancesConfig$TerminationProtected` asked for, so `DescribeCluster`
+/// reports `TerminationProtected` true and `TerminateJobFlows` on it is refused until a
+/// `SetTerminationProtection` with `false` clears the lock — which is the one way to clear
+/// it, exactly as it is for a cluster the launch asked protection for.
+pub fn forces_termination_protection(primary_nodes: i64) -> bool {
+    primary_nodes >= MIN_HIGHLY_AVAILABLE_PRIMARY_NODES
+}
+
 /// A cluster's state, its reason, and the instants of its lifecycle.
 #[derive(Debug, Clone)]
 pub struct ClusterStatusRecord {
@@ -2744,7 +2715,12 @@ pub struct ClusterStatusRecord {
     pub creation_date_time: SystemTime,
     pub ready_date_time: Option<SystemTime>,
     pub end_date_time: Option<SystemTime>,
-    /// When the `STARTING` -> ready transition the clock owes comes due.
+    /// When the `STARTING` -> `BOOTSTRAPPING` transition the clock owes comes due: the
+    /// instant the cluster's Amazon EC2 capacity has been provisioned and its bootstrap
+    /// actions can run.
+    pub bootstrapping_due_at: Option<SystemTime>,
+    /// When the `BOOTSTRAPPING` -> ready transition the clock owes comes due — the instant
+    /// the cluster can run steps, which is also what a queued step waits for.
     pub ready_due_at: Option<SystemTime>,
     /// When the `TERMINATING` -> `TERMINATED` transition the clock owes comes due.
     pub terminated_due_at: Option<SystemTime>,
@@ -2828,10 +2804,12 @@ pub struct ClusterRecord {
 impl ClusterRecord {
     /// Materialise every transition the clock already made due, and nothing else.
     ///
-    /// Both spans were owed at the same instant whether or not anybody called, so a
+    /// Every span below was owed at the same instant whether or not anybody called, so a
     /// reporting operation may apply them: a cluster that was `STARTING` reaches
-    /// `WAITING` (it is to stay up after its steps) or `RUNNING`, and one the caller
-    /// terminated reaches `TERMINATED`.
+    /// `BOOTSTRAPPING` once its capacity is up and then `WAITING` (it is to stay up after
+    /// its steps) or `RUNNING` once its bootstrap actions have run, a queued step of a
+    /// cluster that is ready runs and then completes, and one the caller terminated
+    /// reaches `TERMINATED`.
     pub fn advance_to(&mut self, now: SystemTime) {
         for fleet in &mut self.fleets {
             fleet.advance_to(now);
@@ -2861,7 +2839,18 @@ impl ClusterRecord {
             }
             return;
         }
+        // The two phases of coming up, applied in order, so a read that comes after both
+        // were due reports the state the clock actually reached rather than the next one
+        // along.
         if self.status.state == cluster_state::STARTING {
+            if let Some(due) = self.status.bootstrapping_due_at {
+                if now >= due {
+                    self.status.state = cluster_state::BOOTSTRAPPING.to_string();
+                    self.status.bootstrapping_due_at = None;
+                }
+            }
+        }
+        if self.status.state == cluster_state::BOOTSTRAPPING {
             if let Some(due) = self.status.ready_due_at {
                 if now >= due {
                     self.status.state = if self.instances.keep_job_flow_alive_when_no_steps {
@@ -2873,6 +2862,132 @@ impl ClusterRecord {
                     self.status.ready_due_at = None;
                 }
             }
+        }
+        self.advance_steps(now);
+        self.stop_once_every_step_has_run(now);
+    }
+
+    /// Materialise the shutdown a cluster that does not stay up is owed once it has run its
+    /// last step.
+    ///
+    /// "RunJobFlow creates and starts running a new cluster. The cluster runs the steps
+    /// specified. After the steps complete, the cluster stops … If the
+    /// `JobFlowInstancesConfig` `KeepJobFlowAliveWhenNoSteps` parameter is set to TRUE, the
+    /// cluster transitions to the `WAITING` state rather than shutting down after the steps
+    /// have completed" (`RunJobFlow` doc) — which is exactly what `Cluster$AutoTerminate`
+    /// reports: "specifies whether the cluster should terminate after completing all steps".
+    /// So a cluster that did not ask to stay up shuts itself down when its last step has
+    /// ended, for the modelled reason `ALL_STEPS_COMPLETED`.
+    ///
+    /// The shutdown is owed at the instant that last step ENDED, not at the instant somebody
+    /// looked, so the cluster reports the same timeline however often it is read. A cluster
+    /// that was launched with no steps at all has run no last step and nothing here moves
+    /// it; a caller that submits one is what starts the span. A cluster still running a step
+    /// keeps running.
+    fn stop_once_every_step_has_run(&mut self, now: SystemTime) {
+        if !self.auto_terminate || self.status.state != cluster_state::RUNNING {
+            return;
+        }
+        if self.steps.is_empty() {
+            return;
+        }
+        let mut last_end = self.status.ready_date_time.unwrap_or(self.status.creation_date_time);
+        for step in &self.steps {
+            let Some(ended) = step.end_date_time.filter(|_| step.is_terminal()) else {
+                return;
+            };
+            last_end = last_end.max(ended);
+        }
+        if now < last_end {
+            return;
+        }
+        self.status.state = cluster_state::TERMINATING.to_string();
+        self.status.state_change_reason = Some(StateChangeReasonRecord {
+            // The modelled code for the shutdown an emptied queue brings
+            // (`ClusterStateChangeReasonCode`), beside a message that says what actually
+            // became of those steps: each of them ENDED without its application running
+            // ([`STEP_NOT_EXECUTED_REASON`]), so the cluster does not claim a completion
+            // its own step records contradict.
+            code: cluster_state_change_reason_code::ALL_STEPS_COMPLETED.to_string(),
+            message: Some(CLUSTER_QUEUE_DRAINED_REASON.to_string()),
+        });
+        self.status.terminated_due_at = Some(last_end + TRANSITION_SPAN);
+    }
+
+    /// The instant this cluster's steps may start running from, or `None` for a cluster
+    /// whose steps never will.
+    ///
+    /// A cluster runs its steps once it is up: "If the `JobFlowInstancesConfig`
+    /// `KeepJobFlowAliveWhenNoSteps` parameter is set to TRUE, the cluster transitions to
+    /// the `WAITING` state rather than shutting down after the steps have completed"
+    /// (`RunJobFlow` doc), so a cluster that is ready is one of `RUNNING`/`WAITING` and the
+    /// instant it became ready is when its queue started moving. A cluster still coming up
+    /// has that instant in the FUTURE — its queued steps stay `PENDING` until then, which
+    /// is why the due instant is answered rather than nothing — and one that is shutting
+    /// down or gone runs nothing more.
+    fn steps_runnable_from(&self) -> Option<SystemTime> {
+        match self.status.state.as_str() {
+            cluster_state::RUNNING | cluster_state::WAITING => self
+                .status
+                .ready_date_time
+                .or(self.status.ready_due_at)
+                .or(Some(self.status.creation_date_time)),
+            cluster_state::STARTING | cluster_state::BOOTSTRAPPING => self.status.ready_due_at,
+            _ => None,
+        }
+    }
+
+    /// Run this cluster's step queue up to `now`: start every step whose turn has come and
+    /// complete every running step whose span has passed.
+    ///
+    /// The schedule is a function of what is persisted — the queue in submission order,
+    /// each step's creation instant, the instant the cluster became ready and its
+    /// `StepConcurrencyLevel` — and never of when somebody looked: a step's start is the
+    /// first instant at which one of the cluster's concurrency slots was free and the step
+    /// had been submitted, and its end is one [`STEP_RUN_SPAN`] later. Both instants are
+    /// stored once they are reached ([`StepRecord::start_date_time`],
+    /// [`StepRecord::end_date_time`]), so a later read re-derives the same timeline.
+    ///
+    /// "Specifies the number of steps that can be executed concurrently"
+    /// (`RunJobFlow$StepConcurrencyLevel` doc): that many steps run at once and the rest
+    /// wait, so a cluster at the default level of one runs its queue strictly in order.
+    fn advance_steps(&mut self, now: SystemTime) {
+        let Some(live_at) = self.steps_runnable_from() else {
+            return;
+        };
+        // The slot count is read back under the ceiling the band allows
+        // ([`MAX_STEP_CONCURRENCY_LEVEL`]), which every entry point already refuses a level
+        // outside ([`step_concurrency_level_violation`]): a level this service should never
+        // have persisted still cannot make a read allocate without bound.
+        let ceiling = usize::try_from(MAX_STEP_CONCURRENCY_LEVEL).unwrap_or(1);
+        let slots = usize::try_from(self.step_concurrency_level)
+            .unwrap_or(1)
+            .clamp(1, ceiling);
+        // The instant each concurrency slot next falls free. A cluster that is not ready
+        // yet has every slot falling free when it becomes ready.
+        let mut free_at: Vec<SystemTime> = vec![live_at; slots];
+        for step in &mut self.steps {
+            // A step the queue dropped without running it — cancelled before its turn
+            // came — occupied no slot, so it does not hold one up.
+            if step.start_date_time.is_none() && step.will_not_run() {
+                continue;
+            }
+            let slot = free_at
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, free)| **free)
+                .map_or(0, |(index, _)| index);
+            let start = step
+                .start_date_time
+                .unwrap_or_else(|| free_at[slot].max(step.creation_date_time));
+            // A step that was stopped gives its slot back when the stop comes due; one
+            // running to completion holds it for its whole span.
+            let end = step
+                .end_date_time
+                .or(step.stop_due_at)
+                .unwrap_or(start + STEP_RUN_SPAN);
+            free_at[slot] = end;
+            step.run_between(start, end, now);
         }
     }
 
@@ -2906,8 +3021,18 @@ impl ClusterRecord {
             code: cluster_state_change_reason_code::USER_REQUEST.to_string(),
             message: Some("Terminated by user request".to_string()),
         });
+        self.status.bootstrapping_due_at = None;
         self.status.ready_due_at = None;
-        self.status.terminated_due_at = Some(now + TRANSITION_SPAN);
+        let terminated_at = now + TRANSITION_SPAN;
+        self.status.terminated_due_at = Some(terminated_at);
+        // The cluster takes its step queue with it: a step still to run on it never will,
+        // and one running on it is cut short, both when the shutdown completes. "After the
+        // steps complete, the cluster stops" (`RunJobFlow` doc) is the other way round —
+        // here the cluster stops first, so no step of it stays `PENDING` for a cluster
+        // that no longer exists.
+        for step in &mut self.steps {
+            step.stop_with_cluster(terminated_at);
+        }
         true
     }
 
@@ -3807,15 +3932,22 @@ pub struct StepRecord {
     pub creation_date_time: SystemTime,
     pub start_date_time: Option<SystemTime>,
     pub end_date_time: Option<SystemTime>,
-    /// When the `CANCEL_PENDING` -> `CANCELLED` transition the clock owes comes due.
-    pub cancelled_due_at: Option<SystemTime>,
+    /// When the stop this step has been owed comes due, and the state it lands in: a
+    /// cancel the caller asked for takes it `CANCEL_PENDING` -> [`step_state::CANCELLED`],
+    /// and the shutdown of its cluster takes a step that was already running to
+    /// [`step_state::INTERRUPTED`] and one that had not started yet to
+    /// [`step_state::CANCELLED`]. Both are cleared once the stop has been applied.
+    pub stop_due_at: Option<SystemTime>,
+    /// The state [`Self::stop_due_at`] lands this step in.
+    pub stop_state: Option<String>,
 }
 
 impl StepRecord {
     /// Persist a submitted `StepConfig` under `id`.
     ///
-    /// The step is `PENDING` and stays there: this emulator runs no Hadoop jar, so it
-    /// reports no start, no end and no outcome for work nothing performed.
+    /// The step is `PENDING`: it is queued behind whatever its cluster is already running,
+    /// and the cluster's step runner ([`ClusterRecord::advance_steps`]) is what starts it
+    /// once the cluster is ready and one of its concurrency slots is free.
     pub fn from_config(
         id: String,
         config: StepConfig,
@@ -3847,7 +3979,8 @@ impl StepRecord {
             creation_date_time: now,
             start_date_time: None,
             end_date_time: None,
-            cancelled_due_at: None,
+            stop_due_at: None,
+            stop_state: None,
         }
     }
 
@@ -3872,22 +4005,110 @@ impl StepRecord {
             return false;
         }
         self.state = step_state::CANCEL_PENDING.to_string();
-        self.cancelled_due_at = Some(now + TRANSITION_SPAN);
+        self.stop_due_at = Some(now + TRANSITION_SPAN);
+        self.stop_state = Some(step_state::CANCELLED.to_string());
         true
     }
 
-    /// Materialise the transition the clock already made due, and nothing else: a step
-    /// the caller cancelled reaches `CANCELLED` once its span has passed.
-    pub fn advance_to(&mut self, now: SystemTime) {
-        if self.state != step_state::CANCEL_PENDING {
+    /// Owe this step the stop its cluster's shutdown brings, due at `terminated_at`.
+    ///
+    /// A step that has reached a terminal state is already done with and keeps it. One
+    /// that was running when the shutdown began does not finish: it is `INTERRUPTED`, the
+    /// state `StepState` carries for a step whose run was cut short. One that had not
+    /// started is `CANCELLED`, since it never ran at all. A step already stopping keeps
+    /// the earlier of the two due instants, so a cluster going away cannot push a cancel
+    /// the caller already asked for further out.
+    pub fn stop_with_cluster(&mut self, terminated_at: SystemTime) {
+        if self.is_terminal() {
             return;
         }
-        if let Some(due) = self.cancelled_due_at {
-            if now >= due {
-                self.state = step_state::CANCELLED.to_string();
-                self.end_date_time = Some(due);
-                self.cancelled_due_at = None;
-            }
+        let stop_state = if self.state == step_state::RUNNING {
+            step_state::INTERRUPTED
+        } else if self.state == step_state::CANCEL_PENDING {
+            // The caller's cancel is already owed; the cluster's shutdown only brings it
+            // forward if it lands first.
+            self.stop_due_at = Some(
+                self.stop_due_at
+                    .map_or(terminated_at, |owed| owed.min(terminated_at)),
+            );
+            return;
+        } else {
+            step_state::CANCELLED
+        };
+        self.stop_due_at = Some(
+            self.stop_due_at
+                .map_or(terminated_at, |owed| owed.min(terminated_at)),
+        );
+        self.stop_state = Some(stop_state.to_string());
+    }
+
+    /// Whether this step has reached a state it never leaves.
+    pub fn is_terminal(&self) -> bool {
+        TERMINAL_STEP_STATES.contains(&self.state.as_str())
+    }
+
+    /// Whether this step will never run: it is terminal, or it is stopping and the stop it
+    /// is owed is the one a step that never ran lands in.
+    fn will_not_run(&self) -> bool {
+        self.is_terminal()
+            || self.stop_state.as_deref() == Some(step_state::CANCELLED)
+            || self.state == step_state::CANCEL_PENDING
+    }
+
+    /// Materialise the transition the clock already made due, and nothing else: a step
+    /// that was owed a stop reaches the state that stop lands it in once its instant has
+    /// passed.
+    pub fn advance_to(&mut self, now: SystemTime) {
+        let Some(due) = self.stop_due_at else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        let Some(stop_state) = self.stop_state.take() else {
+            self.stop_due_at = None;
+            return;
+        };
+        self.state = stop_state;
+        self.end_date_time = Some(due);
+        self.stop_due_at = None;
+    }
+
+    /// Report where this step stands at `now`, given the `start` and `end` instants its
+    /// cluster's step runner computed for it ([`ClusterRecord::advance_steps`]).
+    ///
+    /// A step whose turn has not come yet stays `PENDING`; one whose start has passed is
+    /// `RUNNING` and records when it started; one whose span has passed has ENDED, and it
+    /// ends in the state this service can account for.
+    ///
+    /// That end is the modelled FAILURE state, with the details saying why
+    /// ([`STEP_NOT_EXECUTED_REASON`]): this service runs the step lifecycle — the queue,
+    /// the concurrency slots, the timeline — but it executes no Hadoop jar, so the
+    /// application the step submitted produced no outcome, and `COMPLETED` ("the step
+    /// completed successfully") would be a success for work nothing performed. The reason
+    /// is what tells a caller that apart from an application that really failed.
+    ///
+    /// Because that failure is this service's own rather than the application's, it does
+    /// NOT stand in for one in deciding what becomes of the rest of the queue: the step's
+    /// `ActionOnFailure` is recorded and reported, and nothing cancels the steps behind it
+    /// or shuts the cluster down on the strength of an outcome no application produced.
+    ///
+    /// The instants come from the schedule, not from `now`, so two reads of one step report
+    /// the same timeline. A step that was stopped, or that has already reached a terminal
+    /// state, keeps what it has.
+    fn run_between(&mut self, start: SystemTime, end: SystemTime, now: SystemTime) {
+        if self.is_terminal() || self.stop_due_at.is_some() {
+            return;
+        }
+        if now >= end {
+            self.state = step_state::FAILED.to_string();
+            self.start_date_time = Some(start);
+            self.end_date_time = Some(end);
+            return;
+        }
+        if now >= start {
+            self.state = step_state::RUNNING.to_string();
+            self.start_date_time = Some(start);
         }
     }
 
@@ -3908,12 +4129,25 @@ impl StepRecord {
 
     /// The wire `StepStatus` for this record.
     fn to_status(&self) -> StepStatus {
+        // A step that ENDED without its application running says so, in both members the
+        // model gives a failure: "the reason for the step failure"
+        // (`FailureDetails$Reason`) and the descriptive message beside it. Every other
+        // state has nothing to report — "currently, the service provides no code for the
+        // state change" (`StepStateChangeReason$Code` doc), so the code member stays
+        // absent even where the message is given.
+        let failed = self.state == step_state::FAILED;
         StepStatus {
             state: Some(self.state.clone()),
-            // Nothing moved this step out of PENDING other than a cancel the caller
-            // asked for, so there is no reason to give and no failure to detail.
-            state_change_reason: None,
-            failure_details: None,
+            state_change_reason: failed.then(|| StepStateChangeReason {
+                code: None,
+                message: Some(STEP_NOT_EXECUTED_REASON.to_string()),
+            }),
+            failure_details: failed.then(|| FailureDetails {
+                reason: Some(STEP_NOT_EXECUTED_REASON.to_string()),
+                message: Some(STEP_NOT_EXECUTED_MESSAGE.to_string()),
+                // No step log was written, so there is no path to one to report.
+                log_file: None,
+            }),
             timeline: Some(StepTimeline {
                 creation_date_time: Some(timestamp(self.creation_date_time)),
                 start_date_time: self.start_date_time.map(timestamp),
@@ -4047,6 +4281,80 @@ pub const DEFAULT_PERSISTENT_APP_UI_TYPE: &str = "SHS";
 /// selects the interface rather than echoing the id back.
 pub const PRESIGNED_URL_NO_SUCH_UI_MESSAGE: &str = "PersistentAppUIType is not valid.";
 
+/// The query parameter a presigned application-UI URL carries its session token in.
+pub const PRESIGNED_URL_TOKEN_PARAMETER: &str = "authToken";
+
+/// How many characters of a presigned URL's session token are kept.
+///
+/// A chosen length: 64 characters out of the token alphabet below carry far more entropy
+/// than one browser session needs, and the member the URL travels in (`XmlString`, len
+/// 0..10280) admits it comfortably.
+pub const PRESIGNED_URL_TOKEN_LEN: usize = 64;
+
+/// Whether `character` may appear in a presigned URL's session token: the unreserved
+/// characters of RFC 3986 §2.3, which travel in a URL query as themselves. The alphabet
+/// the credential store draws a session token from also carries `+` and `/`, which do not,
+/// so those are filtered out rather than encoded.
+pub fn is_presigned_url_token_char(character: char) -> bool {
+    character.is_ascii_alphanumeric() || matches!(character, '-' | '.' | '_' | '~')
+}
+
+/// How many credential-store mints one presigned URL's token may draw its characters from.
+///
+/// A chosen bound: the store's session token is 712 characters, so one draw almost always
+/// leaves [`PRESIGNED_URL_TOKEN_LEN`] admissible ones, and a few bounded draws keep the
+/// work per request finite.
+const PRESIGNED_URL_TOKEN_MINT_ATTEMPTS: usize = 4;
+
+/// A fresh session token for ONE presigned application-UI URL.
+///
+/// The secret is minted by the emulator's CREDENTIAL STORE — the one component that
+/// generates secrets — and then removed from it again: this token authenticates a browser
+/// to an application user interface, NOT a SigV4 request to this emulator, so the emulator
+/// must not go on accepting it as one and nothing accumulates per call. It is the same seam
+/// every other service that vends a non-SigV4 secret draws from, so this crate adds no
+/// randomness source of its own.
+///
+/// Nothing of the request, of the stored user interface or of the clock enters it, so one
+/// call's token is never predictable from another's. Only the characters a URL query
+/// carries as themselves are kept ([`is_presigned_url_token_char`]), which is a filter over
+/// a uniformly drawn secret rather than a derivation from anything.
+///
+/// `None` when the store minted no secret, when it could not be removed again, or when
+/// [`PRESIGNED_URL_TOKEN_MINT_ATTEMPTS`] draws together held too few admissible characters:
+/// the call then answers its modelled server error rather than a URL carrying something
+/// weaker than the store gives.
+pub fn mint_presigned_url_token(store: &::emulator_server::CredentialStore) -> Option<String> {
+    let mut token = String::with_capacity(PRESIGNED_URL_TOKEN_LEN);
+    for _ in 0..PRESIGNED_URL_TOKEN_MINT_ATTEMPTS {
+        let minted = store.create(&::emulator_server::aws_credentials::AWS_SESSION);
+        let secret = minted
+            .secret(::emulator_server::aws_credentials::SESSION_TOKEN)
+            .map(str::to_string);
+        // The token is not a credential of this emulator; see above.
+        if let Err(error) = store.delete(&minted.id) {
+            ::tracing::warn!(
+                access_key_id = %minted.id,
+                error = ?error,
+                "a credential minted for a presigned URL token could not be deleted"
+            );
+            return None;
+        }
+        // Every admissible character is ASCII, so `len` counts them.
+        let room = PRESIGNED_URL_TOKEN_LEN - token.len();
+        token.extend(
+            secret?
+                .chars()
+                .filter(|character| is_presigned_url_token_char(*character))
+                .take(room),
+        );
+        if token.len() == PRESIGNED_URL_TOKEN_LEN {
+            return Some(token);
+        }
+    }
+    None
+}
+
 /// One persistent application user interface, as this service holds it.
 ///
 /// The wire `PersistentAppUI` is a PROJECTION of this record
@@ -4137,13 +4445,21 @@ impl PersistentAppUIRecord {
     }
 
     /// The URL of this UI's `ui_type` user interface, for the application
-    /// `application_id` when the caller named one.
+    /// `application_id` when the caller named one, carrying the session token
+    /// `session_token` the answering call minted for it.
     ///
-    /// Derived from the UI itself — its own id under the regional EMR application-UI
-    /// domain, with the UI type as the path — exactly the way a Studio's access URL is
-    /// derived from the studio ([`studio_url`]), so repeated reads of one UI answer the
-    /// same URL rather than a freshly invented one.
-    pub fn presigned_url(&self, ui_type: &str, application_id: Option<&str>) -> String {
+    /// Everything but the token is derived from the UI itself — its own id under the
+    /// regional EMR application-UI domain, with the UI type as the path — exactly the way a
+    /// Studio's access URL is derived from the studio ([`studio_url`]), so two calls for one
+    /// UI open the same interface. The TOKEN is what makes the URL a presigned one, and it
+    /// is minted per call rather than stored, so no two calls hand back the same credential
+    /// and a URL that has been shared or cached cannot outlive the token in it.
+    pub fn presigned_url(
+        &self,
+        ui_type: &str,
+        application_id: Option<&str>,
+        session_token: &str,
+    ) -> String {
         let mut url = format!(
             "https://{}.emrappui-prod.{}.amazonaws.com/{}/",
             self.id,
@@ -4158,6 +4474,10 @@ impl PersistentAppUIRecord {
             url.push_str(application_id);
             url.push('/');
         }
+        url.push('?');
+        url.push_str(PRESIGNED_URL_TOKEN_PARAMETER);
+        url.push('=');
+        url.push_str(session_token);
         url
     }
 }

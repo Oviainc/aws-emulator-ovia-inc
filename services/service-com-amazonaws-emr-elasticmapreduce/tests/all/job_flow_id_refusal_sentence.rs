@@ -27,10 +27,11 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use crate::emr_control_plane::{MAX_JOB_FLOW_IDS_PER_REQUEST, UNKNOWN_CLUSTER_IDS};
-use crate::job_flow_lifecycle::{assert_refused, at, kept_alive_request, Emr};
+use crate::job_flow_lifecycle::{
+    assert_refused, at, kept_alive_request, Emr, PAST_CLUSTER_READY,
+};
 use crate::refusal_messages::message;
 use crate::refusal_wording::JOB_FLOW_SENTENCE;
-use crate::termination_protection::PAST_TRANSITION;
 
 /// A second id no cluster is held under, so one batch can carry two DIFFERENT
 /// unresolvable ids and the sentence still cannot name "the" offending one.
@@ -176,7 +177,7 @@ async fn terminate_job_flows_words_the_same_constant_sentence_for_every_batch() 
 
     // The cluster the refused batches named is still the one the clock owes `WAITING`: it
     // is kept alive with no steps, so nothing else can have moved it.
-    tokio::time::sleep(PAST_TRANSITION).await;
+    tokio::time::sleep(PAST_CLUSTER_READY).await;
     let cluster = emr.describe_cluster(&known).await;
     assert_eq!(
         at(&cluster, &["Status", "State"]).as_str(),

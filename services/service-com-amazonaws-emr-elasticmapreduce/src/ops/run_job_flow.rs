@@ -296,11 +296,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            cluster_state, implied_instance_group_configs, validate_instance_group_config,
-            AuditOutcome, ClusterRecord, ClusterStatusRecord, InstanceFleetRecord,
-            InstanceGroupRecord, InstancesRecord, StepRecord, DEFAULT_STEP_CONCURRENCY_LEVEL,
-            MAX_CLUSTERS, MAX_INSTANCE_FLEETS_PER_CLUSTER, MAX_INSTANCE_GROUPS_PER_CLUSTER,
-            MAX_STEPS_PER_JOB_FLOW, TRANSITION_SPAN,
+            cluster_state, forces_termination_protection, implied_instance_group_configs,
+            primary_node_count, validate_instance_group_config, AuditOutcome, ClusterRecord,
+            ClusterStatusRecord, InstanceFleetRecord, InstanceGroupRecord, InstancesRecord,
+            StepRecord, CLUSTER_PHASE_SPAN, DEFAULT_STEP_CONCURRENCY_LEVEL, MAX_CLUSTERS,
+            MAX_INSTANCE_FLEETS_PER_CLUSTER, MAX_INSTANCE_GROUPS_PER_CLUSTER,
+            MAX_STEPS_PER_JOB_FLOW,
         };
 
         let now = ::std::time::SystemTime::now();
@@ -486,13 +487,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let id = store.mint_cluster_id();
         let arn = crate::state::cluster_arn(&region, &id);
-        let instances = InstancesRecord::from_config(&input.instances);
+        let mut instances = InstancesRecord::from_config(&input.instances);
 
         // One InstanceFleetRecord per fleet the request configured, in request order,
         // each under the id EMR mints for it — the same records `AddInstanceFleet`
         // appends to later.
+        let requested_fleet_configs = input.instances.instance_fleets.clone().unwrap_or_default();
         let mut requested_fleets = Vec::new();
-        for config in input.instances.instance_fleets.clone().unwrap_or_default() {
+        for config in requested_fleet_configs.iter().cloned() {
             let fleet_id = store.mint_instance_fleet_id();
             requested_fleets.push(InstanceFleetRecord::from_config(fleet_id, config, now));
         }
@@ -504,6 +506,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut group_configs = requested_group_configs;
         if group_configs.is_empty() {
             group_configs = implied_instance_group_configs(&input.instances);
+        }
+        // A cluster with more than one primary node is highly available, and Amazon EMR
+        // locks such a cluster against a shutdown it did not mean: termination protection
+        // is forced on at the launch whatever the request asked for, and only
+        // `SetTerminationProtection(false)` clears it afterwards.
+        if forces_termination_protection(primary_node_count(&group_configs, &requested_fleet_configs))
+        {
+            instances.termination_protected = true;
         }
         let mut groups = Vec::with_capacity(group_configs.len());
         for config in group_configs {
@@ -568,14 +578,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             auto_termination_policy: input.auto_termination_policy,
             tags: input.tags.unwrap_or_default(),
             status: ClusterStatusRecord {
-                // A new cluster is not up yet; the clock owes it the move to RUNNING,
-                // or to WAITING when it is to stay alive with no steps.
+                // A new cluster is not up yet: the clock owes it the move to
+                // BOOTSTRAPPING once its capacity is provisioned, and then the move to
+                // RUNNING — or to WAITING when it is to stay alive with no steps — once
+                // its bootstrap actions have run.
                 state: cluster_state::STARTING.to_string(),
                 state_change_reason: None,
                 creation_date_time: now,
                 ready_date_time: None,
                 end_date_time: None,
-                ready_due_at: Some(now + TRANSITION_SPAN),
+                bootstrapping_due_at: Some(now + CLUSTER_PHASE_SPAN),
+                ready_due_at: Some(now + CLUSTER_PHASE_SPAN + CLUSTER_PHASE_SPAN),
                 terminated_due_at: None,
             },
             steps,

@@ -35,7 +35,10 @@ use crate::termination_protection::{launched_with_protection, PAST_TRANSITION};
 /// behaviour: it is entirely fixed text — plural and id-free, because the whole batch is
 /// judged before anything is shut down — so no id, name, count or timestamp of the
 /// request or of the state appears in it.
-const PROTECTED_SENTENCE: &str =
+///
+/// `pub(crate)` so the sibling suite that spans the lock a multi-primary launch forces on
+/// asserts the same sentence through one constant rather than its own copy.
+pub(crate) const PROTECTED_SENTENCE: &str =
     "Could not shut down one or more job flows since they are termination protected.";
 
 /// The access key id this suite's audit case presents, which no other suite uses, so the

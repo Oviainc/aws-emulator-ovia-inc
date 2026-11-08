@@ -1568,6 +1568,14 @@ pub const MAX_VPC_ENDPOINT_POLICY_CHARS: usize = 20_480;
 /// prefix and its Region (`com.amazonaws.vpce.<region>.vpce-svc-…`).
 pub const PARTNER_ENDPOINT_SERVICE_LABEL: &str = "vpce.";
 
+/// The second prefix an endpoint service name of Amazon Web Services takes:
+/// `aws.api.<region>.<service>`, the form the services that publish their private-link
+/// name under the `aws.api` label are called by (the Amazon EMR session endpoint service,
+/// `aws.api.<region>.emr-service-cell01`, is one). A name under either prefix names a
+/// service of the Region it carries, so both are read by
+/// [`parse_endpoint_service_name`] and both appear in the Region's catalog.
+pub const AWS_API_ENDPOINT_SERVICE_PREFIX: &str = "aws.api.";
+
 /// The DNS suffix of the endpoint-specific names an interface endpoint answers on, under
 /// which the Region's own label sits (`<endpoint>.<service>.<region>.vpce.amazonaws.com`).
 pub const ENDPOINT_DNS_SUFFIX: &str = "vpce.amazonaws.com";
@@ -1660,19 +1668,24 @@ pub struct EndpointServiceName {
 
 /// Read an endpoint service name, or `None` when the value is not one at all.
 ///
-/// A service name is `com.amazonaws.<region>.<service>`, or
-/// `com.amazonaws.vpce.<region>.<service>` for one a partner offers — the forms the
+/// A service name is `com.amazonaws.<region>.<service>`,
+/// `com.amazonaws.vpce.<region>.<service>` for one a partner offers, or
+/// `aws.api.<region>.<service>` for one published under the `aws.api` label — the forms the
 /// `ServiceName` doc's own examples take ([`AWS_ENDPOINT_SERVICE_PREFIX`],
-/// [`PARTNER_ENDPOINT_SERVICE_LABEL`]). The Region label has to be a Region name
+/// [`PARTNER_ENDPOINT_SERVICE_LABEL`]) plus the one the `aws.api` family takes
+/// ([`AWS_API_ENDPOINT_SERVICE_PREFIX`]). The Region label has to be a Region name
 /// ([`region_name_is_well_formed`]) and the service label a non-empty run of the characters
 /// a DNS label of a service name is made of, since both end up in the DNS names the
 /// endpoint answers on. The ONE reading of a service name, so every operation that resolves
-/// one agrees about what it names.
+/// one agrees about what it names — and so a name of a published family is never refused as
+/// a value that is no service name.
 pub fn parse_endpoint_service_name(service_name: &str) -> Option<EndpointServiceName> {
-    let within_amazon = service_name.strip_prefix(AWS_ENDPOINT_SERVICE_PREFIX)?;
-    let within_region = within_amazon
-        .strip_prefix(PARTNER_ENDPOINT_SERVICE_LABEL)
-        .unwrap_or(within_amazon);
+    let within_region = match service_name.strip_prefix(AWS_ENDPOINT_SERVICE_PREFIX) {
+        Some(within_amazon) => within_amazon
+            .strip_prefix(PARTNER_ENDPOINT_SERVICE_LABEL)
+            .unwrap_or(within_amazon),
+        None => service_name.strip_prefix(AWS_API_ENDPOINT_SERVICE_PREFIX)?,
+    };
     let (region, service) = within_region.split_once('.')?;
     if !region_name_is_well_formed(region) {
         return None;
@@ -1814,6 +1827,22 @@ pub(super) const AWS_ENDPOINT_SERVICES: [AwsEndpointService; 46] = [
     AwsEndpointService { label: "sts", types: INTERFACE_ONLY },
 ];
 
+/// The endpoint services Amazon Web Services offers in every Region under the `aws.api`
+/// label ([`AWS_API_ENDPOINT_SERVICE_PREFIX`]) rather than under `com.amazonaws`.
+///
+/// Amazon EMR's session endpoint service is one: a client that runs Spark Connect sessions
+/// on a cluster reaches them through an interface endpoint to
+/// `aws.api.<region>.emr-service-cell01`, the service cell EMR publishes sessions under.
+/// Sorted by label, the same way [`AWS_ENDPOINT_SERVICES`] is.
+///
+/// The family has further members, and each is added here under the label Amazon Web
+/// Services publishes it as; a label nothing states is not guessed at, since the name IS
+/// the service's identity and an invented one would name a service no Region offers. The
+/// PARSE ([`parse_endpoint_service_name`]) is over the whole family, so an endpoint to a
+/// member this catalogue does not list is still created to the service its name names.
+pub(super) const AWS_API_ENDPOINT_SERVICES: [AwsEndpointService; 1] =
+    [AwsEndpointService { label: "emr-service-cell01", types: INTERFACE_ONLY }];
+
 /// One endpoint service a caller can create a VPC endpoint to, whichever of the two sources it
 /// came from: a service of the Region's catalog, or one of the account's own stored service
 /// configurations.
@@ -1915,7 +1944,8 @@ impl EndpointServiceRecord {
 
 /// The endpoint services Amazon Web Services offers in Region `region`, in `ServiceName`
 /// order — the order a `NextToken` walk of `DescribeVpcEndpointServices` resumes in, and
-/// unique by construction, one name per entry of [`AWS_ENDPOINT_SERVICES`].
+/// unique by construction, one name per entry of [`AWS_ENDPOINT_SERVICES`] and of
+/// [`AWS_API_ENDPOINT_SERVICES`].
 ///
 /// Every reported value is derived from the Region and the entry: the zones come from
 /// [`availability_zones_in_region`], so the service is available in exactly the zones the
@@ -1926,76 +1956,93 @@ impl EndpointServiceRecord {
 /// cannot disagree about what the service is called.
 pub fn endpoint_services_in_region(region: &str) -> Vec<EndpointServiceRecord> {
     let zones = availability_zones_in_region(region);
-    let records: Vec<EndpointServiceRecord> = AWS_ENDPOINT_SERVICES
+    let record_of = |prefix: &str, service: &AwsEndpointService| -> EndpointServiceRecord {
+        let service_name = format!("{prefix}{region}.{}", service.label);
+        // Only a name under `com.amazonaws` says what the service's default public DNS
+        // name is (`<label>.<region>.amazonaws.com`). Nothing in this model or in a request
+        // says which public name a service of another published family answers on, and a
+        // private hosted zone resolves the service's REAL public name or nothing at all, so
+        // such a service reports none here rather than one invented for it — an
+        // acknowledged omission about this catalogue's evidence, not a property of the
+        // family.
+        let publishes_public_name = prefix == AWS_ENDPOINT_SERVICE_PREFIX;
+        let interface = service.types.contains(&VPC_ENDPOINT_TYPE_INTERFACE);
+        let gateway = service.types.contains(&VPC_ENDPOINT_TYPE_GATEWAY);
+        // "The DNS names for the service": the base name an endpoint's own names sit
+        // under. An interface endpoint answers on
+        // `<endpoint>.<service>.<region>.vpce.amazonaws.com`, so the service's base name
+        // under that suffix is what a consumer resolves; a gateway endpoint mints no names
+        // of its own and is reached through the service's default public name.
+        let mut base_endpoint_dns_names = Vec::new();
+        if interface {
+            base_endpoint_dns_names.push(format!(
+                "{label}.{region}.{ENDPOINT_DNS_SUFFIX}",
+                label = service.label,
+            ));
+        }
+        if gateway {
+            base_endpoint_dns_names.push(format!(
+                "{label}.{region}.{SERVICE_DNS_SUFFIX}",
+                label = service.label,
+            ));
+        }
+        EndpointServiceRecord {
+            service_id: endpoint_service_id(&service_name),
+            service_name,
+            service_types: service
+                .types
+                .iter()
+                .map(|service_type| (*service_type).to_string())
+                .collect(),
+            service_region: region.to_string(),
+            owner: AWS_ENDPOINT_SERVICE_OWNER_ALIAS.to_string(),
+            availability_zones: zones
+                .iter()
+                .map(|zone| zone.zone_name.clone())
+                .collect(),
+            availability_zone_ids: zones.iter().map(|zone| zone.zone_id.clone()).collect(),
+            base_endpoint_dns_names,
+            // "The default public DNS name for the service for the Region (for example,
+            // kinesis.us-east-1.amazonaws.com)" (`CreateVpcEndpointRequest$PrivateDnsEnabled`),
+            // which is the name a private hosted zone resolves inside the VPC — so only an
+            // interface endpoint has one, a private hosted zone being an interface
+            // endpoint's option.
+            private_dns_name: (interface && publishes_public_name)
+                .then(|| format!("{label}.{region}.{SERVICE_DNS_SUFFIX}", label = service.label)),
+            // "(Interface and gateway endpoints) A policy to attach to the endpoint that
+            // controls access to the service" (`CreateVpcEndpointRequest$PolicyDocument`):
+            // both kinds of endpoint to a service of this catalog take one.
+            vpc_endpoint_policy_supported: true,
+            // Nothing has to accept a connection to a service Amazon Web Services offers,
+            // and it does not manage the endpoints consumers create to it: the endpoint a
+            // caller creates is the caller's.
+            acceptance_required: false,
+            manages_vpc_endpoints: false,
+            payer_responsibility: Some(PAYER_RESPONSIBILITY_SERVICE_OWNER.to_string()),
+            private_dns_name_verification_state: (interface && publishes_public_name)
+                .then(|| DNS_NAME_STATE_VERIFIED.to_string()),
+            // The one address type an endpoint to this service can be created with: this
+            // slice's subnets carry an IPv4 range only, so an endpoint network interface
+            // has an IPv4 address and the endpoint's DNS records are IPv4 records
+            // ([`DNS_RECORD_IP_TYPE_IPV4`]).
+            supported_ip_address_types: vec![IP_ADDRESS_TYPE_IPV4.to_string()],
+            // Nobody can tag a service Amazon Web Services offers, there being no resource
+            // of the account to tag.
+            tags: Vec::new(),
+        }
+    };
+    let mut records: Vec<EndpointServiceRecord> = AWS_ENDPOINT_SERVICES
         .iter()
-        .map(|service| {
-            let service_name = format!("{AWS_ENDPOINT_SERVICE_PREFIX}{region}.{}", service.label);
-            let interface = service.types.contains(&VPC_ENDPOINT_TYPE_INTERFACE);
-            let gateway = service.types.contains(&VPC_ENDPOINT_TYPE_GATEWAY);
-            // "The DNS names for the service": the base name an endpoint's own names sit
-            // under. An interface endpoint answers on
-            // `<endpoint>.<service>.<region>.vpce.amazonaws.com`, so the service's base name
-            // under that suffix is what a consumer resolves; a gateway endpoint mints no names
-            // of its own and is reached through the service's default public name.
-            let mut base_endpoint_dns_names = Vec::new();
-            if interface {
-                base_endpoint_dns_names.push(format!(
-                    "{label}.{region}.{ENDPOINT_DNS_SUFFIX}",
-                    label = service.label,
-                ));
-            }
-            if gateway {
-                base_endpoint_dns_names.push(format!(
-                    "{label}.{region}.{SERVICE_DNS_SUFFIX}",
-                    label = service.label,
-                ));
-            }
-            EndpointServiceRecord {
-                service_id: endpoint_service_id(&service_name),
-                service_name,
-                service_types: service
-                    .types
-                    .iter()
-                    .map(|service_type| (*service_type).to_string())
-                    .collect(),
-                service_region: region.to_string(),
-                owner: AWS_ENDPOINT_SERVICE_OWNER_ALIAS.to_string(),
-                availability_zones: zones
-                    .iter()
-                    .map(|zone| zone.zone_name.clone())
-                    .collect(),
-                availability_zone_ids: zones.iter().map(|zone| zone.zone_id.clone()).collect(),
-                base_endpoint_dns_names,
-                // "The default public DNS name for the service for the Region (for example,
-                // kinesis.us-east-1.amazonaws.com)" (`CreateVpcEndpointRequest$PrivateDnsEnabled`),
-                // which is the name a private hosted zone resolves inside the VPC — so only an
-                // interface endpoint has one, a private hosted zone being an interface
-                // endpoint's option.
-                private_dns_name: interface
-                    .then(|| format!("{label}.{region}.{SERVICE_DNS_SUFFIX}", label = service.label)),
-                // "(Interface and gateway endpoints) A policy to attach to the endpoint that
-                // controls access to the service" (`CreateVpcEndpointRequest$PolicyDocument`):
-                // both kinds of endpoint to a service of this catalog take one.
-                vpc_endpoint_policy_supported: true,
-                // Nothing has to accept a connection to a service Amazon Web Services offers,
-                // and it does not manage the endpoints consumers create to it: the endpoint a
-                // caller creates is the caller's.
-                acceptance_required: false,
-                manages_vpc_endpoints: false,
-                payer_responsibility: Some(PAYER_RESPONSIBILITY_SERVICE_OWNER.to_string()),
-                private_dns_name_verification_state: interface
-                    .then(|| DNS_NAME_STATE_VERIFIED.to_string()),
-                // The one address type an endpoint to this service can be created with: this
-                // slice's subnets carry an IPv4 range only, so an endpoint network interface
-                // has an IPv4 address and the endpoint's DNS records are IPv4 records
-                // ([`DNS_RECORD_IP_TYPE_IPV4`]).
-                supported_ip_address_types: vec![IP_ADDRESS_TYPE_IPV4.to_string()],
-                // Nobody can tag a service Amazon Web Services offers, there being no resource
-                // of the account to tag.
-                tags: Vec::new(),
-            }
-        })
+        .map(|service| record_of(AWS_ENDPOINT_SERVICE_PREFIX, service))
+        .chain(
+            AWS_API_ENDPOINT_SERVICES
+                .iter()
+                .map(|service| record_of(AWS_API_ENDPOINT_SERVICE_PREFIX, service)),
+        )
         .collect();
+    // The report is in `ServiceName` order whichever prefix a service's name sits under,
+    // since that order is what a page cursor resumes in.
+    records.sort_by(|left, right| left.service_name.cmp(&right.service_name));
     // `ServiceNames` selects by name and the page cursor names the service the next page
     // starts at, so two services of one Region sharing a name would make both ambiguous. The
     // catalog's labels are distinct, which keeps the names distinct; the assertion pins that
