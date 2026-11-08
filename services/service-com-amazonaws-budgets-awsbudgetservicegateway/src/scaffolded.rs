@@ -180,24 +180,20 @@ impl SerializableStruct for ValidationException {
 /// The HTTP status this service answers a MODELED error with.
 ///
 /// A Smithy model binds one `@httpError` to each error shape, but AWS Budgets does not
-/// send those statuses. It is an awsJson1_1 service, and its recorded wire responses
-/// answer a refusal of the REQUEST — its values, the state of the resource it names, a
-/// quota or a limit — with HTTP 400 whatever 4xx the shape declares: `NotFoundException`
-/// (`@httpError` 404) and `DuplicateRecordException` (`@httpError` 409) are both recorded
-/// as 400. Clients branch on the status as well as the code, so the pair has to be the
-/// pair the service really sends; the `__type` and the members stay the model's, only the
-/// status is the service's.
+/// send those statuses. It is an awsJson1_1 service whose published error list gives HTTP
+/// 400 for every one of its client errors, and its recorded wire responses agree: a
+/// refusal of the REQUEST — its values, the authorization it carries, the state of the
+/// resource it names, a quota or a limit — is answered with HTTP 400 whatever 4xx the
+/// shape declares. `NotFoundException` (`@httpError` 404), `DuplicateRecordException`
+/// (409), `ResourceLockedException` (423) and `AccessDeniedException` (403) are all
+/// recorded as 400. Clients branch on the status as well as the code, so the pair has to
+/// be the pair the service really sends; the `__type` and the members stay the model's,
+/// only the status is the service's.
 ///
-/// Two statuses are NOT folded in:
-///
-/// * `403` — an authentication/authorization refusal, which the framework answers with
-///   403 before any handler runs too, so the modeled `AccessDeniedException` and the
-///   framework's own refusal agree. No recording contradicts it.
-/// * `5xx` — a server fault is not a refusal of the request, and an SDK's retry
-///   classifier keys on that difference.
+/// `5xx` is NOT folded in: a server fault is not a refusal of the request, and an SDK's
+/// retry classifier keys on that difference.
 pub fn modeled_error_status(modeled_status: u16) -> u16 {
     match modeled_status {
-        403 => 403,
         400..=499 => 400,
         other => other,
     }

@@ -235,10 +235,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the action's CURRENT STATUS does not allow is a refusal of the method for the
         // state the resource is in — not of any value in the request: work this service
         // started and has not settled yet is locked against a second execution, and a
-        // settled status that leaves this execution type nothing to do refuses it the
-        // same way. Both are the locked resource `ResourceLockedException` names ("the
+        // settled status that leaves this execution type nothing to do — the approval of
+        // an action whose threshold has not triggered among them — refuses it the same
+        // way. Both are the locked resource `ResourceLockedException` names ("the
         // server rejected that particular method for the requested resource"), reported
-        // with the status the action carries at this instant.
+        // with the status the action carries at this instant, and refused before anything
+        // is written, so the action keeps the status and the members it already had.
         let execution = (!crate::state::action_is_in_progress(&action.action.status))
             .then(|| crate::state::action_execution(&input.execution_type, &action.action.status))
             .flatten()
@@ -257,15 +259,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `DescribeBudgetActionHistories` reports. `ActionHistory$Status` is "the status
         // of action at the time of the event", so the record carries the `*_IN_PROGRESS`
         // status this call moved the action to, not the status the clock owes it next.
-        crate::state::record_action_event(
-            action,
-            crate::state::EVENT_TYPE_EXECUTE_ACTION,
-            &format!(
-                "A {} execution of the budget action was started.",
-                input.execution_type
-            ),
-            now,
-        );
+        crate::state::record_action_event(action, crate::state::EVENT_TYPE_EXECUTE_ACTION, now);
 
         Ok(ExecuteBudgetActionOutput {
             account_id: input.account_id,

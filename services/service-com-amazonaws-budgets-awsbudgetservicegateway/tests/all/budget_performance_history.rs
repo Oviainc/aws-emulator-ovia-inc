@@ -845,8 +845,8 @@ async fn a_history_the_service_cannot_report_is_refused() {
         ),
         // The service answers every request refusal at HTTP 400 whatever 4xx its error
         // shape declares, keeping the modelled error code — the rule
-        // `tests/all/client_error_envelopes.rs` pins — except `AccessDeniedException`,
-        // which keeps its modelled 403.
+        // `tests/all/client_error_envelopes.rs` pins, which holds for the authorization
+        // refusal too.
         (
             "a budget that does not exist",
             ask("no-such-budget"),
@@ -856,7 +856,7 @@ async fn a_history_the_service_cannot_report_is_refused() {
         (
             "another account's budget",
             json!({"AccountId": account(210_987_654_321), "BudgetName": "monthly-budget"}),
-            403,
+            400,
             "AccessDeniedException",
         ),
         (

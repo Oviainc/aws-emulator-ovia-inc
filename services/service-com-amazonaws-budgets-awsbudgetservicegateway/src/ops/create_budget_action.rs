@@ -401,7 +401,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::record_action_event(
             &mut held,
             crate::state::EVENT_TYPE_CREATE_ACTION,
-            "The budget action was created.",
             now,
         );
         stored.actions.push(held);

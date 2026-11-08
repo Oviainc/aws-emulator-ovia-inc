@@ -38,7 +38,7 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
 
 use super::budget_action_execution::{
     describe_action, execute_action, make_settle_due, read_status, seed_action, seed_budget,
-    seed_status,
+    seed_pending_action, seed_status,
 };
 use super::budget_action_history::read_history;
 use super::budget_lifecycle::{caller_account, router, router_with_engine, same};
@@ -62,13 +62,6 @@ struct Row {
 /// The settle table.
 fn settle_rows() -> Vec<Row> {
     vec![
-        Row {
-            case: "approve an armed action",
-            from: ACTION_STATUS_STANDBY,
-            execution_type: EXECUTION_TYPE_APPROVE,
-            in_progress: ACTION_STATUS_EXECUTION_IN_PROGRESS,
-            settled: ACTION_STATUS_EXECUTION_SUCCESS,
-        },
         Row {
             case: "approve an action waiting for its manual approval",
             from: ACTION_STATUS_PENDING,
@@ -284,7 +277,7 @@ async fn the_clock_alone_appends_the_system_event() {
     let account_id = caller_account();
     let budget_name = "settles-on-the-clock";
     seed_budget(&router, &account_id, budget_name).await;
-    let action_id = seed_action(&router, &account_id, budget_name).await;
+    let action_id = seed_pending_action(&router, &account_id, budget_name).await;
 
     let (http, body) = execute_action(
         &router,
@@ -354,7 +347,7 @@ async fn each_execution_and_its_settle_are_recorded_in_order() {
     let account_id = caller_account();
     let budget_name = "settle-sequence";
     seed_budget(&router, &account_id, budget_name).await;
-    let action_id = seed_action(&router, &account_id, budget_name).await;
+    let action_id = seed_pending_action(&router, &account_id, budget_name).await;
 
     // One execution per settled status this state machine reaches, run back to back over
     // ONE action: approve it, reverse it, then re-arm it.
@@ -365,7 +358,7 @@ async fn each_execution_and_its_settle_are_recorded_in_order() {
     ];
     let mut expected: Vec<(String, String)> = vec![(
         EVENT_TYPE_CREATE_ACTION.to_string(),
-        ACTION_STATUS_STANDBY.to_string(),
+        ACTION_STATUS_PENDING.to_string(),
     )];
     for (execution_type, settled) in sequence {
         let case = format!("{execution_type} -> {settled}");

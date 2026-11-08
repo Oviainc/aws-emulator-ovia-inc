@@ -354,12 +354,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             action.subscribers = crate::state::distinct_subscribers(subscribers);
         }
         let new_action = held.action.clone();
-        crate::state::record_action_event(
-            held,
-            crate::state::EVENT_TYPE_UPDATE_ACTION,
-            "The budget action was updated.",
-            now,
-        );
+        crate::state::record_action_event(held, crate::state::EVENT_TYPE_UPDATE_ACTION, now);
 
         Ok(UpdateBudgetActionOutput {
             account_id: input.account_id,

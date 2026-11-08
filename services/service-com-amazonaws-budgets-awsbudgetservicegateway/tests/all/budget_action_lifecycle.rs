@@ -40,8 +40,8 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::ops::types::{
 };
 use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     action_is_in_progress, ComAmazonawsBudgetsAwsbudgetservicegatewayState, ACTION_SETTLES_AFTER,
-    ACTION_STATUS_EXECUTION_IN_PROGRESS, ACTION_STATUS_EXECUTION_SUCCESS,
-    ACTION_STATUS_RESET_IN_PROGRESS, ACTION_STATUS_REVERSE_IN_PROGRESS, ACTION_STATUS_STANDBY,
+    ACTION_STATUS_EXECUTION_IN_PROGRESS, ACTION_STATUS_EXECUTION_SUCCESS, ACTION_STATUS_PENDING,
+    ACTION_STATUS_RESET_IN_PROGRESS, ACTION_STATUS_REVERSE_IN_PROGRESS,
     EXECUTION_TYPE_APPROVE, EXECUTION_TYPE_RESET, EXECUTION_TYPE_REVERSE,
 };
 
@@ -127,7 +127,9 @@ async fn create_action(router: &MultiServiceRouter, create: &Value, case: &str) 
 }
 
 /// One `DeleteBudgetAction` call.
-async fn delete_action(
+///
+/// `pub(crate)` so the sibling suites in this test target delete an action the same way.
+pub(crate) async fn delete_action(
     router: &MultiServiceRouter,
     account_id: &str,
     budget_name: &str,
@@ -443,7 +445,7 @@ async fn an_action_whose_work_is_in_flight_is_locked_against_deletion() {
 
     for (from_status, execution_type, in_progress) in [
         (
-            ACTION_STATUS_STANDBY,
+            ACTION_STATUS_PENDING,
             EXECUTION_TYPE_APPROVE,
             ACTION_STATUS_EXECUTION_IN_PROGRESS,
         ),

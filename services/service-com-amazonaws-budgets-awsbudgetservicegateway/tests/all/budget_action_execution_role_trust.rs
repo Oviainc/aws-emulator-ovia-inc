@@ -8,7 +8,7 @@
 //! every write that establishes that member resolves the role first, and a role IAM
 //! answers for as one this account does not hold, or whose trust policy does not let this
 //! service's principal assume it, is refused with the modelled `AccessDeniedException`
-//! (HTTP 403, "You are not authorized to use this operation with the given parameters.")
+//! ("You are not authorized to use this operation with the given parameters.")
 //! with NOTHING written. The refusal names the role the request asked for and the grant it
 //! is missing.
 //!
@@ -38,9 +38,10 @@ use super::budget_action_execution::{email_subscriber, iam_definition};
 use super::budget_lifecycle::{caller_account, call, is_error, same};
 use super::client_error_envelopes::message;
 
-/// The status `AccessDeniedException` is answered with: its modelled `@httpError`
-/// (`smithy_query(query="shape",shape="AccessDeniedException")`).
-const REFUSAL_STATUS: u16 = 403;
+/// The status `AccessDeniedException` is answered with: HTTP 400, the status this service
+/// answers every refusal of a request at whatever 4xx the error shape's `@httpError`
+/// declares (`client_error_envelopes.rs`).
+const REFUSAL_STATUS: u16 = 400;
 
 /// The Region the IAM hop is addressed in; budgets is global and this harness signs its
 /// requests in `us-east-1`.
@@ -193,7 +194,8 @@ fn expected_message(execution_role_arn: &str) -> String {
 enum Verdict {
     /// The role is one this service can assume: the write is served.
     Served,
-    /// IAM answered that the role is not assumable by this service: the modelled 403.
+    /// IAM answered that the role is not assumable by this service: the modelled
+    /// `AccessDeniedException`.
     Unassumable,
     /// The role is not this account's at all, which the cross-member account rule refuses
     /// before IAM is asked.
@@ -321,7 +323,8 @@ async fn rows(iam: &::aws_sdk_iam::Client, account_id: &str) -> Vec<Row> {
 }
 
 /// RULE: `CreateBudgetAction` resolves the execution role before it persists anything — a
-/// role this service cannot assume is the modelled 403 with the documented sentence, and
+/// role this service cannot assume is the modelled `AccessDeniedException` with the
+/// documented sentence, and
 /// the budget still holds no action.
 #[tokio::test]
 async fn a_create_resolves_its_execution_role_before_it_persists_the_action() {

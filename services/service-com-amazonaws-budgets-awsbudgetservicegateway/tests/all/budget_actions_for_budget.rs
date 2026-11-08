@@ -42,14 +42,14 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::ops::types::{
 };
 use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     ACTION_SETTLES_AFTER, ACTION_STATUS_EXECUTION_IN_PROGRESS, ACTION_STATUS_EXECUTION_SUCCESS,
-    EXECUTION_TYPE_APPROVE, MAX_ACTIONS_PER_BUDGET,
+    ACTION_STATUS_PENDING, EXECUTION_TYPE_APPROVE, MAX_ACTIONS_PER_BUDGET,
 };
 
 use super::budget_action_execution::{
     create_body, created_status, definition_for, describe_action, email_subscriber, execute_action,
-    is_action_id, seed_action, seed_budget, sns_subscriber,
+    is_action_id, seed_action, seed_budget, seed_status, sns_subscriber,
 };
-use super::budget_lifecycle::{caller_account, call, is_error, router, same};
+use super::budget_lifecycle::{caller_account, call, is_error, router, router_with_engine, same};
 
 /// One row of the action table: a case name and the `CreateBudgetAction` body it creates.
 ///
@@ -501,7 +501,7 @@ async fn a_token_this_list_never_minted_and_a_page_size_out_of_range_are_refused
 /// siblings stay armed.
 #[tokio::test]
 async fn the_list_reports_the_status_the_clock_owes() {
-    let router = router();
+    let (router, engine) = router_with_engine();
     let account_id = caller_account();
     let table = action_rows(&account_id, "placeholder");
 
@@ -516,6 +516,16 @@ async fn the_list_reports_the_status_the_clock_owes() {
         }
         let case = format!("target {target} of {}: {}", table.len(), table[target].case);
 
+        // Only an action WAITING for its approval has an approval to give, and the
+        // created status of a row is the service's own reading of its threshold, so the
+        // target is put into that status before it is executed.
+        seed_status(
+            &engine,
+            &account_id,
+            &budget_name,
+            &created[target],
+            ACTION_STATUS_PENDING,
+        );
         let (status, body) = execute_action(
             &router,
             &account_id,

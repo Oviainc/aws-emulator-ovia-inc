@@ -640,7 +640,23 @@ async fn executing_an_action_records_one_execute_action_event() {
     let account_id = caller_account();
     let budget_name = "execution-history".to_string();
     create_budget(&router, &account_id, &budget_name).await;
-    let row = &action_catalog()[0];
+    // An action WAITING for its manual approval, which is the one status an
+    // `APPROVE_BUDGET_ACTION` is accepted from: the published minimum threshold is
+    // already reached by the zero ACTUAL spend every budget here reports.
+    let row = &Row {
+        case: "approve".to_string(),
+        action_type: ACTION_TYPE_VALUES[0],
+        notification_type: "ACTUAL",
+        approval_model: "MANUAL",
+        threshold_value: THRESHOLD_MIN,
+        threshold_type: THRESHOLD_TYPE_VALUES[0],
+        subscriber_count: SUBSCRIBERS_MIN,
+    };
+    assert_eq!(
+        row.created_status(),
+        ACTION_STATUS_PENDING,
+        "case approve: expected the row to create an action waiting for its approval"
+    );
     let action_id = create_action(&router, &account_id, &budget_name, row).await;
 
     let (status, body) = call(

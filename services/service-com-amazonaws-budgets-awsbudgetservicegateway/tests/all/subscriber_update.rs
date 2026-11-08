@@ -27,7 +27,7 @@
 //! the subscription type.
 //!
 //! The account gate every operation of this service shares — an `AccountId` that is not
-//! the caller's own is refused with the modelled 403 — is asserted for this operation
+//! the caller's own is refused with `AccessDeniedException` — is asserted for this operation
 //! among all of them in `account_scoping.rs`, and the ADDRESS rule every write that
 //! establishes a subscriber is held to in `subscriber_address_validation.rs`, so every
 //! request here names the caller's own account and a well-formed address.

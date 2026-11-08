@@ -23,7 +23,7 @@
 //! the type mix of the subscriber set.
 //!
 //! The account gate every operation of this service shares — an `AccountId` that is not
-//! the caller's own is refused with the modelled 403 — is asserted for this operation
+//! the caller's own is refused with `AccessDeniedException` — is asserted for this operation
 //! among all of them in `account_scoping.rs`, so every request here names the caller's
 //! own account.
 

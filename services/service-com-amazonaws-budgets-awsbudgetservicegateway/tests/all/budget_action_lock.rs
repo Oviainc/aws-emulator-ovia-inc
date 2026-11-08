@@ -30,7 +30,7 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::ops::types::ACTION_ST
 
 use super::budget_action_execution::{
     describe_action, email_subscriber, execute_action, make_settle_due, seed_action, seed_budget,
-    seed_status, sns_subscriber,
+    seed_pending_action, seed_status, sns_subscriber,
 };
 use super::budget_action_history::read_history;
 use super::budget_lifecycle::{caller_account, call, is_error, router_with_engine, same};
@@ -316,7 +316,7 @@ async fn the_clock_releases_the_lock_an_execution_took() {
     let account_id = caller_account();
     let budget_name = "locked-until-settled";
     seed_budget(&router, &account_id, budget_name).await;
-    let action_id = seed_action(&router, &account_id, budget_name).await;
+    let action_id = seed_pending_action(&router, &account_id, budget_name).await;
     let created = read_action(&router, &account_id, budget_name, &action_id, "created").await;
 
     let (http, body) = execute_action(

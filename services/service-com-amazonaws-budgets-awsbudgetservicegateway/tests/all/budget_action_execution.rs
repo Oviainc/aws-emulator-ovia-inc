@@ -13,8 +13,8 @@
 //! 2. `ExecuteBudgetAction` moves the action into the `*_IN_PROGRESS` status its
 //!    `ExecutionType` names, and the clock settles that status a span later; an
 //!    execution the action's current status does not allow — one its status leaves
-//!    nothing to do, or one aimed at work that is still running — is refused for that
-//!    state. The
+//!    nothing to do (the approval of an action nothing has triggered among them), or one
+//!    aimed at work that is still running — is refused for that state. The
 //!    rule is asserted over the WHOLE cross product of the modelled `ActionStatus` and
 //!    `ExecutionType` catalogs.
 //! 3. The settle is owed to the CLOCK, so it happens with no further call.
@@ -218,6 +218,29 @@ pub(crate) fn simple_create_body(account_id: &str, budget_name: &str) -> Value {
     )
 }
 
+/// The simplest action a row can create that is READY to be executed: an action whose
+/// threshold has already been reached and whose `ApprovalModel` is `MANUAL` is created
+/// waiting for that approval (`PENDING`), which is the status
+/// `APPROVE_BUDGET_ACTION` is accepted from. Every budget these suites seed reports an
+/// `ACTUAL` spend of zero, so a zero threshold — `NotificationThreshold`'s published
+/// `@range` minimum — is the one already reached.
+///
+/// `pub(crate)` so the sibling suites in this test target reach an executable action the
+/// same way.
+pub(crate) fn pending_create_body(account_id: &str, budget_name: &str) -> Value {
+    create_body(
+        account_id,
+        budget_name,
+        "APPLY_IAM_POLICY",
+        &iam_definition(),
+        "MANUAL",
+        "ACTUAL",
+        &json!({"ActionThresholdValue": 0.0, "ActionThresholdType": "PERCENTAGE"}),
+        &json!([email_subscriber(0)]),
+        None,
+    )
+}
+
 /// Create one action and answer its minted `ActionId`, failing the test if the setup
 /// call did not take.
 pub(crate) async fn seed_action(
@@ -225,12 +248,33 @@ pub(crate) async fn seed_action(
     account_id: &str,
     budget_name: &str,
 ) -> String {
-    let (status, body) = call(
-        router,
-        "CreateBudgetAction",
-        &simple_create_body(account_id, budget_name),
-    )
-    .await;
+    seed_action_from(router, &simple_create_body(account_id, budget_name), budget_name).await
+}
+
+/// As [`seed_action`], for an action created in the one status an approval is accepted
+/// from ([`pending_create_body`]).
+pub(crate) async fn seed_pending_action(
+    router: &MultiServiceRouter,
+    account_id: &str,
+    budget_name: &str,
+) -> String {
+    let action_id =
+        seed_action_from(router, &pending_create_body(account_id, budget_name), budget_name).await;
+    let status = read_status(router, account_id, budget_name, &action_id).await;
+    assert_eq!(
+        status, "PENDING",
+        "setup: expected the created action to be waiting for its approval, got {status:?}"
+    );
+    action_id
+}
+
+/// Create one action from `create` and answer the `ActionId` the service minted for it.
+async fn seed_action_from(
+    router: &MultiServiceRouter,
+    create: &Value,
+    budget_name: &str,
+) -> String {
+    let (status, body) = call(router, "CreateBudgetAction", create).await;
     assert_eq!(
         status, 200,
         "setup: expected CreateBudgetAction({budget_name}) to answer 200, got {status} {body}"
@@ -601,21 +645,16 @@ pub(crate) const IN_PROGRESS_STATUSES: [&str; 3] = [
 /// execution type, the `*_IN_PROGRESS` status it takes, the status the clock settles it
 /// to)`.
 ///
-/// `APPROVE_BUDGET_ACTION` executes an action that has not been applied; `REVERSE_…`
-/// takes an applied one back off; `RESET_…` re-arms one that has already run (and
-/// `ActionStatus` has no `RESET_SUCCESS`, so a completed reset leaves the action armed
-/// in `STANDBY`); `RETRY_…` runs the work that failed again, whichever operation that
-/// was. Every other pair of the catalogs has nothing to do and is refused.
+/// `APPROVE_BUDGET_ACTION` gives the approval a triggered action is waiting for;
+/// `REVERSE_…` takes an applied one back off; `RESET_…` re-arms one that has already run
+/// (and `ActionStatus` has no `RESET_SUCCESS`, so a completed reset leaves the action
+/// armed in `STANDBY`); `RETRY_…` runs the work that failed again, whichever operation
+/// that was. Every other pair of the catalogs has nothing to do — an armed `STANDBY`
+/// action has no triggered execution to approve — and is refused.
 ///
 /// `pub(crate)` so the sibling suite that asserts the refusal's WORDING reads the same
 /// matrix rather than copying it.
 pub(crate) const ALLOWED_EXECUTIONS: &[(&str, &str, &str, &str)] = &[
-    (
-        "STANDBY",
-        "APPROVE_BUDGET_ACTION",
-        "EXECUTION_IN_PROGRESS",
-        "EXECUTION_SUCCESS",
-    ),
     (
         "PENDING",
         "APPROVE_BUDGET_ACTION",
@@ -716,23 +755,6 @@ async fn an_execution_moves_the_action_only_where_its_status_leaves_work() {
                 .iter()
                 .find(|(from, execution, _, _)| from == status && execution == execution_type);
 
-            if IN_PROGRESS_STATUSES.contains(status) {
-                assert_eq!(
-                    http, 400,
-                    "case {case:?}: expected an in-flight action to be refused with 400, got {http} {body}"
-                );
-                assert!(
-                    is_error(&body, "ResourceLockedException"),
-                    "case {case:?}: expected ResourceLockedException, got {body}"
-                );
-                let read = read_status(&router, &account_id, budget_name, &action_id).await;
-                assert_eq!(
-                    read, *status,
-                    "case {case:?}: expected the refusal to leave the status alone, got {read:?}"
-                );
-                continue;
-            }
-
             let Some((_, _, in_progress, settled)) = allowed else {
                 assert_eq!(
                     http, 400,
@@ -801,7 +823,7 @@ async fn the_clock_settles_an_execution_with_no_further_call() {
     let account_id = caller_account();
     let budget_name = "action-settles-on-the-clock";
     seed_budget(&router, &account_id, budget_name).await;
-    let action_id = seed_action(&router, &account_id, budget_name).await;
+    let action_id = seed_pending_action(&router, &account_id, budget_name).await;
 
     // The window a transition this emulator owes falls due in.
     let floor = Duration::from_millis(250);

@@ -19,8 +19,7 @@
 //!    rest.
 //! 4. A `NextToken` this list never minted is an `InvalidNextTokenException`,
 //!    `MaxResults` outside its published `@range` is refused at request validation, and
-//!    an `AccountId` that is not the caller's keeps `AccessDeniedException`'s modelled
-//!    403.
+//!    an `AccountId` that is not the caller's is an `AccessDeniedException`.
 //! 5. The statuses listed are the ones the CLOCK already owed, and repeating the list
 //!    changes nothing a later caller sees.
 //! 6. An action is a resource OF the budget that owns it, so deleting that budget takes
@@ -42,14 +41,16 @@ use std::time::Duration;
 
 use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     ACTION_SETTLES_AFTER, ACTION_STATUS_EXECUTION_IN_PROGRESS, ACTION_STATUS_EXECUTION_SUCCESS,
-    EXECUTION_TYPE_APPROVE, MAX_ACTIONS_PER_BUDGET,
+    ACTION_STATUS_PENDING, EXECUTION_TYPE_APPROVE, MAX_ACTIONS_PER_BUDGET,
 };
 
 use super::budget_action_execution::{
-    created_status, describe_action, execute_action, seed_budget, simple_create_body,
+    created_status, describe_action, execute_action, seed_budget, seed_status, simple_create_body,
 };
 use super::budget_actions_for_budget::{action_rows, create_action, ids_of, list_actions};
-use super::budget_lifecycle::{account, caller_account, call, is_error, router, same};
+use super::budget_lifecycle::{
+    account, caller_account, call, is_error, router, router_with_engine, same,
+};
 
 /// The most actions one page of this operation can hold, and so the page a request
 /// naming no `MaxResults` is served: `DescribeBudgetActionsForAccountResponse$Actions` is
@@ -428,7 +429,8 @@ async fn an_absent_max_results_is_capped_at_the_page_the_output_list_holds() {
 /// `InvalidNextTokenException` instead of silently serving the first page; `MaxResults`
 /// outside its published `@range(min: 1, max: 100)` is refused at request validation
 /// while both published bounds are accepted; and an `AccountId` that is not the caller's
-/// keeps `AccessDeniedException`'s modelled 403.
+/// keeps `AccessDeniedException` — answered, like every other refusal of a request this
+/// service makes, at HTTP 400.
 #[tokio::test]
 async fn bad_tokens_page_sizes_and_accounts_are_refused() {
     let router = router();
@@ -500,8 +502,8 @@ async fn bad_tokens_page_sizes_and_accounts_are_refused() {
     for other in [account(1), account(999_999_999_999), account(123_456_789_012)] {
         let (status, body) = list_for_account(&router, &other, None, None).await;
         assert_eq!(
-            status, 403,
-            "case AccountId={other:?}: expected the modelled 403, got {status} {body}"
+            status, 400,
+            "case AccountId={other:?}: expected the refusal at HTTP 400, got {status} {body}"
         );
         assert!(
             is_error(&body, "AccessDeniedException"),
@@ -525,7 +527,7 @@ async fn the_account_list_reports_the_status_the_clock_owes() {
 
     for target in targets {
         // One store per row, so each row executes exactly one action of a fresh account.
-        let router = router();
+        let (router, engine) = router_with_engine();
         let account_id = caller_account();
         let seeded = seed_account(&router, &account_id).await;
         let expected = flattened(&seeded);
@@ -536,6 +538,16 @@ async fn the_account_list_reports_the_status_the_clock_owes() {
             .unwrap_or_default();
         let case = format!("action {target} of {}, held by {owner:?}", expected.len());
 
+        // Only an action WAITING for its approval has an approval to give, and the
+        // created status of a seeded action is the service's own reading of its
+        // threshold, so the target is put into that status before it is executed.
+        seed_status(
+            &engine,
+            &account_id,
+            &owner,
+            &expected[target],
+            ACTION_STATUS_PENDING,
+        );
         let (status, body) = execute_action(
             &router,
             &account_id,

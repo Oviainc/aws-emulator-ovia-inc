@@ -6,9 +6,9 @@
 //! Two rules, each asserted over a table that spans its class rather than the one
 //! request the issue recorded:
 //!
-//! 1. A refusal of the request — its values, the state of the resource it names, a
-//!    quota — is answered with HTTP 400 whatever 4xx its error shape's `@httpError`
-//!    declares. The `__type` and the members stay the model's.
+//! 1. A refusal of the request — its values, the authorization it carries, the state of
+//!    the resource it names, a quota — is answered with HTTP 400 whatever 4xx its error
+//!    shape's `@httpError` declares. The `__type` and the members stay the model's.
 //! 2. A value outside a constraint the MODEL declares is refused at request
 //!    validation: HTTP 400, error code `ValidationException`, and a message built from
 //!    the request that names the failing member path and the constraint it violated.
@@ -63,10 +63,8 @@ struct Refusal {
 /// error shape declares; the error code stays the shape the model names.
 ///
 /// The rows differ along the error shape and so along the modelled status folded in
-/// (404, 409, 402) as well as the statuses already at 400 (400 shapes, and the
+/// (404, 409, 403) as well as the statuses already at 400 (400 shapes, and the
 /// framework's own `ValidationException`), and along the operation that answers it.
-/// `AccessDeniedException` is the one refusal NOT folded in — it keeps its modelled
-/// 403, which `account_scoping.rs` asserts.
 #[tokio::test]
 async fn every_request_refusal_is_answered_at_http_400() {
     let router = router();
@@ -130,6 +128,17 @@ async fn every_request_refusal_is_answered_at_http_400() {
             request: json!({"AccountId": &account_id, "Budget": valid_budget("stored")}),
             exception: "DuplicateRecordException",
             modeled_status: 409,
+        },
+        // AccessDeniedException — "You are not authorized to use this operation with the
+        // given parameters", @httpError 403. Every operation is scoped to the account the
+        // caller signed with (`account_scoping.rs`), so an `AccountId` naming another one
+        // is this refusal, folded in like the rest.
+        Refusal {
+            case: "DescribeBudget for an account that is not the caller's",
+            operation: "DescribeBudget",
+            request: json!({"AccountId": "210987654321", "BudgetName": "stored"}),
+            exception: "AccessDeniedException",
+            modeled_status: 403,
         },
         // InvalidParameterException — @httpError 400 already, so the mapping must
         // leave it alone: a documented cross-member rule, not a modelled constraint.

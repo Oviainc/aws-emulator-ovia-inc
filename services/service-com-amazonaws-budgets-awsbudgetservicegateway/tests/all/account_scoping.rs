@@ -7,7 +7,7 @@
 //! its caller signs as (`engine::emulator_account_id`). So the RULE asserted here:
 //!
 //! > a request whose `AccountId` is not the caller's own account is refused with the
-//! > modelled `AccessDeniedException` (HTTP 403) before it reads or writes anything, and
+//! > modelled `AccessDeniedException` before it reads or writes anything, and
 //! > the same request naming the caller's own account is served.
 //!
 //! The tables span the class the rule generalises over: EVERY implemented operation of
@@ -30,15 +30,14 @@ use std::sync::Arc;
 
 use service_com_amazonaws_budgets_awsbudgetservicegateway::state::ComAmazonawsBudgetsAwsbudgetservicegatewayState;
 
-use super::budget_action_execution::{email_subscriber, simple_create_body};
+use super::budget_action_execution::{email_subscriber, pending_create_body, simple_create_body};
 use super::budget_lifecycle::{account, caller_account, call, is_error, router_with_engine};
 use super::resource_tags::{action_arn, budget_arn, reported, tag_list};
 
-/// The status `AccessDeniedException` is answered with: its modelled `@httpError`
-/// (`smithy_query(query="shape",shape="AccessDeniedException")`), which this service
-/// does NOT fold into 400 — unlike a refusal of the request's values or of the state of
-/// the resource it names (`client_error_envelopes.rs`).
-const REFUSAL_STATUS: u16 = 403;
+/// The status `AccessDeniedException` is answered with: HTTP 400, the status this service
+/// answers EVERY refusal of a request at whatever 4xx the error shape's `@httpError`
+/// declares (`client_error_envelopes.rs`), the authorization refusal included.
+const REFUSAL_STATUS: u16 = 400;
 
 /// The budget every row addresses, and the notification and action created on it.
 const BUDGET: &str = "scoped";
@@ -151,10 +150,13 @@ async fn seeded() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>, String) {
         status, 200,
         "setup: expected CreateBudget to answer 200, got {status} {body}"
     );
+    // The action is created WAITING for its approval, which is the status
+    // `ExecuteBudgetAction`'s `APPROVE_BUDGET_ACTION` is accepted from, so the row that
+    // executes it under the caller's own account has work to do.
     let (status, body) = call(
         &router,
         "CreateBudgetAction",
-        &simple_create_body(&own, BUDGET),
+        &pending_create_body(&own, BUDGET),
     )
     .await;
     assert_eq!(
@@ -314,8 +316,8 @@ fn stored_keys(engine: &Arc<engine::InMemoryEngine>) -> Vec<(String, String)> {
 }
 
 /// RULE: a request whose `AccountId` is not the caller's own is refused with
-/// `AccessDeniedException` at HTTP 403 — on every operation, for every foreign account
-/// id — and it neither reports nor changes anything.
+/// `AccessDeniedException` at [`REFUSAL_STATUS`] — on every operation, for every foreign
+/// account id — and it neither reports nor changes anything.
 #[tokio::test]
 async fn every_operation_refuses_an_account_that_is_not_the_callers() {
     let (router, engine, action_id) = seeded().await;
@@ -388,7 +390,7 @@ async fn every_operation_refuses_an_account_that_is_not_the_callers() {
 /// RULE, the other side: the gate refuses ONLY a foreign account. Every one of those
 /// same requests, sent for the caller's own account against a store seeded the same way,
 /// is served — so none of them is refused with `AccessDeniedException` and none answers
-/// 403.
+/// [`REFUSAL_STATUS`].
 ///
 /// Each row gets a store of its own, because the operations are destructive of each
 /// other (a delete removes what the next row's read addresses). The table is rebuilt per
@@ -469,8 +471,9 @@ fn arn_rows(account_id: &str, action_id: &str) -> Vec<(&'static str, String, boo
 
 /// RULE, over the tag plane: the account a request names is refused the same way whether
 /// it arrives as an `AccountId` member or as the account field of a `ResourceARN`. An ARN
-/// of an account that is not the caller's is answered `AccessDeniedException` at HTTP 403
-/// — not the `NotFoundException` a lookup under that account would produce — and it
+/// of an account that is not the caller's is answered `AccessDeniedException` at
+/// [`REFUSAL_STATUS`] — not the `NotFoundException` a lookup under that account would
+/// produce — and it
 /// neither reports nor changes anything.
 #[tokio::test]
 async fn the_tag_plane_refuses_an_arn_whose_account_is_not_the_callers() {

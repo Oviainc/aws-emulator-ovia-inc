@@ -19,6 +19,8 @@ mod account_scoping;
 mod action_arn_name_boundary;
 #[path = "all/attached_notification_identity.rs"]
 mod attached_notification_identity;
+#[path = "all/budget_action_approval_gate.rs"]
+mod budget_action_approval_gate;
 #[path = "all/budget_action_execution.rs"]
 mod budget_action_execution;
 #[path = "all/budget_action_execution_role.rs"]
@@ -27,12 +29,16 @@ mod budget_action_execution_role;
 mod budget_action_execution_role_trust;
 #[path = "all/budget_action_history.rs"]
 mod budget_action_history;
+#[path = "all/budget_action_history_wording.rs"]
+mod budget_action_history_wording;
 #[path = "all/budget_action_lifecycle.rs"]
 mod budget_action_lifecycle;
 #[path = "all/budget_action_lock.rs"]
 mod budget_action_lock;
 #[path = "all/budget_action_read_purity.rs"]
 mod budget_action_read_purity;
+#[path = "all/budget_action_refusal_fidelity.rs"]
+mod budget_action_refusal_fidelity;
 #[path = "all/budget_action_role_account_scope.rs"]
 mod budget_action_role_account_scope;
 #[path = "all/budget_action_settle_history.rs"]
