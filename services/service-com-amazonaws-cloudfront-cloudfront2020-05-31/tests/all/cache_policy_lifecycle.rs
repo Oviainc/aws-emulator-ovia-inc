@@ -9,8 +9,9 @@
 //!
 //! * a policy is PERSISTED by the call that creates it, which MINTS its identity (a UUID
 //!   `Id` and a version token), so a later `GetCachePolicy` and `GetCachePolicyConfig`
-//!   answer from that record rather than from the request being served — down to the
-//!   members the create left out;
+//!   answer from that record rather than from the request being served — with the members
+//!   the create left out carrying the values CloudFront supplies for them (`DefaultTTL`,
+//!   `MaxTTL` and `EnableAcceptEncodingBrotli`);
 //! * the three TTLs are ORDERED (`MinTTL` <= `DefaultTTL` <= `MaxTTL`, over the members a
 //!   request supplies), and a TTL is an amount of time in seconds so it is never negative:
 //!   a configuration that breaks either is refused with `InvalidArgument` and stores
@@ -206,6 +207,26 @@ impl Policy {
         out.push_str("</CachePolicyConfig>");
         out
     }
+
+    /// The `DefaultTTL` the stored policy runs under: the one this configuration submits,
+    /// or the documented default CloudFront supplies for a configuration that submits none
+    /// — "86400 seconds (one day). If the value of `MinTTL` is more than 86400 seconds,
+    /// then the default value for this field is the same as the value of `MinTTL`"
+    /// (`smithy_query(query="doc",shape="CachePolicyConfig",member="DefaultTTL")`).
+    pub(crate) fn effective_default_ttl(&self) -> i64 {
+        self.default_ttl
+            .unwrap_or_else(|| self.min_ttl.max(DOCUMENTED_DEFAULT_TTL))
+    }
+
+    /// The `MaxTTL` the stored policy runs under: the one this configuration submits, or
+    /// the documented default — "31536000 seconds (one year). If the value of `MinTTL` or
+    /// `DefaultTTL` is more than 31536000 seconds, then the default value for this field is
+    /// the same as the value of `DefaultTTL`"
+    /// (`smithy_query(query="doc",shape="CachePolicyConfig",member="MaxTTL")`).
+    pub(crate) fn effective_max_ttl(&self) -> i64 {
+        self.max_ttl
+            .unwrap_or_else(|| self.effective_default_ttl().max(DOCUMENTED_MAX_TTL))
+    }
 }
 
 /// One CloudFront name list wrapper: its `Quantity` and its `Items`, each item in the
@@ -367,8 +388,9 @@ pub(crate) fn policy_table() -> Vec<Policy> {
 // Reading what the service stored
 // ---------------------------------------------------------------------------
 
-/// Assert the `CachePolicyConfig` element `config` reports exactly what `policy`
-/// submitted: every member it carried, and no element for a member it left out.
+/// Assert the `CachePolicyConfig` element `config` reports the configuration the stored
+/// policy runs under: every member `policy` carried, and for a member it left out the value
+/// CloudFront supplies for that member.
 pub(crate) fn assert_config(config: &Node, policy: &Policy, context: &str, raw: &str) {
     let case = policy.case;
 
@@ -396,9 +418,23 @@ pub(crate) fn assert_config(config: &Node, policy: &Policy, context: &str, raw: 
         policy.name
     );
 
-    assert_ttl(config, "MinTTL", Some(policy.min_ttl), case, context, raw);
-    assert_ttl(config, "DefaultTTL", policy.default_ttl, case, context, raw);
-    assert_ttl(config, "MaxTTL", policy.max_ttl, case, context, raw);
+    assert_ttl(config, "MinTTL", policy.min_ttl, case, context, raw);
+    assert_ttl(
+        config,
+        "DefaultTTL",
+        policy.effective_default_ttl(),
+        case,
+        context,
+        raw,
+    );
+    assert_ttl(
+        config,
+        "MaxTTL",
+        policy.effective_max_ttl(),
+        case,
+        context,
+        raw,
+    );
 
     let Some(parameters) = &policy.parameters else {
         assert_absent(
@@ -425,18 +461,15 @@ pub(crate) fn assert_config(config: &Node, policy: &Policy, context: &str, raw: 
         "case {case} ({context}): expected EnableAcceptEncodingGzip {}, got {gzip:?}",
         parameters.gzip
     );
-    match parameters.brotli {
-        Some(brotli) => {
-            let actual = text(block, "EnableAcceptEncodingBrotli", case, context, raw);
-            assert_eq!(
-                actual,
-                brotli.to_string(),
-                "case {case} ({context}): expected EnableAcceptEncodingBrotli {brotli}, got \
-                 {actual:?}"
-            );
-        }
-        None => assert_absent(block, "EnableAcceptEncodingBrotli", case, context),
-    }
+    // `EnableAcceptEncodingBrotli` is optional in the request and reported either way: a
+    // block that names only the gzip flag describes the brotli flag's off position.
+    let brotli = parameters.brotli.unwrap_or(false);
+    let actual = text(block, "EnableAcceptEncodingBrotli", case, context, raw);
+    assert_eq!(
+        actual,
+        brotli.to_string(),
+        "case {case} ({context}): expected EnableAcceptEncodingBrotli {brotli}, got {actual:?}"
+    );
 
     let behavior = text(block, "HeadersConfig/HeaderBehavior", case, context, raw);
     assert_eq!(
@@ -493,20 +526,10 @@ pub(crate) fn assert_config(config: &Node, policy: &Policy, context: &str, raw: 
     );
 }
 
-/// Assert one TTL member reports the value the request submitted, or is absent entirely
-/// when the request left it out — the service invents no TTL for a member it was not given.
-fn assert_ttl(
-    config: &Node,
-    member: &str,
-    expected: Option<i64>,
-    case: &str,
-    context: &str,
-    raw: &str,
-) {
-    let Some(expected) = expected else {
-        assert_absent(config, member, case, context);
-        return;
-    };
+/// Assert one TTL member reports the value the stored policy runs under: the one the
+/// request submitted, or the documented default the service supplied for a member the
+/// request left out.
+fn assert_ttl(config: &Node, member: &str, expected: i64, case: &str, context: &str, raw: &str) {
     let actual = text(config, member, case, context, raw);
     assert_eq!(
         actual,

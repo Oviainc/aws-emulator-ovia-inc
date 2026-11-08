@@ -95,7 +95,8 @@ use crate::ops::types::{
     NoSuchResponseHeadersPolicy, Origin, OriginAccessControl, OriginAccessControlConfig,
     OriginAccessControlSummary, OriginRequestPolicy, OriginRequestPolicyAlreadyExists,
     OriginRequestPolicyConfig, OriginSslProtocols, Parameter, ParameterDefinition, Paths,
-    PublicKey, PublicKeyConfig, PublicKeySummary, QueryArgProfile, ResponseHeadersPolicy,
+    PublicKey, PublicKeyConfig, PublicKeySummary, QueryArgProfile, QueryArgProfileConfig,
+    QueryArgProfiles, ResponseHeadersPolicy,
     ResponseHeadersPolicyAlreadyExists, ResponseHeadersPolicyConfig, Restrictions,
     SessionStickinessConfig, Signer, StreamingDistribution, StreamingDistributionConfig,
     StreamingDistributionSummary, StreamingLoggingConfig, StringSchemaConfig, Tag, Tags,
@@ -2273,9 +2274,10 @@ pub struct StoredCachePolicy {
     /// `CachePolicy$Id` — the identifier minted when the policy was created, and the key
     /// the policy is held under.
     pub id: String,
-    /// The configuration as submitted — "A cache policy configuration." Stored whole, so
-    /// a read reports what was stored rather than re-deriving anything from a request,
-    /// down to the members the create left out.
+    /// The configuration the policy runs under — "A cache policy configuration." Stored
+    /// RESOLVED, so a read reports what was stored rather than re-deriving anything from a
+    /// request: a member the create left out carries the value CloudFront supplies for it
+    /// ([`resolve_cache_policy_config`]).
     pub config: CachePolicyConfig,
     /// `CachePolicy$LastModifiedTime` — "The date and time when the cache policy was last
     /// modified."
@@ -3178,9 +3180,9 @@ pub struct StoredPublicKey {
     /// `PublicKey$CreatedTime` — "The date and time when the public key was uploaded."
     /// Written once, by the create, so every later read reports the same instant.
     pub created_time: SystemTime,
-    /// The configuration as submitted — stored whole, so a read reports what was stored
-    /// rather than re-deriving anything from a request, down to the members the create
-    /// left out.
+    /// The configuration the key is held under — stored RESOLVED, so a read reports what
+    /// was stored rather than re-deriving anything from a request: a member the create left
+    /// out carries the value CloudFront supplies for it ([`resolve_public_key_config`]).
     pub config: PublicKeyConfig,
     /// The version token the last mutation handed back, and the single source of truth
     /// for every `If-Match` check against this public key.
@@ -3201,9 +3203,9 @@ impl StoredPublicKey {
     /// The `PublicKeySummary` a listing reports for this key.
     ///
     /// Every member is the stored record's: `PublicKeySummary` repeats the configuration's
-    /// `Name`, `EncodedKey` and `Comment` beside the identity the create minted, and
-    /// `Comment` is optional on both, so a key uploaded without one is summarised without
-    /// one rather than with an empty element invented by the read.
+    /// `Name`, `EncodedKey` and `Comment` beside the identity the create minted, so the
+    /// summary reports the `Comment` the stored configuration carries and the read invents
+    /// nothing of its own.
     pub fn to_summary(&self) -> PublicKeySummary {
         PublicKeySummary {
             id: self.id.clone(),
@@ -3278,9 +3280,10 @@ pub struct StoredFieldLevelEncryptionProfile {
     /// encryption profile was updated", which for a profile nothing has updated yet is the
     /// instant the create stored it.
     pub last_modified_time: SystemTime,
-    /// The configuration as submitted — stored whole, so a read reports what was stored
-    /// rather than re-deriving anything from a request, down to the members the create
-    /// left out.
+    /// The configuration the profile runs under — stored RESOLVED, so a read reports what
+    /// was stored rather than re-deriving anything from a request: a member the create left
+    /// out carries the value CloudFront supplies for it
+    /// ([`resolve_field_level_encryption_profile_config`]).
     pub config: FieldLevelEncryptionProfileConfig,
     /// The version token the last mutation handed back, and the single source of truth for
     /// every `If-Match` check against this profile.
@@ -3302,9 +3305,8 @@ impl StoredFieldLevelEncryptionProfile {
     ///
     /// Every member is the stored record's: the summary repeats the configuration's `Name`,
     /// `EncryptionEntities` and `Comment` beside the identity the create minted and the
-    /// instant that record was last written, and `Comment` is optional on both, so a profile
-    /// created without one is summarised without one rather than with an empty element
-    /// invented by the read.
+    /// instant that record was last written, so the summary reports the `Comment` the
+    /// stored configuration carries and the read invents nothing of its own.
     pub fn to_summary(&self) -> FieldLevelEncryptionProfileSummary {
         FieldLevelEncryptionProfileSummary {
             id: self.id.clone(),
@@ -3336,9 +3338,10 @@ pub struct StoredFieldLevelEncryptionConfig {
     /// configuration was changed", which for a configuration nothing has changed yet is the
     /// instant the create stored it.
     pub last_modified_time: SystemTime,
-    /// The configuration as submitted — stored whole, so a read reports what was stored
-    /// rather than re-deriving anything from a request, down to the members the create
-    /// left out.
+    /// The configuration the resource runs under — stored RESOLVED, so a read reports what
+    /// was stored rather than re-deriving anything from a request: a member the create left
+    /// out carries the value CloudFront supplies for it
+    /// ([`resolve_field_level_encryption_config`]).
     pub config: FieldLevelEncryptionConfig,
     /// The version token the last mutation handed back, and the single source of truth for
     /// every `If-Match` check against this configuration.
@@ -3360,9 +3363,9 @@ impl StoredFieldLevelEncryptionConfig {
     ///
     /// Every member is the stored record's: the summary repeats the stored configuration's
     /// `Comment`, `QueryArgProfileConfig` and `ContentTypeProfileConfig` beside the identity
-    /// the create minted, and all three are optional on both, so a configuration stored
-    /// without one is summarised without one rather than with an element invented by the
-    /// read. `CallerReference` is not a summary member, so it is not reported here.
+    /// the create minted, so the summary reports what the stored configuration carries —
+    /// the members the service resolved into it included — and the read invents nothing of
+    /// its own. `CallerReference` is not a summary member, so it is not reported here.
     pub fn to_summary(&self) -> FieldLevelEncryptionSummary {
         FieldLevelEncryptionSummary {
             id: self.id.clone(),

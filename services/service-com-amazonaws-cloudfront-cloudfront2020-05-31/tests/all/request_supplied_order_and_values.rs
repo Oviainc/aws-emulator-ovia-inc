@@ -421,26 +421,21 @@ async fn a_configuration_reports_the_values_submitted() {
     }
 }
 
-/// Assert that one serialised element reports each optional section exactly as `row` submitted
-/// it: present only when the request carried it, each required flag at the submitted value,
-/// and each content type mapping's members as submitted.
+/// Assert that one serialised element reports each section as the stored configuration
+/// carries it: `QueryArgProfileConfig` always — a configuration that submits none carries
+/// the mapping that maps nothing, under the forwarding flag the service supplies —
+/// `ContentTypeProfileConfig` only when the request carried it, each required flag at the
+/// submitted value, and each content type mapping's members as submitted.
 fn assert_sections(row: &Config, node: &Node, case: &str, context: &str, raw: &str) {
-    match &row.query_arg {
-        None => assert!(
-            node.at("QueryArgProfileConfig").is_none(),
-            "case {case:?} ({context}): expected no QueryArgProfileConfig, got {raw}"
-        ),
-        Some(section) => {
-            let flag = node.text_at("QueryArgProfileConfig/ForwardWhenQueryArgProfileIsUnknown");
-            assert_eq!(
-                flag,
-                Some(section.forward_when_unknown.to_string().as_str()),
-                "case {case:?} ({context}): expected ForwardWhenQueryArgProfileIsUnknown {}, got \
-                 {flag:?} in {raw}",
-                section.forward_when_unknown
-            );
-        }
-    }
+    let query_arg = row.effective_query_arg();
+    let flag = node.text_at("QueryArgProfileConfig/ForwardWhenQueryArgProfileIsUnknown");
+    assert_eq!(
+        flag,
+        Some(query_arg.forward_when_unknown.to_string().as_str()),
+        "case {case:?} ({context}): expected ForwardWhenQueryArgProfileIsUnknown {}, got \
+         {flag:?} in {raw}",
+        query_arg.forward_when_unknown
+    );
 
     match &row.content_type {
         None => assert!(

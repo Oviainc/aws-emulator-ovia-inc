@@ -3649,6 +3649,155 @@ pub(super) fn resolve_origin(mut origin: Origin) -> Origin {
     origin
 }
 
+/// Resolve every member of a submitted `CachePolicyConfig` that the SERVICE supplies.
+///
+/// The same rule [`resolve_distribution_config`] states, over a cache policy: a member a
+/// request leaves out is not unset on the policy — it takes the value CloudFront applies,
+/// and the policy then runs under, and reports, the resolved configuration. So the
+/// resolution happens once, when the configuration is STORED (by `CreateCachePolicy` and by
+/// [`ComAmazonawsCloudfrontCloudfront20200531State::apply_cache_policy_config`]), and the
+/// create, every later read and every read-modify-write round trip answer from the resolved
+/// record.
+///
+/// Three members are resolved, each one the documentation states a value for:
+///
+/// * `DefaultTTL` — "The default value for this field is 86400 seconds (one day). If the
+///   value of `MinTTL` is more than 86400 seconds, then the default value for this field is
+///   the same as the value of `MinTTL`" ([`DEFAULT_DEFAULT_TTL`] is that one day);
+/// * `MaxTTL` — "The default value for this field is 31536000 seconds (one year). If the
+///   value of `MinTTL` or `DefaultTTL` is more than 31536000 seconds, then the default value
+///   for this field is the same as the value of `DefaultTTL`" ([`DEFAULT_MAX_TTL`] is that
+///   one year), compared against the `DefaultTTL` resolved above, which is never below
+///   `MinTTL`;
+/// * `ParametersInCacheKeyAndForwardedToOrigin$EnableAcceptEncodingBrotli` — the flag's off
+///   position, which is what a cache key block naming only the gzip flag describes: "If both
+///   of these fields are `false`, then CloudFront treats the `Accept-Encoding` header the
+///   same as any other HTTP header in the viewer request."
+///
+/// Nothing else is: `Comment` is free text the policy was created with, and the cache key
+/// block as a whole is a CHOICE the configuration either made or did not, so a policy that
+/// states no cache key parameters is stored with none rather than with a cache key invented
+/// here.
+///
+/// The TTL ORDERING a configuration is admitted under is checked over the members the
+/// request SUPPLIES, before this resolution and for the reason
+/// [`cache_policy_config_invalid`] states.
+pub fn resolve_cache_policy_config(mut config: CachePolicyConfig) -> CachePolicyConfig {
+    let default_ttl = config
+        .default_ttl
+        .unwrap_or_else(|| config.min_ttl.max(DEFAULT_DEFAULT_TTL));
+    config.default_ttl = Some(default_ttl);
+    config.max_ttl = Some(
+        config
+            .max_ttl
+            .unwrap_or_else(|| default_ttl.max(DEFAULT_MAX_TTL)),
+    );
+    if let Some(parameters) = config
+        .parameters_in_cache_key_and_forwarded_to_origin
+        .as_mut()
+    {
+        parameters.enable_accept_encoding_brotli = Some(
+            parameters
+                .enable_accept_encoding_brotli
+                .unwrap_or(DEFAULT_ENABLE_ACCEPT_ENCODING_BROTLI),
+        );
+    }
+    config
+}
+
+/// `ParametersInCacheKeyAndForwardedToOrigin$EnableAcceptEncodingBrotli` for a cache key
+/// block that names only the gzip flag: the flag's off position — "If both of these fields
+/// are `false`, then CloudFront treats the `Accept-Encoding` header the same as any other
+/// HTTP header in the viewer request. By default, it's not included in the cache key and
+/// it's not included in origin requests."
+pub const DEFAULT_ENABLE_ACCEPT_ENCODING_BROTLI: bool = false;
+
+/// Resolve every member of a submitted `FieldLevelEncryptionConfig` that the SERVICE
+/// supplies.
+///
+/// [`resolve_distribution_config`]'s rule, over a field-level encryption configuration:
+///
+/// * `Comment` is "An optional comment about the configuration" — free text the
+///   configuration carries, which for one that states none is the empty text rather than no
+///   member at all, so a round trip through `UpdateFieldLevelEncryptionConfig` does not turn
+///   the member's presence into its absence;
+/// * `QueryArgProfileConfig` is the mapping every stored configuration carries — an update
+///   of one cannot leave it out ([`QUERY_ARG_PROFILE_CONFIG_REQUIRED_MESSAGE`]) — so a
+///   configuration created without one carries the mapping that maps nothing
+///   ([`default_query_arg_profile_config`]).
+///
+/// `ContentTypeProfileConfig` is left exactly as submitted: it is a CHOICE a configuration
+/// either made or did not, and neither the model nor the update rule makes it a member of
+/// every stored configuration. A `QueryArgProfileConfig` the request DID state is stored as
+/// stated, down to its own optional `QueryArgProfiles` wrapper: what the service supplies is
+/// the whole mapping for a configuration that states none, not a member inside one it
+/// states.
+pub fn resolve_field_level_encryption_config(
+    mut config: FieldLevelEncryptionConfig,
+) -> FieldLevelEncryptionConfig {
+    config.comment = Some(config.comment.unwrap_or_default());
+    config.query_arg_profile_config = Some(
+        config
+            .query_arg_profile_config
+            .unwrap_or_else(default_query_arg_profile_config),
+    );
+    config
+}
+
+/// The `QueryArgProfiles` wrapper of a mapping that maps no query argument to a profile:
+/// `Quantity` 0 beside no entries.
+fn empty_query_arg_profiles() -> QueryArgProfiles {
+    QueryArgProfiles {
+        quantity: 0,
+        items: Some(Vec::new()),
+    }
+}
+
+/// The query argument-profile mapping a field-level encryption configuration that states
+/// none carries: a mapping of no query argument to any profile, under which a request
+/// naming a profile CloudFront cannot resolve is still forwarded to the origin.
+///
+/// `QueryArgProfileConfig$ForwardWhenQueryArgProfileIsUnknown` is REQUIRED by the model, so
+/// the mapping cannot be half-present: a configuration that leaves the whole block out
+/// still carries the flag, and the value it carries is the one that forwards — "Flag to set
+/// if you want a request to be forwarded to the origin even if the profile specified by the
+/// field-level encryption query argument, fle-profile, is unknown" — since a configuration
+/// that maps no query argument to a profile cannot have meant to drop the requests it does
+/// not recognise.
+pub fn default_query_arg_profile_config() -> QueryArgProfileConfig {
+    QueryArgProfileConfig {
+        forward_when_query_arg_profile_is_unknown: true,
+        query_arg_profiles: Some(empty_query_arg_profiles()),
+    }
+}
+
+/// Resolve every member of a submitted `FieldLevelEncryptionProfileConfig` that the SERVICE
+/// supplies.
+///
+/// `Comment` is "An optional comment for the field-level encryption profile" — free text the
+/// profile carries, which for one that states none is the empty text rather than no member
+/// at all, so a round trip through `UpdateFieldLevelEncryptionProfile` does not turn the
+/// member's presence into its absence. `Name`, `CallerReference` and `EncryptionEntities`
+/// are required, so nothing is supplied for them.
+pub fn resolve_field_level_encryption_profile_config(
+    mut config: FieldLevelEncryptionProfileConfig,
+) -> FieldLevelEncryptionProfileConfig {
+    config.comment = Some(config.comment.unwrap_or_default());
+    config
+}
+
+/// Resolve every member of a submitted `PublicKeyConfig` that the SERVICE supplies.
+///
+/// `Comment` is "A comment to describe the public key" — free text the key carries, which
+/// for one uploaded without a comment is the empty text rather than no member at all, so a
+/// round trip through `UpdatePublicKey` (whose "only value you can change is the comment")
+/// does not turn the member's presence into its absence. `CallerReference`, `Name` and
+/// `EncodedKey` are required, so nothing is supplied for them.
+pub fn resolve_public_key_config(mut config: PublicKeyConfig) -> PublicKeyConfig {
+    config.comment = Some(config.comment.unwrap_or_default());
+    config
+}
+
 /// Resolve the members the service supplies on a custom origin's configuration.
 pub(super) fn resolve_custom_origin_config(mut custom: CustomOriginConfig) -> CustomOriginConfig {
     custom.origin_ssl_protocols = Some(custom.origin_ssl_protocols.unwrap_or_else(|| {

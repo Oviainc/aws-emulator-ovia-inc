@@ -272,9 +272,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let etag = store.next_etag();
         let stored = StoredCachePolicy {
             id: id.clone(),
-            // Stored whole: a later read reports the configuration that was submitted,
-            // down to the members this create left out.
-            config,
+            // Stored RESOLVED: a configuration member the request left out is not unset on
+            // the policy but carries the value CloudFront applies to it, so the policy runs
+            // under — and every later read reports — the resolved configuration
+            // ([`crate::state::resolve_cache_policy_config`]).
+            config: crate::state::resolve_cache_policy_config(config),
             last_modified_time: now,
             etag: etag.clone(),
         };

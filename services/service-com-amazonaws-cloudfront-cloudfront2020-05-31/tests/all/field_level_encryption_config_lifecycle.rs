@@ -336,14 +336,16 @@ impl Config {
     }
 
     /// Assert that `config` — a `FieldLevelEncryptionConfig` element the emulator serialised
-    /// — reports exactly this configuration.
+    /// — reports the configuration the stored record runs under: every member this request
+    /// carried, and for a member it left out the value CloudFront supplies for it.
     pub(crate) fn assert_matches(&self, config: &Node, context: &str, raw: &str) {
         let case = self.case.as_str();
         for (member, expected) in [
             ("CallerReference", Some(self.caller_reference.clone())),
-            // An optional member the create left out is reported as the stored record has
-            // it: absent, rather than as an empty element invented by the read.
-            ("Comment", self.comment.clone()),
+            // "An optional comment about the configuration": a configuration that states
+            // none carries the empty comment the service supplies, so the member is
+            // reported either way.
+            ("Comment", Some(self.effective_comment())),
         ] {
             let actual = config.text_at(member).map(str::to_string);
             assert_eq!(
@@ -353,34 +355,32 @@ impl Config {
             );
         }
 
-        match &self.query_arg {
-            None => assert!(
-                config.at("QueryArgProfileConfig").is_none(),
-                "case {case:?} ({context}): expected no QueryArgProfileConfig, got {raw}"
-            ),
-            Some(section) => {
-                let node = config.at("QueryArgProfileConfig").unwrap_or_else(|| {
-                    panic!("case {case:?} ({context}): expected a QueryArgProfileConfig in {raw}")
-                });
-                let flag = node.text_at("ForwardWhenQueryArgProfileIsUnknown");
-                assert_eq!(
-                    flag,
-                    Some(section.forward_when_unknown.to_string().as_str()),
-                    "case {case:?} ({context}): expected \
-                     ForwardWhenQueryArgProfileIsUnknown {}, got {flag:?} in {raw}",
-                    section.forward_when_unknown
-                );
-                assert_section(
-                    node,
-                    "QueryArgProfiles",
-                    "QueryArgProfile",
-                    section,
-                    case,
-                    context,
-                    raw,
-                    |mapping, element| mapping.assert_matches(element, case, context, raw),
-                );
-            }
+        {
+            // `QueryArgProfileConfig` is the mapping every stored configuration carries, so
+            // a configuration that states none is reported with the mapping that maps
+            // nothing.
+            let section = self.effective_query_arg();
+            let node = config.at("QueryArgProfileConfig").unwrap_or_else(|| {
+                panic!("case {case:?} ({context}): expected a QueryArgProfileConfig in {raw}")
+            });
+            let flag = node.text_at("ForwardWhenQueryArgProfileIsUnknown");
+            assert_eq!(
+                flag,
+                Some(section.forward_when_unknown.to_string().as_str()),
+                "case {case:?} ({context}): expected \
+                 ForwardWhenQueryArgProfileIsUnknown {}, got {flag:?} in {raw}",
+                section.forward_when_unknown
+            );
+            assert_section(
+                node,
+                "QueryArgProfiles",
+                "QueryArgProfile",
+                &section,
+                case,
+                context,
+                raw,
+                |mapping, element| mapping.assert_matches(element, case, context, raw),
+            );
         }
 
         match &self.content_type {
@@ -413,6 +413,23 @@ impl Config {
                     |mapping, element| mapping.assert_matches(element, case, context, raw),
                 );
             }
+        }
+    }
+
+    /// The `Comment` the stored configuration carries: the one this request submits, or the
+    /// empty comment CloudFront supplies for a configuration that states none.
+    pub(crate) fn effective_comment(&self) -> String {
+        self.comment.clone().unwrap_or_default()
+    }
+
+    /// The `QueryArgProfileConfig` the stored configuration carries: the section this
+    /// request submits exactly as submitted, or — for a request that states no section at
+    /// all — the mapping that maps nothing, under the forwarding flag the service supplies
+    /// for it.
+    pub(crate) fn effective_query_arg(&self) -> Section<QueryArgMapping> {
+        match &self.query_arg {
+            Some(section) => section.clone(),
+            None => Section::new(true, Some(Vec::new())),
         }
     }
 }

@@ -77,9 +77,9 @@ fn assert_summary(row: &Profile, summary: &Node, id: &str, last_modified: &str, 
         ("Id", Some(id.to_string())),
         ("LastModifiedTime", Some(last_modified.to_string())),
         ("Name", Some(row.name.clone())),
-        // An optional member the create left out is summarised as the stored record has it:
-        // absent, rather than as an empty element invented by the read.
-        ("Comment", row.comment.clone()),
+        // The summary repeats the stored configuration's `Comment`, which a profile created
+        // without one carries as the empty comment the service supplies.
+        ("Comment", Some(row.effective_comment())),
     ] {
         let actual = summary.text_at(member).map(str::to_string);
         assert_eq!(

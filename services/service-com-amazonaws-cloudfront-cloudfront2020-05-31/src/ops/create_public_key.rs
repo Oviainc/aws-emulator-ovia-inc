@@ -226,9 +226,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The date and time when the public key was uploaded": the instant this call
             // stored it, written once so every later read reports the same one.
             created_time: now,
-            // Stored whole: a later read answers from this record, never from the request
-            // that was served.
-            config,
+            // Stored RESOLVED: a configuration member the request left out is not unset on
+            // the key but carries the value CloudFront applies to it, so every later read
+            // reports the resolved configuration
+            // ([`crate::state::resolve_public_key_config`]).
+            config: crate::state::resolve_public_key_config(config),
             etag: etag.clone(),
         };
         // Read from the record just built, never from the request.

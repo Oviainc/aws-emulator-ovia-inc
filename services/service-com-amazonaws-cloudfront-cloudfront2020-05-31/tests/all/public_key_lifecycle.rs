@@ -180,16 +180,23 @@ impl Key {
                 self.case
             );
         }
-        // An optional member the create left out is reported as the stored record has it:
-        // absent, rather than as an empty element invented by the read.
+        // `Comment` is "A comment to describe the public key": a key uploaded without one
+        // carries the empty comment the service supplies, so the member is reported either
+        // way.
+        let expected = self.effective_comment();
         let actual = config.text_at("Comment").map(str::to_string);
         assert_eq!(
-            actual,
-            self.comment.clone(),
-            "case {} ({context}): expected Comment {:?}, got {actual:?} in {raw}",
-            self.case,
-            self.comment
+            actual.as_deref(),
+            Some(expected.as_str()),
+            "case {} ({context}): expected Comment {expected:?}, got {actual:?} in {raw}",
+            self.case
         );
+    }
+
+    /// The `Comment` the stored key carries: the one this configuration submits, or the
+    /// empty comment CloudFront supplies for a key uploaded without one.
+    pub(crate) fn effective_comment(&self) -> String {
+        self.comment.clone().unwrap_or_default()
     }
 
     /// Assert that `summary` — a `PublicKeySummary` element of a listing — reports this
@@ -200,9 +207,9 @@ impl Key {
             ("Name", Some(self.name.clone())),
             ("CreatedTime", Some(created_time.to_string())),
             ("EncodedKey", Some(self.encoded_key.clone())),
-            // `PublicKeySummary$Comment` is optional, exactly as the configuration's is, so
-            // a key uploaded without one is summarised without one.
-            ("Comment", self.comment.clone()),
+            // `PublicKeySummary$Comment` repeats the stored configuration's, which a key
+            // uploaded without a comment carries as the empty comment.
+            ("Comment", Some(self.effective_comment())),
         ] {
             let actual = summary.text_at(member).map(str::to_string);
             assert_eq!(

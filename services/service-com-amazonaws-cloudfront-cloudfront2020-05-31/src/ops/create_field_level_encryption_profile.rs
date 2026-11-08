@@ -296,9 +296,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The last time the field-level encryption profile was updated": for a profile
             // nothing has updated yet, the instant this call stored it.
             last_modified_time: now,
-            // Stored whole: a later read answers from this record, never from the request
-            // that was served.
-            config,
+            // Stored RESOLVED: a configuration member the request left out is not unset on
+            // the profile but carries the value CloudFront applies to it, so every later
+            // read reports the resolved configuration
+            // ([`crate::state::resolve_field_level_encryption_profile_config`]).
+            config: crate::state::resolve_field_level_encryption_profile_config(config),
             etag: etag.clone(),
         };
         // Read from the record just built, never from the request.

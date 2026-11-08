@@ -2055,7 +2055,9 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
         let etag = self.next_etag();
         let stored = self.cache_policies.get_mut(id)?;
-        stored.config = config;
+        // Stored RESOLVED, exactly as the create stores it: the members CloudFront supplies
+        // for the ones this payload left out ([`resolve_cache_policy_config`]).
+        stored.config = resolve_cache_policy_config(config);
         stored.last_modified_time = now;
         stored.etag = etag;
         Some(stored)
@@ -2313,7 +2315,8 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
         let etag = self.next_etag();
         let stored = self.public_keys.get_mut(id)?;
-        stored.config = config;
+        // Stored RESOLVED, exactly as the create stores it ([`resolve_public_key_config`]).
+        stored.config = resolve_public_key_config(config);
         stored.etag = etag;
         Some(stored)
     }
@@ -2403,7 +2406,9 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
         let etag = self.next_etag();
         let stored = self.field_level_encryption_profiles.get_mut(id)?;
-        stored.config = config;
+        // Stored RESOLVED, exactly as the create stores it
+        // ([`resolve_field_level_encryption_profile_config`]).
+        stored.config = resolve_field_level_encryption_profile_config(config);
         stored.last_modified_time = now;
         stored.etag = etag;
         Some(stored)
@@ -2436,7 +2441,9 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         }
         let etag = self.next_etag();
         let stored = self.field_level_encryption_configs.get_mut(id)?;
-        stored.config = config;
+        // Stored RESOLVED, exactly as the create stores it
+        // ([`resolve_field_level_encryption_config`]).
+        stored.config = resolve_field_level_encryption_config(config);
         stored.last_modified_time = now;
         stored.etag = etag;
         Some(stored)

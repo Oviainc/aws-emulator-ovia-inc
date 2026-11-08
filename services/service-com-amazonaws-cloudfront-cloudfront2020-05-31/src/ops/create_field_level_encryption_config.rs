@@ -210,6 +210,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A configuration member the request left out is not unset on the configuration: it
+        // carries the value CloudFront applies to it, and the configuration is stored — and
+        // reported — resolved ([`crate::state::resolve_field_level_encryption_config`]).
+        // Resolved HERE, before the caller reference below is compared, so a repeat of the
+        // same request is compared against the stored record on equal terms.
+        let config = crate::state::resolve_field_level_encryption_config(config);
+
         let query_arg_profiles: &[QueryArgProfile] = config
             .query_arg_profile_config
             .as_ref()
@@ -343,8 +350,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "The last time the field-level encryption configuration was changed": for a
             // configuration nothing has changed yet, the instant this call stored it.
             last_modified_time: now,
-            // Stored whole: a later read answers from this record, never from the request
-            // that was served.
+            // Stored as resolved above: a later read answers from this record, never from
+            // the request that was served.
             config,
             etag: etag.clone(),
         };

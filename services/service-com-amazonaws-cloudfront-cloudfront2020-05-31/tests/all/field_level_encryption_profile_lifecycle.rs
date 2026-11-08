@@ -288,14 +288,16 @@ impl Profile {
     }
 
     /// Assert that `config` — a `FieldLevelEncryptionProfileConfig` element the emulator
-    /// serialised — reports exactly this configuration.
+    /// serialised — reports the configuration the stored profile runs under: every member
+    /// this request carried, and for a member it left out the value CloudFront supplies.
     pub(crate) fn assert_matches(&self, config: &Node, context: &str, raw: &str) {
         for (member, expected) in [
             ("Name", Some(self.name.clone())),
             ("CallerReference", Some(self.caller_reference.clone())),
-            // An optional member the create left out is reported as the stored record has
-            // it: absent, rather than as an empty element invented by the read.
-            ("Comment", self.comment.clone()),
+            // "An optional comment for the field-level encryption profile": a profile
+            // created without one carries the empty comment the service supplies, so the
+            // member is reported either way.
+            ("Comment", Some(self.effective_comment())),
         ] {
             let actual = config.text_at(member).map(str::to_string);
             assert_eq!(
@@ -328,6 +330,12 @@ impl Profile {
         for (expected, actual) in self.entities.iter().zip(serialised) {
             expected.assert_matches(actual, &self.case, context, raw);
         }
+    }
+
+    /// The `Comment` the stored profile carries: the one this request submits, or the empty
+    /// comment CloudFront supplies for a profile created without one.
+    pub(crate) fn effective_comment(&self) -> String {
+        self.comment.clone().unwrap_or_default()
     }
 }
 

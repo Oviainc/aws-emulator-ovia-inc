@@ -257,6 +257,8 @@ mod response_headers_policy_lifecycle;
 mod response_headers_policy_refusal_message;
 #[path = "all/response_headers_policy_security_headers.rs"]
 mod response_headers_policy_security_headers;
+#[path = "all/server_supplied_config_members.rs"]
+mod server_supplied_config_members;
 #[path = "all/staging_config_promotion.rs"]
 mod staging_config_promotion;
 #[path = "all/state_roundtrip.rs"]

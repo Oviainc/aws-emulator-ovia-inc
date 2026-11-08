@@ -243,16 +243,22 @@ impl Row {
             "case {case:?}: expected the stored id {id:?}, got {listed_id:?} in {raw}"
         );
         let listed_comment = summary.text_at("Comment").map(str::to_string);
+        let expected_comment = self.comment.clone().unwrap_or_default();
         assert_eq!(
-            listed_comment, self.comment,
-            "case {case:?}: expected the stored Comment {:?}, got {listed_comment:?} in {raw}",
-            self.comment
+            listed_comment.as_deref(),
+            Some(expected_comment.as_str()),
+            "case {case:?}: expected the stored Comment {expected_comment:?}, got \
+             {listed_comment:?} in {raw}"
         );
         assert!(
             summary.text_at("CallerReference").is_none(),
             "case {case:?}: a summary models no CallerReference, got {raw}"
         );
 
+        // `QueryArgProfileConfig` is the mapping every stored configuration carries, so a
+        // configuration created without one is summarised with the mapping that maps
+        // nothing, under the forwarding flag the service supplies for it.
+        let query_arg = self.effective_query_arg();
         self.assert_section(
             summary,
             "QueryArgProfileConfig",
@@ -260,7 +266,7 @@ impl Row {
             "QueryArgProfiles",
             "QueryArgProfile",
             "QueryArg",
-            self.query_arg.as_ref(),
+            Some(&query_arg),
             raw,
         );
         self.assert_section(
@@ -273,6 +279,15 @@ impl Row {
             self.content_type.as_ref(),
             raw,
         );
+    }
+
+    /// The `QueryArgProfileConfig` the stored configuration carries: the section this row
+    /// submits, or — for a row that states none — the mapping that maps nothing, under the
+    /// forwarding flag the service supplies for it.
+    fn effective_query_arg(&self) -> Section {
+        self.query_arg
+            .clone()
+            .unwrap_or_else(|| Section::new(true, &[], false))
     }
 
     /// Assert that one mapping section of a serialised document reports the section this row
@@ -620,7 +635,7 @@ async fn a_listing_reports_every_stored_configuration_and_pages_through_them() {
             "QueryArgProfiles",
             "QueryArgProfile",
             "QueryArg",
-            row.query_arg.as_ref(),
+            Some(&row.effective_query_arg()),
             &read.raw,
         );
         row.assert_section(
