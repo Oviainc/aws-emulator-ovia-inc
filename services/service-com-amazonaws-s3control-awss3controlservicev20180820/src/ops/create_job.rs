@@ -182,17 +182,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@required`, so the boundary validator cannot refuse either half of
         // this; the service does.
         match (&input.manifest, &input.manifest_generator) {
-            (Some(_), Some(_)) => {
-                return Err(bad_request(
-                    "A job is created with either Manifest or ManifestGenerator, but not both.",
-                ))
-            }
-            (None, None) => {
-                return Err(bad_request(
-                    "A job is created with either Manifest or ManifestGenerator; \
-                     the request carries neither.",
-                ))
-            }
+            // A create naming BOTH names two object lists for one job, which
+            // this service answers with its own sentence for that half of the
+            // rule.
+            (Some(_), Some(_)) => return Err(crate::state::job_source_ambiguous()),
+            // A create naming NEITHER names no object list at all, which this
+            // service answers with its own sentence for that class.
+            (None, None) => return Err(crate::state::job_source_required()),
             _ => {}
         }
 
@@ -204,15 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // accepts and the action a listing reports cannot disagree.
         let actions = crate::state::job_operation_names(&input.operation);
         if actions.len() != 1 {
-            return Err(bad_request(format!(
-                "Operation names exactly one action; the request names {}{}.",
-                actions.len(),
-                if actions.is_empty() {
-                    String::new()
-                } else {
-                    format!(" ({})", actions.join(", "))
-                }
-            )));
+            return Err(crate::state::request_invalid());
         }
 
         // `JobReport$Bucket` is where "the specified job-completion report will
@@ -225,10 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .is_none_or(|bucket| bucket.is_empty())
         {
-            return Err(bad_request(
-                "Report.Enabled is true, so Report.Bucket must name the bucket the \
-                 job-completion report is stored in.",
-            ));
+            return Err(crate::state::request_invalid());
         }
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -246,7 +231,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // don't accidentally submit the same request twice": the same request
         // under a token already used is answered with the job that token
         // created, so no second job exists; a DIFFERENT request reusing it is
-        // the modelled `IdempotencyException`.
+        // refused, because the token already names a job that is not the one
+        // this request asks for.
         if let Some(existing) =
             store.job_by_client_request_token(&input.account_id, &input.client_request_token)
         {
@@ -255,15 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     job_id: Some(existing.job_id.clone()),
                 });
             }
-            let message = format!(
-                "ClientRequestToken {} was already used to create job {}, with different \
-                 job parameters.",
-                input.client_request_token, existing.job_id
-            );
-            return Err(CreateJobErrorModeled::IdempotencyException(IdempotencyException {
-                message: Some(message),
-            })
-            .into());
+            return Err(crate::state::duplicate_client_request_token());
         }
 
         // The store is bounded: past its quota a create is refused rather than
@@ -337,12 +315,4 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// Refuse the request with the modelled `BadRequestException` (HTTP 400): it is
-/// well-formed against the model but asks for no one job.
-fn bad_request(message: impl Into<String>) -> CreateJobError {
-    CreateJobErrorModeled::BadRequestException(BadRequestException {
-        message: Some(message.into()),
-    })
-    .into()
-}
 

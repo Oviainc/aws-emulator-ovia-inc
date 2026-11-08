@@ -172,10 +172,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // touched.
         if input.tags.len() > crate::state::MAX_JOB_TAGS {
             return Err(PutJobTaggingErrorModeled::TooManyTagsException(TooManyTagsException {
+                // The modelled shape for this class ("Amazon S3 throws this
+                // exception if you have too many tags in your tag set" —
+                // `TooManyTagsException`), stating the bound its own operation
+                // documents: "you can associate up to 50 tags with a job as
+                // long as they have unique tag keys" (`PutJobTagging`), which
+                // is where [`crate::state::MAX_JOB_TAGS`] comes from. How many
+                // tags the request submitted is the caller's own, carried by
+                // the request it sent, so it is not interpolated into the
+                // sentence.
                 message: Some(format!(
-                    "A job carries at most {} tags; this request submitted {}.",
-                    crate::state::MAX_JOB_TAGS,
-                    input.tags.len()
+                    "A job's tag set carries at most {} tags.",
+                    crate::state::MAX_JOB_TAGS
                 )),
             })
             .into());
@@ -183,7 +191,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut keys = ::std::collections::BTreeSet::new();
         for tag in &input.tags {
             if !keys.insert(tag.key.as_str()) {
-                return Err(crate::state::duplicate_job_tag_key(&tag.key));
+                // A set naming one key twice is not a set, so it is one of the
+                // requests this surface will not carry out: it is answered with
+                // the one refusal that surface answers them all with, and the
+                // key that was named twice stays in the request the caller
+                // sent rather than appearing in the sentence.
+                return Err(crate::state::request_invalid());
             }
         }
 

@@ -48,6 +48,31 @@ use crate::access_point_lifecycle::{
 /// `IAMRoleArn` pattern (`^arn:[^:]+:iam::\d{12}:role/`).
 const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/S3BatchOperations";
 
+/// The `<Code>` every `CreateJob` refusal below carries: the S3-style envelope
+/// the whole Batch Operations job surface answers a well-formed request it will
+/// not carry out with, which is what this service was recorded answering rather
+/// than one of the modelled exception shapes.
+const CREATE_REFUSAL: &str = "InvalidRequest";
+
+/// The fixed sentence that refusal carries for a create naming neither of the
+/// two members a job's object list can come from.
+const SOURCE_REQUIRED: &str = "Either a Manifest or a ManifestGenerator must be provided.";
+
+/// The fixed sentence that refusal carries for a create naming BOTH of them:
+/// the same words, closing with the clause that states which half of the one
+/// rule the request broke.
+const SOURCE_AMBIGUOUS: &str =
+    "Either a Manifest or a ManifestGenerator must be provided, but not both";
+
+/// The fixed sentence that refusal carries for a create reusing a
+/// `ClientRequestToken` for different parameters: no variable part, so neither
+/// the token nor the job it already created is restated to the caller.
+const DUPLICATE_TOKEN: &str = "Duplicate ClientRequestToken";
+
+/// The fixed sentence this surface answers every other request it will not
+/// carry out with, whatever the member and whatever the value.
+const REQUEST_INVALID: &str = "Request invalid";
+
 // ---------------------------------------------------------------------------
 // The `Operation` bodies: one action each, spelled with the member name
 // `JobOperation` declares for it. Enum values are the ones the model's own
@@ -758,8 +783,22 @@ async fn one_client_request_token_creates_one_job_and_a_different_request_is_ref
             );
             assert_eq!(
                 refused.code(),
-                "IdempotencyException",
-                "case {:?} with {variation:?}: expected IdempotencyException, got body {}",
+                CREATE_REFUSAL,
+                "case {:?} with {variation:?}: expected {CREATE_REFUSAL}, got body {}",
+                case.case,
+                refused.body
+            );
+            let message = refused.text("Message").unwrap_or_default();
+            assert_eq!(
+                message, DUPLICATE_TOKEN,
+                "case {:?} with {variation:?}: expected the fixed message \
+                 {DUPLICATE_TOKEN:?}, got body {}",
+                case.case, refused.body
+            );
+            assert!(
+                !message.contains(&token) && !message.contains(&job_id),
+                "case {:?} with {variation:?}: expected the refusal to restate neither the \
+                 token nor the job it already created, got body {}",
                 case.case,
                 refused.body
             );
@@ -828,15 +867,34 @@ async fn a_create_that_names_no_single_job_is_refused_and_records_nothing() {
     );
 
     // Each of these is well-formed against the model and still names no one
-    // job, so the service refuses it with the modelled `BadRequestException`.
+    // job, so the service refuses it in the fixed words it answers that class
+    // with: the sentence naming the two members a job's object list can come
+    // from for the create that names NEITHER of them, and otherwise the one
+    // sentence this surface answers a request it will not carry out with.
     let modelled_refusals = [
-        ("both a manifest and a generator", manifest_and_generator),
-        ("neither a manifest nor a generator", neither),
-        ("an Operation naming no action", no_action),
-        ("an Operation naming two actions", two_actions),
-        ("an enabled report with no bucket", report_without_bucket),
+        (
+            "both a manifest and a generator",
+            manifest_and_generator,
+            SOURCE_AMBIGUOUS,
+        ),
+        (
+            "neither a manifest nor a generator",
+            neither,
+            SOURCE_REQUIRED,
+        ),
+        ("an Operation naming no action", no_action, REQUEST_INVALID),
+        (
+            "an Operation naming two actions",
+            two_actions,
+            REQUEST_INVALID,
+        ),
+        (
+            "an enabled report with no bucket",
+            report_without_bucket,
+            REQUEST_INVALID,
+        ),
     ];
-    for (case, body) in modelled_refusals {
+    for (case, body, message) in modelled_refusals {
         let refused = emulator
             .call("POST", "/v20180820/jobs", ACCOUNT, &body)
             .await;
@@ -847,8 +905,14 @@ async fn a_create_that_names_no_single_job_is_refused_and_records_nothing() {
         );
         assert_eq!(
             refused.code(),
-            "BadRequestException",
-            "case {case:?}: expected BadRequestException, got body {}",
+            CREATE_REFUSAL,
+            "case {case:?}: expected {CREATE_REFUSAL}, got body {}",
+            refused.body
+        );
+        assert_eq!(
+            refused.text("Message").unwrap_or_default(),
+            message,
+            "case {case:?}: expected the fixed message {message:?}, got body {}",
             refused.body
         );
         assert!(

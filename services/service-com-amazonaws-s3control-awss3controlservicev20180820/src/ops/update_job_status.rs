@@ -198,10 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // is no confirmation to give it.
             JOB_STATUS_READY => {
                 if job.status != JOB_STATUS_SUSPENDED {
-                    return Err(crate::state::job_status_not_updatable(
-                        &job.status,
-                        JOB_STATUS_READY,
-                    ));
+                    return Err(crate::state::job_status_not_updatable());
                 }
                 job.status = crate::state::job_status(JOB_STATUS_READY);
                 // `SuspendedDate` and `SuspendedCause` are what the job WAS
@@ -217,10 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the terminal `Cancelled`, terminated at this instant.
             JOB_STATUS_CANCELLED => {
                 if !crate::state::job_cancellable(&job.status) {
-                    return Err(crate::state::job_status_not_updatable(
-                        &job.status,
-                        JOB_STATUS_CANCELLED,
-                    ));
+                    return Err(crate::state::job_status_not_updatable());
                 }
                 job.status = crate::state::job_status(JOB_STATUS_CANCELLED);
                 job.termination_date = Some(::aws_smithy_types::DateTime::from(now));
@@ -229,12 +223,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // dropped rather than left to fire against a terminal status.
                 job.status_due_at = None;
             }
-            requested => {
-                return Err(crate::scaffolded::Scaffolded::validation(format!(
-                    "RequestedJobStatus must be one of {}; the request asks for {requested}.",
-                    REQUESTED_JOB_STATUS_VALUES.join(", ")
-                )))
-            }
+            // `RequestedJobStatus` is a modelled enum, so the boundary
+            // validator has already refused every other value — and it refuses
+            // it with the one refusal this surface answers a request it will
+            // not carry out with, which is what this arm answers too rather
+            // than restating the value and the enum's value set.
+            _ => return Err(crate::state::request_invalid()),
         }
 
         // `StatusUpdateReason` is "a description of the reason why you want to

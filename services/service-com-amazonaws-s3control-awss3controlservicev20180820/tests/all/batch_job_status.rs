@@ -60,6 +60,11 @@ const REASON_MAX_LENGTH: usize = 256;
 /// rather than the modelled `JobStatusException`.
 const JOB_STATUS_REFUSAL: &str = "InvalidRequest";
 
+/// The fixed sentence that refusal carries: the words this surface answers a
+/// status move it will not make with, with no variable part — neither the status
+/// the job is in nor the one the request asked for is restated to the caller.
+const JOB_STATUS_FORBIDDEN: &str = "Requested job status forbidden";
+
 /// The members a status update is allowed to change, which is what the rows
 /// below leave out of the described document when they compare the rest of the
 /// job against what the create recorded.
@@ -566,11 +571,16 @@ async fn a_move_the_jobs_status_does_not_admit_is_refused_and_changes_nothing() 
             "case {case:?}: expected {JOB_STATUS_REFUSAL}, got body {}",
             refused.body
         );
+        let message = refused.text("Message").unwrap_or_default();
         assert_eq!(
-            refused.text("Message").as_deref(),
-            Some(format!("Job status cannot be updated from {stays} to {requested}").as_str()),
-            "case {case:?}: expected the refusal to name the status the job is in and the one \
-             asked for, got body {}",
+            message, JOB_STATUS_FORBIDDEN,
+            "case {case:?}: expected the fixed message {JOB_STATUS_FORBIDDEN:?}, got body {}",
+            refused.body
+        );
+        assert!(
+            !message.contains(requested) && !message.contains(stays) && !message.contains(job_id),
+            "case {case:?}: expected the refusal to restate neither the status asked for, the \
+             status the job is in nor the job id, got body {}",
             refused.body
         );
 

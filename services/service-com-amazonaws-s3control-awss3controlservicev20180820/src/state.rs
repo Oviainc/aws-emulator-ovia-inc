@@ -3705,33 +3705,92 @@ pub const JOB_NOT_FOUND_MESSAGE: &str = "Job not found";
 /// behaviour of this service for a status it will not move is the same S3-style
 /// XML envelope the rest of the job surface answers a well-formed request it
 /// cannot carry out with (see [`job_not_found`]): code `InvalidRequest` with
-/// HTTP 400.
-pub fn job_status_not_updatable<E>(
-    current: &str,
-    requested: &str,
-) -> crate::scaffolded::Scaffolded<E> {
+/// HTTP 400 and [`JOB_STATUS_FORBIDDEN_MESSAGE`] — fixed text, so neither the
+/// status the job is in nor the one the request asked for is interpolated into
+/// it. Which job was addressed and which status it asked for are the caller's
+/// own, carried by the request it sent, and the status the job IS in is what
+/// `DescribeJob` reports.
+pub fn job_status_not_updatable<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_failure(
-        "InvalidRequest",
-        400,
-        format!("Job status cannot be updated from {current} to {requested}"),
+        REQUEST_INVALID_CODE,
+        REQUEST_INVALID_STATUS,
+        JOB_STATUS_FORBIDDEN_MESSAGE,
     )
 }
 
-/// `InvalidRequest` (HTTP 400): a submitted job tag set names one key twice, so
-/// it is not a set — "you can associate up to 50 tags with a job as long as
-/// they have unique tag keys" (`PutJobTagging`), and the keys are case
-/// sensitive, so two spellings that differ in case are two keys.
+/// The fixed sentence the Batch Operations job surface answers a status move it
+/// will not make with, as this service words it.
+pub const JOB_STATUS_FORBIDDEN_MESSAGE: &str = "Requested job status forbidden";
+
+/// `InvalidRequest` (HTTP 400): a `CreateJob` names no source for the object
+/// list its action runs over — "jobs must be created with either a manifest
+/// file or a ManifestGenerator, but not both"
+/// (`CreateJobRequest$ManifestGenerator`), and neither member is modelled
+/// `@required`, so the boundary validator cannot refuse this.
 ///
-/// The code and status are the ones the job-id surface already answers a
-/// well-formed request it cannot carry out with (see [`job_not_found`]): the
-/// S3-style XML envelope with code `InvalidRequest` and HTTP 400.
-pub fn duplicate_job_tag_key<E>(key: &str) -> crate::scaffolded::Scaffolded<E> {
+/// The message is [`JOB_SOURCE_REQUIRED_MESSAGE`], the fixed sentence this
+/// service answers that class with: it names the two members the model
+/// declares, and nothing the request carried.
+pub fn job_source_required<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_failure(
-        "InvalidRequest",
-        400,
-        format!("A job's tag keys must be unique; {key} is named more than once."),
+        REQUEST_INVALID_CODE,
+        REQUEST_INVALID_STATUS,
+        JOB_SOURCE_REQUIRED_MESSAGE,
     )
 }
+
+/// The fixed sentence the Batch Operations job surface answers a create that
+/// names neither of the two members a job's object list can come from with, as
+/// this service words it.
+pub const JOB_SOURCE_REQUIRED_MESSAGE: &str =
+    "Either a Manifest or a ManifestGenerator must be provided.";
+
+/// `InvalidRequest` (HTTP 400): a `CreateJob` names BOTH members a job's object
+/// list can come from, so it names two object lists for one job — "but not
+/// both" (`CreateJobRequest$ManifestGenerator`).
+///
+/// The other half of the one rule [`job_source_required`] answers, so it is
+/// answered in the same words, which this service closes with the clause that
+/// states the half that was broken: [`JOB_SOURCE_AMBIGUOUS_MESSAGE`]. Fixed
+/// text — neither the manifest nor the generator the request carried appears in
+/// it.
+pub fn job_source_ambiguous<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        REQUEST_INVALID_CODE,
+        REQUEST_INVALID_STATUS,
+        JOB_SOURCE_AMBIGUOUS_MESSAGE,
+    )
+}
+
+/// The fixed sentence the Batch Operations job surface answers a create that
+/// names both of the two members a job's object list can come from with, as
+/// this service words it.
+pub const JOB_SOURCE_AMBIGUOUS_MESSAGE: &str =
+    "Either a Manifest or a ManifestGenerator must be provided, but not both";
+
+/// `InvalidRequest` (HTTP 400): a `CreateJob` reuses a `ClientRequestToken`
+/// that already created a job, for a DIFFERENT job — "an idempotency token to
+/// ensure that you don't accidentally submit the same request twice"
+/// (`CreateJobRequest$ClientRequestToken`) names one job, so a second set of
+/// parameters under it asks for a job the token cannot name.
+///
+/// The model binds `IdempotencyException` to `CreateJob`, but the recorded
+/// behaviour of this service for a token collision is the envelope the rest of
+/// the job surface answers a request it will not carry out with (see
+/// [`job_not_found`]): code `InvalidRequest`, HTTP 400 and
+/// [`DUPLICATE_CLIENT_REQUEST_TOKEN_MESSAGE`] — fixed text, so neither the
+/// token nor the id of the job it already created is interpolated into it.
+pub fn duplicate_client_request_token<E>() -> crate::scaffolded::Scaffolded<E> {
+    crate::scaffolded::Scaffolded::service_failure(
+        REQUEST_INVALID_CODE,
+        REQUEST_INVALID_STATUS,
+        DUPLICATE_CLIENT_REQUEST_TOKEN_MESSAGE,
+    )
+}
+
+/// The fixed sentence the Batch Operations job surface answers a reused
+/// `ClientRequestToken` with, as this service words it.
+pub const DUPLICATE_CLIENT_REQUEST_TOKEN_MESSAGE: &str = "Duplicate ClientRequestToken";
 
 /// `NoSuchMultiRegionAccessPoint` (HTTP 404): no Multi-Region Access Point of
 /// that name is owned by the account the request names.
