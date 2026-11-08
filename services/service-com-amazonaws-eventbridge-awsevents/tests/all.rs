@@ -35,6 +35,8 @@ mod archive_state_is_settled;
 mod bus_forward_authorization;
 #[path = "all/bus_forward_failure_accounting.rs"]
 mod bus_forward_failure_accounting;
+#[path = "all/bus_forward_refusal_telemetry.rs"]
+mod bus_forward_refusal_telemetry;
 #[path = "all/bus_policy_publication_authorization.rs"]
 mod bus_policy_publication_authorization;
 #[path = "all/client_error_wording.rs"]

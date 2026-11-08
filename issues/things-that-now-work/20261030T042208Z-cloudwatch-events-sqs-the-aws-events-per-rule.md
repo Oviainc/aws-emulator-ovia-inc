@@ -62,3 +62,27 @@ Expected vs actual at the failing read:
    Expected: at least one Datapoint with Sum >= 1.
    Actual: Datapoints == [] indefinitely.
 10. Also read AWS/Events FailedInvocations and InvocationsSentToDlq for the forwarding rule (expected: Sum 0 over 0 datapoints) and SuccessfulInvocationAttempts for the control rule (expected: Sum >= 1); none of these series exists either. Receive from the DLQ: expected exactly one message whose body detail.nonce equals the denied nonce and whose MessageAttributes carry ERROR_CODE = "NO_PERMISSIONS".
+
+## Resolution
+The code base drifted past this report: the AWS/Events per-rule telemetry the failing read asks for
+is published and served now. The routing counters (`MatchedEvents`, `TriggeredRules`) are counted on
+every pattern match, whatever became of the handover, and the handover counters (`Invocations`,
+`SuccessfulInvocationAttempts`, `FailedInvocations`) on what each target's API call answered, all into
+the CloudWatch store of the same engine, where `GetMetricStatistics` and `ListMetrics` serve them. A
+forward onto another event bus is a publication onto that bus rather than an invocation of a target's
+own API, so a refused one is dead-lettered with its condition and counted on neither
+`FailedInvocations` nor `InvocationsSentToDlq` — those series are not published at all, which is the
+observation the recording makes.
+
+What was missing was a test over the WHOLE read this check makes, so the three observations cannot
+regress apart: `services/service-com-amazonaws-eventbridge-awsevents/tests/all/bus_forward_refusal_telemetry.rs`
+pins, over the wire through the router, the forwarding rule's `TriggeredRules`/`MatchedEvents`
+datapoints, the twin control rule's `Invocations`/`SuccessfulInvocationAttempts` under both dimension
+sets, and the absence of any `FailedInvocations`/`InvocationsSentToDlq` datapoint or series for the
+withheld forward — read both over the aligned 60-second period ending now and over a window around
+now, across a table that varies the round's event count, whether the forwarding target carries a
+dead-letter queue at all, and whether the forward is withheld.
+
+Replay: the recorded unit
+`cloudwatch__events__sqs.failed-invocations-records-the-bus-forwarding-the-destination-policy-denied`
+passes.
