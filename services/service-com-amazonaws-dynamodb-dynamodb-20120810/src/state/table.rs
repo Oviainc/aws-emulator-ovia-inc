@@ -918,6 +918,37 @@ impl Table {
         }
     }
 
+    /// The destination the table's streaming state is about: its LIVE replication, to
+    /// whichever stream it replicates to, or `None` while it replicates to none.
+    ///
+    /// A table replicates to AT MOST ONE Kinesis data stream, so this is what an enable's
+    /// admission is decided on ([`kinesis_destination_not_enableable`]): the records left
+    /// over from replication that failed or was stopped are the table's history, and an
+    /// enable may start again while only those are held.
+    pub fn live_kinesis_destination(&self, now: SystemTime) -> Option<&KinesisDestination> {
+        self.kinesis_destinations
+            .iter()
+            .find(|destination| destination.replicating(now))
+    }
+
+    /// Every destination of this table an item change made at `now` is DELIVERED to
+    /// ([`KinesisDestination::delivers`]) — the data plane's half of a streaming
+    /// destination.
+    pub fn delivering_kinesis_destinations(
+        &self,
+        now: SystemTime,
+    ) -> impl Iterator<Item = &KinesisDestination> {
+        self.kinesis_destinations
+            .iter()
+            .filter(move |destination| destination.delivers(now))
+    }
+
+    /// Whether a change made at `now` is delivered to any Kinesis data stream — what a
+    /// write asks before it keeps the images a delivered record carries.
+    pub fn delivers_to_kinesis(&self, now: SystemTime) -> bool {
+        self.delivering_kinesis_destinations(now).next().is_some()
+    }
+
     /// The destination the command addressed, mutably: this table's LIVE replication to
     /// the stream that `stream_arn` names, or `None` when the table replicates to no
     /// such stream — a stream it has never replicated to, and one it has stopped
@@ -973,8 +1004,9 @@ impl Table {
     /// and under none where it named none.
     ///
     /// Whether the stream resolves is the KINESIS service's to answer
-    /// ([`kinesis_stream_exists`]), so the caller reads it there and passes it in — this
-    /// record only remembers which of the two ends the enable is headed for.
+    /// ([`resolve_kinesis_stream`]), so the caller reads it there and passes the failure in
+    /// — this record only remembers which of the two ends the enable is headed for, and why
+    /// it could not be completed where it failed.
     ///
     /// A stream this table once replicated to is re-registered IN PLACE, so one stream
     /// has one record whatever number of times replication to it is started and stopped,
@@ -983,13 +1015,14 @@ impl Table {
         &mut self,
         stream_arn: &str,
         precision: Option<&str>,
-        stream_resolved: bool,
+        failure: Option<&KinesisEnableFailure>,
         now: SystemTime,
     ) -> &KinesisDestination {
-        let registered = if stream_resolved {
-            KinesisDestination::enabling(stream_arn, precision, now)
-        } else {
-            KinesisDestination::enable_failing(stream_arn, precision, now)
+        let registered = match failure {
+            None => KinesisDestination::enabling(stream_arn, precision, now),
+            Some(failure) => {
+                KinesisDestination::enable_failing(stream_arn, precision, failure, now)
+            }
         };
         let index = match self
             .kinesis_destinations

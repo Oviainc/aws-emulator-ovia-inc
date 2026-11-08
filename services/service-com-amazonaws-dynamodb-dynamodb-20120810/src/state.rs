@@ -1617,8 +1617,17 @@ impl TableStream {
 /// was and still is a `MODIFY`, and one that is gone a `REMOVE` (`OperationType`).
 #[derive(Debug, Clone)]
 pub struct PendingStreamRecord {
-    /// The stream the record belongs to, as the streams registry minted its ARN.
-    pub stream_arn: String,
+    /// The Region whose endpoint holds the table the change was made on: the scope the
+    /// table and its destination's stream are both resolved in, and what a Kinesis record
+    /// reports as the Region the change was made in.
+    pub region: String,
+    /// The table the change was made on, as this store holds its name.
+    pub table_name: String,
+    /// The DynamoDB stream the record belongs to, as the streams registry minted its ARN,
+    /// or `None` for a change made on a table with no stream enabled — a change a Kinesis
+    /// streaming destination still owes a record for
+    /// ([`kinesis_delivery::deliver_item_changes`]).
+    pub stream_arn: Option<String>,
     /// "The primary key attribute(s) for the DynamoDB item that was modified"
     /// (`StreamRecord$Keys`), read off the item through the table's own key schema.
     pub keys: Item,
@@ -2994,18 +3003,21 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
             )
         });
         // An expired item's deletion is an item-level modification like any other, so a
-        // stream-enabled table owes its stream one record per item swept. The records
-        // are queued once the walk over the tables is done, because the queue is the
-        // STORE's.
+        // table that publishes its changes — to its own stream, to a Kinesis streaming
+        // destination, or to both — owes one record per item swept. The records are queued
+        // once the walk over the tables is done, because the queue is the STORE's.
         let mut expired: Vec<PendingStreamRecord> = Vec::new();
-        for tables in self.regions.values_mut() {
+        for (region, tables) in self.regions.iter_mut() {
             tables.retain(|_, table| !table.removal_due(now));
             for table in tables.values_mut() {
                 let stream_arn = table.enabled_stream_arn();
+                let publishes = stream_arn.is_some() || table.delivers_to_kinesis(now);
                 for item in table.apply_due_expirations(now) {
-                    if let Some(stream_arn) = stream_arn.clone() {
+                    if publishes {
                         expired.push(PendingStreamRecord {
-                            stream_arn,
+                            region: region.clone(),
+                            table_name: table.name.clone(),
+                            stream_arn: stream_arn.clone(),
                             keys: table.stream_keys(&item),
                             old_image: Some(item),
                             new_image: None,
@@ -3500,19 +3512,26 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
         }
         table.stored_bytes = table_bytes;
         // "DynamoDB Streams captures a time-ordered sequence of item-level
-        // modifications in any DynamoDB table": a write that LANDS on a stream-enabled
-        // table owes its stream one record, whether it stores a new item or replaces
-        // one. The images the record carries are the only reason to keep a copy of the
-        // item, so a table with no enabled stream clones nothing.
+        // modifications in any DynamoDB table": a write that LANDS on a table that
+        // publishes its changes owes one record, whether it stores a new item or replaces
+        // one. A table PUBLISHES through its own stream, through a Kinesis streaming
+        // destination that is taking changes, or both. The images the record carries are
+        // the only reason to keep a copy of the item, so a table that publishes nowhere
+        // clones nothing.
         let publishes_to = table.enabled_stream_arn();
-        let keys = publishes_to
-            .as_ref()
-            .map(|_| table.stream_keys(&item))
-            .unwrap_or_default();
-        let new_image = publishes_to.as_ref().map(|_| item.clone());
+        let publishes = publishes_to.is_some() || table.delivers_to_kinesis(now);
+        let keys = if publishes {
+            table.stream_keys(&item)
+        } else {
+            Item::default()
+        };
+        let new_image = publishes.then(|| item.clone());
+        let published_by = publishes.then(|| table.name.clone());
         let replaced = table.items.insert(key, item);
-        let change = publishes_to.map(|stream_arn| PendingStreamRecord {
-            stream_arn,
+        let change = published_by.map(|table_name| PendingStreamRecord {
+            region: region.to_string(),
+            table_name,
+            stream_arn: publishes_to,
             keys,
             old_image: replaced.clone(),
             new_image,
@@ -3546,17 +3565,22 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
         table.stored_bytes = table
             .stored_bytes
             .saturating_sub(removed.as_ref().map_or(0, item_size));
-        // A delete that removed NOTHING changed no item, so the stream carries no
-        // record for it: the stream is a sequence of modifications, and a delete of
-        // an absent key is none.
-        let change = removed.as_ref().zip(table.enabled_stream_arn()).map(
-            |(before, stream_arn)| PendingStreamRecord {
+        // A delete that removed NOTHING changed no item, so nothing publishes a record
+        // for it: a stream is a sequence of modifications, and a delete of an absent key
+        // is none.
+        let stream_arn = table.enabled_stream_arn();
+        let publishes = stream_arn.is_some() || table.delivers_to_kinesis(now);
+        let change = removed
+            .as_ref()
+            .filter(|_| publishes)
+            .map(|before| PendingStreamRecord {
+                region: region.to_string(),
+                table_name: table.name.clone(),
                 stream_arn,
                 keys: table.stream_keys(before),
                 old_image: Some(before.clone()),
                 new_image: None,
-            },
-        );
+            });
         self.queue_stream_record(change);
         // The same item change the local table applied is applied to every replica of it,
         // so a key deleted in one Region of a global table is deleted in all of them.
@@ -4724,6 +4748,12 @@ mod table;
 mod table_settings;
 pub use table_settings::*;
 mod kinesis;
+
+/// The DATA plane of a table's Kinesis streaming destination: the change records a landed
+/// write delivers to the Kinesis data stream the destination names. Re-exported below, so
+/// every caller still names them `crate::state::…`.
+pub mod kinesis_delivery;
+pub use kinesis_delivery::deliver_item_changes;
 
 /// The export catalogue: the records `ExportTableToPointInTime` writes, their ARNs and
 /// the status every export reader derives from the clock. Re-exported below, so every

@@ -193,14 +193,17 @@ pub fn register_table_stream<Eng: Send + Sync + 'static>(
     })
 }
 
-/// Hand every item-level change the writes of this request made to the DynamoDB
-/// Streams store, in the order they were made.
+/// Hand every item-level change the writes of this request made to the stores that hold
+/// the records: the DynamoDB Streams registry, and the Kinesis data stream of every
+/// streaming destination the table delivers to.
 ///
 /// This is the DATA plane's half of the publishing seam: a write landed an item in
 /// THIS service's store and queued what it changed
 /// ([`crate::state::PendingStreamRecord`]); the records themselves are the streams
 /// service's resources, so they are appended THERE, which is where every stream
-/// consumer reads them.
+/// consumer reads them — and the same change is delivered to the table's Kinesis
+/// streaming destinations ([`crate::state::deliver_item_changes`]), whose records are the
+/// Kinesis service's own.
 ///
 /// Which modification a record describes is derived from the images the write queued:
 /// an item that was not there before is an `INSERT`, one that was and still is a
@@ -214,17 +217,36 @@ pub fn register_table_stream<Eng: Send + Sync + 'static>(
 /// turned into an error for the caller.
 ///
 /// LOCKING: like [`register_table_stream`], this takes the STREAMS store's lock while
-/// the caller holds this service's own, which is the one order the emulator uses. The
-/// work is bounded by the queue, and the queue by one request's writes.
+/// the caller holds this service's own, which is the one order the emulator uses, and then
+/// the KINESIS store's under the same order. The work is bounded by the queue, and the
+/// queue by one request's writes.
 pub fn publish_item_changes<Eng: Send + Sync + 'static>(
     engine: &Eng,
     store: &mut crate::state::ComAmazonawsDynamodbDynamodb20120810State,
     at: SystemTime,
 ) {
-    use ::service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810 as streams;
-
     let changes = store.take_stream_records();
     if changes.is_empty() {
+        return;
+    }
+    publish_to_streams(engine, &changes, at);
+    // The same changes, to the table's Kinesis streaming destinations: a table can publish
+    // to its own stream, to a Kinesis data stream, or to both, so each store is handed the
+    // queue independently of what the other holds.
+    crate::state::deliver_item_changes(engine, store, &changes, at);
+}
+
+/// Append every change to the DynamoDB stream it belongs to, for the changes made on a
+/// table whose own stream is enabled: a change queued by a table with no stream belongs to
+/// none and is only a Kinesis streaming destination's.
+fn publish_to_streams<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    changes: &[crate::state::PendingStreamRecord],
+    at: SystemTime,
+) {
+    use ::service_com_amazonaws_dynamodbstreams_dynamodbstreams_20120810 as streams;
+
+    if changes.iter().all(|change| change.stream_arn.is_none()) {
         return;
     }
     let Some(registry) = streams::state::service_state(engine) else {
@@ -236,6 +258,9 @@ pub fn publish_item_changes<Eng: Send + Sync + 'static>(
     };
     let mut registry = registry.lock();
     for change in changes {
+        let Some(stream_arn) = change.stream_arn.as_deref() else {
+            continue;
+        };
         let event_name = match (&change.old_image, &change.new_image) {
             (None, Some(_)) => streams::state::OperationType::Insert,
             (Some(_), Some(_)) => streams::state::OperationType::Modify,
@@ -250,9 +275,9 @@ pub fn publish_item_changes<Eng: Send + Sync + 'static>(
             new_image: change.new_image.as_ref().map(streams_image),
             old_image: change.old_image.as_ref().map(streams_image),
         };
-        if let Err(rejected) = registry.append_record(&change.stream_arn, &event, at) {
+        if let Err(rejected) = registry.append_record(stream_arn, &event, at) {
             ::tracing::error!(
-                stream_arn = %change.stream_arn,
+                stream_arn = %stream_arn,
                 event_name = event_name.as_str(),
                 reason = ?rejected,
                 "an item change could not be appended to its stream"

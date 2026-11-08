@@ -15,18 +15,22 @@
 //!    precision — by carrying no configuration at all, or one with the member absent —
 //!    registers none, and the member stays absent in the answer and in the reader's
 //!    report until a command names one;
-//! 3. a table holds ONE record per stream: starting replication to a stream the table is
-//!    already replicating to is refused with HTTP 400 `ValidationException` carrying
-//!    DynamoDB's already-enabled sentence over the stream ARN and the table name the
-//!    request carried, whatever transient status that replication is in, while a stream
-//!    whose replication has STOPPED is re-registered in place — so the reader's report
-//!    stays the table's replication history, in registration order, and a replacement
-//!    stream is appended beside the stopped record it replaces;
+//! 3. a table replicates to AT MOST ONE Kinesis data stream, and holds ONE record per
+//!    stream: an enable against a table whose replication is live is refused with HTTP 400
+//!    `ValidationException` carrying DynamoDB's enable-state sentence — whichever stream it
+//!    names and whatever transient status that replication is in (the whole set of live
+//!    statuses, and the second stream, have their own suite
+//!    `kinesis_destination_record_delivery`) — while a stream whose replication has STOPPED
+//!    is re-registered in place, so the reader's report stays the table's replication
+//!    history, in registration order, and a replacement stream is appended beside the
+//!    stopped record it replaces;
 //! 4. the table is resolved like every other table-addressed operation's: by bare name or
 //!    by the table's ARN, with a name no table answers for refused as
 //!    `ResourceNotFoundException` and a name outside the documented form refused by the
-//!    validator's own clause; a `StreamArn` that names no Kinesis data stream is refused
-//!    as a member the service cannot read, and a refused command registers nothing;
+//!    validator's own clause; `StreamArn` is bounded in LENGTH alone, so a value shorter
+//!    than the bound is refused by the validator and every value that clears it is accepted
+//!    — what it resolves to is settled asynchronously
+//!    (`kinesis_destination_record_delivery`);
 //! 5. the registration changes the ONE table it names: every destination of another
 //!    table, and every other destination of this one, is left exactly as it was.
 //!
@@ -364,47 +368,48 @@ async fn an_enable_re_registers_a_stopped_stream_in_place() {
     declared_streams(&router).await;
     create_table(&router, "Replaced", &[]).await;
     create_table(&router, "Untouched", &[]).await;
-    for (stream, precision) in [
-        ("cdc", Some(PRECISIONS[0])),
-        ("audit", None),
-        ("history", Some(PRECISIONS[1])),
-    ] {
-        register(&router, "Replaced", stream, precision).await;
-    }
     register(&router, "Untouched", "audit", Some(PRECISIONS[1])).await;
-    settle().await;
 
-    // Stop replication to the middle record, then start it again under the other
-    // precision: the record is re-registered where it already was.
-    ok(
-        &router,
-        "DisableKinesisStreamingDestination",
-        json!({"TableName": "Replaced", "StreamArn": stream_arn("audit")}),
-    )
-    .await;
+    /// Stop `table`'s replication to `stream` and wait the stop out, which is what frees
+    /// the table to replicate to the next one.
+    async fn stop(router: &MultiServiceRouter, table: &str, stream: &str) {
+        ok(
+            router,
+            "DisableKinesisStreamingDestination",
+            json!({"TableName": table, "StreamArn": stream_arn(stream)}),
+        )
+        .await;
+        settle().await;
+    }
+
+    // A table replicates to ONE stream at a time, so each stream below is registered,
+    // waited out and stopped before the next one is: `cdc` first, then `audit`.
+    register(&router, "Replaced", "cdc", Some(PRECISIONS[0])).await;
     settle().await;
+    stop(&router, "Replaced", "cdc").await;
+    register(&router, "Replaced", "audit", None).await;
+    settle().await;
+    stop(&router, "Replaced", "audit").await;
+
+    // Start replication to `audit` again under the other precision: the record is
+    // re-registered where it already was, rather than appended as a second record.
     let restarted = register(&router, "Replaced", "audit", Some(PRECISIONS[1])).await;
     assert_eq!(
         restarted["DestinationStatus"],
         json!("ENABLING"),
         "case \"re-registered\": expected the transient status, got {restarted}"
     );
+    settle().await;
 
-    // Replace the last record with a different stream: the stopped record stays in the
-    // report and the new stream is appended after it.
-    ok(
-        &router,
-        "DisableKinesisStreamingDestination",
-        json!({"TableName": "Replaced", "StreamArn": stream_arn("history")}),
-    )
-    .await;
+    // Replace it with a DIFFERENT stream: the stopped record stays in the report and the
+    // new stream is appended after it.
+    stop(&router, "Replaced", "audit").await;
     register(&router, "Replaced", "replacement", Some(PRECISIONS[0])).await;
     settle().await;
 
     let wanted: Vec<(String, String)> = vec![
-        (stream_arn("cdc"), "ACTIVE".to_string()),
-        (stream_arn("audit"), "ACTIVE".to_string()),
-        (stream_arn("history"), "DISABLED".to_string()),
+        (stream_arn("cdc"), "DISABLED".to_string()),
+        (stream_arn("audit"), "DISABLED".to_string()),
         (stream_arn("replacement"), "ACTIVE".to_string()),
     ];
     let reported = history(&router, "Replaced").await;
@@ -432,12 +437,6 @@ async fn an_enable_re_registers_a_stopped_stream_in_place() {
             "Replaced",
             "replacement",
             Some(PRECISIONS[0]),
-        ),
-        (
-            "the stopped record it replaced",
-            "Replaced",
-            "history",
-            Some(PRECISIONS[1]),
         ),
         (
             "the same stream of another table",
@@ -522,42 +521,10 @@ async fn an_enable_resolves_the_table_and_the_stream_it_names() {
         );
     }
 
-    // Every value here satisfies the `StreamArn` member's documented 37..=1024 length
-    // bound (`smithy_query(query="operation",operation="EnableKinesisStreamingDestination")`),
-    // so the refusal under test is the service's own reading of the ARN and not the
-    // boundary validator's length check.
-    for value in [
-        "arn:aws:kinesis:us-east-1:000000000000:stream",
-        "arn:aws:KINESIS:us-east-1:000000000000:stream/cdc",
-        "arn::kinesis:us-east-1:000000000000:stream/cdc",
-        "arn:aws:kinesis:us-east-1:000000000000:stream/",
-        "a-value-that-names-no-arn-but-clears-the-length-bound",
-    ] {
-        let (status, body) = call(
-            &router,
-            "EnableKinesisStreamingDestination",
-            json!({"TableName": "Resolved", "StreamArn": value}),
-        )
-        .await;
-        assert_eq!(
-            status, 400,
-            "case {value:?}: expected HTTP 400, got {status} with {body}"
-        );
-        assert_eq!(
-            error_code(&body),
-            "ValidationException",
-            "case {value:?}: expected ValidationException, got {body}"
-        );
-        assert_eq!(
-            message(&body),
-            format!("Invalid StreamArn: Invalid StreamArn provided as input {value}"),
-            "case {value:?}: expected DynamoDB's unreadable-ARN sentence, got {:?}",
-            message(&body)
-        );
-    }
-
-    // A `StreamArn` shorter than the member's documented minimum is refused by the
-    // boundary validator's own length clause, before the handler reads it.
+    // A `StreamArn` SHORTER than the member's documented minimum is refused by the
+    // boundary validator's own length clause, before the handler reads it — the one
+    // constraint the member carries, so every value that clears it is accepted and settled
+    // asynchronously (`kinesis_destination_record_delivery`).
     let short = "arn:aws:kinesis:x";
     let (status, body) = call(
         &router,

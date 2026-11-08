@@ -77,7 +77,6 @@ async fn reported(router: &MultiServiceRouter, table: &str, arn: &str) -> String
 #[tokio::test]
 async fn a_destination_settles_on_whether_its_stream_resolves() {
     let router = emulator();
-    create_table(&router, "Resolving", &[]).await;
     // One stream the Kinesis service holds in THIS region, and one it holds in another:
     // the second is the row that shows the resolution is per endpoint.
     let live = ensure_kinesis_stream(&router, "live").await;
@@ -105,22 +104,27 @@ async fn a_destination_settles_on_whether_its_stream_resolves() {
         ),
     ];
 
-    for (case, arn, settled) in cases {
+    for (index, (case, arn, settled)) in cases.into_iter().enumerate() {
+        // A table replicates to AT MOST ONE Kinesis data stream, so each row gets its own
+        // table: the first enable leaves replication live, and that is what the table's
+        // streaming state refuses a second enable on.
+        let table = format!("Resolving{index}");
+        create_table(&router, &table, &[]).await;
         // Registering is asynchronous either way, so the command reports the transient
         // status whichever end it is heading for.
-        let answered = enable(&router, "Resolving", &arn).await;
+        let answered = enable(&router, &table, &arn).await;
         assert_eq!(
             answered, "ENABLING",
             "case {case:?}: expected the transient status, got {answered}"
         );
-        let registering = reported(&router, "Resolving", &arn).await;
+        let registering = reported(&router, &table, &arn).await;
         assert_eq!(
             registering, "ENABLING",
             "case {case:?}: the reader reports the transient status too, got {registering}"
         );
 
         settle().await;
-        let reached = reported(&router, "Resolving", &arn).await;
+        let reached = reported(&router, &table, &arn).await;
         assert_eq!(
             reached, settled,
             "case {case:?}: expected the destination to settle on {settled}, got {reached}"

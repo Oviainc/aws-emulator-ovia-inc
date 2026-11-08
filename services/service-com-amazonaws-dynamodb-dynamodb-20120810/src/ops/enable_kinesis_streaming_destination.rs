@@ -8,9 +8,15 @@
 //!
 //! What it settles INTO is decided by the stream itself: the `StreamArn` is resolved
 //! against the Kinesis service's own stream registry
-//! (`crate::state::kinesis_stream_exists`), and a destination whose stream does not exist
-//! settles `ENABLE_FAILED` — nothing replicates to a stream that is not there, so it never
-//! reaches `ACTIVE`.
+//! (`crate::state::resolve_kinesis_stream`), and a destination whose stream does not resolve
+//! settles `ENABLE_FAILED`, reporting WHY it could not be enabled — nothing replicates to a
+//! stream that is not there, so it never reaches `ACTIVE`. `StreamArn` carries a length
+//! bound and no other constraint, so every value that clears it is accepted here and
+//! answered asynchronously.
+//!
+//! A table replicates to AT MOST ONE Kinesis data stream, so this command is served only
+//! while the table has no live destination; the records of replication that failed or was
+//! stopped are the table's history, and an enable may start again from them.
 //!
 //! ## Shape of an operation
 //!
@@ -174,14 +180,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name_in(&input.table_name, &region).map_err(lift)?;
-        // A destination IS a Kinesis data stream, so a value that names no stream names
-        // no destination this command could register.
-        let stream = crate::state::check_stream_arn(&input.stream_arn).map_err(lift)?;
-        // WHETHER that stream exists is the Kinesis service's to answer, and it is asked
-        // BEFORE this service's store is locked: an enable whose `StreamArn` resolves to no
-        // stream cannot be completed, so its destination settles `ENABLE_FAILED` rather
-        // than reporting replication to a stream nothing could reach.
-        let stream_resolved = crate::state::kinesis_stream_exists(
+        // `StreamArn` is modelled as a length-bounded string, so a value that clears that
+        // bound is ACCEPTED by this call: WHAT it resolves to is the Kinesis service's to
+        // answer, and it is asked BEFORE this service's store is locked. An enable whose
+        // `StreamArn` resolves to no stream of this Region cannot be completed, so its
+        // destination settles `ENABLE_FAILED` — carrying the reason it could not be — rather
+        // than being refused up front or reporting replication to a stream nothing reaches.
+        let resolved = crate::state::resolve_kinesis_stream(
             &*self.engine,
             &region,
             &input.stream_arn,
@@ -217,10 +222,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The refusals below are stated over the table's STORED name, so reading it
         // cannot overlap the borrow of the record they are about.
         let table_name = table.name.clone();
-        if table
-            .replicating_kinesis_destination_mut(&input.stream_arn, now)
-            .is_some()
-        {
+        // A table replicates to AT MOST ONE Kinesis data stream, so an enable is served
+        // only while the table has no LIVE replication — whichever stream the request
+        // names. The records of replication that failed or was stopped are the table's
+        // history, and an enable may start again from them.
+        if table.live_kinesis_destination(now).is_some() {
             return Err(lift(crate::state::kinesis_destination_not_enableable()));
         }
         // A table keeps a bounded replication history, so a caller naming new streams
@@ -241,7 +247,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let registered = table.register_kinesis_destination(
             &input.stream_arn,
             precision,
-            stream_resolved,
+            resolved.as_ref().err(),
             now,
         );
         let stream_arn = registered.stream_arn.clone();
@@ -255,9 +261,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation = Self::NAME,
             akid = %::emulator_server::extract_akid(&ctx.parts().headers),
             table_name = %table_name,
-            stream = %stream,
+            stream = %input.stream_arn,
             destination_status = %status,
-            outcome = if stream_resolved { "enabled" } else { "enable_failed" },
+            outcome = if resolved.is_ok() { "enabled" } else { "enable_failed" },
             "kinesis streaming destination enabled"
         );
 

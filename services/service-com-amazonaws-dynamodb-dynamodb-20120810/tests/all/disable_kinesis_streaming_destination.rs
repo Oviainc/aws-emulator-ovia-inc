@@ -26,8 +26,10 @@
 //! 4. the table is resolved like every other table-addressed operation's: by bare name
 //!    or by the table's ARN, with a name no table answers for refused as
 //!    `ResourceNotFoundException` and a name outside the documented form refused by the
-//!    validator's own clause; a `StreamArn` that names no Kinesis data stream is refused
-//!    as a member the service cannot read;
+//!    validator's own clause; a `StreamArn` is bounded in LENGTH alone, so a value that
+//!    clears that bound is read, and one that names no Kinesis data stream addresses no
+//!    `ACTIVE` destination of this table — the required-status refusal, like every other
+//!    stream the table does not replicate to;
 //! 5. a stopped destination stays in the reader's report — it is the table's replication
 //!    history — and the stop leaves every other destination, of this table and of
 //!    another, exactly as it was.
@@ -196,13 +198,19 @@ async fn a_disable_stops_only_the_destination_it_addresses() {
     let router = emulator();
     create_table(&router, "Addressed", &[]).await;
     create_table(&router, "Untouched", &[]).await;
-    for (stream, precision) in [
-        ("cdc", Some("MICROSECOND")),
-        ("audit", Some("MILLISECOND")),
-        ("history", None),
-    ] {
-        register(&router, "Addressed", stream, precision).await;
-    }
+    // A table replicates to ONE stream at a time, so the history below is built the only
+    // way a client can build one: replication to `cdc` is started and stopped, and `audit`
+    // is registered after it — which is the destination the stop under test addresses.
+    register(&router, "Addressed", "cdc", Some("MICROSECOND")).await;
+    settle().await;
+    ok(
+        &router,
+        "DisableKinesisStreamingDestination",
+        json!({"TableName": "Addressed", "StreamArn": stream_arn("cdc")}),
+    )
+    .await;
+    settle().await;
+    register(&router, "Addressed", "audit", Some("MILLISECOND")).await;
     register(&router, "Untouched", "cdc", Some("MICROSECOND")).await;
     settle().await;
 
@@ -227,15 +235,8 @@ async fn a_disable_stops_only_the_destination_it_addresses() {
             "a destination registered before it",
             "Addressed",
             "cdc",
-            "ACTIVE",
+            "DISABLED",
             Some("MICROSECOND"),
-        ),
-        (
-            "a destination registered after it",
-            "Addressed",
-            "history",
-            "ACTIVE",
-            None,
         ),
         (
             "the same stream of another table",
@@ -282,9 +283,8 @@ async fn a_disable_stops_only_the_destination_it_addresses() {
         })
         .collect();
     let wanted: Vec<(Value, Value)> = vec![
-        (json!(stream_arn("cdc")), json!("ACTIVE")),
+        (json!(stream_arn("cdc")), json!("DISABLED")),
         (json!(stream_arn("audit")), json!("DISABLED")),
-        (json!(stream_arn("history")), json!("ACTIVE")),
     ];
     assert_eq!(
         order, wanted,
@@ -457,8 +457,8 @@ async fn a_disable_resolves_the_table_and_the_stream_the_request_names() {
 
     // Every value here satisfies the `StreamArn` member's documented 37..=1024 length
     // bound (`smithy_query(query="operation",operation="DisableKinesisStreamingDestination")`),
-    // so the refusal under test is the service's own reading of the ARN and not the
-    // boundary validator's length check.
+    // which is the only constraint the member carries: each is READ, and names no stream
+    // this table replicates to, so each earns the required-status refusal.
     for value in [
         "arn:aws:dynamodb:us-east-1:000000000000:table/Other",
         "arn:aws:kinesis:us-east-1:000000000000:table/Other",
@@ -483,8 +483,8 @@ async fn a_disable_resolves_the_table_and_the_stream_the_request_names() {
         );
         assert_eq!(
             message(&body),
-            format!("Invalid StreamArn: Invalid StreamArn provided as input {value}"),
-            "case {value:?}: expected DynamoDB's unreadable-ARN sentence, got {}",
+            not_active_message(),
+            "case {value:?}: expected the required-status sentence, got {}",
             message(&body)
         );
     }

@@ -15,8 +15,9 @@
 //! 2. the table is resolved like every other table-addressed operation's: by bare name
 //!    or by the table's ARN, with a name no table answers for refused as
 //!    `ResourceNotFoundException` and a name outside the documented form refused by the
-//!    validator's own clause; a `StreamArn` that names no Kinesis data stream is refused
-//!    as a member the service cannot read;
+//!    validator's own clause; `StreamArn` is bounded in LENGTH alone, so a value that
+//!    clears that bound is read, and one that names no Kinesis data stream addresses no
+//!    destination record of this table — the no-such-destination refusal;
 //! 3. an accepted command applies the configuration it names to that one destination and
 //!    to nothing else, and the destination is `UPDATING` for the transient span and
 //!    `ACTIVE` after it — both as the command answers and as the reader reports;
@@ -75,6 +76,11 @@ type Destination = (&'static str, Option<&'static str>, Replication);
 /// Leave `destinations` on `table`: each is REGISTERED over the wire, and the ones a row
 /// wants stopped are stopped in the store the handlers read.
 ///
+/// A table replicates to AT MOST ONE Kinesis data stream, so the destinations a row wants
+/// STOPPED are registered first and stopped one by one; the row's live one — a row carries
+/// at most one — is registered last, which is the only order a client can build such a
+/// history in.
+///
 /// The stop is the one step applied through the store rather than over the wire, because
 /// a row wants its span already elapsed: that is a stop placed in the past, which only
 /// the store can state — the same per-service store the handlers read (the shared engine
@@ -85,7 +91,14 @@ async fn set_up(
     table: &str,
     destinations: &[Destination],
 ) {
-    for (stream, precision, _) in destinations {
+    let ordered = destinations.iter().filter(|(_, _, replication)| {
+        !matches!(replication, Replication::Live)
+    });
+    for (stream, precision, replication) in ordered.chain(
+        destinations
+            .iter()
+            .filter(|(_, _, replication)| matches!(replication, Replication::Live)),
+    ) {
         // The stream has to EXIST for the registration to replicate: a destination whose
         // `StreamArn` resolves to no stream settles `ENABLE_FAILED` rather than `ACTIVE`.
         let arn = ensure_kinesis_stream(router, stream).await;
@@ -95,17 +108,16 @@ async fn set_up(
                 json!({"ApproximateCreationDateTimePrecision": precision});
         }
         ok(router, "EnableKinesisStreamingDestination", request).await;
-    }
-    if !destinations.is_empty() {
-        // Every registration above is asynchronous, so wait the span out once: each
-        // destination is replicating before a row's own command runs.
+        // Every registration is asynchronous, so wait the span out: the destination is
+        // replicating before the row's own command runs, and before the next one is
+        // registered.
         settle().await;
-    }
-    for (stream, _, replication) in destinations {
         let stopped_at = match replication {
             Replication::Live => continue,
             // Far enough in the past that the stop span has already elapsed.
-            Replication::Stopped => SystemTime::now() - (STATUS_TRANSITION + Duration::from_millis(150)),
+            Replication::Stopped => {
+                SystemTime::now() - (STATUS_TRANSITION + Duration::from_millis(150))
+            }
             Replication::Stopping => SystemTime::now(),
         };
         let store =
@@ -504,9 +516,8 @@ async fn an_update_changes_only_the_destination_it_addresses() {
         &engine,
         "Addressed",
         &[
-            ("cdc", Some("MICROSECOND"), Replication::Live),
-            ("audit", Some("MICROSECOND"), Replication::Live),
             ("history", Some("MILLISECOND"), Replication::Stopped),
+            ("cdc", Some("MICROSECOND"), Replication::Live),
         ],
     )
     .await;
@@ -542,13 +553,6 @@ async fn an_update_changes_only_the_destination_it_addresses() {
             Some("MILLISECOND"),
         ),
         (
-            "another destination of the same table",
-            "Addressed",
-            "audit",
-            "ACTIVE",
-            Some("MICROSECOND"),
-        ),
-        (
             "a stopped destination of the same table",
             "Addressed",
             "history",
@@ -579,17 +583,19 @@ async fn an_update_changes_only_the_destination_it_addresses() {
     }
 }
 
-/// Rule 2, the stream half: a `StreamArn` that names no Kinesis data stream addresses no
-/// destination at all, on the command that registers one and on the command that updates
-/// one alike.
+/// Rule 2, the stream half: a `StreamArn` that names no Kinesis data stream names no
+/// destination record of the table either, so the command that addresses an EXISTING
+/// destination answers its own lookup miss — the value is read, not refused as unreadable.
+/// What the command that REGISTERS a destination does with such a value (accept it, and
+/// settle `ENABLE_FAILED`) is its own suite's
+/// (`kinesis_destination_record_delivery`).
 #[tokio::test]
 async fn a_stream_arn_that_names_no_stream_is_refused() {
     let (router, _engine) = emulator_and_engine();
     create_table(&router, "Addressed", &[]).await;
 
-    // Every value here satisfies the member's documented 37..=1024 length bound, so the
-    // refusal under test is the service's own reading of the ARN and not the boundary
-    // validator's length check.
+    // Every value here satisfies the member's documented 37..=1024 length bound, which is
+    // the only constraint it carries, so each is READ and resolves to no destination.
     let values = [
         "arn:aws:dynamodb:us-east-1:000000000000:table/Other",
         "arn:aws:kinesis:us-east-1:000000000000:table/Other",
@@ -599,33 +605,28 @@ async fn a_stream_arn_that_names_no_stream_is_refused() {
     ];
 
     for value in values {
-        for operation in [
-            "EnableKinesisStreamingDestination",
+        let case = format!("UpdateKinesisStreamingDestination with {value}");
+        let (status, body) = call(
+            &router,
             "UpdateKinesisStreamingDestination",
-        ] {
-            let case = format!("{operation} with {value}");
-            let (status, body) = call(
-                &router,
-                operation,
-                json!({"TableName": "Addressed", "StreamArn": value}),
-            )
-            .await;
-            assert_eq!(
-                status, 400,
-                "case {case:?}: expected HTTP 400, got {status} with {body}"
-            );
-            assert_eq!(
-                error_code(&body),
-                "ValidationException",
-                "case {case:?}: expected ValidationException, got {body}"
-            );
-            assert_eq!(
-                message(&body),
-                format!("Invalid StreamArn: Invalid StreamArn provided as input {value}"),
-                "case {case:?}: expected DynamoDB's unreadable-ARN sentence, got {}",
-                message(&body)
-            );
-        }
+            json!({"TableName": "Addressed", "StreamArn": value}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} with {body}"
+        );
+        assert_eq!(
+            error_code(&body),
+            "ValidationException",
+            "case {case:?}: expected ValidationException, got {body}"
+        );
+        assert_eq!(
+            message(&body),
+            no_destination_message("Addressed", value),
+            "case {case:?}: expected DynamoDB's no-such-destination sentence, got {}",
+            message(&body)
+        );
     }
 }
 

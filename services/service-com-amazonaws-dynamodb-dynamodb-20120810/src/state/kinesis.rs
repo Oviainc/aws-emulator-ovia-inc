@@ -61,3 +61,31 @@ pub fn kinesis_stream_exists<Eng: Send + Sync + 'static>(
             .is_some()
     })
 }
+
+/// The Kinesis data stream a `StreamArn` resolves to for a table of `region`: its name, or
+/// the reason an enable naming it cannot be completed.
+///
+/// `StreamArn` is modelled as a length-bounded string, so the API ACCEPTS every value that
+/// clears that bound; this is what the value then resolves to, and each way it resolves to
+/// no stream is a distinct [`KinesisEnableFailure`] the destination describes itself with:
+/// the value is no stream ARN, it names a stream of another Region — a table replicates
+/// only to a stream of its own Region — or this Region's endpoint holds no stream under it.
+///
+/// LOCKING: as [`kinesis_stream_exists`], whose lookup this is stated over.
+pub fn resolve_kinesis_stream<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    stream_arn: &str,
+    at: SystemTime,
+) -> Result<String, KinesisEnableFailure> {
+    let Some((stream_region, name)) = parse_kinesis_stream_arn(stream_arn) else {
+        return Err(KinesisEnableFailure::NotAStreamArn);
+    };
+    if stream_region != region {
+        return Err(KinesisEnableFailure::AnotherRegion(stream_region));
+    }
+    if !kinesis_stream_exists(engine, region, stream_arn, at) {
+        return Err(KinesisEnableFailure::NoSuchStream);
+    }
+    Ok(name)
+}

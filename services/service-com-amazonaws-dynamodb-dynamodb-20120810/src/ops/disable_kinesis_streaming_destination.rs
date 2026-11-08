@@ -166,9 +166,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         let name = crate::state::resolve_table_name_in(&input.table_name, &region).map_err(lift)?;
-        // A destination IS a Kinesis data stream, so a value that names no stream
-        // addresses no destination of this table.
-        let stream = crate::state::check_stream_arn(&input.stream_arn).map_err(lift)?;
         let precision = input
             .enable_kinesis_streaming_configuration
             .as_ref()
@@ -218,7 +215,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             operation = Self::NAME,
             akid = %::emulator_server::extract_akid(&ctx.parts().headers),
             table_name = %table_name,
-            stream = %stream,
+            stream = %input.stream_arn,
             destination_status = %status,
             outcome = "disabled",
             "kinesis streaming destination disabled"

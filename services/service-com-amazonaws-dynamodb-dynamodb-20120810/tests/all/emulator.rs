@@ -86,6 +86,34 @@ pub async fn ensure_kinesis_stream(router: &MultiServiceRouter, name: &str) -> S
         .to_string()
 }
 
+/// Send one KINESIS operation in [`REGION`], signed for that service — the surface a
+/// table's streaming destination delivers its records into, so a suite that asserts what
+/// was delivered reads it where Kinesis holds it.
+pub async fn call_kinesis(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
+    dispatch_as(
+        router,
+        REGION,
+        "kinesis",
+        &format!("Kinesis_20131202.{operation}"),
+        body,
+    )
+    .await
+}
+
+/// [`call_kinesis`] for an operation that must succeed, returning its parsed body.
+pub async fn ok_kinesis(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+    let (status, parsed) = call_kinesis(router, operation, body.clone()).await;
+    assert_eq!(
+        status, 200,
+        "case kinesis {operation} {body}: expected HTTP 200, got {status} with {parsed}"
+    );
+    parsed
+}
+
 /// One emulator holding this service AND DynamoDB Streams, over ONE shared engine.
 ///
 /// A stream is created by a DynamoDB call and read by a streams call, so a suite

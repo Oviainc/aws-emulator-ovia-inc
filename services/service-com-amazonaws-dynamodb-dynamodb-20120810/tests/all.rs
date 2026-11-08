@@ -79,6 +79,8 @@ mod item_write_expressions;
 mod item_write_vocabularies;
 #[path = "all/key_schema_element_refusals.rs"]
 mod key_schema_element_refusals;
+#[path = "all/kinesis_destination_record_delivery.rs"]
+mod kinesis_destination_record_delivery;
 #[path = "all/kinesis_destination_state_refusals.rs"]
 mod kinesis_destination_state_refusals;
 #[path = "all/kinesis_destination_stream_resolution.rs"]

@@ -520,6 +520,15 @@ pub const DESTINATION_STATUS_DISABLED: &str = "DISABLED";
 /// that does not exist asks for ([`kinesis_stream_exists`]).
 pub const DESTINATION_STATUS_ENABLE_FAILED: &str = "ENABLE_FAILED";
 
+/// The two units `ApproximateCreationDateTimePrecision` declares
+/// ([`crate::ops::types::APPROXIMATE_CREATION_DATE_TIME_PRECISION_VALUES`]) — "the precision
+/// of the Kinesis data stream timestamp. The values are either MILLISECOND or MICROSECOND"
+/// (`KinesisDataStreamDestination$ApproximateCreationDateTimePrecision`) — named one per
+/// meaning, because the unit of the creation time a delivered record carries is this value
+/// ([`super::kinesis_delivery`]).
+pub const DESTINATION_PRECISION_MILLISECOND: &str = "MILLISECOND";
+pub const DESTINATION_PRECISION_MICROSECOND: &str = "MICROSECOND";
+
 /// How DynamoDB opens its refusal of a command against a table's Kinesis streaming
 /// destination that the table's state cannot serve; the reason follows the colon.
 pub(super) const KINESIS_DESTINATION_INVALID_STATE: &str =
@@ -565,13 +574,54 @@ pub fn kinesis_destination_not_active_to_update(table: &str, stream_arn: &str) -
     ))
 }
 
-/// How the command that STARTS replication is refused when the table's record for that
-/// stream is in a status an enable cannot start from.
+/// Why an enable could not be completed, which is what the failed destination's
+/// `DestinationStatusDescription` reports — "the human-readable string that corresponds to
+/// the replica status".
 ///
-/// Replication is started from a stream the table either has no record for or has stopped
-/// replicating to, so a record that is `ENABLING`, `ACTIVE`, `UPDATING` or `DISABLING` is
-/// refused — and the refusal is stated over the statuses an enable REQUIRES, the way the
-/// stop command's refusal is stated over the status it requires
+/// A destination IS a Kinesis data stream, so every reason an enable settles
+/// `ENABLE_FAILED` is a reason the `StreamArn` resolves to no stream this table could
+/// replicate to, and each is told apart for the caller: a value that is not a stream ARN at
+/// all, an ARN of a stream in another Region, and an ARN no stream of this Region carries.
+#[derive(Debug, Clone)]
+pub enum KinesisEnableFailure {
+    /// The `StreamArn` does not name a Kinesis data stream
+    /// ([`parse_kinesis_stream_arn`]).
+    NotAStreamArn,
+    /// It names a stream of another Region, which no table of this one replicates to.
+    AnotherRegion(String),
+    /// It is the ARN of a Kinesis data stream, and this Region's Kinesis endpoint holds no
+    /// stream under it.
+    NoSuchStream,
+}
+
+impl KinesisEnableFailure {
+    /// The human-readable description of this failure, over the `StreamArn` the enable
+    /// named: what the destination reports for as long as it carries the failed status.
+    pub fn description(&self, stream_arn: &str) -> String {
+        let reason = match self {
+            Self::NotAStreamArn => {
+                format!("{stream_arn} is not the ARN of a Kinesis data stream")
+            }
+            Self::AnotherRegion(region) => format!(
+                "the Kinesis data stream must be in the same Region as the table, and \
+                 {stream_arn} is in {region}"
+            ),
+            Self::NoSuchStream => {
+                format!("there is no Kinesis data stream with ARN {stream_arn}")
+            }
+        };
+        format!("Failed to enable Kinesis streaming destination: {reason}")
+    }
+}
+
+/// How the command that STARTS replication is refused when the table's streaming state
+/// cannot serve it.
+///
+/// A table replicates to AT MOST ONE Kinesis data stream, so an enable is served only
+/// while the table has no LIVE destination: whether the request names the stream the table
+/// already replicates to or another one, the table's own streaming state is the same, and
+/// so is the refusal. It is stated over the statuses an enable REQUIRES, the way the stop
+/// command's refusal is stated over the status it requires
 /// ([`kinesis_destination_not_active_to_disable`]): it names neither the table nor the
 /// stream. `ENABLE_FAILED` is named beside `DISABLED` because AWS states both as the
 /// statuses an enable may start from, and this store reaches both: a destination whose
@@ -595,19 +645,17 @@ pub fn kinesis_destination_not_enableable() -> RequestError {
 pub const MAX_KINESIS_DESTINATIONS_PER_TABLE: usize = 64;
 
 /// The form a Kinesis data stream's ARN takes
-/// (`arn:<partition>:kinesis:<region>:<account>:stream/<name>`), answering the stream it
-/// names.
+/// (`arn:<partition>:kinesis:<region>:<account>:stream/<name>`), answering the Region the
+/// stream it names belongs to and the stream's own name.
 ///
-/// The `StreamArn` member is modelled as a length-bounded string only, so this is the
-/// check the service itself makes: a value that names no Kinesis data stream addresses
-/// no destination at all, which is an INPUT failure rather than a lookup miss, worded
-/// the way this service words an ARN member it cannot read ([`check_table_arn`]).
-pub fn check_stream_arn(stream_arn: &str) -> Result<String, RequestError> {
-    let invalid = || {
-        RequestError::Validation(format!(
-            "Invalid StreamArn: Invalid StreamArn provided as input {stream_arn}"
-        ))
-    };
+/// `None` for a value that names no Kinesis data stream. The `StreamArn` member is
+/// modelled as a length-bounded string only, so a value that clears that bound is ACCEPTED
+/// by every command that carries one: what it resolves to is answered here and against the
+/// Kinesis service's own registry ([`kinesis_stream_exists`]), rather than refused as
+/// unreadable input — the enable settles `ENABLE_FAILED` for a `StreamArn` that resolves to
+/// no stream, and the commands that address an EXISTING destination answer their own
+/// lookup miss.
+pub fn parse_kinesis_stream_arn(stream_arn: &str) -> Option<(String, String)> {
     // `arn`, partition, service, region, account, resource — the resource field is the
     // last one and may itself carry `/`, so the split stops at six.
     let fields: Vec<&str> = stream_arn.splitn(6, ':').collect();
@@ -615,16 +663,16 @@ pub fn check_stream_arn(stream_arn: &str) -> Result<String, RequestError> {
         ["arn", partition, service, region, _account, resource] => {
             (*partition, *service, *region, *resource)
         }
-        _ => return Err(invalid()),
+        _ => return None,
     };
     if partition.is_empty() || service != "kinesis" || region.is_empty() {
-        return Err(invalid());
+        return None;
     }
-    let name = resource.strip_prefix("stream/").ok_or_else(invalid)?;
+    let name = resource.strip_prefix("stream/")?;
     if name.is_empty() || name.contains('/') {
-        return Err(invalid());
+        return None;
     }
-    Ok(name.to_string())
+    Some((region.to_string(), name.to_string()))
 }
 
 /// One Kinesis data stream destination of a table: the stream it replicates to, where
@@ -648,6 +696,11 @@ pub struct KinesisDestination {
     /// (`KinesisDataStreamDestination$ApproximateCreationDateTimePrecision`), or `None`
     /// while no command has named one: the member is absent until one does.
     pub(super) precision: Option<String>,
+    /// Why the enable this record came from could not be completed, for a registration
+    /// headed for `ENABLE_FAILED` — what the failed destination reports as its
+    /// `DestinationStatusDescription` ([`KinesisEnableFailure::description`]). `None` for a
+    /// registration that replicates: there is no failure to describe.
+    pub(super) status_description: Option<String>,
 }
 
 impl KinesisDestination {
@@ -660,19 +713,27 @@ impl KinesisDestination {
             transient_status: DESTINATION_STATUS_ENABLING,
             settles_at: now + STATUS_TRANSITION,
             precision: precision.map(str::to_string),
+            status_description: None,
         }
     }
 
     /// The same registration for an enable that CANNOT be completed: the record is
     /// `ENABLING` for the span, like any other, and settles in `ENABLE_FAILED` instead of
-    /// `ACTIVE`.
+    /// `ACTIVE`, carrying the human-readable description of `failure`.
     ///
-    /// Nothing replicates to a stream that does not exist, so the destination never
-    /// reaches `ACTIVE`; the status that says so is the one the model declares for it, and
-    /// a later enable may start again from it ([`kinesis_destination_not_enableable`]).
-    pub fn enable_failing(stream_arn: &str, precision: Option<&str>, now: SystemTime) -> Self {
+    /// Nothing replicates to a stream that does not resolve, so the destination never
+    /// reaches `ACTIVE`; the status that says so is the one the model declares for it, the
+    /// description is what tells the caller WHY, and a later enable may start again from it
+    /// ([`kinesis_destination_not_enableable`]).
+    pub fn enable_failing(
+        stream_arn: &str,
+        precision: Option<&str>,
+        failure: &KinesisEnableFailure,
+        now: SystemTime,
+    ) -> Self {
         Self {
             settled_status: DESTINATION_STATUS_ENABLE_FAILED,
+            status_description: Some(failure.description(stream_arn)),
             ..Self::enabling(stream_arn, precision, now)
         }
     }
@@ -707,6 +768,30 @@ impl KinesisDestination {
     /// is in a transient status, and the change is refused on that status.
     pub fn active(&self, now: SystemTime) -> bool {
         self.status(now) == DESTINATION_STATUS_ACTIVE
+    }
+
+    /// Whether a change made at `now` is DELIVERED to this destination's stream.
+    ///
+    /// Replication runs once the registration has settled, and keeps running while a
+    /// configuration change of its own is still owed, so a record that is `ACTIVE` or
+    /// `UPDATING` takes the item changes its table's writes make. A registration that has
+    /// not settled yet delivers nothing — replication starts "at a timestamp chosen during
+    /// the enable workflow" (the `EnableKinesisStreamingDestination` doc) — and neither
+    /// does one that failed, or one whose replication has been stopped.
+    pub fn delivers(&self, now: SystemTime) -> bool {
+        matches!(
+            self.status(now),
+            DESTINATION_STATUS_ACTIVE | DESTINATION_STATUS_UPDATING
+        )
+    }
+
+    /// The unit the creation time of a delivered record is stated in: the precision in
+    /// force, and — for a destination no command has named one for — the service's own
+    /// default, which is the enum's `MILLISECOND`.
+    pub fn precision_in_force(&self) -> &str {
+        self.precision
+            .as_deref()
+            .unwrap_or(DESTINATION_PRECISION_MILLISECOND)
     }
 
     /// Apply one update of this destination's configuration: the record is `UPDATING`
@@ -744,12 +829,17 @@ impl KinesisDestination {
     ///
     /// `DestinationStatusDescription` is "the human-readable string that corresponds to
     /// the replica status" — a description of a FAILURE, which a record that replicates
-    /// has none of, so the member stays absent.
+    /// has none of, so the member is reported only while the record carries the failed
+    /// status and stays absent for every other one.
     pub fn describe(&self, now: SystemTime) -> KinesisDataStreamDestination {
+        let status = self.status(now);
         KinesisDataStreamDestination {
             stream_arn: Some(self.stream_arn.clone()),
-            destination_status: Some(self.status(now).to_string()),
-            destination_status_description: None,
+            destination_status: Some(status.to_string()),
+            destination_status_description: self
+                .status_description
+                .clone()
+                .filter(|_| status == DESTINATION_STATUS_ENABLE_FAILED),
             approximate_creation_date_time_precision: self.precision(),
         }
     }
