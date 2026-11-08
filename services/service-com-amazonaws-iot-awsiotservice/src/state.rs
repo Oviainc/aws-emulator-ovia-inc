@@ -85,6 +85,12 @@
 //! [`thing_registration`]). The THINGS such a task provisions are not a store of their own:
 //! they go into the thing registry above, so a reader of a thing cannot tell whether
 //! `CreateThing` or a bulk task put it there.
+//!
+//! It also holds the account's ROLE ALIASES, keyed by `roleAlias` for the same reason:
+//! the name is the alias's identity and the `@httpLabel` of
+//! `/role-aliases/{roleAlias}`. One record carries everything a reader hands back, so
+//! `DescribeRoleAlias` after `CreateRoleAlias` reports the created alias
+//! member-for-member (see [`role_aliases`]).
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::time::{Duration, SystemTime};
@@ -837,6 +843,17 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// A caller grows this store, so it is bounded: [`MAX_CERTIFICATES`] is the ceiling
     /// `CreateKeysAndCertificate` refuses past.
     pub certificates: BTreeMap<String, RegisteredCertificate>,
+    /// Every role alias that exists, keyed by `roleAlias`.
+    ///
+    /// The name is the alias's identity — the model binds it as the `@httpLabel` of
+    /// `/role-aliases/{roleAlias}` on every single-alias operation — so a `BTreeMap`
+    /// keyed by name is the role-alias registry itself. `BTreeMap` (not `HashMap`)
+    /// because `ListRoleAliases` is `@paginated` and a page boundary is only
+    /// meaningful over a stable order.
+    ///
+    /// A caller grows this store, so it is bounded: [`MAX_ROLE_ALIASES`] is the
+    /// ceiling `CreateRoleAlias` refuses past.
+    pub role_aliases: BTreeMap<String, RegisteredRoleAlias>,
 }
 
 impl ComAmazonawsIotAwsiotserviceState {
@@ -2668,6 +2685,16 @@ pub use certificates::{
     MintedKeysAndCertificate, RegisteredCertificate, CERTIFICATE_MODE_DEFAULT,
     CERTIFICATE_STATUS_ACTIVE, CERTIFICATE_STATUS_INACTIVE, FIRST_CERTIFICATE_CUSTOMER_VERSION,
     MAX_CERTIFICATES,
+};
+
+// What a ROLE ALIAS is — the record one holds, the ARN minted for it and what every
+// reader of one reports — lives in `state/role_aliases.rs`, beside the store accessor
+// for the same reason the rules engine does. Its names are re-exported here so a
+// handler reaches them as `crate::state::<name>`.
+pub mod role_aliases;
+pub use role_aliases::{
+    missing_role_alias_message, role_alias_arn, RegisteredRoleAlias,
+    DEFAULT_CREDENTIAL_DURATION_SECONDS, MAX_ROLE_ALIASES, MAX_ROLE_ALIAS_TAGS,
 };
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.

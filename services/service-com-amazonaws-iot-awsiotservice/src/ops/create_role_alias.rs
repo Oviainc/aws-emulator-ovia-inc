@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateRoleAlias
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateRoleAlias`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateRoleAlias::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records a role alias under its name in this service's role-alias store
+//! ([`crate::state::ComAmazonawsIotAwsiotserviceState::role_aliases`]) and reports the
+//! name and the ARN minted for it; `DescribeRoleAlias` reads that record back.
+//!
+//! The name is the alias's identity, so a create under a name the store already holds
+//! is refused `ResourceAlreadyExistsException` (409) and changes nothing, and a create
+//! past [`crate::state::MAX_ROLE_ALIASES`] is refused with the modelled
+//! `LimitExceededException` (410).
 //!
 //! ## Shape of an operation
 //!
@@ -162,18 +162,101 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateRoleAlias` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateRoleAliasErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateRoleAlias"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateRoleAliasErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+
+        // `Tag$Key` is `@required` and keys a resource's tag set, so the last value
+        // given for a key is the one the alias carries. How MANY tags one request may
+        // carry is bounded: `TagList` has no modelled maximum, so without the ceiling
+        // one request would choose how large a single record is. The refusal is the
+        // modelled `InvalidRequestException` ("The request is not valid", HTTP 400),
+        // naming the limit.
+        let requested_tags = input.tags.unwrap_or_default();
+        if requested_tags.len() > crate::state::MAX_ROLE_ALIAS_TAGS {
+            return Err(CreateRoleAliasErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(format!(
+                        "a role alias may carry at most {} tags; this request carries {}",
+                        crate::state::MAX_ROLE_ALIAS_TAGS,
+                        requested_tags.len()
+                    )),
+                },
+            )
+            .into());
+        }
+        let tags: ::std::collections::BTreeMap<String, Option<String>> = requested_tags
+            .into_iter()
+            .map(|tag| (tag.key, tag.value))
+            .collect();
+
+        let mut store = state.lock();
+
+        // The name is the alias's identity, so a name already taken is a conflict:
+        // `ResourceAlreadyExistsException` (HTTP 409), naming the alias and the ARN that
+        // already exist. Nothing this operation documents makes it idempotent, so even
+        // the same role ARN under an existing name is refused rather than re-created —
+        // that is what `UpdateRoleAlias` is for. The message is the sentence AWS IoT
+        // words a create refused for a name already in use with, with the name taken
+        // from the request.
+        if let Some(existing) = store.role_aliases.get(&input.role_alias) {
+            return Err(CreateRoleAliasErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(format!(
+                        "RoleAlias cannot be created - name already exists (name={})",
+                        existing.role_alias
+                    )),
+                    resource_id: Some(existing.role_alias.clone()),
+                    resource_arn: Some(existing.role_alias_arn.clone()),
+                },
+            )
+            .into());
+        }
+
+        // The store is one a CALLER grows, an alias at a time, so the number an account
+        // can hold is bounded. The ceiling is read AFTER the conflict check, because a
+        // name already taken adds no record. `LimitExceededException` ("A limit has been
+        // exceeded", HTTP 410) is the modelled refusal for exactly this, never a 200
+        // that records nothing.
+        if store.role_aliases.len() >= crate::state::MAX_ROLE_ALIASES {
+            return Err(CreateRoleAliasErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "the maximum of {} role aliases is already reached",
+                        crate::state::MAX_ROLE_ALIASES
+                    )),
+                },
+            )
+            .into());
+        }
+
+        let role_alias = crate::state::RegisteredRoleAlias::new(
+            &region,
+            input.role_alias,
+            input.role_arn,
+            ::engine::emulator_account_id().to_string(),
+            input.credential_duration_seconds,
+            tags,
+            ::std::time::SystemTime::now(),
+        );
+
+        // The response is built from the record that is about to be persisted, so what
+        // this call reports and what the next `DescribeRoleAlias` reads are one value,
+        // not two that could drift.
+        let output = CreateRoleAliasOutput {
+            role_alias: Some(role_alias.role_alias.clone()),
+            role_alias_arn: Some(role_alias.role_alias_arn.clone()),
+        };
+        store
+            .role_aliases
+            .insert(role_alias.role_alias.clone(), role_alias);
+        Ok(output)
     }
 }
