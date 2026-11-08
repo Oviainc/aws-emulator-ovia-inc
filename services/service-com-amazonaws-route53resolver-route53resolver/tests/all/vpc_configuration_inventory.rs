@@ -359,8 +359,9 @@ async fn every_vpc_the_account_holds_is_listed_with_the_configuration_its_reader
     associate_rule_group(&router, &rule_group, &associated, 101).await;
 
     // A VPC the account's inventory holds nothing under, which only this
-    // service's own records name.
-    let record_only = "vpc-00000000000000099";
+    // service's own records name: a well-formed id above everything Amazon
+    // EC2's ONE id mint has issued, so no VPC of the account carries it.
+    let record_only = "vpc-0000000000000ffff";
     update_firewall_config(&router, record_only, "USE_LOCAL_RESOURCE_SETTING").await;
 
     let rows = [

@@ -856,9 +856,22 @@ pub const IMAGE_HYPERVISOR_XEN: &str = "xen";
 /// enum's `hvm` member (`paravirtual` is the retired alternative).
 pub const IMAGE_VIRTUALIZATION_TYPE_HVM: &str = "hvm";
 
+/// The `VirtualizationType` enum's `paravirtual` member: the virtualization of the oldest
+/// published images, whose own names carry it (`…-pv-…`).
+pub const IMAGE_VIRTUALIZATION_TYPE_PARAVIRTUAL: &str = "paravirtual";
+
 /// An AMI whose root volume is an Amazon EBS volume: the `DeviceType` enum's `ebs`
 /// member (`Image$RootDeviceType`).
 pub const IMAGE_ROOT_DEVICE_TYPE_EBS: &str = "ebs";
+
+/// An AMI whose root device is the instance store: the `DeviceType` enum's
+/// `instance-store` member. Such an image restores no snapshot, so it has no Amazon EBS
+/// root block device mapping at all.
+pub const IMAGE_ROOT_DEVICE_TYPE_INSTANCE_STORE: &str = "instance-store";
+
+/// The root device name of an instance-store-backed image, which is where the published
+/// images whose names end `-s3` carry their root file system.
+pub const INSTANCE_STORE_ROOT_DEVICE_NAME: &str = "/dev/sda1";
 
 /// "A value of `simple` indicates that enhanced networking with the Intel 82599 VF
 /// interface is enabled" (the `sriov-net-support` filter of `DescribeImages`).
@@ -871,6 +884,10 @@ pub const IMAGE_ROOT_VOLUME_TYPE: &str = "gp3";
 /// The EBS volume type of the older published images whose own names carry it (`…-gp2`):
 /// the `VolumeType` enum's `gp2` member.
 pub const IMAGE_ROOT_VOLUME_TYPE_GP2: &str = "gp2";
+
+/// The magnetic EBS volume type the published names that predate `gp2` carry (`…-ebs`):
+/// the `VolumeType` enum's `standard` member.
+pub const IMAGE_ROOT_VOLUME_TYPE_STANDARD: &str = "standard";
 
 /// "Indicates whether deregistration protection is enabled for the AMI"
 /// (`Image$DeregistrationProtection`) — off, nothing having enabled it.
@@ -1135,6 +1152,12 @@ pub struct ImageSpec {
     pub root_volume_size: i32,
     /// The EBS volume type that volume is created as.
     pub root_volume_type: String,
+    /// One of `VIRTUALIZATION_TYPE_VALUES` ([`IMAGE_VIRTUALIZATION_TYPE_HVM`]).
+    pub virtualization_type: String,
+    /// Where the image's root file system lives ([`IMAGE_ROOT_DEVICE_TYPE_EBS`]). An
+    /// instance-store-backed image restores no snapshot, so it carries no Amazon EBS root
+    /// block device mapping.
+    pub root_device_type: String,
     /// One of `IMAGE_STATE_VALUES`.
     pub state: String,
     /// "Indicates whether the image has public launch permissions" (`Image$Public`).
@@ -1179,6 +1202,8 @@ impl Default for ImageSpec {
             root_device_name: LINUX_ROOT_DEVICE_NAME.to_string(),
             root_volume_size: LINUX_ROOT_VOLUME_SIZE,
             root_volume_type: IMAGE_ROOT_VOLUME_TYPE.to_string(),
+            virtualization_type: IMAGE_VIRTUALIZATION_TYPE_HVM.to_string(),
+            root_device_type: IMAGE_ROOT_DEVICE_TYPE_EBS.to_string(),
             state: IMAGE_STATE_AVAILABLE.to_string(),
             public: false,
             owner_id: ::engine::emulator_account_id().to_string(),
@@ -1196,7 +1221,8 @@ impl Default for ImageSpec {
 /// The caller-chosen bytes one stored AMI holds: its tags, and every string of the record
 /// whose LENGTH a request chose — the name (which the derived `ImageLocation` holds a
 /// second copy of), the description, the architecture, the root device name (stored on the
-/// image and on its block device mapping), the volume type, the state, the billing strings,
+/// image and on its block device mapping), the volume type, the virtualization type, the
+/// root device type, the state, the billing strings,
 /// the creation date, the owning account and its alias, the deprecation time, the public
 /// parameter name, the platform, the boot mode and the IMDS support. The ids, the snapshot
 /// and the fixed facts of an EBS-backed HVM image are derived by this module, so they are
@@ -1217,6 +1243,8 @@ pub fn image_payload_bytes(spec: &ImageSpec) -> usize {
         // `Image$RootDeviceName`, and the block device mapping's own `DeviceName`.
         .saturating_add(spec.root_device_name.len().saturating_mul(2))
         .saturating_add(spec.root_volume_type.len())
+        .saturating_add(spec.virtualization_type.len())
+        .saturating_add(spec.root_device_type.len())
         .saturating_add(spec.state.len())
         .saturating_add(spec.platform_details.len())
         .saturating_add(spec.usage_operation.len())
@@ -1264,8 +1292,11 @@ impl ComAmazonawsEc2Amazonec2State {
     /// Everything the service itself owns is derived here rather than taken from the
     /// caller — the image's own id, the snapshot id of its root block device mapping, the
     /// manifest location `<owner>/<name>` the `manifest-location` filter selects on, and
-    /// the fixed facts of an EBS-backed HVM machine image — so two writers cannot report
-    /// the same image differently. Like [`Self::insert_vpc`], the caller-chosen bytes of
+    /// the fixed facts of a machine image — so two writers cannot report the same image
+    /// differently. An image whose root device is the instance store
+    /// ([`IMAGE_ROOT_DEVICE_TYPE_INSTANCE_STORE`]) restores no snapshot, so it is stored
+    /// with no root block device mapping and spends no snapshot id; enhanced networking
+    /// follows the virtualization, which is what offers it. Like [`Self::insert_vpc`], the caller-chosen bytes of
     /// the record are charged against the store's byte budget here, counted by the ONE
     /// definition of that charge ([`image_payload_bytes`]) rather than by the tags alone:
     /// a count ceiling ([`MAX_IMAGES`]) is no memory bound on its own, so every string
@@ -1275,7 +1306,8 @@ impl ComAmazonawsEc2Amazonec2State {
         // caller supplied rather than what survived into the record.
         let payload_bytes = image_payload_bytes(&spec);
         let image_id = self.next_id("ami");
-        let snapshot_id = self.next_id("snap");
+        let ebs_backed = spec.root_device_type == IMAGE_ROOT_DEVICE_TYPE_EBS;
+        let snapshot_id = ebs_backed.then(|| self.next_id("snap"));
         let owner = spec
             .owner_alias
             .clone()
@@ -1284,40 +1316,48 @@ impl ComAmazonawsEc2Amazonec2State {
             platform_details: Some(spec.platform_details),
             usage_operation: Some(spec.usage_operation),
             // "Any block device mapping entries" (`Image$BlockDeviceMappings`): the root
-            // volume's, restored from the snapshot minted above.
-            block_device_mappings: Some(vec![BlockDeviceMapping {
-                ebs: Some(EbsBlockDevice {
-                    delete_on_termination: Some(true),
-                    snapshot_id: Some(snapshot_id),
-                    volume_size: Some(spec.root_volume_size),
-                    volume_type: Some(spec.root_volume_type),
-                    encrypted: Some(false),
-                    iops: None,
-                    kms_key_id: None,
-                    throughput: None,
-                    outpost_arn: None,
-                    availability_zone: None,
-                    volume_initialization_rate: None,
-                    availability_zone_id: None,
-                    ebs_card_index: None,
-                }),
-                no_device: None,
-                device_name: Some(spec.root_device_name.clone()),
-                virtual_name: None,
-            }]),
+            // volume's, restored from the snapshot minted above — and none at all for an
+            // image whose root device is the instance store, which restores none.
+            block_device_mappings: Some(
+                snapshot_id
+                    .map(|snapshot_id| BlockDeviceMapping {
+                        ebs: Some(EbsBlockDevice {
+                            delete_on_termination: Some(true),
+                            snapshot_id: Some(snapshot_id),
+                            volume_size: Some(spec.root_volume_size),
+                            volume_type: Some(spec.root_volume_type),
+                            encrypted: Some(false),
+                            iops: None,
+                            kms_key_id: None,
+                            throughput: None,
+                            outpost_arn: None,
+                            availability_zone: None,
+                            volume_initialization_rate: None,
+                            availability_zone_id: None,
+                            ebs_card_index: None,
+                        }),
+                        no_device: None,
+                        device_name: Some(spec.root_device_name.clone()),
+                        virtual_name: None,
+                    })
+                    .into_iter()
+                    .collect(),
+            ),
             description: Some(spec.description),
-            ena_support: Some(true),
+            // "enhanced networking with the Intel 82599 VF interface" is an HVM facility:
+            // a paravirtual image offers neither it nor ENA.
+            ena_support: Some(spec.virtualization_type == IMAGE_VIRTUALIZATION_TYPE_HVM),
             hypervisor: Some(IMAGE_HYPERVISOR_XEN.to_string()),
             image_owner_alias: spec.owner_alias,
             name: Some(spec.name.clone()),
             root_device_name: Some(spec.root_device_name),
-            root_device_type: Some(IMAGE_ROOT_DEVICE_TYPE_EBS.to_string()),
+            root_device_type: Some(spec.root_device_type),
             sriov_net_support: Some(IMAGE_SRIOV_NET_SUPPORT_SIMPLE.to_string()),
             // "The reason for the state change" (`Image$StateReason`): an image that
             // never left `available` has had no state change to report.
             state_reason: None,
             tags: Some(spec.tags),
-            virtualization_type: Some(IMAGE_VIRTUALIZATION_TYPE_HVM.to_string()),
+            virtualization_type: Some(spec.virtualization_type),
             boot_mode: spec.boot_mode,
             // NitroTPM is not configured for any image this store holds.
             tpm_support: None,
@@ -1454,7 +1494,7 @@ impl ComAmazonawsEc2Amazonec2State {
     /// records which AMI a parameter names, rather than a second table of ids that could
     /// disagree with the catalog. The member holds ONE name per image while AWS publishes
     /// some images under more than one name, so the names that share an image's entry
-    /// ([`PUBLIC_SSM_PARAMETER_ALIASES`]) are resolved to the same id here.
+    /// ([`super::PUBLIC_SSM_PARAMETER_ALIASES`]) are resolved to the same id here.
     ///
     /// Only an image `account` can see resolves: a parameter whose image has been
     /// deregistered or recycled names no AMI, the same way the describe reports none.
@@ -1470,7 +1510,7 @@ impl ComAmazonawsEc2Amazonec2State {
                 ))
             })
             .collect();
-        for (alias, published_as) in PUBLIC_SSM_PARAMETER_ALIASES {
+        for (alias, published_as) in super::PUBLIC_SSM_PARAMETER_ALIASES {
             if let Some(image_id) = resolved.get(*published_as).cloned() {
                 resolved.insert((*alias).to_string(), image_id);
             }
@@ -1658,83 +1698,27 @@ pub(super) fn deprecated_amazon_linux_2_image(days_ago: u64) -> ImageSpec {
 
 /// The public AMIs a fresh account can already see.
 ///
-/// Each row is one Amazon-published image, named the way Amazon documents its published
-/// names: an Amazon Linux 2023 image is
-/// `al2023-ami[-minimal]-<version>-kernel-<kernel version>-<architecture>` and an Amazon
-/// Linux 2 image `amzn2-ami[-kernel-<kernel version>][-minimal]-hvm-<version>-<architecture>-<root volume>`
-/// (Amazon Linux 2023 User Guide, "Find an AMI"), with the build date of that version as
-/// its `CreationDate` — which is what makes "the newest `CreationDate` of the images
-/// matching a name pattern" pick the same image on every run. Two builds of the same
-/// variant are published, because that is the choice a caller resolving an AMI by name
-/// pattern has to make, and the oldest Amazon Linux 2 build carries the
-/// `DeprecationTime` its end of standard support fell on, so a deprecated image is part
-/// of the catalog rather than only of a test.
+/// The Amazon Linux families open it: ONE ROW PER PUBLISHED ALIAS
+/// ([`super::published_amazon_linux_specs`]), each named the way Amazon documents its
+/// published names and carrying the build date of its version as its `CreationDate` — which
+/// is what makes "the newest `CreationDate` of the images matching a name pattern" pick the
+/// same image on every run. The rows after them are the ones no public parameter names: a
+/// previous build of two Amazon Linux 2023 variants, because that is the choice a caller
+/// resolving an AMI by name pattern has to make, and two Amazon Linux 2 builds carrying the
+/// `DeprecationTime` their end of standard support fell on, so a deprecated image is part of
+/// the catalog rather than only of a test.
 ///
 /// The AWS PCS sample AMIs ([`pcs_sample_image_specs`]) close the catalog: they are
 /// published the same way and under the Parameter Store names AWS publishes their ids
 /// under.
 pub fn published_image_specs() -> Vec<ImageSpec> {
-    let mut specs = vec![
-        ImageSpec {
-            description: "Amazon Linux 2023 AMI 2023.6.20241121.0 x86_64 HVM kernel-6.1"
-                .to_string(),
-            boot_mode: Some(BOOT_MODE_UEFI_PREFERRED.to_string()),
-            imds_support: Some(IMDS_SUPPORT_V2.to_string()),
-            public_ssm_parameter_name: Some(
-                "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64".to_string(),
-            ),
-            ..published_amazon_image(
-                "al2023-ami-2023.6.20241121.0-kernel-6.1-x86_64",
-                "x86_64",
-                "2024-11-21T04:40:03.000Z",
-            )
-        },
-        ImageSpec {
-            description: "Amazon Linux 2023 AMI 2023.6.20241121.0 arm64 HVM kernel-6.1"
-                .to_string(),
-            boot_mode: Some(BOOT_MODE_UEFI.to_string()),
-            imds_support: Some(IMDS_SUPPORT_V2.to_string()),
-            public_ssm_parameter_name: Some(
-                "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64".to_string(),
-            ),
-            ..published_amazon_image(
-                "al2023-ami-2023.6.20241121.0-kernel-6.1-arm64",
-                "arm64",
-                "2024-11-21T04:40:03.000Z",
-            )
-        },
-        ImageSpec {
-            description: "Amazon Linux 2023 AMI 2023.6.20241121.0 x86_64 HVM kernel-6.1 Minimal"
-                .to_string(),
-            boot_mode: Some(BOOT_MODE_UEFI_PREFERRED.to_string()),
-            imds_support: Some(IMDS_SUPPORT_V2.to_string()),
-            public_ssm_parameter_name: Some(
-                "/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-6.1-x86_64"
-                    .to_string(),
-            ),
-            ..published_amazon_image(
-                "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-x86_64",
-                "x86_64",
-                "2024-11-21T04:40:03.000Z",
-            )
-        },
-        ImageSpec {
-            description: "Amazon Linux 2023 AMI 2023.6.20241121.0 arm64 HVM kernel-6.1 Minimal"
-                .to_string(),
-            boot_mode: Some(BOOT_MODE_UEFI.to_string()),
-            imds_support: Some(IMDS_SUPPORT_V2.to_string()),
-            public_ssm_parameter_name: Some(
-                "/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-6.1-arm64"
-                    .to_string(),
-            ),
-            ..published_amazon_image(
-                "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-arm64",
-                "arm64",
-                "2024-11-21T04:40:03.000Z",
-            )
-        },
-        // The previous build of the same two variants: an older `CreationDate`, and no
-        // public Systems Manager parameter, which resolves to the latest build only.
+    // Every variant Amazon publishes a public Systems Manager parameter for, one row per
+    // published alias — the hierarchy a client that cannot hardcode an AMI id enumerates to
+    // find one.
+    let mut specs = super::published_amazon_linux_specs();
+    specs.extend([
+        // The previous build of two Amazon Linux 2023 variants: an older `CreationDate`, and
+        // no public Systems Manager parameter, which resolves to the latest build only.
         ImageSpec {
             description: "Amazon Linux 2023 AMI 2023.5.20240903.0 x86_64 HVM kernel-6.1"
                 .to_string(),
@@ -1755,64 +1739,6 @@ pub fn published_image_specs() -> Vec<ImageSpec> {
                 "al2023-ami-minimal-2023.5.20240903.0-kernel-6.1-x86_64",
                 "x86_64",
                 "2024-09-03T22:17:11.000Z",
-            )
-        },
-        // The STANDARD Amazon Linux 2 variant — the one whose published name carries no
-        // kernel or `minimal` qualifier, `amzn2-ami-hvm-<version>-<architecture>-gp2` — in
-        // each architecture Amazon publishes it for (the
-        // `/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2` and
-        // `…-arm64-gp2` public parameters). It is published from the same release as the
-        // qualified variants below, so all of them carry that release's version, minutes
-        // apart as one release's variants are built.
-        ImageSpec {
-            description: "Amazon Linux 2 AMI 2.0.20241113.1 x86_64 HVM gp2".to_string(),
-            boot_mode: Some(BOOT_MODE_LEGACY_BIOS.to_string()),
-            root_volume_type: IMAGE_ROOT_VOLUME_TYPE_GP2.to_string(),
-            public_ssm_parameter_name: Some(
-                "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2".to_string(),
-            ),
-            ..published_amazon_image(
-                "amzn2-ami-hvm-2.0.20241113.1-x86_64-gp2",
-                "x86_64",
-                "2024-11-13T18:17:12.000Z",
-            )
-        },
-        ImageSpec {
-            description: "Amazon Linux 2 AMI 2.0.20241113.1 arm64 HVM gp2".to_string(),
-            boot_mode: Some(BOOT_MODE_UEFI.to_string()),
-            root_volume_type: IMAGE_ROOT_VOLUME_TYPE_GP2.to_string(),
-            public_ssm_parameter_name: Some(
-                "/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-arm64-gp2".to_string(),
-            ),
-            ..published_amazon_image(
-                "amzn2-ami-hvm-2.0.20241113.1-arm64-gp2",
-                "arm64",
-                "2024-11-13T18:19:04.000Z",
-            )
-        },
-        ImageSpec {
-            description: "Amazon Linux 2 Kernel 5.10 AMI 2.0.20241113.1 x86_64 HVM gp2"
-                .to_string(),
-            boot_mode: Some(BOOT_MODE_LEGACY_BIOS.to_string()),
-            root_volume_type: IMAGE_ROOT_VOLUME_TYPE_GP2.to_string(),
-            public_ssm_parameter_name: Some(
-                "/aws/service/ami-amazon-linux-latest/amzn2-ami-kernel-5.10-hvm-x86_64-gp2"
-                    .to_string(),
-            ),
-            ..published_amazon_image(
-                "amzn2-ami-kernel-5.10-hvm-2.0.20241113.1-x86_64-gp2",
-                "x86_64",
-                "2024-11-13T18:21:48.000Z",
-            )
-        },
-        ImageSpec {
-            description: "Amazon Linux 2 AMI 2.0.20241113.1 x86_64 HVM ebs Minimal".to_string(),
-            boot_mode: Some(BOOT_MODE_LEGACY_BIOS.to_string()),
-            root_volume_type: IMAGE_ROOT_VOLUME_TYPE_GP2.to_string(),
-            ..published_amazon_image(
-                "amzn2-ami-minimal-hvm-2.0.20241113.1-x86_64-ebs",
-                "x86_64",
-                "2024-11-13T18:21:48.000Z",
             )
         },
         // Amazon Linux 2 reached the end of its standard support, which is the
@@ -1846,8 +1772,10 @@ pub fn published_image_specs() -> Vec<ImageSpec> {
                 "2024-11-13T07:36:19.000Z",
             )
         },
-    ];
+    ]);
     specs.extend(pcs_sample_image_specs());
+    // The images a service publishes a METADATA hierarchy about rather than a bare alias.
+    specs.extend(super::published_image_metadata_specs());
     specs
 }
 
@@ -1931,42 +1859,9 @@ pub fn pcs_sample_image_specs() -> Vec<ImageSpec> {
         .collect()
 }
 
-/// The public Systems Manager parameter names AWS publishes as a SECOND name for an image
-/// [`published_image_specs`] already publishes under one: `(the other name, the published
-/// name that names the same AMI)`.
-///
-/// Amazon publishes the latest Amazon Linux image both under a KERNEL-VERSION-PINNED name
-/// and under a `kernel-default` name, and while that kernel is the distribution's default
-/// the two resolve to the same AMI (Amazon Linux 2023 User Guide, "Find an AMI" and Amazon
-/// EC2 User Guide, "Use a Systems Manager parameter instead of an AMI ID", which list the
-/// `/aws/service/ami-amazon-linux-latest/` names): kernel 6.1 is the default for Amazon
-/// Linux 2023 and kernel 5.10 for Amazon Linux 2. `Image$PublicSsmParameterName` carries
-/// one name per image, so the second name of an image is recorded here and resolved to the
-/// same id by
-/// [`ComAmazonawsEc2Amazonec2State::public_ssm_parameter_image_ids`] — rather than as a
-/// second image record, which would make one AMI resolve to two ids.
-pub const PUBLIC_SSM_PARAMETER_ALIASES: &[(&str, &str)] = &[
-    (
-        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64",
-        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-x86_64",
-    ),
-    (
-        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-arm64",
-        "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64",
-    ),
-    (
-        "/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-default-x86_64",
-        "/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-6.1-x86_64",
-    ),
-    (
-        "/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-default-arm64",
-        "/aws/service/ami-amazon-linux-latest/al2023-ami-minimal-kernel-6.1-arm64",
-    ),
-    (
-        "/aws/service/ami-amazon-linux-latest/amzn2-ami-kernel-default-hvm-x86_64-gp2",
-        "/aws/service/ami-amazon-linux-latest/amzn2-ami-kernel-5.10-hvm-x86_64-gp2",
-    ),
-];
+// The public Systems Manager parameter names AWS publishes as a SECOND name for an image
+// `published_image_specs` already publishes under one are
+// `super::PUBLIC_SSM_PARAMETER_ALIASES`, beside the table that publishes those images.
 
 // ---------------------------------------------------------------------------
 // Application status: what `DescribeApplicationStatus` aggregates

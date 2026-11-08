@@ -1000,7 +1000,12 @@ async fn every_launch_gets_one_root_volume_the_snapshot_set_covers() {
     let (windows_image, windows_device, windows_size, _) = published_image(
         &router,
         "the published Windows image",
-        &[("root-device-name", &[WINDOWS_ROOT_DEVICE_NAME])],
+        // The Windows root device name is the published catalog's instance-store images' too,
+        // and those restore no snapshot, so the row narrows to the EBS-backed one it means.
+        &[
+            ("root-device-name", &[WINDOWS_ROOT_DEVICE_NAME]),
+            ("root-device-type", &["ebs"]),
+        ],
     )
     .await;
     let gib = |case: &str, size: &str| -> i32 {

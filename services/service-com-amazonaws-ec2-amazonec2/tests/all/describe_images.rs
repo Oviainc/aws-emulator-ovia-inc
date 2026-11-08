@@ -282,17 +282,30 @@ fn free_tier_catalog_names() -> Vec<String> {
         .collect()
 }
 
-/// `names` followed by the catalog's deprecated image names, for a table row whose filter
-/// selects those too.
-fn with_deprecated_catalog(names: &[&'static str]) -> Vec<&'static str> {
-    let mut all: Vec<&'static str> = names.to_vec();
-    all.extend(DEPRECATED_CATALOG_NAMES.iter().map(String::as_str));
-    all
-}
-
 /// `names` as the borrowed slice the tables take.
 fn borrowed(names: &[String]) -> Vec<&str> {
     names.iter().map(String::as_str).collect()
+}
+
+/// The published catalog's names, narrowed to the images one filter row selects.
+///
+/// Read off the catalog a fresh account holds rather than frozen into the row, so a
+/// published variant the catalog gains later — the catalog publishes one image per public
+/// Systems Manager alias, across every Amazon Linux family — is covered without rewriting
+/// the table.
+fn catalog_names_where(selects: impl Fn(&ImageSpec) -> bool) -> Vec<String> {
+    published_image_specs()
+        .into_iter()
+        .filter(|spec| selects(spec))
+        .map(|spec| spec.name)
+        .collect()
+}
+
+/// `catalog` followed by the seeded names `extra`, as the one borrowed slice a row takes.
+fn borrowed_with<'a>(catalog: &'a [String], extra: &[&'a str]) -> Vec<&'a str> {
+    let mut all = borrowed(catalog);
+    all.extend(extra);
+    all
 }
 
 /// Write the seeded images into the engine's store, the way a register operation would,
@@ -512,7 +525,7 @@ async fn the_newest_image_matching_a_name_pattern_can_be_launched() {
     let cases = [
         (
             "al2023-ami-minimal-*-x86_64",
-            "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-x86_64",
+            "al2023-ami-minimal-2023.8.20251104.0-kernel-6.18-x86_64",
         ),
         (
             "al2023-ami-2023.*-kernel-6.1-x86_64",
@@ -520,7 +533,7 @@ async fn the_newest_image_matching_a_name_pattern_can_be_launched() {
         ),
         (
             "al2023-ami-2023.*-arm64",
-            "al2023-ami-2023.6.20241121.0-kernel-6.1-arm64",
+            "al2023-ami-2023.8.20251104.0-kernel-6.18-arm64",
         ),
         (
             "amzn2-ami-*-x86_64-gp2",
@@ -620,6 +633,25 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
     let account = engine::emulator_account_id().to_string();
     let catalog = catalog_names();
     let free_tier_catalog = free_tier_catalog_names();
+    // The catalog images each attribute-bound row selects, read off the catalog itself.
+    let arm64_catalog = catalog_names_where(|spec| spec.architecture == "arm64");
+    let gp2_catalog = catalog_names_where(|spec| spec.root_volume_type == "gp2");
+    let uefi_catalog =
+        catalog_names_where(|spec| spec.boot_mode.as_deref() == Some("uefi"));
+    let legacy_bios_catalog =
+        catalog_names_where(|spec| spec.boot_mode.as_deref() == Some("legacy-bios"));
+    let minimal_catalog = catalog_names_where(|spec| spec.description.ends_with("Minimal"));
+    let minimal_al2023_arm64 = catalog_names_where(|spec| {
+        spec.name.starts_with("al2023-ami-minimal-") && spec.name.ends_with("-arm64")
+    });
+    let minimal_al2023_x86_64 = catalog_names_where(|spec| {
+        spec.name.starts_with("al2023-ami-minimal-") && spec.name.ends_with("-x86_64")
+    });
+    let sda1_catalog = catalog_names_where(|spec| spec.root_device_name == "/dev/sda1");
+    let instance_store_catalog =
+        catalog_names_where(|spec| spec.root_device_type == "instance-store");
+    let paravirtual_catalog =
+        catalog_names_where(|spec| spec.virtualization_type == "paravirtual");
     let windows_snapshot = seeded.windows_snapshot_id.clone();
     let golden_location = format!("{account}/app-golden-2026-01-x86_64");
     let watermark_key = format!("{account}:approvedAmi");
@@ -632,31 +664,17 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
         (
             "architecture",
             vec!["arm64".into()],
-            vec![
-                "al2023-ami-2023.6.20241121.0-kernel-6.1-arm64",
-                "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-arm64",
-                // The published catalog's 64-bit Arm AWS PCS sample AMIs
-                // (`ec2::state::pcs_sample_image_specs`).
-                "aws-pcs-sample_ami-amzn2-arm64-slurm-24.11-2025.01.15",
-                "aws-pcs-sample_ami-al2023-arm64-slurm-24.11-2025.01.15",
-                "amzn2-ami-hvm-2.0.20241113.1-arm64-gp2",
-                "app-golden-2026-01-arm64",
-            ],
+            borrowed_with(&arm64_catalog, &["app-golden-2026-01-arm64"]),
         ),
         ("architecture", vec!["i386".into()], vec!["legacy-i386-image"]),
         // Two values for one filter: joined with OR.
         (
             "architecture",
             vec!["i386".into(), "arm64".into()],
-            vec![
-                "al2023-ami-2023.6.20241121.0-kernel-6.1-arm64",
-                "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-arm64",
-                "aws-pcs-sample_ami-amzn2-arm64-slurm-24.11-2025.01.15",
-                "aws-pcs-sample_ami-al2023-arm64-slurm-24.11-2025.01.15",
-                "amzn2-ami-hvm-2.0.20241113.1-arm64-gp2",
-                "app-golden-2026-01-arm64",
-                "legacy-i386-image",
-            ],
+            borrowed_with(
+                &arm64_catalog,
+                &["app-golden-2026-01-arm64", "legacy-i386-image"],
+            ),
         ),
         // An architecture no stored image has: an empty set, not an error.
         ("architecture", vec!["x86_64_mac".into()], vec![]),
@@ -689,37 +707,13 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
         (
             "block-device-mapping.volume-type",
             vec!["gp2".into()],
-            with_deprecated_catalog(&[
-                "amzn2-ami-hvm-2.0.20241113.1-x86_64-gp2",
-                "amzn2-ami-hvm-2.0.20241113.1-arm64-gp2",
-                "amzn2-ami-kernel-5.10-hvm-2.0.20241113.1-x86_64-gp2",
-                "amzn2-ami-minimal-hvm-2.0.20241113.1-x86_64-ebs",
-            ]),
+            borrowed(&gp2_catalog),
         ),
-        (
-            "boot-mode",
-            vec!["uefi".into()],
-            vec![
-                "al2023-ami-2023.6.20241121.0-kernel-6.1-arm64",
-                "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-arm64",
-                // 64-bit Arm boots UEFI, so the catalog's Arm AWS PCS sample AMIs
-                // (`ec2::state::pcs_sample_image_specs`) are here too.
-                "aws-pcs-sample_ami-amzn2-arm64-slurm-24.11-2025.01.15",
-                "aws-pcs-sample_ami-al2023-arm64-slurm-24.11-2025.01.15",
-                "amzn2-ami-hvm-2.0.20241113.1-arm64-gp2",
-            ],
-        ),
+        ("boot-mode", vec!["uefi".into()], borrowed(&uefi_catalog)),
         (
             "boot-mode",
             vec!["legacy-bios".into()],
-            with_deprecated_catalog(&[
-                "amzn2-ami-hvm-2.0.20241113.1-x86_64-gp2",
-                "amzn2-ami-kernel-5.10-hvm-2.0.20241113.1-x86_64-gp2",
-                "amzn2-ami-minimal-hvm-2.0.20241113.1-x86_64-ebs",
-                // The x86 Amazon Linux 2 AWS PCS sample AMIs boot the same way.
-                "aws-pcs-sample_ami-amzn2-x86_64-slurm-24.11-2025.01.15",
-                "aws-pcs-sample_ami-amzn2-x86_64-slurm-24.05-2025.01.15",
-            ]),
+            borrowed(&legacy_bios_catalog),
         ),
         // "You can use a wildcard (*), for example, 2021-09-29T*, which matches an entire
         // day" (the `creation-date` filter).
@@ -741,14 +735,13 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
         (
             "description",
             vec!["*Minimal".into()],
-            vec![
-                "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-x86_64",
-                "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-arm64",
-                "al2023-ami-minimal-2023.5.20240903.0-kernel-6.1-x86_64",
-                "amzn2-ami-minimal-hvm-2.0.20241113.1-x86_64-ebs",
-            ],
+            borrowed(&minimal_catalog),
         ),
-        ("ena-support", vec!["false".into()], vec!["legacy-i386-image"]),
+        (
+            "ena-support",
+            vec!["false".into()],
+            borrowed_with(&paravirtual_catalog, &["legacy-i386-image"]),
+        ),
         (
             "free-tier-eligible",
             vec!["true".into()],
@@ -826,7 +819,7 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
         (
             "manifest-location",
             vec!["amazon/al2023-ami-minimal-*-arm64".into()],
-            vec!["al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-arm64"],
+            borrowed(&minimal_al2023_arm64),
         ),
         (
             "manifest-location",
@@ -836,10 +829,7 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
         (
             "name",
             vec!["al2023-ami-minimal-*-x86_64".into()],
-            vec![
-                "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-x86_64",
-                "al2023-ami-minimal-2023.5.20240903.0-kernel-6.1-x86_64",
-            ],
+            borrowed(&minimal_al2023_x86_64),
         ),
         (
             "name",
@@ -902,12 +892,12 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
         (
             "root-device-name",
             vec!["/dev/sda1".into()],
-            vec!["Windows_Server-2022-English-Full-Base-2024.11.13"],
+            borrowed(&sda1_catalog),
         ),
         (
             "root-device-type",
             vec!["instance-store".into()],
-            vec!["legacy-i386-image"],
+            borrowed_with(&instance_store_catalog, &["legacy-i386-image"]),
         ),
         (
             "source-image-id",
@@ -957,7 +947,7 @@ async fn each_documented_filter_selects_the_images_whose_attribute_matches_a_val
         (
             "virtualization-type",
             vec!["paravirtual".into()],
-            vec!["legacy-i386-image"],
+            borrowed_with(&paravirtual_catalog, &["legacy-i386-image"]),
         ),
         // A documented filter carrying no value at all: there is no value for the
         // attribute to match, so it selects nothing rather than everything.
@@ -989,6 +979,12 @@ type FilterCombination<'a> = (Vec<(&'a str, &'a [&'a str])>, Vec<&'a str>);
 async fn several_filters_are_joined_with_an_and() {
     let (router, engine) = super::ec2_query::emulator();
     let seeded = seed(&engine);
+    let al2023_arm64 = catalog_names_where(|spec| {
+        spec.name.starts_with("al2023-ami-") && spec.architecture == "arm64"
+    });
+    let legacy_bios_gp2 = catalog_names_where(|spec| {
+        spec.boot_mode.as_deref() == Some("legacy-bios") && spec.root_volume_type == "gp2"
+    });
 
     let cases: Vec<FilterCombination<'_>> = vec![
         (
@@ -996,10 +992,7 @@ async fn several_filters_are_joined_with_an_and() {
                 ("name", &["al2023-ami-*"][..]),
                 ("architecture", &["arm64"][..]),
             ],
-            vec![
-                "al2023-ami-2023.6.20241121.0-kernel-6.1-arm64",
-                "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-arm64",
-            ],
+            borrowed(&al2023_arm64),
         ),
         (
             vec![
@@ -1007,11 +1000,7 @@ async fn several_filters_are_joined_with_an_and() {
                 ("boot-mode", &["legacy-bios"][..]),
                 ("block-device-mapping.volume-type", &["gp2"][..]),
             ],
-            with_deprecated_catalog(&[
-                "amzn2-ami-hvm-2.0.20241113.1-x86_64-gp2",
-                "amzn2-ami-kernel-5.10-hvm-2.0.20241113.1-x86_64-gp2",
-                "amzn2-ami-minimal-hvm-2.0.20241113.1-x86_64-ebs",
-            ]),
+            borrowed(&legacy_bios_gp2),
         ),
         // Each filter matches something, but no image matches both.
         (
@@ -1468,13 +1457,19 @@ async fn paging_covers_every_image_exactly_once_for_each_page_size() {
 async fn a_page_is_cut_from_the_filtered_set() {
     let (router, engine) = super::ec2_query::emulator();
     let seeded = seed(&engine);
-    let expected = seeded.ids_for(&[
-        "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-x86_64",
-        "al2023-ami-minimal-2023.6.20241121.0-kernel-6.1-arm64",
-        "al2023-ami-minimal-2023.5.20240903.0-kernel-6.1-x86_64",
-    ]);
+    // One kernel's minimal Amazon Linux 2023 builds: a filtered set of more than one page,
+    // read off the catalog rather than written out.
+    let minimal_kernel_6_1 = catalog_names_where(|spec| {
+        spec.name.starts_with("al2023-ami-minimal-") && spec.name.contains("-kernel-6.1-")
+    });
+    let expected = seeded.ids_for(&borrowed(&minimal_kernel_6_1));
+    assert_eq!(
+        expected.len(),
+        3,
+        "the catalog must publish three builds for this page walk to span, got {expected:?}"
+    );
 
-    let mut params = filters(&[("name", &["al2023-ami-minimal-*"])]);
+    let mut params = filters(&[("name", &["al2023-ami-minimal-*-kernel-6.1-*"])]);
     params.push(param("MaxResults", "2"));
     let (status, body) = describe(&router, &params).await;
     assert_eq!(status, 200, "first page: got {status} with body {body}");
@@ -1489,7 +1484,7 @@ async fn a_page_is_cut_from_the_filtered_set() {
         .cloned()
         .unwrap_or_else(|| panic!("first page: expected a NextToken in {body}"));
 
-    let mut next = filters(&[("name", &["al2023-ami-minimal-*"])]);
+    let mut next = filters(&[("name", &["al2023-ami-minimal-*-kernel-6.1-*"])]);
     next.push(param("MaxResults", "2"));
     next.push(param("NextToken", token));
     let second = described_ids(&router, "second page", &next).await;

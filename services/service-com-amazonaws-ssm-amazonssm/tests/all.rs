@@ -63,6 +63,10 @@ mod parameter_store;
 mod parameters_batch;
 #[path = "all/parameters_by_path.rs"]
 mod parameters_by_path;
+#[path = "all/public_amazon_linux_alias_namespace.rs"]
+mod public_amazon_linux_alias_namespace;
+#[path = "all/public_image_metadata_hierarchies.rs"]
+mod public_image_metadata_hierarchies;
 #[path = "all/public_parameter_catalog.rs"]
 mod public_parameter_catalog;
 #[path = "all/published_documents.rs"]

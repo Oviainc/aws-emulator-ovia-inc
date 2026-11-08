@@ -67,6 +67,19 @@ const REGION: &str = "us-east-1";
 /// The IPv6 CIDR block the dual-stack and the IPv6-only seeded subnets carry.
 const SEEDED_IPV6_CIDR_BLOCK: &str = "2600:1f14:abc:1200::/64";
 
+/// A well-formed endpoint id nothing of the account carries, for the rows that name one.
+///
+/// Every resource kind but the instance draws its identifiers from the store's ONE id mint, so
+/// an id that names nothing is one the mint has not reached: far above what a fresh account's
+/// ambient resources and this suite's own fixture spend between them.
+const UNISSUED_ENDPOINT_ID: &str = "eice-0000000000000ffff";
+
+/// A subnet id of the same kind (see [`UNISSUED_ENDPOINT_ID`]).
+const UNISSUED_SUBNET_ID: &str = "subnet-0000000000000ffff";
+
+/// A security group id of the same kind (see [`UNISSUED_ENDPOINT_ID`]).
+const UNISSUED_GROUP_ID: &str = "sg-0000000000000ffff";
+
 /// A `(key, value)` request parameter.
 fn p(key: &str, value: impl Into<String>) -> (String, String) {
     (key.to_string(), value.into())
@@ -925,14 +938,14 @@ async fn an_unresolvable_filter_or_id_is_refused() {
         ),
         (
             "a well-formed id no endpoint of the account has",
-            indexed("InstanceConnectEndpointId", &["eice-00000000000000099"]),
+            indexed("InstanceConnectEndpointId", &[UNISSUED_ENDPOINT_ID]),
             "InvalidInstanceConnectEndpointId.NotFound",
         ),
         (
             "a known id beside an unknown one",
             indexed(
                 "InstanceConnectEndpointId",
-                &[ids[0].as_str(), "eice-00000000000000099"],
+                &[ids[0].as_str(), UNISSUED_ENDPOINT_ID],
             ),
             "InvalidInstanceConnectEndpointId.NotFound",
         ),
@@ -959,14 +972,14 @@ async fn an_unresolvable_filter_or_id_is_refused() {
     let create_rows: Vec<RefusalRow> = vec![
         (
             "a subnet no subnet of the account has",
-            vec![p("SubnetId", "subnet-00000000000000099")],
+            vec![p("SubnetId", UNISSUED_SUBNET_ID)],
             "InvalidSubnetID.NotFound",
         ),
         (
             "a security group no group of the account has",
             {
                 let mut params = vec![p("SubnetId", fixture.ipv4_subnet.clone())];
-                params.extend(indexed("SecurityGroupId", &["sg-00000000000000099"]));
+                params.extend(indexed("SecurityGroupId", &[UNISSUED_GROUP_ID]));
                 params
             },
             "InvalidGroup.NotFound",
@@ -1665,7 +1678,7 @@ async fn a_delete_that_cannot_resolve_its_endpoint_is_refused() {
         ),
         (
             "a long id no endpoint of the account has",
-            vec![p("InstanceConnectEndpointId", "eice-00000000000000099")],
+            vec![p("InstanceConnectEndpointId", UNISSUED_ENDPOINT_ID)],
             "InvalidInstanceConnectEndpointId.NotFound",
         ),
         (
@@ -1681,7 +1694,7 @@ async fn a_delete_that_cannot_resolve_its_endpoint_is_refused() {
         (
             "a dry run of a delete naming an id no endpoint has",
             vec![
-                p("InstanceConnectEndpointId", "eice-00000000000000099"),
+                p("InstanceConnectEndpointId", UNISSUED_ENDPOINT_ID),
                 p("DryRun", "true"),
             ],
             "InvalidInstanceConnectEndpointId.NotFound",

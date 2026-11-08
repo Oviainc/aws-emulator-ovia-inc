@@ -358,11 +358,12 @@ async fn a_source_the_account_holds_no_subnet_for_is_refused() {
     )
     .await;
 
-    // A held id with its last character changed: as well-formed as the held one,
-    // and the account holds no subnet under it.
+    // A held id with the low digits of its identifier changed: as well-formed as the held
+    // one, and above everything the store's ONE id mint has issued, so the account holds no
+    // subnet under it however many ids a fresh account's ambient resources spent.
     let mut neighbour = held.subnet_id.clone();
-    neighbour.pop();
-    neighbour.push('9');
+    neighbour.truncate(neighbour.len() - 3);
+    neighbour.push_str("fff");
     assert_ne!(
         neighbour, held.subnet_id,
         "the neighbouring id must differ from the held one"
@@ -384,7 +385,7 @@ async fn a_source_the_account_holds_no_subnet_for_is_refused() {
             "subnet-0a1b2c3d".to_string(),
         ),
         (
-            "a held subnet's id with its last character changed",
+            "a held subnet's id with its low digits changed",
             arn_spelled("aws", REGION, &neighbour),
             neighbour.clone(),
         ),

@@ -45,7 +45,7 @@ const PCS_X86_LEAF: &str = "/x86_64/latest/ami-id";
 
 /// The two other published AMI-alias namespaces, so the suites below span more than the one
 /// the failing workflow reads.
-const AMAZON_LINUX_NAMESPACE: &str = "/aws/service/ami-amazon-linux-latest";
+pub(super) const AMAZON_LINUX_NAMESPACE: &str = "/aws/service/ami-amazon-linux-latest";
 
 /// See [`AMAZON_LINUX_NAMESPACE`].
 const WINDOWS_NAMESPACE: &str = "/aws/service/ami-windows-latest";
@@ -59,12 +59,12 @@ const MAX_PAGE_SIZE: i64 = 10;
 
 /// The `ParameterType` a published alias carries, from the modelled enum
 /// (`smithy_query(query="shape", shape="ParameterType")`).
-const PUBLISHED_TYPE: &str = "String";
+pub(super) const PUBLISHED_TYPE: &str = "String";
 
 /// The `ParameterDataType` it carries (`smithy_query(query="doc",
 /// shape="PutParameterRequest", member="DataType")`: "text aws:ec2:image
 /// aws:ssm:integration").
-const PUBLISHED_DATA_TYPE: &str = "text";
+pub(super) const PUBLISHED_DATA_TYPE: &str = "text";
 
 /// The EC2 API version an ec2Query body carries.
 const EC2_API_VERSION: &str = "2016-11-15";
@@ -74,7 +74,7 @@ const EC2_API_VERSION: &str = "2016-11-15";
 /// EC2 is there because the published catalog is projected from ITS image state: the ids a
 /// read of the `/aws` hierarchy reports are the ids of the images that service holds, and
 /// the suites below check both sides of that through each service's own front door.
-fn emulator() -> MultiServiceRouter {
+pub(super) fn emulator() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are not what these tests are about; the router still reads the SigV4
@@ -97,7 +97,7 @@ async fn by_path(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
 /// Every parameter a read of `path` reports — recursively or at the level immediately
 /// below it — paging until the read hands out no further token, the way a client's
 /// paginator walks the hierarchy.
-async fn listing(
+pub(super) async fn listing(
     router: &MultiServiceRouter,
     case: &str,
     path: &str,
@@ -136,12 +136,16 @@ async fn listing(
 }
 
 /// [`listing`] with `Recursive` set: every parameter under `path`, however deep.
-async fn recursive_listing(router: &MultiServiceRouter, case: &str, path: &str) -> Vec<Value> {
+pub(super) async fn recursive_listing(
+    router: &MultiServiceRouter,
+    case: &str,
+    path: &str,
+) -> Vec<Value> {
     listing(router, case, path, true).await
 }
 
 /// The `Name` of each reported parameter, in the order the read reported them.
-fn names(parameters: &[Value]) -> Vec<String> {
+pub(super) fn names(parameters: &[Value]) -> Vec<String> {
     parameters
         .iter()
         .map(|parameter| {
@@ -156,13 +160,23 @@ fn names(parameters: &[Value]) -> Vec<String> {
 /// Whether `value` is shaped like an AMI id: the form PCS's own `AmiId` member publishes
 /// (`smithy_query(query="shape", shape="AmiId")` in the PCS model: pattern
 /// `^ami-[a-z0-9]+$`), which is also the form EC2 mints its image ids in.
-fn is_ami_id(value: &str) -> bool {
+pub(super) fn is_ami_id(value: &str) -> bool {
     value.strip_prefix("ami-").is_some_and(|rest| {
         !rest.is_empty()
             && rest
                 .chars()
                 .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
     })
+}
+
+/// Whether the published name `name` names an IMAGE: an AMI alias, or the `image_id` leaf of
+/// an image-metadata hierarchy. Every OTHER published name carries a fact published beside an
+/// image — its own name, its build version, the operating system it is built on, a runtime
+/// version — which is not an id.
+pub(super) fn names_an_image(name: &str) -> bool {
+    name.ends_with("/image_id")
+        || name.ends_with("/ami-id")
+        || name.starts_with("/aws/service/ami-")
 }
 
 /// The hierarchy one level above `name` (`/a/b/c` -> `/a/b`).
@@ -173,12 +187,23 @@ fn parent_path(name: &str) -> String {
     parent.to_string()
 }
 
+/// The text of one XML element of an `ec2Query` body, or `None` when the body carries none —
+/// as much of a reader as the Amazon EC2 assertions of this crate's published-catalog suites
+/// need, in ONE place for all of them.
+pub(super) fn element(body: &str, tag: &str) -> Option<String> {
+    let open = format!("<{tag}>");
+    let close = format!("</{tag}>");
+    let start = body.find(&open)? + open.len();
+    let end = body[start..].find(&close)? + start;
+    Some(body[start..end].to_string())
+}
+
 /// One Amazon EC2 `DescribeImages` call for `image_id`, as its status and XML body.
 ///
 /// EC2 speaks ec2Query: an `application/x-www-form-urlencoded` POST carrying
 /// `Action=<Operation>`, answered with XML, selected by the `ec2` signing name of the
 /// request's SigV4 credential scope (the EC2 crate's `OPERATIONS.md`, "Wire protocol").
-async fn describe_image(router: &MultiServiceRouter, image_id: &str) -> (u16, String) {
+pub(super) async fn describe_image(router: &MultiServiceRouter, image_id: &str) -> (u16, String) {
     let body = format!(
         "Action=DescribeImages&Version={EC2_API_VERSION}&ImageId.1={image_id}"
     );
@@ -293,7 +318,7 @@ async fn the_pcs_namespace_publishes_an_x86_64_recommended_ami() {
 
 /// `GetParameter` for a published name, asserting it was served and returning the reported
 /// `Parameter`.
-async fn read_published(router: &MultiServiceRouter, name: &str) -> Value {
+pub(super) async fn read_published(router: &MultiServiceRouter, name: &str) -> Value {
     let (status, response) = call(router, "GetParameter", &json!({ "Name": name })).await;
     assert_eq!(
         status, 200,
@@ -341,10 +366,17 @@ async fn a_published_name_resolves_through_every_read() {
             version >= 1,
             "case {case}: expected a server-assigned version of at least 1, got {single}"
         );
-        assert!(
-            is_ami_id(&value),
-            "case {case}: expected the value to be an AMI id, got {value:?}"
-        );
+        if names_an_image(name) {
+            assert!(
+                is_ami_id(&value),
+                "case {case}: expected the value to be an AMI id, got {value:?}"
+            );
+        } else {
+            assert!(
+                !value.is_empty(),
+                "case {case}: expected the published fact to carry a value, got {single}"
+            );
+        }
         // AWS publishes these parameters itself, in every account alike, so the ARN names
         // no account: the account field is empty where an account's own parameter carries
         // this endpoint's account id.
@@ -552,16 +584,21 @@ async fn a_published_parameter_is_read_only() {
     );
 }
 
-/// RULE (the backed outcome): the id a published AMI alias resolves to names an image the
-/// account can really read through Amazon EC2's own front door, and the architecture the
-/// alias names is that image's architecture.
+/// RULE (the backed outcome): the id a published name that NAMES an image resolves to names
+/// an image the account can really read through Amazon EC2's own front door, and the
+/// architecture the name carries is that image's architecture.
 #[tokio::test]
 async fn a_published_alias_resolves_to_an_image_ec2_describes() {
     let router = emulator();
     let catalog = recursive_listing(&router, "the catalog to describe", PUBLISHED_ROOT).await;
+    let mut described = 0usize;
 
     for parameter in &catalog {
         let name = parameter["Name"].as_str().unwrap_or_default().to_string();
+        if !names_an_image(&name) {
+            continue;
+        }
+        described += 1;
         let case = format!("the image published as {name}");
         let image_id = read_published(&router, &name).await["Value"]
             .as_str()
@@ -588,6 +625,12 @@ async fn a_published_alias_resolves_to_an_image_ec2_describes() {
             }
         }
     }
+
+    assert!(
+        described > 1,
+        "the catalog must publish more than one name that names an image for this table to \
+         span, got {described}"
+    );
 }
 
 /// RULE: the account's own hierarchy is unaffected — it reports what the account wrote and

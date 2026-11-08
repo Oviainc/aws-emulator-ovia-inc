@@ -2336,6 +2336,18 @@ mod byoip_and_capacity_reservations;
 mod resource_dependencies_and_conversion_tasks;
 mod security_group_rules_and_page_tokens;
 mod images_and_zone_facts;
+/// The Amazon Linux images Amazon publishes and the public Systems Manager parameter name
+/// each one's id is published under — the POPULATION of the public AMI alias namespace, in a
+/// file of its own rather than as more rows of `images_and_zone_facts`. Everything it
+/// declares is re-exported below.
+mod published_amazon_linux;
+pub use published_amazon_linux::*;
+/// The image-metadata hierarchies AWS publishes in Parameter Store beside an image's id —
+/// the recommended ECS-optimized and Bottlerocket builds — and the ONE projection Parameter
+/// Store reads the whole published catalog through. Everything it declares is re-exported
+/// below.
+mod published_image_metadata;
+pub use published_image_metadata::*;
 mod import_image_tasks_and_verified_access;
 /// Which Verified Access trust providers each Verified Access instance has attached: the one
 /// writer of that attachment, the one reading of it, and the tokens the two calls that change

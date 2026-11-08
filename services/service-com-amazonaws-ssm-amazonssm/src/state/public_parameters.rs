@@ -8,18 +8,18 @@
 //! and never stored by this service: it is AWS's own published data, and a read resolves it
 //! against whatever this emulator holds of that data rather than against the store.
 //!
-//! What it holds of it today is the image catalog Amazon EC2 publishes: every public
-//! Systems Manager parameter name an image of that catalog is published under, and the id
-//! of the image it names
-//! (`ComAmazonawsEc2Amazonec2State::public_ssm_parameter_image_ids`) — the ONE place this
-//! emulator records which AMI a public parameter resolves to, so Parameter Store and EC2
-//! cannot disagree about it and the id a read reports is an AMI the account can really
-//! launch, describe or hand to a service that provisions compute from one. An alias whose
-//! image was deregistered resolves to nothing, exactly as the describe reports none.
+//! What it holds of it today is what the services that publish an image publish about it:
+//! every public Systems Manager parameter name of this endpoint, and the value it resolves to
+//! (`ComAmazonawsEc2Amazonec2State::public_ssm_parameter_values`) — the ONE place this
+//! emulator records what a public parameter resolves to, so Parameter Store and the service
+//! that publishes it cannot disagree about it and an id a read reports is an AMI the account
+//! can really launch, describe or hand to a service that provisions compute from one. An
+//! alias whose image was deregistered resolves to nothing, exactly as the describe reports
+//! none.
 //!
 //! Nothing here writes: the catalog is projected from EC2's image state on each read, so a
-//! read of it changes nothing a later caller sees and the ids it reports are the ids that
-//! state holds.
+//! read of it changes nothing a later caller sees and the values it reports are the values
+//! that state holds.
 
 use std::collections::BTreeMap;
 use std::time::SystemTime;
@@ -77,19 +77,18 @@ pub fn published_records<Eng: Send + Sync + 'static>(
     };
     let store = state.lock();
     store
-        .public_ssm_parameter_image_ids(::engine::emulator_account_id())
+        .public_ssm_parameter_values(::engine::emulator_account_id())
         .into_iter()
-        .map(|(name, image_id)| {
-            let published_at = store
-                .images
-                .get(&image_id)
-                .and_then(|image| image.creation_date.as_deref())
+        .map(|(name, published)| {
+            let published_at = published
+                .published_at
+                .as_deref()
                 .and_then(parsed_instant)
-                // The instant the image was published is the instant its alias last
+                // The instant the image was published is the instant its parameter last
                 // changed; a date this emulator cannot read reports the epoch rather than
                 // now, so a read never reports an instant that moves between two reads.
                 .unwrap_or(SystemTime::UNIX_EPOCH);
-            published_record(region, &name, &image_id, published_at)
+            published_record(region, &name, &published.value, published_at)
         })
         .collect()
 }
