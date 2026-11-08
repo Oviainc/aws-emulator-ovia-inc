@@ -133,10 +133,10 @@ fn parse_rows() -> Vec<Row> {
             expected: parse_failure("Unexpected token after expression"),
         },
         Row {
-            case: "a misspelled verb states no data manipulation",
+            case: "a misspelled verb reads as an expression the text carries on past",
             statement: format!("INSRT INTO \"{TABLE}\" VALUE {{'pk':'a'}}"),
             parameters: Value::Null,
-            expected: parse_failure("Expected data manipulation"),
+            expected: parse_failure("Unexpected token after expression"),
         },
         Row {
             case: "the text reads as an expression and nothing more",
@@ -163,13 +163,28 @@ fn parse_rows() -> Vec<Row> {
             expected: parse_failure("Expected FROM after SELECT list"),
         },
         Row {
-            // A function the dialect DOES define, standing where only a name may stand:
-            // the statement spells a call there, which is no name — not a call to
-            // something undefined.
+            // A projection names PATHS into the item, so a call standing there — one the
+            // dialect defines or one it does not — is refused as the path component it
+            // is not, at the position the statement spells it.
             case: "a defined function in a projection",
             statement: format!("SELECT attribute_exists(pk) FROM {TABLE}"),
             parameters: Value::Null,
-            expected: parse_failure("Expected identifier for simple path"),
+            expected: format!(
+                "Unexpected path component at {}",
+                position_of(
+                    &format!("SELECT attribute_exists(pk) FROM {TABLE}"),
+                    "attribute_exists"
+                )
+            ),
+        },
+        Row {
+            case: "an undefined function in a projection",
+            statement: format!("SELECT other_fn(pk) FROM {TABLE}"),
+            parameters: Value::Null,
+            expected: format!(
+                "Unexpected path component at {}",
+                position_of(&format!("SELECT other_fn(pk) FROM {TABLE}"), "other_fn")
+            ),
         },
         Row {
             case: "a defined function on the left of a SET clause",
@@ -178,10 +193,37 @@ fn parse_rows() -> Vec<Row> {
             expected: parse_failure("Expected identifier for simple path"),
         },
         Row {
+            // A lexeme the scanner cannot read is no token at all, so there is no
+            // grammar position to name: the sentence's tail is empty, the way it is for
+            // a quoted run the statement never closes.
             case: "a malformed numeric literal",
             statement: format!("INSERT INTO {TABLE} VALUE {{'pk': 'z', 'n': 1.2.3}}"),
             parameters: Value::Null,
-            expected: parse_failure("Unexpected term"),
+            expected: parse_failure(""),
+        },
+        Row {
+            case: "an exponent marker with no exponent",
+            statement: format!("INSERT INTO {TABLE} VALUE {{'pk': 'z', 'n': 1e}}"),
+            parameters: Value::Null,
+            expected: parse_failure(""),
+        },
+        Row {
+            case: "a tuple literal the statement never closes",
+            statement: format!("INSERT INTO {TABLE} VALUE {{'pk': 'z', 'n': 1"),
+            parameters: Value::Null,
+            expected: parse_failure("Expected RIGHT_CURLY"),
+        },
+        Row {
+            case: "a bag literal the statement never closes",
+            statement: format!("INSERT INTO {TABLE} VALUE {{'pk': 'z', 'n': <<1, 2}}"),
+            parameters: Value::Null,
+            expected: parse_failure("Expected RIGHT_DOUBLE_ANGLE_BRACKET"),
+        },
+        Row {
+            case: "a list literal the statement never closes",
+            statement: format!("INSERT INTO {TABLE} VALUE {{'pk': 'z', 'n': [1, 2}}"),
+            parameters: Value::Null,
+            expected: parse_failure("Expected RIGHT_BRACKET"),
         },
         Row {
             case: "a clause that stops before its predicate",
@@ -202,11 +244,6 @@ fn unrecognized_function_rows() -> Vec<Row> {
             "an unknown function in a predicate",
             format!("SELECT * FROM \"{TABLE}\" WHERE made_up_function(pk)"),
             "made_up_function",
-        ),
-        (
-            "an unknown function in a projection",
-            format!("SELECT other_fn(pk) FROM {TABLE}"),
-            "other_fn",
         ),
         (
             "an unknown function on the right of a comparison",
@@ -238,10 +275,10 @@ fn operand_rows() -> Vec<Row> {
     let requires_path = |function: &str| {
         format!("Operator or function requires a document path; operator or function: {function}")
     };
-    let operand_count = |function: &str| {
+    let operand_count = |function: &str, operands: usize| {
         format!(
             "Incorrect number of operands for operator or function; operator or function: \
-             {function}"
+             {function}, number of operands: {operands}"
         )
     };
     // The functions are the ones this dialect defines over a document path
@@ -274,28 +311,34 @@ fn operand_rows() -> Vec<Row> {
             expected: requires_path("size"),
         },
         Row {
+            case: "attribute_exists given no operand at all",
+            statement: format!("SELECT * FROM {TABLE} WHERE attribute_exists()"),
+            parameters: Value::Null,
+            expected: operand_count("attribute_exists", 0),
+        },
+        Row {
             case: "attribute_exists given two operands",
             statement: format!("SELECT * FROM {TABLE} WHERE attribute_exists(pk, n)"),
             parameters: Value::Null,
-            expected: operand_count("attribute_exists"),
+            expected: operand_count("attribute_exists", 2),
         },
         Row {
             case: "begins_with given one operand",
             statement: format!("SELECT * FROM {TABLE} WHERE begins_with(pk)"),
             parameters: Value::Null,
-            expected: operand_count("begins_with"),
+            expected: operand_count("begins_with", 1),
         },
         Row {
             case: "contains given three operands",
             statement: format!("SELECT * FROM {TABLE} WHERE contains(pk, 'a', 'b')"),
             parameters: Value::Null,
-            expected: operand_count("contains"),
+            expected: operand_count("contains", 3),
         },
         Row {
             case: "size given two operands",
             statement: format!("SELECT * FROM {TABLE} WHERE size(pk, n) > 1"),
             parameters: Value::Null,
-            expected: operand_count("size"),
+            expected: operand_count("size", 2),
         },
     ]
 }
@@ -330,50 +373,50 @@ fn source_rows() -> Vec<Row> {
             expected: PATH_ARITY.to_string(),
         },
     ];
-    // Only a `DELETE` states its target through a `FROM` clause, which is what the
-    // positioned sentence is about; an `UPDATE` and an `INSERT` name theirs directly.
-    rows.push(Row {
-        case: "a DELETE through an index qualifier",
-        statement: format!("DELETE FROM \"keyed\".\"{INDEX}\" WHERE pk = 'a' AND sk = 1"),
-        parameters: Value::Null,
-        expected: format!(
-            "FROM clause may only contain a single table name in data manipulation statements \
-             at {}",
-            position_of(
-                &format!("DELETE FROM \"keyed\".\"{INDEX}\" WHERE pk = 'a' AND sk = 1"),
-                &format!("\"keyed\".\"{INDEX}\"")
-            )
+    // An `INSERT` names its target inside the `INTO` CLAUSE, which is what the
+    // positioned sentence is about, and the position it reports is where the statement
+    // spells the TABLE that clause may name. An `UPDATE` and a `DELETE` CHANGE an item
+    // of the table, and a qualifier on their source asks for that change through an
+    // index: the fixed index sentence.
+    for (case, statement, path) in [
+        (
+            "an INSERT through an index qualifier",
+            format!("INSERT INTO \"keyed\".\"{INDEX}\" VALUE {{'pk':'b','sk':2}}"),
+            "\"keyed\"".to_string(),
         ),
-    });
-    rows.push(Row {
-        case: "a DELETE through a bare index qualifier",
-        statement: "DELETE FROM keyed.anyindex WHERE pk = 'a' AND sk = 1".to_string(),
-        parameters: Value::Null,
-        expected: format!(
-            "FROM clause may only contain a single table name in data manipulation statements \
-             at {}",
-            position_of(
-                "DELETE FROM keyed.anyindex WHERE pk = 'a' AND sk = 1",
-                "keyed.anyindex"
-            )
+        (
+            "an INSERT through a longer qualifier still addresses an index",
+            format!("INSERT INTO {TABLE}.a.b VALUE {{'pk':'b'}}"),
+            TABLE.to_string(),
         ),
-    });
+    ] {
+        rows.push(Row {
+            expected: format!(
+                "FROM clause may only contain a single table name in data manipulation \
+                 statements at {}",
+                position_of(&statement, &path)
+            ),
+            case,
+            statement,
+            parameters: Value::Null,
+        });
+    }
     for (case, statement) in [
         (
             "an UPDATE through an index qualifier",
             format!("UPDATE \"keyed\".\"{INDEX}\" SET note = 'two' WHERE pk = 'a' AND sk = 1"),
         ),
         (
-            "an INSERT through an index qualifier",
-            format!("INSERT INTO \"keyed\".\"{INDEX}\" VALUE {{'pk':'b','sk':2}}"),
-        ),
-        (
             "an UPDATE through a longer qualifier still addresses an index",
-            format!("UPDATE keyed.{INDEX}.extra SET note = 'two' WHERE pk = 'a'"),
+            format!("UPDATE \"keyed\".\"{INDEX}\".\"extra\" SET note = 'two' WHERE pk = 'a'"),
         ),
         (
-            "an INSERT through a longer qualifier still addresses an index",
-            format!("INSERT INTO {TABLE}.a.b VALUE {{'pk':'b'}}"),
+            "a DELETE through an index qualifier",
+            format!("DELETE FROM \"keyed\".\"{INDEX}\" WHERE pk = 'a' AND sk = 1"),
+        ),
+        (
+            "a DELETE through a bare index qualifier",
+            "DELETE FROM keyed.anyindex WHERE pk = 'a' AND sk = 1".to_string(),
         ),
     ] {
         rows.push(Row {
@@ -500,7 +543,7 @@ async fn a_batch_slot_states_the_same_sentence_its_own_statement_earns() {
         (
             "a misspelled verb",
             format!("INSRT INTO \"{TABLE}\" VALUE {{'pk':'q'}}"),
-            parse_failure("Expected data manipulation"),
+            parse_failure("Unexpected token after expression"),
         ),
         (
             "an unknown function",
@@ -516,7 +559,11 @@ async fn a_batch_slot_states_the_same_sentence_its_own_statement_earns() {
         (
             "a write addressed through an index qualifier",
             format!("INSERT INTO {TABLE}.a.b VALUE {{'pk':'q'}}"),
-            "This operation is not supported on an index".to_string(),
+            format!(
+                "FROM clause may only contain a single table name in data manipulation \
+                 statements at {}",
+                position_of(&format!("INSERT INTO {TABLE}.a.b VALUE {{'pk':'q'}}"), TABLE)
+            ),
         ),
     ];
 
@@ -650,7 +697,7 @@ async fn a_transaction_states_the_slot_a_statement_was_sent_in() {
         (
             "a misspelled verb",
             format!("INSRT INTO \"{TABLE}\" VALUE {{'pk':'q'}}"),
-            parse_failure("Expected data manipulation"),
+            parse_failure("Unexpected token after expression"),
         ),
         (
             "a single-quoted table name",
@@ -774,10 +821,10 @@ fn cross_surface_rows() -> Vec<Row> {
     let requires_path = |function: &str| {
         format!("Operator or function requires a document path; operator or function: {function}")
     };
-    let operand_count = |function: &str| {
+    let operand_count = |function: &str, operands: usize| {
         format!(
             "Incorrect number of operands for operator or function; operator or function: \
-             {function}"
+             {function}, number of operands: {operands}"
         )
     };
     // 39 digits: one past the documented 38 significant digits an N carries.
@@ -788,7 +835,7 @@ fn cross_surface_rows() -> Vec<Row> {
             case: "a misspelled verb",
             statement: format!("INSRT INTO \"{TABLE}\" VALUE {{'pk':'q'}}"),
             parameters: Value::Null,
-            expected: parse_failure("Expected data manipulation"),
+            expected: parse_failure("Unexpected token after expression"),
         },
         Row {
             case: "a single-quoted table name",
@@ -815,7 +862,7 @@ fn cross_surface_rows() -> Vec<Row> {
             case: "a call carrying one operand too many",
             statement: format!("SELECT * FROM {TABLE} WHERE size(pk, n) > 1"),
             parameters: Value::Null,
-            expected: operand_count("size"),
+            expected: operand_count("size", 2),
         },
         Row {
             case: "a three-component FROM path",
@@ -964,10 +1011,11 @@ async fn a_reported_position_is_counted_in_the_statements_own_lines_and_characte
         );
     }
 
-    // The positioned sentence a write through an index qualifier earns reports the whole
-    // source path, counted off the line that spells it.
-    let statement = format!("DELETE\nFROM \"keyed\".\"{INDEX}\"\nWHERE pk = 'a' AND sk = 1");
-    let path = format!("\"keyed\".\"{INDEX}\"");
+    // The positioned sentence an `INSERT` through an index qualifier earns reports where
+    // the statement spells the TABLE its `INTO` clause may name, counted off the line
+    // that spells it.
+    let statement = format!("INSERT\nINTO \"keyed\".\"{INDEX}\"\nVALUE {{'pk':'b','sk':2}}");
+    let path = "\"keyed\"".to_string();
     let stated = refused(
         &router,
         "a source path on the second line",

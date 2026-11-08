@@ -91,7 +91,16 @@ impl NumberKey {
             digits.pop();
         }
         if digits.is_empty() {
-            // Every spelling of zero normalises to the same value, sign included.
+            // Every spelling of zero normalises to the same value, sign included — but
+            // the EXPONENT the text spelled is still held to the documented range: a
+            // zero written with an exponent outside that range is a number this service
+            // does not store, whatever its mantissa normalises to.
+            if exponent > MAX_EXPONENT {
+                return Err(NumberFault::Overflow);
+            }
+            if exponent < MIN_EXPONENT {
+                return Err(NumberFault::Underflow);
+            }
             return Ok(Self {
                 negative: false,
                 point: 0,

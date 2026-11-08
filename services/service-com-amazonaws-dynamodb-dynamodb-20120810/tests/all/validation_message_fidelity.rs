@@ -196,7 +196,8 @@ async fn a_number_outside_the_documented_rules_is_stated_inside_the_envelope() {
     // Each row: the case, the `N` text, and the whole clause the envelope carries.
     // The rows span the three documented rules (the text is no number, the
     // magnitude is outside the exponent range either way, the precision is past 38
-    // significant digits) and the forms an unparsable text takes.
+    // significant digits), the forms an unparsable text takes, and a mantissa that
+    // normalises to zero under an exponent outside the documented range.
     let rows: Vec<(&str, String, String)> = vec![
         (
             "an exponent with no mantissa",
@@ -246,6 +247,22 @@ async fn a_number_outside_the_documented_rules_is_stated_inside_the_envelope() {
             "one digit more than the documented precision",
             THIRTY_NINE_DIGITS.to_string(),
             "Attempting to store more than 38 significant digits in a Number".to_string(),
+        ),
+        (
+            // The mantissa normalises to zero, and the exponent the text spelled is
+            // still outside the documented range.
+            "a zero written with an exponent past the documented maximum",
+            "0e126".to_string(),
+            "Number overflow. Attempting to store a number with magnitude larger than \
+             supported range"
+                .to_string(),
+        ),
+        (
+            "a zero written with an exponent below the documented minimum",
+            "0e-131".to_string(),
+            "Number underflow. Attempting to store a number with magnitude smaller than \
+             supported range"
+                .to_string(),
         ),
     ];
 

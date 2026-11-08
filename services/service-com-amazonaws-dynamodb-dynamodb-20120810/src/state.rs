@@ -327,6 +327,13 @@ const MAX_SIGNIFICANT_DIGITS: usize = 38;
 const MIN_POINT: i32 = -129;
 const MAX_POINT: i32 = 126;
 
+/// The same documented exponent range, as the EXPONENT a text spells rather than as the
+/// normalised `point` of a magnitude: the quota bounds the exponent, and a text whose
+/// mantissa is zero has no magnitude to bound, so the exponent it wrote is what the rule
+/// is read against.
+const MIN_EXPONENT: i32 = -130;
+const MAX_EXPONENT: i32 = 125;
+
 /// The most DIGITS one `N` value's text may carry, before normalisation strips its
 /// leading and trailing zeros. This is the EMULATOR's own input-size limit, not an AWS
 /// quota: AWS bounds the significant digits and the exponent (above) and normalises the
@@ -4143,6 +4150,26 @@ pub fn number_rejection(text: &str, fault: NumberFault) -> RequestError {
             "One or more parameter values were invalid: A Number may carry at most \
              {MAX_NUMBER_TEXT_DIGITS} digits of text, this emulator's input-size limit"
         )),
+    }
+}
+
+/// One clause stated ON ITS OWN, out of the `<N> validation error(s) detected: `
+/// envelope [`refused`] builds a value refusal with.
+///
+/// The envelope reports a constraint on a value an input MEMBER carried; a number a
+/// statement spelled or an UPDATE computed is not one — the member is the statement or
+/// the expression, and the rule the number broke is stated as the sentence it is. The
+/// envelope is recognised through the renderer that writes it
+/// ([`validation_message`]), so the two cannot drift.
+pub(crate) fn unenveloped(error: RequestError) -> RequestError {
+    match error {
+        RequestError::Validation(message) => RequestError::Validation(
+            message
+                .strip_prefix(&validation_message([String::new()]).unwrap_or_default())
+                .unwrap_or(&message)
+                .to_string(),
+        ),
+        error => error,
     }
 }
 

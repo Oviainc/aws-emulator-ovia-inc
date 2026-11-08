@@ -161,7 +161,7 @@ impl Table {
     }
 
     /// The `AttributeType` (`S`/`N`/`B`) declared for `attribute`.
-    fn declared_type(&self, attribute: &str) -> Option<&str> {
+    pub(crate) fn declared_type(&self, attribute: &str) -> Option<&str> {
         self.attribute_definitions
             .iter()
             .find(|definition| definition.attribute_name == attribute)

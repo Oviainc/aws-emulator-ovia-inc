@@ -624,7 +624,7 @@ async fn sort_key_conditions_select_by_the_documented_comparison() {
     create_active_table(
         &router,
         "Episodes",
-        &[("Show", "HASH", "S"), ("Episode", "RANGE", "S")],
+        &[("Series", "HASH", "S"), ("Episode", "RANGE", "S")],
     )
     .await;
     for episode in ["s01e01", "s01e02", "s02e01", "s02e02"] {
@@ -633,7 +633,7 @@ async fn sort_key_conditions_select_by_the_documented_comparison() {
             "PutItem",
             json!({
                 "TableName": "Episodes",
-                "Item": {"Show": {"S": "Acme"}, "Episode": {"S": episode}},
+                "Item": {"Series": {"S": "Acme"}, "Episode": {"S": episode}},
             }),
         )
         .await;
@@ -645,37 +645,37 @@ async fn sort_key_conditions_select_by_the_documented_comparison() {
     // BEGINS_WITH | BETWEEN" (the `Condition` doc).
     let expression_cases: [(&str, Value, &[&str]); 7] = [
         (
-            "Show = :s AND Episode = :a",
+            "Series = :s AND Episode = :a",
             json!({":s": {"S": "Acme"}, ":a": {"S": "s01e02"}}),
             &["s01e02"],
         ),
         (
-            "Show = :s AND Episode < :a",
+            "Series = :s AND Episode < :a",
             json!({":s": {"S": "Acme"}, ":a": {"S": "s01e02"}}),
             &["s01e01"],
         ),
         (
-            "Show = :s AND Episode <= :a",
+            "Series = :s AND Episode <= :a",
             json!({":s": {"S": "Acme"}, ":a": {"S": "s01e02"}}),
             &["s01e01", "s01e02"],
         ),
         (
-            "Show = :s AND Episode > :a",
+            "Series = :s AND Episode > :a",
             json!({":s": {"S": "Acme"}, ":a": {"S": "s02e01"}}),
             &["s02e02"],
         ),
         (
-            "Show = :s AND Episode >= :a",
+            "Series = :s AND Episode >= :a",
             json!({":s": {"S": "Acme"}, ":a": {"S": "s02e01"}}),
             &["s02e01", "s02e02"],
         ),
         (
-            "Show = :s AND Episode BETWEEN :low AND :high",
+            "Series = :s AND Episode BETWEEN :low AND :high",
             json!({":s": {"S": "Acme"}, ":low": {"S": "s01e02"}, ":high": {"S": "s02e01"}}),
             &["s01e02", "s02e01"],
         ),
         (
-            "Show = :s AND begins_with ( Episode , :prefix )",
+            "Series = :s AND begins_with ( Episode , :prefix )",
             json!({":s": {"S": "Acme"}, ":prefix": {"S": "s02"}}),
             &["s02e01", "s02e02"],
         ),
@@ -726,7 +726,7 @@ async fn sort_key_conditions_select_by_the_documented_comparison() {
             json!({
                 "TableName": "Episodes",
                 "KeyConditions": {
-                    "Show": {"AttributeValueList": [{"S": "Acme"}], "ComparisonOperator": "EQ"},
+                    "Series": {"AttributeValueList": [{"S": "Acme"}], "ComparisonOperator": "EQ"},
                     "Episode": condition,
                 },
             }),

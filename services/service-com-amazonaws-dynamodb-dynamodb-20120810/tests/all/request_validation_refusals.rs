@@ -731,6 +731,13 @@ async fn every_value_a_request_carries_obeys_the_rules_for_its_type() {
                 .to_string(),
         ),
         (
+            "a zero carrying an exponent past the documented range",
+            json!({"N": "0e126"}),
+            "Number overflow. Attempting to store a number with magnitude larger than supported \
+             range"
+                .to_string(),
+        ),
+        (
             "an empty string set",
             json!({"SS": []}),
             "One or more parameter values were invalid: An string set  may not be empty"

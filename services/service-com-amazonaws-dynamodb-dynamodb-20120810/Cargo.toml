@@ -23,6 +23,10 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Linear-time substring search over BYTES: `contains(path, :operand)` over a binary
+# attribute searches one caller-sized value for another, so the search has to cost the
+# SUM of the two lengths rather than their product (`state::expressions::contains_bytes`).
+memchr = "2"
 # Exact decimal arithmetic for the `N` attribute type: an `ADD`ed or `SET`-computed
 # number carries up to 38 significant digits, which no primitive float can hold.
 bigdecimal = "0.4"

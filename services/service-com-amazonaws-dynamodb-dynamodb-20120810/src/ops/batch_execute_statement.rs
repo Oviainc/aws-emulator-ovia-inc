@@ -333,15 +333,13 @@ const DUPLICATE_ITEM_CODE: &str = "DuplicateItem";
 const CONDITIONAL_CHECK_FAILED_CODE: &str = "ConditionalCheckFailed";
 
 
-/// Parse one slot's statement, holding each `?` marker's value to the same rules a
-/// stored value is held to before the statement is read.
+/// Parse one slot's statement; each `?` marker's value is held to the same rules a
+/// stored value is by the parser that binds it
+/// ([`crate::state::parse_statement`]).
 fn parse_slot(
     request: &BatchStatementRequest,
 ) -> Result<crate::state::PartiqlStatement, crate::state::RequestError> {
     let parameters = request.parameters.clone().unwrap_or_default();
-    for (position, value) in parameters.iter().enumerate() {
-        crate::state::check_statement_value(&format!("Parameters[{position}]"), value)?;
-    }
     crate::state::parse_statement(&request.statement, &parameters)
 }
 

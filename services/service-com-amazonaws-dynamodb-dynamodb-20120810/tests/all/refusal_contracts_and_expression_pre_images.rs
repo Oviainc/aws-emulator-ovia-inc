@@ -390,6 +390,29 @@ async fn an_expression_refusal_names_its_member_and_the_request_detail() {
             json!({"TableName": "Expressions", "ProjectionExpression": "a b"}),
             "Invalid ProjectionExpression: Syntax error; token: \"b\", near: \"a b\"".to_string(),
         ),
+        (
+            // The key condition is the one expression grammar the `Query` handler parses
+            // itself; the reserved-word rule is the same rule, in that member's words.
+            "a bare reserved word as a key attribute in a key condition",
+            "Query",
+            json!({"TableName": "Expressions",
+                   "KeyConditionExpression": "pk = :p AND timestamp > :t",
+                   "ExpressionAttributeValues": {":p": {"S": "one"}, ":t": {"N": "1"}}}),
+            "Invalid KeyConditionExpression: Attribute name is a reserved keyword; reserved \
+             keyword: timestamp"
+                .to_string(),
+        ),
+        (
+            // A key condition the grammar cannot read is a SYNTAX defect: the reserved
+            // word is not yet an attribute name in an expression that never parsed.
+            "an unparsable key condition carrying a reserved word",
+            "Query",
+            json!({"TableName": "Expressions",
+                   "KeyConditionExpression": "pk = :p AND timestamp",
+                   "ExpressionAttributeValues": {":p": {"S": "one"}}}),
+            "Invalid KeyConditionExpression: Syntax error; token: \"<EOF>\", near: \"timestamp\""
+                .to_string(),
+        ),
     ];
     for (case, operation, request, expected) in read_members {
         let stated = refusal(&router, case, operation, request, "ValidationException").await;

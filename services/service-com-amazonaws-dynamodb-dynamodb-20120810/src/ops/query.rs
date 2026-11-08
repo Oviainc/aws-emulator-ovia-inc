@@ -1411,10 +1411,19 @@ fn parse_key_condition_expression(
         depth: 0,
         names,
         values,
+        reserved: None,
     };
     let comparisons = parser.conjunction()?;
     if parser.at != tokens.len() {
         return Err(parser.syntax());
+    }
+    // A reserved word written out as a name is refused once the expression has PARSED:
+    // in an expression the grammar cannot read, a keyword is not yet an attribute name
+    // at all, so the parse defect is what such a request earns. The rule itself is the
+    // one every expression member of this service states
+    // ([`crate::state::check_reserved_attribute_name`]).
+    if let Some(word) = &parser.reserved {
+        crate::state::check_reserved_attribute_name(KEY_CONDITION_MEMBER, word)?;
     }
     Ok(comparisons)
 }
@@ -1431,6 +1440,9 @@ struct Parser<'a> {
     depth: usize,
     names: Option<&'a std::collections::HashMap<String, String>>,
     values: Option<&'a std::collections::HashMap<String, AttributeValue>>,
+    /// The first name the expression wrote out that is a DynamoDB reserved word, noted
+    /// as it is read and refused once the whole expression has parsed.
+    reserved: Option<String>,
 }
 
 impl Parser<'_> {
@@ -1582,9 +1594,19 @@ impl Parser<'_> {
     /// attribute name itself. An alias the request never defined is the one
     /// undefined-token refusal every expression member of this service states
     /// (`crate::state::undefined_name`).
-    fn resolve_name(&self, token: &str) -> Result<String, crate::state::RequestError> {
+    fn resolve_name(&mut self, token: &str) -> Result<String, crate::state::RequestError> {
         match token.strip_prefix('#') {
-            None => Ok(token.to_string()),
+            None => {
+                // Noted, not refused: the refusal belongs after the parse
+                // ([`parse_key_condition_expression`]).
+                if self.reserved.is_none()
+                    && crate::state::check_reserved_attribute_name(KEY_CONDITION_MEMBER, token)
+                        .is_err()
+                {
+                    self.reserved = Some(token.to_string());
+                }
+                Ok(token.to_string())
+            }
             Some(_) => self
                 .names
                 .and_then(|names| names.get(token))

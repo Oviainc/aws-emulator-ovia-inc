@@ -284,15 +284,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let return_old_on_failure =
             input.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD");
 
-        // A value the statement's `?` markers stand for is held to the same rules a
-        // stored value is — the documented nesting depth, and this emulator's ceiling
-        // on a collection's members — before the statement is parsed, because both
-        // bound the work this request can ask for.
+        // A value the statement's `?` markers stand for is held to the rules every
+        // value a statement carries is held to, inside the parser that binds them
+        // ([`crate::state::parse_statement`]): one choke point for every surface that
+        // runs a statement.
         let parameters = input.parameters.clone().unwrap_or_default();
-        for (position, value) in parameters.iter().enumerate() {
-            crate::state::check_statement_value(&format!("Parameters[{position}]"), value)
-                .map_err(lift)?;
-        }
         let statement =
             crate::state::parse_statement(&input.statement, &parameters).map_err(lift)?;
         let name = crate::state::resolve_table_name_in(statement.table(), &region).map_err(lift)?;
@@ -416,6 +412,12 @@ fn select_items(
     // scan. The plan decides what is READ, and therefore what the statement is charged
     // for; the predicate is applied to each row the plan read, and never narrows the
     // read itself.
+    //
+    // An equality the clause pins on a key attribute is held to the type the table
+    // declared for it FIRST: a value of another type addresses nothing the table can
+    // hold, so the statement is refused rather than planned as a scan that answers no
+    // rows.
+    crate::state::check_pinned_key_types(table, select.filter.as_ref()).map_err(lift)?;
     let pinned = select
         .filter
         .as_ref()

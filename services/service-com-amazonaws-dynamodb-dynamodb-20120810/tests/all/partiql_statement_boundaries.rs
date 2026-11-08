@@ -83,21 +83,34 @@ async fn refused(router: &MultiServiceRouter, case: &str, statement: &str) -> St
 async fn text_that_states_no_data_manipulation_and_a_bound_table_name_are_refused_as_such() {
     let router = seeded().await;
 
-    // The rows differ in WHAT the text reads as: a misspelled verb followed by a whole
-    // statement's worth of text, a bare name, a name with text after it, a quoted name,
-    // a literal, a predicate, and a statement of another dialect. None of them opens
-    // with one of the four verbs, so none of them manipulates data.
+    // The rows differ in WHAT the text reads as: a bare name, a quoted name, a literal
+    // and a predicate — each an expression that accounts for the whole text, so each
+    // states no data manipulation. Text whose one expression is followed by MORE text is
+    // a token after that expression instead, which the rows below assert.
+    for (case, statement) in [
+        ("a bare name alone", TABLE.to_string()),
+        ("a quoted name alone", format!("\"{TABLE}\"")),
+        ("a string literal alone", "'not a statement'".to_string()),
+        ("a predicate alone", "pk = 'a'".to_string()),
+    ] {
+        let stated = refused(&router, case, &statement).await;
+        assert_eq!(
+            stated,
+            parse_failure("Expected data manipulation"),
+            "case {case}: {statement:?} states no data manipulation, got {stated:?}"
+        );
+    }
+
+    // A PartiQL query may be a bare expression, so text that states no manipulation of
+    // data is still READ as one: these rows each open with an expression and then carry
+    // on, which is a token after that expression rather than a statement of any kind.
     for (case, statement) in [
         ("a misspelled SELECT", format!("SELCT * FROM \"{TABLE}\"")),
         (
             "a misspelled INSERT",
             format!("INSRT INTO \"{TABLE}\" VALUE {{'pk':'z'}}"),
         ),
-        ("a bare name alone", TABLE.to_string()),
         ("a bare name and a word after it", format!("{TABLE} rows")),
-        ("a quoted name alone", format!("\"{TABLE}\"")),
-        ("a string literal alone", "'not a statement'".to_string()),
-        ("a predicate alone", "pk = 'a'".to_string()),
         (
             "a statement of another dialect",
             format!("DROP TABLE \"{TABLE}\""),
@@ -110,8 +123,8 @@ async fn text_that_states_no_data_manipulation_and_a_bound_table_name_are_refuse
         let stated = refused(&router, case, &statement).await;
         assert_eq!(
             stated,
-            parse_failure("Expected data manipulation"),
-            "case {case}: {statement:?} states no data manipulation, got {stated:?}"
+            parse_failure("Unexpected token after expression"),
+            "case {case}: {statement:?} carries on past its one expression, got {stated:?}"
         );
     }
 

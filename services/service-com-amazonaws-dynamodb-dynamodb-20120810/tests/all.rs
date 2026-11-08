@@ -89,6 +89,8 @@ mod kinesis_destination_state_refusals;
 mod kinesis_destination_stream_resolution;
 #[path = "all/kinesis_streaming_destinations.rs"]
 mod kinesis_streaming_destinations;
+#[path = "all/legacy_filters_and_statement_values.rs"]
+mod legacy_filters_and_statement_values;
 #[path = "all/list_exports.rs"]
 mod list_exports;
 #[path = "all/list_imports.rs"]

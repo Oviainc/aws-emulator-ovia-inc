@@ -860,11 +860,6 @@ async fn a_select_clause_that_repeats_an_identifier_is_refused() {
             "nested",
         ),
         (
-            "two indexed paths under one attribute",
-            format!("SELECT l[0], l[1] FROM \"{STATEMENTS}\" WHERE pk = 'p'"),
-            "l",
-        ),
-        (
             "two items aliased to one identifier",
             format!("SELECT s AS one, n AS one FROM \"{STATEMENTS}\" WHERE pk = 'p'"),
             "one",
@@ -913,6 +908,13 @@ async fn a_select_clause_that_repeats_an_identifier_is_refused() {
             "two paths under one attribute, reported under their own last steps",
             format!("SELECT m.nested, m.other FROM \"{STATEMENTS}\" WHERE pk = 'p'"),
             json!([{"nested": {"S": "deep"}, "other": {"N": "2"}}]),
+        ),
+        (
+            // Two elements of one list are two entries of the answer: a projected path
+            // is reported under the PATH, so the index tells them apart.
+            "two indexed paths under one attribute, reported under their paths",
+            format!("SELECT l[0], l[1] FROM \"{STATEMENTS}\" WHERE pk = 'p'"),
+            json!([{"l[0]": {"S": "first"}, "l[1]": {"NULL": true}}]),
         ),
         (
             "the colliding pair, told apart by an alias",

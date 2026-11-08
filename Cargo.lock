@@ -11399,6 +11399,7 @@ dependencies = [
  "flate2",
  "hex",
  "http",
+ "memchr",
  "serde_json",
  "service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810",
  "service-com-amazonaws-kinesis-kinesis-20131202",

@@ -293,6 +293,22 @@ fn unknown_function(member: &str, name: &str) -> RequestError {
     invalid_expression_member(member, &format!("Invalid function name; function: {name}"))
 }
 
+/// Whether a NAME an expression writes out is one of DynamoDB's reserved words, refused
+/// behind the member it travelled in when it is.
+///
+/// The one place that rule is spelled, for the expression grammars this module parses
+/// and for the `KeyConditionExpression` grammar the `Query` handler parses: both reach
+/// an attribute whose name collides with a keyword through `ExpressionAttributeNames`
+/// ("To access an attribute whose name conflicts with a DynamoDB reserved word" — that
+/// member's doc), so a bare reserved word is refused in one wording wherever it is
+/// written.
+pub fn check_reserved_attribute_name(member: &str, word: &str) -> Result<(), RequestError> {
+    if is_reserved_word(word) {
+        return Err(reserved_attribute_name(member, word));
+    }
+    Ok(())
+}
+
 /// Whether `word`, written out in an expression, is one of DynamoDB's reserved words.
 ///
 /// Matched without regard to case, the way the keywords of the expression languages are
@@ -1473,9 +1489,15 @@ fn begins_with_value(value: &AttributeValue, prefix: &AttributeValue) -> bool {
 /// `contains (path, operand)` — "true if the attribute specified by path is: A String
 /// that contains a particular substring, [or] A Set that contains a particular
 /// element". A list is searched for the element too, the way `CONTAINS` reads it.
+///
+/// A binary value is a sequence of BYTES, and "DynamoDB treats each byte of the binary
+/// data as unsigned when it compares binary values" (`AttributeValueList`), so a `B`
+/// haystack contains a `B` needle when the needle's bytes appear in it as a contiguous
+/// run — any byte value included, `0x00` among them.
 fn contains_value(haystack: &AttributeValue, needle: &AttributeValue) -> bool {
     match (haystack, needle) {
         (AttributeValue::S(text), AttributeValue::S(part)) => text.contains(part.as_str()),
+        (AttributeValue::B(bytes), AttributeValue::B(part)) => contains_bytes(bytes, part),
         (AttributeValue::Ss(members), AttributeValue::S(member)) => members.contains(member),
         (AttributeValue::Ns(members), AttributeValue::N(member)) => {
             members.iter().any(|stored| numbers_equal(stored, member))
@@ -1486,6 +1508,23 @@ fn contains_value(haystack: &AttributeValue, needle: &AttributeValue) -> bool {
             .any(|stored| attribute_values_equal(stored, needle)),
         _ => false,
     }
+}
+
+/// Whether `part` appears in `bytes` as a contiguous run of bytes. The empty run is in
+/// every sequence, the way the empty string is a substring of every string.
+///
+/// Both lengths are the CALLER's — the haystack is a stored `B` value and the needle an
+/// operand the request carried — so the search is the linear-time one `str::contains`
+/// uses for text (`memchr::memmem`), and what one evaluation costs is the SUM of the two
+/// lengths rather than their product.
+fn contains_bytes(bytes: &[u8], part: &[u8]) -> bool {
+    if part.is_empty() {
+        return true;
+    }
+    if part.len() > bytes.len() {
+        return false;
+    }
+    ::memchr::memmem::find(bytes, part).is_some()
 }
 
 /// `size (path)` — the length of the value at a path: bytes for a string or binary
@@ -1512,6 +1551,10 @@ fn size_of_value(value: &AttributeValue) -> Option<i64> {
 /// rendered through [`canonical_number_text`], the same canonicalization a written
 /// number goes through, so a computed number is refused by the rule it breaks and
 /// stored in the one form every read reports.
+///
+/// The rule a COMPUTED number breaks is stated on its own ([`unenveloped`]): no input
+/// member carried that number — the expression asked for it — so there is no member for
+/// the validation envelope to report a constraint on.
 pub fn number_arithmetic(
     left: &str,
     right: &str,
@@ -1527,7 +1570,7 @@ pub fn number_arithmetic(
     let precision = u64::try_from(MAX_SIGNIFICANT_DIGITS).unwrap_or(38);
     let (digits, scale) = result.with_prec(precision).as_bigint_and_exponent();
     // `digits * 10^-scale` is the value, which is exactly what an `N` text spells.
-    canonical_number_text(&format!("{digits}e{}", -scale))
+    canonical_number_text(&format!("{digits}e{}", -scale)).map_err(unenveloped)
 }
 
 /// One operand of that arithmetic. The canonical text is what reaches the decimal
@@ -2674,6 +2717,21 @@ impl<'a> ExprParser<'a> {
                 candidates.push(self.operand()?);
             }
             self.expect(&ExprToken::Close)?;
+            // "IN — ... The IN operator can have up to 100 comparison values"
+            // (`ConditionExpression` comparator and function reference), the same
+            // ceiling the legacy `IN` comparison is held to ([`MAX_IN_OPERANDS`]): a
+            // longer list is refused as the expression it is, before anything is read,
+            // naming how many operands the expression gave it.
+            if candidates.len() > MAX_IN_OPERANDS {
+                return Err(invalid_expression_member(
+                    self.member,
+                    &format!(
+                        "The IN operator is provided with too many operands; number of \
+                         operands: {}",
+                        candidates.len()
+                    ),
+                ));
+            }
             return Ok(ConditionNode::In(left, candidates));
         }
         match self.next_token()? {
@@ -3041,12 +3099,17 @@ pub fn legacy_comparison_matches(
         _ => {
             let Some(held) = held else {
                 // Every other operator compares a value, and the item holds none here.
-                // The legacy operators lower onto the expression language one for one
-                // ("Use FilterExpression instead": `NE` is `<>` and `NOT_CONTAINS` is
-                // `NOT contains(...)`), so the NEGATED ones hold for an attribute that
-                // is not there — nothing is not equal to, and does not contain, a value
-                // — while a positive comparison has nothing to compare and fails.
-                return Ok(matches!(operator, "NE" | "NOT_CONTAINS"));
+                // A comparison needs something to compare, so an item that does not
+                // carry the attribute at all satisfies none of them — the one documented
+                // exception is `NE`: "NE : Not equal ... If the item contains an
+                // AttributeValue of a different type than the one provided in the
+                // request, the value does not match" (`ComparisonOperator`), and an item
+                // carrying no value for the name is not equal to the one compared
+                // against. Every other operator — the negated `NOT_CONTAINS` included —
+                // selects only the items that HAVE the attribute, which is what makes a
+                // legacy filter answer the item set `attribute_exists` plus the
+                // expression form of the comparator answers.
+                return Ok(operator == "NE");
             };
             match operator {
                 "EQ" => attribute_values_equal(held, &operands[0]),
@@ -3115,6 +3178,35 @@ pub fn check_legacy_comparison(
     // ceiling on that list ([`MAX_IN_OPERANDS`]).
     if required == usize::MAX && operands.len() > MAX_IN_OPERANDS {
         return Err(RequestError::Validation(invalid_argument_count(operator)));
+    }
+    check_legacy_operand_types(operator, operands)?;
+    Ok(())
+}
+
+/// Hold a legacy comparison's operands to the TYPES that comparison can compare.
+///
+/// "BEGINS_WITH : Checks for a prefix. ... AttributeValueList can contain only one
+/// AttributeValue of type String or Binary (not a Number or a set type)"
+/// (`ComparisonOperator`): only those two types have a prefix, so an operand of any
+/// other type is refused as the request defect it is — before anything is read, like
+/// every other fact of the request. The ordering comparisons are not held here: they
+/// compare whatever two values DynamoDB documents an order between, and a type that has
+/// none simply does not match.
+fn check_legacy_operand_types(
+    operator: &str,
+    operands: &[AttributeValue],
+) -> Result<(), RequestError> {
+    if operator != "BEGINS_WITH" {
+        return Ok(());
+    }
+    for operand in operands {
+        if !matches!(operand, AttributeValue::S(_) | AttributeValue::B(_)) {
+            return Err(RequestError::Validation(format!(
+                "{INVALID_PARAMETER_CLAUSE}: ComparisonOperator {operator} is not valid for {} \
+                 AttributeValue type",
+                attribute_value_type(operand)
+            )));
+        }
     }
     Ok(())
 }

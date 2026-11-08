@@ -311,10 +311,22 @@ const SELECT_TABLE: &[SelectRow] = &[
         reported: &[("p", "1"), ("p", "2"), ("p", "10")],
     },
     SelectRow {
-        case: "IS NULL, which an absent attribute satisfies as well as a NULL one",
+        case: "IS NULL, which only a stored NULL satisfies",
         statement: "SELECT * FROM items WHERE pk = 'p' AND nothing IS NULL",
         parameters: Value::Null,
+        reported: &[("p", "2")],
+    },
+    SelectRow {
+        case: "IS NOT NULL over an attribute every item carries",
+        statement: "SELECT * FROM items WHERE pk = 'p' AND s IS NOT NULL",
+        parameters: Value::Null,
         reported: &[("p", "1"), ("p", "2"), ("p", "3"), ("p", "10")],
+    },
+    SelectRow {
+        case: "IS NOT NULL, which an item carrying no value for the name satisfies",
+        statement: "SELECT * FROM items WHERE pk = 'p' AND nothing IS NOT NULL",
+        parameters: Value::Null,
+        reported: &[("p", "1"), ("p", "3"), ("p", "10")],
     },
     SelectRow {
         case: "NOT around an equality",
