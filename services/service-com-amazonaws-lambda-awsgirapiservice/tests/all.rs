@@ -308,6 +308,8 @@ mod resource_tags;
 mod response_stream_invocation;
 #[path = "all/runtime_management_config.rs"]
 mod runtime_management_config;
+#[path = "all/s3_package_source.rs"]
+mod s3_package_source;
 #[path = "all/signing_name_routing.rs"]
 mod signing_name_routing;
 #[path = "all/sqs_event_source_handler_run.rs"]

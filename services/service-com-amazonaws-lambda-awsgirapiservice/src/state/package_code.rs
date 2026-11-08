@@ -6,13 +6,16 @@ use super::*;
 
 /// Where the code of a function came from.
 ///
-/// `zip_bytes` is the only variant whose bytes this emulator holds, so it is the only
-/// one `code_size` and `code_sha256` can be computed from; an S3 object or a container
-/// image is a reference this emulator does not resolve, and nothing is reported for it
-/// that was not computed.
+/// `zip_bytes` holds the deployment package's own bytes whenever this emulator has them:
+/// the ones a caller uploaded inline, and the ones Amazon S3 handed over for a package
+/// named by an S3 location ([`super::s3_source`]). They are what `code_size` and
+/// `code_sha256` are computed from; a container image is a reference this emulator does not
+/// pull, and an S3 object nothing could be shown about holds no bytes either, so nothing is
+/// reported for one that was not computed.
 #[derive(Debug, Clone, Default)]
 pub struct CodeRecord {
-    /// The deployment package bytes, when the caller uploaded them inline.
+    /// The deployment package bytes, when the caller uploaded them inline or Amazon S3
+    /// handed them over for the location the package names.
     pub zip_bytes: Option<Vec<u8>>,
     /// The S3 bucket holding the deployment package, when the caller named one.
     pub s3_bucket: Option<String>,

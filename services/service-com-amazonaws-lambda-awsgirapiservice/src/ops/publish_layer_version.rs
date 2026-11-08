@@ -193,21 +193,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ))
         })?;
 
-        let archive = layer_archive(&input.content)?;
+        let now = ::std::time::SystemTime::now();
+        let region = crate::state::request_region(ctx);
+
+        let mut archive = layer_archive(&input.content)?;
+
+        // "A ZIP archive that contains the contents of an Lambda layer" named as "an Amazon
+        // S3 location" is a reference Lambda FOLLOWS when the archive is stored, exactly as
+        // a function's .zip package is (see [`crate::state::s3_source`]): an object Amazon
+        // S3 answers that it will not hand over is refused and no version is published, and
+        // the bytes it does hand over ARE the archive. A bucket this emulator's Amazon S3
+        // holds no record of shows nothing about the object and refuses nothing.
+        if let (Some(bucket), Some(key)) = (archive.s3_bucket.clone(), archive.s3_key.clone()) {
+            let version = archive.s3_object_version.clone();
+            match crate::state::s3_package_bytes(ctx, &region, &bucket, &key, version.as_deref())
+                .await
+            {
+                Ok(bytes) => archive.zip_bytes = bytes,
+                Err(message) => return Err(invalid_parameter(message)),
+            }
+        }
+
         let (code_size, code_sha256) = match &archive.zip_bytes {
-            // The only bytes this emulator holds are the ones the caller uploaded
-            // inline, so they are the only ones a size and a digest can come from.
+            // The archive's own bytes, whether the caller uploaded them inline or Amazon S3
+            // handed them over, are the only ones a size and a digest can come from.
             Some(bytes) => (
                 i64::try_from(bytes.len()).unwrap_or(i64::MAX),
                 Some(crate::state::code_sha256(bytes)),
             ),
-            // An S3 object is a reference this emulator does not resolve: it reports no
-            // size it did not measure and no digest it did not compute.
+            // An Amazon S3 object nothing could be shown about is one this emulator holds no
+            // bytes for: it reports no size it did not measure and no digest it did not
+            // compute.
             None => (0, None),
         };
 
-        let now = ::std::time::SystemTime::now();
-        let region = crate::state::request_region(ctx);
         let mut store = state.lock();
 
         // "The amount of storage space, in bytes, that's being used by deployment

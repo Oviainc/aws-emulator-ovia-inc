@@ -269,10 +269,37 @@ pub(crate) async fn create_topic(router: &MultiServiceRouter, name: &str) -> Str
     element(&answered, "TopicArn", &case)
 }
 
+/// The key the deployment package of the function below is uploaded under, and read back
+/// from: Lambda reads the package out of the Amazon S3 object the `Code` names, so the
+/// object has to be there before the function is created.
+const PACKAGE_KEY: &str = "function.zip";
+
+/// `PUT /<bucket>/<key>` on the mounted Amazon S3 service: the deployment package the
+/// function below is created from, in the bucket this suite created.
+///
+/// Nothing this suite calls reads the archive's contents — only its presence decides whether
+/// the create is served — so the bytes are a marker rather than a real .zip.
+async fn put_package(router: &MultiServiceRouter, bucket: &str, case: &str) {
+    let (status, body) = owning_service(
+        router,
+        "s3",
+        "PUT",
+        &format!("/{bucket}/{PACKAGE_KEY}"),
+        &[("content-type", "application/zip")],
+        "snowball-order-function package",
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected PutObject to answer 200, got {status} with {body}"
+    );
+}
+
 /// `CreateFunction` on the mounted Lambda service, answering the function ARN it minted.
 ///
-/// The deployment package is the S3 object form, so the suite needs no archive of its own;
-/// the bucket is one this suite created in the mounted Amazon S3 service.
+/// The deployment package is the S3 object form, uploaded to the bucket this suite created
+/// before the create is made ([`put_package`]): Lambda reads the package out of the object
+/// the `Code` names, and refuses a create whose bucket holds nothing under that key.
 async fn create_function(
     router: &MultiServiceRouter,
     name: &str,
@@ -280,12 +307,13 @@ async fn create_function(
     bucket: &str,
 ) -> String {
     let case = format!("create the function {name}");
+    put_package(router, bucket, &case).await;
     let body = json!({
         "FunctionName": name,
         "Role": role_arn,
         "Runtime": "python3.12",
         "Handler": "index.handler",
-        "Code": { "S3Bucket": bucket, "S3Key": "function.zip" },
+        "Code": { "S3Bucket": bucket, "S3Key": PACKAGE_KEY },
     })
     .to_string();
     let (status, answered) = owning_service(

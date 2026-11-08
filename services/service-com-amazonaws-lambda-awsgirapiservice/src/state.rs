@@ -269,6 +269,13 @@ pub use vpc_attachment_authorization::unattachable_vpc_config;
 pub mod image_source;
 pub use image_source::{resolve_image_source, source_image_message, ImageResolution};
 
+/// Following a .zip package's Amazon S3 location — whether Amazon S3 hands the object over,
+/// and which bytes the package is — lives in [`s3_source`], beside the reference-following
+/// above and re-exported for the same reason: the three writes that store such a package
+/// name it as `crate::state::…`.
+pub mod s3_source;
+pub use s3_source::{read_s3_package, s3_package_bytes, s3_package_message, S3Package};
+
 /// Asking that question for the SET of calls one such thing takes — which of them the role
 /// may not make — lives in [`role_actions`], so the gates that each take several calls ask it
 /// the same way over the one decision above.
@@ -4138,8 +4145,10 @@ pub fn code_sha256(bytes: &[u8]) -> String {
 /// with cannot disagree.
 ///
 /// `CodeSize` is "The size of the function's deployment package, in bytes", which can only
-/// be measured for the bytes this emulator HOLDS: an S3 object it does not resolve has no
-/// size it measured and no digest it computed, so it reports neither.
+/// be measured for the bytes this emulator HOLDS — for a package named by an Amazon S3
+/// location, the ones Amazon S3 handed over when the package was stored
+/// ([`s3_source`]); an object nothing could be shown about has no size it measured and no
+/// digest it computed, so it reports neither.
 #[must_use]
 pub fn package_code_identity(code: &CodeRecord) -> (i64, Option<String>) {
     if let Some(bytes) = &code.zip_bytes {

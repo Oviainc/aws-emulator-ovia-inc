@@ -372,6 +372,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // A new package named by an Amazon S3 location is FOLLOWED exactly as the create's
+        // is (see [`crate::state::s3_source`]). The read is made HERE, before the store is
+        // reached, because it is a call out of this handler and no store guard may be held
+        // across one; whether it refuses this update is decided where the package is
+        // resolved below, so the order a client sees this operation's refusals in is
+        // unchanged.
+        let s3_package = match (input.s3_bucket.clone(), input.s3_key.clone()) {
+            (Some(bucket), Some(key)) => Some(
+                crate::state::read_s3_package(
+                    ctx,
+                    &region,
+                    &bucket,
+                    &key,
+                    input.s3_object_version.as_deref(),
+                )
+                .await,
+            ),
+            _ => None,
+        };
+
         let mut store = state.lock();
 
         // The storage this account already uses, measured BEFORE this call changes it
@@ -453,6 +473,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         )
         .map_err(invalid_parameter)?;
+
+        // The object the Amazon S3 location named, as this handler already read it: a
+        // refusal Amazon S3 answered about a bucket it holds refuses this update with
+        // nothing changed, and the bytes it handed over ARE the new deployment package.
+        if let Some(package) = &s3_package {
+            if let Some(message) = crate::state::s3_package_message(package) {
+                return Err(invalid_parameter(message));
+            }
+            if let crate::state::S3Package::Read(bytes) = package {
+                code.zip_bytes = Some(bytes.clone());
+            }
+        }
 
         // A new container image is FOLLOWED into the registry exactly as the create's was:
         // the same rule decides whether the reference names an image of this Region's

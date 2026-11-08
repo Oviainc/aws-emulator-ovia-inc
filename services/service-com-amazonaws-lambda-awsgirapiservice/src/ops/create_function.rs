@@ -476,6 +476,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "For a .zip file archive, the code property specifies the location of the .zip
+        // file": a package named by an Amazon S3 location is a reference Lambda FOLLOWS when
+        // the package is stored, just as an image reference above is. An object Amazon S3
+        // answers that it will not hand over is refused and nothing is created; the bytes it
+        // does hand over ARE the deployment package, so the function's `CodeSize`,
+        // `CodeSha256` and the code an invocation runs are the object's own (see
+        // [`crate::state::s3_source`]). A bucket this emulator's Amazon S3 holds no record
+        // of shows nothing about the object and refuses nothing.
+        if let (Some(bucket), Some(key)) = (code.s3_bucket.clone(), code.s3_key.clone()) {
+            let version = code.s3_object_version.clone();
+            match crate::state::s3_package_bytes(ctx, &region, &bucket, &key, version.as_deref())
+                .await
+            {
+                Ok(bytes) => code.zip_bytes = bytes,
+                Err(message) => return Err(invalid_parameter(message)),
+            }
+        }
+
         // "To create a function, you need a deployment package and an execution role."
         // The function RUNS AS the role the request names, so that role is resolved
         // before anything is written: a role this emulator's own IAM HOLDS whose trust
