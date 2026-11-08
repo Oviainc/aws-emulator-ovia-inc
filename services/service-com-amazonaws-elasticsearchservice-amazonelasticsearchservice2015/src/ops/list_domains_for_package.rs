@@ -154,11 +154,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(&ctx.parts().headers);
 
         let store = state.lock();
-        // The package the request names must exist: this is a read OF that
-        // package, not of an empty set.
-        if !store
-            .packages
-            .contains_key(&crate::state::package_key(&region, &input.package_id))
+        // The package the request names must be visible in this Region — one
+        // this account created, else one the service publishes: this is a read
+        // OF that package, not of an empty set.
+        if store
+            .visible_package(&region, &input.package_id)
+            .is_none()
         {
             // The resource named is not there: HTTP 404
             // (`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`), not the

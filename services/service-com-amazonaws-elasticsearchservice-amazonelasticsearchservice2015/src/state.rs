@@ -23,7 +23,10 @@
 //! A [`Package`] carries its own content history — one [`PackageVersionRecord`]
 //! per revision, appended by `CreatePackage` and `UpdatePackage` — and a
 //! [`DomainPackage`] records one package installed on one domain, which
-//! `AssociatePackage` writes and the two list operations read.
+//! `AssociatePackage` writes and the two list operations read. Beside the
+//! packages an account creates, the service publishes a catalogue of plugin
+//! packages every account sees ([`PUBLISHED_PACKAGES`]); the package reads
+//! answer from the union of the two ([`ComAmazonawsElasticsearchserviceAmazonelasticsearchservice2015State::visible_packages`]).
 //!
 //! The other resource this store holds is the outbound
 //! [`CrossClusterSearchConnection`]: `CreateOutboundCrossClusterSearchConnection`
@@ -204,27 +207,20 @@ pub fn engine_type_of(version: Option<&str>) -> &'static str {
 }
 
 /// Every engine version a domain of this service can run, in upgrade order:
-/// the Elasticsearch versions the service offers, then the OpenSearch versions
-/// a domain can be moved onto.
+/// the Elasticsearch versions the service still offers as an upgrade source,
+/// then the OpenSearch versions a domain can be moved onto.
 ///
 /// The model constrains only the FORM of a version string
 /// (`ElasticsearchVersionString`'s pattern — `X.Y`, `OpenSearch_X.Y`, `OS_X.Y`),
 /// never which versions exist, so the supported set is named here ONCE and
 /// every version answer is derived from it rather than from a per-operation
-/// list.
-pub const SUPPORTED_ENGINE_VERSIONS: [&str; 31] = [
-    "1.5",
-    "2.3",
-    "5.1",
-    "5.3",
-    "5.5",
-    "5.6",
-    "6.0",
-    "6.2",
-    "6.3",
-    "6.4",
-    "6.5",
-    "6.7",
+/// list. It is the inventory the service CURRENTLY offers: the Elasticsearch
+/// 6.8/7.x line and the OpenSearch 1.x/2.x/3.x line, the engines a domain can
+/// be created on or upgraded to. A version retired from that inventory is no
+/// longer a source or a target of an upgrade, which is why none is listed here;
+/// a domain still running one is answered by the same rule
+/// ([`compatible_target_versions`]) from its place in this order.
+pub const SUPPORTED_ENGINE_VERSIONS: [&str; 22] = [
     "6.8",
     "7.1",
     "7.4",
@@ -244,6 +240,9 @@ pub const SUPPORTED_ENGINE_VERSIONS: [&str; 31] = [
     "OpenSearch_2.13",
     "OpenSearch_2.15",
     "OpenSearch_2.17",
+    "OpenSearch_2.19",
+    "OpenSearch_3.0",
+    "OpenSearch_3.1",
 ];
 
 /// One version's place in the upgrade order: its lineage (Elasticsearch before
@@ -278,11 +277,14 @@ fn ordered_versions() -> Vec<((u8, u32, u32), &'static str)> {
 /// The service's upgrade paths step through the supported set: from any version
 /// a domain reaches every LATER supported version of its own major, and a major
 /// boundary is crossed only from the last supported version of a major, into
-/// the versions of the major that follows it — so the last supported 5.x
-/// reaches the 6.x versions, the last 6.x the 7.x ones, and the last
-/// Elasticsearch version the first OpenSearch major. A version the supported
-/// set does not carry is placed in the same order and answered by the same
-/// rule; a string outside the modelled forms reaches nothing.
+/// the versions of the major that follows it — so the last supported 2.x
+/// OpenSearch version reaches the 3.x ones. The one boundary that is open from
+/// EVERY version of a lineage is the migration out of Elasticsearch: a domain
+/// on any Elasticsearch version reaches the first OpenSearch major the service
+/// offers, which is how a current Elasticsearch domain is moved onto OpenSearch
+/// without first stepping to the last Elasticsearch version. A version the
+/// supported set does not carry is placed in the same order and answered by the
+/// same rule; a string outside the modelled forms reaches nothing.
 pub fn compatible_target_versions(version: &str) -> Vec<String> {
     let Some(source) = version_order(version) else {
         return Vec::new();
@@ -320,11 +322,21 @@ pub fn compatible_target_versions(version: &str) -> Vec<String> {
             .copied(),
     };
 
+    // The lineage boundary: the first OpenSearch major the set carries is
+    // reachable from EVERY Elasticsearch version, not only from the last one of
+    // its major.
+    let first_opensearch_major = (source.0 == 0)
+        .then(|| majors.iter().find(|(lineage, _)| *lineage == 1).copied())
+        .flatten();
+
     catalog
         .into_iter()
         .filter(|(order, _)| {
             let major = (order.0, order.1);
-            *order > source && (major == source_major || Some(major) == next_major)
+            *order > source
+                && (major == source_major
+                    || Some(major) == next_major
+                    || Some(major) == first_opensearch_major)
         })
         .map(|(_, version)| version.to_string())
         .collect()
@@ -1044,6 +1056,11 @@ impl CrossClusterSearchConnection {
 // Packages
 // ---------------------------------------------------------------------------
 
+/// The plugin packages the service itself publishes, which every account sees
+/// beside the ones it created.
+mod package_catalog;
+pub use package_catalog::*;
+
 /// `PackageStatus`'s `COPYING`: the package's content is still being copied out
 /// of the customer's S3 location. The status a package holds from the instant
 /// `CreatePackage` returns until [`active_deadline`] has passed.
@@ -1605,6 +1622,33 @@ impl ComAmazonawsElasticsearchserviceAmazonelasticsearchservice2015State {
             .map(|(_, package)| package)
     }
 
+    /// Every package VISIBLE in one Region, in package-id order: the catalog of
+    /// plugin packages the service publishes to every account, plus the
+    /// packages this account created in that Region.
+    ///
+    /// This is the set the package reads report and resolve an id against —
+    /// `DescribePackages` describes "all packages available to Amazon ES", not
+    /// only the ones a caller created. The published entries are computed from
+    /// the read-only catalog table on each call rather than inserted into the
+    /// store, so reporting them writes nothing, and the merged set is ordered
+    /// by package id, so two calls report the same order and a pagination
+    /// token names a place in it.
+    pub fn visible_packages(&self, region: &str) -> Vec<Package> {
+        let mut visible = published_packages();
+        visible.extend(self.packages_in(region).cloned());
+        visible.sort_by(|left, right| left.package_id.cmp(&right.package_id));
+        visible
+    }
+
+    /// The visible package of one Region carrying `package_id` — one this
+    /// account created there, else one the service publishes.
+    pub fn visible_package(&self, region: &str, package_id: &str) -> Option<Package> {
+        self.packages
+            .get(&package_key(region, package_id))
+            .cloned()
+            .or_else(|| published_package(package_id))
+    }
+
     /// The package of `region` carrying `package_name`, if the store holds one:
     /// a package name is unique among the packages of one Region, so this is
     /// what a create checks before minting another.
@@ -1654,17 +1698,16 @@ impl ComAmazonawsElasticsearchserviceAmazonelasticsearchservice2015State {
     }
 
     /// One association as the `DomainPackageDetails` every association
-    /// operation reports, or `None` when the store no longer holds the package
-    /// it names.
+    /// operation reports, or `None` when the package it names is no longer
+    /// visible in that Region.
     pub fn association_details(
         &self,
         region: &str,
         association: &DomainPackage,
         now: SystemTime,
     ) -> Option<DomainPackageDetails> {
-        self.packages
-            .get(&package_key(region, &association.package_id))
-            .map(|package| association.to_details(package, now))
+        self.visible_package(region, &association.package_id)
+            .map(|package| association.to_details(&package, now))
     }
 }
 

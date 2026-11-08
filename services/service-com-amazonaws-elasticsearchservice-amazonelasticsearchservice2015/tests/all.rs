@@ -35,6 +35,8 @@ mod package_versions;
 mod packages;
 #[path = "all/pattern_refusal_quoting.rs"]
 mod pattern_refusal_quoting;
+#[path = "all/published_package_catalog.rs"]
+mod published_package_catalog;
 #[path = "all/refusal_value_echo.rs"]
 mod refusal_value_echo;
 #[path = "all/shared_es_signing_name_claim.rs"]

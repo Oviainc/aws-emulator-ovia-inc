@@ -169,11 +169,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
 
         // The two resources the request names, in the order the URI names them.
-        let Some(package) = store
-            .packages
-            .get(&crate::state::package_key(&region, &input.package_id))
-            .cloned()
-        else {
+        // A package the service publishes resolves here just as one this
+        // account created does: listing the plugin catalogue and then
+        // associating an entry with a domain is what the catalogue is for.
+        let Some(package) = store.visible_package(&region, &input.package_id) else {
             // The resource named is not there: HTTP 404
             // (`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`), not the
             // `@httpError(409)` the model annotates on the shape.

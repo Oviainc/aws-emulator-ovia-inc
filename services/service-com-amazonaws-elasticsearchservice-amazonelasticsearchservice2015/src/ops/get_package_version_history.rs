@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPackageVersionHistory
-//! Reports one package's version history, NEWEST FIRST: every entry is a stored
-//! revision of that package's content — the one `CreatePackage` minted and one
-//! per `UpdatePackage` since — paged. A read, so nothing here writes.
+//! Reports one package's version history, NEWEST FIRST: every entry is a
+//! revision of that package's content, paged. For a package this account
+//! created, the revisions `CreatePackage` and each `UpdatePackage` recorded;
+//! for one the service publishes, the versions its catalog offers. A read, so
+//! nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -158,10 +160,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(&ctx.parts().headers);
 
         let store = state.lock();
-        let Some(package) = store
-            .packages
-            .get(&crate::state::package_key(&region, &input.package_id))
-        else {
+        // Every package visible in the Region resolves here: one this account
+        // created, else one the service's own catalog publishes.
+        let Some(package) = store.visible_package(&region, &input.package_id) else {
             // The resource named is not there: HTTP 404
             // (`crate::scaffolded::RESOURCE_NOT_FOUND_STATUS`), not the
             // `@httpError(409)` the model annotates on the shape.

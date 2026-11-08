@@ -10,6 +10,11 @@
 //! 1. A create PERSISTS the package and answers with the stored record's own
 //!    `PackageDetails`; a later `DescribePackages` answers from that same
 //!    record, with the id the service minted for it.
+//!
+//! `DescribePackages` reports "all packages available to Amazon ES", so every
+//! answer below also carries the plugin packages the service publishes; the
+//! rows here are about the packages this account CREATES, and the published
+//! catalogue is the subject of `published_package_catalog.rs`.
 //! 2. A created package is `COPYING` for a non-zero span and then settles on
 //!    `AVAILABLE`, which is when it has an `AvailablePackageVersion` — and no
 //!    read changes what the next read sees.
@@ -62,6 +67,40 @@ fn reported(answer: &Answer, case: &str) -> Vec<Value> {
         .as_array()
         .unwrap_or_else(|| panic!("case {case:?}: PackageDetailsList is not a list, got {}", answer.body))
         .clone()
+}
+
+/// The one entry of a describe answer carrying `package_id`.
+fn entry_for(answer: &Answer, case: &str, package_id: &str) -> Value {
+    let entries = reported(answer, case);
+    let mut found: Vec<Value> = entries
+        .iter()
+        .filter(|entry| entry.pointer("/PackageID") == Some(&json!(package_id)))
+        .cloned()
+        .collect();
+    assert_eq!(
+        found.len(),
+        1,
+        "case {case:?}: {package_id} must be reported exactly once, got {found:?}"
+    );
+    found.remove(0)
+}
+
+/// The names a describe answer carries, restricted to the ones `names` lists —
+/// the packages the case itself created, told apart from the published
+/// catalogue every answer also carries.
+fn own_names(answer: &Answer, case: &str, names: &[&str]) -> Vec<String> {
+    let mut got: Vec<String> = reported(answer, case)
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .pointer("/PackageName")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .filter(|name| names.contains(&name.as_str()))
+        .collect();
+    got.sort();
+    got
 }
 
 /// One create request and what the stored record must then report.
@@ -184,20 +223,21 @@ async fn create_persists_the_package_and_describe_answers_from_the_store() {
             "case {label:?}: describe must answer 200, got {} {}",
             read.status, read.body
         );
-        let entries = reported(&read, label);
-        assert_eq!(
-            entries.len(),
-            1,
-            "case {label:?}: the one created package must be the one reported, got {entries:?}"
-        );
+        let entry = entry_for(&read, label, &package_id);
         for member in ["PackageID", "PackageName", "PackageType", "CreatedAt"] {
             assert_eq!(
-                entries[0].pointer(&format!("/{member}")),
+                entry.pointer(&format!("/{member}")),
                 created.body.pointer(&format!("{details}/{member}")),
                 "case {label:?}: describe must report the create's {member}, got {:?}",
-                entries[0].pointer(&format!("/{member}"))
+                entry.pointer(&format!("/{member}"))
             );
         }
+        assert_eq!(
+            own_names(&read, label, &[case.name]),
+            vec![case.name.to_string()],
+            "case {label:?}: the created package must be the only one of this account's own \
+             reported"
+        );
     }
 }
 
@@ -274,6 +314,7 @@ async fn a_package_copies_then_settles_without_a_read_changing_it() {
         "create must answer 200, got {} {}",
         created.status, created.body
     );
+    let package_id = created.text("while copying", "/PackageDetails/PackageID");
     assert!(
         created.missing("/PackageDetails/AvailablePackageVersion"),
         "case {:?}: a copying package has no available version yet, got {:?}",
@@ -284,12 +325,12 @@ async fn a_package_copies_then_settles_without_a_read_changing_it() {
     // Two reads inside the copy span agree: a read must not move the status on.
     for case in ["first read while copying", "second read while copying"] {
         let read = describe_packages(&router, &json!({})).await;
-        let entries = reported(&read, case);
+        let entry = entry_for(&read, case, &package_id);
         assert_eq!(
-            entries[0].pointer("/PackageStatus"),
+            entry.pointer("/PackageStatus"),
             Some(&json!("COPYING")),
             "case {case:?}: the package must still be COPYING, got {:?}",
-            entries[0].pointer("/PackageStatus")
+            entry.pointer("/PackageStatus")
         );
     }
 
@@ -298,18 +339,18 @@ async fn a_package_copies_then_settles_without_a_read_changing_it() {
 
     for case in ["first read once due", "second read once due"] {
         let read = describe_packages(&router, &json!({})).await;
-        let entries = reported(&read, case);
+        let entry = entry_for(&read, case, &package_id);
         assert_eq!(
-            entries[0].pointer("/PackageStatus"),
+            entry.pointer("/PackageStatus"),
             Some(&json!("AVAILABLE")),
             "case {case:?}: the copy is due, so the package must be AVAILABLE, got {:?}",
-            entries[0].pointer("/PackageStatus")
+            entry.pointer("/PackageStatus")
         );
         assert_eq!(
-            entries[0].pointer("/AvailablePackageVersion"),
+            entry.pointer("/AvailablePackageVersion"),
             Some(&json!("v1")),
             "case {case:?}: an available package reports its first version, got {:?}",
-            entries[0].pointer("/AvailablePackageVersion")
+            entry.pointer("/AvailablePackageVersion")
         );
     }
 }
@@ -369,17 +410,21 @@ async fn a_package_name_the_region_holds_cannot_be_created_again() {
     }
 
     let read = describe_packages(&router, &json!({})).await;
-    let entries = reported(&read, "after the refusals");
     assert_eq!(
-        entries.len(),
-        1,
-        "a refused duplicate must store nothing, got {entries:?}"
+        own_names(&read, "after the refusals", &["dict-taken"]),
+        vec!["dict-taken".to_string()],
+        "a refused duplicate must store nothing, got {}",
+        read.body
+    );
+    let entry = entry_for(
+        &read,
+        "after the refusals",
+        &first.text("the first create", "/PackageDetails/PackageID"),
     );
     assert_eq!(
-        entries[0].pointer("/PackageID"),
-        first.body.pointer("/PackageDetails/PackageID"),
-        "the stored package must be the first one, got {:?}",
-        entries[0].pointer("/PackageID")
+        entry.pointer("/PackageName"),
+        Some(&json!("dict-taken")),
+        "the stored package must be the first one, got {entry:?}"
     );
 
     // The same name in another Region is another package: the name is unique
@@ -429,26 +474,20 @@ async fn a_describe_is_region_scoped_and_filters_by_the_field_it_names() {
     .await;
 
     let here = describe_packages(&router, &json!({})).await;
-    let mut names: Vec<Value> = reported(&here, "the signed region")
-        .iter()
-        .map(|entry| entry.pointer("/PackageName").cloned().unwrap_or(Value::Null))
-        .collect();
-    names.sort_by_key(|name| name.to_string());
+    let created_names = ["dict-alpha", "dict-beta", "dict-elsewhere"];
     assert_eq!(
-        names,
-        vec![json!("dict-alpha"), json!("dict-beta")],
-        "a describe must report only the Region it was signed for, got {names:?}"
+        own_names(&here, "the signed region", &created_names),
+        vec!["dict-alpha".to_string(), "dict-beta".to_string()],
+        "a describe must report only the Region it was signed for, got {}",
+        here.body
     );
 
     let elsewhere = describe_packages_in(&router, "eu-west-1", &json!({})).await;
-    let there: Vec<Value> = reported(&elsewhere, "another region")
-        .iter()
-        .map(|entry| entry.pointer("/PackageName").cloned().unwrap_or(Value::Null))
-        .collect();
     assert_eq!(
-        there,
-        vec![json!("dict-elsewhere")],
-        "the other Region must report only its own package, got {there:?}"
+        own_names(&elsewhere, "another region", &created_names),
+        vec!["dict-elsewhere".to_string()],
+        "the other Region must report only its own package, got {}",
+        elsewhere.body
     );
 
     // Rows span the three fields the filter name enum declares, a filter
@@ -502,17 +541,9 @@ async fn a_describe_is_region_scoped_and_filters_by_the_field_it_names() {
             "case {case:?}: a filtered describe must answer 200, got {} {}",
             answer.status, answer.body
         );
-        let mut got: Vec<String> = reported(&answer, case)
-            .iter()
-            .map(|entry| {
-                entry
-                    .pointer("/PackageName")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string()
-            })
-            .collect();
-        got.sort();
+        // Restricted to the packages this case created: a status filter also
+        // selects published packages, which the catalogue suite asserts.
+        let got = own_names(&answer, case, &created_names);
         assert_eq!(
             got, expected,
             "case {case:?}: expected {expected:?}, got {got:?}"
@@ -540,9 +571,24 @@ async fn max_results_pages_the_set_and_next_token_resumes_it() {
     let whole = describe_packages(&router, &json!({})).await;
     let all: Vec<Value> = reported(&whole, "no page size");
     assert_eq!(
-        all.len(),
+        own_names(
+            &whole,
+            "no page size",
+            &[
+                "dict-page-0",
+                "dict-page-1",
+                "dict-page-2",
+                "dict-page-3",
+                "dict-page-4"
+            ]
+        )
+        .len(),
         5,
-        "a request naming no page size must report every package, got {all:?}"
+        "a request naming no page size must report every package of this account, got {all:?}"
+    );
+    assert!(
+        all.len() > 5,
+        "the answer must also carry the published catalogue, got {all:?}"
     );
     assert!(
         whole.missing("/NextToken"),
@@ -551,11 +597,14 @@ async fn max_results_pages_the_set_and_next_token_resumes_it() {
     );
 
     // Rows differ along the page size, including one past the set's own size.
-    for page_size in [1_usize, 2, 5, 7] {
+    for page_size in [1_usize, 2, 5, 7, all.len() + 2] {
         let case = format!("page size {page_size}");
         let mut walked: Vec<Value> = Vec::new();
         let mut token: Option<String> = None;
         let mut pages = 0;
+        // One page per page-size-worth of the set, plus the page that reports
+        // the set ended.
+        let most_pages = all.len().div_ceil(page_size) + 1;
         loop {
             let body = match &token {
                 Some(token) => json!({"MaxResults": page_size, "NextToken": token}),
@@ -576,7 +625,7 @@ async fn max_results_pages_the_set_and_next_token_resumes_it() {
             walked.extend(entries);
             pages += 1;
             assert!(
-                pages <= 6,
+                pages <= most_pages,
                 "case {case:?}: paging must terminate, walked {pages} pages"
             );
             token = page

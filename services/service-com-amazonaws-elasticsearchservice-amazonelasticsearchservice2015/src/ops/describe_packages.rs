@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribePackages
-//! Reports the packages this store holds for the Region the call was signed for:
-//! every answer is the stored record's own `PackageDetails`, filtered and paged.
-//! A read, so nothing here writes.
+//! Reports the packages VISIBLE in the Region the call was signed for — "all
+//! packages available to Amazon ES" (this operation's own documentation): the
+//! plugin packages the service publishes to every account plus the packages
+//! this account created there. Every answer is that package's own
+//! `PackageDetails`, filtered and paged. A read, so nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -191,11 +193,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let filters = compile_filters(input.filters.unwrap_or_default())?;
 
         let store = state.lock();
-        // Order-stable, because the store is keyed by package id: the same
-        // request reports the same order twice, which is what lets a token name
-        // a place in the set.
-        let matching: Vec<&Package> = store
-            .packages_in(&region)
+        // Order-stable, because the visible set is ordered by package id: the
+        // same request reports the same order twice, which is what lets a token
+        // name a place in the set.
+        let matching: Vec<Package> = store
+            .visible_packages(&region)
+            .into_iter()
             .filter(|package| matches_every_filter(package, &filters, now))
             .collect();
 
