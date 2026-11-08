@@ -160,9 +160,10 @@ async fn an_extended_statistics_element_that_is_no_percentile_is_refused_as_unsu
     let at = recent();
 
     // The rows differ along which name the percentile-only member cannot serve — each of the
-    // five declared basic statistics, and a name that is no statistic at all — and along where
-    // in the list it sits: first, second, and the tenth element of a list at that member's
-    // documented maximum.
+    // five declared basic statistics, a statistic over a span of the window's distribution
+    // (which belongs to the members that take any CloudWatch statistic, not to this one), and a
+    // name that is no statistic at all — and along where in the list it sits: first, second, and
+    // the tenth element of a list at that member's documented maximum.
     let mut rows: Vec<(&str, Vec<&str>, usize, &str)> = STATISTIC_VALUES
         .iter()
         .map(|name| ("a declared basic statistic alone", vec![*name], 1, *name))
@@ -186,6 +187,30 @@ async fn an_extended_statistics_element_that_is_no_percentile_is_refused_as_unsu
         vec!["Median"],
         1,
         "Median",
+    ));
+    // "The percentile statistics. Specify values between p0.0 and p100."
+    // (`smithy_query(query="doc",shape="GetMetricStatisticsInput",member="ExtendedStatistics")`)
+    // — a statistic over a span of the window's distribution is not a percentile, in either of
+    // the forms the definitions page writes one in, and nor is a percentile spelled with the
+    // wrong case.
+    rows.push((
+        "a bounded-family statistic under its bare form",
+        vec!["tm90"],
+        1,
+        "tm90",
+    ));
+    rows.push((
+        "a bounded-family statistic under its span form",
+        vec!["p99", "TM(10%:90%)"],
+        2,
+        "TM(10%:90%)",
+    ));
+    rows.push(("the interquartile mean", vec!["IQM"], 1, "IQM"));
+    rows.push((
+        "a percentile spelled with an upper-case prefix",
+        vec!["P90"],
+        1,
+        "P90",
     ));
 
     for (case, extended, position, offending) in rows {
@@ -270,10 +295,10 @@ async fn each_member_still_serves_the_statistic_names_that_belong_on_it() {
         );
     }
 
-    // And every percentile-family name is served on `ExtendedStatistics`, under the name the
-    // request spelled, with no basic statistic beside it. The rows span the percentile bounds
-    // and both bounded-family forms (`tm90`, and the interquartile mean under its own name).
-    for name in ["p0", "p50", "p90", "p100", "tm90", "IQM"] {
+    // And every percentile is served on `ExtendedStatistics`, under the name the request
+    // spelled, with no basic statistic beside it. The rows span the percentile bounds and a
+    // fractional percentile between them.
+    for name in ["p0", "p50", "p90", "p99.9", "p100"] {
         let body = ok(
             &router,
             "GetMetricStatistics",

@@ -213,7 +213,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Use the token returned by the previous operation to request the next page of
         // results." (`DescribeAnomalyDetectorsInput$NextToken`) — a token this service did not
         // issue is the `InvalidNextToken` this operation models.
-        let start_at = match input.next_token.as_deref() {
+        let start_at = match crate::state::requested_page(input.next_token.as_deref()) {
             None => None,
             Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
                 DescribeAnomalyDetectorsErrorModeled::InvalidNextToken(InvalidNextToken {

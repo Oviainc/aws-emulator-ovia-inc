@@ -577,12 +577,13 @@ async fn a_value_outside_a_modelled_enum_is_refused_with_this_services_validatio
     // Each row is an operation member modelled as an ENUM, with a value the type does not
     // declare: `PutMetricStreamInput$OutputFormat` (json | opentelemetry0.7 |
     // opentelemetry1.0), `GetMetricDataInput$ScanBy` and `DescribeAlarmHistoryInput$ScanBy`
-    // (TimestampDescending | TimestampAscending), `DescribeAlarmHistoryInput$HistoryItemType`,
-    // `ListMetricsInput$RecentlyActive` (PT3H) and `SetAlarmStateInput$StateValue` (OK | ALARM
-    // | INSUFFICIENT_DATA) — the enumerated types the model declares
+    // (TimestampDescending | TimestampAscending), `DescribeAlarmHistoryInput$HistoryItemType`
+    // and `SetAlarmStateInput$StateValue` (OK | ALARM | INSUFFICIENT_DATA) — the enumerated
+    // types the model declares
     // (`smithy_query(query="shape",shape="MetricStreamOutputFormat,ScanBy,HistoryItemType,\
     // RecentlyActive,StateValue")`). The member path the refusal names is the walk's own
-    // lowerCamel spelling of the member.
+    // lowerCamel spelling of the member. `ListMetricsInput$RecentlyActive` is the one such
+    // member refused as a parameter VALUE instead, below.
     let cases: Vec<(&str, &str, Value, &str, &str)> = vec![
         (
             "a metric stream's output format",
@@ -627,13 +628,6 @@ async fn a_value_outside_a_modelled_enum_is_refused_with_this_services_validatio
             json!({"HistoryItemType": "Nonsense"}),
             "historyItemType",
             "Nonsense",
-        ),
-        (
-            "the recency filter of a metric listing",
-            "ListMetrics",
-            json!({"RecentlyActive": "PT4H"}),
-            "recentlyActive",
-            "PT4H",
         ),
         (
             "the state an alarm is forced into",
@@ -686,4 +680,35 @@ async fn a_value_outside_a_modelled_enum_is_refused_with_this_services_validatio
             "case {format:?}: a declared output format must be accepted, got {created}"
         );
     }
+
+    // The metric LISTING is the one reader that judges such a filter as a parameter VALUE
+    // instead: the only client error its model declares is the parameter-value fault
+    // (`smithy_query(query="operation",operation="ListMetrics")`), and the sentence is fixed
+    // apart from the parameter, named as the wire spells it. The rows differ along the value
+    // offered for the one window the type declares.
+    for offered in ["PT4H", "pt3h", "PT3M", ""] {
+        let (status, body) = call(
+            &router,
+            "ListMetrics",
+            &json!({"RecentlyActive": offered}),
+        )
+        .await;
+        assert_eq!(
+            (status, error_code(&body).as_str()),
+            (400, "InvalidParameterValueException"),
+            "case {offered:?}: expected the listing's parameter-value fault, got {status} {body}"
+        );
+        assert_eq!(
+            error_message(&body),
+            "Request parameter recentlyActive value is invalid",
+            "case {offered:?}: expected the listing's fixed sentence, got {body}"
+        );
+    }
+
+    // And the one window the type DOES declare is applied rather than refused.
+    let listed = ok(&router, "ListMetrics", &json!({"RecentlyActive": "PT3H"})).await;
+    assert!(
+        listed.get("Metrics").and_then(Value::as_array).is_some(),
+        "the declared recency window must be applied, got {listed}"
+    );
 }

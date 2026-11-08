@@ -419,6 +419,8 @@ const MAX_FILTER_NAMES: usize = 1_000;
 fn validate_filters(
     input: &PutMetricStreamInput,
 ) -> Result<(Filters, Filters), PutMetricStreamError> {
+    validate_filter_namespaces(input.include_filters.as_deref(), "IncludeFilters")?;
+    validate_filter_namespaces(input.exclude_filters.as_deref(), "ExcludeFilters")?;
     let include = filters_given(input.include_filters.as_deref());
     let exclude = filters_given(input.exclude_filters.as_deref());
     if include.is_some() && exclude.is_some() {
@@ -435,6 +437,35 @@ fn validate_filters(
     validate_filter_names(exclude.as_deref(), "ExcludeFilters")?;
     Ok((include, exclude))
 }
+
+/// Refuse a filter that names NO namespace.
+///
+/// "The name of the metric namespace in the filter." (`MetricStreamFilter$Namespace`) — a filter
+/// selects the namespace it names, so one carrying no namespace selects nothing and could never
+/// include or exclude a metric: the member is the whole content of a filter and has to be
+/// present. The model leaves it optional, so no boundary validator refuses a filter without one;
+/// CloudWatch refuses it as the value fault it is, naming the member path the null arrived on
+/// ([`crate::state::member_must_not_be_null_message`]) — the element's own position inside the
+/// list it was submitted in, so a client repairing the request knows WHICH filter is empty.
+fn validate_filter_namespaces(
+    filters: Option<&[MetricStreamFilter]>,
+    member: &str,
+) -> Result<(), PutMetricStreamError> {
+    for (position, filter) in filters.unwrap_or_default().iter().enumerate() {
+        if filter.namespace.is_none() {
+            return Err(invalid_parameter_value(
+                crate::state::member_must_not_be_null_message(&crate::state::element_member_path(
+                    member, position, NAMESPACE_MEMBER,
+                )),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The member of one filter such a refusal names, as the model declares it
+/// (`MetricStreamFilter$Namespace`).
+const NAMESPACE_MEMBER: &str = "Namespace";
 
 /// Refuse a filter list naming more than [`MAX_FILTER_NAMES`] names in total — the sum, over
 /// the list's filters, of the namespace names and the metric names they carry.
@@ -604,13 +635,15 @@ mod tests {
 
     #[test]
     fn percentile_statistics_are_recognised_by_form() {
-        for statistic in ["p0", "p90", "p99.9", "p100", "P95"] {
+        for statistic in ["p0", "p90", "p99.9", "p100"] {
             assert!(
                 crate::state::parse_percentile(statistic).is_some(),
                 "case {statistic:?}: expected a percentile, got None"
             );
         }
-        for statistic in ["p101", "p", "pp9", "Average", "tm98", "p1e2", "p+9"] {
+        // The form is spelled with a lower-case `p`: a name differing only in that case is no
+        // percentile.
+        for statistic in ["p101", "p", "pp9", "P95", "P0.0", "Average", "tm98", "p1e2", "p+9"] {
             assert!(
                 crate::state::parse_percentile(statistic).is_none(),
                 "case {statistic:?}: expected no percentile, got {:?}",
@@ -683,7 +716,9 @@ mod tests {
                 "case {statistic:?}: expected a supported statistic, got unsupported"
             );
         }
-        for statistic in ["Median", "tm", "tm110", "TM(:)", "PR(300)", "PR(a:b)", ""] {
+        for statistic in [
+            "Median", "tm", "tm110", "TM(:)", "PR(300)", "PR(a:b)", "", "average", "P99", "iqm",
+        ] {
             assert!(
                 !crate::state::is_cloudwatch_statistic(statistic),
                 "case {statistic:?}: expected an unsupported statistic, got supported"

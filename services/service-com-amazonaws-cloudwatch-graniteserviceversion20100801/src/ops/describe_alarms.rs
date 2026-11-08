@@ -211,7 +211,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `NextToken` is refused on EVERY path, including the relationship paths below,
         // so whether a bogus token is rejected never depends on which filter was used.
-        let start_at = match input.next_token.as_deref() {
+        let start_at = match crate::state::requested_page(input.next_token.as_deref()) {
             None => None,
             Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
                 DescribeAlarmsErrorModeled::InvalidNextToken(InvalidNextToken {

@@ -481,12 +481,20 @@ fn retrieving_query(id: &str, instance: &str) -> Value {
     })
 }
 
-/// The work ONE query array may ask for is bounded before any of it is done, and the bound is
-/// the product of its factors: how many queries the array carries, how wide the range is and
-/// how narrow each query's `Period` is. Rows differ in which factor crosses the bound — the
-/// query count, the range alone, and the product of a range and a query count that each stay
-/// inside it — and the last two rows are inside every bound, so the table is the bound rather
-/// than a blanket refusal.
+/// The same query, with its data RETURNED — so the result it contributes carries the page's
+/// `StatusCode`.
+fn returning_query(id: &str, instance: &str) -> Value {
+    let mut query = retrieving_query(id, instance);
+    query["ReturnData"] = json!(true);
+    query
+}
+
+/// The work ONE query array may ask for is bounded before any of it is done: an array carrying
+/// more queries than one call may include is refused outright. A wide RANGE is not refused —
+/// a range and a period that together span more datapoints than one page carries are answered
+/// one slice of the range at a time — so the rows below are the bound on the array itself,
+/// and the blocks after them are the two answers a legal request gets: paged when the range
+/// asks for more than one page, whole when it does not.
 #[tokio::test]
 async fn an_array_asking_for_more_work_than_one_resolution_does_is_refused() {
     let router = build_router();
@@ -515,36 +523,16 @@ async fn an_array_asking_for_more_work_than_one_resolution_does_is_refused() {
 
     // (case, the queries, the range in seconds back from the current window, the words the
     // refusal must carry)
-    let refused: Vec<(&str, Value, f64, &str)> = vec![
-        (
-            "more queries than one call may include",
-            Value::Array(
-                (0..501)
-                    .map(|index| retrieving_query(&format!("m{index}"), "bounds"))
-                    .collect(),
-            ),
-            3.0 * period,
-            "one call can include up to 500",
+    let refused: Vec<(&str, Value, f64, &str)> = vec![(
+        "more queries than one call may include",
+        Value::Array(
+            (0..501)
+                .map(|index| retrieving_query(&format!("m{index}"), "bounds"))
+                .collect(),
         ),
-        (
-            "one query over a range of a thousand days at a one-minute period",
-            json!([retrieving_query("m1", "bounds")]),
-            1_000.0 * DAY,
-            "which exceeds the limit of 100800",
-        ),
-        (
-            // Neither factor crosses the bound on its own: five queries, and a range of
-            // 30,000 one-minute windows each. Their PRODUCT does.
-            "five queries each asking for a third of the datapoints one call may request",
-            Value::Array(
-                (0..5)
-                    .map(|index| retrieving_query(&format!("m{index}"), "bounds"))
-                    .collect(),
-            ),
-            30_000.0 * period,
-            "which exceeds the limit of 100800",
-        ),
-    ];
+        3.0 * period,
+        "one call can include up to 500",
+    )];
     for (case, queries, span, says) in refused {
         let (status, body) = call(
             &router,
@@ -573,9 +561,63 @@ async fn an_array_asking_for_more_work_than_one_resolution_does_is_refused() {
         );
     }
 
-    // A range and a period that ask for no more than the limit are answered, however sparse
-    // the series behind them is: the bound is on what the request ASKS FOR, and this one asks
-    // for exactly the datapoints one call may request.
+    // A range that asks for more datapoints than one page carries is answered, not refused:
+    // the page covers the slice of the range that fits, reports it as partial and hands back a
+    // token. Rows differ in which factor makes the request exceed one page — the range alone,
+    // and the product of a range and a query count that each stay inside it.
+    let paged: Vec<(&str, Value, f64)> = vec![
+        (
+            "one query over a range of a thousand days at a one-minute period",
+            json!([returning_query("m1", "bounds")]),
+            1_000.0 * DAY,
+        ),
+        (
+            // Neither factor crosses one page on its own: five queries, and a range of
+            // 30,000 one-minute windows each. Their PRODUCT does.
+            "five queries each asking for a third of the datapoints one page carries",
+            Value::Array(
+                (0..5)
+                    .map(|index| returning_query(&format!("m{index}"), "bounds"))
+                    .collect(),
+            ),
+            30_000.0 * period,
+        ),
+    ];
+    for (case, queries, span) in paged {
+        let body = ok(
+            &router,
+            "GetMetricData",
+            &json!({
+                "MetricDataQueries": queries,
+                "StartTime": window - span,
+                "EndTime": window + period,
+            }),
+        )
+        .await;
+        assert!(
+            body.get("NextToken").and_then(Value::as_str).is_some(),
+            "case {case:?}: a range wider than one page must hand back a token, got {body}"
+        );
+        let status = body
+            .get("MetricDataResults")
+            .and_then(Value::as_array)
+            .and_then(|results| results.first().cloned())
+            .and_then(|result| {
+                result
+                    .get("StatusCode")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            });
+        assert_eq!(
+            status.as_deref(),
+            Some("PartialData"),
+            "case {case:?}: every result of a cut page is partial, got {body}"
+        );
+    }
+
+    // A range and a period that ask for no more than one page are answered whole, however
+    // sparse the series behind them is: what decides the page is what the request ASKS FOR, and
+    // this one asks for exactly the datapoints one page carries.
     let inside = ok(
         &router,
         "GetMetricData",
@@ -604,6 +646,10 @@ async fn an_array_asking_for_more_work_than_one_resolution_does_is_refused() {
             .and_then(Value::as_array)
             .is_some_and(|results| results.len() == 1),
         "a request asking for exactly the datapoint limit must be answered, got {inside}"
+    );
+    assert!(
+        inside.get("NextToken").and_then(Value::as_str).is_none(),
+        "a request inside one page mints no token, got {inside}"
     );
 
     // A long but bounded CHAIN of expressions, each reading the one before it: the ordering

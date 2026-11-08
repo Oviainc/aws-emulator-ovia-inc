@@ -168,7 +168,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 Arc::clone(&engine),
                 JudgingTheValuesThisServiceEnforces::new(
                     crate::ops::list_metrics::ListMetrics::new(Arc::clone(&engine)),
-                    the_service_wide_refusal,
+                    listing_value_fault,
                 ),
             ))) as Box<dyn ErasedOperation>,
         );
@@ -264,6 +264,7 @@ fn parameter_fault(refusal: &Refusal) -> Option<Refused> {
         .iter()
         .find_map(dimension_cap_refusal)
         .or_else(|| violations.iter().find_map(empty_required_value_refusal))
+        .or_else(|| violations.iter().find_map(omitted_required_member_refusal))
         .or_else(|| violations.iter().find_map(list_element_enum_refusal))
         .or_else(|| scalar_enum_refusal(violations))
 }
@@ -296,6 +297,52 @@ fn empty_required_value_refusal(
         message: crate::state::parameter_required_message(&crate::state::query_parameter_path(
             &violation.path,
         )),
+    })
+}
+
+/// The refusal of a required member the request did not supply AT ALL, or `None` when
+/// `violation` is not one.
+///
+/// The same class and the same sentence as a required member supplied EMPTY
+/// ([`empty_required_value_refusal`]): CloudWatch answers the missing-parameter fault naming the
+/// request member path the value was looked for at, and a member the request left out and one it
+/// carried with no characters are both parameters it supplied no value for. Keyed on the CLASS of
+/// violation alone, so it holds for every required member of every operation whose refusals this
+/// service words, at any depth — the `Name` of a dimension FILTER a metric listing is narrowed
+/// by is the recorded case.
+fn omitted_required_member_refusal(
+    violation: &aws_smithy_schema_server::Violation,
+) -> Option<Refused> {
+    let aws_smithy_schema_server::ViolationKind::MissingRequiredMember = violation.kind else {
+        return None;
+    };
+    Some(Refused {
+        code: MISSING_PARAMETER.shape_name.to_string(),
+        message: crate::state::parameter_required_message(&crate::state::query_parameter_path(
+            &violation.path,
+        )),
+    })
+}
+
+/// The refusal policy of the metric LISTING: a filter value outside the enumerated type its
+/// member names, in the fixed sentence CloudWatch refuses one with, and nothing else — every
+/// other class keeps the service-wide wording behind it ([`the_service_wide_wording`]).
+///
+/// The listing's filters are judged as VALUES rather than as the shape of the request: a window
+/// to filter recent activity by that this service does not offer is a parameter value it cannot
+/// use ([`crate::state::request_parameter_invalid_message`], the parameter named as the wire
+/// spells it), under the parameter-value fault the operation's model declares — which is the
+/// only client error it declares at all
+/// (`smithy_query(query="operation",operation="ListMetrics")`).
+fn listing_value_fault(violations: &[aws_smithy_schema_server::Violation]) -> Option<Refused> {
+    violations.iter().find_map(|violation| {
+        let aws_smithy_schema_server::ViolationKind::EnumValue(_) = violation.kind else {
+            return None;
+        };
+        Some(Refused {
+            code: PARAMETER_VALUE.shape_name.to_string(),
+            message: crate::state::request_parameter_invalid_message(&violation.path),
+        })
     })
 }
 
@@ -530,12 +577,14 @@ fn parameter_fault_for(violations: &[aws_smithy_schema_server::Violation]) -> Op
         .iter()
         .find_map(dimension_cap_refusal)
         .or_else(|| violations.iter().find_map(empty_required_value_refusal))
+        .or_else(|| violations.iter().find_map(omitted_required_member_refusal))
         .or_else(|| violations.iter().find_map(enum_value_refusal))
 }
 
 /// Whether `violation` broke a constraint this service does NOT enforce on the wire.
 ///
-/// Two such members, both of them values the service reads rather than values it refuses:
+/// Three such members, all of them values the service reads or applies rather than values it
+/// refuses:
 ///
 /// * a metric NAMESPACE: `Namespace` is modelled `@pattern "^[^:]"`, and the service accepts a
 ///   namespace whatever character it begins with — the only namespace space it refuses a
@@ -550,18 +599,47 @@ fn parameter_fault_for(violations: &[aws_smithy_schema_server::Violation]) -> Op
 ///   `Failures`, per entry, on the HTTP 200 ("If the operation could not process one of the
 ///   rules, the following data is returned for each of those rules.", `PartialFailure`), which
 ///   is what keeps the other entries of the same batch enabled.
+/// * a DIMENSION FILTER list longer than that member's own modelled maximum
+///   ([`is_applicable_dimension_filter`]): what bounds a dimension collection of this service is
+///   the per-metric dimension maximum, so a filter list inside it names dimensions a metric can
+///   actually carry and is APPLIED — a listing filtered by more of them simply matches fewer
+///   metrics, and the recorded answer to one is an empty listing rather than a refusal.
 ///
 /// Each is keyed on the member and the CLASS of violation alone — a pattern broken by the
 /// namespace of a METRIC ([`is_metric_namespace`]) or by the template name of a MANAGED RULE
-/// ([`is_managed_rule_template_name`]) — so each holds wherever that member is submitted: for
+/// ([`is_managed_rule_template_name`]), a maximum broken by a dimension COLLECTION
+/// ([`is_dimension_collection`]) — so each holds wherever that member is submitted: for
 /// the namespace, inside a `MetricDataQuery` as well as at the top of a publish; for the
 /// template name, at any position of the `ManagedRules` array.
 fn is_unenforced_constraint(violation: &aws_smithy_schema_server::Violation) -> bool {
-    matches!(
+    (matches!(
         violation.kind,
         aws_smithy_schema_server::ViolationKind::Pattern(_)
     ) && (is_metric_namespace(&violation.path)
-        || is_managed_rule_template_name(&violation.path))
+        || is_managed_rule_template_name(&violation.path)))
+        || is_applicable_dimension_filter(violation)
+}
+
+/// Whether `violation` is a dimension collection longer than the maximum its own member
+/// declares, but no longer than the dimensions one metric can carry
+/// ([`crate::state::MAX_METRIC_DIMENSIONS`]) — a filter this service can still apply.
+///
+/// `ListMetricsInput$Dimensions` is modelled `length 0..10` while a metric's dimension set holds
+/// up to thirty, so a listing may legitimately be narrowed by more filters than that member's
+/// own maximum admits: the collection the service refuses is one bigger than any metric could
+/// match, which [`dimension_cap_refusal`] states against the cap it broke.
+fn is_applicable_dimension_filter(violation: &aws_smithy_schema_server::Violation) -> bool {
+    let aws_smithy_schema_server::ViolationKind::MaxLength(_) = violation.kind else {
+        return false;
+    };
+    if !is_dimension_collection(&violation.path) {
+        return false;
+    }
+    violation
+        .value
+        .as_deref()
+        .and_then(service_common::validation_message::list_item_count)
+        .is_some_and(|submitted| submitted <= crate::state::MAX_METRIC_DIMENSIONS)
 }
 
 /// Whether `path` points at the `TemplateName` of a `ManagedRule` entry — at any position of

@@ -187,7 +187,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A `NextToken` this service did not mint is refused before anything is read, so a
         // bogus token never silently answers the first page.
-        let start_at = match input.next_token.as_deref() {
+        let start_at = match crate::state::requested_page(input.next_token.as_deref()) {
             None => None,
             Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
                 DescribeAlarmHistoryErrorModeled::InvalidNextToken(InvalidNextToken {

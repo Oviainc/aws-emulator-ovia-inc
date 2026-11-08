@@ -123,10 +123,12 @@ fn too_many_points() -> QueryRefusal {
 /// Checked BEFORE the first fold, because every factor of that work is the caller's: how many
 /// queries the array carries, how wide the range is, and how narrow each retrieving query's
 /// `Period` is. Each of those queries asks for one datapoint per `Period` of the range, which
-/// is what CloudWatch calls the datapoints the request HAS REQUESTED — it answers for them up
-/// to the published total ("a total of as many as 100,800 data points", `GetMetricData`) and
-/// refuses past it, naming how many were asked for and the two ways to ask for fewer, rather
-/// than materialising them and then trimming to the page the caller reads.
+/// is what CloudWatch calls the datapoints the request HAS REQUESTED — an operation that
+/// answers for them up to the published total ("a total of as many as 100,800 data points",
+/// `GetMetricData`) and refuses past it is refused here, naming how many were asked for and the
+/// two ways to ask for fewer, rather than materialising them and then trimming to the page the
+/// caller reads. An operation that PAGES the range instead counts the same datapoints
+/// ([`requested_datapoints`]) and slices rather than refusing.
 #[must_use]
 pub fn resolution_refusal(
     queries: &[MetricDataQuery],
@@ -136,19 +138,7 @@ pub fn resolution_refusal(
     if queries.len() > MAX_RESOLVED_QUERIES {
         return Some(too_many_queries(queries.len()));
     }
-    let span = (end - start).max(0.0);
-    let mut requested = 0usize;
-    for query in queries {
-        // A query that retrieves no metric requests no datapoint: an expression's own series is
-        // computed from the values of the queries it reads, bounded by the evaluator's budget.
-        if query.metric_stat.is_none() {
-            continue;
-        }
-        let period = query_period(query).max(1.0);
-        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-        let asked = (span / period).ceil().min(f64::from(u32::MAX)) as usize;
-        requested = requested.saturating_add(asked);
-    }
+    let requested = requested_datapoints(queries, start, end);
     if requested > MAX_RETRIEVED_POINTS {
         return Some(QueryRefusal::InvalidCombination(format!(
             "You have requested up to {requested} datapoints, which exceeds the limit of \
@@ -157,6 +147,27 @@ pub fn resolution_refusal(
         )));
     }
     None
+}
+
+/// How many datapoints an array asks for over `[start, end)`: one per `Period` of the range for
+/// each query that RETRIEVES a metric, summed over those queries.
+///
+/// A query that retrieves no metric requests no datapoint: an expression's own series is
+/// computed from the values of the queries it reads, bounded by the evaluator's budget.
+#[must_use]
+pub fn requested_datapoints(queries: &[MetricDataQuery], start: f64, end: f64) -> usize {
+    let span = (end - start).max(0.0);
+    let mut requested = 0usize;
+    for query in queries {
+        if query.metric_stat.is_none() {
+            continue;
+        }
+        let period = query_period(query).max(1.0);
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let asked = (span / period).ceil().min(f64::from(u32::MAX)) as usize;
+        requested = requested.saturating_add(asked);
+    }
+    requested
 }
 
 /// The granularity ONE query is folded at: its own `Period`, else the `Period` of the

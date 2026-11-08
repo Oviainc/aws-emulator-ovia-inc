@@ -181,7 +181,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // metrics that have had data points published in the past three hours".
         const RECENTLY_ACTIVE_WINDOW_SECS: f64 = 3.0 * 60.0 * 60.0;
 
-        let start_at = match input.next_token.as_deref() {
+        // "The token returned by a previous call to indicate that there is more data available."
+        // (`ListMetricsInput$NextToken`) — a token this service did not mint names no page of
+        // this enumeration and is refused; an EMPTY one is no token at all and asks for the
+        // first page, by the one rule every paginated read of this service reads a token under
+        // ([`crate::state::requested_page`]).
+        let start_at = match crate::state::requested_page(input.next_token.as_deref()) {
             None => None,
             Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
                 ListMetricsErrorModeled::InvalidParameterValueException(

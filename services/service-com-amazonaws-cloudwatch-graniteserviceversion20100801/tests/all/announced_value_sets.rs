@@ -228,9 +228,12 @@ async fn a_value_outside_a_set_is_refused_with_that_set_as_the_service_announces
         });
     }
 
-    // The readable granularities, announced inside bare brackets: either side of a published
-    // sub-minute value, and either side of a minute.
-    for period in [2, 7, 59, 61] {
+    // The readable granularities, announced inside bare brackets: the SUB-MINUTE set is what a
+    // period shorter than a minute had to come from, so the rows are either side of a published
+    // sub-minute value and one just under a minute. A period OVER a minute had to be a whole
+    // number of minutes instead, and is refused against that requirement rather than against a
+    // set (`crate::period_refusal_message` tables both halves).
+    for period in [2, 7, 59] {
         rows.push(Row {
             case: "a period outside the granularities a metric is readable at",
             operation: "GetMetricStatistics",

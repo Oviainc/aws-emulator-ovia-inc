@@ -1109,7 +1109,9 @@ async fn every_defined_statistic_is_computed_from_the_windows_distribution() {
         );
     }
 
-    // A name no statistic family produces is refused as the bad value it is.
+    // A name no statistic family produces is refused as the SHAPE of the request it is: the
+    // member path is named and nothing of the value is echoed
+    // (`crate::statistic_name_refusals` tables that rule).
     for stat in ["Median", "p101", "tm110", "TM(:)", "PR(300)", "average!"] {
         let (status, body) = call(
             &router,
@@ -1127,8 +1129,8 @@ async fn every_defined_statistic_is_computed_from_the_windows_distribution() {
         );
         assert_eq!(
             error_code(&body),
-            "InvalidParameterValueException",
-            "case stat {stat}: expected InvalidParameterValueException, got {body}"
+            "ValidationException",
+            "case stat {stat}: expected ValidationException, got {body}"
         );
     }
 

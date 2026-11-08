@@ -154,6 +154,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // "To filter the results, specify a statistic, period, or unit." — a statistic, singular:
+        // `Statistic` names one of the basic five and `ExtendedStatistic` a percentile
+        // (`DescribeAlarmsForMetricInput$Statistic`, `$ExtendedStatistic`), and an alarm is
+        // configured with one or the other, so a request carrying BOTH asks to filter on two
+        // statistics at once and names no single one to match. The model cannot express a rule
+        // between two members, so it is judged here — BEFORE anything is read, and in the one
+        // sentence this service states that pair in ([`crate::state::both_statistics_message`]).
+        if input.statistic.is_some() && input.extended_statistic.is_some() {
+            return Err(DescribeAlarmsForMetricError::validation_error(
+                crate::state::both_statistics_message(
+                    Self::NAME,
+                    crate::state::AT_MOST_ONE_STATISTIC,
+                ),
+            ));
+        }
+
         // An alarm's state is EVALUATED from the datapoints the metric store holds, and each
         // evaluation is due a span after the write that configured it. This read reports an
         // alarm, so it materialises what the clock has already made due — and executes the

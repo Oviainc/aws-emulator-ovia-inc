@@ -195,7 +195,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Include this value to get the next set of rules if the value was returned by the
         // previous operation." (`ListManagedInsightRulesInput$NextToken`) — a token this
         // service did not issue is the `InvalidNextToken` this operation models.
-        let start_at = match input.next_token.as_deref() {
+        let start_at = match crate::state::requested_page(input.next_token.as_deref()) {
             None => None,
             Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
                 ListManagedInsightRulesErrorModeled::InvalidNextToken(InvalidNextToken {

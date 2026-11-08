@@ -15,7 +15,12 @@
 //! service cannot evaluate — one that is malformed, refers to an id the request does not
 //! define, calls a function nothing here computes, or combines kinds of value a call does not
 //! take — is REFUSED in CloudWatch's own words rather than answered with a series nothing
-//! computed. A `Stat` outside the statistic grammar is a bad parameter value.
+//! computed. A `Stat` outside the statistic grammar is not a statistic at all, so the request
+//! is refused for its SHAPE, naming the query it arrived on.
+//!
+//! A range and a granularity that together span more datapoints than one page carries are NOT
+//! refused: the request is answered one slice of its range at a time, each page reporting its
+//! results `PartialData` and handing back the token the next slice resumes at.
 //!
 //! ## Shape of an operation
 //!
@@ -303,6 +308,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 _ => {}
             }
+            // "The statistic to return. It can include any CloudWatch statistic or extended
+            // statistic." (`MetricStat$Stat`) — an unconstrained string in the model, so no
+            // boundary validator refuses a name outside the statistic grammar
+            // ([`crate::state::is_cloudwatch_statistic`]) before a handler runs. A name that is
+            // no statistic of that grammar is the SHAPE of the request, so it is refused in the
+            // request-validation class naming the member path the name arrived on, and nothing
+            // of this request is read or folded first.
+            if let Some(stat) = query.metric_stat.as_ref() {
+                if !crate::state::is_cloudwatch_statistic(&stat.stat) {
+                    return Err(GetMetricDataError::validation_error(
+                        crate::state::not_a_valid_statistic_message(&format!(
+                            "{path}.MetricStat.Stat"
+                        )),
+                    ));
+                }
+            }
         }
 
         // "The order in which data points should be returned" — "If you omit this parameter,
@@ -331,42 +352,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "Include this value, if it was returned by the previous GetMetricData operation, to
-        // get the next set of data points": the cursor this operation mints carries how many
-        // of THIS request's data points the earlier pages already returned, together with the
-        // identity of the request it was minted for — so anything else is not a token this
+        // get the next set of data points": the cursor this operation mints carries WHERE in
+        // this request the earlier pages stopped — how much of the requested range they covered
+        // and how many datapoints of the current slice they returned — together with the
+        // identity of the request it was minted for, so anything else is not a token this
         // service handed out, and a token replayed against a different request is refused
         // rather than silently skipping or repeating datapoints.
         let identity = request_identity(&input);
-        let already_returned: usize = match input.next_token.as_deref() {
-            None => 0,
+        let resumed = match crate::state::requested_page(input.next_token.as_deref()) {
+            None => Position::default(),
             Some(token) => {
-                let (returned, minted_for) = decode_cursor(token).ok_or_else(invalid_next_token)?;
+                let (position, minted_for) = decode_cursor(token).ok_or_else(invalid_next_token)?;
                 if minted_for != identity {
                     return Err(invalid_next_token());
                 }
-                returned
+                position
             }
         };
+        let already_returned = resumed.returned;
 
         let requested_start = crate::state::from_timestamp(&input.start_time);
         let end = crate::state::from_timestamp(&input.end_time);
+        // Each instant is judged on its OWN before the requirement between the two, by the one
+        // span every read of this service reads inside
+        // ([`crate::state::instant_range_error`]).
+        for (parameter, instant) in [
+            (crate::state::START_TIME, requested_start),
+            (crate::state::END_TIME, end),
+        ] {
+            if let Some(message) = crate::state::instant_range_error(parameter, instant) {
+                return Err(invalid_value(message));
+            }
+        }
         if end <= requested_start {
-            return Err(invalid_value(format!(
-                "EndTime must be later than StartTime; got StartTime {requested_start} and \
-                 EndTime {end} (epoch seconds)"
-            )));
+            return Err(invalid_value(crate::state::range_order_message()));
         }
         let now = crate::state::now_secs();
-        // How much work this request's queries ask for is bounded BEFORE the first series is
-        // folded: the range, the granularity and the number of queries are all the caller's,
-        // and their product is the windows the fold would materialise — so an array asking for
-        // more than one call may retrieve is refused here rather than built and then trimmed to
-        // the page the caller reads.
-        if let Some(refused) =
-            crate::state::metric_query::resolution_refusal(&input.metric_data_queries, requested_start, end)
-        {
-            return Err(refusal(refused));
-        }
+        // How much of the requested range THIS page answers. A range and a granularity that
+        // together span more datapoints than one page carries is not a request this operation
+        // refuses — it is a request that takes several pages: the page covers as much of the
+        // range as fits, reports its results as partial and hands back a token that resumes at
+        // the slice boundary ([`page_slice`]).
+        let slice = page_slice(&input.metric_data_queries, requested_start, end, resumed.covered, descending);
 
         // Every query is resolved under its OWN short acquisition of the store, and the walk
         // yields between queries: one call can carry up to [`MAX_QUERIES`] of them, so neither
@@ -388,8 +415,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &store,
                     query,
                     stat,
-                    requested_start,
-                    end,
+                    slice.start,
+                    slice.end,
                     now,
                 )
             }
@@ -436,11 +463,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     tree,
                     &crate::state::metric_query::StoreSeriesSource {
                         store: &store,
-                        requested_start,
-                        end,
+                        requested_start: slice.start,
+                        end: slice.end,
                         now,
                     },
-                    (requested_start, end),
+                    (slice.start, slice.end),
                     period,
                 )
             }
@@ -451,7 +478,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        let answers = answers(&resolution, &input, requested_start).await?;
+        let answers = answers(&resolution, &input, slice.start).await?;
 
         // One datapoint budget is spent across every result, in query order, and the cursor
         // the response hands back is how many of them this and the earlier pages returned —
@@ -520,9 +547,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // PartialData means that an incomplete set of data points were returned. You can use
         // the NextToken value that was returned and repeat your request to get more data
         // points." — so the status is a property of the PAGE: a page that hands back a token
-        // reports every result as partial, and only the page that exhausts the request's
-        // datapoints reports them complete.
-        let status = if truncated {
+        // reports every result as partial, and only the page that returns the rest of the
+        // requested range reports them complete. Either half cuts a page short: the datapoint
+        // budget inside this slice, and the range still left beyond the slice — which is why a
+        // slice holding no datapoint at all is still partial when more of the range remains.
+        let next = if truncated {
+            Some(Position {
+                covered: resumed.covered,
+                returned: already_returned.saturating_add(returned),
+            })
+        } else if slice.more {
+            Some(Position {
+                covered: resumed.covered + (slice.end - slice.start),
+                returned: 0,
+            })
+        } else {
+            None
+        };
+        let status = if next.is_some() {
             STATUS_PARTIAL_DATA
         } else {
             STATUS_COMPLETE
@@ -533,11 +575,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         Ok(GetMetricDataOutput {
             metric_data_results: Some(results),
-            // "A token that marks the next batch of returned results", minted only when the
-            // budget cut the data short, and only for THIS request.
-            next_token: truncated.then(|| {
-                encode_cursor(already_returned.saturating_add(returned), &identity)
-            }),
+            // "A token that marks the next batch of returned results", minted only when this
+            // page left some of the request unanswered, and only for THIS request.
+            next_token: next.map(|position| encode_cursor(&position, &identity)),
             // "A message appears here only if it is related to the global GetMetricData
             // operation."
             messages: Some(Vec::new()),
@@ -655,13 +695,29 @@ fn request_identity(input: &GetMetricDataInput) -> String {
     ::hex::encode(<::sha2::Sha256 as ::sha2::Digest>::digest(identity.as_bytes()))
 }
 
-/// Encode the cursor the next page resumes from: how many datapoints this and the earlier
-/// pages returned, and the request it was minted for.
-fn encode_cursor(returned: usize, identity: &str) -> String {
+/// WHERE in a request the next page resumes: how much of the requested range the earlier pages
+/// already covered, and how many datapoints of the slice they returned out of it.
+///
+/// A page is cut short by either half, so a cursor has to carry both: the datapoint budget
+/// (`MaxDatapoints`) stops a page inside one slice of the range, and the slice itself stops it
+/// at the boundary of what one page may cover.
+#[derive(Debug, Default, Clone, Copy)]
+struct Position {
+    /// The seconds of the requested range the earlier pages covered, measured from the edge the
+    /// scan order starts at.
+    covered: f64,
+    /// How many datapoints of the CURRENT slice those pages already returned.
+    returned: usize,
+}
+
+/// Encode the cursor the next page resumes from: the position inside this request, and the
+/// request it was minted for.
+fn encode_cursor(position: &Position, identity: &str) -> String {
     crate::state::encode_page_token(
         &::serde_json::json!({
             "kind": CURSOR_KIND,
-            "returned": returned,
+            "covered": position.covered,
+            "returned": position.returned,
             "identity": identity,
         })
         .to_string(),
@@ -669,15 +725,116 @@ fn encode_cursor(returned: usize, identity: &str) -> String {
 }
 
 /// Decode a cursor [`encode_cursor`] produced; `None` for anything else.
-fn decode_cursor(token: &str) -> Option<(usize, String)> {
+fn decode_cursor(token: &str) -> Option<(Position, String)> {
     let decoded = crate::state::decode_page_token(token)?;
     let value: ::serde_json::Value = ::serde_json::from_str(&decoded).ok()?;
     if value.get("kind")?.as_str()? != CURSOR_KIND {
         return None;
     }
+    let covered = value.get("covered")?.as_f64()?;
+    if !covered.is_finite() || covered < 0.0 {
+        return None;
+    }
     let returned = usize::try_from(value.get("returned")?.as_u64()?).ok()?;
-    Some((returned, value.get("identity")?.as_str()?.to_string()))
+    let position = Position { covered, returned };
+    Some((position, value.get("identity")?.as_str()?.to_string()))
 }
+
+/// The slice of the requested range ONE page answers from, and whether any of the range is left
+/// beyond it.
+#[derive(Debug, Clone, Copy)]
+struct PageSlice {
+    /// The first instant this page covers.
+    start: f64,
+    /// The instant it stops before.
+    end: f64,
+    /// Whether the request's range extends past this slice in the scan direction, so a further
+    /// page has data to report.
+    more: bool,
+}
+
+/// The slice of `[requested_start, end)` this page answers, `covered` seconds into the scan.
+///
+/// "A GetMetricData operation that does not include a query can retrieve as many as 500
+/// different metrics in a single request, with a total of as many as 100,800 data points."
+/// (`GetMetricData`) — the datapoints a request asks for are its range over each retrieving
+/// query's `Period`, summed over those queries, and that total is what one page carries up to.
+/// A request asking for more is not refused: it is answered one slice of its range at a time,
+/// each slice narrow enough to span at most that many datapoints, which is what the
+/// continuation token of a partial page resumes. The slice grows from the edge the scan order
+/// starts at — the newest instant for `TimestampDescending`, the oldest for
+/// `TimestampAscending` — so the page a caller reads first is the one it asked for first.
+fn page_slice(
+    queries: &[MetricDataQuery],
+    requested_start: f64,
+    end: f64,
+    covered: f64,
+    descending: bool,
+) -> PageSlice {
+    let span = match page_span(queries, requested_start, end) {
+        None => {
+            return PageSlice {
+                start: requested_start,
+                end,
+                more: false,
+            }
+        }
+        Some(span) => span,
+    };
+    if descending {
+        let slice_end = (end - covered).max(requested_start);
+        let slice_start = (slice_end - span).max(requested_start);
+        PageSlice {
+            start: slice_start,
+            end: slice_end,
+            more: slice_start > requested_start,
+        }
+    } else {
+        let slice_start = (requested_start + covered).min(end);
+        let slice_end = (slice_start + span).min(end);
+        PageSlice {
+            start: slice_start,
+            end: slice_end,
+            more: slice_end < end,
+        }
+    }
+}
+
+/// How many SECONDS of a range one page may cover, or `None` when the whole range already fits
+/// in one page.
+///
+/// EVERY query of the array reports one datapoint per `Period` of the range — a retrieving query
+/// at its `MetricStat`'s granularity, an expression at its own ([`DEFAULT_EXPRESSION_PERIOD`]
+/// when it names none) — so the datapoints one second of the range asks for is the sum of the
+/// reciprocals of those periods, and the seconds one page covers is the page's datapoint total
+/// over that sum. Counting the expressions too is what bounds the series a page MATERIALISES
+/// rather than merely the datapoints it emits: an array of nothing but expressions constructs
+/// its series from the range and its own period, and would otherwise be answered over the whole
+/// range however wide the caller made it.
+///
+/// A period is at least one second and a request carries at most [`MAX_QUERIES`] queries, so the
+/// quotient is always at least one second: every page covers ground, and paging terminates.
+fn page_span(queries: &[MetricDataQuery], requested_start: f64, end: f64) -> Option<f64> {
+    let per_second: f64 = queries
+        .iter()
+        .map(|query| 1.0 / crate::state::metric_query::query_period(query).max(1.0))
+        .sum();
+    if per_second <= 0.0 || !per_second.is_finite() {
+        return None;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    let page = MAX_PAGE_DATAPOINTS as f64;
+    if (end - requested_start).max(0.0) * per_second <= page {
+        return None;
+    }
+    let seconds = (page / per_second).floor();
+    (seconds >= 1.0).then_some(seconds)
+}
+
+/// "a total of as many as 100,800 data points" (`GetMetricData`) — the datapoints of a request's
+/// range one page covers, which is also the default the caller's own `MaxDatapoints` takes
+/// ([`DEFAULT_MAX_DATAPOINTS`]).
+const MAX_PAGE_DATAPOINTS: usize = DEFAULT_MAX_DATAPOINTS;
 
 /// Refuse members that cannot be used together — "Parameters were used together that cannot
 /// be used together."

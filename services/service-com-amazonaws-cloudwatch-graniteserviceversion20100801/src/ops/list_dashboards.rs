@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The token returned by a previous call to indicate that there is more data
         // available." (`ListDashboardsInput$NextToken`) — a token this service did not issue
         // names no page, so it is a bad parameter value rather than an empty page.
-        let start_at = match input.next_token.as_deref() {
+        let start_at = match crate::state::requested_page(input.next_token.as_deref()) {
             None => None,
             Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
                 invalid_parameter_value(

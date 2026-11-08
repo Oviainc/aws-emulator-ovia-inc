@@ -471,6 +471,18 @@ fn configuration_refusal(input: &PutMetricAlarmInput) -> Option<String> {
             }
         }
     }
+    // "For an alarm based on a metric, you must specify either Statistic or ExtendedStatistic
+    // but not both." (`smithy_query(query="doc",shape="PutMetricAlarmInput",member="Statistic")`)
+    // — one statistic is what the alarm folds each of its windows by, so a request naming a basic
+    // statistic AND a percentile configures no single series to grade. Stated in the one sentence
+    // this service states that pair in ([`crate::state::both_statistics_message`]), closed the
+    // way an alarm WRITE is recorded closing it.
+    if input.statistic.is_some() && input.extended_statistic.is_some() {
+        return Some(crate::state::both_statistics_message(
+            ALARM_WRITE,
+            crate::state::ONLY_ONE_STATISTIC,
+        ));
+    }
     if let Some(period) = input.period {
         if !is_alarm_period(period) {
             let valid = HIGH_RESOLUTION_ALARM_PERIODS
@@ -503,6 +515,9 @@ fn configuration_refusal(input: &PutMetricAlarmInput) -> Option<String> {
     }
     unresolvable_metrics(input)
 }
+
+/// The operation a refusal of this alarm write names, as the model declares it.
+const ALARM_WRITE: &str = "PutMetricAlarm";
 
 /// How CloudWatch states a single-metric member that may not be set beside a `Metrics` array:
 /// the member, and that the array is what states the series instead.

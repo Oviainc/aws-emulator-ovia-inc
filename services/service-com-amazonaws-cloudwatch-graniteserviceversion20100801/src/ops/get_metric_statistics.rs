@@ -238,10 +238,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(String::as_str)
             .collect();
         // "When calling GetMetricStatistics, you must specify either Statistics or
-        // ExtendedStatistics" (`GetMetricStatisticsInput$Statistics`, `$ExtendedStatistics`) —
-        // the two members are one EITHER/OR combination, so a call naming neither of them is
-        // a combination this operation cannot be served under, not a single member that is
-        // missing.
+        // ExtendedStatistics" — the two members are one EITHER/OR combination, so a call naming
+        // NEITHER of them is a combination this operation cannot be served under, not a single
+        // member that is missing. A call naming BOTH is SERVED: the recorded answer to one is a
+        // 200 carrying the datapoints of both members, so the "but not both" half of that
+        // sentence is documentation this service is recorded not enforcing.
         if statistics.is_empty() && extended.is_empty() {
             return Err(invalid_combination(crate::state::one_of_required_message(
                 STATISTICS,
@@ -251,11 +252,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Resolve every extended statistic BEFORE any data is read, so an unsupported name is
         // refused whether or not the requested range happens to hold datapoints.
         for (position, name) in extended.iter().enumerate() {
-            // The grammar and the statistic itself are `crate::state`'s, shared with
-            // `GetMetricData` and with the metric-alarm evaluation that reads an alarm's
-            // `ExtendedStatistic` over the same stored datapoints, so no two of them can
-            // compute a different number for one span.
-            if !crate::state::is_extended_statistic(name) {
+            // "The percentile statistics. Specify values between p0.0 and p100." — this member
+            // carries PERCENTILES and nothing else, so the grammar it is judged by is the
+            // percentile form alone ([`crate::state::parse_percentile`], shared with every
+            // other reader of a percentile, including the metric-alarm evaluation that reads an
+            // alarm's `ExtendedStatistic` over the same stored datapoints, so no two of them
+            // can compute a different number for one span). A statistic over a span of the
+            // window's distribution — a trimmed mean, the interquartile mean — is a name this
+            // member does not serve, however well the store computes it for the members that do.
+            if crate::state::parse_percentile(name).is_none() {
                 // A name this member cannot compute — a basic statistic, whose place is
                 // `Statistics` — is refused naming the element it arrived on the way every
                 // refusal of a value inside a list on this service names one: the list, the
@@ -273,11 +278,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let requested_start = crate::state::from_timestamp(&input.start_time);
         let end = crate::state::from_timestamp(&input.end_time);
+        // Each instant is judged on its OWN before the requirement between the two: a moment
+        // outside the span this service reads is a bad value for the member that carried it,
+        // whatever the other member says ([`crate::state::instant_range_error`]).
+        for (parameter, instant) in [
+            (crate::state::START_TIME, requested_start),
+            (crate::state::END_TIME, end),
+        ] {
+            if let Some(message) = crate::state::instant_range_error(parameter, instant) {
+                return Err(invalid_value(message));
+            }
+        }
         if end <= requested_start {
-            return Err(invalid_value(format!(
-                "EndTime must be later than StartTime; got StartTime {requested_start} and \
-                 EndTime {end} (epoch seconds)"
-            )));
+            return Err(invalid_value(crate::state::range_order_message()));
         }
         let period = f64::from(input.period);
         // How many data points the REQUEST asks for: the range the caller named, over the
@@ -459,5 +472,27 @@ fn aggregate(
             .filter(|value: &f64| value.is_finite()),
         unit: Some(unit.to_string()),
         extended_statistics: (!extended_statistics.is_empty()).then_some(extended_statistics),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// RULE: the two instants the refusal NAMES are the two the span is measured by — the
+    /// epoch-second bounds rendered back through this service's own clock
+    /// ([`crate::state::rfc3339`]), so the sentence and the check cannot drift apart.
+    #[test]
+    fn the_span_the_refusal_names_is_the_span_it_enforces() {
+        for (secs, expected) in [
+            (crate::state::EARLIEST_READABLE_SECS, "1700-01-01T00:00:00Z"),
+            (crate::state::LATEST_READABLE_SECS, "9999-12-31T23:59:59Z"),
+        ] {
+            let rendered = crate::state::rfc3339(secs);
+            assert_eq!(
+                rendered.as_deref(),
+                Some(expected),
+                "case {expected:?}: expected the bound to render as the instant the refusal \
+                 names, got {rendered:?}"
+            );
+        }
     }
 }

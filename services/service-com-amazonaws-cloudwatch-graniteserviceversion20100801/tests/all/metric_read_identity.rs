@@ -549,22 +549,6 @@ async fn a_boundary_constraint_is_stated_as_the_parameter_fault_the_operation_mo
             )),
         },
         RefusalRow {
-            case: "a filter list between the member's own bound and the metric's dimensions",
-            operation: "ListMetrics",
-            request: json!({
-                "Namespace": NAMESPACE,
-                "Dimensions": dimensions(MAX_FILTERS + 5),
-            }),
-            code: "InvalidParameterValueException",
-            // The published model declares this member `length 0..10` while the recorded
-            // service enforces the per-metric 30, so a list in that band is refused HERE
-            // although AWS appears to serve it: the model-side bound is the real gap, and it
-            // is not this seam's to relax — the seam chooses only the words and the code. So
-            // the row pins the code and that the refusal names the collection, not a sentence
-            // no recording supports.
-            message: MessageCheck::Names(vec!["The collection Dimensions"]),
-        },
-        RefusalRow {
             case: "the over-long list on a read of one metric",
             operation: "GetMetricStatistics",
             request: statistics_request(at, json!({"Dimensions": dimensions(MAX_DIMENSIONS + 1)})),
@@ -670,16 +654,30 @@ async fn a_boundary_constraint_is_stated_as_the_parameter_fault_the_operation_mo
         }
     }
 
-    // A collection INSIDE every bound is a request this service answers rather than refuses.
-    let at_the_bound = ok(
-        &router,
-        "ListMetrics",
-        &json!({"Namespace": NAMESPACE, "Dimensions": dimensions(MAX_FILTERS)}),
-    )
-    .await;
-    assert_eq!(
-        error_code(&at_the_bound),
-        "",
-        "a dimension filter list inside the bound is served, got {at_the_bound}"
-    );
+    // A collection INSIDE every bound is a request this service answers rather than refuses —
+    // and so is one between the LISTING member's own modelled maximum and the dimensions a
+    // metric can carry: the published model declares `ListMetricsInput$Dimensions`
+    // `length 0..10` while a metric holds up to thirty dimensions, and a listing narrowed by a
+    // filter for each of them is applied rather than refused. The rows span the member's own
+    // maximum, one past it, and the per-metric maximum itself.
+    for count in [MAX_FILTERS, MAX_FILTERS + 1, MAX_DIMENSIONS] {
+        let served = ok(
+            &router,
+            "ListMetrics",
+            &json!({"Namespace": NAMESPACE, "Dimensions": dimensions(count)}),
+        )
+        .await;
+        assert_eq!(
+            error_code(&served),
+            "",
+            "case {count} dimension filters: a filter list a metric could carry is served, got \
+             {served}"
+        );
+        assert_eq!(
+            served.get("Metrics").and_then(Value::as_array),
+            Some(&vec![]),
+            "case {count} dimension filters: a filter nothing matches is an empty listing, got \
+             {served}"
+        );
+    }
 }
