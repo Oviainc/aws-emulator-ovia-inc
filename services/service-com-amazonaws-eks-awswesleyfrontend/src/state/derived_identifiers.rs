@@ -342,6 +342,19 @@ pub fn addon_not_supported_message(addon_name: &str, kubernetes_version: &str) -
     )
 }
 
+/// The sentence Amazon EKS refuses an `UpdateAddon` of an add-on that has not
+/// SETTLED with.
+///
+/// An add-on is in use by whatever has not finished with it — its own install, a
+/// delete, or an update already running — and the refusal names the add-on the
+/// request asked to update and the `AddonStatus` it is currently in, both read
+/// from the request and from the record rather than from anything the body
+/// carried. There is no trailing stop.
+#[must_use]
+pub fn addon_not_updatable_message(addon_name: &str, status: &str) -> String {
+    format!("Addon {addon_name} cannot be updated as it is currently in {status} state")
+}
+
 /// The sentence Amazon EKS refuses an `addonVersion` the catalog does not offer
 /// for the cluster's Kubernetes version with.
 ///

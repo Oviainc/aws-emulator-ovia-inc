@@ -1420,3 +1420,461 @@ pub(super) fn seed_addon_catalog() -> Vec<AddonCatalogRecord> {
         })
         .collect()
 }
+
+/// The sentence Amazon EKS refuses a `configurationValues` document it cannot
+/// read at all with.
+///
+/// Fixed text in its entirety, with no variable part: the document is the
+/// caller's own, and the refusal says only that it is neither of the two formats
+/// an add-on configuration is written in.
+pub const ADDON_CONFIGURATION_UNREADABLE_MESSAGE: &str =
+    "The ConfigurationValues provided is not in valid YAML or JSON format.";
+
+/// The sentence Amazon EKS refuses a `configurationValues` document that does not
+/// satisfy the configuration schema published for the build with.
+///
+/// `format` is the format the document was READ as — the word the refusal names,
+/// which is [`AddonConfiguration::format`] — and `violation` is the path at fault
+/// and what is wrong with it, as the validator states it
+/// ([`AddonCatalogRecord::configuration_violation`]).
+#[must_use]
+pub fn addon_configuration_violation_message(format: &str, violation: &str) -> String {
+    format!(
+        "ConfigurationValue provided in request is not supported: {format} schema \
+         validation failed with error: [{violation}]"
+    )
+}
+
+/// What a `configurationValues` document a request carried states.
+///
+/// "The set of configuration values for the add-on" is a document a caller writes
+/// in JSON or in YAML, and either form is held to the configuration schema
+/// published for the build ([`AddonCatalogRecord::configuration_violation`]) —
+/// which is why the FORM it was read as travels with it: the refusal a document
+/// that fails that schema earns names the format it was read as.
+#[derive(Debug)]
+pub enum AddonConfiguration {
+    /// The request carried no document, or carried one with nothing in it: there
+    /// is nothing to read and nothing to validate.
+    Absent,
+    /// A document that was read, as the format [`Self::format`] names.
+    Read {
+        /// Whether it was read as JSON or as YAML.
+        json: bool,
+        /// The document, as the value the schema is checked against.
+        document: ::serde_json::Value,
+    },
+    /// A document that is neither JSON nor YAML, which is refused with
+    /// [`ADDON_CONFIGURATION_UNREADABLE_MESSAGE`].
+    Unreadable,
+}
+
+impl AddonConfiguration {
+    /// The format word the refusal of this document names: `Json` for a document
+    /// read as JSON, `Yaml` for one read as YAML — and, for a document there was
+    /// nothing to read, `Yaml` is never asked for: only a document that WAS read
+    /// earns a refusal that names a format.
+    #[must_use]
+    pub fn format(&self) -> &'static str {
+        match self {
+            Self::Read { json: true, .. } => "Json",
+            Self::Read { json: false, .. } => "Yaml",
+            Self::Absent | Self::Unreadable => "",
+        }
+    }
+}
+
+/// How deeply a configuration document is read.
+///
+/// It is the bound at BOTH ends of the reading, so one document is not read
+/// deeper by one half of it than by the other:
+///
+/// * a document whose nesting goes past it is read as no document at all, decided
+///   by the one pre-parse bound this tree states
+///   ([`::service_common::yaml_nesting::nesting_depth_bound`]) BEFORE any parser
+///   sees the text, because a parser costs a level of recursion per nested
+///   collection and exhausting the stack aborts the process rather than
+///   unwinding;
+/// * a node past it in a document that bound admitted is read as the EMPTY value
+///   of its own kind: an object or an array with nothing in it, which states the
+///   same TYPE at that level and so is judged exactly as the document states it.
+///   The published configuration schemas declare properties at the top level
+///   only, so nothing below that level is a key a schema could declare and
+///   nothing is skipped by cutting there — the schema check runs on every
+///   document that bound admits.
+///
+/// The value is the recursion limit `serde_json` applies to a JSON document of
+/// its own accord, applied to the YAML reading too.
+pub const MAX_CONFIGURATION_DEPTH: usize = 128;
+
+/// The most bytes of a `configurationValues` document this service reads.
+///
+/// `CreateAddon$configurationValues` carries no modelled `length`, and the
+/// document is read into a tree sized by what the caller sent, so this is the
+/// bound that keeps one request from growing the emulator's memory without a
+/// limit. It is generous next to the documents an add-on's schema can be
+/// satisfied by — the published schemas declare a couple of dozen top-level
+/// keys — and a document past it is read as no document at all
+/// ([`ADDON_CONFIGURATION_UNREADABLE_MESSAGE`]) rather than parsed.
+pub const MAX_CONFIGURATION_BYTES: usize = 64 * 1024;
+
+/// Read the `configurationValues` document of an add-on request the way Amazon
+/// EKS reads one: as JSON, or else as the YAML an add-on configuration may
+/// equally be written in.
+///
+/// This is the one reading both add-on write operations share, so an install and
+/// an update cannot disagree about which documents are readable or about which
+/// form one was read as.
+///
+/// BOUNDED on the way in, because the text is a caller's, and every bound is
+/// settled BEFORE a parser is handed the text: a document past
+/// [`MAX_CONFIGURATION_BYTES`], one whose nesting is past what this service reads
+/// (the one pre-parse nesting bound this tree states,
+/// [`::service_common::yaml_nesting::nesting_depth_bound`]), and one that
+/// references an anchor — which that bound deliberately leaves to its caller,
+/// because a YAML loader resolves an alias by COPYING the anchored node into each
+/// alias position, so a shallow document that anchors a collection and references
+/// it a few times per level expands multiplicatively while it is being loaded.
+/// None of the three is a document this service reads, so each is answered as one
+/// it could not read.
+pub fn read_addon_configuration(values: Option<&str>) -> AddonConfiguration {
+    let Some(text) = values.map(str::trim).filter(|text| !text.is_empty()) else {
+        return AddonConfiguration::Absent;
+    };
+    if text.len() > MAX_CONFIGURATION_BYTES {
+        return AddonConfiguration::Unreadable;
+    }
+    if let Ok(document) = ::serde_json::from_str::<::serde_json::Value>(text) {
+        return AddonConfiguration::Read {
+            json: true,
+            document,
+        };
+    }
+    if ::service_common::yaml_nesting::nesting_depth_bound(text, MAX_CONFIGURATION_DEPTH)
+        > MAX_CONFIGURATION_DEPTH
+        || references_an_anchor(text)
+    {
+        return AddonConfiguration::Unreadable;
+    }
+    let Ok(documents) = ::yaml_rust2::YamlLoader::load_from_str(text) else {
+        return AddonConfiguration::Unreadable;
+    };
+    // A YAML stream with nothing in it (a document of comments alone) states no
+    // values, which is the same as carrying none.
+    let Some(first) = documents.first() else {
+        return AddonConfiguration::Absent;
+    };
+    AddonConfiguration::Read {
+        json: false,
+        document: yaml_as_json(first, MAX_CONFIGURATION_DEPTH),
+    }
+}
+
+/// Whether `text` references a YAML anchor anywhere.
+///
+/// Answered by the EVENT parser, which reports an alias as one event and copies
+/// nothing: the question has to be settled before a loader builds a tree, which
+/// is the point at which an alias would be expanded (see
+/// [`read_addon_configuration`]). The events are discarded, so this costs the
+/// bytes the document already occupies and nothing more.
+fn references_an_anchor(text: &str) -> bool {
+    struct AliasDetector {
+        found: bool,
+    }
+    impl ::yaml_rust2::parser::EventReceiver for AliasDetector {
+        fn on_event(&mut self, event: ::yaml_rust2::parser::Event) {
+            if matches!(event, ::yaml_rust2::parser::Event::Alias(_)) {
+                self.found = true;
+            }
+        }
+    }
+    let mut detector = AliasDetector { found: false };
+    let _ = ::yaml_rust2::parser::Parser::new_from_str(text).load(&mut detector, true);
+    detector.found
+}
+
+
+/// One YAML node as the JSON value a JSON Schema is checked against.
+///
+/// YAML's scalars are JSON's: a mapping is an object keyed by the text of its
+/// keys, a sequence is an array, and a node YAML carries that JSON has no value
+/// for (an alias, a value the parser could not resolve) reads as null, the same
+/// as an explicitly null one. A node past `depth` reads as the empty value of its
+/// own kind, which states the same type at that level
+/// ([`MAX_CONFIGURATION_DEPTH`]).
+fn yaml_as_json(node: &::yaml_rust2::Yaml, depth: usize) -> ::serde_json::Value {
+    use ::yaml_rust2::Yaml;
+    let Some(depth) = depth.checked_sub(1) else {
+        return match node {
+            Yaml::Array(_) => ::serde_json::Value::Array(Vec::new()),
+            Yaml::Hash(_) => ::serde_json::Value::Object(::serde_json::Map::new()),
+            scalar => yaml_as_json(scalar, 1),
+        };
+    };
+    match node {
+        Yaml::String(text) => ::serde_json::Value::String(text.clone()),
+        Yaml::Integer(number) => ::serde_json::Value::from(*number),
+        Yaml::Real(text) => text
+            .parse::<f64>()
+            .ok()
+            .and_then(::serde_json::Number::from_f64)
+            .map_or(::serde_json::Value::String(text.clone()), |number| {
+                ::serde_json::Value::Number(number)
+            }),
+        Yaml::Boolean(held) => ::serde_json::Value::Bool(*held),
+        Yaml::Array(items) => ::serde_json::Value::Array(
+            items.iter().map(|item| yaml_as_json(item, depth)).collect(),
+        ),
+        Yaml::Hash(entries) => {
+            let mut members = ::serde_json::Map::new();
+            for (key, value) in entries {
+                members.insert(yaml_key(key, depth), yaml_as_json(value, depth));
+            }
+            ::serde_json::Value::Object(members)
+        }
+        Yaml::Null | Yaml::BadValue | Yaml::Alias(_) => ::serde_json::Value::Null,
+    }
+}
+
+/// The member name a YAML mapping key states, as a JSON object names one.
+///
+/// A scalar key names the member its own text does. A key that is itself a
+/// collection names no member a schema can declare — JSON has no such key — so it
+/// is named by the JSON the key is written as, which keeps the member in the
+/// document: a key no schema declares is the schema's to refuse, not this
+/// reading's to drop.
+fn yaml_key(key: &::yaml_rust2::Yaml, depth: usize) -> String {
+    use ::yaml_rust2::Yaml;
+    match key {
+        Yaml::String(text) | Yaml::Real(text) => text.clone(),
+        Yaml::Integer(number) => number.to_string(),
+        Yaml::Boolean(held) => held.to_string(),
+        other => ::serde_json::to_string(&yaml_as_json(other, depth)).unwrap_or_default(),
+    }
+}
+
+#[cfg(test)]
+mod configuration_document_tests {
+    use super::{
+        read_addon_configuration, AddonConfiguration, MAX_CONFIGURATION_BYTES,
+        MAX_CONFIGURATION_DEPTH,
+    };
+
+    /// RULE: a configuration document is read as JSON, or else as YAML; one that
+    /// is neither is unreadable. The rows differ along the FORM the document
+    /// takes rather than along one recorded document, and each row states the
+    /// format word the refusal of that document would name.
+    #[test]
+    fn a_configuration_document_is_read_as_json_or_as_yaml() {
+        // (case, document, what it states)
+        let rows: &[(&str, Option<&str>, &str)] = &[
+            ("no document at all", None, "absent"),
+            ("an empty document", Some(""), "absent"),
+            ("a document of whitespace", Some("  \n\t"), "absent"),
+            ("a document of comments alone", Some("# nothing\n"), "absent"),
+            ("a JSON object", Some("{\"useFips\":true}"), "Json"),
+            ("a JSON array", Some("[1, 2]"), "Json"),
+            ("a JSON scalar", Some("3"), "Json"),
+            ("a YAML mapping", Some("env:\n  LOG_LEVEL: debug\n"), "Yaml"),
+            ("a YAML list", Some("- one\n- two\n"), "Yaml"),
+            (
+                "a YAML flow mapping JSON would reject",
+                Some("{useFips: true}"),
+                "Yaml",
+            ),
+            ("a YAML scalar", Some("replicaCount"), "Yaml"),
+            ("a JSON object that is not closed", Some("{\"a\":"), "neither"),
+            ("a JSON array that is not closed", Some("[1,"), "neither"),
+            ("a document that opens a brace", Some("{nope"), "neither"),
+            ("a mapping with a stray quote", Some("a: \"b\nc: d\n"), "neither"),
+        ];
+        for (case, document, expected) in rows {
+            let read = read_addon_configuration(*document);
+            let actual = match &read {
+                AddonConfiguration::Absent => "absent",
+                AddonConfiguration::Read { .. } => read.format(),
+                AddonConfiguration::Unreadable => "neither",
+            };
+            assert_eq!(
+                actual, *expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: either form is read into the SAME value, so the schema check cannot
+    /// depend on which of them the caller wrote. The rows differ along the JSON
+    /// type the document states; each YAML form is one JSON would not accept, so
+    /// the two readings are genuinely different paths.
+    #[test]
+    fn the_two_forms_of_one_document_are_read_into_one_value() {
+        // (case, the JSON form, the YAML form)
+        let rows: &[(&str, &str, &str)] = &[
+            ("an object", "{\"useFIPS\":true}", "useFIPS: true\n"),
+            (
+                "a nested object",
+                "{\"node\":{\"replicaCount\":2}}",
+                "node:\n  replicaCount: 2\n",
+            ),
+            ("an array", "[\"one\",\"two\"]", "- one\n- two\n"),
+            ("a string", "\"replicaCount\"", "replicaCount\n"),
+            ("a number", "{\"replicaCount\":2}", "replicaCount: 2\n"),
+            ("a fraction", "{\"ratio\":1.5}", "ratio: 1.5\n"),
+            ("null", "null", "~\n"),
+            (
+                "an object of several types",
+                "{\"useFIPS\":true,\"replicaCount\":2,\"name\":\"efs\"}",
+                "useFIPS: true\nreplicaCount: 2\nname: efs\n",
+            ),
+        ];
+        for (case, as_json, as_yaml) in rows {
+            let json = read_addon_configuration(Some(as_json));
+            let yaml = read_addon_configuration(Some(as_yaml));
+            let (
+                AddonConfiguration::Read {
+                    document: from_json,
+                    ..
+                },
+                AddonConfiguration::Read {
+                    document: from_yaml,
+                    ..
+                },
+            ) = (&json, &yaml)
+            else {
+                panic!("case {case:?}: both forms must be read, got {json:?} and {yaml:?}");
+            };
+            assert_eq!(
+                from_json, from_yaml,
+                "case {case:?}: expected {from_json:?}, got {from_yaml:?}"
+            );
+            assert_eq!(json.format(), "Json", "case {case:?}: the JSON form");
+        }
+    }
+
+    /// RULE: how deeply a document nests is settled BEFORE any parser is handed
+    /// the text, by the one pre-parse nesting bound this tree states — a document
+    /// past it is read as no document at all — and a document that bound admits
+    /// is read to [`MAX_CONFIGURATION_DEPTH`], the node at the bound keeping the
+    /// TYPE the document states there, so the schema check runs on every document
+    /// that is read and no caller can opt out of it by nesting.
+    #[test]
+    fn how_deeply_a_document_nests_is_settled_before_it_is_parsed() {
+        // A YAML flow sequence nested `depth` deep: `[[[…]]]`, so every level
+        // states an array and the document carries one nesting indicator per
+        // level. The rows straddle the bound, and the last is sized from the BYTE
+        // bound rather than the depth one: a document that is well inside the
+        // bytes a request may carry still cannot drive a parse that deep.
+        for (case, depth, read) in [
+            ("at the bound", MAX_CONFIGURATION_DEPTH, true),
+            ("one level past the bound", MAX_CONFIGURATION_DEPTH + 1, false),
+            ("two levels past the bound", MAX_CONFIGURATION_DEPTH + 2, false),
+            ("as deep as the byte bound allows", MAX_CONFIGURATION_BYTES / 2, false),
+        ] {
+            let document = format!("{}{}", "[".repeat(depth), "]".repeat(depth));
+            let answer = read_addon_configuration(Some(&document));
+            assert_eq!(
+                !matches!(answer, AddonConfiguration::Unreadable),
+                read,
+                "case {case:?}: expected read={read}, got {answer:?}"
+            );
+            if read {
+                match answer {
+                    AddonConfiguration::Read { document, .. } => assert!(
+                        document.is_array(),
+                        "case {case:?}: the document states an array, got {document:?}"
+                    ),
+                    other => panic!("case {case:?}: the document must be read, got {other:?}"),
+                }
+            }
+        }
+
+        // A closer hidden in a quoted scalar cannot talk the bound down: every
+        // opener counts, however many closers the text carries.
+        let hidden = format!(
+            "{}\"]\"{}",
+            "[".repeat(MAX_CONFIGURATION_DEPTH + 1),
+            "]".repeat(MAX_CONFIGURATION_DEPTH + 1)
+        );
+        assert!(
+            matches!(
+                read_addon_configuration(Some(&hidden)),
+                AddonConfiguration::Unreadable
+            ),
+            "a document with more openers than the bound allows is read as none"
+        );
+
+        // Indentation is the other form nesting takes, and it needs no indicator
+        // byte at all: a line indented past the bound is read as no document.
+        let indented = format!("a:\n{}b: one\n", " ".repeat(MAX_CONFIGURATION_DEPTH + 1));
+        assert!(
+            matches!(
+                read_addon_configuration(Some(&indented)),
+                AddonConfiguration::Unreadable
+            ),
+            "a line indented past the bound is read as no document"
+        );
+
+        // A block mapping the bound admits is read, so the key it sets is the key
+        // the schema judges — and the cut the reading makes at the bound (above)
+        // never touches a top-level key.
+        let deep = format!(
+            "notAProperty:\n{}",
+            (1..MAX_CONFIGURATION_DEPTH / 4)
+                .map(|level| format!("{}a{level}:\n", " ".repeat(level)))
+                .collect::<String>()
+        );
+        match read_addon_configuration(Some(&deep)) {
+            AddonConfiguration::Read { document, .. } => assert!(
+                document.get("notAProperty").is_some(),
+                "a nested mapping keeps the key it sets, got {document:?}"
+            ),
+            other => panic!("the document must be read, got {other:?}"),
+        }
+    }
+
+    /// RULE: a document this service cannot read WITHOUT growing without a bound
+    /// is read as no document at all. The rows differ along what would grow: the
+    /// text itself, and the anchor references a loader expands by copying.
+    #[test]
+    fn a_document_that_could_only_be_read_by_growing_without_a_bound_is_unreadable() {
+        let key = "priorityClassName: system-cluster-critical\n";
+        // (case, the document, whether this service reads it)
+        let rows: Vec<(&str, String, bool)> = vec![
+            ("a document at the byte bound", "a".repeat(MAX_CONFIGURATION_BYTES), true),
+            (
+                "a document one byte past it",
+                "a".repeat(MAX_CONFIGURATION_BYTES + 1),
+                false,
+            ),
+            (
+                "a JSON document past it",
+                format!("{{\"a\":\"{}\"}}", "b".repeat(MAX_CONFIGURATION_BYTES)),
+                false,
+            ),
+            ("a document well inside it", key.to_string(), true),
+            (
+                "one alias of an anchored scalar",
+                "anchored: &a one\nalias: *a\n".to_string(),
+                false,
+            ),
+            (
+                "a mapping anchored and referenced per level",
+                "a: &x\n  k: v\nb: [*x, *x, *x]\nc: [*x, *x, *x]\n".to_string(),
+                false,
+            ),
+            (
+                "an anchor nothing references",
+                "anchored: &a one\nother: two\n".to_string(),
+                true,
+            ),
+        ];
+        for (case, document, read) in rows {
+            let answer = read_addon_configuration(Some(&document));
+            assert_eq!(
+                !matches!(answer, AddonConfiguration::Unreadable),
+                read,
+                "case {case:?}: expected read={read}, got {answer:?}"
+            );
+        }
+    }
+}

@@ -61,8 +61,27 @@ pub mod precedence;
 pub mod resolve_conflicts_contract;
 pub mod tag_contract;
 
-use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
+use smithy_server_runtime::{
+    http, ErasedOperation, ErasedServiceDefinition, Refusal, Refused, ServerHttpProtocol, Service,
+};
 use std::sync::Arc;
+
+/// The codec a layer that runs BEFORE dispatch reads a request body with.
+///
+/// It has to be the codec the modelled sequence will read that body with — this
+/// service's own (see [`lenient_json`]) — because a layer that reads a member
+/// differently from the handler it precedes can refuse a request that handler
+/// would have served: this service reads one add-on member without regard to case
+/// (see [`lenient_scalars`]), and a pre-dispatch contract reading the strict codec
+/// would judge such a value as naming nothing. The model's own codec stands in
+/// only for a service that overrides none.
+pub fn body_codec<'svc>(
+    svc: &'svc dyn Service,
+    definition: &'svc dyn ErasedServiceDefinition,
+) -> &'svc dyn ServerHttpProtocol {
+    svc.override_protocol()
+        .unwrap_or_else(|| definition.protocol())
+}
 
 /// The `com-amazonaws-eks-awswesleyfrontend` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
@@ -157,12 +176,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // cannot word because no operation is named by the time it is reached. See
         // [`resolve_conflicts_contract`], and [`off_enum_member_contract`] for the
         // rule both it and the capability-type half of [`precedence`] implement.
+        // The ROUTING KEY is resolved by the model's own codec, which is the one
+        // that carries this service's route table; the BODY is read by the codec
+        // dispatch will read it with (see [`body_codec`]).
         let protocol = self.entry.protocol();
         let key = protocol.routing_key(req).ok()?;
-        if tag_contract::refusal_for(key, protocol, req).is_some() {
+        let body = body_codec(self, &self.entry);
+        if tag_contract::refusal_for(key, body, req).is_some() {
             return Some(&self.refused_tag_request as &dyn ErasedOperation);
         }
-        if resolve_conflicts_contract::refusal_for(key, protocol, req).is_some() {
+        if resolve_conflicts_contract::refusal_for(key, body, req).is_some() {
             return Some(&self.refused_addon_request as &dyn ErasedOperation);
         }
         // ALSO EDITED HERE, and for the same reason — the decision needs the
@@ -173,7 +196,7 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // to, BEFORE it judges the body. The walk runs before any handler does, so
         // without this seam the body refusal pre-empts all three. See [`precedence`],
         // which claims nothing else.
-        if precedence::has_a_question(key, protocol, req) {
+        if precedence::has_a_question(key, body, req) {
             return Some(&self.precedence_first as &dyn ErasedOperation);
         }
         None

@@ -13,17 +13,17 @@
 //! The request harness (`Answer`, `emulator`, `call`, `encode_label`) is the one
 //! every suite in this crate shares, from `tests/all/wire.rs`.
 
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    ADDON_ACTIVATION_DELAY, ADDON_DEFAULT_NAMESPACE, CLUSTER_ACTIVATION_DELAY,
-    MAX_ADDONS_PER_CLUSTER, MAX_KUBERNETES_NAME_LEN,
+    ComAmazonawsEksAwswesleyfrontendState, ADDON_ACTIVATION_DELAY, ADDON_DEFAULT_NAMESPACE,
+    CLUSTER_ACTIVATION_DELAY, MAX_ADDONS_PER_CLUSTER, MAX_KUBERNETES_NAME_LEN,
     MAX_POD_IDENTITY_ASSOCIATIONS_PER_CLUSTER,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::nodegroup_lifecycle::{create_nodegroup_in, minimal_request as nodegroup_request};
-use crate::wire::{call, emulator, encode_label, Answer};
+use crate::wire::{call, emulator, emulator_with_engine, encode_label, Answer};
 
 /// The region every request in this suite is signed for, unless a case names
 /// another to show that an add-on belongs to one Region's cluster.
@@ -269,18 +269,18 @@ async fn a_created_addon_reads_back_exactly_as_stored() {
             arn.starts_with(&expected_prefix),
             "case {case:?}: expected an ARN starting {expected_prefix:?}, got {arn:?}"
         );
-        assert_eq!(
-            created.addon()["owner"],
-            serde_json::json!("aws"),
-            "case {case:?}: an EKS-managed add-on is owned by aws, got {:?}",
-            created.addon()["owner"]
-        );
-        assert_eq!(
-            created.addon()["publisher"],
-            serde_json::json!("eks"),
-            "case {case:?}: an EKS-managed add-on is published by eks, got {:?}",
-            created.addon()["publisher"]
-        );
+        // An Amazon EKS-managed add-on reports no owner, publisher or Marketplace
+        // listing: those identify the listing a Marketplace add-on is bought
+        // through, and the catalog (`DescribeAddonVersions`) is where who publishes
+        // and owns each published add-on is stated.
+        for member in ["owner", "publisher", "marketplaceInformation"] {
+            assert_eq!(
+                created.addon()[member],
+                serde_json::Value::Null,
+                "case {case:?}: an EKS-managed add-on reports no {member}, got {:?}",
+                created.addon()[member]
+            );
+        }
         assert_eq!(
             created.addon()["health"],
             serde_json::json!({ "issues": [] }),
@@ -474,38 +474,27 @@ async fn a_cluster_that_does_not_exist_is_not_found_whatever_the_body_says() {
 }
 
 // ---------------------------------------------------------------------------
-// RULE: an add-on is installed into a running control plane, so a cluster that is
-// not `ACTIVE` cannot take one — 400 `InvalidRequestException`, "the request is
-// invalid given the state of the cluster".
+// RULE: an add-on install is ASYNCHRONOUS, so a cluster Amazon EKS is still
+// provisioning takes one — the add-on is recorded in `CREATING` and its install
+// settles only once that cluster is running. What is refused 400
+// `InvalidRequestException` ("the request is invalid given the state of the
+// cluster") is a cluster whose state no add-on of it can outlive.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn a_cluster_that_is_not_active_yet_refuses_an_addon() {
-    let router = emulator();
+async fn a_cluster_still_being_provisioned_takes_an_addon_that_settles_after_it() {
+    let (router, engine) = emulator_with_engine();
     // Rows differ along the add-on name, which is the point: the cluster's state
     // decides the answer, not the body.
     let names = ["vpc-cni", "coredns", "kube-proxy"];
 
     create_cluster_in(&router, REGION, &cluster_request("settling")).await;
-    for name in names {
-        let answer = create_addon(
-            &router,
-            "settling",
-            &serde_json::json!({ "addonName": name }),
-        )
-        .await;
-        assert_eq!(
-            answer.status, 400,
-            "case {name:?}: a CREATING cluster cannot take an add-on, got {answer:?}"
-        );
-        assert_eq!(
-            answer.error_type.as_deref(),
-            Some("InvalidRequestException"),
-            "case {name:?}: expected InvalidRequestException, got {answer:?}"
-        );
-    }
+    // The instant the cluster is owed `ACTIVE` is held a KNOWN span out rather than
+    // waited out, so what the rows below exercise is the state of the cluster rather
+    // than how fast the test runs: every install lands while it is still `CREATING`.
+    let cluster_hold = 2 * ADDON_ACTIVATION_DELAY;
+    set_cluster_activation(&engine, "settling", Some(SystemTime::now() + cluster_hold));
 
-    wait_for_cluster_active().await;
     for name in names {
         let answer = create_addon(
             &router,
@@ -515,18 +504,94 @@ async fn a_cluster_that_is_not_active_yet_refuses_an_addon() {
         .await;
         assert_eq!(
             answer.status, 200,
-            "case {name:?}: once the cluster is ACTIVE the same request succeeds, \
-             got {answer:?}"
+            "case {name:?}: a cluster still being provisioned takes an add-on, got {answer:?}"
         );
-        // Nothing was written by the refusals above: this is the first and only
-        // record for the name.
-        let described = describe_addon(&router, "settling", name).await;
         assert_eq!(
-            described.addon()["createdAt"],
-            answer.addon()["createdAt"],
-            "case {name:?}: the stored add-on is the one the accepted call wrote"
+            answer.addon()["status"],
+            serde_json::json!("CREATING"),
+            "case {name:?}: the install has not settled, got {:?}",
+            answer.addon()["status"]
         );
     }
+
+    // The install cannot settle before its cluster does: a span after the install —
+    // which is still inside the cluster's own span — every add-on still reports
+    // `CREATING`.
+    tokio::time::sleep(ADDON_ACTIVATION_DELAY + Duration::from_millis(100)).await;
+    for name in names {
+        let described = describe_addon(&router, "settling", name).await;
+        assert_eq!(
+            described.addon()["status"],
+            serde_json::json!("CREATING"),
+            "case {name:?}: an add-on of a cluster that is still CREATING has not \
+             settled, got {:?}",
+            described.addon()["status"]
+        );
+    }
+
+    // A span after the cluster is owed `ACTIVE`, the add-ons have settled.
+    tokio::time::sleep(cluster_hold + ADDON_ACTIVATION_DELAY + Duration::from_millis(250)).await;
+    for name in names {
+        let described = describe_addon(&router, "settling", name).await;
+        assert_ne!(
+            described.addon()["status"],
+            serde_json::json!("CREATING"),
+            "case {name:?}: the install settles once its cluster is running, got {:?}",
+            described.addon()["status"]
+        );
+    }
+
+    // A cluster whose state no add-on of it can outlive refuses the same request.
+    // `FAILED` and `DELETING` are the two such states a cluster record can carry
+    // (`smithy_query query="shape" shape="ClusterStatus"` reports
+    // `CREATING | ACTIVE | DELETING | FAILED | UPDATING | PENDING`; a `PENDING`
+    // cluster is a connected one, which the connected-cluster gate refuses first).
+    for (case, status) in [("a failed cluster", "FAILED"), ("a deleting cluster", "DELETING")] {
+        let name = format!("terminal-{status}");
+        create_cluster_in(&router, REGION, &cluster_request(&name)).await;
+        {
+            let store = engine.state::<ComAmazonawsEksAwswesleyfrontendState>();
+            let mut guard = store.lock();
+            let record = guard
+                .clusters
+                .get_mut(&(REGION.to_string(), name.clone()))
+                .unwrap_or_else(|| panic!("case {case}: the cluster must be in the store"));
+            record.active_at = None;
+            record.status = status.to_string();
+        }
+        let answer = create_addon(&router, &name, &serde_json::json!({ "addonName": "vpc-cni" })).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case}: expected 400, got {answer:?}"
+        );
+        assert_eq!(
+            answer.error_type.as_deref(),
+            Some("InvalidRequestException"),
+            "case {case}: expected InvalidRequestException, got {answer:?}"
+        );
+        let described = describe_addon(&router, &name, "vpc-cni").await;
+        assert_eq!(
+            described.status, 404,
+            "case {case}: a refused create must store nothing, got {described:?}"
+        );
+    }
+}
+
+/// Hold the instant one cluster's move to `ACTIVE` is owed at, so a suite drives
+/// the cluster's STATE rather than the wall clock.
+fn set_cluster_activation(
+    engine: &std::sync::Arc<engine::InMemoryEngine>,
+    cluster: &str,
+    active_at: Option<SystemTime>,
+) {
+    let store = engine.state::<ComAmazonawsEksAwswesleyfrontendState>();
+    let mut guard = store.lock();
+    let record = guard
+        .clusters
+        .get_mut(&(REGION.to_string(), cluster.to_string()))
+        .unwrap_or_else(|| panic!("the cluster {cluster:?} must be in the store"));
+    record.active_at = active_at;
+    record.status = "CREATING".to_string();
 }
 
 // ---------------------------------------------------------------------------
@@ -591,6 +656,17 @@ async fn members_the_model_cannot_constrain_are_refused_as_invalid_parameters() 
         (
             "configurationValues that open a JSON array and do not close it",
             serde_json::json!({ "addonName": "vpc-cni", "configurationValues": "[1," }),
+        ),
+        (
+            "configurationValues written in YAML that set a key the schema does not declare",
+            serde_json::json!({
+                "addonName": "vpc-cni",
+                "configurationValues": "notAProperty:\n  LOG_LEVEL: debug\n",
+            }),
+        ),
+        (
+            "configurationValues written in YAML that state no object at all",
+            serde_json::json!({ "addonName": "vpc-cni", "configurationValues": "useFIPS" }),
         ),
         (
             "an association roleArn that is not a role ARN",
@@ -686,10 +762,10 @@ async fn members_the_model_cannot_constrain_are_refused_as_invalid_parameters() 
             }),
         ),
         (
-            "configurationValues that are not JSON at all",
+            "configurationValues written in YAML rather than JSON",
             serde_json::json!({
                 "addonName": "kube-state-metrics",
-                "configurationValues": "env:\n  LOG_LEVEL: debug\n",
+                "configurationValues": "priorityClassName: system-cluster-critical\n",
             }),
         ),
         (

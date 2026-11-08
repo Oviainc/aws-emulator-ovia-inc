@@ -491,9 +491,13 @@ async fn the_operator_publishes_its_pod_identity_policy_and_cert_manager_none() 
 }
 
 // ---------------------------------------------------------------------------
-// RULE: an INSTALLED add-on reports the same metadata the catalog publishes for
-// its name — `Addon$owner`, `$publisher` and `$marketplaceInformation` are that
-// add-on's own, read back unchanged through `DescribeAddon`.
+// RULE: an INSTALLED add-on reports the metadata that identifies the AWS
+// Marketplace listing it was bought through — `Addon$owner`, `$publisher` and
+// `$marketplaceInformation` are that listing's, read back unchanged through
+// `DescribeAddon`. An add-on Amazon EKS builds or curates is bought through no
+// listing and reports none of the three: the recorded service answers an
+// install of one with those members absent (the add-on's own owner and
+// publisher are what `DescribeAddonVersions` publishes, asserted above).
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -522,18 +526,25 @@ async fn an_installed_addon_reports_the_catalog_metadata_of_its_own_name() {
             "case {addon_name:?}: expected HTTP 200 from DescribeAddon, got {described:?}"
         );
 
+        // What an installed add-on reports for the three members: the listing's
+        // own values for an add-on bought through AWS Marketplace, and nothing at
+        // all for one that is bought through no listing.
+        let sold_on_marketplace = string_member(&published, "owner") == ADDON_OWNER_MARKETPLACE;
         for member in ["owner", "publisher"] {
+            let expected = if sold_on_marketplace {
+                published[member].clone()
+            } else {
+                serde_json::Value::Null
+            };
             assert_eq!(
                 created.addon()[member],
-                published[member],
-                "case {addon_name:?}: an installed add-on reports the {member} the catalog \
-                 publishes for it, got {:?} against {:?}",
-                created.addon()[member],
-                published[member]
+                expected,
+                "case {addon_name:?}: expected {member} {expected:?}, got {:?}",
+                created.addon()[member]
             );
             assert_eq!(
                 described.addon()[member],
-                published[member],
+                expected,
                 "case {addon_name:?}: the installed {member} reads back unchanged, got {:?}",
                 described.addon()[member]
             );
@@ -549,7 +560,7 @@ async fn an_installed_addon_reports_the_catalog_metadata_of_its_own_name() {
              catalog publishes for it, got {:?} against {listing:?}",
             described.addon()["marketplaceInformation"]
         );
-        if string_member(&published, "owner") == ADDON_OWNER_MARKETPLACE {
+        if sold_on_marketplace {
             assert!(
                 !string_member(&listing, "productId").is_empty(),
                 "case {addon_name:?}: a Marketplace add-on is installed with its listing, got \

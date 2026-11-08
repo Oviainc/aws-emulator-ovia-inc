@@ -7,9 +7,11 @@
 //! RULE: Amazon EKS reads a body leniently. A member whose modelled type is a
 //! number or a boolean is read from the string that spells that value, a member
 //! whose modelled type is a string is read from the number or boolean the body
-//! carries there, and `kubernetesNetworkConfig.ipFamily` names one of the two
-//! families `IpFamily` declares matched WITHOUT regard to case. A value that
-//! states nothing of the modelled type is still refused.
+//! carries there, and the members this service reads without regard to case —
+//! `kubernetesNetworkConfig.ipFamily` and the add-on operations'
+//! `resolveConflicts` — name one of the values their own enum declares whatever
+//! case it is spelled in. A value that states nothing of the modelled type is
+//! still refused.
 //!
 //! These are the value rules alone — no request, no codec and no state — so they
 //! are stated and tested here once; [`super::lenient_json`] is where they are
@@ -19,7 +21,7 @@ use aws_smithy_schema::serde::SerdeError;
 use aws_smithy_schema::Schema;
 use aws_smithy_types::{Document, Number};
 
-use crate::ops::types::IP_FAMILY_VALUES;
+use crate::ops::types::{IP_FAMILY_VALUES, RESOLVE_CONFLICTS_VALUES};
 
 /// The members this service reads without regard to case, as `(the modelled
 /// member name, the values it is read against)`.
@@ -35,19 +37,30 @@ use crate::ops::types::IP_FAMILY_VALUES;
 /// compares the family a request asks for to the modelled member ignoring case,
 /// and the recorded service serves a create that spells it `IPv4`.
 ///
+/// `resolveConflicts` is in it for the same reason: the recorded service serves a
+/// `CreateAddon` whose conflict-resolution option is spelled `overwrite`, so the
+/// value names the declared member it spells rather than naming nothing. Both
+/// operations that take the member (`CreateAddon`, `UpdateAddon`) target the same
+/// enum, so one entry reads it the same way for both.
+///
 /// It is keyed by the modelled member NAME because that is what a member schema
 /// carries: the generated schema of a structure member holds the member's own
 /// shape id and kind, not the id of the shape it targets
 /// (`vendor/smithy-macros/src/lib.rs` emits `Schema::new_member(...)` with the
-/// member's own id), so the enum behind it is not reachable from here. The name
+/// member's own id), so the enum behind it is not reachable from here. Each name
 /// identifies one member of this model's input shapes today
-/// (`KubernetesNetworkConfigRequest$ipFamily`; the only other member of that name
+/// (`KubernetesNetworkConfigRequest$ipFamily`, and
+/// `CreateAddonRequest$resolveConflicts`/`UpdateAddonRequest$resolveConflicts`,
+/// which target one enum between them; the only other member named `ipFamily`
 /// belongs to the response shape, which is never read from a request), and the
-/// rule fires only for a value that IS one of the declared families in some other
+/// rule fires only for a value that IS one of the declared values in some other
 /// case — so a member of that name on another shape could at worst have a value of
 /// this value set re-spelled. The reconciliation is for the generated member
 /// schema to carry its target's shape id, which a service crate cannot add.
-const CASE_INSENSITIVE_MEMBERS: &[(&str, &[&str])] = &[("ipFamily", IP_FAMILY_VALUES)];
+const CASE_INSENSITIVE_MEMBERS: &[(&str, &[&str])] = &[
+    ("ipFamily", IP_FAMILY_VALUES),
+    ("resolveConflicts", RESOLVE_CONFLICTS_VALUES),
+];
 
 /// The declared spelling of `value` for `member`, when that member is read without
 /// regard to case and the value is one of its declared values in some other case.
@@ -174,7 +187,10 @@ pub fn text_of(document: &Document) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{boolean_of, declared_spelling, double_of, integral_of, text_of};
-    use crate::ops::types::{KubernetesNetworkConfigRequest, VpcConfigRequest};
+    use crate::ops::types::{
+        KubernetesNetworkConfigRequest, VpcConfigRequest, CREATE_ADDON_INPUT_SCHEMA,
+        UPDATE_ADDON_INPUT_SCHEMA,
+    };
     use aws_smithy_schema::Schema;
     use aws_smithy_types::{Document, Number};
 
@@ -363,6 +379,41 @@ mod tests {
                 actual, None,
                 "case {value:?}: a member outside the table keeps its value, got {actual:?}"
             );
+        }
+    }
+
+    /// The same rule on the other member of the table, read off the two input
+    /// shapes that carry it: a value that spells a declared conflict-resolution
+    /// option in another case is restated in the spelling the model declares, and
+    /// a value that spells no declared one is left exactly as sent.
+    #[test]
+    fn the_conflict_resolution_member_is_restated_onto_the_declared_option() {
+        // Rows: every value of `ResolveConflicts` (source: the generated
+        // `RESOLVE_CONFLICTS_VALUES`, `smithy_query query="shape"
+        // shape="ResolveConflicts"`) in several cases, then values that spell no
+        // declared option at all.
+        let rows: [(&str, Option<&str>); 11] = [
+            ("OVERWRITE", None),
+            ("overwrite", Some("OVERWRITE")),
+            ("Overwrite", Some("OVERWRITE")),
+            ("NONE", None),
+            ("none", Some("NONE")),
+            ("None", Some("NONE")),
+            ("PRESERVE", None),
+            ("Preserve", Some("PRESERVE")),
+            ("BANANA", None),
+            (" NONE", None),
+            ("", None),
+        ];
+        for schema in [CREATE_ADDON_INPUT_SCHEMA, UPDATE_ADDON_INPUT_SCHEMA] {
+            let member = member_of(schema, "resolveConflicts");
+            for (value, expected) in rows {
+                let actual = declared_spelling(member, value);
+                assert_eq!(
+                    actual, expected,
+                    "case {value:?}: expected {expected:?}, got {actual:?}"
+                );
+            }
         }
     }
 }

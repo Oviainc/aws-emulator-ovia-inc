@@ -2,11 +2,17 @@
 
 //! @op DeleteAddon
 //!
-//! IMPLEMENTED. `DeleteAddon` MUTATES: it takes the [`crate::state::AddonRecord`]
-//! `CreateAddon` wrote off its cluster
-//! ([`crate::state::ComAmazonawsEksAwswesleyfrontendState::remove_addon`]) and answers
-//! with that record in its final `DELETING` status, so a later `DescribeAddon` or
-//! `ListAddons` no longer finds it.
+//! IMPLEMENTED. `DeleteAddon` MUTATES: it starts taking the
+//! [`crate::state::AddonRecord`] `CreateAddon` wrote off its cluster
+//! ([`crate::state::ComAmazonawsEksAwswesleyfrontendState::start_addon_removal`]) and
+//! answers with that record in the `DELETING` status the removal runs in.
+//!
+//! The removal is ASYNCHRONOUS, like the install: the add-on reports `DELETING` from
+//! this call until the clock has finished it
+//! ([`crate::state::ADDON_DELETION_DELAY`]), so `DescribeAddon` and `ListAddons`
+//! still find it — in `DELETING` — and installing the same add-on again collides
+//! with the one on its way out until then. Only after that is the add-on no longer an
+//! add-on of its cluster.
 //!
 //! The layers are the same as `DescribeAddon`'s, outside in: the cluster named by the
 //! `@httpLabel` must exist in the request's region, that cluster must have an Amazon
@@ -195,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get(&key)
             .map(|record| guard.association_arns_owned_by(&record.arn))
             .unwrap_or_default();
-        let Some(record) = guard.remove_addon(&key, input.preserve, now) else {
+        let Some(record) = guard.start_addon_removal(&key, input.preserve, now) else {
             return Err(not_found());
         };
 

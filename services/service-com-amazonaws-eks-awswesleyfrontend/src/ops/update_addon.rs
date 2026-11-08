@@ -116,8 +116,8 @@
 use super::types::*;
 use crate::state::{
     self, PendingAddonUpdate, UpdateRecord, UpdateScope, ADDON_STATUSES_AN_UPDATE_STARTS_FROM,
-    ADDON_STATUS_UPDATING, DEFAULT_KUBERNETES_VERSION,
-    MAX_POD_IDENTITY_ASSOCIATIONS_PER_CLUSTER, STATUS_ACTIVE,
+    ADDON_STATUS_UPDATING, CLUSTER_STATUSES_AN_ADDON_IS_MANAGED_IN, DEFAULT_KUBERNETES_VERSION,
+    MAX_POD_IDENTITY_ASSOCIATIONS_PER_CLUSTER,
     UPDATE_COMPLETION_DELAY, UPDATE_IN_PROGRESS, UPDATE_PARAM_ADDON_VERSION,
     UPDATE_PARAM_CONFIGURATION_VALUES, UPDATE_PARAM_POD_IDENTITY_ASSOCIATIONS,
     UPDATE_PARAM_RESOLVE_CONFLICTS, UPDATE_PARAM_SERVICE_ACCOUNT_ROLE_ARN, UPDATE_TYPE_ADDON,
@@ -341,25 +341,42 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // LAYER 4 — the state of the cluster and of the add-on. An add-on runs in a
-        // running control plane, and an add-on can only take a change once it has
-        // SETTLED: one still being created, or being deleted, cannot. An add-on whose
-        // last update failed, or that is running in a degraded state, has settled —
-        // another `UpdateAddon` is how such an add-on is remediated, so it is admitted
-        // here and a successful update clears the issue the failure left on it.
-        if cluster_status != STATUS_ACTIVE {
-            return Err(invalid_request(format!(
-                "Cluster {} is in {cluster_status} status; it must be {STATUS_ACTIVE} to update \
-                 an add-on.",
-                input.cluster_name
+        // LAYER 4 — the state of the cluster and of the add-on. The cluster must be
+        // one Amazon EKS is managing an add-on of at all
+        // ([`crate::state::CLUSTER_STATUSES_AN_ADDON_IS_MANAGED_IN`]: one being
+        // provisioned, running, or taking a change does, one on its way out does not),
+        // and an add-on can only take a change once it has SETTLED: one still being
+        // created, or being deleted, cannot. An add-on whose last update failed, or
+        // that is running in a degraded state, has settled — another `UpdateAddon` is
+        // how such an add-on is remediated, so it is admitted here and a successful
+        // update clears the issue the failure left on it.
+        if !CLUSTER_STATUSES_AN_ADDON_IS_MANAGED_IN.contains(&cluster_status.as_str()) {
+            return Err(invalid_request(state::cluster_cannot_manage_an_addon(
+                &input.cluster_name,
+                &cluster_status,
+                "update an add-on",
             )));
         }
         if !ADDON_STATUSES_AN_UPDATE_STARTS_FROM.contains(&addon_status.as_str()) {
-            return Err(invalid_request(format!(
-                "Addon {} is in {addon_status} status; it must be one of {} to be updated.",
-                input.addon_name,
-                ADDON_STATUSES_AN_UPDATE_STARTS_FROM.join(", ")
-            )));
+            // An add-on that has not settled is IN USE by whatever has not finished
+            // with it — its own install, a delete, or an update already running — so
+            // this is the 409 `ResourceInUseException` the operation models rather
+            // than a statement about the request: a caller that waits can send the
+            // same request again and have it accepted. The sentence names the add-on
+            // the request asked to update and the status it is currently in, and the
+            // exception reports both the add-on and its cluster.
+            return Err(UpdateAddonErrorModeled::ResourceInUseException(
+                ResourceInUseException {
+                    cluster_name: Some(input.cluster_name.clone()),
+                    addon_name: Some(input.addon_name.clone()),
+                    message: Some(state::addon_not_updatable_message(
+                        &input.addon_name,
+                        &addon_status,
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
         }
 
         // LAYER 5 — the body's own members. Each is a rule the model cannot express, so
@@ -402,42 +419,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         // "The values that you provide are validated against the schema returned by
-        // DescribeAddonConfiguration" — so a JSON document is held to exactly that
-        // schema, the one the catalog publishes for the build the add-on will be running
-        // once this update completes: the version the request asks for, or the one the
-        // add-on already runs when it asks for no new version. Before any of that, a
-        // document which opens like JSON must BE JSON. A YAML document is not validated
-        // here — the schema is a JSON Schema — and neither is a build this catalog does
-        // not publish, which publishes no schema to validate against.
+        // DescribeAddonConfiguration" — so the document is READ first
+        // ([`crate::state::read_addon_configuration`], the one reading this operation
+        // shares with the install) and then held to exactly that schema, the one the
+        // catalog publishes for the build the add-on will be running once this update
+        // completes: the version the request asks for, or the one the add-on already
+        // runs when it asks for no new version. Either form of document — JSON or
+        // YAML — is held to that schema and the refusal names the format it was read
+        // as; one that is neither cannot be read at all and is refused for that. A
+        // build this catalog does not publish publishes no schema to validate against.
         let target_version = requested_version
             .clone()
             .unwrap_or_else(|| installed_version.clone());
-        if let Some(values) = input
-            .configuration_values
-            .as_deref()
-            .map(str::trim)
-            .filter(|values| values.starts_with('{') || values.starts_with('['))
-        {
-            match ::serde_json::from_str::<::serde_json::Value>(values) {
-                Err(error) => {
-                    return Err(invalid_parameter(format!(
-                        "configurationValues opens like JSON but is not valid JSON: {error}"
-                    )));
-                }
-                Ok(document) => {
-                    if let Some(violation) = guard
-                        .published_addon_build(&input.addon_name, &target_version, now)
-                        .and_then(|(catalog_entry, build)| {
-                            catalog_entry.configuration_violation(build, &document)
-                        })
-                    {
-                        return Err(invalid_parameter(format!(
-                            "ConfigurationValue provided in request is not supported: Json \
-                             schema validation failed with error: [{violation}]"
-                        )));
-                    }
+        let configuration = state::read_addon_configuration(input.configuration_values.as_deref());
+        match &configuration {
+            state::AddonConfiguration::Unreadable => {
+                return Err(invalid_parameter(
+                    state::ADDON_CONFIGURATION_UNREADABLE_MESSAGE.to_string(),
+                ));
+            }
+            state::AddonConfiguration::Read { document, .. } => {
+                if let Some(violation) = guard
+                    .published_addon_build(&input.addon_name, &target_version, now)
+                    .and_then(|(catalog_entry, build)| {
+                        catalog_entry.configuration_violation(build, document)
+                    })
+                {
+                    return Err(invalid_parameter(
+                        state::addon_configuration_violation_message(
+                            configuration.format(),
+                            &violation,
+                        ),
+                    ));
                 }
             }
+            state::AddonConfiguration::Absent => {}
         }
 
         // LAYER 6 — the EKS Pod Identity associations the add-on would own afterwards.

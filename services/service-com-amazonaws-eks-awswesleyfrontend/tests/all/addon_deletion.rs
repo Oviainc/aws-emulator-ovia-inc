@@ -19,7 +19,8 @@
 use std::time::Duration;
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    ADDON_ACTIVATION_DELAY, CLUSTER_ACTIVATION_DELAY, UPDATE_COMPLETION_DELAY,
+    ADDON_ACTIVATION_DELAY, ADDON_DELETION_DELAY, CLUSTER_ACTIVATION_DELAY,
+    UPDATE_COMPLETION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -254,6 +255,29 @@ async fn a_deleted_addon_answers_the_record_that_left_and_is_then_gone() {
             deleted.addon()["modifiedAt"]
         );
 
+        // The removal is ASYNCHRONOUS: until the clock has finished it the add-on
+        // is still an add-on of its cluster, reported in the status the delete
+        // answered with.
+        let deleting = describe_addon(&router, "deleted-addons", addon_name).await;
+        assert_eq!(
+            deleting.status, 200,
+            "case {case:?}: the add-on must still read back while it is deleting, got \
+             {deleting:?}"
+        );
+        assert_eq!(
+            deleting.addon()["status"],
+            serde_json::json!("DELETING"),
+            "case {case:?}: a deleting add-on reports DELETING, got {:?}",
+            deleting.addon()["status"]
+        );
+        let listed_while_deleting = list_addons(&router, "deleted-addons").await;
+        assert!(
+            listed_while_deleting.iter().any(|name| name == addon_name),
+            "case {case:?}: ListAddons lists an add-on that is still deleting, got \
+             {listed_while_deleting:?}"
+        );
+        tokio::time::sleep(ADDON_DELETION_DELAY + Duration::from_millis(250)).await;
+
         // The add-on has left the store: neither read finds it any more.
         let after = describe_addon(&router, "deleted-addons", addon_name).await;
         assert_eq!(
@@ -365,7 +389,9 @@ async fn preserve_decides_whether_the_associations_the_addon_owns_go_with_it() {
                 "case {case:?}: expected 200 from DeleteAddon, got {deleted:?}"
             );
 
-            // The add-on itself leaves whatever `preserve` says.
+            // The add-on itself leaves whatever `preserve` says, once the clock has
+            // finished the removal it started.
+            tokio::time::sleep(ADDON_DELETION_DELAY + Duration::from_millis(250)).await;
             let after = describe_addon(&router, "preserving", &addon_name).await;
             assert_eq!(
                 after.status, 404,
@@ -562,6 +588,9 @@ async fn deleting_one_addon_leaves_the_cluster_its_others() {
             "case {deleted_name:?}: expected 200 from DeleteAddon, got {deleted:?}"
         );
         remaining.retain(|name| name != deleted_name);
+        // The removal is asynchronous, so the deleted add-on is off the cluster
+        // once the clock has finished it.
+        tokio::time::sleep(ADDON_DELETION_DELAY + Duration::from_millis(250)).await;
 
         let listed = list_addons(&router, "many-addons").await;
         assert_eq!(

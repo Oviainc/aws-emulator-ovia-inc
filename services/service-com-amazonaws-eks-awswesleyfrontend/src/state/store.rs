@@ -164,6 +164,12 @@ impl ComAmazonawsEksAwswesleyfrontendState {
 
     /// Materialise every clock-owed status move across the store.
     pub fn materialize_due_transitions(&mut self, now: SystemTime) {
+        // An add-on whose removal the clock has finished is no longer an add-on of
+        // its cluster. It goes first: the record is gone, so nothing below has to
+        // reason about one that is on its way out, and the removal was due at that
+        // instant whether or not anybody called.
+        self.addons
+            .retain(|_, addon| addon.removed_at.is_none_or(|due| now < due));
         // The ADD-ONS go first: completing an add-on's update may FAIL it (see
         // [`Self::complete_addon_update`]), and the cluster pass below is what
         // would otherwise already have reported that same update `Successful`.
@@ -594,17 +600,22 @@ impl ComAmazonawsEksAwswesleyfrontendState {
     /// cluster is owed, decided from that cluster's own state.
     ///
     /// An add-on install is asynchronous and settles in the state that reflects
-    /// what the cluster could actually do with it, which is three questions in
+    /// what the cluster could actually do with it, which is four questions in
     /// order, each about one thing the install needs:
     ///
-    /// 1. the add-ons its resources are applied against must be ON the cluster,
+    /// 1. an add-on sold through the AWS Marketplace needs a SUBSCRIPTION to it
+    ///    before its software may be pulled at all. This emulator serves no
+    ///    Marketplace, so it holds no subscription to any listing and such an
+    ///    install never comes up ([`ADDON_ISSUE_SUBSCRIPTION_NEEDED`]); the
+    ///    remediation is the one Amazon EKS states, outside this API;
+    /// 2. the add-ons its resources are applied against must be ON the cluster,
     ///    otherwise the Kubernetes resources it needs are not there and the
     ///    install fails ([`ADDON_ISSUE_K8S_RESOURCE_NOT_FOUND`]);
-    /// 2. one that is installed but is NOT RUNNING cannot answer the admission
+    /// 3. one that is installed but is NOT RUNNING cannot answer the admission
     ///    review the API server sends its webhook, so every resource that
     ///    webhook gates is refused and the install fails
     ///    ([`ADDON_ISSUE_ADMISSION_REQUEST_DENIED`]);
-    /// 3. an add-on with a replica to schedule needs the cluster to have compute
+    /// 4. an add-on with a replica to schedule needs the cluster to have compute
     ///    to schedule it onto; without it the resources are applied but no pod
     ///    of the add-on runs, which is a running add-on that is not healthy
     ///    ([`ADDON_ISSUE_INSUFFICIENT_REPLICAS`]).
@@ -622,6 +633,15 @@ impl ComAmazonawsEksAwswesleyfrontendState {
         let Some(published) = self.published_addon(addon_name, now) else {
             return AddonInstallOutcome::running();
         };
+        if published.owner == ADDON_OWNER_MARKETPLACE {
+            return AddonInstallOutcome::failed(AddonIssue {
+                code: Some(ADDON_ISSUE_SUBSCRIPTION_NEEDED.to_string()),
+                message: Some(ADDON_ISSUE_SUBSCRIPTION_NEEDED_MESSAGE.to_string()),
+                // Nothing was applied to the cluster, so there is no resource of
+                // this add-on for the issue to name.
+                resource_ids: None,
+            });
+        }
         let missing: Vec<String> = published
             .required_addons
             .iter()
@@ -712,11 +732,12 @@ impl ComAmazonawsEksAwswesleyfrontendState {
         if replicated && !self.cluster_can_place_pods(region, cluster_name, namespace) {
             return AddonInstallOutcome::degraded(AddonIssue {
                 code: Some(ADDON_ISSUE_INSUFFICIENT_REPLICAS.to_string()),
-                message: Some(format!(
-                    "No replica of add-on {addon_name} is running: cluster {cluster_name} has \
-                     no compute to schedule a pod in namespace {namespace} onto."
-                )),
-                resource_ids: Some(vec![format!("{namespace}/{addon_name}")]),
+                message: Some(ADDON_ISSUE_INSUFFICIENT_REPLICAS_MESSAGE.to_string()),
+                // The issue is about the add-on's OWN pods, which are not
+                // resources this emulator holds — it runs no Kubernetes — so it
+                // names none. The issues that are about resources name them (see
+                // [`Self::addon_install_outcome`]).
+                resource_ids: None,
             });
         }
         AddonInstallOutcome::running()
@@ -726,11 +747,18 @@ impl ComAmazonawsEksAwswesleyfrontendState {
     /// terminal state.
     ///
     /// One span ([`ADDON_ACTIVATION_DELAY`]) from now for an add-on that waits
-    /// for nothing. An add-on applied against another add-on's resources cannot
-    /// settle before THAT add-on has, so when one it is installed against is
-    /// still settling, its own span starts from the last of their due instants:
-    /// a dependency level costs a span, which is what makes the install of a
-    /// chain take one span per level.
+    /// for nothing. An add-on cannot come up before the things it is applied
+    /// against are themselves ready, so its span starts from the last of their
+    /// due instants:
+    ///
+    /// * the CLUSTER it is installed on — an add-on of a cluster Amazon EKS is
+    ///   still provisioning is recorded straight away
+    ///   ([`CLUSTER_STATUSES_AN_ADDON_IS_MANAGED_IN`]) and settles once that
+    ///   cluster is running;
+    /// * each add-on it is applied against that is still settling.
+    ///
+    /// A dependency level therefore costs a span, which is what makes the
+    /// install of a chain take one span per level.
     pub fn addon_install_settles_at(
         &self,
         region: &str,
@@ -747,7 +775,15 @@ impl ComAmazonawsEksAwswesleyfrontendState {
             .filter_map(|required| self.installed_addon(region, cluster_name, required))
             .filter_map(|record| record.active_at)
             .max();
-        last_prerequisite.unwrap_or(now).max(now) + ADDON_ACTIVATION_DELAY
+        let cluster_running = self
+            .clusters
+            .get(&(region.to_string(), cluster_name.to_string()))
+            .and_then(|cluster| cluster.active_at);
+        let waits_for = [cluster_running, last_prerequisite]
+            .into_iter()
+            .flatten()
+            .max();
+        waits_for.unwrap_or(now).max(now) + ADDON_ACTIVATION_DELAY
     }
 
     /// Drop every add-on installed on one cluster.
@@ -788,33 +824,40 @@ impl ComAmazonawsEksAwswesleyfrontendState {
             .retain(|_, record| record.owner_arn.as_deref() != Some(owner_arn));
     }
 
-    /// Take one add-on off its cluster and answer the record that left, carrying
-    /// the final status the delete reports it in, or `None` when the cluster
-    /// holds no add-on under that key.
+    /// Start taking one add-on off its cluster and answer the record as the
+    /// delete reports it, or `None` when the cluster holds no add-on under that
+    /// key.
+    ///
+    /// A removal is ASYNCHRONOUS: `DeleteAddon` answers with the add-on in
+    /// `DELETING`, and the add-on is still an add-on of its cluster — readable,
+    /// listed, and in the way of installing the same one again — until the clock
+    /// reaches [`ADDON_DELETION_DELAY`] and [`Self::materialize_due_transitions`]
+    /// drops it.
     ///
     /// Removing an add-on removes what Amazon EKS manages FOR it, which is the
-    /// EKS Pod Identity associations it owns. `preserve` is the request member
-    /// that asks for the add-on software to stay on the cluster with Amazon EKS
-    /// no longer managing its settings, and then "if an IAM account is associated
-    /// with the add-on, it isn't removed" — so those associations are left in
-    /// place. Either way the add-on itself stops being an Amazon EKS-managed
-    /// add-on of this cluster, which is what this store holds.
+    /// EKS Pod Identity associations it owns; they go as the removal starts,
+    /// because Amazon EKS stops managing them the moment the delete is accepted.
+    /// `preserve` is the request member that asks for the add-on software to stay
+    /// on the cluster with Amazon EKS no longer managing its settings, and then
+    /// "if an IAM account is associated with the add-on, it isn't removed" — so
+    /// those associations are left in place.
     ///
     /// A change an update still in flight carries can no longer be made once the
-    /// add-on it would change is gone, so that update stops being owed its
-    /// completion and reports the same status as any other change that could not
-    /// be made (see [`Self::complete_addon_update`]).
-    pub fn remove_addon(
+    /// add-on it would change is being removed, so that update stops being owed
+    /// its completion and reports the same status as any other change that could
+    /// not be made (see [`Self::complete_addon_update`]).
+    pub fn start_addon_removal(
         &mut self,
         key: &(String, String, String),
         preserve: bool,
         at: SystemTime,
     ) -> Option<AddonRecord> {
-        let mut record = self.addons.remove(key)?;
         if !preserve {
-            self.remove_associations_owned_by(&record.arn);
+            let arn = self.addons.get(key)?.arn.clone();
+            self.remove_associations_owned_by(&arn);
         }
-        if let Some(pending) = record.pending_update.take() {
+        let pending = self.addons.get_mut(key)?.pending_update.take();
+        if let Some(pending) = pending {
             if let Some(update) = self
                 .clusters
                 .get_mut(&(key.0.clone(), key.1.clone()))
@@ -824,12 +867,15 @@ impl ComAmazonawsEksAwswesleyfrontendState {
                 update.succeeds_at = None;
             }
         }
+        let record = self.addons.get_mut(key)?;
         record.status = ADDON_STATUS_DELETING.to_string();
-        // The add-on has left the store, so the status move the clock owed it is
-        // no longer owed to anybody.
+        // The add-on is on its way out, so the status move the clock owed its
+        // install is no longer owed to anybody; what it is owed now is the end of
+        // the removal.
         record.active_at = None;
+        record.removed_at = Some(at + ADDON_DELETION_DELAY);
         record.modified_at = at;
-        Some(record)
+        Some(record.clone())
     }
 
     /// The next value to mix into a minted update id, counted from this store's

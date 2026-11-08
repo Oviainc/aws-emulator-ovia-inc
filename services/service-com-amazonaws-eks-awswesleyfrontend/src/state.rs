@@ -27,9 +27,10 @@
 //! reports none of them — it reports [`ClusterRecord::connector_config`] instead.
 //!
 //! It also holds the add-on slice: `CreateAddon` writes an [`AddonRecord`] here,
-//! `DescribeAddon` and `ListAddons` read it back and `DeleteAddon` removes it
-//! ([`ComAmazonawsEksAwswesleyfrontendState::remove_addon`]). An add-on lives
-//! INSIDE a cluster, so its
+//! `DescribeAddon` and `ListAddons` read it back and `DeleteAddon` starts its
+//! removal
+//! ([`ComAmazonawsEksAwswesleyfrontendState::start_addon_removal`]). An add-on
+//! lives INSIDE a cluster, so its
 //! key carries the cluster's key and `DeleteCluster` drops the add-ons of the
 //! cluster it removes. `UpdateAddon` does not write the change it is asked for
 //! onto that record straight away: the update it starts is asynchronous, so the
@@ -2596,8 +2597,9 @@ pub const ADDON_STATUS_UPDATING: &str = "UPDATING";
 /// an update carried could not be made.
 pub const ADDON_STATUS_UPDATE_FAILED: &str = "UPDATE_FAILED";
 /// See [`ADDON_STATUS_CREATING`] — the status an add-on reports once `DeleteAddon`
-/// has taken it off its cluster, which is the final status that call answers with
-/// ([`ComAmazonawsEksAwswesleyfrontendState::remove_addon`]).
+/// has started taking it off its cluster
+/// ([`ComAmazonawsEksAwswesleyfrontendState::start_addon_removal`]), which it keeps
+/// until the clock has finished the removal [`ADDON_DELETION_DELAY`] later.
 pub const ADDON_STATUS_DELETING: &str = "DELETING";
 
 /// The `AddonIssueCode` an add-on reports for a change an update could not make
@@ -2614,6 +2616,28 @@ pub const ADDON_ISSUE_K8S_RESOURCE_NOT_FOUND: &str = "K8sResourceNotFound";
 /// running than it needs — on a cluster with no compute to schedule them onto,
 /// none of them is.
 pub const ADDON_ISSUE_INSUFFICIENT_REPLICAS: &str = "InsufficientNumberOfReplicas";
+
+/// The `AddonHealth$issues` message that code carries.
+///
+/// Fixed text in its entirety: it reports that the add-on's deployments have no
+/// pod running and why — there is nowhere to schedule one — and names neither the
+/// add-on nor the cluster, both of which the caller is already reading the record
+/// of.
+pub const ADDON_ISSUE_INSUFFICIENT_REPLICAS_MESSAGE: &str =
+    "The add-on is unhealthy because all deployments have all pods unscheduled no nodes \
+     available to schedule pods";
+
+/// The `AddonIssueCode` an add-on bought through the AWS Marketplace reports
+/// when the account holds no subscription to it
+/// (`smithy_query query="shape" shape="AddonIssueCode"`).
+pub const ADDON_ISSUE_SUBSCRIPTION_NEEDED: &str = "AddonSubscriptionNeeded";
+
+/// The `AddonHealth$issues` message that code carries: fixed text naming the
+/// remediation — the Marketplace subscription the add-on cannot run without.
+pub const ADDON_ISSUE_SUBSCRIPTION_NEEDED_MESSAGE: &str =
+    "You are currently not subscribed to this add-on. To subscribe, visit the AWS \
+     Marketplace console, agree to the seller EULA, select the pricing type if required, \
+     then re-install the add-on";
 
 /// The `AddonIssueCode` an add-on reports when the API server refused its
 /// resources at admission, which is what an admission webhook with no replica
@@ -2642,6 +2666,38 @@ pub const ADDON_STATUSES_AN_UPDATE_STARTS_FROM: &[&str] = &[
     ADDON_STATUS_DEGRADED,
     ADDON_STATUS_UPDATE_FAILED,
 ];
+
+/// The `ClusterStatus` members a cluster can have an add-on INSTALLED ON or
+/// UPDATED ON: the ones in which Amazon EKS is managing a control plane for it
+/// that an add-on belongs to.
+///
+/// An add-on install is ASYNCHRONOUS — `CreateAddon` answers with the add-on in
+/// `CREATING` and the install settles later — so a cluster Amazon EKS is still
+/// provisioning does not refuse one: the add-on is recorded against the cluster
+/// and its own install settles only once that cluster is running
+/// ([`ComAmazonawsEksAwswesleyfrontendState::addon_install_settles_at`]), which
+/// is what makes the normal bootstrap sequence (create a cluster, then install
+/// its add-ons) answerable without polling in between. A cluster taking a change
+/// is running throughout, so it takes one too.
+///
+/// What is refused is a cluster whose state no add-on of it can outlive: one
+/// being deleted, one whose provisioning failed, and one `RegisterCluster`
+/// connected but not yet registered — for a connected cluster the refusal is the
+/// connected-cluster gate, which precedes this one, because no wait makes such a
+/// cluster take the call at all.
+pub const CLUSTER_STATUSES_AN_ADDON_IS_MANAGED_IN: &[&str] =
+    &[STATUS_CREATING, STATUS_ACTIVE, STATUS_UPDATING];
+
+/// The sentence an add-on operation refuses a cluster whose state no add-on of
+/// it can outlive with ([`CLUSTER_STATUSES_AN_ADDON_IS_MANAGED_IN`]).
+///
+/// `doing` is what the call would have done — the variable part that names the
+/// operation's own work — beside the cluster and the status it is in, both read
+/// from state.
+#[must_use]
+pub fn cluster_cannot_manage_an_addon(cluster_name: &str, status: &str, doing: &str) -> String {
+    format!("Cluster {cluster_name} is in {status} status; it cannot {doing}.")
+}
 
 /// The `UpdateType` an add-on's own asynchronous update reports
 /// (`smithy_query query="shape" shape="UpdateType"`): `UpdateAddon` answers "an
@@ -2673,6 +2729,17 @@ pub const UPDATE_PARAM_POD_IDENTITY_ASSOCIATIONS: &str = "PodIdentityAssociation
 /// still observes `CREATING`, short enough to be worth waiting for. The due
 /// instant is stored on the record; nothing sleeps for it.
 pub const ADDON_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
+
+/// How long an add-on `DeleteAddon` has taken off its cluster reports `DELETING`
+/// before the clock has finished removing it and the cluster no longer holds it.
+///
+/// `DeleteAddon` answers with the add-on in `DELETING` and publishes no duration
+/// for the removal, so this span is CHOSEN rather than cited, with the same
+/// reasoning as [`ADDON_ACTIVATION_DELAY`]: a removal is asynchronous, so the
+/// add-on is still there to be read — and still in the way of installing it again
+/// — until the clock has finished. The due instant is stored on the record;
+/// nothing sleeps for it.
+pub const ADDON_DELETION_DELAY: Duration = Duration::from_millis(500);
 
 /// The `owner` of an add-on Amazon EKS builds itself.
 ///
@@ -2822,6 +2889,15 @@ pub struct AddonRecord {
     /// When set, the instant at which the clock owes this add-on the move from
     /// `CREATING` to `ACTIVE`. Cleared once the move is materialised.
     pub active_at: Option<SystemTime>,
+    /// When set, the instant at which the clock has finished the removal
+    /// `DeleteAddon` started, after which the cluster no longer holds this
+    /// add-on. An add-on nothing has asked to delete carries `None`.
+    ///
+    /// A removal is asynchronous: the add-on reports [`ADDON_STATUS_DELETING`]
+    /// from the call that started it until this instant, so a caller can read
+    /// the state it has to wait out, and an install of the same add-on collides
+    /// with it until then.
+    pub removed_at: Option<SystemTime>,
     pub service_account_role_arn: Option<String>,
     pub tags: BTreeMap<String, String>,
     pub configuration_values: Option<String>,
@@ -3001,9 +3077,22 @@ impl AddonRecord {
                     .map(|(key, value)| (key.clone(), value.clone()))
                     .collect(),
             ),
-            publisher: Some(self.publisher.clone()),
-            owner: Some(self.owner.clone()),
+            // Who publishes and owns the add-on, and the AWS Marketplace listing
+            // it is subscribed through, are reported for an add-on bought through
+            // the Marketplace — the add-on whose `owner` and `publisher` identify
+            // the listing and the vendor behind it. An add-on Amazon EKS or the
+            // community publishes reports none of the three: the recorded service
+            // answers a read of one with all three ABSENT (every recorded add-on
+            // read of an Amazon EKS-built add-on in the corpus this emulator is
+            // replayed against does), and `DescribeAddonVersions` is where the
+            // catalog states who publishes and owns each published add-on.
+            publisher: (self.owner == ADDON_OWNER_MARKETPLACE).then(|| self.publisher.clone()),
+            owner: (self.owner == ADDON_OWNER_MARKETPLACE).then(|| self.owner.clone()),
             configuration_values: self.configuration_values.clone(),
+            // "Information about an Amazon EKS add-on from the Amazon Web
+            // Services Marketplace": the listing the catalog publishes for this
+            // add-on, which an Amazon EKS-managed add-on has none of.
+            marketplace_information: self.marketplace_information.clone(),
             pod_identity_associations: {
                 let owned: Vec<String> = self
                     .pod_identity_association_arns
@@ -3016,11 +3105,6 @@ impl AddonRecord {
             namespace_config: Some(AddonNamespaceConfigResponse {
                 namespace: Some(self.namespace.clone()),
             }),
-            // "Information about an Amazon EKS add-on from the Amazon Web
-            // Services Marketplace": the listing is a property of the add-on,
-            // so it is the one the catalog publishes for this add-on name —
-            // nothing for an add-on that is not listed on Marketplace.
-            marketplace_information: self.marketplace_information.clone(),
         }
     }
 }

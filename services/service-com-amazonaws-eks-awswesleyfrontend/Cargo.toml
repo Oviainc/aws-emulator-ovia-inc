@@ -44,6 +44,11 @@ aws-sdk-cloudwatchlogs = { version = "1", default-features = false }
 # decode of the URL-encoded form IAM reports a document in — shared with every
 # other service that resolves a caller-supplied role.
 service-common = { path = "../common" }
+# An add-on's `configurationValues` document is written in JSON or in YAML, and a
+# document that is neither is refused, so the add-on write operations have to know
+# whether a body parses as YAML at all. yaml-rust2 is the pure-Rust YAML 1.2
+# implementation the other services that read caller-supplied YAML already use.
+yaml-rust2 = { version = "0.10", default-features = false }
 
 [dev-dependencies]
 # The clock-owed `CREATING` -> `ACTIVE` test waits with `tokio::time::sleep`, so

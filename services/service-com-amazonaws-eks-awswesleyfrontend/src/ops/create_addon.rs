@@ -14,23 +14,35 @@
 //!    otherwise `ResourceNotFoundException` (404), before any member of the body is
 //!    looked at, because a request against a cluster that does not exist cannot be
 //!    answered whatever else it says;
-//! 2. that cluster must be `ACTIVE` — otherwise `InvalidRequestException` (400), the
-//!    modelled error for "the request is invalid given the state of the cluster";
+//! 2. that cluster must have an Amazon EKS-managed control plane for an add-on to
+//!    live in — otherwise the connected-cluster refusal, which no wait can change;
 //! 3. the body's own members must hold up — otherwise `InvalidParameterException`
 //!    (400), naming the member and what it must be. The add-on and the build asked
 //!    for are held to the CATALOG the same `DescribeAddonVersions` serves: a name
 //!    the catalog publishes no build of for the cluster's Kubernetes version, and a
-//!    build whose compatibilities do not carry that version, are both refused;
-//! 4. the add-on must not already be installed — otherwise `ResourceInUseException`
+//!    build whose compatibilities do not carry that version, are both refused, and
+//!    the `configurationValues` document is read and held to the schema
+//!    `DescribeAddonConfiguration` publishes for that build. What the request ASKS
+//!    FOR does not depend on what the cluster is doing, so this layer runs BEFORE
+//!    the one below: a caller debugging its request is told what is wrong with it
+//!    rather than what the cluster is busy with;
+//! 4. that cluster must be `ACTIVE` — otherwise `InvalidRequestException` (400), the
+//!    modelled error for "the request is invalid given the state of the cluster";
+//! 5. the add-on must not already be installed — otherwise `ResourceInUseException`
 //!    (409), unless the request replays the `clientRequestToken` that created it, in
 //!    which case that add-on is returned again. This layer runs BEFORE the checks on
 //!    the child resources the add-on would create, so a retry of a call that already
 //!    succeeded is absorbed rather than colliding with its own children;
-//! 5. the EKS Pod Identity associations the add-on would create must fit the
+//! 6. the EKS Pod Identity associations the add-on would create must fit the
 //!    cluster's association ceiling and must not double-book a `(namespace, service
 //!    account)` pair — otherwise `InvalidRequestException` (400) or
 //!    `ResourceInUseException` (409), decided before anything is written, so a
 //!    request that cannot be carried out in full writes nothing.
+//!
+//! What a refusal's PAYLOAD reports beside the sentence is a rule of its own: a
+//! refusal about the add-on the request names, or about the cluster, reports them in
+//! the exception's `addonName`/`clusterName`, while one about the request's own text
+//! carries the sentence alone — see the two refusal shapes the handler builds.
 //!
 //! The record carries both the caller's input and the server-generated parts
 //! (`addonArn`, `createdAt`, `modifiedAt`, the assigned version, the namespace the
@@ -138,8 +150,8 @@ use super::types::*;
 use crate::state::{
     self, AddonRecord,
     ADDON_DEFAULT_NAMESPACE, ADDON_OWNER_AWS, ADDON_PUBLISHER_EKS, ADDON_STATUS_CREATING,
-    DEFAULT_KUBERNETES_VERSION, MAX_ADDONS_PER_CLUSTER,
-    MAX_POD_IDENTITY_ASSOCIATIONS_PER_CLUSTER, STATUS_ACTIVE,
+    CLUSTER_STATUSES_AN_ADDON_IS_MANAGED_IN, DEFAULT_KUBERNETES_VERSION, MAX_ADDONS_PER_CLUSTER,
+    MAX_POD_IDENTITY_ASSOCIATIONS_PER_CLUSTER,
 };
 use std::time::SystemTime;
 
@@ -230,10 +242,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = store.lock();
         guard.materialize_due_transitions(now);
 
-        // An `InvalidParameterException` naming the member that is wrong: "The
-        // specified parameter is invalid. Review the available parameters for the API
-        // request." Built here so every parameter layer below reports the same way.
+        // The two refusal shapes every parameter layer below reports through, both the
+        // `InvalidParameterException` the operation models for a member of the body —
+        // "The specified parameter is invalid. Review the available parameters for the
+        // API request." — and differing only in WHAT the payload reports beside the
+        // sentence.
+        //
+        // RULE: a refusal ABOUT THE ADD-ON the request names — the add-on this cluster
+        // is not offered, the build it is not offered, the configuration that add-on
+        // does not take — reports the add-on and its cluster in the exception's
+        // `addonName`/`clusterName`; one about the REQUEST'S OWN TEXT — a member of a
+        // form no add-on name, role ARN, service account or namespace can have, and a
+        // document that cannot be read at all — carries the sentence alone, as the
+        // recorded service answers each.
         let invalid_parameter = |message: String| {
+            CreateAddonError::from(CreateAddonErrorModeled::InvalidParameterException(
+                InvalidParameterException {
+                    message: Some(message),
+                    ..Default::default()
+                },
+            ))
+        };
+        let invalid_parameter_about_the_addon = |message: String| {
             CreateAddonError::from(CreateAddonErrorModeled::InvalidParameterException(
                 InvalidParameterException {
                     cluster_name: Some(input.cluster_name.clone()),
@@ -274,37 +304,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        // LAYER 3 — the cluster's state. `InvalidRequestException` is "The request is
-        // invalid given the state of the cluster. Check the state of the cluster and
-        // the associated operations": an add-on is installed into a running control
-        // plane, so a cluster that is still `CREATING` (or deleting, updating, failed)
-        // cannot take one.
-        if cluster.status != STATUS_ACTIVE {
-            return Err(CreateAddonErrorModeled::InvalidRequestException(
-                InvalidRequestException {
-                    cluster_name: Some(input.cluster_name.clone()),
-                    addon_name: Some(input.addon_name.clone()),
-                    message: Some(format!(
-                        "Cluster {} is in {} status; it must be {STATUS_ACTIVE} to create \
-                         an add-on.",
-                        input.cluster_name, cluster.status
-                    )),
-                    ..Default::default()
-                },
-            )
-            .into());
-        }
-        // The cluster's own Kubernetes version, which the add-on's default version is
-        // taken from. Every cluster this far into the handler is an Amazon EKS cluster
-        // and reports one; the service's default Kubernetes version stands in for a
-        // record that somehow carries none.
+        // LAYER 3 — the body's own members. Each is a rule the model cannot express,
+        // so the boundary validator passed the request and this is where it is caught.
+        //
+        // They are judged BEFORE the state of the cluster (LAYER 4 below): what this
+        // request ASKS FOR does not depend on what the cluster is doing, and the
+        // recorded service answers a request whose members do not hold up with the
+        // refusal those members earn rather than with the state of the cluster — so a
+        // caller debugging its request is told what is wrong with it.
+        //
+        // The cluster's own Kubernetes version, which the catalog layers below narrow
+        // to and the add-on's default version is taken from, and its status, which
+        // LAYER 4 judges, are both read off the record here so nothing below holds a
+        // borrow of it. Every cluster this far into the handler is an Amazon EKS
+        // cluster and reports a version; the service's default Kubernetes version
+        // stands in for a record that somehow carries none.
+        let cluster_status = cluster.status.clone();
         let cluster_version = cluster
             .version
             .clone()
             .unwrap_or_else(|| DEFAULT_KUBERNETES_VERSION.to_string());
 
-        // LAYER 4 — the body's own members. Each is a rule the model cannot express,
-        // so the boundary validator passed the request and this is where it is caught.
         if !state::is_addon_name_shaped(&input.addon_name) {
             return Err(invalid_parameter(format!(
                 "addonName {:?} is not an add-on name: it must be a non-empty string of \
@@ -319,10 +339,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before any version is resolved and before anything is written, rather than
         // installed at a version nothing published.
         if !guard.publishes_addon_for(&input.addon_name, &cluster_version, now) {
-            return Err(invalid_parameter(state::addon_not_supported_message(
-                &input.addon_name,
-                &cluster_version,
-            )));
+            return Err(invalid_parameter_about_the_addon(
+                state::addon_not_supported_message(&input.addon_name, &cluster_version),
+            ));
         }
         // "The version of the add-on. The version must match one of the versions
         // returned by DescribeAddonVersions" — the same listing, narrowed the same
@@ -341,7 +360,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &cluster_version,
                 now,
             ) {
-                return Err(invalid_parameter(
+                return Err(invalid_parameter_about_the_addon(
                     state::ADDON_VERSION_NOT_SUPPORTED_MESSAGE.to_string(),
                 ));
             }
@@ -370,43 +389,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // "The set of configuration values for the add-on that's created. The values
         // that you provide are validated against the schema returned by
-        // DescribeAddonConfiguration" — so a JSON document is held to exactly that
-        // schema, the one the catalog publishes for the build being installed
-        // (`crate::state::AddonCatalogRecord::configuration_violation`): a key the
-        // add-on's schema does not declare, a declared key of the wrong JSON type and
-        // a missing required property are each refused, naming the path at fault.
-        // Before any of that, a document which opens like JSON must BE JSON: an add-on
-        // configuration is JSON or YAML, and a JSON document that does not parse can
-        // never satisfy any schema. A YAML document is not validated here — the schema
-        // is a JSON Schema. The build is one the catalog offers this cluster by the
-        // time this runs (see above), so the schema it is held to is the one
+        // DescribeAddonConfiguration" — so the document is READ first and then held to
+        // exactly that schema, the one the catalog publishes for the build being
+        // installed (`crate::state::AddonCatalogRecord::configuration_violation`): a
+        // key the add-on's schema does not declare, a declared key of the wrong JSON
+        // type and a missing required property are each refused, naming the path at
+        // fault. An add-on configuration is written in JSON or in YAML and EITHER form
+        // is held to that schema, so the refusal names the format the document was
+        // read as; a document that is neither cannot be read at all and is refused
+        // for that ([`crate::state::read_addon_configuration`]) before any schema is
+        // consulted. The build is one the catalog offers this cluster by the time this
+        // runs (see above), so the schema it is held to is the one
         // `DescribeAddonConfiguration` publishes for that same build.
-        if let Some(values) = input
-            .configuration_values
-            .as_deref()
-            .map(str::trim)
-            .filter(|values| values.starts_with('{') || values.starts_with('['))
-        {
-            match serde_json::from_str::<serde_json::Value>(values) {
-                Err(error) => {
-                    return Err(invalid_parameter(format!(
-                        "configurationValues opens like JSON but is not valid JSON: {error}"
-                    )));
-                }
-                Ok(document) => {
-                    if let Some(violation) = guard
-                        .published_addon_build(&input.addon_name, &addon_version, now)
-                        .and_then(|(addon, build)| {
-                            addon.configuration_violation(build, &document)
-                        })
-                    {
-                        return Err(invalid_parameter(format!(
-                            "ConfigurationValue provided in request is not supported: Json \
-                             schema validation failed with error: [{violation}]"
-                        )));
-                    }
+        let configuration = state::read_addon_configuration(input.configuration_values.as_deref());
+        match &configuration {
+            state::AddonConfiguration::Unreadable => {
+                return Err(invalid_parameter(
+                    state::ADDON_CONFIGURATION_UNREADABLE_MESSAGE.to_string(),
+                ));
+            }
+            state::AddonConfiguration::Read { document, .. } => {
+                if let Some(violation) = guard
+                    .published_addon_build(&input.addon_name, &addon_version, now)
+                    .and_then(|(addon, build)| addon.configuration_violation(build, document))
+                {
+                    return Err(invalid_parameter_about_the_addon(
+                        state::addon_configuration_violation_message(
+                            configuration.format(),
+                            &violation,
+                        ),
+                    ));
                 }
             }
+            state::AddonConfiguration::Absent => {}
         }
         // `podIdentityAssociations` maps a Kubernetes service account to an IAM role,
         // so each entry's role must be a role ARN and each service account must be a
@@ -501,7 +516,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`AddonInfo$defaultNamespace`, `DescribeAddonVersions`), so a request that
         // names no namespace installs the add-on where the catalog says it goes.
         // Every add-on this far into the handler is one the catalog publishes (see
-        // LAYER 4 above), so [`ADDON_DEFAULT_NAMESPACE`] stands in only for a catalog
+        // LAYER 3 above), so [`ADDON_DEFAULT_NAMESPACE`] stands in only for a catalog
         // entry that somehow publishes no namespace of its own.
         let namespace = input
             .namespace_config
@@ -513,6 +528,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map(|published| published.default_namespace.clone())
             })
             .unwrap_or_else(|| ADDON_DEFAULT_NAMESPACE.to_string());
+
+        // LAYER 4 — the cluster's state. `InvalidRequestException` is "The request is
+        // invalid given the state of the cluster. Check the state of the cluster and
+        // the associated operations". An add-on install is ASYNCHRONOUS, so a cluster
+        // Amazon EKS is still provisioning takes one — the install settles after that
+        // cluster is running (see [`crate::state::AddonRecord::active_at`] and
+        // [`crate::state::ComAmazonawsEksAwswesleyfrontendState::addon_install_settles_at`])
+        // — and what is refused is a cluster whose state no add-on of it can outlive
+        // ([`crate::state::CLUSTER_STATUSES_AN_ADDON_IS_MANAGED_IN`]). It is a
+        // statement about the CLUSTER, so the exception names it and the add-on that
+        // could not be installed onto it.
+        if !CLUSTER_STATUSES_AN_ADDON_IS_MANAGED_IN.contains(&cluster_status.as_str()) {
+            return Err(CreateAddonErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    cluster_name: Some(input.cluster_name.clone()),
+                    addon_name: Some(input.addon_name.clone()),
+                    message: Some(state::cluster_cannot_manage_an_addon(
+                        &input.cluster_name,
+                        &cluster_status,
+                        "take an add-on",
+                    )),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
 
         // LAYER 5 — the add-on itself. One add-on name installs at most once per
         // cluster. This layer runs BEFORE the checks on the child associations below:
@@ -552,11 +593,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             return Err(CreateAddonErrorModeled::ResourceInUseException(
                 ResourceInUseException {
-                    cluster_name: Some(input.cluster_name.clone()),
-                    addon_name: Some(input.addon_name.clone()),
-                    // The sentence Amazon EKS answers a duplicate install with; the
-                    // cluster and the add-on are reported in the exception's own
-                    // `clusterName` and `addonName` members rather than in it.
+                    // The sentence Amazon EKS answers a duplicate install with, in
+                    // its entirety: the recorded error body carries this sentence
+                    // and nothing else, so neither the cluster nor the add-on is
+                    // reported in an identity member.
                     message: Some("Addon already exists.".to_string()),
                     ..Default::default()
                 },
@@ -704,6 +744,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             created_at: now,
             modified_at: now,
             active_at: Some(settles_at),
+            // Nothing has asked to remove a freshly installed add-on.
+            removed_at: None,
             service_account_role_arn: input.service_account_role_arn.clone(),
             tags: input
                 .tags
@@ -721,9 +763,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // (`AddonInfo$publisher` / `$owner` / `$marketplaceInformation`), so
             // an installed add-on reports what `DescribeAddonVersions` publishes
             // for that name rather than one value for every add-on. Every add-on
-            // this far into the handler is one the catalog publishes (see LAYER 4
-            // above); the Amazon EKS-managed pair stands in only for a catalog
-            // entry that somehow publishes none of its own.
+            // this far into the handler is one the catalog publishes (see the
+            // body-member layer above); the Amazon EKS-managed pair stands in
+            // only for a catalog entry that somehow publishes none of its own.
             publisher: catalog_metadata
                 .as_ref()
                 .map(|(publisher, _, _)| publisher.clone())
@@ -732,8 +774,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .as_ref()
                 .map(|(_, owner, _)| owner.clone())
                 .unwrap_or_else(|| ADDON_OWNER_AWS.to_string()),
-            marketplace_information: catalog_metadata
-                .and_then(|(_, _, listing)| listing),
+            marketplace_information: catalog_metadata.and_then(|(_, _, listing)| listing),
             client_request_token: input.client_request_token.clone(),
             cluster_name: input.cluster_name.clone(),
             addon_name: input.addon_name.clone(),

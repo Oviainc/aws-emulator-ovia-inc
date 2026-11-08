@@ -21,6 +21,8 @@ mod access_entry_updates;
 mod access_policy_catalog;
 #[path = "all/access_policy_revocation.rs"]
 mod access_policy_revocation;
+#[path = "all/addon_bootstrap_lifecycle.rs"]
+mod addon_bootstrap_lifecycle;
 #[path = "all/addon_catalog_coverage.rs"]
 mod addon_catalog_coverage;
 #[path = "all/addon_catalog_metadata.rs"]

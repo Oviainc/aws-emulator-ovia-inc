@@ -17,7 +17,8 @@
 use std::time::Duration;
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    ADDON_ACTIVATION_DELAY, CLUSTER_ACTIVATION_DELAY, UPDATE_COMPLETION_DELAY,
+    addon_not_updatable_message, ADDON_ACTIVATION_DELAY, CLUSTER_ACTIVATION_DELAY,
+    UPDATE_COMPLETION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -1227,9 +1228,11 @@ async fn an_update_whose_change_can_no_longer_be_made_fails() {
 }
 
 // ---------------------------------------------------------------------------
-// RULE: an add-on that is not `ACTIVE` cannot take an update: one still being
-// created is in a state the request cannot be carried out in, which is the
-// modelled 400 `InvalidRequestException`.
+// RULE: an add-on that has not SETTLED cannot take an update: one still being
+// created is in use by its own install, which is the modelled 409
+// `ResourceInUseException` — a refusal a caller that waits can retry — worded
+// with the add-on the request named and the status it is currently in, and
+// carrying both the add-on and its cluster.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1256,14 +1259,28 @@ async fn an_addon_that_is_not_active_cannot_take_an_update() {
     )
     .await;
     assert_eq!(
-        refused.status, 400,
-        "an add-on that is not ACTIVE cannot take an update, got {refused:?}"
+        refused.status, 409,
+        "an add-on that has not settled cannot take an update, got {refused:?}"
     );
     assert_eq!(
         error_code(&refused),
-        "InvalidRequestException",
-        "the state of the add-on is an invalid-request refusal, got {refused:?}"
+        "ResourceInUseException",
+        "an add-on its own install still holds is in use, got {refused:?}"
     );
+    assert_eq!(
+        refused.body["message"].as_str(),
+        Some(addon_not_updatable_message("vpc-cni", "CREATING").as_str()),
+        "the refusal names the add-on and the status it is in, got {:?}",
+        refused.body["message"]
+    );
+    for (member, expected) in [("addonName", "vpc-cni"), ("clusterName", cluster)] {
+        assert_eq!(
+            refused.body[member].as_str(),
+            Some(expected),
+            "case {member:?}: the refusal reports the add-on it could not update, got {:?}",
+            refused.body[member]
+        );
+    }
 
     // Once the clock has made it `ACTIVE` the same request is taken.
     tokio::time::sleep(ADDON_ACTIVATION_DELAY + Duration::from_millis(250)).await;

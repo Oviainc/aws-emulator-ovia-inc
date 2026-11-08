@@ -263,12 +263,16 @@ impl ErasedOperation for RefusedAddonRequest {
                 let definition = svc.definition();
                 let protocol = definition.protocol();
                 let key = protocol.routing_key(req).ok();
+                // The body is read with the codec dispatch reads one with, which is
+                // the codec `override_operation` read it with too (see
+                // [`crate::service::body_codec`]).
+                let body = super::body_codec(svc, definition);
                 // The same decision `override_operation` made, re-derived from the same
                 // request: this operation is reached only when it answered `Some`, so
                 // the refusal is found again, and answering it is FAIL CLOSED (see
                 // [`ResolveConflictsRefusal::response`]). If it somehow is not found,
                 // the modelled operation serves the request as it would have anyway.
-                match key.and_then(|key| refusal_for(key, protocol, req)) {
+                match key.and_then(|key| refusal_for(key, body, req)) {
                     Some(refusal) => Ok(refusal.response(definition, req)),
                     None => match key.and_then(|key| definition.routing_table().get(key)) {
                         Some(operation) => Err(operation),

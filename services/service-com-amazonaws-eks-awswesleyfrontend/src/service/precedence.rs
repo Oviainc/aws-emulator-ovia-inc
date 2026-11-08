@@ -520,12 +520,15 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for PrecedenceFirst<Eng> {
                 let definition = svc.definition();
                 let protocol = definition.protocol();
                 let key = protocol.routing_key(req).ok();
+                // The body is read with the codec dispatch reads one with (see
+                // [`crate::service::body_codec`]).
+                let body = super::body_codec(svc, definition);
                 // The same decision `override_operation` made, re-derived from the
                 // same request, and then the answer it owes. When neither check
                 // fires, the modelled operation the routing key names serves the
                 // request exactly as it would have.
                 match key
-                    .and_then(|key| addressed(key, protocol, req))
+                    .and_then(|key| addressed(key, body, req))
                     .and_then(|addressed| self.answer(&addressed, ctx))
                 {
                     Some(answer) => Ok(answer.response(definition, req)),

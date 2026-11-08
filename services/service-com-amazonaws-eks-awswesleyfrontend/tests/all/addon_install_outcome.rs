@@ -25,7 +25,8 @@
 use std::time::Duration;
 
 use service_com_amazonaws_eks_awswesleyfrontend::state::{
-    ADDON_ACTIVATION_DELAY, CLUSTER_ACTIVATION_DELAY, NODEGROUP_ACTIVATION_DELAY,
+    ADDON_ACTIVATION_DELAY, ADDON_DELETION_DELAY, ADDON_ISSUE_INSUFFICIENT_REPLICAS_MESSAGE,
+    CLUSTER_ACTIVATION_DELAY, NODEGROUP_ACTIVATION_DELAY,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -519,10 +520,17 @@ async fn the_state_an_install_settled_in_is_stored_and_read_back() {
     }
     wait_for_addon_settled().await;
 
-    for (addon, expected) in [
-        ("vpc-cni", "ACTIVE"),
-        ("coredns", "DEGRADED"),
-        (failed, "CREATE_FAILED"),
+    // The sentence each settled state's issue carries: the replica shortage is
+    // one fixed sentence Amazon EKS words for every add-on alike, while the
+    // missing prerequisite names the add-on and the cluster it is about.
+    for (addon, expected, fixed_message) in [
+        ("vpc-cni", "ACTIVE", None),
+        (
+            "coredns",
+            "DEGRADED",
+            Some(ADDON_ISSUE_INSUFFICIENT_REPLICAS_MESSAGE),
+        ),
+        (failed, "CREATE_FAILED", None),
     ] {
         let first = describe_addon(&router, cluster, addon).await;
         let again = describe_addon(&router, cluster, addon).await;
@@ -551,21 +559,44 @@ async fn the_state_an_install_settled_in_is_stored_and_read_back() {
             first.addon()["health"]
         );
         for issue in &issues {
-            assert!(
-                issue["message"].as_str().is_some_and(|message| {
-                    message.contains(addon) && message.contains(cluster)
-                }),
-                "case {addon:?}: the issue must say what is wrong of this add-on on this \
-                 cluster, got {:?}",
-                issue["message"]
-            );
-            assert!(
-                issue["resourceIds"]
-                    .as_array()
-                    .is_some_and(|ids| !ids.is_empty()),
-                "case {addon:?}: the issue must name the resources it is about, got {:?}",
-                issue["resourceIds"]
-            );
+            match fixed_message {
+                // The replica shortage is one fixed sentence about the add-on's own
+                // pods, which are no resource this emulator holds, so it names
+                // none.
+                Some(fixed) => {
+                    assert_eq!(
+                        issue["message"].as_str(),
+                        Some(fixed),
+                        "case {addon:?}: expected the fixed sentence {fixed:?}, got {:?}",
+                        issue["message"]
+                    );
+                    assert_eq!(
+                        issue["resourceIds"],
+                        serde_json::Value::Null,
+                        "case {addon:?}: this issue names no resource, got {:?}",
+                        issue["resourceIds"]
+                    );
+                }
+                // An issue about the resources of OTHER add-ons names them.
+                None => {
+                    assert!(
+                        issue["message"].as_str().is_some_and(|message| {
+                            message.contains(addon) && message.contains(cluster)
+                        }),
+                        "case {addon:?}: the issue must say what is wrong of this add-on on \
+                         this cluster, got {:?}",
+                        issue["message"]
+                    );
+                    assert!(
+                        issue["resourceIds"]
+                            .as_array()
+                            .is_some_and(|ids| !ids.is_empty()),
+                        "case {addon:?}: the issue must name the resources it is about, got \
+                         {:?}",
+                        issue["resourceIds"]
+                    );
+                }
+            }
         }
     }
 
@@ -591,6 +622,9 @@ async fn the_state_an_install_settled_in_is_stored_and_read_back() {
         deleted.status, 200,
         "a failed add-on can be deleted, got {deleted:?}"
     );
+    // The removal is asynchronous, so the add-on is off the cluster once the clock
+    // has finished it.
+    tokio::time::sleep(ADDON_DELETION_DELAY + Duration::from_millis(250)).await;
     let listed = list_addons(&router, cluster).await;
     assert!(
         !listed.contains(&failed.to_string()),

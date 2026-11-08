@@ -17,9 +17,10 @@
 //!    rows differ along why the build is not offered (published for other Kubernetes
 //!    versions only, published for another add-on, not published at all) and along
 //!    the operation that pins it;
-//! 3. `resolveConflicts` must be a value the modelled enum declares, so the rows
-//!    differ along how the value misses the enum and along the operation it was sent
-//!    to, which the refusal names.
+//! 3. `resolveConflicts` names one of the values the modelled enum declares,
+//!    without regard to case, so the rows differ along how the value spells no
+//!    declared option at all and along the operation it was sent to, which the
+//!    refusal names — and the accepted rows along the case it is spelled in.
 //!
 //! Every set the rows are drawn from — the published add-ons, the builds offered for
 //! a Kubernetes version, the Kubernetes versions themselves — is read out of the
@@ -522,10 +523,12 @@ async fn an_addon_version_the_catalog_does_not_offer_the_cluster_is_refused() {
 }
 
 // ---------------------------------------------------------------------------
-// RULE 3: `resolveConflicts` carries one of the values the modelled enum
-// declares. A value outside it is refused 400 `InvalidParameterException` with
-// `Resolve conflicts option <value> is not supported for operation
-// <the operation it was sent to>`, and nothing is written.
+// RULE 3: `resolveConflicts` names one of the values the modelled enum
+// declares, WITHOUT regard to case — a value that spells a declared option in
+// another case names that option. A value that spells none of them is refused
+// 400 `InvalidParameterException` with `Resolve conflicts option <value> is not
+// supported for operation <the operation it was sent to>`, and nothing is
+// written.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -536,16 +539,9 @@ async fn a_resolve_conflicts_value_outside_the_enum_is_refused_in_this_services_
     // Source for the accepted rows: the `ResolveConflicts` enum values the model
     // declares (`smithy_query query="shape" shape="ResolveConflicts"` reports
     // OVERWRITE | NONE | PRESERVE). The refused rows differ along HOW the value
-    // misses that set: unknown, the right word in the wrong case, a declared value
-    // with padding, a comma-joined pair, and the empty string.
-    let refused = [
-        "BANANA",
-        "overwrite",
-        "Preserve",
-        " NONE",
-        "NONE,OVERWRITE",
-        "",
-    ];
+    // spells no declared option in any case: unknown, a declared value with
+    // padding, a comma-joined pair, and the empty string.
+    let refused = ["BANANA", " NONE", "NONE,OVERWRITE", ""];
 
     for (index, value) in refused.iter().enumerate() {
         let addon_name = format!("refused-{index}");
@@ -639,18 +635,35 @@ async fn a_resolve_conflicts_value_outside_the_enum_is_refused_in_this_services_
         );
     }
 
-    // Every value the enum declares is accepted, on both operations. One add-on per
-    // value, since one name installs at most once per cluster.
-    let accepted = ["NONE", "OVERWRITE", "PRESERVE"];
-    let published = published_addon_names(&router).await;
+    // Every value the enum declares is accepted, on both operations, and so is a
+    // value that spells one of them in another case: the member is read WITHOUT
+    // regard to case, which is how the recorded service reads it. One add-on per
+    // row, since one name installs at most once per cluster, and each name is one
+    // the catalog offers this cluster's Kubernetes version — read out of the
+    // catalog rather than written here.
+    let accepted = [
+        "NONE",
+        "OVERWRITE",
+        "PRESERVE",
+        "overwrite",
+        "Preserve",
+        "none",
+    ];
+    let version = default_cluster_version(&router).await;
+    let mut installable: Vec<String> = Vec::new();
+    for name in published_addon_names(&router).await {
+        if !catalog_builds(&router, &name, &version).await.is_empty() {
+            installable.push(name);
+        }
+    }
     assert!(
-        published.len() >= accepted.len(),
-        "setup: the catalog must publish at least {} add-ons, got {}",
+        installable.len() >= accepted.len(),
+        "setup: the catalog must offer at least {} add-ons on {version}, got {}",
         accepted.len(),
-        published.len()
+        installable.len()
     );
     for (index, value) in accepted.iter().enumerate() {
-        let addon_name = published[index].clone();
+        let addon_name = installable[index].clone();
         let answer = create_addon(
             &router,
             "conflicts",
@@ -659,7 +672,7 @@ async fn a_resolve_conflicts_value_outside_the_enum_is_refused_in_this_services_
         .await;
         assert_eq!(
             answer.status, 200,
-            "case {value:?}: a declared enum value is accepted, got {answer:?}"
+            "case {value:?}: a value that names a declared option is accepted, got {answer:?}"
         );
         let update = update_addon(
             &router,
@@ -670,7 +683,8 @@ async fn a_resolve_conflicts_value_outside_the_enum_is_refused_in_this_services_
         .await;
         assert_eq!(
             update.status, 200,
-            "case {value:?} (UpdateAddon): a declared enum value is accepted, got {update:?}"
+            "case {value:?} (UpdateAddon): a value that names a declared option is \
+             accepted, got {update:?}"
         );
         // One add-on takes one update at a time, so the update just started is waited
         // out before the next row starts another.
