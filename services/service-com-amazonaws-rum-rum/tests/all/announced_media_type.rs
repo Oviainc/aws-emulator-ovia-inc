@@ -6,13 +6,15 @@
 //! restJson1 request — so routing, deserialization, the modelled constraints, the handler
 //! and the response ENVELOPE are all exercised, not just a handler body.
 //!
-//! The rule pinned here is a property of the SERVICE, not of one operation: the media
-//! type a RUM response announces for a JSON body is the one the REQUEST's payload
-//! declared — `restJson1`'s `application/json`
-//! ([`crate::support`]'s requests and an SDK's send no other) — and a request that carried
-//! NO payload declared none, so its answer falls back to RUM's own JSON type,
-//! `application/x-amz-json-1.1` (`crate::state::RESPONSE_CONTENT_TYPE`). That holds
-//! whatever the operation, whatever the status, and whoever produced the answer — a
+//! The rule pinned here is a property of the FRONTEND that answers the call, not of one
+//! operation. RUM's ARN-addressed tagging frontend (`/tags/{ResourceArn}`) announces
+//! `restJson1`'s `application/json` on every JSON body it answers with, whatever the
+//! status and whether or not the request carried a payload; every other frontend of this
+//! service announces the media type the REQUEST's payload declared — `restJson1`'s
+//! `application/json` ([`crate::support`]'s requests and an SDK's send no other) — and a
+//! request that carried NO payload declared none, so its answer falls back to RUM's own
+//! JSON type, `application/x-amz-json-1.1` (`crate::state::RESPONSE_CONTENT_TYPE`). That
+//! holds whatever the operation, whatever the status, and whoever produced the answer — a
 //! handler's success, a handler's modelled error, or a refusal the request boundary
 //! raised. The `restJson1` protocol the model declares announces
 //! `application/json` on every JSON body, so the fallback is recorded behaviour the
@@ -24,7 +26,8 @@
 //! and on the same operation group), all four HTTP methods RUM binds, every operation
 //! group (app monitor, resource policy, metrics destinations, tagging, the data plane),
 //! the 200 / 400 / 404 / 409 status classes, and outputs that model members as well as
-//! outputs that model none.
+//! outputs that model none. The tagging frontend's own half is spanned operation by
+//! operation and status by status in [`crate::tagging_frontend_media_type`].
 
 use serde_json::{json, Value};
 use service_com_amazonaws_rum_rum::state::{JSON_CONTENT_TYPE, RESPONSE_CONTENT_TYPE};
@@ -191,6 +194,7 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: tags_uri(live),
             body: Some(json!({"Tags": {"Team": "observability"}})),
             status: 204,
+            // The tagging frontend announces `restJson1`'s own type on every body.
             announces: JSON_CONTENT_TYPE,
             expected: Body::MemberLess,
         },
@@ -200,7 +204,9 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: tags_uri(live),
             body: None,
             status: 200,
-            announces: RESPONSE_CONTENT_TYPE,
+            // No payload, and still `application/json`: this is the tagging frontend,
+            // which announces that type whatever the request carried.
+            announces: JSON_CONTENT_TYPE,
             expected: Body::Members,
         },
         Case {
@@ -209,20 +215,21 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: format!("{}?tagKeys=Team", tags_uri(live)),
             body: None,
             status: 204,
-            announces: RESPONSE_CONTENT_TYPE,
+            announces: JSON_CONTENT_TYPE,
             expected: Body::MemberLess,
         },
         Case {
             // The one route the protocol's routing key cannot name — a `DELETE
             // /tags/{ResourceArn}` binding no `tagKeys` value, the empty key list
             // `TagKeyList`'s `@length(min: 0)` admits — is served by the service's own
-            // seam, so it must announce the same media type as every other response.
+            // seam, so it must announce the same media type as every other answer of the
+            // frontend that serves it.
             case: "UntagResource 204 (DELETE, no tagKeys bound)",
             method: "DELETE",
             path: tags_uri(live),
             body: None,
             status: 204,
-            announces: RESPONSE_CONTENT_TYPE,
+            announces: JSON_CONTENT_TYPE,
             expected: Body::MemberLess,
         },
         Case {
@@ -272,7 +279,7 @@ fn cases(live: &str, live_id: &str) -> Vec<Case> {
             path: "/tags/not-an-arn-at-all".to_string(),
             body: None,
             status: 400,
-            announces: RESPONSE_CONTENT_TYPE,
+            announces: JSON_CONTENT_TYPE,
             expected: Body::Error("BadRequestException"),
         },
         Case {

@@ -3594,20 +3594,29 @@ pub fn app_monitor_quota_exceeded(ceiling: usize) -> ServiceQuotaExceededExcepti
     }
 }
 
-/// The media type RUM announces for the JSON body of an answer to a request that carried
-/// no payload, and so declared no media type of its own.
+/// The media type RUM's app-monitor, resource-policy and metrics frontends announce for the
+/// JSON body of an answer to a request that carried no payload, and so declared no media
+/// type of its own.
 ///
 /// RECORDED BEHAVIOUR: the model declares `restJson1`, whose serializer stamps
 /// [`JSON_CONTENT_TYPE`] on a JSON body, but a recorded real-RUM answer to a request with
 /// no payload — `GetAppMonitor`, `ListAppMonitors`, `DeleteAppMonitor`, the resource-policy
-/// reads, `ListRumMetricsDestinations`, their 404s included — carries
-/// `application/x-amz-json-1.1`: the frontend answers in the media type the request's
-/// payload declared, and a payload-less request declared none, so it falls back to RUM's
-/// own JSON type. An answer to a request that DID carry a payload (`CreateAppMonitor`,
-/// `UpdateAppMonitor`, `PutResourcePolicy`, `PutRumEvents`,
+/// reads, `ListRumMetricsDestinations`, the metric-definition reads, their 404s included —
+/// carries `application/x-amz-json-1.1`: the frontend answers in the media type the
+/// request's payload declared, and a payload-less request declared none, so it falls back
+/// to RUM's own JSON type. An answer to a request that DID carry a payload
+/// (`CreateAppMonitor`, `UpdateAppMonitor`, `PutResourcePolicy`, `PutRumEvents`,
 /// `BatchCreateRumMetricDefinitions`, their 4xxs included) is recorded in
 /// [`JSON_CONTENT_TYPE`], the type that payload declared. The body is the same JSON
 /// either way, so nothing but the announced type differs.
+///
+/// It is NOT what the ARN-addressed TAGGING frontend announces: a recorded
+/// `ListTagsForResource` 200 and a recorded `UntagResource` 204 — both answers to a
+/// payload-less request — carry [`JSON_CONTENT_TYPE`], as do that frontend's recorded 400
+/// (a `ResourceArn` that is not an ARN) and 404 (one naming no resource). That frontend has
+/// its own error vocabulary too ([`TAGGING_BAD_REQUEST_ERROR_CODE`]); the media type is the
+/// same split, so which frontend answers the call is what settles the header
+/// (`crate::service::serves_the_tagging_frontend`).
 ///
 /// How the payload half is known: a replay of the recorded fixture
 /// `rum-multi-platform-monitors` with `application/x-amz-json-1.1` announced on EVERY
@@ -3623,7 +3632,8 @@ pub fn app_monitor_quota_exceeded(ceiling: usize) -> ServiceQuotaExceededExcepti
 pub const RESPONSE_CONTENT_TYPE: &str = "application/x-amz-json-1.1";
 
 /// The media type the `restJson1` serializer stamps on a JSON body — the one value
-/// [`RESPONSE_CONTENT_TYPE`] replaces, and the one a request's JSON payload declares. A
+/// [`RESPONSE_CONTENT_TYPE`] replaces, the one a request's JSON payload declares, and the
+/// one the ARN-addressed tagging frontend announces on every body it answers with. A
 /// response whose body is NOT that JSON envelope (a `@httpPayload` blob's
 /// `application/octet-stream`, a string payload's `text/plain`) announces the type its own
 /// target shape maps to and is left alone.

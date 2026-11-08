@@ -127,6 +127,8 @@ mod support;
 mod tag_key_clauses;
 #[path = "all/tagging_authorization.rs"]
 mod tagging_authorization;
+#[path = "all/tagging_frontend_media_type.rs"]
+mod tagging_frontend_media_type;
 #[path = "all/tagging_no_content.rs"]
 mod tagging_no_content;
 #[path = "all/vended_cw_log_group.rs"]

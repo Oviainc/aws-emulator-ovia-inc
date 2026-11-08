@@ -52,18 +52,28 @@
 //!
 //! The model declares `restJson1`, whose serializer announces
 //! [`crate::state::JSON_CONTENT_TYPE`] on every JSON body, but a recorded RUM response to
-//! a request that carried NO payload — every operation, a 200 and a 404 alike — carries
+//! a request that carried NO payload — a 200 and a 404 alike — carries
 //! [`crate::state::RESPONSE_CONTENT_TYPE`] instead, and the announced media type is what a
-//! client selecting a parser or validating the response's type reads. What the frontend
-//! answers in is the media type the REQUEST's payload declared, and a request that carried
-//! none declared nothing, so such an answer falls back to RUM's own JSON type; a request
-//! that DID carry a payload declared `restJson1`'s `application/json` and is answered in
-//! it. Both halves are a property of the SERVICE, uniform across operations and across
-//! success and error paths, so they are applied once here rather than in twenty handlers:
-//! [`AnnouncedMediaType`] fronts every request this service serves, runs the operation
-//! the model names unchanged, and settles that one header on the way out
-//! ([`announced`]). A response whose body is not the JSON envelope keeps the type its own
-//! target shape maps to.
+//! client selecting a parser or validating the response's type reads. WHICH frontend
+//! answers the call settles it, because the media type is that frontend's own:
+//!
+//! * the ARN-addressed TAGGING frontend ([`TAGGING_OPERATIONS`], the operations bound to
+//!   `/tags/{ResourceArn}`) labels every JSON body it answers with — a success and a
+//!   refusal alike, whether or not the request carried a payload — `restJson1`'s
+//!   [`crate::state::JSON_CONTENT_TYPE`], the type the codec already stamps, so its
+//!   answers are left exactly as the serializer produced them;
+//! * every other frontend of this service answers in the media type the REQUEST's payload
+//!   declared, and a request that carried none declared nothing, so such an answer falls
+//!   back to RUM's own JSON type; a request that DID carry a payload declared
+//!   `application/json` and is answered in it.
+//!
+//! Each half is a property of a FRONTEND rather than of one operation, uniform across its
+//! operations and across its success and error paths, so they are applied once here rather
+//! than in twenty handlers: [`AnnouncedMediaType`] fronts every request this service
+//! serves, runs the operation the model names unchanged, and settles that one header on
+//! the way out ([`announced`], which reads the frontend off the operation the model names
+//! for the request — [`serves_the_tagging_frontend`]). A response whose body is not the
+//! JSON envelope keeps the type its own target shape maps to.
 //!
 //! `override_protocol` is not the seam for it: the codec is right, and swapping in
 //! another protocol would swap away the URI-based routing this REST service needs.
@@ -179,6 +189,36 @@ fn is_tagging_refusal(violations: &[Violation]) -> bool {
 /// of these is worded in that frontend's error vocabulary ([`stated`]) whatever member it is
 /// about, which [`TAGGING_MEMBER_PATHS`] cannot say on its own for the tag map.
 const TAGGING_OPERATIONS: [&str; 3] = ["TagResource", "UntagResource", "ListTagsForResource"];
+
+/// Whether RUM's ARN-addressed tagging frontend is the one that answers `req`, read off the
+/// operation the model names for it rather than off the request's shape.
+///
+/// That frontend is reached by exactly the operations [`TAGGING_OPERATIONS`] lists — the
+/// three the model binds to `/tags/{ResourceArn}` — and it both words its refusals
+/// ([`TAGGING_BAD_REQUEST_CODE`]) and announces its media type ([`announced`]) in its own
+/// vocabulary.
+///
+/// The operation is the protocol's routing key, the same key the generated routing table is
+/// keyed by, or — for a request that key cannot name — the operation the model binds to the
+/// request's method and path ([`QUERY_UNMATCHED_ROUTES`]), so a `DELETE
+/// /tags/{ResourceArn}` binding no `tagKeys` value is answered by the frontend of the
+/// operation it reaches. A request this service answers without naming a modelled operation
+/// at all reaches no frontend of its own.
+fn serves_the_tagging_frontend(svc: &dyn Service, req: &RtRequest) -> bool {
+    let operation = routing_key_name(svc, req).or_else(|| query_unmatched_operation(req));
+    operation.is_some_and(|name| TAGGING_OPERATIONS.contains(&name))
+}
+
+/// The modelled name of the operation `req` names: the key the protocol resolves, which is
+/// the key the generated routing table is keyed by and the name `Operation::NAME` reports.
+///
+/// ONE spelling of "the operation the model names for this request", so the places that ask
+/// — which operation's input schema a refusal is read against, which operation serves the
+/// request, and which frontend answers it — cannot come to different answers. `None` for a
+/// request whose key the protocol cannot resolve.
+fn routing_key_name<'r>(svc: &dyn Service, req: &'r RtRequest) -> Option<&'r str> {
+    svc.definition().protocol().routing_key(req).ok()
+}
 
 /// Whether one of these violations says the `ResourceArn` is not an ARN: a `@pattern`
 /// violation on that member, which is the one refusal the tagging frontend has its own
@@ -456,7 +496,7 @@ impl<Eng: Send + Sync + 'static> AnnouncedMediaType<Eng> {
         svc: &dyn Service,
         req: &RtRequest,
     ) -> Option<(Vec<Violation>, Refused)> {
-        let key = svc.definition().protocol().routing_key(req).ok()?;
+        let key = routing_key_name(svc, req)?;
         let protocol = svc.definition().protocol();
         stated_refusal_for_key!(
             key,
@@ -701,12 +741,17 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AnnouncedMediaType<Eng> {
             // read, used and dropped inside each statement: `&dyn
             // ErasedServiceDefinition` is not `Sync`, so holding one across the await
             // below would make this future non-`Send`.
+            //
+            // WHICH frontend answers this request is read here too, for the same reason:
+            // it is resolved from the definition, and the one fact the answer needs of it
+            // travels across the await as a plain value.
+            let tagging = serves_the_tagging_frontend(svc, req);
             let refused = self.stated_refusal(svc, req);
             if let Some((violations, chosen)) = refused {
                 let response = svc
                     .definition()
                     .refusal_response(ProtocolError::Invalid(violations), Some(chosen), req);
-                return announced(req, response);
+                return announced(req, response, tagging);
             }
             // The generated operation serves the request through the framework's own
             // deserialize -> validate -> handle -> serialize sequence, so a modelled
@@ -723,7 +768,7 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AnnouncedMediaType<Eng> {
                 // cases above.
                 None => svc.definition().routing_error_response(req),
             };
-            announced(req, response)
+            announced(req, response, tagging)
         })
     }
 
@@ -744,9 +789,9 @@ impl<Eng: Send + Sync + 'static> ErasedOperation for AnnouncedMediaType<Eng> {
 /// A request that carries one declares its media type (`restJson1` has exactly one for a
 /// JSON payload, [`crate::state::JSON_CONTENT_TYPE`]); a request whose members are all
 /// bound to the URI, the query string or the headers carries no body and declares nothing.
-/// That is the distinction [`announced`] settles the response's media type on, so it is
-/// read off the BODY rather than off a `content-type` header a client may send on a
-/// payload-less request anyway.
+/// That is the distinction [`announced`] settles the response's media type on for every
+/// frontend but the tagging one, so it is read off the BODY rather than off a
+/// `content-type` header a client may send on a payload-less request anyway.
 ///
 /// A body whose bytes are not in memory (a stream of unknown length) is a payload: only a
 /// body that is known to be empty is not one.
@@ -756,17 +801,21 @@ fn carries_a_payload(req: &RtRequest) -> bool {
         .is_none_or(|bytes: &[u8]| !bytes.is_empty())
 }
 
-/// The response as this service announces it: one media type for every JSON body it
-/// produces in answer to a payload-less request, successes and failures alike.
+/// The response as the frontend that produced it announces it: one media type for every
+/// JSON body that frontend answers a payload-less request with, successes and failures
+/// alike.
 ///
 /// Only the `restJson1` JSON envelope is re-announced
 /// ([`crate::state::JSON_CONTENT_TYPE`] -> [`crate::state::RESPONSE_CONTENT_TYPE`]), and
-/// only for a request that declared no media type of its own by carrying no payload (see
-/// [`carries_a_payload`] and the module docs). A body that is not that envelope, and an
-/// answer to a request that did carry a payload, carries the type its own target shape
-/// maps to and is left exactly as the serializer produced it.
-fn announced(req: &RtRequest, mut response: RtResponse) -> RtResponse {
-    if carries_a_payload(req) {
+/// only for an answer of a frontend that announces RUM's own JSON type for a request which
+/// declared no media type of its own by carrying no payload (see [`carries_a_payload`] and
+/// the module docs). The tagging frontend (`tagging`, read by
+/// [`serves_the_tagging_frontend`]) announces `restJson1`'s own type on every body it
+/// answers with, so its answers are never re-announced. A body that is not that envelope,
+/// and an answer to a request that did carry a payload, carries the type its own target
+/// shape maps to and is left exactly as the serializer produced it.
+fn announced(req: &RtRequest, mut response: RtResponse, tagging: bool) -> RtResponse {
+    if tagging || carries_a_payload(req) {
         return response;
     }
     if response.headers().get("content-type") == Some(crate::state::JSON_CONTENT_TYPE) {
@@ -779,7 +828,7 @@ fn announced(req: &RtRequest, mut response: RtResponse) -> RtResponse {
 
 /// The operation the model's routing table names for this request.
 fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dyn ErasedOperation> {
-    let key = svc.definition().protocol().routing_key(req).ok()?;
+    let key = routing_key_name(svc, req)?;
     svc.definition().routing_table().get(key)
 }
 
