@@ -1900,6 +1900,12 @@ fn audit_sink() -> Arc<std::sync::Mutex<Vec<Record>>> {
             records: Arc::clone(&records),
         })
         .expect("this suite installs the only tracing subscriber in the test binary");
+        // `tracing` caches each callsite's INTEREST the first time it is hit, and with no
+        // subscriber installed yet that cached answer is "never enabled" — so an audit
+        // callsite some other case of this binary reached before this install would stay
+        // silent, and which records arrive would depend on the order the cases happened to
+        // run in. Rebuilding the cache re-asks this subscriber about every callsite.
+        tracing::callsite::rebuild_interest_cache();
         records
     }))
 }
@@ -1910,6 +1916,12 @@ fn audit_sink() -> Arc<std::sync::Mutex<Vec<Record>>> {
 #[tokio::test]
 async fn every_state_changing_operation_emits_an_audit_record() {
     let sink = audit_sink();
+    // Where this case's own records start: every case of this binary shares the sink, so
+    // anything already in it was emitted by another one.
+    let before = sink
+        .lock()
+        .expect("the capture mutex must not be poisoned")
+        .len();
 
     let router = emulator();
     let (portal_arn, _) = create_portal(&router, json!({"displayName": "audited"})).await;
@@ -1930,11 +1942,13 @@ async fn every_state_changing_operation_emits_an_audit_record() {
     )
     .await;
 
-    // Only this suite's own resources: other suites share the process-wide sink.
+    // Only this case's own records: the ones it appended, for its own resources — other
+    // cases share the process-wide sink.
     let captured: Vec<Record> = sink
         .lock()
         .expect("the capture mutex must not be poisoned")
         .iter()
+        .skip(before)
         .filter(|record| {
             record
                 .get("resource")

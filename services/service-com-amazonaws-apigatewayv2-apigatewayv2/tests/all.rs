@@ -63,6 +63,8 @@ mod constraint_refusal;
 mod create_api_modelled_outcomes;
 #[path = "all/custom_domain_hosted_zone.rs"]
 mod custom_domain_hosted_zone;
+#[path = "all/date_time_schema_coverage.rs"]
+mod date_time_schema_coverage;
 #[path = "all/deployment_deletion.rs"]
 mod deployment_deletion;
 #[path = "all/deployment_lifecycle.rs"]

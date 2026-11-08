@@ -60,7 +60,7 @@ use crate::api_lifecycle::{as_str, call, emulator};
 use crate::portal_lifecycle::portal_content;
 
 /// This service's Smithy namespace, the prefix of every shape id below.
-const NAMESPACE: &str = "com.amazonaws.apigatewayv2";
+pub(crate) const NAMESPACE: &str = "com.amazonaws.apigatewayv2";
 
 /// How far a reported instant may sit from this test's clock reading, in seconds. The
 /// point of the assertion is that the member reads the write instant rather than zero or a
@@ -731,7 +731,11 @@ fn the_projection_keeps_the_stored_instant_sub_second_digits() {
 }
 
 /// The member schemas of one shape, keyed by the shape's local name in the model.
-fn shapes_under_test() -> Vec<(&'static str, &'static Schema)> {
+///
+/// Written by hand, so `date_time_schema_coverage.rs` checks it against the model: a shape
+/// the model marks `@timestampFormat("date-time")` and this list omits keeps the derived
+/// schema, which reports no format.
+pub(crate) fn shapes_under_test() -> Vec<(&'static str, &'static Schema)> {
     vec![
         ("CreatePortalProductResponse", &CreatePortalProductOutput::SCHEMA),
         ("GetPortalProductResponse", &GetPortalProductOutput::SCHEMA),
@@ -784,7 +788,7 @@ fn shapes_under_test() -> Vec<(&'static str, &'static Schema)> {
 }
 
 /// The service's own Smithy model, as shipped in this crate.
-fn model() -> Value {
+pub(crate) fn model() -> Value {
     let path = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/smithy-model/com-amazonaws-apigatewayv2-apigatewayv2.json"
@@ -795,7 +799,7 @@ fn model() -> Value {
 
 /// Whether the model marks `member` of a structure as a `date-time` timestamp: the trait
 /// on the member itself, or — the form this model uses — on the shape the member targets.
-fn is_date_time(model: &Value, member: &Value) -> bool {
+pub(crate) fn is_date_time(model: &Value, member: &Value) -> bool {
     let on_member = member
         .get("traits")
         .and_then(|traits| traits.get("smithy.api#timestampFormat"))
