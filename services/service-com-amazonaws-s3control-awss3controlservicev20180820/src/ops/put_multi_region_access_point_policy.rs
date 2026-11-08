@@ -218,6 +218,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
             regions,
             due_at,
+            // A policy put this service accepted is one it carries out: the
+            // document is already the proposed one, so there is no outcome left
+            // to fail.
+            failure: None,
         });
 
         Ok(PutMultiRegionAccessPointPolicyOutput {

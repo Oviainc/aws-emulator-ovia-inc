@@ -12,10 +12,12 @@
 //! reports that request. Both calls are asynchronous: the access point is
 //! `CREATING` and the request `INPROGRESS` until the clock owes the outcome, and
 //! `READY` / `SUCCEEDED` after it, with nobody having to call again. A create
-//! under a name the account already holds is refused rather than becoming a
-//! second record, a byte-identical retry is handed the first call's token rather
-//! than a second resource, and a `DeleteMultiRegionAccessPoint` moves the record
-//! to `DELETING` and releases it once the clock owes that.
+//! under a name the account already holds is accepted like any other — the call
+//! answers a token and binds no errors — and the conflict settles as THAT
+//! request's outcome, leaving one record under the name; a byte-identical retry
+//! is handed the first call's token rather than a second resource, and a
+//! `DeleteMultiRegionAccessPoint` moves the record to `DELETING` and releases it
+//! once the clock owes that.
 //!
 //! Every row below differs along something that rule generalises over: how many
 //! buckets the access point associates and whether they name their owning
@@ -40,8 +42,8 @@ use crate::access_point_lifecycle::{
 use crate::storage_lens_configuration::{leaves_of, Leaf};
 
 use service_com_amazonaws_s3control_awss3controlservicev20180820::state::{
-    ASYNC_REQUEST_IN_PROGRESS, ASYNC_REQUEST_SUCCEEDED, MULTI_REGION_ACCESS_POINT_SETTLE_AFTER,
-    STATUS_CREATING, STATUS_DELETING, STATUS_READY,
+    ASYNC_REQUEST_FAILED, ASYNC_REQUEST_IN_PROGRESS, ASYNC_REQUEST_SUCCEEDED,
+    MULTI_REGION_ACCESS_POINT_SETTLE_AFTER, STATUS_CREATING, STATUS_DELETING, STATUS_READY,
 };
 
 /// A second signing Region, used to pin that a request token's ARN names the
@@ -240,6 +242,19 @@ pub(crate) async fn describe(
         region,
         "GET",
         &format!("/v20180820/async-requests/mrap/{token}"),
+        account,
+        "",
+    )
+    .await
+}
+
+/// `ListMultiRegionAccessPoints` for one account.
+async fn list(emulator: &Emulator, region: &str, account: &str) -> Reply {
+    call_in_region(
+        &emulator.router,
+        region,
+        "GET",
+        "/v20180820/mrap/instances",
         account,
         "",
     )
@@ -602,8 +617,14 @@ async fn describe_reports_the_parameters_the_request_submitted() {
     }
 }
 
+/// RULE: `CreateMultiRegionAccessPoint` answers nothing but a request token and
+/// binds no errors at all, so a create under a name the account already holds is
+/// ACCEPTED — with a token of its own — and the conflict is the OUTCOME of that
+/// request: it settles `FAILED` carrying
+/// `MultiRegionAccessPointAlreadyOwnedByYou` in its `ErrorDetails`, exactly one
+/// access point stands under the name, and the one that was there is untouched.
 #[tokio::test]
-async fn a_create_under_a_name_the_account_holds_is_refused() {
+async fn a_create_under_a_name_the_account_holds_fails_the_request_it_minted() {
     let emulator = Emulator::start();
 
     for case in create_cases() {
@@ -613,6 +634,7 @@ async fn a_create_under_a_name_the_account_holds_is_refused() {
             "case {:?}: expected the first create to answer 200, got {} with body {}",
             case.case, first.status, first.body
         );
+        let first_token = first.text("RequestTokenARN").unwrap_or_default();
 
         // A different idempotency token makes this a different request for a
         // name the account already holds — the loser of a create race.
@@ -620,32 +642,114 @@ async fn a_create_under_a_name_the_account_holds_is_refused() {
             client_token: "a-second-request",
             ..case
         };
-        let refused = create(&emulator, &second).await;
+        let losing = create(&emulator, &second).await;
         assert_eq!(
-            refused.status, 409,
-            "case {:?}: expected a duplicate name to be refused with 409, got {} with body {}",
-            second.case, refused.status, refused.body
+            losing.status, 200,
+            "case {:?}: expected the losing create to be accepted with 200, got {} with body {}",
+            second.case, losing.status, losing.body
         );
-        assert_eq!(
-            refused.code(),
-            "MultiRegionAccessPointAlreadyOwnedByYou",
-            "case {:?}: expected the name-conflict code, got body {}",
-            second.case,
-            refused.body
+        let losing_token = losing.text("RequestTokenARN").unwrap_or_default();
+        assert_ne!(
+            losing_token, first_token,
+            "case {:?}: expected the two creates to be handed distinct request tokens, got \
+             body {}",
+            second.case, losing.body
         );
 
-        // The refusal left the first access point exactly as it was.
+        // The clock, not another call, is what settles both requests.
+        std::thread::sleep(settled_wait());
+
+        let winner = describe(&emulator, second.region, second.account, &first_token).await;
+        assert_eq!(
+            leaf(&leaves_of(&winner.body), "AsyncOperation/RequestStatus"),
+            Some(ASYNC_REQUEST_SUCCEEDED.to_string()),
+            "case {:?}: expected exactly one request to have succeeded, got body {}",
+            second.case,
+            winner.body
+        );
+
+        let loser = describe(&emulator, second.region, second.account, &losing_token).await;
+        let loser_leaves = leaves_of(&loser.body);
+        assert_eq!(
+            leaf(&loser_leaves, "AsyncOperation/RequestStatus"),
+            Some(ASYNC_REQUEST_FAILED.to_string()),
+            "case {:?}: expected the losing request to have failed, got body {}",
+            second.case,
+            loser.body
+        );
+        assert_eq!(
+            leaf(
+                &loser_leaves,
+                "AsyncOperation/ResponseDetails/ErrorDetails/Code"
+            ),
+            Some(NAME_CONFLICT_CODE.to_string()),
+            "case {:?}: expected the name-conflict code in the failure's error details, got \
+             body {}",
+            second.case,
+            loser.body
+        );
+        assert_eq!(
+            leaf(
+                &loser_leaves,
+                "AsyncOperation/ResponseDetails/ErrorDetails/Message"
+            ),
+            Some(format!(
+                "A Multi-Region Access Point with the same name already exists: {}",
+                second.name
+            )),
+            "case {:?}: expected the failure to name the contested access point, got body {}",
+            second.case,
+            loser.body
+        );
+        let regional: Vec<String> = loser_leaves
+            .iter()
+            .filter(|(path, _)| {
+                path == "AsyncOperation/ResponseDetails/MultiRegionAccessPointDetails/\
+                         Regions/Region/RequestStatus"
+            })
+            .map(|(_, value)| value.clone())
+            .collect();
+        assert_eq!(
+            regional,
+            vec![ASYNC_REQUEST_FAILED.to_string(); second.regions.len()],
+            "case {:?}: expected one failed entry per associated Region, got body {}",
+            second.case,
+            loser.body
+        );
+
+        // The losing request left the first access point exactly as it was, and
+        // the name still stands for one record.
         let read = get(&emulator, second.region, second.account, second.name).await;
         let leaves = leaves_of(&read.body);
         assert_eq!(
             region_entries(&leaves, REPORT_REGION_PREFIX),
             second.expected_regions(),
-            "case {:?}: expected the refused create to have changed nothing, got body {}",
+            "case {:?}: expected the losing create to have changed nothing, got body {}",
             second.case,
             read.body
         );
+        assert_eq!(
+            leaf(&leaves, "AccessPoint/Status"),
+            Some(STATUS_READY.to_string()),
+            "case {:?}: expected the access point that won to be settled, got body {}",
+            second.case,
+            read.body
+        );
+        let listed = list(&emulator, second.region, second.account).await;
+        let named = listed
+            .body
+            .matches(&format!("<Name>{}</Name>", second.name))
+            .count();
+        assert_eq!(
+            named, 1,
+            "case {:?}: expected exactly one access point under the contested name, got body {}",
+            second.case, listed.body
+        );
     }
 }
+
+/// The `ErrorDetails$Code` the loser of a create race settles with.
+const NAME_CONFLICT_CODE: &str = "MultiRegionAccessPointAlreadyOwnedByYou";
 
 #[tokio::test]
 async fn a_byte_identical_retry_is_handed_the_first_token_and_creates_nothing() {

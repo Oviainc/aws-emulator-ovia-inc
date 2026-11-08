@@ -41,6 +41,8 @@ mod access_point_reads_and_refusals;
 mod account_authorization;
 #[path = "all/batch_job_absent_refusal.rs"]
 mod batch_job_absent_refusal;
+#[path = "all/batch_job_execution.rs"]
+mod batch_job_execution;
 #[path = "all/batch_job_lifecycle.rs"]
 mod batch_job_lifecycle;
 #[path = "all/batch_job_list.rs"]
@@ -57,10 +59,14 @@ mod batch_job_tagging;
 mod empty_body_success_status;
 #[path = "all/multi_region_access_point_lifecycle.rs"]
 mod multi_region_access_point_lifecycle;
+#[path = "all/multi_region_access_point_member_regions.rs"]
+mod multi_region_access_point_member_regions;
 #[path = "all/multi_region_access_point_route_submit.rs"]
 mod multi_region_access_point_route_submit;
 #[path = "all/multi_region_access_point_sub_resources.rs"]
 mod multi_region_access_point_sub_resources;
+#[path = "all/object_store.rs"]
+mod object_store;
 #[path = "all/public_access_block.rs"]
 mod public_access_block;
 #[path = "all/refusal_resource_members.rs"]

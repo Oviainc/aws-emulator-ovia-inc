@@ -211,6 +211,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
             regions,
             due_at,
+            // A delete this service accepted is one it carries out: the record
+            // is on its way out, so there is no outcome left to fail.
+            failure: None,
         });
 
         Ok(DeleteMultiRegionAccessPointOutput {

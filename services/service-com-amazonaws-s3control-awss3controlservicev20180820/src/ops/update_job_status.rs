@@ -11,11 +11,13 @@
 //! job or ... cancel an existing job":
 //!
 //! * `Ready` confirms a job that is waiting for confirmation, which is the only
-//!   status a confirmation has anything to do;
+//!   status a confirmation has anything to do — and which hands that job's RUN
+//!   over ([`crate::state::batch_job_worker`]), the run `CreateJob` did not
+//!   start because the job was waiting for this call;
 //! * `Cancelled` cancels a job that has neither ended nor begun ending
-//!   ([`crate::state::job_cancellable`]), which terminates it there and then —
-//!   this emulator runs no batch tasks, so no job it holds has work in flight
-//!   for the cancellation to wait on.
+//!   ([`crate::state::job_cancellable`]), which terminates it there and then; a
+//!   run already under way stops at the next task it would have carried out,
+//!   leaving the tasks it did carry out accounted for.
 //!
 //! Any other move is refused through the one refusal the whole job surface
 //! shares for a well-formed request it cannot carry out
@@ -171,7 +173,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(crate::state::state_unavailable());
@@ -209,9 +211,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // there is no due transition to drop.
             }
             // A cancellation stops a job that has not ended and has not begun
-            // ending. This emulator runs no batch tasks, so no job it holds has
-            // work in flight for the cancellation to wait on: the job reaches
-            // the terminal `Cancelled`, terminated at this instant.
+            // ending: the job reaches the terminal `Cancelled`, terminated at
+            // this instant, and a run already under way stops at the next task
+            // it would have carried out
+            // (`crate::state::batch_job_worker`).
             JOB_STATUS_CANCELLED => {
                 if !crate::state::job_cancellable(&job.status) {
                     return Err(crate::state::job_status_not_updatable());
@@ -237,10 +240,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and none, when it carried none.
         job.status_update_reason = input.status_update_reason.clone();
 
-        Ok(UpdateJobStatusOutput {
+        let output = UpdateJobStatusOutput {
             job_id: Some(job.job_id.clone()),
             status: Some(job.status.clone()),
             status_update_reason: job.status_update_reason.clone(),
-        })
+        };
+        let confirmed = input.requested_job_status == JOB_STATUS_READY;
+        // The guard is released before the run is handed over: the worker takes
+        // it itself.
+        drop(store);
+
+        // A confirmation is what a suspended job was waiting for — "confirm
+        // that you want to run a job" — so the run the create did not hand over
+        // is handed over here, and the job's tasks are carried out exactly as
+        // they are for a job that needed no confirmation.
+        if confirmed {
+            crate::state::batch_job_worker::start(
+                ::std::sync::Arc::clone(&self.engine),
+                ctx.callback().clone(),
+                crate::state::signing_region(ctx.parts()),
+                input.account_id.clone(),
+                input.job_id.clone(),
+            );
+        }
+        Ok(output)
     }
 }

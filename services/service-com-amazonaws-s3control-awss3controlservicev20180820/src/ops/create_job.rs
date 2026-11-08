@@ -4,10 +4,16 @@
 //!
 //! Creates an S3 Batch Operations job and records it in this service's state,
 //! keyed by (account id, job id), so `DescribeJob` — and the job operations
-//! still scaffolded beside it — serve the one record this call stored. The job
-//! id is assigned by the service and returned; the job is left in the status a
-//! created job has: `Suspended` while it awaits confirmation, otherwise `New`,
-//! which the clock moves on to `Ready`.
+//! beside it — serve the one record this call stored. The job id is assigned by
+//! the service and returned; the job is left in the status a created job has:
+//! `Suspended` while it awaits confirmation, otherwise `New`, which the clock
+//! moves on to `Ready`.
+//!
+//! The job then RUNS: the call answers while the job is still owed, so its
+//! tasks are carried out off this response path and the job settles in a
+//! terminal status a caller polling `DescribeJob` observes
+//! ([`crate::state::batch_job_worker`]). A job awaiting confirmation is handed
+//! its run by the `UpdateJobStatus` that confirms it instead.
 //!
 //! ## Shape of an operation
 //!
@@ -305,12 +311,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: input.tags.clone().unwrap_or_default(),
             client_request_token: input.client_request_token.clone(),
             request_fingerprint: fingerprint,
+            // Nothing has run yet, so there is no object list to account for
+            // and no outcome to report: the job's run records all of this
+            // (`crate::state::batch_job_worker`).
+            total_tasks: None,
+            tasks_succeeded: 0,
+            tasks_failed: 0,
+            elapsed_active_seconds: None,
+            failures: Vec::new(),
+            generated_manifest: None,
         };
 
         let output = CreateJobOutput {
             job_id: Some(record.job_id.clone()),
         };
-        store.jobs.insert((input.account_id.clone(), job_id), record);
+        store.jobs.insert((input.account_id.clone(), job_id.clone()), record);
+        // The guard is released before the run is handed over: the worker takes
+        // it itself, to read the job it runs and to record what each task did.
+        drop(store);
+
+        // "Creates an S3 Batch Operations job" that "performs a specified
+        // operation on every object listed in the manifest": the call answers
+        // with the job's id while the job is still owed, so the tasks run off
+        // this response path and the job reaches a terminal status once they
+        // have. A job awaiting confirmation is waiting for a caller rather than
+        // for the clock, so nothing is owed to it until `UpdateJobStatus`
+        // confirms it — which is where its run is handed over instead.
+        if !confirmation_required {
+            crate::state::batch_job_worker::start(
+                ::std::sync::Arc::clone(&self.engine),
+                ctx.callback().clone(),
+                region,
+                input.account_id.clone(),
+                job_id,
+            );
+        }
         Ok(output)
     }
 }

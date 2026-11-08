@@ -3,9 +3,12 @@
 //! @op DescribeJob
 //!
 //! Reports the job `CreateJob` recorded under this account and job id: its
-//! configuration as the create submitted it, and its current status — with any
+//! configuration as the create submitted it, its current status — with any
 //! transition the clock had already made due materialised first, so what this
-//! answers is what the clock owed rather than a move caused by the read.
+//! answers is what the clock owed rather than a move caused by the read — and
+//! what the job's RUN accounted for: the `ProgressSummary` of its tasks, the
+//! manifest its generator wrote, and the reasons a job that could not be run
+//! carries ([`crate::state::batch_job_worker`]).
 //!
 //! Implemented together with `CreateJob` (this issue) because it is the reader
 //! that proves what the create stored; the job-tagging and job-update

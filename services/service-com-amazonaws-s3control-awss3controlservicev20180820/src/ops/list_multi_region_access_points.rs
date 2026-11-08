@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMultiRegionAccessPoints
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMultiRegionAccessPoints`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMultiRegionAccessPoints::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the Multi-Region Access Points the account named in the request
+//! holds — the records `CreateMultiRegionAccessPoint` stored, each as the same
+//! `MultiRegionAccessPointReport` `GetMultiRegionAccessPoint` reports for one of
+//! them, so a listing and a read cannot disagree about an access point.
+
 //!
 //! ## Shape of an operation
 //!
@@ -146,20 +142,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMultiRegionAccessPoints` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMultiRegionAccessPointsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::state_unavailable());
+        };
+
+        let mut store = state.lock();
+        // Materialise what the clock already owed before reporting: a creating
+        // access point reaches `READY` and a deleting one is released at an
+        // instant, whether or not anybody asks.
+        store.settle_multi_region_access_points(::std::time::SystemTime::now());
+
+        // "Returns a list of the Multi-Region Access Points currently
+        // associated with the specified Amazon Web Services account", so the
+        // account the request names is what selects the records — and the
+        // listing reports each one through the SAME derivation
+        // `GetMultiRegionAccessPoint` reports it with.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMultiRegionAccessPoints"))
+        // The whole set in one answer: `MaxResults` and `NextToken` are both
+        // "Not currently used. Do not use this parameter", and "each call can
+        // return up to 100 Multi-Region Access Points, the maximum number of
+        // Multi-Region Access Points that can be associated with a single
+        // account" — so there is no page for a token to resume. The store's
+        // scan order is its key order, which is the name within the account.
+        let access_points: Vec<MultiRegionAccessPointReport> = store
+            .multi_region_access_points
+            .values()
+            .filter(|record| record.account_id == input.account_id)
+            .map(crate::state::MultiRegionAccessPointRecord::report)
+            .collect();
+
+        Ok(ListMultiRegionAccessPointsOutput {
+            access_points: Some(access_points),
+            next_token: None,
+        })
     }
 }

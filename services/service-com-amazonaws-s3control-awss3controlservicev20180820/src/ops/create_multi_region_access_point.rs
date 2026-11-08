@@ -11,7 +11,11 @@
 //! The call is asynchronous: it returns a request token while the access point
 //! is still `CREATING`, and the clock — not a later call — is what moves it to
 //! `READY` once [`crate::state::MULTI_REGION_ACCESS_POINT_SETTLE_AFTER`] has
-//! elapsed.
+//! elapsed. It binds no errors and answers nothing but that token, so a request
+//! for a name the account already holds is accepted like any other and the
+//! conflict is reported as THAT request's outcome
+//! ([`crate::state::AsyncRequestRecord::failure`]) rather than as a refusal of
+//! this call.
 //!
 //! ## Shape of an operation
 //!
@@ -177,6 +181,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &crate::state::create_details_fingerprint(&input.details),
         );
 
+        // `RegionReport$Region` is the Region the ASSOCIATED BUCKET is in, and a
+        // create request names each bucket without one: the Region is resolved
+        // from the bucket itself, in the store of the service that owns it, so a
+        // Multi-Region Access Point over buckets in two Regions reports two.
+        // Read before this store's guard is taken — see
+        // [`crate::state::bucket_regions`] on the lock order.
+        let regions = crate::state::bucket_regions::associated_region_reports(
+            &*self.engine,
+            &input.details.regions,
+            &region,
+        );
+
         let mut store = state.lock();
         store.settle_multi_region_access_points(now);
 
@@ -191,71 +207,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        let access_point_key = (input.account_id.clone(), input.details.name.clone());
-        if store.multi_region_access_points.contains_key(&access_point_key) {
-            // A name identifies one Multi-Region Access Point within an account,
-            // so a create under a name the account already holds is a conflict —
-            // whichever of two racing creates reaches the store second sees it.
-            return Err(crate::state::multi_region_access_point_already_owned_by_you(
-                &input.details.name,
-            ));
-        }
         // The store is bounded: past its quota a create is refused rather than
         // adding another record, so a caller cannot grow this process's state
-        // without end by varying the account id or the name.
+        // without end by varying the account id or the name. The REQUEST store
+        // is bounded too, by retention rather than by a refusal — see
+        // [`crate::state::ComAmazonawsS3controlAwss3controlservicev20180820State::record_async_request`]
+        // and [`crate::state::ASYNC_REQUEST_RETENTION`] — which is what bounds
+        // the path below that records a request and no access point.
         if store.multi_region_access_points.len() >= crate::state::MULTI_REGION_ACCESS_POINT_QUOTA {
             return Err(crate::state::too_many_multi_region_access_points());
         }
 
         let due_at = now + crate::state::MULTI_REGION_ACCESS_POINT_SETTLE_AFTER;
         let created_at = ::aws_smithy_types::DateTime::from(now);
-        // `RegionReport$Region` is the Region the associated bucket is in. A
-        // create request names each bucket WITHOUT its Region, and this emulator
-        // holds no bucket-to-Region directory (S3's own bucket state belongs to
-        // another service), so the Region reported for a bucket is the one its
-        // request was signed for — the only Region this service knows the
-        // association was made in.
-        let regions: Vec<RegionReport> = input
-            .details
-            .regions
-            .iter()
-            .map(|associated| RegionReport {
-                bucket: Some(associated.bucket.clone()),
-                region: Some(region.clone()),
-                bucket_account_id: associated.bucket_account_id.clone(),
-            })
-            .collect();
 
-        let record = crate::state::MultiRegionAccessPointRecord {
-            name: input.details.name.clone(),
-            account_id: input.account_id.clone(),
-            alias: crate::state::multi_region_access_point_alias(
-                &input.account_id,
-                &input.details.name,
-            ),
-            created_at,
-            // A Multi-Region Access Point is blocked from public access by
-            // default, like the single-Region access points of this service:
-            // the settings the request supplied, or all four blocked when it
-            // supplied none.
-            public_access_block: crate::state::effective_public_access_block(
-                input.details.public_access_block.as_ref(),
-            ),
-            regions: regions.clone(),
-            // Every associated bucket starts out ACTIVE: the routing
-            // configuration a create leaves behind is one active route per
-            // bucket it associated.
-            routes: crate::state::default_routes(&regions),
-            // A Multi-Region Access Point carries no access control policy
-            // until a `PutMultiRegionAccessPointPolicy` puts one on it.
-            established_policy: None,
-            proposed_policy: None,
-            policy_due_at: None,
-            // The create is asynchronous, so the access point is reported as
-            // `CREATING` until the clock owes it `READY`.
-            status: crate::state::multi_region_access_point_status(crate::state::STATUS_CREATING),
-            status_due_at: Some(due_at),
-        };
+        // A name identifies ONE Multi-Region Access Point within an account, so
+        // only one of two creates under one name can be carried out. This
+        // operation answers nothing but a request token and binds no errors at
+        // all, so BOTH submissions are accepted: the conflict is the OUTCOME of
+        // the losing request, which settles `FAILED` carrying it, and the
+        // caller observes it where this operation's one contract puts it —
+        // `DescribeMultiRegionAccessPointOperation` of the token it was handed.
+        let access_point_key = (input.account_id.clone(), input.details.name.clone());
+        let conflict = store
+            .multi_region_access_points
+            .contains_key(&access_point_key)
+            .then(|| {
+                crate::state::multi_region_access_point_already_owned_by_you(&input.details.name)
+            });
+
+        if conflict.is_none() {
+            let record = crate::state::MultiRegionAccessPointRecord {
+                name: input.details.name.clone(),
+                account_id: input.account_id.clone(),
+                alias: crate::state::multi_region_access_point_alias(
+                    &input.account_id,
+                    &input.details.name,
+                ),
+                created_at,
+                // A Multi-Region Access Point is blocked from public access by
+                // default, like the single-Region access points of this
+                // service: the settings the request supplied, or all four
+                // blocked when it supplied none.
+                public_access_block: crate::state::effective_public_access_block(
+                    input.details.public_access_block.as_ref(),
+                ),
+                regions: regions.clone(),
+                // Every associated bucket starts out ACTIVE: the routing
+                // configuration a create leaves behind is one active route per
+                // bucket it associated.
+                routes: crate::state::default_routes(&regions),
+                // A Multi-Region Access Point carries no access control policy
+                // until a `PutMultiRegionAccessPointPolicy` puts one on it.
+                established_policy: None,
+                proposed_policy: None,
+                policy_due_at: None,
+                // The create is asynchronous, so the access point is reported
+                // as `CREATING` until the clock owes it `READY`.
+                status: crate::state::multi_region_access_point_status(
+                    crate::state::STATUS_CREATING,
+                ),
+                status_due_at: Some(due_at),
+            };
+            store
+                .multi_region_access_points
+                .insert(access_point_key, record);
+        }
 
         let request = crate::state::AsyncRequestRecord {
             request_token_arn: request_token_arn.clone(),
@@ -272,12 +289,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter_map(|report| report.region.clone())
                 .collect(),
             due_at,
+            failure: conflict,
         };
 
-        store
-            .multi_region_access_points
-            .insert(access_point_key, record);
+        // Recording the request is what the caller is handed the token for.
+        // This store is bounded two ways and neither is this quota: it retains
+        // at most [`crate::state::ASYNC_REQUESTS_RETAINED`] records, releasing
+        // the oldest to make room, and releases any record settled longer ago
+        // than [`crate::state::ASYNC_REQUEST_RETENTION`] (done by the settle
+        // above) — so a caller that repeats this create for a name the account
+        // already holds, varying only its `ClientToken`, replaces retained
+        // records rather than adding without end.
         store.record_async_request(request);
+
         Ok(CreateMultiRegionAccessPointOutput {
             request_token_arn: Some(request_token_arn),
         })

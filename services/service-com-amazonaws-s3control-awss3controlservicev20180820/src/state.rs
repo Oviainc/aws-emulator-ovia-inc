@@ -10,22 +10,33 @@
 //! handlers under `src/ops/` compute each one way instead of once per handler.
 
 use crate::ops::types::{
-    AccessGrantsLocationConfiguration, AccessPoint, AsyncOperation, AsyncRequestParameters,
-    AsyncResponseDetails, CreateJobInput, CreateMultiRegionAccessPointInput2,
-    DeleteMultiRegionAccessPointInput2, EstablishedMultiRegionAccessPointPolicy, Grantee,
-    JobDescriptor, JobListDescriptor, JobManifest, JobManifestGenerator, JobOperation, JobReport,
+    AccessGrantsLocationConfiguration, AccessPoint, AsyncErrorDetails, AsyncOperation,
+    AsyncRequestParameters, AsyncResponseDetails, CreateJobInput,
+    CreateMultiRegionAccessPointInput2, DeleteMultiRegionAccessPointInput2,
+    EstablishedMultiRegionAccessPointPolicy, Grantee, JobDescriptor, JobFailure, JobListDescriptor,
+    JobManifest, JobManifestGenerator, JobOperation, JobProgressSummary, JobReport, JobTimers,
     ListStorageLensConfigurationEntry, MultiRegionAccessPointPolicyDocument,
     MultiRegionAccessPointRegionalResponse, MultiRegionAccessPointReport,
     MultiRegionAccessPointRoute, MultiRegionAccessPointsAsyncResponse, PolicyStatus,
     ProposedMultiRegionAccessPointPolicy, PublicAccessBlockConfiguration,
-    PutMultiRegionAccessPointPolicyInput2, RegionReport, S3Tag, StorageLensConfiguration,
-    StorageLensGroup, StorageLensTag, Tag, VpcConfiguration, ASYNC_OPERATION_NAME_VALUES,
-    JOB_STATUS_VALUES, MULTI_REGION_ACCESS_POINT_STATUS_VALUES, NETWORK_ORIGIN_VALUES,
-    OPERATION_NAME_VALUES,
+    PutMultiRegionAccessPointPolicyInput2, RegionReport, S3GeneratedManifestDescriptor, S3Tag,
+    StorageLensConfiguration, StorageLensGroup, StorageLensTag, Tag, VpcConfiguration,
+    ASYNC_OPERATION_NAME_VALUES, JOB_STATUS_VALUES, MULTI_REGION_ACCESS_POINT_STATUS_VALUES,
+    NETWORK_ORIGIN_VALUES, OPERATION_NAME_VALUES,
 };
 use aws_smithy_schema::{Schema, ShapeId, ShapeType};
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// Reading a job's manifest and rendering what its run writes back — the
+/// derivations the worker below runs over, held apart from it because they are
+/// pure functions of a manifest, a filter and a set of task outcomes.
+pub mod batch_job_plan;
+/// Running a submitted S3 Batch Operations job's tasks, off the response path.
+pub mod batch_job_worker;
+/// Where a bucket this service associates actually lives, read from the object
+/// store that owns the bucket.
+pub mod bucket_regions;
 
 /// One stored access point: everything `GetAccessPoint`, `ListAccessPoints` and
 /// `GetAccessPointPolicy` report, recorded by `CreateAccessPoint`.
@@ -496,6 +507,57 @@ pub fn job_cancellable(status: &str) -> bool {
 /// still sees `New`.
 pub const JOB_PREPARATION: Duration = Duration::from_millis(500);
 
+/// `JobStatus` of a job whose tasks are being run.
+pub const JOB_STATUS_ACTIVE: &str = "Active";
+
+/// `JobStatus` of a job a caller has paused — no run is owed to it until it is
+/// resumed.
+pub const JOB_STATUS_PAUSED: &str = "Paused";
+
+/// `JobStatus` of a job whose tasks have all been run — the terminal status a
+/// job reaches however many of its individual tasks failed, because the job
+/// itself did what it was created to do.
+pub const JOB_STATUS_COMPLETE: &str = "Complete";
+
+/// `JobStatus` of a job that could not be run at all: the manifest could not be
+/// read, or the action is one this emulator does not carry out. What stopped it
+/// is reported in `JobDescriptor$FailureReasons`.
+pub const JOB_STATUS_FAILED: &str = "Failed";
+
+/// The `JobStatus` values a job has ENDED in: nothing moves a job out of one of
+/// them, so a caller polling for the outcome stops here.
+///
+/// The model's `JobStatus` enum also names the three transient statuses on the
+/// way into these (`Cancelling`, `Completing`, `Failing`); a job of this store
+/// reaches the ended status itself, so they are not among them.
+pub const TERMINAL_JOB_STATUSES: &[&str] =
+    &[JOB_STATUS_COMPLETE, JOB_STATUS_FAILED, JOB_STATUS_CANCELLED];
+
+/// Whether a job in `status` has ended — see [`TERMINAL_JOB_STATUSES`].
+pub fn job_terminal(status: &str) -> bool {
+    TERMINAL_JOB_STATUSES.contains(&status)
+}
+
+/// How long after a created job's submission its RUN begins — the instant the
+/// job leaves the statuses it waits in for [`JOB_STATUS_ACTIVE`], after which
+/// its tasks are carried out and it settles.
+///
+/// A span chosen by this emulator: AWS documents no duration for it, and on the
+/// real service a job takes minutes. It is never zero, so a caller that
+/// describes the job straight after creating it still sees the job waiting, and
+/// it is long enough that the statuses before the run are observable to a
+/// caller polling at a client's pace.
+pub const JOB_RUN_AFTER: Duration = Duration::from_secs(3);
+
+/// How many tasks one job of this store runs.
+///
+/// S3 Batch Operations itself bounds a job by the size of its manifest rather
+/// than by a task count, so this is the emulator's OWN bound on the work one
+/// job can ask this process for — what stops a caller spending this process's
+/// time on a single manifest. A job whose object list is longer is FAILED with
+/// that reason rather than run over part of it.
+pub const MAX_JOB_TASKS: usize = 1_000;
+
 /// How long after a job has ended it is still reported by a job listing.
 ///
 /// `ListJobs` "lists current S3 Batch Operations jobs as well as the jobs that
@@ -576,14 +638,42 @@ pub struct JobRecord {
     /// has been materialised (or when the job was never in `New`). Stored as an
     /// instant rather than slept for.
     pub status_due_at: Option<SystemTime>,
+    /// How many tasks the job's object list came to — `None` until the run has
+    /// read the manifest (or generated one), which is what
+    /// `ProgressSummary$TotalNumberOfTasks` reports ("the total number of tasks
+    /// that the specified job has run"). A job reports no progress summary
+    /// until there is an object list to account for.
+    pub total_tasks: Option<i64>,
+    /// How many of those tasks the run carried out, and how many it could not:
+    /// `ProgressSummary$NumberOfTasksSucceeded` and `NumberOfTasksFailed`,
+    /// counted as the tasks run rather than derived from the total.
+    pub tasks_succeeded: i64,
+    /// See [`Self::tasks_succeeded`].
+    pub tasks_failed: i64,
+    /// How long the job was `Active`, in seconds — `JobTimers$
+    /// ElapsedTimeInActiveSeconds` — recorded when the run ends, so the value a
+    /// read reports is the one the run measured rather than one computed per
+    /// read. `None` until then.
+    pub elapsed_active_seconds: Option<i64>,
+    /// Why the job could not be run at all, if it could not: what
+    /// `JobDescriptor$FailureReasons` reports. Empty for a job whose run was
+    /// carried out, however many of its individual tasks failed — a task
+    /// failure is accounted in [`Self::tasks_failed`], not here.
+    pub failures: Vec<JobFailure>,
+    /// The manifest the job's own generator WROTE, once it has written one —
+    /// `JobDescriptor$GeneratedManifestDescriptor`. `None` for a job whose
+    /// object list came from a manifest the request named, and for a generator
+    /// that was not asked to write its manifest out.
+    pub generated_manifest: Option<S3GeneratedManifestDescriptor>,
 }
 
 impl JobRecord {
     /// The record as the `JobDescriptor` shape `DescribeJob` returns.
     ///
-    /// `ProgressSummary` and `FailureReasons` are absent: this emulator runs no
-    /// batch tasks, so there is no task count or failure to report — and a
-    /// synthesised one would be a claim about work nothing did.
+    /// `ProgressSummary` and `FailureReasons` report what the job's RUN
+    /// accounted for ([`crate::state::batch_job_worker`]): the object list's
+    /// task count and the outcome of each task once the run has them, and
+    /// nothing at all before, so neither is a claim about work nothing did.
     pub fn descriptor(&self) -> JobDescriptor {
         JobDescriptor {
             job_id: Some(self.job_id.clone()),
@@ -594,9 +684,9 @@ impl JobRecord {
             manifest: self.manifest.clone(),
             operation: Some(self.operation.clone()),
             priority: self.priority,
-            progress_summary: None,
+            progress_summary: self.progress_summary(),
             status_update_reason: self.status_update_reason.clone(),
-            failure_reasons: None,
+            failure_reasons: (!self.failures.is_empty()).then(|| self.failures.clone()),
             report: Some(self.report.clone()),
             creation_time: Some(self.creation_time),
             termination_date: self.termination_date,
@@ -604,10 +694,31 @@ impl JobRecord {
             suspended_date: self.suspended_date,
             suspended_cause: self.suspended_cause.clone(),
             manifest_generator: self.manifest_generator.clone(),
-            // A generated manifest is described only once a generator has
-            // actually written one, and nothing in this emulator does.
-            generated_manifest_descriptor: None,
+            // A generated manifest is described only once the job's generator
+            // has actually written one out.
+            generated_manifest_descriptor: self.generated_manifest.clone(),
         }
+    }
+
+    /// What the job's run has accounted for, or `None` while it has no object
+    /// list to account for yet.
+    ///
+    /// `TotalNumberOfTasks` is the length of that list, and the two counters
+    /// are the outcomes the run recorded as it went, so a job read mid-run
+    /// reports the tasks already carried out rather than the whole list as
+    /// done. `Timers` carries the measured active span once the run has ended.
+    pub fn progress_summary(&self) -> Option<JobProgressSummary> {
+        let total = self.total_tasks?;
+        Some(JobProgressSummary {
+            total_number_of_tasks: Some(total),
+            number_of_tasks_succeeded: Some(self.tasks_succeeded),
+            number_of_tasks_failed: Some(self.tasks_failed),
+            timers: self
+                .elapsed_active_seconds
+                .map(|elapsed| JobTimers {
+                    elapsed_time_in_active_seconds: Some(elapsed),
+                }),
+        })
     }
 
     /// The record as the `JobListDescriptor` summary shape a job listing
@@ -615,10 +726,9 @@ impl JobRecord {
     ///
     /// A SUMMARY of the same record [`Self::descriptor`] reports in full, so the
     /// two cannot disagree about one job: every member `JobListDescriptor`
-    /// declares is the stored one, and `ProgressSummary` is absent for the
-    /// reason it is absent there — this emulator runs no batch tasks, so there is
-    /// no task count to report and a synthesised one would be a claim about work
-    /// nothing did.
+    /// declares is the stored one, and `ProgressSummary` is the same derivation
+    /// — what the job's run accounted for, and nothing before it has an object
+    /// list to account for.
     pub fn list_descriptor(&self) -> JobListDescriptor {
         JobListDescriptor {
             job_id: Some(self.job_id.clone()),
@@ -628,7 +738,7 @@ impl JobRecord {
             status: Some(self.status.clone()),
             creation_time: Some(self.creation_time),
             termination_date: self.termination_date,
-            progress_summary: None,
+            progress_summary: self.progress_summary(),
         }
     }
 
@@ -786,6 +896,12 @@ pub const ASYNC_REQUEST_IN_PROGRESS: &str = "INPROGRESS";
 /// The `AsyncRequestStatus` an asynchronous request carries once its work is
 /// due. See [`ASYNC_REQUEST_IN_PROGRESS`].
 pub const ASYNC_REQUEST_SUCCEEDED: &str = "SUCCEEDED";
+
+/// The `AsyncRequestStatus` of a request whose span has run out and whose work
+/// this service will not carry out — the status the LOSER of a create race
+/// settles in, with the conflict in its `ErrorDetails`. See
+/// [`ASYNC_REQUEST_IN_PROGRESS`].
+pub const ASYNC_REQUEST_FAILED: &str = "FAILED";
 
 /// `wanted` as the generated enum list `values` spells it.
 ///
@@ -1087,16 +1203,30 @@ pub struct AsyncRequestRecord {
     /// When the clock owes this request's work — the same instant the Multi-Region
     /// Access Point's transient status settles at.
     pub due_at: SystemTime,
+    /// Why this request's work will not be carried out, for a request this
+    /// service accepted but cannot complete — what
+    /// `AsyncResponseDetails$ErrorDetails` reports once the clock owes the
+    /// outcome, and what makes the request's status [`ASYNC_REQUEST_FAILED`]
+    /// rather than [`ASYNC_REQUEST_SUCCEEDED`]. `None` for a request whose work
+    /// is done.
+    pub failure: Option<AsyncErrorDetails>,
 }
 
 impl AsyncRequestRecord {
     /// The record as the `AsyncOperation` shape, with the status the clock owes
     /// at `now`.
+    ///
+    /// A request whose span has not run out is still `INPROGRESS` whatever its
+    /// outcome will be: the outcome — including the error details of a request
+    /// whose work this service will not carry out — is what the clock makes
+    /// due, which is why a caller polling the token observes the conflict here
+    /// rather than at submission.
     pub fn operation_report(&self, now: SystemTime) -> AsyncOperation {
-        let status = if now >= self.due_at {
-            ASYNC_REQUEST_SUCCEEDED
-        } else {
-            ASYNC_REQUEST_IN_PROGRESS
+        let settled = now >= self.due_at;
+        let status = match (settled, self.failure.is_some()) {
+            (false, _) => ASYNC_REQUEST_IN_PROGRESS,
+            (true, false) => ASYNC_REQUEST_SUCCEEDED,
+            (true, true) => ASYNC_REQUEST_FAILED,
         };
         AsyncOperation {
             creation_time: Some(self.creation_time),
@@ -1116,11 +1246,10 @@ impl AsyncRequestRecord {
                             .collect(),
                     ),
                 }),
-                // Only a request that failed carries error details, and a
-                // request this service accepted is one it completes: the
-                // refusals this lifecycle has are answered to the create or
-                // delete call itself, not recorded as an async failure.
-                error_details: None,
+                // Only a request that FAILED carries error details, and only
+                // once its span has run out: before that there is no outcome to
+                // report, and a request whose work was done has no error.
+                error_details: settled.then(|| self.failure.clone()).flatten(),
             }),
         }
     }
@@ -1129,6 +1258,15 @@ impl AsyncRequestRecord {
     /// retained request: when it was made, to the nanosecond.
     fn made_at(&self) -> (i64, u32) {
         (self.creation_time.secs(), self.creation_time.subsec_nanos())
+    }
+
+    /// Whether this record has been settled for longer than
+    /// [`ASYNC_REQUEST_RETENTION`], so the store no longer holds it — see that
+    /// constant.
+    fn retention_over(&self, now: SystemTime) -> bool {
+        self.due_at
+            .checked_add(ASYNC_REQUEST_RETENTION)
+            .is_some_and(|released_at| now >= released_at)
     }
 }
 
@@ -1160,6 +1298,21 @@ pub const MULTI_REGION_ACCESS_POINT_QUOTA: usize = 1_000;
 /// then describes a forgotten token is answered the same not-found refusal as
 /// one that invents a token.
 pub const ASYNC_REQUESTS_RETAINED: usize = 1_000;
+
+/// How long after its work settled an asynchronous request record is still
+/// retained, after which it is released whether or not the store is near
+/// [`ASYNC_REQUESTS_RETAINED`].
+///
+/// The count above bounds how many records the store can hold at once; this
+/// bounds how LONG one is held, which is the other half of "the real service
+/// forgets a request long after it completed": a caller that keeps submitting
+/// requests — the same create for a name it already holds, with a fresh
+/// `ClientToken` each time — accumulates nothing beyond this window, and a
+/// token described after it is answered the same not-found refusal as an
+/// invented one. The span is this emulator's own: AWS publishes no retention
+/// for these records, and it is set far beyond any workflow an emulator serves,
+/// so no caller observes a request being forgotten mid-test.
+pub const ASYNC_REQUEST_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 
 /// One stored S3 Access Grants instance: everything
 /// `CreateAccessGrantsInstance` recorded and `GetAccessGrantsInstance` reports.
@@ -2101,6 +2254,13 @@ impl ComAmazonawsS3controlAwss3controlservicev20180820State {
         for record in self.multi_region_access_points.values_mut() {
             record.settle(now);
         }
+        // An asynchronous request record is released once it has been settled
+        // for longer than [`ASYNC_REQUEST_RETENTION`] — owed at that instant
+        // whether or not anybody called, exactly like the transitions above, and
+        // what keeps a caller that submits request after request from
+        // accumulating records beyond that window.
+        self.async_requests
+            .retain(|_, request| !request.retention_over(now));
     }
 
     /// The Multi-Region Access Point of `account_id` that `alias` names, if the
@@ -3873,22 +4033,28 @@ pub fn too_many_route_updates<E>() -> crate::scaffolded::Scaffolded<E> {
     )
 }
 
-/// `MultiRegionAccessPointAlreadyOwnedByYou` (HTTP 409): the account already
-/// owns a Multi-Region Access Point of that name — including one still being
-/// created or deleted — so creating it again would be a second resource under
-/// one name.
+/// The `ErrorDetails` the LOSER of a Multi-Region Access Point create race
+/// settles with: the account already owns a Multi-Region Access Point of that
+/// name — including one still being created or deleted — so creating it again
+/// would be a second resource under one name.
 ///
-/// The code follows the one this service already answers for the same conflict
-/// one resource down (`AccessPointAlreadyOwnedByYou`), and the 409 is the status
-/// a name conflict carries.
-pub fn multi_region_access_point_already_owned_by_you<E>(
-    name: &str,
-) -> crate::scaffolded::Scaffolded<E> {
-    crate::scaffolded::Scaffolded::service_failure(
-        "MultiRegionAccessPointAlreadyOwnedByYou",
-        409,
-        format!("A Multi-Region Access Point with the same name already exists: {name}"),
-    )
+/// `CreateMultiRegionAccessPoint` is asynchronous and binds no errors at all:
+/// it answers a request token, and uniqueness is decided by the request the
+/// token names rather than by the submission. So this conflict is an OUTCOME of
+/// that request ([`AsyncRequestRecord::failure`]), reported to the caller that
+/// describes the token, and the code follows the one this service answers for
+/// the same conflict one resource down (`AccessPointAlreadyOwnedByYou`).
+pub fn multi_region_access_point_already_owned_by_you(name: &str) -> AsyncErrorDetails {
+    AsyncErrorDetails {
+        code: Some("MultiRegionAccessPointAlreadyOwnedByYou".to_string()),
+        message: Some(format!(
+            "A Multi-Region Access Point with the same name already exists: {name}"
+        )),
+        resource: Some(name.to_string()),
+        // The request id is the one the answer to the DESCRIBE call carries,
+        // which this record is read by rather than written with.
+        request_id: None,
+    }
 }
 
 /// `TooManyMultiRegionAccessPoints` (HTTP 400): the store already holds
