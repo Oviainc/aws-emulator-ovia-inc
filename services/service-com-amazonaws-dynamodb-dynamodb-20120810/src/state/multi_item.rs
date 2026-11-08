@@ -12,6 +12,10 @@
 //! `crate::state::…`.
 
 use super::*;
+// The shape of one `BatchGetItem` `RequestItems` entry, which the rendering of that
+// member walks ([`rendered_batch_get_request_items`]); `super` reaches only the shapes it
+// names itself.
+use crate::ops::types::KeysAndAttributes;
 
 /// How many put-or-delete operations one `BatchWriteItem` may carry: "up to 25 item
 /// put or delete operations" (the `BatchWriteItem` doc), which is also the length the
@@ -58,22 +62,36 @@ pub const REQUEST_ITEMS_MEMBER_PATH: &str = "requestItems";
 /// (`service_common::validation_message::map_key_refusal`, the tree's one rendering of
 /// that clause).
 ///
-/// The clause states NO value. AWS echoes the whole `RequestItems` map here, in its own
-/// internal object rendering of the map's structure values — `{<table>=[WriteRequest(
+/// The VALUE half of that clause is the map the offending key was held in, quoted as the
+/// request carried it, and `quoted_map` is what renders it: a request-validator clause
+/// states the value it refused (`Value '<the submitted map>' at 'requestItems' …`), so the
+/// caller can see WHICH map its rejected key sat in. `BatchGetItem` renders its
+/// `RequestItems` as the JSON the request carried it as
+/// ([`rendered_batch_get_request_items`]).
+///
+/// `quoted_map` answers `None` where the recorded refusal quotes a rendering no rule
+/// reachable from the model produces: `BatchWriteItem`'s clause echoes AWS's own internal
+/// object rendering of the map's structure values — `{<table>=[WriteRequest(
 /// putRequest=PutRequest(item={pk=AttributeValue(s=k0, n=null, …)}, …)…)]}`, over members
 /// this service's model does not declare (`smithy_query(query="shape",
 /// shape="com.amazonaws.dynamodb#AttributeValue")` gives `S N B SS NS BS M L NULL BOOL`
-/// and no `workloadProfileName`) — so no rule reachable from the model or the docs
-/// renders that text, and the clause states what is derivable: the member and the
-/// constraint set its keys broke. That is the same choice this service already makes for
-/// a capped collection's echoed value (see "Which form a constraint clause takes" in
+/// and no `workloadProfileName`) — so that clause states what is derivable: the member and
+/// the constraint set its keys broke. That is the same choice this service already makes
+/// for a capped collection's echoed value (see "Which form a constraint clause takes" in
 /// `src/service.rs`).
-pub fn batch_table_key(key: &str, region: &str) -> Result<String, RequestError> {
+///
+/// It is a closure rather than a value because it is needed only by the refusal: a served
+/// batch renders nothing.
+pub fn batch_table_key(
+    key: &str,
+    region: &str,
+    quoted_map: impl FnOnce() -> Option<String>,
+) -> Result<String, RequestError> {
     resolve_table_name_in(key, region).map_err(|_| {
         RequestError::Validation(
             ::service_common::validation_message::map_key_refusal_quoting(
                 REQUEST_ITEMS_MEMBER_PATH,
-                None,
+                quoted_map().as_deref(),
                 i64::try_from(MIN_TABLE_NAME_LENGTH).unwrap_or(0),
                 i64::try_from(MAX_TABLE_NAME_LENGTH).unwrap_or(0),
                 // The expression a key must satisfy, without the anchoring that makes the
@@ -85,6 +103,85 @@ pub fn batch_table_key(key: &str, region: &str) -> Result<String, RequestError> 
             ),
         )
     })
+}
+
+/// A `BatchGetItem`'s `RequestItems` map as the request carried it: the JSON rendering of
+/// that member, which is the value a refusal of one of its KEYS quotes
+/// ([`batch_table_key`]).
+///
+/// It is the request's own value re-rendered rather than the request bytes, which no
+/// handler is handed: every member the request sent is written and no member it left out
+/// is, each under the name the model spells it on the wire, with the entry members in the
+/// order the model declares them (`smithy_query(query="shape",
+/// shape="com.amazonaws.dynamodb#KeysAndAttributes")`). A map arrives as a `HashMap`, whose
+/// iteration order is not the request's, so the table entries and an entry's substitution
+/// names are written in NAME order: one submitted map renders one way, whatever order its
+/// JSON arrived in.
+///
+/// Every VALUE is rendered by `serde_json` — which is also what escapes every string here —
+/// and each KEY by the one renderer this crate states DynamoDB JSON with ([`item_json`],
+/// which orders an item's attributes by name and encodes a blob the way the wire form does),
+/// so a key quoted back in a refusal and an item written out by an export read the same way.
+/// What is assembled here rather than by `serde_json` is the ORDER of an entry's members: a
+/// `serde_json::Map` keeps insertion order only where the build resolves that crate's
+/// `preserve_order` feature, which this crate's does not, so the five members would come out
+/// alphabetically instead of as the model declares them.
+pub fn rendered_batch_get_request_items(
+    request_items: &HashMap<String, KeysAndAttributes>,
+) -> String {
+    let entries: Vec<String> = request_items
+        .iter()
+        .collect::<BTreeMap<_, _>>()
+        .into_iter()
+        .map(|(table, entry)| rendered_json_member(table, &rendered_keys_and_attributes(entry)))
+        .collect();
+    format!("{{{}}}", entries.join(","))
+}
+
+/// One `RequestItems` entry, as the JSON object the request carried: its members in the
+/// order the model declares them, and only the ones it sent.
+fn rendered_keys_and_attributes(entry: &KeysAndAttributes) -> String {
+    let mut members: Vec<String> = vec![rendered_json_member(
+        "Keys",
+        &::serde_json::Value::Array(entry.keys.iter().map(item_json).collect()).to_string(),
+    )];
+    if let Some(attributes) = entry.attributes_to_get.as_deref() {
+        members.push(rendered_json_member(
+            "AttributesToGet",
+            &::serde_json::json!(attributes).to_string(),
+        ));
+    }
+    if let Some(consistent) = entry.consistent_read {
+        members.push(rendered_json_member(
+            "ConsistentRead",
+            &::serde_json::json!(consistent).to_string(),
+        ));
+    }
+    if let Some(projection) = entry.projection_expression.as_deref() {
+        members.push(rendered_json_member(
+            "ProjectionExpression",
+            &::serde_json::json!(projection).to_string(),
+        ));
+    }
+    if let Some(names) = entry.expression_attribute_names.as_ref() {
+        // In name order, for the reason the entries above are: the map does not keep the
+        // order the request wrote it in.
+        let aliases: BTreeMap<&String, &String> = names.iter().collect();
+        members.push(rendered_json_member(
+            "ExpressionAttributeNames",
+            &::serde_json::json!(aliases).to_string(),
+        ));
+    }
+    format!("{{{}}}", members.join(","))
+}
+
+/// One member of a JSON object: `"<name>":<the rendered value>`, with the name escaped the
+/// way `serde_json` escapes a string, so nothing here restates the escaping rules.
+fn rendered_json_member(name: &str, rendered_value: &str) -> String {
+    format!(
+        "{}:{rendered_value}",
+        ::serde_json::Value::String(name.to_string())
+    )
 }
 
 /// How a batch that asks for more operations than it may carry is refused: AWS's

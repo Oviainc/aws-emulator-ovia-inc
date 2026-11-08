@@ -431,12 +431,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // What the update resolves to is computed against the STORED table, so a
         // request that only names an index update leaves the table's own mode and
         // throughput alone.
-        let billing_mode = input.billing_mode.clone().unwrap_or(stored_billing_mode);
-        if !matches!(billing_mode.as_str(), "PROVISIONED" | "PAY_PER_REQUEST") {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "Invalid BillingMode: {billing_mode} must be PROVISIONED or PAY_PER_REQUEST"
-            )));
-        }
+        let billing_mode = crate::state::requested_throughput_mode(
+            input.billing_mode.as_deref(),
+            input.table_throughput_mode.as_deref(),
+        )
+        .map_or(stored_billing_mode, str::to_string);
+        // Each mode member was held to the enum's value set before this handler ran, and a
+        // stored mode is one this service wrote, so what the update resolves to is always
+        // one of the two modes.
         // An on-demand capacity ceiling cannot hold on a table the update leaves in the
         // PROVISIONED capacity mode, whichever resource it was named for
         // ([`crate::state::check_on_demand_ceilings`]). That contradiction is in the
@@ -841,6 +843,13 @@ const UPDATABLE_MEMBERS: &[UpdatableMember] = &[
         input.provisioned_throughput.is_some()
     }),
     ("BillingMode", |input| input.billing_mode.is_some()),
+    // The throughput-mode spelling of the same setting, which the model declares beside it
+    // ([`crate::state::requested_throughput_mode`]): a request that states the mode through
+    // it asks for the same change, so it belongs in the one list that decides whether a
+    // request asks for anything.
+    ("TableThroughputMode", |input| {
+        input.table_throughput_mode.is_some()
+    }),
     ("GlobalSecondaryIndexUpdates", |input| {
         list_named(input.global_secondary_index_updates.as_ref())
     }),
@@ -923,6 +932,7 @@ fn empty_update_message() -> String {
 /// nothing is left for the clock to finish and the next control-plane call is served.
 fn asks_for_asynchronous_work(input: &UpdateTableInput) -> bool {
     input.billing_mode.is_some()
+        || input.table_throughput_mode.is_some()
         || input.provisioned_throughput.is_some()
         || input.warm_throughput.is_some()
         || input.table_class.is_some()
@@ -1184,7 +1194,7 @@ fn resolve_table_throughput(
             // accepts — the capacity members cannot be set on a table that is
             // pay-per-request.
             return Err(crate::state::RequestError::Validation(
-                match input.billing_mode.is_some() {
+                match input.billing_mode.is_some() || input.table_throughput_mode.is_some() {
                     true => super::create_table::THROUGHPUT_WITH_PAY_PER_REQUEST_MESSAGE
                         .to_string(),
                     false => "One or more parameter values were invalid: Neither \
@@ -1514,11 +1524,9 @@ fn resolve_indexes(
     if billing_mode == "PROVISIONED" {
         for index in &indexes {
             if index.provisioned_throughput.is_none() {
-                return Err(crate::state::RequestError::Validation(format!(
-                    "One or more parameter values were invalid: Both ReadCapacityUnits and \
-                     WriteCapacityUnits must be specified for index: {}",
-                    index.name
-                )));
+                return Err(crate::state::RequestError::Validation(
+                    crate::state::index_capacity_required_message(&index.name),
+                ));
             }
         }
     }

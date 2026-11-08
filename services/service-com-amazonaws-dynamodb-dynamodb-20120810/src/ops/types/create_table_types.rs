@@ -20,6 +20,13 @@ pub struct CreateTableInput {
     pub local_secondary_indexes: Option<Vec<LocalSecondaryIndex>>,
     pub global_secondary_indexes: Option<Vec<GlobalSecondaryIndex>>,
     pub billing_mode: Option<String>,
+    /// The throughput-mode spelling of `billing_mode`, which the model declares beside it:
+    /// both members target the `BillingMode` enum and name the same read/write capacity
+    /// mode, and a request states the mode through one of them. It is written AFTER
+    /// `billing_mode` because the validating walk reports a violated member in the order
+    /// the members are written, and a request that breaks both is refused with the
+    /// billing-mode clause first.
+    pub table_throughput_mode: Option<String>,
     pub provisioned_throughput: Option<ProvisionedThroughput>,
     pub stream_specification: Option<StreamSpecification>,
     pub sse_specification: Option<SSESpecification>,

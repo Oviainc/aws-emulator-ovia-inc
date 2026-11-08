@@ -58,8 +58,8 @@ async fn seeded() -> smithy_server_runtime::MultiServiceRouter {
 }
 
 /// One row: the case, the operation, the request, the expression member the request
-/// states its intent through (empty when it carries none), the substitution table the
-/// unused keys belong to, and those keys in the order the message lists them.
+/// states its intent through, the substitution table the unused keys belong to, and those
+/// keys in the order the message lists them.
 struct Row {
     case: &'static str,
     operation: &'static str,

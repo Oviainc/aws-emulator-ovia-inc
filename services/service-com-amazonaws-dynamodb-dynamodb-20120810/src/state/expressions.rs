@@ -654,23 +654,8 @@ impl<'a> Substitutions<'a> {
         &self,
         expressions: &[(&str, Option<&str>)],
     ) -> Result<(), RequestError> {
+        self.check_an_expression_was_sent(expressions)?;
         self.check_tables_not_empty()?;
-        // A substitution table holds "substitution tokens for attribute names in an
-        // expression" / "values that can be substituted in an expression" (those
-        // members' docs), so a request that states NO expression at all offers its
-        // tokens to nothing: the member itself is the mistake, not one of its entries,
-        // and the caller is told it cannot be used without an expression rather than
-        // which entry went unused.
-        if expressions
-            .iter()
-            .all(|(_, expression)| expression.is_none())
-        {
-            if let Some(member) = self.supplied_table() {
-                return Err(RequestError::Validation(format!(
-                    "{member} can only be specified when using expressions"
-                )));
-            }
-        }
         let mut names: BTreeSet<String> = BTreeSet::new();
         let mut values: BTreeSet<String> = BTreeSet::new();
         for (member, expression) in expressions {
@@ -710,16 +695,54 @@ impl<'a> Substitutions<'a> {
         check_referenced("ExpressionAttributeValues", self.values, &values, enveloped)
     }
 
-    /// Which substitution table this request SUPPLIED entries in, the names table first:
-    /// what a refusal about carrying a table at all has to name.
-    fn supplied_table(&self) -> Option<&'static str> {
-        if self.names.is_some_and(|names| !names.is_empty()) {
-            return Some("ExpressionAttributeNames");
+    /// A substitution table sent with NO expression to substitute into is a different
+    /// defect from one whose entries an expression does not reference, and AWS words the
+    /// two differently.
+    ///
+    /// Both members exist to be substituted INTO — they hold "substitution tokens for
+    /// attribute names in an expression" and "values that can be substituted in an
+    /// expression" (those members' docs) — so a table the request has no expression for has
+    /// nothing to be substituted into: the caller has to ADD the expression, which is what
+    /// this sentence says, where the unused-entry sentence ([`check_referenced`]) says to
+    /// DROP the entry. Collapsing the two onto the second one tells a caller that supplied
+    /// no expression that its names are unused in expressions.
+    ///
+    /// WHICH expressions count differs per table: a `#alias` stands for an attribute NAME,
+    /// which every expression member spells, while a `:placeholder` stands for a VALUE,
+    /// which only a member that COMPARES one can substitute — a projection names
+    /// attributes and compares nothing ([`substitutes_values`]).
+    ///
+    /// A table that DEFINES something is what this is about: an empty one offers no token to
+    /// substitute anywhere, so it is refused for being empty
+    /// ([`Substitutions::check_tables_not_empty`], asked after this) rather than for the
+    /// expression it has nothing to go into. That is also why this runs FIRST: a request
+    /// that offers real tokens and no expression for them is told about the expression,
+    /// whichever of its other tables happens to be empty.
+    ///
+    /// The sentence is entirely fixed — it names neither the keys nor an expression member,
+    /// because there is no expression member to name. WHETHER it carries the
+    /// `<N> validation error(s) detected: ` envelope follows the same rule every other
+    /// refusal about this request's expressions follows ([`envelopes_expression_refusals`]):
+    /// the members a WRITE states its intent through carry it and the members a READ narrows
+    /// its result with do not — read off the members the OPERATION declares, since none of
+    /// them was sent. The refusal of one ELEMENT's tables is then stated outside the envelope
+    /// like every other refusal about an element
+    /// ([`Substitutions::check_all_referenced_in_element`]). The NAMES table is reported
+    /// first, which is the order the two tables are checked in throughout.
+    fn check_an_expression_was_sent(
+        &self,
+        expressions: &[(&str, Option<&str>)],
+    ) -> Result<(), RequestError> {
+        let enveloped = expressions
+            .iter()
+            .any(|(member, _)| envelopes_expression_refusals(member));
+        if defines_a_token(self.names) && !names_an_expression(expressions, |_| true) {
+            return Err(only_with_expressions(enveloped, "ExpressionAttributeNames"));
         }
-        if self.values.is_some_and(|values| !values.is_empty()) {
-            return Some("ExpressionAttributeValues");
+        if defines_a_token(self.values) && !names_an_expression(expressions, substitutes_values) {
+            return Err(only_with_expressions(enveloped, "ExpressionAttributeValues"));
         }
-        None
+        Ok(())
     }
 
     /// A substitution table the request SENT must define something, and every name it
@@ -759,6 +782,49 @@ impl<'a> Substitutions<'a> {
         Ok(())
     }
 }
+
+/// The refusal for a substitution table sent with no expression to substitute into: AWS's
+/// FIXED sentence for that defect, naming the table alone, inside the validation envelope
+/// where the operation's expression members carry one ([`expression_refusal`]).
+pub(super) fn only_with_expressions(enveloped: bool, member: &str) -> RequestError {
+    expression_refusal(
+        enveloped,
+        format!("{member} can only be specified when using expressions"),
+    )
+}
+
+/// Whether this request names an expression member `substitutable` admits, with a value.
+fn names_an_expression(
+    expressions: &[(&str, Option<&str>)],
+    substitutable: fn(&str) -> bool,
+) -> bool {
+    expressions
+        .iter()
+        .any(|(member, expression)| expression.is_some() && substitutable(member))
+}
+
+/// Whether a substitution table the request sent DEFINES a token at all.
+///
+/// A table sent EMPTY offers no token to substitute anywhere, so it is refused for being
+/// empty ([`Substitutions::check_tables_not_empty`]) rather than for the expression it has
+/// nothing to go into.
+fn defines_a_token<V>(table: Option<&HashMap<String, V>>) -> bool {
+    table.is_some_and(|entries| !entries.is_empty())
+}
+
+/// Whether `member` is an expression a VALUE can be substituted into.
+///
+/// Every expression member spells attribute names, so a `#alias` has somewhere to go in any
+/// of them; a `:placeholder` stands for a value to compare or to write, and a projection
+/// does neither — "one or more attributes to be retrieved" (`ProjectionExpression`) names
+/// attributes and compares nothing — so a value token sent to a request whose only
+/// expression is a projection has nothing to be substituted into.
+fn substitutes_values(member: &str) -> bool {
+    member != PROJECTION_EXPRESSION_MEMBER
+}
+
+/// The expression member that names attributes to report rather than values to compare.
+const PROJECTION_EXPRESSION_MEMBER: &str = "ProjectionExpression";
 
 /// The refusal for a substitution table sent with no entries: AWS's own clause, naming
 /// the member, inside the validation envelope every refusal of a member's VALUE carries.

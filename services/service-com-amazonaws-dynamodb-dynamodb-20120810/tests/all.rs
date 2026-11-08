@@ -121,6 +121,8 @@ mod refusal_contracts_and_expression_pre_images;
 
 #[path = "all/required_member_refusals.rs"]
 mod required_member_refusals;
+#[path = "all/request_shape_validation_classes.rs"]
+mod request_shape_validation_classes;
 #[path = "all/request_validation_refusals.rs"]
 mod request_validation_refusals;
 

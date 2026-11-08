@@ -4738,6 +4738,11 @@ mod export_objects;
 pub use export_objects::*;
 pub use kinesis::*;
 
+/// Which member of a request states the read/write capacity mode. Re-exported below, so
+/// every caller still names it `crate::state::…`.
+mod throughput_mode;
+pub use throughput_mode::*;
+
 pub use authorization::request_caller;
 pub use backups::*;
 pub use expressions::*;

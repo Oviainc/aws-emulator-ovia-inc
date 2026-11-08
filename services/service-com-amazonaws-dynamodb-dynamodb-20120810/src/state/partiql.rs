@@ -743,6 +743,53 @@ pub struct ProjectionItem {
     alias: Option<String>,
 }
 
+impl ProjectionItem {
+    /// The identifier this item is reported under: the alias the statement gave it, and
+    /// otherwise the path's own label ([`StatementPath::label`]). The ONE place that is
+    /// decided, so what a served statement reports an item under and what a refusal calls
+    /// it cannot drift ([`check_distinct_identifiers`], [`project_item`]).
+    fn identifier(&self) -> &str {
+        match self.alias.as_deref() {
+            Some(alias) => alias,
+            None => self.path.label(),
+        }
+    }
+}
+
+/// How a `SELECT` whose projection list reports two of its paths under ONE identifier is
+/// refused, naming the identifier(s) the list repeats.
+///
+/// A projection reports one entry per path it names, keyed by the identifier that path is
+/// reported under ([`ProjectionItem::identifier`]) — so a list that states one identifier
+/// twice asks for a result in which one key carries two values, which no item can hold:
+/// serving it would silently report ONE of them and hand back a tuple narrower than the
+/// clause asked for. The statement is refused instead, before anything is read.
+///
+/// The repeated identifiers are each named once, in the order the clause first repeats
+/// them, so a client reading the message sees which names to disambiguate (with `AS`) or
+/// drop.
+fn check_distinct_identifiers(projection: &[ProjectionItem]) -> Result<(), RequestError> {
+    let mut stated: Vec<&str> = Vec::new();
+    let mut repeated: Vec<&str> = Vec::new();
+    for item in projection {
+        let identifier = item.identifier();
+        if stated.contains(&identifier) {
+            if !repeated.contains(&identifier) {
+                repeated.push(identifier);
+            }
+        } else {
+            stated.push(identifier);
+        }
+    }
+    if repeated.is_empty() {
+        return Ok(());
+    }
+    Err(RequestError::Validation(format!(
+        "Duplicate identifiers in select clause: {}",
+        repeated.join(", ")
+    )))
+}
+
 /// One operand of a predicate: a path into the item, a value the statement carries,
 /// or the `size` of a path.
 #[derive(Debug, Clone)]
@@ -1194,6 +1241,7 @@ impl StatementParser<'_> {
                     break;
                 }
             }
+            check_distinct_identifiers(&items)?;
             Some(items)
         };
         // The `FROM` that follows a projection list is the one keyword position the
@@ -2510,15 +2558,10 @@ pub fn project_item(item: &Item, projection: Option<&Vec<ProjectionItem>>) -> It
     projection
         .iter()
         .filter_map(|projected| {
-            projected.path.read(item).map(|value| {
-                (
-                    projected
-                        .alias
-                        .clone()
-                        .unwrap_or_else(|| projected.path.label().to_string()),
-                    value.clone(),
-                )
-            })
+            projected
+                .path
+                .read(item)
+                .map(|value| (projected.identifier().to_string(), value.clone()))
         })
         .collect()
 }

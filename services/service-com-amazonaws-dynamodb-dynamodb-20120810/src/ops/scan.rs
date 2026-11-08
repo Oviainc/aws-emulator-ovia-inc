@@ -432,17 +432,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.expression_attribute_names.as_ref(),
         )
         .map_err(lift)?;
-        // A substitution token has nothing to substitute into unless the request
-        // carries an expression, so one supplied beside no expression at all is
-        // refused rather than silently ignored.
-        if let Some(member) = substitution_without_expression(&input) {
-            return Err(crate::scaffolded::Scaffolded::validation(format!(
-                "{member} can only be specified when using expressions"
-            )));
-        }
-        // Every token the request DEFINES must be one an expression uses: an unused
-        // entry of either substitution table makes the whole request invalid, however
-        // well-formed the expressions that ignore it are.
+        // Every token the request DEFINES must be one an expression uses, and a
+        // substitution table the request has no expression to substitute into is refused
+        // rather than silently ignored: both rules belong to the one checker every
+        // operation with expression members shares
+        // ([`crate::state::Substitutions::check_all_referenced`]).
         crate::state::Substitutions::new(
             input.expression_attribute_names.as_ref(),
             input.expression_attribute_values.as_ref(),
@@ -690,35 +684,6 @@ fn lift(error: crate::state::RequestError) -> ScanError {
             crate::scaffolded::Scaffolded::validation(message)
         }
     }
-}
-
-/// The substitution map this request carries with no expression to substitute into:
-/// `ExpressionAttributeNames` holds "substitution tokens for attribute names in an
-/// expression" and `ExpressionAttributeValues` "values that can be substituted in an
-/// expression" (those members' docs), so neither has a meaning on its own.
-///
-/// A name token is substituted into either expression member a scan carries — it is how
-/// a reserved word is projected at all — while a value token has only the filter to
-/// substitute into, since a projection names attributes and compares nothing.
-fn substitution_without_expression(input: &ScanInput) -> Option<&'static str> {
-    if input.filter_expression.is_none()
-        && input.projection_expression.is_none()
-        && input
-            .expression_attribute_names
-            .as_ref()
-            .is_some_and(|names| !names.is_empty())
-    {
-        return Some("ExpressionAttributeNames");
-    }
-    if input.filter_expression.is_none()
-        && input
-            .expression_attribute_values
-            .as_ref()
-            .is_some_and(|values| !values.is_empty())
-    {
-        return Some("ExpressionAttributeValues");
-    }
-    None
 }
 
 /// How a parallel scan whose `Segment` is not inside its `TotalSegments` is refused:

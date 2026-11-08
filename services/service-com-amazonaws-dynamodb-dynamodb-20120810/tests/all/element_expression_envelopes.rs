@@ -14,7 +14,8 @@
 //! boundary), the element kind (`Put`, `Update`, `Delete`, `ConditionCheck`, `Get`), the
 //! expression member the element carried (`ConditionExpression`, `UpdateExpression`,
 //! `ProjectionExpression`, and none at all), which diagnosis the element earns (an entry no
-//! expression references, a token no entry defines), which substitution table carries it
+//! expression references, a token no entry defines, a table offered with no expression at
+//! all), which substitution table carries it
 //! (`ExpressionAttributeNames`, `ExpressionAttributeValues`), how many entries are unused
 //! (one, two, three) and where the faulty element sits among its siblings (first, second).
 //!

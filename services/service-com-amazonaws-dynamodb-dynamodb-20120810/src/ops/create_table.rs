@@ -1479,10 +1479,9 @@ pub(crate) fn validated_index_throughput(
             }
             Ok(Some(throughput))
         }
-        (_, None) => Err(crate::state::RequestError::Validation(format!(
-            "One or more parameter values were invalid: Both ReadCapacityUnits and \
-             WriteCapacityUnits must be specified for index: {index_name}"
-        ))),
+        (_, None) => Err(crate::state::RequestError::Validation(
+            crate::state::index_capacity_required_message(index_name),
+        )),
     }
 }
 
@@ -1493,16 +1492,21 @@ pub(crate) fn validated_index_throughput(
 fn validated_throughput(
     input: &CreateTableInput,
 ) -> Result<(String, Option<ProvisionedThroughput>), crate::state::RequestError> {
-    let billing_mode = input
-        .billing_mode
-        .clone()
-        .unwrap_or_else(|| "PROVISIONED".to_string());
-    match (billing_mode.as_str(), input.provisioned_throughput.clone()) {
-        ("PAY_PER_REQUEST", None) => Ok((billing_mode, None)),
-        ("PAY_PER_REQUEST", Some(_)) => Err(crate::state::RequestError::Validation(
+    let billing_mode = crate::state::requested_throughput_mode(
+        input.billing_mode.as_deref(),
+        input.table_throughput_mode.as_deref(),
+    )
+    .unwrap_or("PROVISIONED")
+    .to_string();
+    // Each mode member was held to the enum's value set before this handler ran, so the
+    // two modes below are the whole of what a request can resolve to.
+    let on_demand = billing_mode == "PAY_PER_REQUEST";
+    match (on_demand, input.provisioned_throughput.clone()) {
+        (true, None) => Ok((billing_mode, None)),
+        (true, Some(_)) => Err(crate::state::RequestError::Validation(
             THROUGHPUT_WITH_PAY_PER_REQUEST_MESSAGE.to_string(),
         )),
-        ("PROVISIONED", Some(throughput)) => {
+        (false, Some(throughput)) => {
             if throughput.read_capacity_units < 1 || throughput.write_capacity_units < 1 {
                 return Err(crate::state::RequestError::Validation(format!(
                     "Invalid ProvisionedThroughput: ReadCapacityUnits and WriteCapacityUnits \
@@ -1512,11 +1516,8 @@ fn validated_throughput(
             }
             Ok((billing_mode, Some(throughput)))
         }
-        ("PROVISIONED", None) => Err(crate::state::RequestError::Validation(
+        (false, None) => Err(crate::state::RequestError::Validation(
             THROUGHPUT_WITHOUT_PROVISIONED_MESSAGE.to_string(),
         )),
-        (other, _) => Err(crate::state::RequestError::Validation(format!(
-            "Invalid BillingMode: {other} must be PROVISIONED or PAY_PER_REQUEST"
-        ))),
     }
 }

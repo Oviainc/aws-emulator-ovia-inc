@@ -378,10 +378,22 @@ async fn a_table_listing_states_its_page_size_clause_before_its_cursor_clause() 
 /// must satisfy — the table-name form, which the model does not carry on the key shape
 /// (`smithy_query(query="shape", shape="com.amazonaws.dynamodb#BatchGetRequestMap")`
 /// gives a key of `TableArn`, length 1..1024).
-const MAP_KEY_CLAUSE: &str = "1 validation error detected: Value at 'requestItems' failed to \
-     satisfy constraint: Map keys must satisfy constraint: [Member must have length less than \
-     or equal to 255, Member must have length greater than or equal to 3, Member must satisfy \
-     regular expression pattern: [a-zA-Z0-9_.-]+]";
+///
+/// `quoted` is the map the clause states as the value it refused, which `BatchGetItem`
+/// renders as the JSON the request carried and `BatchWriteItem` states none of
+/// (`request_shape_validation_classes` spans that rule).
+fn map_key_clause(quoted: Option<&str>) -> String {
+    let value = match quoted {
+        Some(rendered) => format!("Value '{rendered}' at"),
+        None => "Value at".to_string(),
+    };
+    format!(
+        "1 validation error detected: {value} 'requestItems' failed to satisfy constraint: Map \
+         keys must satisfy constraint: [Member must have length less than or equal to 255, \
+         Member must have length greater than or equal to 3, Member must satisfy regular \
+         expression pattern: [a-zA-Z0-9_.-]+]"
+    )
+}
 
 #[tokio::test]
 async fn a_request_items_key_that_addresses_no_table_is_refused_as_a_map_key() {
@@ -407,6 +419,10 @@ async fn a_request_items_key_that_addresses_no_table_is_refused_as_a_map_key() {
     ];
 
     for (case, key) in &keys {
+        let quoted = format!(
+            "{{{}:{{\"Keys\":[{{\"pk\":{{\"S\":\"one\"}}}}]}}}}",
+            serde_json::Value::String(key.clone())
+        );
         let (code, stated) = refusal(
             &router,
             case,
@@ -416,7 +432,7 @@ async fn a_request_items_key_that_addresses_no_table_is_refused_as_a_map_key() {
         .await;
         assert_eq!(
             (code.as_str(), stated.as_str()),
-            ("ValidationException", MAP_KEY_CLAUSE),
+            ("ValidationException", map_key_clause(Some(&quoted)).as_str()),
             "case {case:?} (BatchGetItem): expected the map-key clause, got {code} with \
              {stated:?}"
         );
@@ -434,7 +450,7 @@ async fn a_request_items_key_that_addresses_no_table_is_refused_as_a_map_key() {
         .await;
         assert_eq!(
             (code.as_str(), stated.as_str()),
-            ("ValidationException", MAP_KEY_CLAUSE),
+            ("ValidationException", map_key_clause(None).as_str()),
             "case {case:?} (BatchWriteItem): expected the map-key clause, got {code} with \
              {stated:?}"
         );

@@ -17,6 +17,13 @@ pub struct UpdateTableInput {
     pub attribute_definitions: Option<Vec<AttributeDefinition>>,
     pub table_name: String,
     pub billing_mode: Option<String>,
+    /// The throughput-mode spelling of `billing_mode`, which the model declares beside it:
+    /// both members target the `BillingMode` enum and name the same read/write capacity
+    /// mode, and a request states the mode through one of them. It is written AFTER
+    /// `billing_mode` because the validating walk reports a violated member in the order
+    /// the members are written, and a request that breaks both is refused with the
+    /// billing-mode clause first.
+    pub table_throughput_mode: Option<String>,
     pub provisioned_throughput: Option<ProvisionedThroughput>,
     pub global_secondary_index_updates: Option<Vec<GlobalSecondaryIndexUpdate>>,
     pub stream_specification: Option<StreamSpecification>,
