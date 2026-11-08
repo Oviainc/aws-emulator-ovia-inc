@@ -274,6 +274,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let arn = st::collaboration_arn(&region, &id);
         let created_at = st::now();
 
+        // Every party to a new collaboration — the creator and each declared member —
+        // holds its member record from this instant, which is what a member listing
+        // reports as that member's `createTime`/`updateTime`. A party a committed change
+        // request adds later is stamped when that change applies.
+        let member_times: ::std::collections::HashMap<String, st::MemberTimes> =
+            ::std::iter::once(creator_account_id.clone())
+                .chain(input.members.iter().map(|member| member.account_id.clone()))
+                .map(|account_id| {
+                    (
+                        account_id,
+                        st::MemberTimes {
+                            create_time: created_at,
+                            update_time: created_at,
+                        },
+                    )
+                })
+                .collect();
+
         let record = st::CollaborationRecord {
             id: id.clone(),
             arn: arn.clone(),
@@ -297,6 +315,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             auto_approved_change_types: input.auto_approved_change_request_types,
             allowed_result_regions: input.allowed_result_regions,
             is_metrics_enabled: st::effective_is_metrics_enabled(input.is_metrics_enabled),
+            member_times,
             members: input.members,
         };
 

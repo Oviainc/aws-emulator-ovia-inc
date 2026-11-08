@@ -6,7 +6,9 @@
 //! computed from it. The two stored records are deliberately split:
 //!
 //! * [`CollaborationRecord`] holds the collaboration as the CREATOR declared it —
-//!   including the creator's own abilities and the immutable `members` list. The
+//!   including the creator's own abilities and the immutable `members` list, plus each
+//!   party's own member timestamps, since a member's `createTime`/`updateTime` move with
+//!   that party's grant rather than with the collaboration. The
 //!   modelled `Collaboration` shape is NOT stored, because two of its members
 //!   (`memberStatus`, `membershipId`/`membershipArn`) describe the CALLER's relation
 //!   to the collaboration rather than the collaboration itself, so they are derived
@@ -80,16 +82,17 @@ use crate::ops::types::{
     ConfiguredTableAssociationAnalysisRulePolicyV1, ConfiguredTableAssociationSummary,
     DataEncryptionMetadata,
     DifferentialPrivacyTemplateParametersOutput, ErrorMessageConfiguration, MLMemberAbilities,
-    MemberChangeSpecification, MemberSpecification, Membership, MembershipJobComputePaymentConfig,
-    MembershipMLPaymentConfig, MembershipModelInferencePaymentConfig,
-    MembershipModelTrainingPaymentConfig, MembershipPaymentConfiguration,
-    MembershipProtectedJobResultConfiguration, MembershipProtectedQueryOutputConfiguration,
-    MembershipProtectedQueryResultConfiguration, MembershipQueryComputePaymentConfig,
-    MembershipSummary, MembershipSyntheticDataGenerationPaymentConfig, PaymentConfiguration,
-    PrivacyBudgetTemplate, PrivacyBudgetTemplateParametersInput,
-    PrivacyBudgetTemplateParametersOutput, ProtectedQuery, ProtectedQueryError,
-    ProtectedQueryOutputConfiguration, ProtectedQueryResultConfiguration, SyntheticDataParameters,
-    TableReference, WorkerComputeConfiguration,
+    MemberChangeSpecification, MemberSpecification, MemberSummary, Membership,
+    MembershipJobComputePaymentConfig, MembershipMLPaymentConfig,
+    MembershipModelInferencePaymentConfig, MembershipModelTrainingPaymentConfig,
+    MembershipPaymentConfiguration, MembershipProtectedJobResultConfiguration,
+    MembershipProtectedQueryOutputConfiguration, MembershipProtectedQueryResultConfiguration,
+    MembershipQueryComputePaymentConfig, MembershipSummary,
+    MembershipSyntheticDataGenerationPaymentConfig, PaymentConfiguration, PrivacyBudgetTemplate,
+    PrivacyBudgetTemplateParametersInput, PrivacyBudgetTemplateParametersOutput, ProtectedQuery,
+    ProtectedQueryError, ProtectedQueryOutputConfiguration, ProtectedQueryResultConfiguration,
+    QueryComputePaymentConfig, SyntheticDataParameters, TableReference,
+    WorkerComputeConfiguration,
 };
 
 /// The ARN service segment and the SigV4 signing name for Clean Rooms, from
@@ -622,6 +625,23 @@ pub struct CollaborationRecord {
     /// The initial members, not including the creator. Immutable, per the
     /// `CreateCollaboration` `members` doc.
     pub members: Vec<MemberSpecification>,
+    /// When each party's own member record was created and last updated, keyed by
+    /// account id — the `MemberSummary$createTime`/`updateTime` a member listing
+    /// reports.
+    ///
+    /// A member's timestamps are NOT the collaboration's: the creator and the declared
+    /// members are created with the collaboration, but a committed change request can
+    /// add a party later and can restate one party's grant without touching another's,
+    /// so each party's pair is stamped on its own (see
+    /// [`CleanRoomsState::apply_collaboration_change`]).
+    pub member_times: HashMap<String, MemberTimes>,
+}
+
+/// When one party's member record was created and last updated.
+#[derive(Debug, Clone, Copy)]
+pub struct MemberTimes {
+    pub create_time: DateTime,
+    pub update_time: DateTime,
 }
 
 /// What one account was granted in a collaboration: its abilities and the payment
@@ -655,6 +675,34 @@ impl CollaborationRecord {
                 member_abilities: m.member_abilities.clone(),
                 ml_member_abilities: m.ml_member_abilities.clone(),
                 payment_configuration: m.payment_configuration.clone(),
+            })
+    }
+
+    /// Every account this collaboration holds a grant for, in declaration order: the
+    /// creator first, then the declared members. One entry per account — the creator is
+    /// not repeated by a member entry naming it.
+    pub fn party_accounts(&self) -> Vec<String> {
+        let mut accounts = Vec::with_capacity(self.members.len() + 1);
+        accounts.push(self.creator_account_id.clone());
+        for member in &self.members {
+            if member.account_id != self.creator_account_id {
+                accounts.push(member.account_id.clone());
+            }
+        }
+        accounts
+    }
+
+    /// When `account_id`'s member record was created and last updated.
+    ///
+    /// A party the record holds no stamped pair for was declared with the collaboration,
+    /// so it carries the collaboration's own timestamps.
+    pub fn member_times_of(&self, account_id: &str) -> MemberTimes {
+        self.member_times
+            .get(account_id)
+            .copied()
+            .unwrap_or(MemberTimes {
+                create_time: self.create_time,
+                update_time: self.update_time,
             })
     }
 }
@@ -940,6 +988,48 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
             membership_arn: membership.map(|m| m.arn.clone()),
             analytics_engine: Some(record.analytics_engine.clone()),
         })
+    }
+
+    /// The modelled `MemberSummary` for one party to `record` — what a member listing
+    /// reports about that account — or `None` when the account is not a party to the
+    /// collaboration at all.
+    ///
+    /// Every member of the summary is derived from the collaboration as stored: the
+    /// grant the creator declared for that account, the status it holds in the
+    /// collaboration ([`Self::member_status_for`]), the membership it has joined with if
+    /// any, and its own timestamps ([`CollaborationRecord::member_times_of`]).
+    pub fn member_summary(
+        &self,
+        record: &CollaborationRecord,
+        account_id: &str,
+    ) -> Option<MemberSummary> {
+        let grant = record.grant_for(account_id)?;
+        let status = self.member_status_for(record, account_id)?;
+        let membership = self.membership_of(&record.id, account_id);
+        let times = record.member_times_of(account_id);
+        Some(MemberSummary {
+            account_id: account_id.to_string(),
+            status: status.to_string(),
+            display_name: grant.display_name,
+            abilities: grant.member_abilities,
+            ml_abilities: grant.ml_member_abilities,
+            create_time: times.create_time,
+            update_time: times.update_time,
+            membership_id: membership.map(|membership| membership.id.clone()),
+            membership_arn: membership.map(|membership| membership.arn.clone()),
+            payment_configuration: member_payment_configuration(record, account_id),
+        })
+    }
+
+    /// Every party to `record` as a [`MemberSummary`], in declaration order (see
+    /// [`CollaborationRecord::party_accounts`]) — the order a member listing pages in,
+    /// so a token handed out by one call resumes at the same row on the next one.
+    pub fn member_summaries(&self, record: &CollaborationRecord) -> Vec<MemberSummary> {
+        record
+            .party_accounts()
+            .iter()
+            .filter_map(|account_id| self.member_summary(record, account_id))
+            .collect()
     }
 
     /// The analysis rule of `analysis_rule_type` stored for configured table
@@ -1319,14 +1409,7 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
     /// parties to a change of it. The account a change ADDS is not among them: it is the
     /// subject of the change, not yet a party to the collaboration.
     pub fn change_request_approvals(&self, record: &CollaborationRecord) -> Vec<String> {
-        let mut accounts = Vec::with_capacity(record.members.len() + 1);
-        accounts.push(record.creator_account_id.clone());
-        for member in &record.members {
-            if member.account_id != record.creator_account_id {
-                accounts.push(member.account_id.clone());
-            }
-        }
-        accounts
+        record.party_accounts()
     }
 
     /// Apply one COMMITTED change to the collaboration it was made against.
@@ -1393,6 +1476,22 @@ impl ComAmazonawsCleanroomsAwsbastioncontrolplaneservicelambdaState {
             });
         }
         record.update_time = at;
+
+        // The party's OWN timestamps move with the grant this change states: an account
+        // the change added holds its member record from now on, and one whose grant the
+        // change restated was last updated now. A party the change did not name keeps
+        // its pair, which is why these are stamped per account rather than taken from
+        // the collaboration's `updateTime`.
+        if record.grant_for(&member_spec.account_id).is_some() {
+            record
+                .member_times
+                .entry(member_spec.account_id.clone())
+                .or_insert(MemberTimes {
+                    create_time: at,
+                    update_time: at,
+                })
+                .update_time = at;
+        }
 
         let membership_id = self
             .membership_by_collaboration
@@ -2384,9 +2483,7 @@ fn materialize_ml_payment_config(
 /// — and `None` when the collaboration configured neither, which leaves the optional
 /// member absent rather than guessed.
 pub fn query_compute_payer(record: &CollaborationRecord) -> Option<String> {
-    let accounts: Vec<String> = ::std::iter::once(record.creator_account_id.clone())
-        .chain(record.members.iter().map(|m| m.account_id.clone()))
-        .collect();
+    let accounts = record.party_accounts();
     let configured = accounts.iter().find(|account| {
         record.grant_for(account).is_some_and(|grant| {
             grant
@@ -2405,6 +2502,37 @@ pub fn query_compute_payer(record: &CollaborationRecord) -> Option<String> {
                 .any(|ability| ability == ABILITY_CAN_QUERY)
         })
     })
+}
+
+/// The `PaymentConfiguration` a member listing reports for one party to `record`.
+///
+/// `MemberSummary$paymentConfiguration` is documented as "the collaboration member's
+/// payment responsibilities SET BY THE COLLABORATION CREATOR", so a party the creator
+/// configured reports that configuration as stored, untouched.
+///
+/// The member is required, so a party the creator configured for nothing reports the
+/// documented default instead: `QueryComputePaymentConfig$isResponsible` makes "the
+/// member who can query" the default payer for query compute, which is the one account
+/// [`query_compute_payer`] resolves for the collaboration — the other parties are not
+/// responsible for it. The costs the shape leaves OPTIONAL stay absent, because nobody
+/// was made responsible for them.
+pub fn member_payment_configuration(
+    record: &CollaborationRecord,
+    account_id: &str,
+) -> PaymentConfiguration {
+    if let Some(configured) = record
+        .grant_for(account_id)
+        .and_then(|grant| grant.payment_configuration)
+    {
+        return configured;
+    }
+    PaymentConfiguration {
+        query_compute: QueryComputePaymentConfig {
+            is_responsible: query_compute_payer(record).as_deref() == Some(account_id),
+        },
+        machine_learning: None,
+        job_compute: None,
+    }
 }
 
 /// The `WorkerComputeConfiguration$type` a worker compute configuration runs at when

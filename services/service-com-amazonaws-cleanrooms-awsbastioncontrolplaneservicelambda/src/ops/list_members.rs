@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListMembers
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListMembers`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListMembers::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reporting only: one `MemberSummary` per party to the collaboration the request
+//! names — its creator and its declared members — in declaration order, paged by
+//! `maxResults`/`nextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +150,76 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListMembers` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListMembersErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListMembers"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(ListMembersErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("cleanrooms state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let caller = st::caller_account_id();
+
+        // The collaboration is resolved exactly as every other operation that takes a
+        // `collaborationIdentifier` resolves it, so this read never reports the members
+        // of a collaboration the caller is not a party to.
+        let Some(record) = store.visible_collaboration(&input.collaboration_identifier, caller)
+        else {
+            return Err(ListMembersErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    // This operation binds the collaboration identifier as its URI
+                    // label, so the resource the decision was taken on is that
+                    // collaboration.
+                    message: Some(st::authorization_denied_message(
+                        Self::NAME,
+                        &st::collaboration_arn(
+                            &st::request_region(ctx.parts()),
+                            &input.collaboration_identifier,
+                        ),
+                    )),
+                    reason: Some(st::ACCESS_DENIED_REASON_INSUFFICIENT_PERMISSIONS.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Declaration order (the creator, then the declared members), so a token handed
+        // out by one call resumes at the same row on the next one.
+        let summaries = store.member_summaries(record);
+
+        let (member_summaries, next_token) = st::page(
+            summaries,
+            |summary| summary.account_id.as_str(),
+            input.next_token.as_deref(),
+            input.max_results,
+        )
+        .map_err(|error| {
+            let (member, message) = match error {
+                st::PageError::UnknownToken => (
+                    "nextToken",
+                    "must be a token returned by a previous ListMembers call",
+                ),
+                st::PageError::InvalidMaxResults => {
+                    ("maxResults", "must be a page size of at least 1")
+                }
+            };
+            ListMembersErrorModeled::ValidationException(ValidationException {
+                message: Some(format!("{member} {message}")),
+                reason: Some(st::VALIDATION_REASON_FIELD_VALIDATION_FAILED.to_string()),
+                field_list: Some(vec![ValidationExceptionField {
+                    name: member.to_string(),
+                    message: message.to_string(),
+                }]),
+            })
+        })?;
+
+        Ok(ListMembersOutput {
+            next_token,
+            member_summaries,
+        })
     }
 }
