@@ -113,3 +113,9 @@ mod package_version_summary_published_time;
 mod asset_response_media_type;
 #[path = "all/control_plane_refusal_sentences.rs"]
 mod control_plane_refusal_sentences;
+#[path = "all/pypi_data_plane.rs"]
+mod pypi_data_plane;
+#[path = "all/repository_endpoint_credentials.rs"]
+mod repository_endpoint_credentials;
+#[path = "all/package_version_readme.rs"]
+mod package_version_readme;

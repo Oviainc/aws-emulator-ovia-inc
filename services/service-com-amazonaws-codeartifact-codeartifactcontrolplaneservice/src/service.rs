@@ -52,8 +52,16 @@
 //!   [`override_operation`](Service::override_operation) resolves it to the one operation
 //!   that serves it ([`npm_registry::NpmRegistryEndpoint`]), out of the same package and
 //!   asset records the control plane writes.
+//! - [`pypi_registry`] — the same for a repository's `pypi` endpoint, which speaks the PyPI
+//!   upload API and the Simple Repository API (PEP 503 and PEP 691) instead
+//!   ([`pypi_registry::PypiRegistryEndpoint`]).
+//! - [`repository_data_plane`] — what those two planes share: how a request addresses a
+//!   repository endpoint, which credential authenticates it, what the repository's own
+//!   policy says about it, and how an answer is rendered.
 //! - [`npm_manifest`] — the one reading of an npm metadata document, which is where every
 //!   member this service reports off one comes from.
+//! - [`npm_readme`] — the one reading of the README an npm publish carried, which is what
+//!   `GetPackageVersionReadme` reports for a version published over the npm endpoint.
 //! - [`authorization`] — whether IAM lets the caller perform a CodeArtifact action on a
 //!   repository, the decision every control-plane operation addressing one takes before it
 //!   answers.
@@ -66,7 +74,13 @@ pub mod authorization;
 
 pub mod npm_manifest;
 
+pub mod npm_readme;
+
 pub mod npm_registry;
+
+pub mod pypi_registry;
+
+pub mod repository_data_plane;
 
 pub mod token_authorization;
 
@@ -182,6 +196,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// ([`npm_registry::NpmRegistryEndpoint`]), built from that same engine and resolved by
     /// [`override_operation`](Service::override_operation).
     npm_registry_endpoint: npm_registry::NpmRegistryEndpoint<Eng>,
+    /// The same for a `pypi` endpoint's traffic
+    /// ([`pypi_registry::PypiRegistryEndpoint`]), which speaks the PyPI protocols over the
+    /// same records.
+    pypi_registry_endpoint: pypi_registry::PypiRegistryEndpoint<Eng>,
     /// This service's wire protocol: the model's own `restJson1`, answering with the media
     /// type of [`wire`]. Built once here because
     /// [`override_protocol`](Service::override_protocol) hands back a borrow of it.
@@ -196,6 +214,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             npm_registry_endpoint: npm_registry::NpmRegistryEndpoint::new(Arc::clone(&engine)),
+            pypi_registry_endpoint: pypi_registry::PypiRegistryEndpoint::new(Arc::clone(&engine)),
             protocol: wire::JsonMediaTypeRestJson::new(),
             engine,
         }
@@ -217,17 +236,22 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         match smithy_server_runtime::resolve_route_key(parts) {
             Some(key) if key == self.entry.identity().signing_name() => true,
             // And a repository ENDPOINT's own traffic: a request addressed to a repository
-            // endpoint this service holds a record for ([`npm_registry::claims_parts`]).
-            // Such a request names no modelled operation and carries no credential scope
-            // naming this service — its host is the DOMAIN's published endpoint host, whose
-            // first label names no service — so the front door could resolve no target
-            // service for it and answered `404 UnknownService`, for the one address
-            // `GetRepositoryEndpoint` told the client to use.
+            // endpoint this service holds a record for ([`npm_registry::claims_parts`],
+            // [`pypi_registry::claims_parts`]). Such a request names no modelled operation
+            // and carries no credential scope naming this service — its host is the
+            // DOMAIN's published endpoint host, whose first label names no service — so the
+            // front door could resolve no target service for it and answered
+            // `404 UnknownService`, for the one address `GetRepositoryEndpoint` told the
+            // client to use.
             //
             // The claim is narrowed to a repository this service HOLDS, read from the one
             // shared store, rather than to a host or a path shape alone, so one request
-            // keeps one claimant.
-            _ => npm_registry::claims_parts(&*self.engine, parts),
+            // keeps one claimant; the two planes claim disjoint paths, because the format
+            // is the first segment of the endpoint path each is published under.
+            _ => {
+                npm_registry::claims_parts(&*self.engine, parts)
+                    || pypi_registry::claims_parts(&*self.engine, parts)
+            }
         }
     }
 
@@ -249,6 +273,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // carries is the repository's bearer token, not a SigV4 signature.
         if npm_registry::claims_request(&*self.engine, req) {
             return Some(&self.npm_registry_endpoint);
+        }
+        if pypi_registry::claims_request(&*self.engine, req) {
+            return Some(&self.pypi_registry_endpoint);
         }
         None
     }

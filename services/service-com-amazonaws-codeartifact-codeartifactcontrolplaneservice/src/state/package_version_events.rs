@@ -461,6 +461,7 @@ mod tests {
                 super::super::Asset::new(super::super::NPM_TARBALL_ASSET, b"tarball".to_vec()),
             )]),
             manifest: Some(r#"{"name":"left-pad","version":"1.0.0"}"#.to_string()),
+            readme: None,
             sequence_number: 1,
         }
     }

@@ -317,9 +317,11 @@ async fn the_endpoint_is_served_at_every_addressing_the_service_publishes() {
             true,
         ),
         (
-            "another format's endpoint path",
+            // `npm` and `pypi` are the two formats whose protocols this service serves; a
+            // path under any other format's endpoint is not claimed by either plane.
+            "a format whose protocol no plane serves",
             endpoint_host(domain),
-            format!("/pypi/{repository}/-/ping"),
+            format!("/maven/{repository}/-/ping"),
             404,
             false,
         ),

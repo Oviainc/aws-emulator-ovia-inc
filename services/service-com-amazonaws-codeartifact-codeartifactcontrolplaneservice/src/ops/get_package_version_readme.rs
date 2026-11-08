@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetPackageVersionReadme
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetPackageVersionReadme`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetPackageVersionReadme::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the README of one package version: "the readme file or descriptive text for a
+//! package version", read off the stored version
+//! ([`crate::state::PackageVersion::readme`]) — the text the publish that created the
+//! version carried, which for an npm version is the `readme` its publish document declared
+//! (or the `README` file inside its tarball) and for a Python version is the long
+//! description its upload sent. A version whose publish carried none reports none rather
+//! than an empty document. Reporting only: this operation writes nothing.
+//!
+//! It is an AUTHORIZED read, decided for the PACKAGE the request addressed
+//! ([`crate::service::authorization`]) ahead of everything else.
 //!
 //! ## Shape of an operation
 //!
@@ -202,18 +204,104 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             },
         )
         .map_err(GetPackageVersionReadmeErrorModeled::AccessDeniedException)?;
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetPackageVersionReadme` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetPackageVersionReadmeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetPackageVersionReadme"))
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetPackageVersionReadmeErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the CodeArtifact store is unavailable".to_string(),
+                },
+            )
+            .into());
+        };
+        // A read: the guard is taken immutably, so no later caller sees anything move
+        // because a readme was fetched.
+        let store = state.lock();
+
+        let Some(domain) = store.domain(&input.domain, input.domain_owner.as_deref()) else {
+            return Err(not_found(
+                crate::state::domain_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                ),
+                &input.domain,
+                crate::state::DOMAIN_RESOURCE_TYPE,
+            ));
+        };
+        let Some(repository) = domain.repositories.get(&input.repository) else {
+            return Err(not_found(
+                crate::state::repository_not_found_message(
+                    &input.domain,
+                    input.domain_owner.as_deref(),
+                    &input.repository,
+                ),
+                &input.repository,
+                crate::state::REPOSITORY_RESOURCE_TYPE,
+            ));
+        };
+        // A package is identified by its whole `(format, namespace, name)` triple: the
+        // same name in another format, or under another namespace, is another package.
+        let Some(package) =
+            repository.package(&input.format, input.namespace.as_deref(), &input.package)
+        else {
+            return Err(not_found(
+                crate::state::package_coordinate_not_found_message(
+                    &input.format,
+                    input.namespace.as_deref(),
+                    &input.package,
+                    &input.repository,
+                ),
+                &input.package,
+                crate::state::PACKAGE_RESOURCE_TYPE,
+            ));
+        };
+        let Some(version) = package.versions.get(&input.package_version) else {
+            return Err(not_found(
+                crate::state::package_version_not_found_message(
+                    &repository.id(),
+                    &input.format,
+                    input.namespace.as_deref(),
+                    &input.package,
+                    &input.package_version,
+                ),
+                &crate::state::package_version_resource_id(
+                    input.namespace.as_deref(),
+                    &input.package,
+                    &input.package_version,
+                ),
+                crate::state::PACKAGE_VERSION_RESOURCE_TYPE,
+            ));
+        };
+
+        Ok(GetPackageVersionReadmeOutput {
+            // The coordinate the version is STORED under, not the strings the request
+            // spelled: the lookup is exact, so they agree, and the answer reports the
+            // record.
+            format: Some(package.format.clone()),
+            namespace: package.namespace.clone(),
+            package: Some(package.name.clone()),
+            version: Some(version.version.clone()),
+            version_revision: Some(version.revision()),
+            // The text the publish carried, byte for byte: the `readme` an npm publish
+            // document declared or its tarball held
+            // ([`crate::service::npm_readme`]), the long description a PyPI upload sent.
+            // Absent for a version whose publish carried none, which is "this version has
+            // no readme" rather than an empty document.
+            readme: version.readme.clone(),
+        })
     }
+}
+
+/// A `ResourceNotFoundException` (404) naming the resource that was addressed, so a caller
+/// can tell an unknown domain or repository from an unknown package or version.
+fn not_found(
+    message: String,
+    resource_id: &str,
+    resource_type: &str,
+) -> GetPackageVersionReadmeError {
+    GetPackageVersionReadmeErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message,
+        resource_id: Some(resource_id.to_string()),
+        resource_type: Some(resource_type.to_string()),
+    })
+    .into()
 }

@@ -215,6 +215,11 @@ pub const PACKAGE_FORMAT_GENERIC: &str = "generic";
 /// (`smithy_query(query="shape",shape="PackageFormat")`).
 pub const PACKAGE_FORMAT_NPM: &str = "npm";
 
+/// The `PackageFormat` whose packages are published and resolved over a PyPI index — the
+/// repository endpoint `crate::service::pypi_registry` serves — as the model spells it
+/// (`smithy_query(query="shape",shape="PackageFormat")`).
+pub const PACKAGE_FORMAT_PYPI: &str = "pypi";
+
 /// The `PackageFormat`s whose namespace is a SCOPE, so the scope is part of how a package
 /// of that format is written: "The namespace of an npm or Swift package version is its
 /// scope" (`PackageVersionDescription$namespace`,
@@ -397,7 +402,8 @@ impl ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState {
     }
 
     /// The total CONTENT bytes this service currently retains: every asset's bytes plus
-    /// every version's metadata document ([`PackageVersion::manifest`]) — the whole of
+    /// every version's retained text ([`PackageVersion::retained_text_bytes`] — its
+    /// metadata document and its readme) — the whole of
     /// what a publish leaves in the store, which is what [`MAX_STORED_ASSET_BYTES`] has to
     /// bound.
     ///
@@ -416,7 +422,7 @@ impl ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState {
             .fold(0i64, |total, version| {
                 total
                     .saturating_add(version.asset_size_bytes())
-                    .saturating_add(version.manifest_size_bytes())
+                    .saturating_add(version.retained_text_bytes())
             })
     }
 
@@ -1759,6 +1765,20 @@ pub struct PackageVersion {
     /// the metadata file for the package format"). It is not an ASSET: the format decides
     /// what a version's assets are, and for npm that is the tarball alone.
     pub manifest: Option<String>,
+    /// The version's README, as the text its package manager published it as: the `readme`
+    /// an npm publish document declares (or the `package/README*` file inside the published
+    /// tarball), and the long description a PyPI upload carries.
+    ///
+    /// `GetPackageVersionReadme` "gets the readme file or descriptive text for a package
+    /// version", so the text is what the publisher sent, kept verbatim and decoded as the
+    /// UTF-8 it arrived as — a multi-byte readme round-trips unchanged. `None` for a version
+    /// whose publish carried none, which is "this version has no readme" rather than an
+    /// empty one.
+    ///
+    /// Extracted at INGEST rather than on each read: the text is a property of what was
+    /// published, and deriving it per read would make a readme fetch re-read a version's
+    /// whole tarball.
+    pub readme: Option<String>,
     /// Which change of this version the next event announces: `1` for the change that
     /// created it, advanced by every later change to it.
     ///
@@ -1922,6 +1942,18 @@ impl PackageVersion {
             .as_ref()
             .and_then(|manifest| i64::try_from(manifest.len()).ok())
             .unwrap_or_default()
+    }
+
+    /// The size of every TEXT this version retains beside its assets: its metadata document
+    /// and its readme. Retained caller content, like the document itself, so it counts
+    /// towards what this emulator may hold.
+    pub fn retained_text_bytes(&self) -> i64 {
+        let readme = self
+            .readme
+            .as_ref()
+            .and_then(|readme| i64::try_from(readme.len()).ok())
+            .unwrap_or_default();
+        self.manifest_size_bytes().saturating_add(readme)
     }
 }
 

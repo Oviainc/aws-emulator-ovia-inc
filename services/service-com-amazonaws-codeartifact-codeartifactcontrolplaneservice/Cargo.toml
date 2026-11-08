@@ -62,6 +62,15 @@ serde = { workspace = true }
 # (`state::package_version_events`). Only the generated client is needed — the emulator
 # supplies the transport, so the SDK's own HTTPS stack and runtime are left out.
 aws-sdk-eventbridge = { version = "1", default-features = false }
+# The twine/pip UPLOAD a repository's pypi endpoint accepts is a `multipart/form-data`
+# document (`:action=file_upload` plus the distribution file), read by `multer` over the
+# buffered body `futures-util` hands it as a one-chunk stream.
+multer = "3.1"
+futures-util = { version = "0.3", default-features = false }
+# An npm version's tarball is a gzip-framed tar, opened to recover the `README` a publish
+# document does not declare inline: `flate2` unframes it and `tar` walks its entries.
+flate2 = "1"
+tar = "0.4"
 
 [dev-dependencies]
 # EventBridge and SQS are mounted beside CodeArtifact on one engine in the integration

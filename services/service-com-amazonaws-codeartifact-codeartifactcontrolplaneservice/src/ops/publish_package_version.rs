@@ -487,6 +487,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> PublishPackageVer
                         // API "takes" no `package.json` or `pom.xml`, so there is nothing
                         // for the metadata-sourced members to be read from.
                         manifest: None,
+                        // Nor a readme: the text `GetPackageVersionReadme` reports comes
+                        // out of a format's own publish document, which this API has none
+                        // of.
+                        readme: None,
                         // This publish is the first change of this version.
                         sequence_number: 1,
                     },

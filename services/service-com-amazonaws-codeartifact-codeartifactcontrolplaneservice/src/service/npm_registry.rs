@@ -38,34 +38,39 @@
 //! ## What authenticates a request
 //!
 //! The credential an npm client presents is the bearer token `GetAuthorizationToken` minted
-//! (`//<host>/<path>:_authToken=<token>` in an npmrc), so this module resolves it against
-//! the tokens this service remembers minting
-//! ([`crate::state::ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState::authorization_token`]):
-//! a token this service did not mint, one the clock has expired, one scoped to another
-//! domain, and no token at all are each `401`. The token is domain-scoped — "The name of
-//! the domain that is in scope for the generated authorization token" — so it authenticates
-//! every repository of that domain and no repository outside it.
+//! (`//<host>/<path>:_authToken=<token>` in an npmrc), resolved against the tokens this
+//! service remembers minting by the reading every repository endpoint shares
+//! ([`crate::service::repository_data_plane::authenticated_principal`]): a token this
+//! service did not mint, one the clock has expired, one scoped to another domain, and no
+//! token at all are each `401`.
 //!
 //! ## What it does not serve yet
 //!
-//! * Only the `npm` format. The other `PackageFormat` values publish over their own
-//!   protocols (a PyPI index, a Maven repository), each of which is its own body of
-//!   behaviour; a request under another format's path is not claimed here at all rather
-//!   than answered in npm's envelope.
+//! * Only the `npm` format. `pypi` is served by [`crate::service::pypi_registry`] and the
+//!   remaining `PackageFormat` values publish over their own protocols (a Maven
+//!   repository, a NuGet feed), each of which is its own body of behaviour; a request under
+//!   another format's path is not claimed here at all rather than answered in npm's
+//!   envelope.
 //! * No EXTERNAL-connection resolution: a package this domain holds nowhere is not fetched
 //!   from a public registry, which is the behaviour of `AssociateExternalConnection` and
 //!   belongs with the issue that owns it. UPSTREAM repositories inside the domain ARE
 //!   resolved, and what they resolve is retained here ([`retain_from_upstreams`]).
 
-use ::aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
-use ::aws_smithy_types::body::SdkBody;
+use ::aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse};
 use ::serde_json::{json, Map, Value};
 use ::std::sync::Arc;
 use ::std::time::SystemTime;
 
-use ::service_common::data_plane_addressing::{first_segment, host_only, names_a_service};
-
-use crate::state::package_version_events::{VersionChange, VersionChanges, OPERATION_CREATED};
+// The addressing of a repository endpoint, the credential that authenticates one, the
+// repository policy's say over what a request may do there, and the rendering of an answer
+// are the same for every format a repository publishes an endpoint for, so they live once in
+// [`crate::service::repository_data_plane`]; only npm's own protocol is here.
+use crate::service::repository_data_plane::{
+    authenticated_principal, bad_request, blocked_download, downloadable, endpoint_url, forbidden,
+    method_of, not_found, parsed_uri, percent_decoded, policy_refusal, presented_bearer,
+    publish_blocked, record_created, rendered, resolve, Addressed, Coordinate, Resolved, Served,
+    BEARER_CHALLENGE, PUBLISH_ACTION, READ_ACTION,
+};
 use crate::state::{
     service_state, Asset, ComAmazonawsCodeartifactCodeartifactcontrolplaneserviceState as CaState,
     Package, PackageVersion,
@@ -74,17 +79,6 @@ use crate::state::{
 /// The one `PackageFormat` this plane serves ([`crate::state::PACKAGE_FORMAT_NPM`]). It is
 /// also the first segment of the endpoint path CodeArtifact publishes for it.
 pub const PACKAGE_FORMAT_NPM: &str = crate::state::PACKAGE_FORMAT_NPM;
-
-/// The infix every published repository-endpoint host carries between the domain label and
-/// the region: `<domain>-<account>.d.codeartifact.<region>.<suffix>` (AWS CodeArtifact user
-/// guide). Reading it is what distinguishes a repository endpoint's host from this
-/// service's own API endpoint.
-const ENDPOINT_HOST_INFIX: &str = "d.codeartifact.";
-
-/// How many digits an account id carries (`AccountId` is modelled `^[0-9]{12}$`), which is
-/// what makes the domain label of an endpoint host splittable: everything before the last
-/// `-` is the domain name, and those digits are the owning account.
-const ACCOUNT_ID_DIGITS: usize = 12;
 
 /// The extension of the file name npm's own tarball URL carries: the URL names
 /// `<package>-<version>.tgz`, while the ASSET the version is stored as carries the format's
@@ -98,12 +92,6 @@ const NPM_RESERVED_SEGMENT: &str = "-";
 /// The registry route an npm client checks a registry (and its credential) with:
 /// `GET /-/ping`, which answers `200` for a credential the registry accepts.
 const PING_ROUTE: &str = "ping";
-
-/// The media type a packument and every error body carry.
-const JSON_MEDIA_TYPE: &str = "application/json";
-
-/// The media type a tarball carries: opaque bytes, which is what npm fetches it as.
-const TARBALL_MEDIA_TYPE: &str = "application/octet-stream";
 
 /// The longest body npm's dist-tag route carries: the version a tag is to name, as a JSON
 /// string. `PackageVersion` is modelled length 1..255, so a body past this names no version
@@ -136,14 +124,14 @@ pub fn claims_parts<Eng: Send + Sync + 'static>(
     engine: &Eng,
     parts: &::http::request::Parts,
 ) -> bool {
-    resolve(engine, &Addressed::of_parts(parts)).is_some()
+    resolve(engine, &Addressed::of_parts(parts), PACKAGE_FORMAT_NPM).is_some()
 }
 
 /// [`claims_parts`] for the runtime-API request the serving seam is handed, resolved by the
 /// same rule.
 pub fn claims_request<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> bool {
     let uri = parsed_uri(req.uri());
-    resolve(engine, &Addressed::of_request(req, &uri)).is_some()
+    resolve(engine, &Addressed::of_request(req, &uri), PACKAGE_FORMAT_NPM).is_some()
 }
 
 /// Answer a request this plane claimed, out of the records the control plane holds.
@@ -153,13 +141,18 @@ pub fn claims_request<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest)
 /// authenticated — which is what lets a client carrying an npm bearer token rather than a
 /// SigV4 signature be answered at all.
 ///
+/// `async` because a PUBLISH reads its document before the store is locked and yields
+/// between the versions it reads ([`read_publish_document`]), so a request carrying many of
+/// them neither holds the store nor occupies a runtime worker without a point for a timeout
+/// or a cancellation to land on.
+///
 /// Every state change it makes is RECORDED on the store
 /// ([`CaState::record_version_change`]); the operation announces them once this function
 /// has returned and the store's lock is released.
-pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtResponse {
+pub async fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtResponse {
     let uri = parsed_uri(req.uri());
     let addressed = Addressed::of_request(req, &uri);
-    let Some(resolved) = resolve(engine, &addressed) else {
+    let Some(resolved) = resolve(engine, &addressed, PACKAGE_FORMAT_NPM) else {
         // The addressing resolved for the claim and no longer does (the repository was
         // deleted by another request in between), so there is no registry at this address.
         return rendered(&not_found(
@@ -176,20 +169,21 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
 
     // The credential first, for every route including `/-/ping`: a registry that answered
     // a packument or a publish to an unauthenticated client would be a registry no
-    // credential gates. The principal the token speaks for is carried out of the record,
-    // because what that principal may do HERE is what this repository's policy states.
-    let presented = bearer_token(req.headers().get("authorization"));
-    let principal = presented.and_then(|token| {
-        state
-            .lock()
-            .authorization_token(token, now)
-            .filter(|held| {
-                held.domain == resolved.domain && held.domain_owner == resolved.domain_owner
-            })
-            .map(|held| held.principal.clone())
-    });
-    let Some(principal) = principal else {
-        return rendered(&unauthorized());
+    // credential gates. An npm client presents the token as a BEARER credential
+    // (`//<host>/<path>:_authToken=<token>` in an npmrc), so that is the scheme this plane
+    // reads and the challenge it states. The principal the token speaks for is carried out
+    // of the record, because what that principal may do HERE is what this repository's
+    // policy states.
+    let presented = presented_bearer(req.headers().get("authorization"));
+    let principal = match authenticated_principal(
+        &state.lock(),
+        &resolved,
+        &presented,
+        BEARER_CHALLENGE,
+        now,
+    ) {
+        Ok(principal) => principal,
+        Err(refusal) => return rendered(&refusal),
     };
 
     let Some(request) = NpmRequest::of(method_of(req), &resolved.path) else {
@@ -242,7 +236,13 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
         }
         NpmRequest::Publish(package) => {
             let body = req.body().bytes().unwrap_or_default();
-            publish(&mut state.lock(), &resolved, &package, body, now)
+            // The document is READ here, before the store is locked: decoding its
+            // attachments and extracting each version's readme are sized by what the caller
+            // sent, and none of that belongs in the critical section.
+            match read_publish_document(&package, body).await {
+                Ok(document) => publish(&mut state.lock(), &resolved, &package, document, now),
+                Err(refusal) => refusal,
+            }
         }
         NpmRequest::ReadDistTags(package) => dist_tags(&state.lock(), &resolved, &package),
         NpmRequest::SetDistTag(package, tag) => {
@@ -261,240 +261,6 @@ pub fn serve<Eng: Send + Sync + 'static>(engine: &Eng, req: &RtRequest) -> RtRes
         )),
     };
     rendered(&served)
-}
-
-/// The IAM action a READ of this repository's packages asks for, as the IAM Service
-/// Authorization Reference names it for CodeArtifact: the action a repository policy grants
-/// a package manager that resolves and downloads from the repository.
-const READ_ACTION: &str = "codeartifact:ReadFromRepository";
-
-/// The IAM action a PUBLISH into this repository asks for, named the same way.
-const PUBLISH_ACTION: &str = "codeartifact:PublishPackageVersion";
-
-/// The refusal this repository's own resource policy states for `principal` performing
-/// `action` on it, or `None` when the policy does not refuse it.
-///
-/// Only an explicit `Deny` refuses here. That is IAM's evaluation order within one account:
-/// a deny in the resource policy wins over anything an identity policy allows, while a
-/// resource policy that merely states nothing withholds no access — the caller's identity
-/// policies may still permit it, and this plane holds no session to read them for: it
-/// authenticates a BEARER credential, whose principal is the one recorded at the mint, not a
-/// signing session ([`crate::service::authorization`] is the decision for a control-plane
-/// call, which does have one). A repository carrying no policy refuses nothing.
-fn policy_refusal(
-    store: &CaState,
-    resolved: &Resolved,
-    principal: &str,
-    action: &str,
-) -> Option<Served> {
-    use ::service_common::iam_authorization as iam;
-
-    let repository = store
-        .domain(&resolved.domain, Some(&resolved.domain_owner))?
-        .repositories
-        .get(&resolved.repository)?;
-    let document = repository.policy.as_ref()?.document.clone()?;
-    // The spellings a statement's `Principal` element may name this caller by: the
-    // principal itself and the account forms that stand for it.
-    let mut principals = vec![principal.to_string()];
-    principals.extend(iam::account_principals(principal));
-    let request = iam::Request::new(action, &repository.arn, &principals);
-    if iam::resource_decision(&document, &request) != iam::Decision::Denied {
-        return None;
-    }
-    Some(Served::json(
-        403,
-        &json!({
-            "error": iam::not_authorized_by_resource_policy(principal, action, &repository.arn)
-        }),
-    ))
-}
-
-// ---------------------------------------------------------------------------
-// Addressing
-// ---------------------------------------------------------------------------
-
-/// What a data-plane request ADDRESSES, as the wire carries it: the host it was sent to —
-/// absent on a request that carries neither a `Host` header nor an absolute URI — and its
-/// path.
-///
-/// Built from BOTH shapes the router hands this module, the buffered parts the claim reads
-/// and the runtime-API request the serving seam reads, so one rule resolves both and the
-/// claim cannot resolve a different repository than the answer does.
-#[derive(Debug)]
-struct Addressed<'a> {
-    host: Option<&'a str>,
-    path: &'a str,
-}
-
-impl<'a> Addressed<'a> {
-    /// The addressing of the buffered request these parts came from.
-    fn of_parts(parts: &'a ::http::request::Parts) -> Self {
-        Self {
-            host: parts
-                .headers
-                .get("host")
-                .and_then(|host| host.to_str().ok())
-                .or_else(|| parts.uri.authority().map(::http::uri::Authority::as_str)),
-            path: parts.uri.path(),
-        }
-    }
-
-    /// The addressing of a runtime-API request, whose URI arrives as a string and is parsed
-    /// by the `http` crate rather than split by hand.
-    fn of_request(req: &'a RtRequest, uri: &'a ::http::Uri) -> Self {
-        Self {
-            host: req
-                .headers()
-                .get("host")
-                .or_else(|| uri.authority().map(::http::uri::Authority::as_str)),
-            path: uri.path(),
-        }
-    }
-}
-
-/// What a request resolves to: the repository whose endpoint it addresses, and the path
-/// WITHIN that endpoint — the part the npm protocol is read from.
-#[derive(Debug)]
-struct Resolved {
-    domain: String,
-    domain_owner: String,
-    repository: String,
-    /// The `/<format>/<repository>` prefix the request addressed, kept so a URL this plane
-    /// publishes back (a tarball's) is under the address the client actually reached.
-    endpoint_prefix: String,
-    /// The path within the endpoint, leading `/` kept.
-    path: String,
-}
-
-/// Which repository endpoint `addressed` addresses, or `None` when this plane serves the
-/// request not at all.
-///
-/// The two addressings are the module documentation's, in that order. Each resolves only to
-/// a repository this service HOLDS, read from the one shared store, so a request keeps one
-/// claimant.
-fn resolve<Eng: Send + Sync + 'static>(engine: &Eng, addressed: &Addressed<'_>) -> Option<Resolved> {
-    let (format, rest) = first_segment(addressed.path)?;
-    if format != PACKAGE_FORMAT_NPM {
-        return None;
-    }
-    let (repository, path) = first_segment(rest)?;
-    if repository.is_empty() {
-        return None;
-    }
-    let state = service_state(engine)?;
-    let store = state.lock();
-    let endpoint_prefix = format!("/{format}/{repository}");
-
-    // HOST-STYLE: the published endpoint host names the domain and the account that owns
-    // it, so the request addresses exactly that domain's repository.
-    if let Some((domain, account)) = addressed
-        .host
-        .map(host_only)
-        .and_then(endpoint_host_domain)
-    {
-        let held = store.domain(domain, Some(account))?;
-        if !held.repositories.contains_key(repository) {
-            return None;
-        }
-        return Some(Resolved {
-            domain: held.name.clone(),
-            domain_owner: held.owner.clone(),
-            repository: repository.to_string(),
-            endpoint_prefix,
-            path: path.to_string(),
-        });
-    }
-
-    // PATH-STYLE on the emulator's OWN endpoint, which is the only address a client on this
-    // machine can reach: the repository name alone, read only when one domain holds a
-    // repository of that name (see the module docs). A host that names some SERVICE — this
-    // service's own API endpoint, or another service's — keeps answering as that service,
-    // so a path under it is not claimed here however it is spelled.
-    if addressed.host.is_some_and(names_a_service) {
-        return None;
-    }
-    let mut holding = store
-        .domains
-        .values()
-        .filter(|domain| domain.repositories.contains_key(repository));
-    let only = holding.next()?;
-    if holding.next().is_some() {
-        return None;
-    }
-    Some(Resolved {
-        domain: only.name.clone(),
-        domain_owner: only.owner.clone(),
-        repository: repository.to_string(),
-        endpoint_prefix,
-        path: path.to_string(),
-    })
-}
-
-/// The domain and the owning account a published repository-endpoint host names, or `None`
-/// for every other host — this service's own API endpoint among them.
-///
-/// The published form is `<domain>-<account>.d.codeartifact.<region>.<suffix>`
-/// ([`crate::state::repository_endpoint`] mints it, with `amazonaws.com` for the IPv4
-/// endpoint and `on.aws` for the dual-stack one), so the account is the last `-`-separated
-/// field of the first label and the domain is everything before it. A `DomainName` is
-/// modelled `^[a-z][a-z0-9\-]{0,48}[a-z0-9]$` and so may itself contain `-`, which is why
-/// the split is from the RIGHT and why the account field has to be
-/// [`ACCOUNT_ID_DIGITS`] digits to be read as one.
-fn endpoint_host_domain(host: &str) -> Option<(&str, &str)> {
-    let (label, rest) = host.split_once('.')?;
-    let region_and_suffix = rest.strip_prefix(ENDPOINT_HOST_INFIX)?;
-    if region_and_suffix.is_empty() {
-        return None;
-    }
-    let (domain, account) = label.rsplit_once('-')?;
-    let account_shaped =
-        account.len() == ACCOUNT_ID_DIGITS && account.bytes().all(|byte| byte.is_ascii_digit());
-    (!domain.is_empty() && account_shaped).then_some((domain, account))
-}
-
-/// The request URI of a runtime-API request, parsed by the `http` crate.
-///
-/// A URI this parse rejects is one the server would not have accepted, and it resolves to
-/// `http::Uri`'s own default (`/`), which names no repository and claims nothing.
-fn parsed_uri(uri: &str) -> ::http::Uri {
-    uri.parse::<::http::Uri>().unwrap_or_default()
-}
-
-/// The request method, upper-cased as the wire carries it.
-fn method_of(req: &RtRequest) -> String {
-    req.method().to_ascii_uppercase()
-}
-
-/// The absolute URL of the endpoint this request reached, so a tarball URL this plane
-/// publishes is one the SAME client can fetch: the host it addressed and the endpoint path
-/// it used.
-///
-/// The host is read exactly as the claim read it ([`Addressed::of_request`]), so a request
-/// that resolved through the URI authority publishes the authority it arrived on. `https`
-/// because that is the scheme every endpoint of this emulator is served on, and the scheme
-/// the published endpoint URL names.
-fn endpoint_url(addressed: &Addressed<'_>, resolved: &Resolved) -> String {
-    let host = addressed.host.map(host_with_port).unwrap_or_default();
-    format!("https://{host}{}", resolved.endpoint_prefix)
-}
-
-/// A `Host` header value with its port kept (the port is part of the address a client on
-/// this machine reaches) and its userinfo removed.
-fn host_with_port(host: &str) -> &str {
-    host.rsplit('@').next().unwrap_or(host)
-}
-
-/// The bearer credential an `Authorization` header presents, or `None` when it presents
-/// none — including a header carrying another scheme, which is not a token this registry
-/// resolves.
-fn bearer_token(authorization: Option<&str>) -> Option<&str> {
-    let (scheme, token) = authorization?.split_once(' ')?;
-    if !scheme.eq_ignore_ascii_case("bearer") {
-        return None;
-    }
-    let token = token.trim();
-    (!token.is_empty()).then_some(token)
 }
 
 // ---------------------------------------------------------------------------
@@ -517,6 +283,16 @@ struct NpmPackage {
 }
 
 impl NpmPackage {
+    /// The coordinate this package is stored under: the npm format and the
+    /// `(namespace, name)` pair the path addressed.
+    fn coordinate(&self) -> Coordinate<'_> {
+        Coordinate {
+            format: PACKAGE_FORMAT_NPM,
+            namespace: self.namespace.as_deref(),
+            name: &self.name,
+        }
+    }
+
     /// The package as npm writes it: `@<scope>/<name>`, or the bare name.
     fn display_name(&self) -> String {
         crate::state::package_display_name(
@@ -707,113 +483,9 @@ fn scoped_name(value: &str) -> Option<(String, String)> {
         .then(|| (scope.to_string(), name.to_string()))
 }
 
-/// One path segment with its percent-escapes resolved, or `None` when they do not decode to
-/// UTF-8 — a segment that addresses no name this service could hold.
-fn percent_decoded(segment: &str) -> Option<String> {
-    ::percent_encoding::percent_decode_str(segment)
-        .decode_utf8()
-        .ok()
-        .map(::std::borrow::Cow::into_owned)
-}
-
 // ---------------------------------------------------------------------------
 // The answers
 // ---------------------------------------------------------------------------
-
-/// One answer this plane renders: the status, the media type it carries, the body, and the
-/// challenge an authentication refusal states.
-#[derive(Debug, Default)]
-struct Served {
-    status: u16,
-    content_type: Option<String>,
-    authenticate: Option<String>,
-    body: Vec<u8>,
-}
-
-impl Served {
-    /// An answer carrying `document` as JSON.
-    fn json(status: u16, document: &Value) -> Self {
-        Self {
-            status,
-            content_type: Some(JSON_MEDIA_TYPE.to_string()),
-            authenticate: None,
-            body: ::serde_json::to_vec(document).unwrap_or_default(),
-        }
-    }
-
-    /// An answer carrying opaque asset bytes.
-    fn bytes(content: Vec<u8>) -> Self {
-        Self {
-            status: 200,
-            content_type: Some(TARBALL_MEDIA_TYPE.to_string()),
-            authenticate: None,
-            body: content,
-        }
-    }
-}
-
-/// The refusal npm reads as "this registry does not have that": the status, with the
-/// `error` member npm renders. The sentence states what was not found, in the same words
-/// this service's control plane states them in, so one client reads one wording.
-fn not_found(reason: String) -> Served {
-    Served::json(404, &json!({ "error": reason }))
-}
-
-/// The refusal a request presenting no usable bearer credential earns.
-///
-/// `401` with the challenge, which is what tells an npm client to present (or refresh) a
-/// token rather than to retry the same request. The reason states what was wrong with the
-/// credential in the terms of the credential, never quoting the value presented.
-fn unauthorized() -> Served {
-    let mut served = Served::json(
-        401,
-        &json!({
-            "error": "unauthorized: an authorization token for this domain is required"
-        }),
-    );
-    served.authenticate = Some("Bearer".to_string());
-    served
-}
-
-/// The refusal a request the registry understood but will not perform earns: a publish
-/// origin control blocks, or a repository policy denies.
-fn forbidden(reason: String) -> Served {
-    Served::json(403, &json!({ "error": reason }))
-}
-
-/// The refusal a download of a version whose STATUS withholds its content earns.
-///
-/// A client asked for a version this repository holds and will not serve, which is a
-/// request it cannot make rather than a resource that is missing: the version is listed by
-/// the control plane, its assets are not downloadable, and a `404` would say it does not
-/// exist. The sentence names the status, so a client can tell a blocked download from a
-/// missing one.
-fn blocked_download(reason: String) -> Served {
-    Served::json(400, &json!({ "error": reason }))
-}
-
-/// The refusal a publish into a package whose origin configuration BLOCKS new versions
-/// earns: `400`, with npm's `success`/`error` envelope and the sentence CodeArtifact's npm
-/// endpoint states for that control.
-///
-/// The sentence states the CONTROL and interpolates nothing — it is the same for whatever
-/// package was addressed — and the status is `400` rather than the `403` an authorization
-/// refusal carries: the credential was accepted and the repository reachable; what the
-/// request asked for is a version this package does not accept.
-fn publish_blocked() -> Served {
-    Served::json(
-        400,
-        &json!({
-            "success": false,
-            "error": "This package is configured to block new versions from being published."
-        }),
-    )
-}
-
-/// The refusal a publish document the registry cannot read earns.
-fn bad_request(reason: String) -> Served {
-    Served::json(400, &json!({ "error": reason }))
-}
 
 /// The packument of `package` in the addressed repository: what an npm client resolves a
 /// version range and a dist-tag against.
@@ -1136,12 +808,6 @@ fn held_package_mut<'s>(
         .get_mut(&key)
 }
 
-/// Whether a version in `status` serves its assets. See [`tarball`].
-fn downloadable(status: &str) -> bool {
-    status == crate::state::PACKAGE_VERSION_STATUS_PUBLISHED
-        || status == crate::state::PACKAGE_VERSION_STATUS_UNLISTED
-}
-
 /// The package record the addressed repository holds for `package`, or `None`.
 fn held_package<'s>(
     store: &'s CaState,
@@ -1243,7 +909,7 @@ fn retain_from_upstreams(
         .map(|version| {
             version
                 .asset_size_bytes()
-                .saturating_add(version.manifest_size_bytes())
+                .saturating_add(version.retained_text_bytes())
         })
         .sum();
     if store
@@ -1320,50 +986,7 @@ fn retain_from_upstreams(
         versions = retained.len(),
         "a repository retained package versions resolved from an upstream repository"
     );
-    record_created(store, resolved, package, &retained, now);
-}
-
-/// Record the state change each version in `versions` just underwent in the addressed
-/// repository: it came to exist there, whether by a publish into it or by a retention from
-/// an upstream.
-///
-/// Read back off the STORED record, so the revision, status and sequence number the event
-/// announces are the ones a later `DescribePackageVersion` reports for the same version.
-/// A version the store does not hold contributes nothing: there is no change to announce.
-fn record_created(
-    store: &mut CaState,
-    resolved: &Resolved,
-    package: &NpmPackage,
-    versions: &[String],
-    now: SystemTime,
-) {
-    let mut changes: Vec<VersionChange> = Vec::new();
-    if let Some(repository) = store
-        .domain(&resolved.domain, Some(&resolved.domain_owner))
-        .and_then(|domain| domain.repositories.get(&resolved.repository))
-    {
-        if let Some(held) = repository.package(
-            PACKAGE_FORMAT_NPM,
-            package.namespace.as_deref(),
-            &package.name,
-        ) {
-            for version in versions {
-                if let Some(stored) = held.versions.get(version) {
-                    changes.push(VersionChange::of(
-                        repository,
-                        held,
-                        stored,
-                        OPERATION_CREATED,
-                        VersionChanges::published(stored.assets.len(), stored.manifest.is_some()),
-                        now,
-                    ));
-                }
-            }
-        }
-    }
-    for change in changes {
-        store.record_version_change(change);
-    }
+    record_created(store, resolved, &package.coordinate(), &retained, now);
 }
 
 /// `SystemTime` as RFC 3339, the spelling a packument's `time` map carries.
@@ -1378,33 +1001,37 @@ fn rfc3339(at: SystemTime) -> Option<String> {
 // ---------------------------------------------------------------------------
 
 /// One version an npm publish document carries: its number, the metadata declared for it,
-/// and the tarball attached to it.
+/// the tarball attached to it, and the README that publish carried for it
+/// ([`crate::service::npm_readme`], read while the document is read — before the store is
+/// locked).
 #[derive(Debug)]
 struct PublishedVersion {
     version: String,
     manifest: String,
     tarball: Vec<u8>,
+    readme: Option<String>,
 }
 
 /// Store the versions an npm publish document carries, into the same records
 /// `PublishPackageVersion` writes.
 ///
+/// The document is READ before this runs ([`read_publish_document`]), so every byte of
+/// caller-sized work — decoding the attachments, extracting each version's readme — happens
+/// outside the store's critical section, and what is left here is the refusals the STORED
+/// records decide and the writes themselves.
+///
 /// Every refusal is taken BEFORE anything is stored, so a rejected publish leaves nothing
-/// behind: the document has to be readable and to name the package the request addressed,
-/// each attached tarball has to be inside the per-asset ceiling, the package's origin
-/// control has to permit a direct publish, and a version the repository already holds in a
-/// closed status cannot be republished (npm's own `cannot modify pre-existing version`).
+/// behind: the package's origin control has to permit a direct publish, a version the
+/// repository already holds in a closed status cannot be republished (npm's own `cannot
+/// modify pre-existing version`), and the content has to fit inside what this emulator
+/// retains.
 fn publish(
     store: &mut CaState,
     resolved: &Resolved,
     package: &NpmPackage,
-    document: &[u8],
+    published_document: PublishDocument,
     now: SystemTime,
 ) -> Served {
-    let published_document = match read_publish_document(package, document) {
-        Ok(document) => document,
-        Err(refusal) => return refusal,
-    };
     let versions = published_document.versions;
 
     // What the service already retains, read before the records are borrowed mutably:
@@ -1516,6 +1143,10 @@ fn publish(
                 // the version's manifest rather than as an asset: it is what every member
                 // read off a version's metadata is read from.
                 manifest: Some(published.manifest.clone()),
+                // The README this publish carried, declared inline by the document or
+                // packed in the tarball ([`crate::service::npm_readme`]), read when the
+                // document was read.
+                readme: published.readme.clone(),
                 // This publish is the first change of this version.
                 sequence_number: 1,
             },
@@ -1548,7 +1179,7 @@ fn publish(
         .iter()
         .map(|published| published.version.clone())
         .collect();
-    record_created(store, resolved, package, &created, now);
+    record_created(store, resolved, &package.coordinate(), &created, now);
     Served::json(
         200,
         &json!({ "ok": true, "success": true, "id": package.display_name() }),
@@ -1601,14 +1232,21 @@ struct WireManifestVersion {
 
 /// What an npm publish document carries, or the refusal it earns.
 ///
-/// Everything is read from the document — nothing is read out of the tarball — and each
+/// Everything about a version's COORDINATE and metadata is read from the document, and each
 /// version's metadata is kept as the text it was declared with, so what a later packument
-/// and a later dependency listing report is what was published.
-fn read_publish_document(
+/// and a later dependency listing report is what was published. The one thing read out of a
+/// tarball is the version's README when the document declares none
+/// ([`crate::service::npm_readme`]), which is why the whole reading happens here: this runs
+/// before the store is locked, and one decompression budget is spent across every version
+/// the document declares rather than per tarball.
+async fn read_publish_document(
     package: &NpmPackage,
     document: &[u8],
 ) -> Result<PublishDocument, Served> {
     use ::base64::Engine as _;
+
+    // The decompression budget for THIS request, spent across the versions below.
+    let mut inflate_budget = crate::service::npm_readme::InflateBudget::for_one_request();
 
     if document.len() > MAX_PUBLISH_DOCUMENT_BYTES {
         return Err(Served::json(
@@ -1663,6 +1301,11 @@ fn read_publish_document(
 
     let mut published = Vec::new();
     for (version, manifest) in &versions {
+        // One yield per version, so the work a document of many versions asks for — decoding
+        // its attachments and reading each README out of a tarball — always has a point for
+        // a timeout or a cancellation to land on, and never occupies a runtime worker for
+        // the whole document.
+        ::tokio::task::yield_now().await;
         let manifest_text = manifest.get();
         let declared_version = ::serde_json::from_str::<WireManifestVersion>(manifest_text)
             .ok()
@@ -1730,10 +1373,16 @@ fn read_publish_document(
                 crate::state::MAX_STORED_ASSET_BYTES
             )));
         }
+        let readme = crate::service::npm_readme::published_readme(
+            Some(manifest_text),
+            &tarball,
+            &mut inflate_budget,
+        );
         published.push(PublishedVersion {
             version: version.clone(),
             manifest: manifest_text.to_string(),
             tarball,
+            readme,
         });
     }
     Ok(PublishDocument {
@@ -1769,44 +1418,6 @@ fn attachment_of<'a>(
         (declared_versions == 1 && attachments.len() == 1)
             .then(|| attachments.values().next())?
     })
-}
-
-// ---------------------------------------------------------------------------
-// Rendering
-// ---------------------------------------------------------------------------
-
-/// One rendered answer: the status, its headers and its body, as the wire carries them.
-fn rendered(served: &Served) -> RtResponse {
-    let mut response = RtResponse::new(
-        StatusCode::try_from(served.status).unwrap_or_else(|_| {
-            StatusCode::try_from(500).expect("500 is a status")
-        }),
-        SdkBody::from(served.body.clone()),
-    );
-    if let Some(content_type) = &served.content_type {
-        if let Err(refused) = response
-            .headers_mut()
-            .try_insert("content-type", content_type.clone())
-        {
-            ::tracing::warn!(
-                error = %refused,
-                "the media type cannot be sent on the wire and is left off the response"
-            );
-        }
-    }
-    if let Some(challenge) = &served.authenticate {
-        if let Err(refused) = response
-            .headers_mut()
-            .try_insert("www-authenticate", challenge.clone())
-        {
-            ::tracing::warn!(
-                error = %refused,
-                "the authentication challenge cannot be sent on the wire and is left off the \
-                 response"
-            );
-        }
-    }
-    response
 }
 
 // ---------------------------------------------------------------------------
@@ -1855,7 +1466,7 @@ impl<Eng: Send + Sync + 'static> ::smithy_server_runtime::ErasedOperation
             // The answer is composed with no store lock held past it — [`serve`] takes and
             // releases the guard inside itself — so the announcement that follows cannot
             // hold this request's own store.
-            let response = serve(&*self.engine, req);
+            let response = serve(&*self.engine, req).await;
             crate::state::package_version_events::publish(ctx, &*self.engine).await;
             response
         })
@@ -1873,62 +1484,6 @@ impl<Eng: Send + Sync + 'static> ::smithy_server_runtime::ErasedOperation
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// One row of the endpoint-host table: the case, the host, and the `(domain, account)`
-    /// it names.
-    type HostRow = (
-        &'static str,
-        &'static str,
-        Option<(&'static str, &'static str)>,
-    );
-
-    /// RULE: a published repository-endpoint host names the domain and the owning account;
-    /// every other host names none. The rows span what the reading generalises over: the
-    /// IPv4 and dual-stack suffixes, a domain name that itself carries `-`, and the hosts
-    /// this service's own API is reached at.
-    #[test]
-    fn an_endpoint_host_names_the_domain_and_the_account_that_owns_it() {
-        let rows: &[HostRow] = &[
-            (
-                "the published IPv4 endpoint",
-                "acme-000000000000.d.codeartifact.us-west-2.amazonaws.com",
-                Some(("acme", "000000000000")),
-            ),
-            (
-                "the dual-stack endpoint",
-                "acme-000000000000.d.codeartifact.us-west-2.on.aws",
-                Some(("acme", "000000000000")),
-            ),
-            (
-                "a domain name carrying a hyphen",
-                "sim2real-ca-repo-123456789012.d.codeartifact.eu-west-1.amazonaws.com",
-                Some(("sim2real-ca-repo", "123456789012")),
-            ),
-            (
-                "this service's own API endpoint",
-                "codeartifact.us-east-1.amazonaws.com",
-                None,
-            ),
-            ("the emulator's own address", "127.0.0.1", None),
-            (
-                "a label whose last field is not an account id",
-                "acme-notanaccount.d.codeartifact.us-east-1.amazonaws.com",
-                None,
-            ),
-            (
-                "another service's endpoint",
-                "acme-000000000000.s3.us-east-1.amazonaws.com",
-                None,
-            ),
-        ];
-        for (case, host, expected) in rows {
-            let named = endpoint_host_domain(host);
-            assert_eq!(
-                named, *expected,
-                "case {case:?}: expected {expected:?}, got {named:?}"
-            );
-        }
-    }
 
     /// RULE: a registry path and a method name one npm route. A scoped package is addressed
     /// in ONE percent-encoded segment on every route that carries the package name alone,
@@ -2039,47 +1594,6 @@ mod tests {
             assert_eq!(
                 described, *expected,
                 "case {case:?}: expected {expected:?}, got {described:?}"
-            );
-        }
-    }
-
-    /// RULE: a version's status decides whether its assets are downloadable — `Published`
-    /// and `Unlisted` serve them, every other status withholds them.
-    #[test]
-    fn only_a_published_or_unlisted_version_serves_its_assets() {
-        let rows: &[(&str, bool)] = &[
-            (crate::state::PACKAGE_VERSION_STATUS_PUBLISHED, true),
-            (crate::state::PACKAGE_VERSION_STATUS_UNLISTED, true),
-            (crate::state::PACKAGE_VERSION_STATUS_ARCHIVED, false),
-            (crate::state::PACKAGE_VERSION_STATUS_DISPOSED, false),
-            (crate::state::PACKAGE_VERSION_STATUS_UNFINISHED, false),
-        ];
-        for (status, expected) in rows {
-            let reached = downloadable(status);
-            assert_eq!(
-                reached, *expected,
-                "case {status:?}: expected downloadable={expected}, got {reached}"
-            );
-        }
-    }
-
-    /// RULE: only an `Authorization` header presenting the `Bearer` scheme carries a token
-    /// this registry resolves.
-    #[test]
-    fn only_a_bearer_header_presents_a_token() {
-        let rows: &[(&str, Option<&str>, Option<&str>)] = &[
-            ("a bearer token", Some("Bearer abc.def"), Some("abc.def")),
-            ("the scheme in another case", Some("bearer abc"), Some("abc")),
-            ("basic authentication", Some("Basic dXNlcjpwYXNz"), None),
-            ("a SigV4 signature", Some("AWS4-HMAC-SHA256 Credential=x"), None),
-            ("an empty token", Some("Bearer  "), None),
-            ("no header at all", None, None),
-        ];
-        for (case, header, expected) in rows {
-            let read = bearer_token(*header);
-            assert_eq!(
-                read, *expected,
-                "case {case:?}: expected {expected:?}, got {read:?}"
             );
         }
     }

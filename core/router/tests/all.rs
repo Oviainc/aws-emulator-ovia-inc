@@ -989,14 +989,27 @@ mod lambda_sqs_event_source_batching_window;
 // read from the objects Amazon S3 holds under the role IAM holds.
 #[path = "all/medical_imaging_dicom_import.rs"]
 mod medical_imaging_dicom_import;
+#[path = "all/cloudformation_wafv2_protection_stack.rs"]
+mod cloudformation_wafv2_protection_stack;
 // Declared here, in the appended tail: what REPEATED requests to one deployed stage are each
 // answered with, and the one stream record each new item they write carries.
 #[path = "all/apigateway_repeated_stage_requests.rs"]
 mod apigateway_repeated_stage_requests;
+// The five suites that stood here — `apigateway_iam_authenticated_invoke`,
+// `cloudformation_rollback_triggers_revert_the_operation`,
+// `cloudformation_wafv2_protection_stack`, `lambda_sqs_event_source_batching_window` and
+// `cloudformation_asset_bucket_publishing_role` — are each ALREADY declared above (the first
+// four in the sorted head, the fifth at line 34, and the wafv2 one at line 1006). Two
+// concurrent changes appended the same entry, which is a redefinition and stops this target
+// from compiling; the duplicate lines are removed here and the first declaration of each
+// stands.
 // Declared HERE, beside the sibling suites above in the same quiet `n`/`o` gap, for the
 // reason those entries record: the appended tail at the end of this file and the `e…` span
 #[path = "all/eks_control_plane_logs.rs"]
 mod eks_control_plane_logs;
+// Declared in this same head region, for the reason the note above records.
+#[path = "all/bedrock_agentcore_data_plane_parent_resources.rs"]
+mod bedrock_agentcore_data_plane_parent_resources;
 // Declared here, in the appended tail, for the reason the entries above record: the tail and
 // the sorted `c…` span (where every cloudformation and codepipeline suite would land) are
 #[path = "all/cloudformation_provisions_codebuild_projects.rs"]

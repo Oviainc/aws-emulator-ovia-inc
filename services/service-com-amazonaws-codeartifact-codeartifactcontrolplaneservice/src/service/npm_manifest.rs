@@ -79,6 +79,10 @@ pub struct NpmManifest {
     /// The repository URL the document names, from `repository` — either the shorthand
     /// string npm allows or the `{"url": …}` object.
     pub repository_url: Option<String>,
+    /// `readme`: the package's README as the publishing client declared it inline, which is
+    /// what CodeArtifact reports as the version's readme
+    /// ([`crate::service::npm_readme`]).
+    pub readme: Option<String>,
     /// Every declared dependency, in the order the document declares them, section by
     /// section in the order the sections appear.
     pub dependencies: Vec<Dependency>,
@@ -121,6 +125,7 @@ impl<'de> Visitor<'de> for ManifestVisitor {
             match member.as_str() {
                 "description" => manifest.description = members.next_value::<Option<String>>()?,
                 "homepage" => manifest.homepage = members.next_value::<Option<String>>()?,
+                "readme" => manifest.readme = members.next_value::<Option<String>>()?,
                 // `license` and `repository` are each written either as a string or as an
                 // object, so both are read as a value and the member is taken out of it.
                 "license" => {
