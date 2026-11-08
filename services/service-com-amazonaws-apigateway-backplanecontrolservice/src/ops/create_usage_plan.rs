@@ -334,6 +334,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A plan is created metering no API key: `CreateUsagePlanKey` is what adds
             // one.
             keys: ::std::collections::BTreeMap::new(),
+            // The day the plan's first metering period begins, which is the one its
+            // quota's `offset` is subtracted in; see `UsagePlanEntry::created_on`.
+            created_on: Some(crate::state::usage_today()),
             sequence,
         };
 

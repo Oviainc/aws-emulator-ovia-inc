@@ -89,6 +89,20 @@ pub struct ComAmazonawsApigatewayBackplanecontrolserviceState {
     /// ([`ComAmazonawsApigatewayBackplanecontrolserviceState::forget_api_key`]), so it
     /// never grows with the request count.
     pub throttle_buckets: BTreeMap<String, ThrottleBucket>,
+    /// The requests each API key that has invoked a stage has sent, counted by the day
+    /// each one fell on and keyed by [`metering_key`] — one log per `(usage plan, API
+    /// key)` pair, for the reason the throttle buckets above are: a usage plan's quota is
+    /// "the target maximum number of requests that can be made in a given time period"
+    /// (`QuotaSettings$limit`) FOR EACH of its keys.
+    ///
+    /// Written by the `execute-api` data plane while METERING a request (see
+    /// [`crate::service::invoke`]) and read by the usage report, through the one
+    /// accounting in [`usage`]: the throttle limits the RATE a key sends at, this count
+    /// the NUMBER of requests it may send in a metering period. Bounded by the stores it
+    /// joins, as the buckets are, times the days a report may cover
+    /// ([`MAX_USAGE_INTERVAL_DAYS`]), and reclaimed with the key it meters
+    /// ([`ComAmazonawsApigatewayBackplanecontrolserviceState::forget_api_key`]).
+    pub usage_logs: BTreeMap<String, UsageLog>,
     /// Drives [`ComAmazonawsApigatewayBackplanecontrolserviceState::mint_id`]; see there for how an id is derived from it.
     pub id_seed: u64,
     /// Drives [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`]: the creation rank stamped on each
@@ -1184,6 +1198,16 @@ pub struct UsagePlanEntry {
     /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::usage_plan_key`] rather than
     /// enumerating it directly, so no read can report a key that no longer exists.
     pub keys: BTreeMap<String, UsagePlanKeyEntry>,
+    /// The UTC day this plan was created on: the "initial time period" its quota's
+    /// `offset` is subtracted from the limit in ("the number of requests subtracted from
+    /// the given limit in the initial time period", `QuotaSettings$offset`), so every
+    /// period after the one the plan was created in starts at the whole limit again. See
+    /// [`quota_window`], which is where it is read.
+    ///
+    /// Not a member of any modelled `UsagePlan` body and reported by no operation: the
+    /// plan's own creation day is what anchors the metering, not something a caller sets
+    /// or reads. `Option` only so the struct keeps the `Default` its siblings have.
+    pub created_on: Option<::chrono::NaiveDate>,
     /// This plan's creation rank, from
     /// [`ComAmazonawsApigatewayBackplanecontrolserviceState::next_sequence`], so a
     /// listing can report creation order rather than id order.
@@ -2888,9 +2912,14 @@ impl ComAmazonawsApigatewayBackplanecontrolserviceState {
             }
         }
         // The throttle accounting goes with the association: a key no plan meters has no
-        // request rate to keep, and a key created later must not inherit this one's.
+        // request rate to keep, and a key created later must not inherit this one's. The
+        // quota accounting goes for the same reason: the requests a deleted key sent are
+        // counted against no plan, and a key created later starts its periods empty.
+        let metered_by_this_key = format!("/{key_id}");
         self.throttle_buckets
-            .retain(|key, _| !key.ends_with(&format!("/{key_id}")));
+            .retain(|key, _| !key.ends_with(&metered_by_this_key));
+        self.usage_logs
+            .retain(|key, _| !key.ends_with(&metered_by_this_key));
         unmetered
     }
 
@@ -4312,3 +4341,9 @@ pub mod default_models;
 /// The VPC endpoints the account has, as Amazon EC2 reports them — what an access
 /// association's source identifier is resolved against; see that module.
 pub mod vpc_endpoints;
+
+/// The usage a usage plan's QUOTA is metered against — the requests each of its API keys
+/// sent on each day, and the daily log of used and remaining quota a read reports from
+/// them; re-exported whole, so a handler still reaches each name as `crate::state::…`.
+mod usage;
+pub use usage::*;

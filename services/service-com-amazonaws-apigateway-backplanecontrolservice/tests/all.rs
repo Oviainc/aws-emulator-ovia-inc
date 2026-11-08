@@ -455,4 +455,9 @@ mod gateway_response_representation;
 // `accessAssociationSource` must name, resolved against the service that owns endpoints.
 #[path = "all/domain_name_access_association_endpoint.rs"]
 mod domain_name_access_association_endpoint;
+// Appended for the reason the note above gives: the USAGE DATA a usage plan reports — the
+// daily log of used and remaining quota each of its API keys earns, and the interval and
+// page a read of it covers.
+#[path = "all/usage_plan_usage_report.rs"]
+mod usage_plan_usage_report;
 

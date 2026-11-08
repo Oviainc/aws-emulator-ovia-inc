@@ -213,13 +213,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .remove(&input.key_id);
         // The throttle accounting goes with the association, for the reason
         // `forget_api_key` gives: a pair no association joins has no request rate to keep,
-        // and an association added later must not inherit this one's.
-        store
-            .throttle_buckets
-            .remove(&crate::state::metering_key(
-                &input.usage_plan_id,
-                &input.key_id,
-            ));
+        // and an association added later must not inherit this one's. The quota accounting
+        // goes with it for the same reason.
+        let metered = crate::state::metering_key(&input.usage_plan_id, &input.key_id);
+        store.throttle_buckets.remove(&metered);
+        store.usage_logs.remove(&metered);
         // The store lock is released before the outcome is recorded: the critical section
         // covers the state change only.
         drop(store);

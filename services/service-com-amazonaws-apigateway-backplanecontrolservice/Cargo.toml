@@ -112,6 +112,12 @@ service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # account has. Only the generated client is needed, as the sibling apigatewayv2 service
 # declares it for the same hop.
 aws-sdk-ec2 = { version = "1", default-features = false }
+# The CIVIL CALENDAR a usage plan's quota is metered on: the UTC day a metered request
+# falls on, the day a `startDate`/`endDate` names, and the first day of the metering
+# period a day belongs to (`state::usage`). The maintained date library the sibling
+# services in this tree use, with the same `default-features = false` + `std` spelling:
+# the clock itself is `std`'s, so no time-zone database is pulled in.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
