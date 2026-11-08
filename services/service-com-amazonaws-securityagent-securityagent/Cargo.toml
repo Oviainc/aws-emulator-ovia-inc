@@ -34,5 +34,10 @@ sha2 = { workspace = true }
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 
+[dev-dependencies]
+# `time` for the suites that wait out a span the service's own clock owes — a target
+# domain's ownership check settles that long after the call that starts it.
+tokio = { workspace = true, features = ["time"] }
+
 [lints]
 workspace = true

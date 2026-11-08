@@ -150,9 +150,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "the target domain store is unavailable".to_string(),
             })
         })?;
-        // A read (`@readonly`): it resolves each id and projects the record, and writes
-        // nothing — a later caller sees exactly what it saw.
-        let state = state.lock();
+        // A read (`@readonly`): it resolves each id and projects the record. The one
+        // write it makes is to materialise an ownership check whose outcome the CLOCK
+        // has already made due — a change that was owed at this instant even if nobody
+        // had called — so a later caller sees exactly what this caller saw.
+        let mut state = state.lock();
+        state.settle_target_domain_verifications(::std::time::SystemTime::now());
 
         // The caller's order is kept, so an id's answer is at the position it asked at;
         // every id lands in exactly one of the two lists.

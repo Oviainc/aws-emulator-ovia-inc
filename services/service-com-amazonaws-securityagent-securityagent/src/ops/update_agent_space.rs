@@ -204,6 +204,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let mut state = state.lock();
+        // The projection below expands the target domains this space is associated
+        // with, so a domain ownership check the CLOCK has already made due is
+        // materialised first and this response reports those domains exactly as their
+        // own batch read does.
+        state.settle_target_domain_verifications(::std::time::SystemTime::now());
         // The record is mutated in place and then CLONED out, so the projection below
         // can read the store's target domains beside it; `AgentSpaceRecord` holds only
         // the members of one agent space, and the association it carries is capped, so

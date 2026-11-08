@@ -17,7 +17,15 @@ pub struct VerifyTargetDomainInput {
     pub target_domain_id: String,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#VerifyTargetDomainOutput")]
+/// `VerifyTargetDomainOutput`, with its schema and serializer written out instead of
+/// derived, for the first of the two reasons [`super::wire_shape`] gives: `createdAt`,
+/// `updatedAt` and `verifiedAt` carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="operation", operation="VerifyTargetDomain",
+/// model_path="services/service-com-amazonaws-securityagent-securityagent/smithy-model/com-amazonaws-securityagent-securityagent.json")`),
+/// which the derive drops — so without this each one would go onto the restJson1 wire
+/// as a bare epoch number rather than the RFC 3339 string the model pins. The model
+/// declares every member this output carries, so there is no recorded-but-unmodelled
+/// one.
 #[derive(Debug, Clone, Default)]
 pub struct VerifyTargetDomainOutput {
     pub target_domain_id: Option<String>,
@@ -28,4 +36,29 @@ pub struct VerifyTargetDomainOutput {
     pub status: Option<String>,
     pub verification_status_reason: Option<String>,
 }
+
+sa_schema_and_codec!(
+    VerifyTargetDomainOutput,
+    VERIFY_TARGET_DOMAIN_OUTPUT_SCHEMA,
+    "com.amazonaws.securityagent#VerifyTargetDomainOutput",
+    "com.amazonaws.securityagent",
+    "VerifyTargetDomainOutput",
+    modelled: [
+        (M_TARGET_DOMAIN_ID, target_domain_id, "targetDomainId", 0, opt, string),
+        (M_DOMAIN_NAME, domain_name, "domainName", 1, opt, string),
+        (M_CREATED_AT, created_at, "createdAt", 2, opt, date_time),
+        (M_UPDATED_AT, updated_at, "updatedAt", 3, opt, date_time),
+        (M_VERIFIED_AT, verified_at, "verifiedAt", 4, opt, date_time),
+        (M_STATUS, status, "status", 5, opt, string),
+        (
+            M_VERIFICATION_STATUS_REASON,
+            verification_status_reason,
+            "verificationStatusReason",
+            6,
+            opt,
+            string
+        ),
+    ],
+    recorded: [],
+);
 

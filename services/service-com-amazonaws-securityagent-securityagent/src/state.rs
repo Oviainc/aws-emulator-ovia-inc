@@ -8,7 +8,9 @@
 //! `CreatePrivateConnection`, `DescribePrivateConnection` and `ListPrivateConnections`
 //! share live here for the same reason, and so do the target domain records:
 //! `CreateTargetDomain` writes one and `BatchGetTargetDomains` reads that same record
-//! back.
+//! back — including the outcome of the ownership check `VerifyTargetDomain` starts on
+//! it, which is stored on the record and so reads the same through every operation that
+//! projects it.
 //!
 //! The agent space records sit beside them in the same struct, so `CreateAgentSpace`
 //! and `BatchGetAgentSpaces` — and every agent space operation implemented after them —
@@ -118,14 +120,39 @@ pub const VERIFICATION_METHOD_VALUES: [&str; 3] = [
     VERIFICATION_METHOD_PRIVATE_VPC,
 ];
 
-/// The `TargetDomainStatus` a registered target domain carries until its ownership is
-/// verified (source: the `PENDING` value's own doc, "Domain verification is pending").
+/// The `TargetDomainStatus` a registered target domain carries while its ownership is
+/// not yet proven (source: the `PENDING` value's own doc, "Domain verification is
+/// pending").
 ///
-/// A target domain does NOT leave this status on a timer: the model documents that
-/// ownership is proven by a record the domain's owner publishes, which nothing inside
-/// this emulator can observe, so the status moves only when a verification call finds
-/// that proof.
+/// A registration does NOT leave this status on a timer: ownership is proven by
+/// something the domain's owner publishes, so the status moves only once an ownership
+/// CHECK has been made, which is what `VerifyTargetDomain` starts.
 pub const TARGET_DOMAIN_STATUS_PENDING: &str = "PENDING";
+
+/// The `TargetDomainStatus` an ownership check leaves a target domain in when the
+/// check could not read the proof the domain's owner was asked to publish (source: the
+/// `UNREACHABLE` value's own doc, "Domain is unreachable for verification").
+///
+/// Every challenge this service issues lives ON the domain — a record in its DNS zone,
+/// a document its web server serves, an address reached from the private VPC — and
+/// nothing of that is reachable from inside this emulator, which makes no outbound
+/// request and holds no domain's zone. So a check this emulator makes reads no proof,
+/// and the one status that states that is this one: `VERIFIED` would claim a proof
+/// nothing read, `FAILED` would report a proof read and rejected, and `PENDING` would
+/// hide a check that has already been made.
+pub const TARGET_DOMAIN_STATUS_UNREACHABLE: &str = "UNREACHABLE";
+
+/// How long after the `VerifyTargetDomain` call that starts it an ownership check takes
+/// to settle, i.e. how long the domain stays `PENDING` before the check's outcome is
+/// due.
+///
+/// CHOSEN, not cited: the model pins no duration for the check. It is non-zero, so a
+/// caller that reads the domain straight after the call still sees the `PENDING` the
+/// check runs in, and short enough that the outcome is due for any later call. The
+/// outcome is materialised by the next call that reads the record (see
+/// [`ComAmazonawsSecurityagentSecurityagentState::settle_target_domain_verifications`]),
+/// never by a timer of its own.
+pub const VERIFICATION_SETTLE_AFTER: Duration = Duration::from_secs(3);
 
 /// The label prefixed onto the domain to name the TXT record a `DNS_TXT` target
 /// domain's owner publishes.
@@ -810,8 +837,18 @@ pub struct TargetDomainRecord {
     /// state to read once they are implemented.
     pub tags: BTreeMap<String, String>,
     pub created_at: SystemTime,
+    /// When this record last changed. At registration it is the creation instant; a
+    /// verification call moves it, because the verification attempt it makes is part of
+    /// the record. `VerifyTargetDomain` is the one operation whose output carries it
+    /// (`updatedAt`); the `TargetDomain` shape the reads project has no such member
+    /// (`smithy_query(query="shape",shape="TargetDomain")`).
+    pub updated_at: SystemTime,
     /// When ownership was proven; `None` while the record is not `VERIFIED`.
     pub verified_at: Option<SystemTime>,
+    /// When the ownership check a `VerifyTargetDomain` call started is due to settle,
+    /// or `None` when no check is in flight. Stored rather than slept on: the next call
+    /// that reads this record materialises the outcome the clock has made due.
+    pub verification_due_at: Option<SystemTime>,
 }
 
 impl TargetDomainRecord {
@@ -823,6 +860,7 @@ impl TargetDomainRecord {
         verification_method: String,
         tags: BTreeMap<String, String>,
     ) -> Self {
+        let created_at = SystemTime::now();
         let mut record = Self {
             target_domain_id: identity.target_domain_id,
             domain_name,
@@ -831,8 +869,12 @@ impl TargetDomainRecord {
             verification_status_reason: None,
             verification_token: identity.verification_token,
             tags,
-            created_at: SystemTime::now(),
+            created_at,
+            // Nothing has changed the record since it was registered.
+            updated_at: created_at,
             verified_at: None,
+            // A registration starts no ownership check: `VerifyTargetDomain` does.
+            verification_due_at: None,
         };
         // The reason names the challenge, which is built from the minted token, so it
         // is computed once the rest of the record exists.
@@ -912,6 +954,83 @@ impl TargetDomainRecord {
             _ => {}
         }
         details
+    }
+
+    /// Why this record is `UNREACHABLE`: the part of the challenge the ownership check
+    /// could not read, and what to do about it.
+    ///
+    /// CHOSEN, not recorded: one constant sentence per verification method, worded like
+    /// the pending ones above — it names the method's challenge, so it carries nothing
+    /// the caller sent.
+    fn unreachable_status_reason(&self) -> String {
+        match self.verification_method.as_str() {
+            VERIFICATION_METHOD_DNS_TXT => "Target domain ownership verification could \
+                 not read the DNS TXT record for the domain. Add the DNS TXT record to \
+                 the DNS resolver associated with your domain, then verify the target \
+                 domain again"
+                .to_string(),
+            VERIFICATION_METHOD_HTTP_ROUTE => "Target domain ownership verification \
+                 could not read the token from the HTTP route path under the domain. Add \
+                 the HTTP route path and token directly under your configured domain, \
+                 then verify the target domain again"
+                .to_string(),
+            // `PRIVATE_VPC`, the remaining enum member a stored record can carry, is
+            // proven by reaching the domain by IP from inside the VPC.
+            _ => "Target domain ownership verification could not reach the domain by IP \
+                  from the private VPC associated with it. Make the domain reachable \
+                  from the private VPC, then verify the target domain again"
+                .to_string(),
+        }
+    }
+
+    /// Start this record's ownership check at `at`, or report the outcome of the check
+    /// already made on it, and answer with the `TargetDomainStatus` the record then
+    /// holds.
+    ///
+    /// A check is started only for a domain that is `PENDING` with none already in
+    /// flight: the outcome of a check that has settled stands, so a repeat call reports
+    /// it rather than returning the record to `PENDING` and hiding a check that has
+    /// already been made, and a call made while one is in flight does not push its due
+    /// instant back.
+    ///
+    /// The started check does not settle within this call — see
+    /// [`VERIFICATION_SETTLE_AFTER`] — so the caller sees the `PENDING` it runs in,
+    /// exactly as it would while the real service reads the domain.
+    pub fn attempt_verification(&mut self, at: SystemTime) -> &str {
+        // An outcome the clock already owes is reported by this very call rather than
+        // by the next one.
+        self.settle_verification(at);
+        if self.verification_status == TARGET_DOMAIN_STATUS_PENDING
+            && self.verification_due_at.is_none()
+        {
+            self.verification_due_at = Some(at + VERIFICATION_SETTLE_AFTER);
+            self.updated_at = at;
+        }
+        &self.verification_status
+    }
+
+    /// Materialise the outcome of this record's ownership check once the clock has made
+    /// it due by `now`; a record with no check in flight, or one whose check is not due
+    /// yet, is left exactly as it was.
+    ///
+    /// The check reads the token this record carries where the record's verification
+    /// method says the domain's OWNER publishes it, so a check made from inside this
+    /// emulator reads no proof and the domain becomes
+    /// [`TARGET_DOMAIN_STATUS_UNREACHABLE`] with no verification time. The record
+    /// changed at the instant the outcome was DUE, not at the instant some later call
+    /// happened to materialise it, so that is what `updated_at` carries.
+    pub fn settle_verification(&mut self, now: SystemTime) {
+        let Some(due) = self.verification_due_at else {
+            return;
+        };
+        if now < due {
+            return;
+        }
+        let reason = self.unreachable_status_reason();
+        self.verification_due_at = None;
+        self.verification_status = TARGET_DOMAIN_STATUS_UNREACHABLE.to_string();
+        self.verification_status_reason = Some(reason);
+        self.updated_at = due;
     }
 
     /// This target domain projected onto the [`TargetDomain`] shape the reads return:
@@ -1131,6 +1250,21 @@ impl ComAmazonawsSecurityagentSecurityagentState {
                         == lattice_arn(region, KIND_RESOURCE_CONFIGURATION, id)
             })
             .map(str::to_string)
+    }
+
+    /// Settle every target domain ownership check the clock has made due by `now`.
+    ///
+    /// Called by each handler that projects a stored target domain — the batch read,
+    /// the agent space reads that expand the domains a space is associated with, and
+    /// `VerifyTargetDomain` itself — so a check's outcome surfaces on the first call
+    /// after it fell due, whichever call that is, and every one of them reports the
+    /// same record. This materialises a change the CLOCK already owed: it is the only
+    /// write a reporting operation makes, and the record it leaves is the one a read
+    /// made at the due instant would have found.
+    pub fn settle_target_domain_verifications(&mut self, now: SystemTime) {
+        for record in self.target_domains.values_mut() {
+            record.settle_verification(now);
+        }
     }
 
     /// Mint the identity of a new target domain.

@@ -223,6 +223,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // credential scope, so it is read before the store is locked.
         let region = crate::state::request_region(ctx.parts());
         let mut state = state.lock();
+        // The projection below expands the target domains the new space is associated
+        // with, so a domain ownership check the CLOCK has already made due is
+        // materialised first and this response reports those domains exactly as their
+        // own batch read does.
+        state.settle_target_domain_verifications(::std::time::SystemTime::now());
 
         // Every agent space is a stored record, so the number of them a caller can
         // create is bounded, as it is on the real service: past the quota this

@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op VerifyTargetDomain
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `VerifyTargetDomain`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`VerifyTargetDomain::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Starts a registered target domain's ownership check: resolves the stored record,
+//! starts the check the call asks for (or reports the outcome of the one already made
+//! on it), and answers with the status that record then holds.
 //!
 //! ## Shape of an operation
 //!
@@ -71,6 +66,19 @@
 //!   verification status.
 //! * `verifiedAt` (Timestamp) — The date and time the target domain was verified, in UTC
 //!   format.
+//!
+//! ## What the check can observe
+//!
+//! Ownership is proven by something the domain's OWNER publishes on the domain — a TXT
+//! record in its DNS zone, a document its web server serves, or the domain answering
+//! from inside the private VPC associated with it. None of that is reachable from
+//! inside this emulator, and no operation of this service publishes a challenge, so a
+//! check reads no proof and the domain ends `UNREACHABLE` with no `verifiedAt`. The
+//! check does not settle inside the call that starts it, so this answers the `PENDING`
+//! it runs in and the next call that reads the record reports the outcome. Both the
+//! check and the span it takes live on `TargetDomainRecord` in `src/state.rs`
+//! (`attempt_verification`, `settle_verification`), so the status this answers is the
+//! status the record holds and a later read of the same id reports.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -86,9 +94,28 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-securityagent-securitya
 // here — hence the `VerifyTargetDomainError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.securityagent#VerifyTargetDomain")]
+//
+// `VerifyTargetDomain` lists no errors of its own, so the three service-wide shapes
+// this handler needs are widened in with `extra_errors`: `ValidationException`
+// (HTTP 400, for a `targetDomainId` that could name no record at all),
+// `ResourceNotFoundException` (HTTP 404, for an id the account does not hold — the
+// alternative would be a 200 reporting the verification of a record that never
+// existed) and `InternalServerException` (HTTP 500). Note the trade: a generated SDK
+// for THIS model cannot deserialize an error shape this operation does not declare,
+// so it sees the status and the `x-amzn-errortype` code rather than a typed exception.
+#[smithy_macros::operation_error(
+    "com.amazonaws.securityagent#VerifyTargetDomain",
+    extra_errors = [
+        "InternalServerException",
+        "ResourceNotFoundException",
+        "ValidationException"
+    ]
+)]
 #[derive(Debug)]
 pub enum VerifyTargetDomainErrorModeled {
+    InternalServerException(InternalServerException),
+    ResourceNotFoundException(ResourceNotFoundException),
+    ValidationException(ValidationException),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -142,18 +169,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `VerifyTargetDomain` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(VerifyTargetDomainErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("VerifyTargetDomain"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            VerifyTargetDomainErrorModeled::InternalServerException(InternalServerException {
+                message: "the target domain store is unavailable".to_string(),
+            })
+        })?;
+
+        // `targetDomainId` is `@required` but carries no `@length`, so an empty one
+        // reaches the handler. It names no record and never could, so it is a bad
+        // request rather than a missing resource.
+        if input.target_domain_id.is_empty() {
+            return Err(VerifyTargetDomainErrorModeled::ValidationException(
+                ValidationException {
+                    message: "targetDomainId must not be empty".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        path: "targetDomainId".to_string(),
+                        message: "must not be empty".to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        let mut state = state.lock();
+
+        // An outcome the clock has already made due is this call's to report: every
+        // stored check that has fallen due is materialised before the record is read,
+        // so this operation and every other reader of the domains agree.
+        let now = ::std::time::SystemTime::now();
+        state.settle_target_domain_verifications(now);
+
+        // The verification attempt is made on the ONE stored record the id names, so
+        // what this call did is what a later read of that id reports. An id the account
+        // does not hold is refused rather than answered with a status for a domain that
+        // was never registered.
+        let record = state
+            .target_domains
+            .get_mut(&input.target_domain_id)
+            .ok_or_else(|| {
+                VerifyTargetDomainErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        // The service's own sentence for a target domain it cannot
+                        // resolve (`crate::state::TARGET_DOMAIN_NOT_FOUND`): fixed text,
+                        // carrying nothing the request sent.
+                        message: crate::state::TARGET_DOMAIN_NOT_FOUND.to_string(),
+                    },
+                )
+            })?;
+
+        // The check: `attempt_verification` starts the ownership check for this
+        // record's verification method — which reads what the domain's owner publishes
+        // ON the domain — and answers with the status the record holds while it runs,
+        // or with the outcome of the check already made on it.
+        let status = record.attempt_verification(now).to_string();
+
+        // Answered from the stored record, so this response and a later read of the
+        // same id carry the same values.
+        Ok(VerifyTargetDomainOutput {
+            target_domain_id: Some(record.target_domain_id.clone()),
+            domain_name: Some(record.domain_name.clone()),
+            created_at: Some(crate::state::timestamp(record.created_at)),
+            // When the record last changed: the instant this call started the check, or
+            // the instant the clock made its outcome due.
+            updated_at: Some(crate::state::timestamp(record.updated_at)),
+            // Absent while ownership is not proven: a domain whose published proof no
+            // check could read has no verification time to report.
+            verified_at: record.verified_at.map(crate::state::timestamp),
+            status: Some(status),
+            // Why the domain is in that status — what its owner has to publish before a
+            // check could read the proof.
+            verification_status_reason: record.verification_status_reason.clone(),
+        })
     }
 }

@@ -47,3 +47,5 @@ mod support;
 mod target_domain_deletion;
 #[path = "all/target_domain_registration.rs"]
 mod target_domain_registration;
+#[path = "all/target_domain_verification.rs"]
+mod target_domain_verification;

@@ -204,11 +204,11 @@ fn strings(payload: &Value, name: &str, case: &str) -> Vec<String> {
 ///
 /// The rows below are every such member a response of this emulator can carry today:
 /// the agent space's `createdAt`/`updatedAt` on the create and on the batch read, the
-/// target domain's `createdAt` on both, and the security requirement pack's
-/// `createdAt`/`updatedAt` on its create, its get and its listing. (The three
-/// private-connection shapes declare `certificateExpiryTime` with the same format;
-/// nothing fills it in — the stored connection holds none — so no response can carry
-/// one and there is no row to drive.)
+/// target domain's `createdAt` on both and its `createdAt`/`updatedAt` on a
+/// verification call, and the security requirement pack's `createdAt`/`updatedAt` on
+/// its create, its get and its listing. (The three private-connection shapes declare
+/// `certificateExpiryTime` with the same format; nothing fills it in — the stored
+/// connection holds none — so no response can carry one and there is no row to drive.)
 #[tokio::test]
 async fn every_date_time_member_is_an_rfc_3339_string() {
     let router = emulator();
@@ -259,6 +259,29 @@ async fn every_date_time_member_is_an_rfc_3339_string() {
             registered_at,
             "case {read_case:?}: the rendered createdAt must be the stored instant on both \
              paths: {read}"
+        );
+
+        // And on the verification call, which reports the record's `updatedAt` beside
+        // its `createdAt`.
+        let verify_case = format!("target domain verify, {method}");
+        let verified = ok(
+            &router,
+            "VerifyTargetDomain",
+            &json!({"targetDomainId": id}),
+            &verify_case,
+        )
+        .await;
+        assert_eq!(
+            assert_date_time(&verified, "createdAt", &verify_case),
+            registered_at,
+            "case {verify_case:?}: the rendered createdAt must be the stored instant on \
+             every path: {verified}"
+        );
+        assert_date_time(&verified, "updatedAt", &verify_case);
+        assert!(
+            present(&verified, "verifiedAt").is_none(),
+            "case {verify_case:?}: a domain whose ownership is not proven carries no \
+             verifiedAt: {verified}"
         );
     }
 

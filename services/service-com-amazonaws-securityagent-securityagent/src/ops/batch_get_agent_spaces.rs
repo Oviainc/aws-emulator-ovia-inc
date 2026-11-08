@@ -150,9 +150,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: "the agent space store is unavailable".to_string(),
             })
         })?;
-        // A read (`@readonly`): it resolves the requested records and projects them,
-        // and writes nothing — a later caller sees exactly what it saw.
-        let state = state.lock();
+        // A read (`@readonly`): it resolves the requested records and projects them. The
+        // one write it makes is to materialise a target domain ownership check whose
+        // outcome the CLOCK has already made due — a change that was owed at this
+        // instant even if nobody had called — because an agent space's projection
+        // expands the domains it is associated with, which must read the same as the
+        // domains' own batch read. A later caller sees exactly what this caller saw.
+        let mut state = state.lock();
+        state.settle_target_domain_verifications(::std::time::SystemTime::now());
+        let state = &*state;
 
         let mut agent_spaces = Vec::new();
         let mut not_found = Vec::new();
