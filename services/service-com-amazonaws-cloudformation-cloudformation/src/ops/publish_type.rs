@@ -29,10 +29,19 @@
 //!    picked, so such an `Arn` is refused with the modelled 400 carrying
 //!    [`ONLY_DEFAULT_VERSION_CAN_BE_PUBLISHED`]. CloudFormation parses an ARN of the caller's
 //!    own account itself ([`crate::state::registry::arn_names_this_account`]), so this is read
-//!    from the ARN alone, before the registry is consulted; an ARN whose account segment is
+//!    from the ARN alone, before the caller is judged and before the registry is consulted; an
+//!    ARN whose account segment is
 //!    another account's addresses nothing of this account and is left to the account-scoped
 //!    refusal below, which is the only answer it can reach.
-//! 3. WHICH record the request names, resolved against the registry of THIS account and
+//! 3. The CALLER: "to publish an extension, you must be
+//!    registered as a publisher with CloudFormation" ([`crate::state::publisher`], which
+//!    `RegisterPublisher` writes), and the publisher id that registration carries is the one
+//!    the published extension belongs to. Whether the calling account may publish at all is
+//!    judged BEFORE the registry is consulted, so an account holding no verified registration
+//!    is refused with the modelled 400 carrying [`not_a_verified_publisher`] whether or not a
+//!    record answers to what the request identifies, and nothing about this account's registry
+//!    reaches a caller that gate is shut for.
+//! 4. WHICH record the request names, resolved against the registry of THIS account and
 //!    Region — an `Arn` by the extension it addresses, and the name form by kind and name. An
 //!    identifier that resolves to no record of this account and Region is refused with the
 //!    modelled 400 carrying [`NOT_FOUND_IN_YOUR_ACCOUNT`]: existence and ownership are what a
@@ -41,10 +50,6 @@
 //!    extension, whether provided by Amazon Web Services or published by a third party and
 //!    activated here — is not a private extension to publish, so it too is refused with the
 //!    modelled 400; `Arn` is a `PrivateTypeArn` for that same reason.
-//! 4. The CALLER: "to publish an extension, you must be registered as a publisher with
-//!    CloudFormation" ([`crate::state::publisher`], which `RegisterPublisher` writes), and
-//!    the publisher id that registration carries is the one the published extension belongs
-//!    to. An account holding no such registration is refused with that same modelled 400.
 //! 5. The DEFAULT VERSION and the VERSION NUMBER: the record's default version, "used when
 //!    the extension version isn't specified". A record carrying none is the modelled
 //!    `TypeNotFoundException` (404), and one whose default version's contract tests have not
@@ -237,8 +242,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The CALLER, judged before the registry is consulted: "to publish an extension, you
+        // must be registered as a publisher with CloudFormation", so an account holding no
+        // verified registration may publish nothing at all and is told that rather than
+        // something about a registry it may not publish into — whether or not the extension
+        // the request names is registered here. The publisher id the registration carries is
+        // the one the publication below belongs to.
+        let publisher_id = match store.publisher(None) {
+            Some(registered)
+                if registered.status == crate::state::publisher::publisher_status::VERIFIED =>
+            {
+                registered.publisher_id.clone()
+            }
+            _ => return Err(registry_exception(not_a_verified_publisher())),
+        };
+
         // The record the request names, in the Region the request was signed for, resolved
-        // BEFORE any rule about the caller: the registry is regional, so a record another
+        // once the caller may publish at all: the registry is regional, so a record another
         // Region holds is not addressable here. An `Arn` resolves by the EXTENSION it
         // addresses, whatever it carries after it. A name a publication has already written a
         // public record for is held by two records at once, so the name form resolves the
@@ -278,13 +298,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !extension.is_private() {
             return Err(registry_exception(not_a_private_extension(&extension.arn)));
         }
-        // "To publish an extension, you must be registered as a publisher with
-        // CloudFormation": the publication belongs to the publisher id that registration
-        // carries, so an account holding none has nothing to publish under.
-        let publisher_id = match store.publisher(None) {
-            Some(registered) => registered.publisher_id.clone(),
-            None => return Err(registry_exception(NOT_A_PUBLISHER.to_string())),
-        };
 
         // The version a publication publishes: the one the record's `DefaultVersionId`
         // names, which is "used when the extension version isn't specified".
@@ -355,10 +368,21 @@ const ONLY_DEFAULT_VERSION_CAN_BE_PUBLISHED: &str =
 /// no part of it comes from the request or from the store.
 pub const NOT_FOUND_IN_YOUR_ACCOUNT: &str = "Type not found in your account.";
 
-/// The refusal AWS answers an account that has not registered as a publisher of public
-/// extensions, which is what this operation requires of its caller.
-const NOT_A_PUBLISHER: &str =
-    "You must register as a publisher with CloudFormation to call publish-type.";
+/// The refusal AWS answers an account that is not a verified publisher of public extensions,
+/// which is what this operation requires of its caller before it consults the registry the
+/// request names an extension of.
+///
+/// The wording is fixed and the single variable part is the 12-digit account id the request
+/// was signed under ([`::emulator_server::emulator_account_id`]) — taken from the caller
+/// rather than from any member, since it is the CALLING account the registration is missing
+/// for — and it names the call that fills the gap: `RegisterPublisher`.
+fn not_a_verified_publisher() -> String {
+    format!(
+        "The account {account_id} is not verified as a publisher. Please register as \
+         publisher first",
+        account_id = ::emulator_server::emulator_account_id()
+    )
+}
 
 /// How a request identifies the extension to publish.
 ///

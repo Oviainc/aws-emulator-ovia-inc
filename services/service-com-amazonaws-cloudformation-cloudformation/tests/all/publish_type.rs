@@ -3,21 +3,26 @@
 //! `PublishType` over the awsQuery wire: publishing a registered private extension as a
 //! public extension of this Region.
 //!
-//! The rule every case here holds the service to: **`PublishType` RESOLVES the extension a
+//! The rule every case here holds the service to: **`PublishType` reads an `Arn` of this
+//! account for the VERSION it pins first of all, then its CALLER — an account holding no
+//! verified publisher registration may publish nothing, so it is refused the registry's
+//! modelled `CFNRegistryException` (400) naming it before the registry is consulted
+//! (`publish_type_publisher_preflight.rs` is the table for that rule) — and only then RESOLVES
+//! the extension a
 //! request identifies — by `Arn`, or by `Type` and `TypeName` — against the registry of THIS
-//! account and Region before it reads any rule about the caller, refusing an identifier that
-//! resolves to no record of this account and Region with the registry's modelled
-//! `CFNRegistryException` (400) and its fixed not-registered sentence; for a record that DOES
+//! account and Region, refusing an identifier that
+//! resolves to no record of this account and Region with that same modelled 400 and its fixed
+//! not-registered sentence; for a record that DOES
 //! resolve it publishes the DEFAULT version of a PRIVATE registration — never a version the
 //! request picked, so an `Arn` of this account that pins one is refused that same modelled 400
 //! from the ARN alone (`publish_type_version_in_arn.rs` is the table for that rule) —
-//! for a CALLER that holds a CloudFormation extension-publisher registration, writing a
+//! writing a
 //! PUBLIC extension record of that Region which carries the published version under the
 //! public version number the publication is assigned (`1.0.0` for a publisher's first
 //! publication of the extension, one minor version release past the latest otherwise, or the
 //! number the request names), answered as that record's account-less ARN; a record this
 //! account did not register, a default version whose contract tests have not concluded
-//! `PASSED`, a caller that is not a publisher and a request that identifies no extension are
+//! `PASSED` and a request that identifies no extension are
 //! each the modelled 400, and a resolved record carrying no version at all the modelled
 //! `TypeNotFoundException` (404), each writing nothing.**
 //!
@@ -51,27 +56,35 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::extension_registry::{router_with_registry, split_required_activated_types, OTHER_REGION};
 use crate::stack_lifecycle::{
-    call, member, store, wait_for_the_transition, xml_text, REGION,
+    call, member, store, wait_for_the_transition, xml_text, ACCOUNT_ID, REGION,
 };
 
 /// The refusal AWS answers a request whose `Arn` names one VERSION of an extension this
 /// account registered: only the extension's default version is published. Entirely fixed
 /// text: no part of it comes from the request or from the store.
-const ONLY_DEFAULT_VERSION: &str =
+pub(crate) const ONLY_DEFAULT_VERSION: &str =
     "Only default version can be published. Please remove versionId from Arn";
 
 /// The refusal AWS answers a request identifying an extension that is registered in no
 /// account — existence and ownership are what a publication resolves first, so this is the
 /// answer whatever else the request carries. Entirely fixed text as well, spelled out here
 /// rather than read from the crate, because the sentence IS the requirement.
-const NOT_FOUND_IN_YOUR_ACCOUNT: &str = "Type not found in your account.";
+pub(crate) const NOT_FOUND_IN_YOUR_ACCOUNT: &str = "Type not found in your account.";
 
-/// The refusal AWS answers an account that has not registered as an extension publisher,
-/// which is what publishing requires of its caller. Entirely fixed text as well.
-const NOT_A_PUBLISHER: &str =
-    "You must register as a publisher with CloudFormation to call publish-type.";
+/// The refusal AWS answers an account that is not a verified publisher of extensions, which is
+/// what publishing requires of its caller before the registry is consulted: fixed
+/// wording whose one variable part is the calling account's 12-digit id.
+pub(crate) fn not_a_verified_publisher() -> String {
+    format!(
+        "The account {ACCOUNT_ID} is not verified as a publisher. Please register as \
+         publisher first"
+    )
+}
 
-async fn publish_type(router: &MultiServiceRouter, members: &[(&str, &str)]) -> (u16, String) {
+pub(crate) async fn publish_type(
+    router: &MultiServiceRouter,
+    members: &[(&str, &str)],
+) -> (u16, String) {
     let members: Vec<(String, String)> = members
         .iter()
         .map(|(key, value)| member(key, value))
@@ -79,7 +92,10 @@ async fn publish_type(router: &MultiServiceRouter, members: &[(&str, &str)]) -> 
     call(router, "PublishType", &members).await
 }
 
-async fn describe_type(router: &MultiServiceRouter, members: &[(&str, &str)]) -> (u16, String) {
+pub(crate) async fn describe_type(
+    router: &MultiServiceRouter,
+    members: &[(&str, &str)],
+) -> (u16, String) {
     let members: Vec<(String, String)> = members
         .iter()
         .map(|(key, value)| member(key, value))
@@ -97,7 +113,7 @@ async fn test_type(router: &MultiServiceRouter, members: &[(&str, &str)]) -> (u1
 
 /// Register this account as an extension publisher, and answer the publisher id the
 /// registration was assigned: the publisher every published extension below belongs to.
-async fn register_publisher(router: &MultiServiceRouter) -> String {
+pub(crate) async fn register_publisher(router: &MultiServiceRouter) -> String {
     let (status_code, body) = call(
         router,
         "RegisterPublisher",
@@ -116,7 +132,7 @@ async fn register_publisher(router: &MultiServiceRouter) -> String {
 /// requires of a publishable version: `TestType` concludes `PASSED` for a version whose stored
 /// schema declares the extension it defines, so a version the fixture holds no schema for is
 /// given one first.
-fn seed_a_schema_for_each_default_version(engine: &Arc<engine::InMemoryEngine>) {
+pub(crate) fn seed_a_schema_for_each_default_version(engine: &Arc<engine::InMemoryEngine>) {
     let state = store(engine);
     let mut guard = state.lock();
     for extension in &mut guard.extensions {
@@ -137,7 +153,7 @@ fn seed_a_schema_for_each_default_version(engine: &Arc<engine::InMemoryEngine>) 
 
 /// Run the contract tests of the default version the request names and wait past the instant
 /// their conclusion is due, so the version carries `PASSED` when the publication is made.
-async fn pass_the_contract_tests(router: &MultiServiceRouter, members: &[(&str, &str)]) {
+pub(crate) async fn pass_the_contract_tests(router: &MultiServiceRouter, members: &[(&str, &str)]) {
     let (status_code, body) = test_type(router, members).await;
     assert_eq!(
         status_code, 200,
@@ -148,7 +164,7 @@ async fn pass_the_contract_tests(router: &MultiServiceRouter, members: &[(&str, 
 
 /// Hold a refused call to the registry's modelled refusal: HTTP 400 `CFNRegistryException`,
 /// carrying `message`.
-fn assert_registry_refusal(case: &str, status_code: u16, body: &str, message: &str) {
+pub(crate) fn assert_registry_refusal(case: &str, status_code: u16, body: &str, message: &str) {
     assert_eq!(
         status_code, 400,
         "case {case:?}: expected the call refused with 400, got {status_code} {body}"
@@ -173,7 +189,7 @@ fn assert_registry_refusal(case: &str, status_code: u16, body: &str, message: &s
 
 /// Hold a refused call to the modelled 404: `TypeNotFoundException`, "the specified extension
 /// doesn't exist in the CloudFormation registry", naming what the request named.
-fn assert_not_found(case: &str, status_code: u16, body: &str, identifier: &str) {
+pub(crate) fn assert_not_found(case: &str, status_code: u16, body: &str, identifier: &str) {
     assert_eq!(
         status_code, 404,
         "case {case:?}: expected the call refused with 404, got {status_code} {body}"
@@ -194,20 +210,20 @@ fn assert_not_found(case: &str, status_code: u16, body: &str, identifier: &str) 
 
 /// Every record the registry holds right now, as the one snapshot a case compares a refused
 /// call against: a refusal must publish nothing.
-fn registry_snapshot(engine: &Arc<engine::InMemoryEngine>) -> String {
+pub(crate) fn registry_snapshot(engine: &Arc<engine::InMemoryEngine>) -> String {
     format!("{:?}", store(engine).lock().extensions)
 }
 
 /// The ARNs of the seeded private records, which every case addresses its extension by.
-fn resource_arn() -> String {
+pub(crate) fn resource_arn() -> String {
     type_arn(REGION, registry_type::RESOURCE, "My::Sample::Resource")
 }
 
-fn module_arn() -> String {
+pub(crate) fn module_arn() -> String {
     type_arn(REGION, registry_type::MODULE, "My::Sample::Thing::MODULE")
 }
 
-fn hook_arn() -> String {
+pub(crate) fn hook_arn() -> String {
     type_arn(REGION, registry_type::HOOK, "My::Sample::Hook")
 }
 
@@ -246,8 +262,8 @@ async fn an_arn_that_names_a_version_of_a_registered_extension_is_refused() {
     ];
 
     // Refused for an account that is not a publisher yet, which is what the recorded trace
-    // was made by: the version segment is read against the record it resolves, before the
-    // caller is looked at.
+    // was made by: the version an ARN of this account pins is read from the ARN alone, before
+    // the caller is judged and before the registry is consulted.
     for (case, arn) in &versioned {
         let (status_code, body) = publish_type(&router, &[("Arn", arn)]).await;
         assert_registry_refusal(case, status_code, &body, ONLY_DEFAULT_VERSION);
@@ -258,8 +274,8 @@ async fn an_arn_that_names_a_version_of_a_registered_extension_is_refused() {
         );
     }
 
-    // And refused for one that IS, with or without a version number beside it: nothing about
-    // the caller or the request's other members makes a version ARN publishable.
+    // And refused for one that IS a publisher, with or without a version number beside it:
+    // nothing about the caller or the request's other members makes a version ARN publishable.
     register_publisher(&router).await;
     for (case, arn) in &versioned {
         for extra in [vec![], vec![("PublicVersionNumber", "1.0.0")]] {
@@ -338,10 +354,11 @@ fn identifiers_registered_in_no_account() -> Vec<(&'static str, Vec<(&'static st
     ]
 }
 
-/// A publication resolves the extension against the registry of THIS account and Region
-/// FIRST: an identifier that resolves nothing is refused the not-registered sentence whatever
-/// else the request carries — a version number beside it and whether the caller is a
-/// registered publisher are both read against a record that resolved.
+/// A publication resolves the extension against the registry of THIS account and Region once
+/// the caller may publish at all: an identifier that resolves nothing is refused the
+/// not-registered sentence whatever else the request carries — a version number beside it is
+/// read against a record that resolved — while an account that is not a publisher is answered
+/// the caller refusal instead, since the registry is not consulted for it at all.
 #[tokio::test]
 async fn an_identifier_registered_in_no_account_is_refused_first() {
     let (router, engine) = router_with_registry();
@@ -349,8 +366,9 @@ async fn an_identifier_registered_in_no_account_is_refused_first() {
     let before = registry_snapshot(&engine);
 
     // Before the account is a publisher and after it is, with and without a version number
-    // beside the identifier: four passes over the same rows, since none of those members is
-    // what the refusal is about.
+    // beside the identifier: four passes over the same rows, since the version number is not
+    // what either refusal is about and the publisher registration decides only WHICH of the
+    // two the row reaches.
     for registered_publisher in [false, true] {
         if registered_publisher {
             register_publisher(&router).await;
@@ -362,8 +380,13 @@ async fn an_identifier_registered_in_no_account_is_refused_first() {
                     .map(|(key, value)| (*key, value.as_str()))
                     .collect();
                 members.extend_from_slice(&extra);
+                let expected = if registered_publisher {
+                    NOT_FOUND_IN_YOUR_ACCOUNT.to_string()
+                } else {
+                    not_a_verified_publisher()
+                };
                 let (status_code, body) = publish_type(&router, &members).await;
-                assert_registry_refusal(case, status_code, &body, NOT_FOUND_IN_YOUR_ACCOUNT);
+                assert_registry_refusal(case, status_code, &body, &expected);
                 assert_eq!(
                     registry_snapshot(&engine),
                     before,
@@ -463,11 +486,9 @@ async fn publishing_is_refused_for_an_account_that_is_not_a_registered_publisher
 
     // One row per thing the request can name that DOES resolve to a private registration of
     // this account and Region — a registered private extension of each kind, by name and by
-    // ARN — because the gate is on the CALLER: what the request named is resolved first, and
-    // then nothing further about the record is read until the account is a publisher, so every
-    // row is refused with the same message. (An identifier that resolves NO record, and one
-    // that resolves a record this account did not register, are refused for that instead,
-    // before the caller is looked at.)
+    // ARN — because the gate is on the CALLER: it is read before the registry is consulted,
+    // so every row is refused with the same message, and the table over identifiers that
+    // resolve nothing at all is in `publish_type_publisher_preflight.rs`.
     for (case, members) in [
         (
             "a registered private resource type, by name",
@@ -497,7 +518,7 @@ async fn publishing_is_refused_for_an_account_that_is_not_a_registered_publisher
             .map(|(key, value)| (*key, value.as_str()))
             .collect();
         let (status_code, body) = publish_type(&router, &members).await;
-        assert_registry_refusal(case, status_code, &body, NOT_A_PUBLISHER);
+        assert_registry_refusal(case, status_code, &body, &not_a_verified_publisher());
         assert_eq!(
             registry_snapshot(&engine),
             before,

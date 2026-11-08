@@ -243,6 +243,8 @@ mod public_extension_arn_versions;
 mod public_extension_arns;
 #[path = "all/publish_type.rs"]
 mod publish_type;
+#[path = "all/publish_type_publisher_preflight.rs"]
+mod publish_type_publisher_preflight;
 #[path = "all/publish_type_version_in_arn.rs"]
 mod publish_type_version_in_arn;
 #[path = "all/published_type_schema.rs"]

@@ -43,9 +43,14 @@ const REGISTERED: &str = "My::Registered::Resource";
 const TEST_TYPE_NOT_A_PUBLISHER: &str =
     "You must register as a publisher with CloudFormation to call test-type.";
 
-/// The same, for `PublishType`.
-const PUBLISH_TYPE_NOT_A_PUBLISHER: &str =
-    "You must register as a publisher with CloudFormation to call publish-type.";
+/// The refusal AWS answers a `PublishType` call from an account that is not a verified
+/// publisher: fixed wording whose one variable part is the calling account's 12-digit id.
+fn publish_type_not_a_publisher() -> String {
+    format!(
+        "The account {ACCOUNT_ID} is not verified as a publisher. Please register as \
+         publisher first"
+    )
+}
 
 /// Hold a refused call to the registry's modelled refusal — HTTP 400 `CFNRegistryException` —
 /// carrying exactly `message`.
@@ -128,10 +133,9 @@ async fn an_account_that_is_not_a_marketplace_seller_cannot_register_as_a_publis
     }
 
     // And because nothing registered, every operation downstream of "is this account a
-    // publisher" goes on answering its own refusal. `PublishType` resolves the extension the
-    // request names against this account's registry before it reads the caller, so its row
-    // names a record the registry does hold — what it is refused for is the caller, as
-    // `TestType`, which reads the caller first, is for that row too.
+    // publisher" goes on answering its own refusal. Both `TestType` and `PublishType` read the
+    // caller before the extension the request names, so the row below names a record the
+    // registry does hold: what each call is refused for is the caller.
     {
         let state = store(&engine);
         state.lock().extensions.push(StoredExtension::new(
@@ -150,6 +154,7 @@ async fn an_account_that_is_not_a_marketplace_seller_cannot_register_as_a_publis
              describe a specific publisher, please specify the publisherID"
         ),
     );
+    let publish_type_refusal = publish_type_not_a_publisher();
     for (case, action, type_name, expected) in [
         (
             "TestType after a refused registration",
@@ -161,7 +166,7 @@ async fn an_account_that_is_not_a_marketplace_seller_cannot_register_as_a_publis
             "PublishType after a refused registration",
             "PublishType",
             REGISTERED,
-            PUBLISH_TYPE_NOT_A_PUBLISHER,
+            publish_type_refusal.as_str(),
         ),
     ] {
         let (status_code, body) = call(
