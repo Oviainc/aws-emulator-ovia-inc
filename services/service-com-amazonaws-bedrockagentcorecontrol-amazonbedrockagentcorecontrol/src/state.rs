@@ -50,7 +50,11 @@
 //!   [`ConfigurationBundleRecord`] per `bundleId`, holding every version ever
 //!   committed to it ([`ConfigurationBundleVersionRecord`]), so a create and
 //!   every later read of the bundle or of one of its versions answer from one
-//!   store.
+//!   store;
+//! * the resource-based policy (`/resourcepolicy/`): the one document a
+//!   runtime or a gateway carries, keyed by the resource the policy's ARN
+//!   names, so `PutResourcePolicy`, `GetResourcePolicy` and
+//!   `DeleteResourcePolicy` answer from one store.
 //!
 //! Helpers the handlers share (the region a request was signed for, the
 //! canonical ARNs, id minting, the clock-owed status transition, the response
@@ -1721,12 +1725,18 @@ pub mod memory_strategies;
 /// [`ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState`], which a
 /// handler reaches through the struct exactly as before.
 mod store;
+/// The resource-based policy one resource of this service carries, and the
+/// resolution of the ARN a request addresses it by. Re-exported, so a handler
+/// names `crate::state::…` for it exactly as it does for the resources the
+/// policy attaches to.
+mod resource_policies;
 /// The CloudWatch Logs group this service vends for an agent runtime: the name it is
 /// derived under and the create that provisions it. Re-exported, so a handler names
 /// `crate::state::…` for it exactly as it does for the object-storage and IAM
 /// resolutions beside it.
 pub mod runtime_logs;
 pub use memory_strategies::*;
+pub use resource_policies::*;
 pub use runtime_logs::*;
 
 /// The AgentCore Runtime environment a harness runs in, for a harness whose id
@@ -2993,7 +3003,9 @@ impl ConfigurationBundleRecord {
 /// [`MAX_CONFIGURATION_BUNDLES`] the configuration bundles (and with them their
 /// 1:1 name index), [`MAX_VERSIONS_PER_CONFIGURATION_BUNDLE`] the versions one
 /// bundle accumulates and
-/// [`MAX_WORKLOAD_IDENTITIES`] the workload identities, and the
+/// [`MAX_WORKLOAD_IDENTITIES`] the workload identities, the resource policies
+/// are capped by the resources they attach to (one per runtime or gateway at
+/// most, and the entry of a resource that is gone is dropped), and the
 /// idempotency records are capped at [`MAX_REMEMBERED_CLIENT_TOKENS`] with
 /// oldest-first eviction plus removal when the resource they name is deleted.
 #[derive(Debug, Default)]
@@ -3187,6 +3199,15 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// type: no operation of this service creates a vault, so the map holds the
     /// one default vault [`TokenVaults`] seeds and never grows.
     pub token_vaults: TokenVaults,
+    /// The resource-based policy document each resource that carries one is
+    /// held under, keyed by the resource (`<arn resource type>/<id>`) rather
+    /// than by the ARN a request addressed it with. Bounded by the two stores
+    /// it keys into — at most one policy per agent runtime
+    /// ([`MAX_AGENT_RUNTIMES`]) and per gateway ([`MAX_GATEWAYS`]) — because a
+    /// policy is attached only to a resource this service holds and the entry
+    /// of a resource that is gone is dropped
+    /// ([`Self::drop_orphaned_resource_policies`]).
+    pub resource_policies: BTreeMap<String, String>,
     /// The tools the service provides in every account — the browser
     /// `aws.browser.v1` and the code interpreter `aws.codeinterpreter.v1`.
     /// Bounded by its own type: nothing creates or deletes a system tool, so

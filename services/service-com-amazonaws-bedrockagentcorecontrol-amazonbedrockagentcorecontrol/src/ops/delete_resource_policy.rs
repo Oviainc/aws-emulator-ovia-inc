@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +136,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResourcePolicy"))
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DeleteResourcePolicyErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the resource policy store is unavailable".to_string()),
+            })
+        })?;
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // A gateway whose deletion the clock has already made due is gone before
+        // this delete looks for it, and the policy it carried goes with it: both
+        // removals were owed at this instant whether or not anybody called.
+        store.expire_deleted_gateways_and_targets(now);
+        store.drop_orphaned_resource_policies();
+
+        // A policy is addressed through the resource that carries it, so an ARN
+        // naming no resource this service holds — or one of a type the feature
+        // does not cover — resolves no document, which is the same answer as a
+        // resource that carries none: neither has a policy to remove.
+        let target = store.resource_policy_target(&region, &input.resource_arn);
+        let removed = match &target {
+            Some(target) => store.detach_resource_policy(target),
+            None => None,
+        };
+        if removed.is_none() {
+            return Err(DeleteResourcePolicyErrorModeled::ResourceNotFoundException(
+                crate::state::resource_policy_not_found(),
+            )
+            .into());
+        }
+
+        Ok(DeleteResourcePolicyOutput {})
     }
 }
