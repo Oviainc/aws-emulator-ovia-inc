@@ -22,13 +22,16 @@
 //! [`crate::state::CLUSTER_STATES_SCRAM_SECRETS_ARE_SERVED_FROM`] is refused on
 //! its state ([`crate::state::invalid_cluster_state_for_scram_message`]),
 //! whatever its client authentication says.
-//! `UnprocessedScramSecrets` is therefore empty on every accepted call: each
-//! secret of a batch this handler admits is associated. The real service also
-//! reports a PER-SECRET failure there, with a 200, for a secret only AWS
-//! Secrets Manager can judge — one it does not hold, or one encrypted with the
-//! service's own key rather than a customer-managed one. This emulator keeps no
-//! Secrets Manager state to ask, so it cannot decide those and associates the
-//! secret instead of reporting it unprocessed.
+//!
+//! `UnprocessedScramSecrets` carries the PER-SECRET outcomes of a batch this
+//! handler admits: a secret of it that AWS Secrets Manager holds no record of,
+//! or that is encrypted with the Amazon Web Services managed Secrets Manager key
+//! rather than with a customer managed KMS key, cannot serve as a SASL/SCRAM
+//! credential, so it comes back named there — with a code and a message — and is
+//! not stored, while the rest of the batch is associated and the call answers
+//! 200. Those two facts belong to Secrets Manager, so they are resolved against
+//! it ([`crate::state::scram_secret_admission`]) rather than assumed, and an
+//! emulator with no Secrets Manager to ask reports nothing unprocessed.
 //!
 //! A batch that would take the cluster past
 //! [`crate::state::MAX_SCRAM_SECRETS_PER_CLUSTER`] is refused whole, as
@@ -229,6 +232,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // WHICH secrets of the batch can serve as this cluster's SASL/SCRAM
+        // credentials is Secrets Manager's to answer, so it is asked — before the
+        // store's guard is taken, because that call cannot be made while it is
+        // held. Each secret it reports on is decided on its own: the ones it
+        // cannot serve come back in `UnprocessedScramSecrets` below and are never
+        // stored, and the rest are what this call associates.
+        let admission = crate::state::scram_secret_admission::admit_for_association(
+            ctx,
+            &region,
+            &input.secret_arn_list,
+        )
+        .await;
+
         let mut state = state.lock();
         // Resolved through the settling lookup, as every operation that reaches
         // a cluster does, so this writer and the readers agree about which
@@ -280,8 +296,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The record enforces its own ceiling on the one association path, so a
-        // refused batch stores nothing.
-        if let Err(rejected) = cluster.associate_scram_secrets(&input.secret_arn_list) {
+        // refused batch stores nothing. Only the secrets Secrets Manager serves
+        // are offered to it: an unprocessed one is not stored, so it does not
+        // count towards the ceiling either.
+        if let Err(rejected) = cluster.associate_scram_secrets(&admission.associable) {
             return Err(
                 BatchAssociateScramSecretErrorModeled::TooManyRequestsException(
                     TooManyRequestsException {
@@ -305,9 +323,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The STORED cluster's ARN, so the answer names the record the
             // secrets were associated with rather than echoing the request.
             cluster_arn: Some(cluster.arn.clone()),
-            // Nothing was left unprocessed: every condition that stops a secret
-            // being associated refuses the whole call above.
-            unprocessed_scram_secrets: Some(Vec::new()),
+            // One entry per secret of the batch this endpoint's Secrets Manager
+            // cannot serve a SASL/SCRAM credential out of; empty when it serves
+            // them all, and when there is no Secrets Manager to ask.
+            unprocessed_scram_secrets: Some(admission.unprocessed),
         })
     }
 }

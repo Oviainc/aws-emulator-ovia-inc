@@ -158,6 +158,12 @@ pub mod identity_authorization;
 /// so it sits beside this module rather than in it.
 pub mod vpc_connection_admission;
 
+/// Whether ONE secret a SCRAM-secret batch names can serve as a cluster's SASL/SCRAM
+/// credential. The secrets are AWS Secrets Manager's resources, not this service's, so
+/// they are not held here — they are resolved, which is why that module sits beside
+/// this one rather than in it.
+pub mod scram_secret_admission;
+
 /// The registry's own operations — every lookup, insertion and removal over the
 /// maps the state struct below holds. Its own file so this module keeps to the
 /// RECORDS and the service's fixed values.

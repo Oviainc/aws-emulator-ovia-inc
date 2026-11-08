@@ -81,16 +81,70 @@ impl Reply {
 
 impl Emulator {
     pub fn new() -> Self {
+        Self::mounting(false)
+    }
+
+    /// The same emulator with AWS SECRETS MANAGER mounted beside this service on the
+    /// SAME engine, as the production router mounts them.
+    ///
+    /// A cluster's SASL/SCRAM credentials live in Secrets Manager secrets, and which of
+    /// them this service can act on is resolved against Secrets Manager rather than
+    /// held here — so a suite about that rule needs the service that OWNS the secrets to
+    /// be there to be asked, and mints every secret it names through that service's own
+    /// `CreateSecret` ([`Emulator::secrets_manager`]).
+    pub fn with_secrets_manager() -> Self {
+        Self::mounting(true)
+    }
+
+    fn mounting(secrets_manager: bool) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // Signature verification is the core's business, not this suite's: the
         // requests below carry a SigV4 scope so the region and route key resolve,
         // but they are not signed.
         router.set_request_authentication(false);
+        if secrets_manager {
+            router.register_service(
+                service_com_amazonaws_secretsmanager_secretsmanager::EmulatedService::new(
+                    Arc::clone(&engine),
+                ),
+            );
+        }
         router.register_service(service_com_amazonaws_kafka_kafka::EmulatedService::new(
             Arc::clone(&engine),
         ));
         Self { router, engine }
+    }
+
+    /// Call one AWS Secrets Manager operation — `target` is its name, as the
+    /// `X-Amz-Target` header of that service's awsJson1.1 wire carries it — in `region`.
+    pub async fn secrets_manager(&self, region: &str, target: &str, body: Value) -> Reply {
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", format!("secretsmanager.{region}.amazonaws.com"))
+            .header("content-type", "application/x-amz-json-1.1")
+            .header("x-amz-target", format!("secretsmanager.{target}"))
+            .header(
+                "authorization",
+                format!(
+                    "AWS4-HMAC-SHA256 Credential={DEFAULT_ACCESS_KEY_ID}/20240101/{region}\
+                     /secretsmanager/aws4_request, SignedHeaders=host, Signature=0123456789abcdef"
+                ),
+            )
+            .body(bytes::Bytes::from(
+                serde_json::to_vec(&body).expect("serialize the request body"),
+            ))
+            .expect("build the request");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let raw = response.into_body();
+        let body = if raw.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&raw).unwrap_or(Value::Null)
+        };
+        Reply { status, body }
     }
 
     pub async fn call(&self, method: &str, uri: &str, body: Option<Value>) -> Reply {

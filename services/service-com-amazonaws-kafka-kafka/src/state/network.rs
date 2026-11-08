@@ -26,6 +26,11 @@
 /// The callback is the framework's documented seam for calling another emulated service:
 /// it routes in process, so no network client is configured here. `region` is the
 /// request's own signing region.
+///
+/// This crate's ONE such seam, re-exported below for every module that resolves a fact
+/// another service owns — the subnets here, the SCRAM secrets in
+/// [`super::scram_secret_admission`] — so there is a single place that says how this
+/// service calls a peer.
 macro_rules! callback_client {
     ($sdk:ident, $ctx:expr, $endpoint:expr, $region:expr) => {{
         let config = ::$sdk::Config::builder()
@@ -46,6 +51,8 @@ macro_rules! callback_client {
         ::$sdk::Client::from_conf(config)
     }};
 }
+
+pub(crate) use callback_client;
 
 /// How many subnets ONE create may name as a placement.
 ///
@@ -158,7 +165,7 @@ pub async fn placement_subnet_refusal(
 /// (`service_common::arn::region_label`, the one place this tree states that grammar)
 /// instead of being interpolated as given: a value carrying a host or path delimiter would
 /// name an authority the caller chose rather than the peer service this emulator asks.
-fn peer_endpoint(service: &str, region: &str) -> Option<String> {
+pub(crate) fn peer_endpoint(service: &str, region: &str) -> Option<String> {
     let Some(region) = ::service_common::arn::region_label(region) else {
         ::tracing::warn!(
             peer = %service,

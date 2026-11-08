@@ -30,6 +30,12 @@ regex = "1.13"
 # EC2 (`src/state/network.rs`) before it mints anything. Only the generated client is
 # needed — the emulator supplies the transport.
 aws-sdk-ec2 = { version = "1", default-features = false }
+# The AWS SDK for Secrets Manager, driven over the same in-process callback: a
+# cluster's SASL/SCRAM credentials live in Secrets Manager secrets, so whether one of
+# them can be associated at all is resolved against Secrets Manager's own
+# `DescribeSecret` (`src/state/scram_secret_admission.rs`) rather than assumed. Only
+# the generated client is needed — the emulator supplies the transport.
+aws-sdk-secretsmanager = { version = "1", default-features = false }
 # `arn::region_label`: the ONE reading of a caller-supplied Region as a Region LABEL,
 # which is what the endpoint the EC2 call above is made at is built from;
 # `iam_authorization`: the shared evaluation of IAM policy documents against
@@ -41,6 +47,11 @@ service-common = { path = "../common" }
 # rather than keeping a second copy of either fact.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# Which `KmsKeyId` names a key of the secret's own and which names the Amazon Web
+# Services managed Secrets Manager key is Secrets Manager's own rule, published by its
+# state module (`envelope::customer_managed_key`): the SCRAM-secret admission reads it
+# from there rather than keeping a second copy of that reading.
+service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

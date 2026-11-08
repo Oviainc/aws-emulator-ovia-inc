@@ -107,6 +107,8 @@ mod replicator_listing;
 mod replicator_provisioning;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/scram_secret_admission.rs"]
+mod scram_secret_admission;
 #[path = "all/scram_secret_cluster_state.rs"]
 mod scram_secret_cluster_state;
 #[path = "all/scram_secrets.rs"]
