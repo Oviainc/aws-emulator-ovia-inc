@@ -3036,6 +3036,10 @@ pub fn mint_vended_role_session<Eng: Send + Sync + 'static>(
         account: role.account.clone(),
         arn: assumed_role_arn.clone(),
     };
+    // Minted through the token service's shared role-session mint, which also records the
+    // session where a service resolves a temporary credential's principal: a call the vended
+    // credential signs is then judged on the policies in force on the role it is a session
+    // of.
     let minted = sts::mint_role_session(
         engine,
         store,

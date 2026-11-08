@@ -113,7 +113,9 @@ impl Emulator {
     }
 
     /// Create a pool and answer its minted `IdentityPoolId`.
-    async fn pool(&self, name: &str) -> String {
+    ///
+    /// `pub(crate)` so a sibling suite on this harness asks for a pool the same way.
+    pub(crate) async fn pool(&self, name: &str) -> String {
         self.ok(
             "CreateIdentityPool",
             &json!({"IdentityPoolName": name, "AllowUnauthenticatedIdentities": true}),
@@ -257,7 +259,7 @@ fn error_code(body: &Value) -> String {
 /// `audience`, written the way the Amazon Cognito Developer Guide writes one: the
 /// `Federated` principal, the web-identity assume, and the `:aud` condition that restricts
 /// the assume to users of that one pool.
-fn trust_policy(audience: &str) -> Value {
+pub(crate) fn trust_policy(audience: &str) -> Value {
     json!({
         "Version": "2012-10-17",
         "Statement": [{

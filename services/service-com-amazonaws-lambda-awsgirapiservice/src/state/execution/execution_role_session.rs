@@ -31,8 +31,11 @@
 //! * It belongs to the EXECUTION ENVIRONMENT rather than to one invocation: Lambda's
 //!   credentials are held by the environment and refreshed, so one session is held per
 //!   function here and re-minted once the clock has brought it close enough to its expiry
-//!   that a run could outlast it ([`REFRESH_MARGIN`]). The one it replaces is forgotten in
-//!   both stores that held it, so no credential nothing uses stays valid.
+//!   that a run could outlast it ([`REFRESH_MARGIN`]). The one it replaces is given up in the
+//!   credential store, so a request presenting it no longer verifies, and in the token
+//!   service's registry, so it names no identity either; the record the mint left where a
+//!   principal is read from speaks for a credential nothing can present any more, and is
+//!   pruned at its own expiry.
 //!
 //! Where nothing can be SHOWN about the role — this emulator holds no IAM record of it (an
 //! execution role is normally provisioned outside the client that creates the function,

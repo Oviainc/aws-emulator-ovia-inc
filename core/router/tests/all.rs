@@ -656,6 +656,9 @@ mod lambda_execution_role_trust;
 // Declared in this span of the sorted list, for the reason the line above states.
 #[path = "all/lambda_capacity_provider_operator_role.rs"]
 mod lambda_capacity_provider_operator_role;
+// Declared in this span of the sorted list, for the reason the line above states.
+#[path = "all/lambda_execution_role_session_identity.rs"]
+mod lambda_execution_role_session_identity;
 // Declared in this span of the sorted list, beside the other `l…` suites, rather than at
 // the head of this file or in its appended tail: both of those are where concurrently
 #[path = "all/lakeformation_catalog_resource_resolution.rs"]
