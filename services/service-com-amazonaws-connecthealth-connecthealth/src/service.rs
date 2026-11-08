@@ -47,10 +47,20 @@
 //! and declares no `@jsonName`, so the framework's renderers write a key no ConnectHealth
 //! client reads. Routing, status, the error code and the text itself all stay with the
 //! framework.
+//!
+//! That same seam routes the ONE operation the generated table cannot serve at all,
+//! `StartMedicalScribeListeningSession`: its output is a `@streaming` union, so the
+//! generated shim declines the request and this file hands it to the operation's own
+//! event-stream implementation instead.
 
 pub mod error_detail;
 pub mod tag_bounds;
 
+use crate::ops::start_medical_scribe_listening_session::{
+    self, StartMedicalScribeListeningSession,
+};
+use service_common::event_stream::EventStreamRoute;
+use service_common::request_path;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
@@ -66,6 +76,16 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The wrapper `override_operation` hands back. Stateless, and held here rather than
     /// built per request because that method answers with a reference to it.
     error_detail: error_detail::ErrorDetailOperation,
+    /// The one event-stream operation this service serves. It is in the generated
+    /// routing table too, but not in a servable form: the generated `ErasedOperation`
+    /// shim of an operation whose output is a `@streaming` union declines the request
+    /// (it cannot drive `serialize_as_event_stream<P>` through an object-safe `run`), so
+    /// this copy is held behind an [`EventStreamRoute`] and routed by
+    /// [`EmulatedService::override_operation`] — which the router consults FIRST, before
+    /// the generated table. Both copies read the same domains, subscriptions and
+    /// sessions, because that state lives in the shared engine rather than on the
+    /// operation.
+    start_medical_scribe_listening_session: EventStreamRoute<StartMedicalScribeListeningSession<Eng>>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -74,8 +94,11 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             error_detail: error_detail::ErrorDetailOperation,
+            start_medical_scribe_listening_session: EventStreamRoute(
+                StartMedicalScribeListeningSession::new(engine),
+            ),
         }
     }
 }
@@ -102,7 +125,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Every request the generated routing table can serve is served through the
+        // ONE operation is routed ahead of the table: `StartMedicalScribeListeningSession`,
+        // whose output is a `@streaming` union and whose generated shim therefore
+        // declines the request. It is matched by the method and the path the model binds
+        // it to, through the operation's own consts, so this cannot drift from the model.
+        if req.method() == start_medical_scribe_listening_session::MODELED_METHOD
+            && request_path(req.uri()) == start_medical_scribe_listening_session::MODELED_PATH
+        {
+            return Some(&self.start_medical_scribe_listening_session);
+        }
+        // Every other request the generated routing table can serve is served through the
         // wrapper, which delegates to that same operation and then reports the detail
         // text of whatever it answered in this service's `Message` member (see
         // [`error_detail`]). A request the table cannot serve is left to the framework.

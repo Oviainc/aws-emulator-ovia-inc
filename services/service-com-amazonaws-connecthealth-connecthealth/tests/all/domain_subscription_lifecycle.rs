@@ -96,6 +96,32 @@ impl Emulator {
         dispatch_signed(&self.router, region, method, path, body).await
     }
 
+    /// Dispatch one request carrying RAW BYTES and whatever headers the suite chose, and
+    /// hand back the whole response — what an operation whose request body is not JSON,
+    /// and whose answer is read off the response headers, has to be driven through.
+    pub(crate) async fn send_bytes(
+        &self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> http::Response<Bytes> {
+        self.send_bytes_in(&self.region, method, path, headers, body)
+            .await
+    }
+
+    /// [`Emulator::send_bytes`], SIGNED FOR `region`.
+    pub(crate) async fn send_bytes_in(
+        &self,
+        region: &str,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Vec<u8>,
+    ) -> http::Response<Bytes> {
+        dispatch_signed_bytes(&self.router, region, method, path, headers, body).await
+    }
+
     /// `CreateDomain`, asserting it was accepted, and the created domain's id.
     pub(crate) async fn create_domain(&self, body: &Value) -> Value {
         self.create_domain_in(&self.region, body).await
@@ -147,18 +173,15 @@ pub(crate) async fn dispatch_signed(
     let payload = body
         .map(|body| serde_json::to_vec(body).expect("a serializable body"))
         .unwrap_or_default();
-    let credential = format!(
-        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/health-agent/aws4_request, \
-         SignedHeaders=host, Signature=0000"
-    );
-    let request = http::Request::builder()
-        .method(method)
-        .uri(path)
-        .header("content-type", "application/json")
-        .header("authorization", credential)
-        .body(Bytes::from(payload))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
+    let response = dispatch_signed_bytes(
+        router,
+        region,
+        method,
+        path,
+        &[("content-type", "application/json")],
+        payload,
+    )
+    .await;
     let status = response.status().as_u16();
     let bytes = response.into_body();
     let parsed = if bytes.is_empty() {
@@ -167,6 +190,37 @@ pub(crate) async fn dispatch_signed(
         serde_json::from_slice(&bytes).unwrap_or(Value::Null)
     };
     (status, parsed)
+}
+
+/// Dispatch ONE signed request with `headers` and `body` exactly as given, and hand back
+/// the whole response.
+///
+/// The byte-level half of [`dispatch_signed`], which is this function with a JSON body
+/// and a JSON content type: an operation that binds its members to request HEADERS and
+/// answers in response headers cannot be driven through the JSON-shaped helper.
+pub(crate) async fn dispatch_signed_bytes(
+    router: &MultiServiceRouter,
+    region: &str,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: Vec<u8>,
+) -> http::Response<Bytes> {
+    let credential = format!(
+        "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{region}/health-agent/aws4_request, \
+         SignedHeaders=host, Signature=0000"
+    );
+    let mut builder = http::Request::builder()
+        .method(method)
+        .uri(path)
+        .header("authorization", credential);
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    let request = builder
+        .body(Bytes::from(body))
+        .expect("a well-formed request");
+    router.dispatch(request).await
 }
 
 /// The wire error code (`__type`), without any namespace prefix.

@@ -7,6 +7,10 @@ publish = false
 build = "build.rs"
 
 [dependencies]
+# The `vnd.amazon.eventstream` framing, the request reader and the routing seam the
+# hand-authored `StartMedicalScribeListeningSession` needs, plus the shared request-path
+# reader that routes it.
+service-common = { path = "../common" }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
@@ -26,6 +30,10 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex codec for those ids and for the opaque `nextToken` pagination cursor.
 hex = { workspace = true }
+# Decodes one `application/vnd.amazon.eventstream` frame: the input stream of
+# `StartMedicalScribeListeningSession` arrives as those frames, and the shared seam reads
+# only the response direction.
+aws-smithy-eventstream = "0.60"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

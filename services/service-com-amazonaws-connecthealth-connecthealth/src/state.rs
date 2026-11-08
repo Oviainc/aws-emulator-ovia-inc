@@ -117,6 +117,23 @@ pub const MAX_SUBSCRIPTIONS_PER_DOMAIN: usize = 100;
 /// start is refused instead (see `StartPatientInsightsJob`).
 pub const MAX_PATIENT_INSIGHTS_JOBS_PER_DOMAIN: usize = 100;
 
+/// The most `ScribeSession` records one `Subscription` holds, so the product
+/// (domains x subscriptions x sessions) is bounded as well: a caller looping
+/// `StartMedicalScribeListeningSession` with a fresh `sessionId` each time cannot grow
+/// the shared store without limit. A session record stays reachable for as long as its
+/// subscription does, so nothing drops one behind a caller's back; past this count a
+/// start is refused instead (see `StartMedicalScribeListeningSession`).
+pub const MAX_SCRIBE_SESSIONS_PER_SUBSCRIPTION: usize = 100;
+
+/// The most event-stream frames ONE `StartMedicalScribeListeningSession` request's
+/// input stream carries.
+///
+/// A caller chooses both how many frames a body holds and how small each one is, so
+/// decoding them is work a caller sizes: a body the transport accepts still holds
+/// hundreds of thousands of tiny frames. The count is refused before the frames are
+/// read rather than after.
+pub const MAX_SCRIBE_STREAM_EVENTS: usize = 1024;
+
 /// How long a patient insights job sits in ONE non-terminal `JobStatus` before the
 /// transition the clock owes it is materialised (`SUBMITTED` -> `IN_PROGRESS`, then
 /// `IN_PROGRESS` -> a terminal status).
@@ -692,8 +709,9 @@ pub struct Subscription {
     pub deactivated_at: Option<SystemTime>,
     /// The Medical Scribe listening sessions started on this subscription, by
     /// `sessionId`. Held HERE rather than in a map beside the registry, so a session is
-    /// scoped to its own subscription and goes away with it. See [`ScribeSession`] for
-    /// why nothing in this crate writes it yet.
+    /// scoped to its own subscription and goes away with it. Written by
+    /// [`Self::start_scribe_session`], the one growth site, which is bounded by
+    /// [`MAX_SCRIBE_SESSIONS_PER_SUBSCRIPTION`].
     pub scribe_sessions: BTreeMap<String, ScribeSession>,
 }
 
@@ -724,13 +742,13 @@ impl ScribeStreamStatus {
 /// (`domainId`, `subscriptionId`) pair it belongs to, so one subscription's session
 /// cannot be read through another's (see [`ComAmazonawsConnecthealthConnecthealthState::live_scribe_session`]).
 ///
-/// A session is written by the operation that starts one,
-/// `StartMedicalScribeListeningSession`, which this emulator does not serve: the
-/// generator skips it (`src/ops/SKIPPED_STUBS.md` — its input carries a `@streaming`
-/// event-stream member, which needs wire framing the generator does not emit), so this
-/// crate has no handler for it and no growth site to bound. `GetMedicalScribeListeningSession`
-/// nevertheless resolves a session out of this map rather than answering a constant, so
-/// a stored session is reported from state and an absent one is the modelled 404.
+/// A session is written by the one operation that starts one,
+/// `StartMedicalScribeListeningSession` (hand-authored, because its input carries a
+/// `@streaming` event-stream member the stub generator emits no framing for), and it is
+/// written through [`Subscription::start_scribe_session`] — the single growth site,
+/// bounded by [`MAX_SCRIBE_SESSIONS_PER_SUBSCRIPTION`]. `GetMedicalScribeListeningSession`
+/// resolves a session out of this map rather than answering a constant, so a stored
+/// session is reported from state and an absent one is the modelled 404.
 #[derive(Debug, Clone)]
 pub struct ScribeSession {
     pub session_id: String,
@@ -771,6 +789,23 @@ impl ScribeSession {
     }
 }
 
+/// What starting a listening session under a subscription did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScribeSessionStart {
+    /// The `sessionId` named no session of this subscription, and the new record is
+    /// stored.
+    Started,
+    /// The `sessionId` named a session this subscription already holds, so that record
+    /// was carried forward rather than duplicated: the new stream's configuration and
+    /// status replace what was stored, and the session keeps the creation instant of
+    /// the stream that first claimed the id.
+    Resumed,
+    /// The subscription already holds [`MAX_SCRIBE_SESSIONS_PER_SUBSCRIPTION`] sessions
+    /// and the id names none of them, so NOTHING was stored: the caller is answered with
+    /// the modelled quota failure and the store is left exactly as it was.
+    AtCapacity,
+}
+
 impl Subscription {
     /// Whether this record is still live: one `DeleteDomain` already marked `DELETED`
     /// is gone as far as every reader and every transition is concerned.
@@ -802,6 +837,30 @@ impl Subscription {
             SubscriptionStatus::Deleted => {}
         }
         self.last_updated_at = now;
+    }
+
+    /// Start a Medical Scribe listening session on this subscription, under the
+    /// `sessionId` the record carries.
+    ///
+    /// The ONE write that adds a session to this service's store, so the bound on how
+    /// many a subscription holds is stated once, here, and a refused start leaves the
+    /// store untouched. An id this subscription already holds RESUMES that session
+    /// rather than adding another: the model requires the caller to name the
+    /// `sessionId`, and a session the model lets a client resume keeps the instant its
+    /// stream was first created.
+    pub fn start_scribe_session(&mut self, mut session: ScribeSession) -> ScribeSessionStart {
+        if let Some(held) = self.scribe_sessions.get(&session.session_id) {
+            session.stream_creation_time = held.stream_creation_time;
+            self.scribe_sessions
+                .insert(session.session_id.clone(), session);
+            return ScribeSessionStart::Resumed;
+        }
+        if self.scribe_sessions.len() >= MAX_SCRIBE_SESSIONS_PER_SUBSCRIPTION {
+            return ScribeSessionStart::AtCapacity;
+        }
+        self.scribe_sessions
+            .insert(session.session_id.clone(), session);
+        ScribeSessionStart::Started
     }
 
     /// This record as the modelled `SubscriptionDescription` four operations return.
@@ -1030,6 +1089,28 @@ impl ComAmazonawsConnecthealthConnecthealthState {
                 return candidate;
             }
         }
+    }
+
+    /// Mint the `requestId` a response reports for ONE call: 32 hex characters in the
+    /// hyphenated 8-4-4-4-12 form AWS request ids take, which is 36 characters and so
+    /// inside the modelled `RequestId` bound of 1..256.
+    ///
+    /// Per CALL, not per resource: it identifies the request, so it is minted fresh on
+    /// every call and stored on nothing. The digest is the one every id this service
+    /// mints comes from, so two calls of one process cannot share an id.
+    pub fn mint_request_id(&mut self) -> String {
+        let seq = self.next_seq();
+        let body = mint_id("", 32, seq);
+        // Hyphenated by walking the digest, so the form never depends on an index being
+        // inside it: the separators go where the 8-4-4-4-12 grouping puts them.
+        let mut request_id = String::with_capacity(36);
+        for (index, digit) in body.chars().enumerate() {
+            if matches!(index, 8 | 12 | 16 | 20) {
+                request_id.push('-');
+            }
+            request_id.push(digit);
+        }
+        request_id
     }
 
     /// Mint the id of the Identity Center application this service creates for a

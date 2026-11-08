@@ -27,6 +27,7 @@ pub mod list_domains_types;
 pub mod list_subscriptions_types;
 pub mod list_tags_for_resource_types;
 pub mod shared_types;
+pub mod start_medical_scribe_listening_session_types;
 pub mod start_patient_insights_job_types;
 pub mod tag_resource_types;
 pub mod untag_resource_types;
@@ -57,6 +58,8 @@ pub use list_subscriptions_types::*;
 pub use list_tags_for_resource_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use shared_types::*;
+#[allow(ambiguous_glob_reexports, unused_imports)]
+pub use start_medical_scribe_listening_session_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]
 pub use start_patient_insights_job_types::*;
 #[allow(ambiguous_glob_reexports, unused_imports)]

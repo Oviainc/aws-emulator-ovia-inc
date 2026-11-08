@@ -18,4 +18,7 @@ union can be declared as `{Op}Output`. A `@required` union member and a
 `@required`-member reference cycle are NOT decline reasons — a scaffolded
 handler returns an error, so it never has to construct a value.
 
-// SKIPPED: StartMedicalScribeListeningSession — unsupported shape construct: operation 'StartMedicalScribeListeningSession' has a @streaming event-stream input member, which needs wire framing the generator does not emit
+Nothing is skipped in this crate any more: `StartMedicalScribeListeningSession`
+was declined here for its `@streaming` event-stream input member and is now
+hand-authored in `ops/start_medical_scribe_listening_session.rs`, with its
+framing driven through `service_common::event_stream`.

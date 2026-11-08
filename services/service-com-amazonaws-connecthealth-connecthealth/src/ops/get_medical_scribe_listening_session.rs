@@ -77,12 +77,12 @@
 //!
 //! ## Where a session comes from
 //!
-//! The only operation that STARTS one, `StartMedicalScribeListeningSession`, is not
-//! generated into this crate (`src/ops/SKIPPED_STUBS.md`: its input carries a
-//! `@streaming` event-stream member, which needs wire framing the generator does not
-//! emit), so nothing this emulator serves writes a session yet. This operation is still
-//! a lookup rather than a constant: it resolves the session out of state and reports
-//! what is stored, which is the modelled 404 for every scope that holds none.
+//! The only operation that STARTS one, [`super::start_medical_scribe_listening_session`],
+//! writes it: a client POSTs the stream, that operation persists the
+//! [`crate::state::ScribeSession`] its headers and `configurationEvent` describe, and
+//! this operation reports what was stored. It is a lookup rather than a constant: it
+//! resolves the session out of state and reports what is there, which is the modelled 404
+//! for every scope that holds none.
 
 #[allow(unused_imports)]
 use super::types::*;
