@@ -147,6 +147,27 @@ fn execution_arn(region: &str, machine: &str, execution: &str) -> String {
     format!("arn:aws:states:{region}:{ACCOUNT}:execution:{machine}:{execution}")
 }
 
+/// The ARN one execution of an EXPRESS machine carries, up to the run's own id. An Express
+/// execution is named by the `express` resource and a trailing run id, because "for EXPRESS
+/// workflows, execution names can be reused immediately" (`StartExecution$name`), so the
+/// name alone does not identify a run of one.
+fn express_execution_arn_prefix(region: &str, machine: &str, execution: &str) -> String {
+    format!("arn:aws:states:{region}:{ACCOUNT}:express:{machine}:{execution}:")
+}
+
+/// Whether `id` is a UUID rendered 8-4-4-4-12 in lowercase hex — the form of the id an
+/// Express execution ARN ends with, and of the execution name Step Functions mints.
+fn is_uuid(id: &str) -> bool {
+    let groups: Vec<&str> = id.split('-').collect();
+    groups.len() == 5
+        && [8usize, 4, 4, 4, 12].iter().zip(&groups).all(|(width, group)| {
+            group.len() == *width
+                && group
+                    .chars()
+                    .all(|character| matches!(character, '0'..='9' | 'a'..='f'))
+        })
+}
+
 /// A one-state definition that ends immediately, as each row's template states it.
 fn pass_definition(result: &str) -> Value {
     json!({
@@ -177,10 +198,10 @@ struct Row {
     name_output: &'static str,
     /// The name the start asks for, or `None` to leave Step Functions to mint one.
     execution_name: Option<&'static str>,
-    /// Whether the machine is an EXPRESS workflow: `ListExecutions` answers
-    /// `StateMachineTypeNotSupported` for one and `DescribeExecution` answers
-    /// `ExecutionDoesNotExist` ("executions of an EXPRESS state machine aren't supported by
-    /// DescribeExecution unless a Map Run dispatched them"), so the row asserts those refusals
+    /// Whether the machine is an EXPRESS workflow: its executions are named by the `express`
+    /// ARN carrying the run's own id, `ListExecutions` answers `StateMachineTypeNotSupported`
+    /// for one, and `DescribeExecution` refuses that ARN as an `InvalidArn` because `express`
+    /// is not the resource type its `executionArn` takes — so the row asserts those refusals
     /// where a STANDARD row asserts the reads.
     express: bool,
 }
@@ -415,12 +436,30 @@ async fn a_stack_published_state_machine_reference_starts_an_execution() {
             .unwrap_or_else(|| panic!("case {case:?}: no 'executionArn' in {started}"));
         let execution_name = match row.execution_name {
             Some(name) => {
-                assert_eq!(
-                    started_arn,
-                    execution_arn(region, &machine_name, name),
-                    "case {case:?}: expected the execution ARN of the name the start asked for, \
-                     got {started_arn:?}"
-                );
+                if row.express {
+                    // An EXPRESS start answers the `express` ARN of the name it asked for
+                    // plus the run's OWN id, which is what tells two runs that reused one
+                    // name apart.
+                    let prefix = express_execution_arn_prefix(region, &machine_name, name);
+                    let id = started_arn.strip_prefix(prefix.as_str()).unwrap_or_else(|| {
+                        panic!(
+                            "case {case:?}: expected an EXPRESS execution ARN under {prefix:?}, \
+                             got {started_arn:?}"
+                        )
+                    });
+                    assert!(
+                        is_uuid(id),
+                        "case {case:?}: expected the run's own id to end the EXPRESS execution \
+                         ARN as a UUID, got {id:?}"
+                    );
+                } else {
+                    assert_eq!(
+                        started_arn,
+                        execution_arn(region, &machine_name, name),
+                        "case {case:?}: expected the execution ARN of the name the start asked \
+                         for, got {started_arn:?}"
+                    );
+                }
                 name.to_string()
             }
             None => {
@@ -452,9 +491,10 @@ async fn a_stack_published_state_machine_reference_starts_an_execution() {
         // reference named and through the execution's own ARN — and each read answers for the
         // reference the way the API documents it for the workflow type. A STANDARD machine
         // reports both; for an EXPRESS one `ListExecutions` answers
-        // `StateMachineTypeNotSupported` and `DescribeExecution` answers `ExecutionDoesNotExist`
-        // ("executions of an EXPRESS state machine aren't supported by DescribeExecution unless
-        // a Map Run dispatched them"), which is itself evidence the reference resolved to a
+        // `StateMachineTypeNotSupported` ("executions of an EXPRESS state machine aren't
+        // supported by DescribeExecution unless a Map Run dispatched them", and the ARN such a
+        // run carries names the `express` resource, which `DescribeExecution`'s `executionArn`
+        // refuses as an `InvalidArn`), which is itself evidence the reference resolved to a
         // machine of that type rather than to nothing.
         let (status, listed) = sfn(
             &router,
@@ -515,12 +555,15 @@ async fn a_stack_published_state_machine_reference_starts_an_execution() {
                 "case {case:?}: expected DescribeExecution to be refused for an EXPRESS \
                  execution, got {status} with body {execution}"
             );
+            // The ARN an EXPRESS run carries names the `express` resource, which this
+            // operation's `executionArn` does not accept, so the refusal is about the ARN
+            // and comes before any record is looked up.
             assert!(
                 execution
                     .get("__type")
                     .and_then(Value::as_str)
-                    .is_some_and(|code| code.ends_with("ExecutionDoesNotExist")),
-                "case {case:?}: expected ExecutionDoesNotExist, got {execution}"
+                    .is_some_and(|code| code.ends_with("InvalidArn")),
+                "case {case:?}: expected InvalidArn, got {execution}"
             );
         } else {
             assert_eq!(

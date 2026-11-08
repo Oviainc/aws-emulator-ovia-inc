@@ -77,6 +77,10 @@ jaq-json = { version = "1", features = ["serde_json"] }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# The generator behind the property-based not-found suite: delivery-stream names are
+# DRAWN from the modelled name class rather than hand-picked. Test-only, seeded, and
+# nothing of it reaches `src/`.
+rand = "0.9"
 sha2 = { workspace = true }
 hex = { workspace = true }
 # The CMK an encrypted stream names is resolved against the KMS service, so the suite that

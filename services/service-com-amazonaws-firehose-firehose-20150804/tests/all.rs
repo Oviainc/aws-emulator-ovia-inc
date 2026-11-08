@@ -59,6 +59,8 @@ mod http_endpoint_delivery;
 mod kms_key_resolution;
 #[path = "all/legacy_s3_destination_mirror.rs"]
 mod legacy_s3_destination_mirror;
+#[path = "all/not_found_message_name_space.rs"]
+mod not_found_message_name_space;
 #[path = "all/opensearch_destination_delivery.rs"]
 mod opensearch_destination_delivery;
 #[path = "all/opensearch_fgac_destination_delivery.rs"]

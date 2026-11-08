@@ -21,16 +21,19 @@ use super::delivery_stream_lifecycle::{error_code, error_message, Emulator, PAST
 
 /// One operation that resolves a stream by name, and the request that probes `name` with
 /// every OTHER member of that request valid, so the lookup is what refuses it.
-struct Probe {
-    case: &'static str,
-    operation: &'static str,
-    request: fn(&str) -> Value,
+///
+/// `pub(crate)` with the probe tables below so a sibling suite probes the same operations
+/// rather than restating them.
+pub(crate) struct Probe {
+    pub(crate) case: &'static str,
+    pub(crate) operation: &'static str,
+    pub(crate) request: fn(&str) -> Value,
 }
 
 /// Every control-plane operation that takes a `DeliveryStreamName` and resolves it
 /// (`smithy_query(query="digest")`): the reads, the delete, the tag changes, the two
 /// encryption changes and the destination update.
-fn control_plane_probes() -> Vec<Probe> {
+pub(crate) fn control_plane_probes() -> Vec<Probe> {
     vec![
         Probe {
             case: "describe",
@@ -92,6 +95,26 @@ fn control_plane_probes() -> Vec<Probe> {
                 "CurrentDeliveryStreamVersionId": "1",
                 "DestinationId": "destinationId-000000000001",
                 "S3DestinationUpdate": { "Prefix": "x/" },
+            }),
+        },
+    ]
+}
+
+/// Every DATA-plane operation that takes a `DeliveryStreamName` and resolves it
+/// (`smithy_query(query="digest")`): the single put and the batch put.
+pub(crate) fn data_plane_probes() -> Vec<Probe> {
+    vec![
+        Probe {
+            case: "put a record",
+            operation: "PutRecord",
+            request: |name| json!({ "DeliveryStreamName": name, "Record": { "Data": "eA==" } }),
+        },
+        Probe {
+            case: "put a batch",
+            operation: "PutRecordBatch",
+            request: |name| json!({
+                "DeliveryStreamName": name,
+                "Records": [{ "Data": "eA==" }, { "Data": "eQ==" }],
             }),
         },
     ]
@@ -168,22 +191,7 @@ async fn a_put_to_an_absent_stream_states_the_account_in_the_data_plane_wording(
     let account = engine::emulator_account_id();
     let expected = format!("Firehose not found under account {account}.");
 
-    // (case, operation, request for a probed name)
-    let puts: Vec<Probe> = vec![
-        Probe {
-            case: "put a record",
-            operation: "PutRecord",
-            request: |name| json!({ "DeliveryStreamName": name, "Record": { "Data": "eA==" } }),
-        },
-        Probe {
-            case: "put a batch",
-            operation: "PutRecordBatch",
-            request: |name| json!({
-                "DeliveryStreamName": name,
-                "Records": [{ "Data": "eA==" }, { "Data": "eQ==" }],
-            }),
-        },
-    ];
+    let puts: Vec<Probe> = data_plane_probes();
 
     emulator.create_stream("present-stream", None).await;
     tokio::time::sleep(PAST_THE_TRANSITION).await;

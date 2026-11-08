@@ -11852,6 +11852,7 @@ dependencies = [
  "jaq-core",
  "jaq-json",
  "quick-xml",
+ "rand 0.9.5",
  "ruzstd",
  "serde_json",
  "service-com-amazonaws-kms-trentservice",
