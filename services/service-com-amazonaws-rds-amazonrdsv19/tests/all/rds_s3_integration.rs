@@ -78,7 +78,7 @@ fn trust_policy(principal: &str) -> String {
 }
 
 /// An identity policy granting the object write an export performs on `bucket`.
-fn put_object_policy(bucket: &str) -> String {
+pub(crate) fn put_object_policy(bucket: &str) -> String {
     format!(
         r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::{bucket}/*"}}]}}"#
     )
@@ -169,7 +169,7 @@ fn iam(router: &MultiServiceRouter) -> aws_sdk_iam::Client {
 }
 
 /// A KMS client over the same callback, for the key the export encrypts its objects under.
-fn kms(router: &MultiServiceRouter) -> aws_sdk_kms::Client {
+pub(crate) fn kms(router: &MultiServiceRouter) -> aws_sdk_kms::Client {
     let callback = smithy_server_runtime::EmbeddedEmulator::from_router(router.clone());
     let config = aws_sdk_kms::Config::builder()
         .behavior_version(aws_sdk_kms::config::BehaviorVersion::latest())

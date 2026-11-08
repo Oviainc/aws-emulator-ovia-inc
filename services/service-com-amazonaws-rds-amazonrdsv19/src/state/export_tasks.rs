@@ -168,13 +168,31 @@ pub fn export_role_missing_permissions_message(role_arn: &str, bucket: &str) -> 
     )
 }
 
-/// What a `KMSKeyNotAccessibleFault` carries for a `KmsKeyId` KMS will not encrypt the
-/// export under.
+/// What a `KMSKeyNotAccessibleFault` carries where a CREATE names a `KmsKeyId` KMS will not
+/// encrypt the resource under.
 pub fn kms_key_not_accessible_message(key_id: &str) -> String {
     format!(
         "The specified KMS key [{key_id}] does not exist, is not enabled or you do not have \
          permissions to access it."
     )
+}
+
+/// What the same fault carries on the EXPORT path, where `KmsKeyId` is the key the exported
+/// data is encrypted with: Amazon RDS words this one as a statement about the key itself,
+/// naming the identifier the request carried and nothing else.
+pub fn export_kms_key_not_accessible_message(key_id: &str) -> String {
+    format!("The KMS key {key_id} doesn't exist or is disabled.")
+}
+
+/// What a request whose `SourceArn` names a resource of ANOTHER Region is refused with.
+///
+/// Amazon RDS is regional: an export reads its source at the endpoint the call was made to,
+/// so an ARN whose Region segment is not that endpoint's names nothing this call can export,
+/// which this Query API answers `InvalidParameterValue`. The sentence names the ARN the
+/// request carried and nothing else — not the Region it names, and not the one the call was
+/// made in.
+pub fn cross_region_export_source_message(source_arn: &str) -> String {
+    format!("The resource {source_arn} is located in a different AWS Region.")
 }
 
 /// `ExportTask$WarningMessage` for an export the object store would not take every object of:

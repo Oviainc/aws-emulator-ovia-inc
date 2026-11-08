@@ -27,6 +27,8 @@ mod cluster_create_refusal_wording;
 mod cluster_parameter_groups;
 #[path = "all/cluster_parameter_value_range.rs"]
 mod cluster_parameter_value_range;
+#[path = "all/cluster_role_and_export_key_refusals.rs"]
+mod cluster_role_and_export_key_refusals;
 #[path = "all/control_plane_operations.rs"]
 mod control_plane_operations;
 #[path = "all/custom_db_engine_versions.rs"]

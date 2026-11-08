@@ -194,10 +194,12 @@ pub use events::{
     DESCRIBE_EVENTS_SOURCE_TYPES, EVENT_RETENTION_SECONDS, MAX_EVENTS_PER_REGION,
 };
 pub use export_tasks::{
-    export_part_id, export_source_of, export_task_already_exists_message,
+    export_kms_key_not_accessible_message, export_part_id, export_source_of,
+    export_task_already_exists_message,
     export_task_not_found_message, export_task_quota_message,
     export_role_missing_permissions_message, export_role_not_found_message,
-    cross_region_export_bucket_message, invalid_export_only_message,
+    cross_region_export_bucket_message, cross_region_export_source_message,
+    invalid_export_only_message,
     invalid_export_source_arn_message, invalid_export_source_state_message,
     invalid_s3_bucket_message, kms_key_not_accessible_message, partial_export_warning,
     ExportTaskRecord,
@@ -1687,8 +1689,10 @@ pub fn db_cluster_cannot_be_accessed_message(named: &str) -> String {
     format!("The source cluster could not be found or cannot be accessed: {named}")
 }
 
-/// Another wording this front door gives a `DBClusterNotFoundFault`, the one the call that
-/// takes a SNAPSHOT of the cluster answers.
+/// Another wording this front door gives a `DBClusterNotFoundFault`: the one the call that
+/// takes a SNAPSHOT of the cluster answers, and the one the calls that manage the cluster's
+/// IAM ROLE ASSOCIATIONS answer — the `<resource type> not found: <named>` form their DB
+/// instance siblings use for the same association calls.
 ///
 /// One fault, a wording per ROLE the cluster plays in the call (see
 /// [`db_cluster_not_found_message`] for a call that REPORTS the cluster or stops it,

@@ -280,6 +280,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // Amazon RDS is regional, and `SourceArn` is "the Amazon Resource Name (ARN) of the
+        // snapshot or cluster to export to Amazon S3": an ARN that names an exportable
+        // source whose Region segment is not the one this call was made in names a resource
+        // of another Region, which this endpoint exports nothing from. It is decided from
+        // the REQUEST alone, so it is answered before the key is asked about and before the
+        // source is looked for. A value that names no exportable source AT ALL is not this
+        // refusal whatever Region it carries: it stays on the unexportable-source path that
+        // resolving the source answers it with.
+        //
+        // It sits with the other checks that read the REQUEST only, above the store guard,
+        // because it needs neither this service's state nor another service's answer. The
+        // key check below needs one — KMS's — and an engine this service has no state in
+        // reaches no other service either, so that one stays under the guard.
+        if crate::state::export_source_of(&input.source_arn).is_some()
+            && crate::state::arn_region(&input.source_arn)
+                .is_some_and(|arn_region| !arn_region.is_empty() && arn_region != region)
+        {
+            return Err(StartExportTaskError::invalid_parameter_value(
+                crate::state::cross_region_export_source_message(&input.source_arn),
+            ));
+        }
+
         // No store means this service was mounted on an engine it has no state in, so it
         // cannot serve the operation at all; 501 is the honest answer, never an export
         // nothing started.
@@ -287,9 +309,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
         };
 
+        // "The ID of the Amazon Web Services KMS key to use to encrypt the data exported to
+        // Amazon S3": a key KMS holds nothing under, or one it holds disabled, cannot
+        // encrypt the export — the modelled `KMSKeyNotAccessibleFault`. The key is a
+        // parameter of the REQUEST, decided before anything the request NAMES is resolved,
+        // so an export that could not be encrypted is reported as the key fault it is rather
+        // than masked by a not-found of the source it would have read.
+        if crate::state::kms_key_is_inaccessible(ctx, &region, &input.kms_key_id).await {
+            return Err(StartExportTaskErrorModeled::KMSKeyNotAccessibleFault(
+                KMSKeyNotAccessibleFault {
+                    message: Some(crate::state::export_kms_key_not_accessible_message(
+                        &input.kms_key_id,
+                    )),
+                },
+            )
+            .into());
+        }
+
         // What is being exported, and the database the export reads: resolved under the
-        // lock, which is then released — the IAM, S3 and KMS answers below are other
-        // services' and cannot be asked while this service's store is held.
+        // lock, which is then released — the IAM and S3 answers below are other services'
+        // and cannot be asked while this service's store is held.
         let source = {
             let mut store = state.lock();
             // The transitions the clock already made due, so the export is judged against
@@ -343,20 +382,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 ));
             }
-        }
-
-        // "The ID of the Amazon Web Services KMS key to use to encrypt the data exported to
-        // Amazon S3": a key KMS holds nothing under, or one it holds disabled, cannot
-        // encrypt the export — the modelled `KMSKeyNotAccessibleFault`.
-        if crate::state::kms_key_is_inaccessible(ctx, &region, &input.kms_key_id).await {
-            return Err(StartExportTaskErrorModeled::KMSKeyNotAccessibleFault(
-                KMSKeyNotAccessibleFault {
-                    message: Some(crate::state::kms_key_not_accessible_message(
-                        &input.kms_key_id,
-                    )),
-                },
-            )
-            .into());
         }
 
         // "The provided IAM role must have access to the S3 bucket": a role the export
