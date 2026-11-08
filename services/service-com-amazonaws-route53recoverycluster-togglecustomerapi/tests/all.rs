@@ -19,5 +19,7 @@ mod control_plane_registry;
 mod routing_control_toggle;
 #[path = "all/safety_rule_enforcement.rs"]
 mod safety_rule_enforcement;
+#[path = "all/safety_rule_refusal_message.rs"]
+mod safety_rule_refusal_message;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

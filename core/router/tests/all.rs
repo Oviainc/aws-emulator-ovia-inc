@@ -1034,3 +1034,8 @@ mod zz_opensearch_fgac_probe;
 // the sorted list either.
 #[path = "all/all_rs_declares_each_suite_once.rs"]
 mod all_rs_declares_each_suite_once;
+// `cloudformation_wafv2_protection_stack` is NOT re-declared here: it is already declared in
+// the sorted head, and a second `mod` for the same file is a redefinition that stops this
+// target from compiling.
+// `bedrock_agentcore_data_plane_parent_resources` is NOT re-declared here either: it stands
+// in the sorted head, and one `mod` per file is what this target compiles with.

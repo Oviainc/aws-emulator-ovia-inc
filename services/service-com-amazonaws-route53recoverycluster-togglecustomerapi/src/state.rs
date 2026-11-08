@@ -325,7 +325,11 @@ impl DataPlane<'_> {
             if (would_be_on >= required_on) == rule.rule_config.inverted {
                 return Some(SafetyRuleViolation {
                     safety_rule_arn: rule.arn.clone(),
-                    message: safety_rule_violation_message(rule, would_be_on, evaluated.len()),
+                    message: safety_rule_violation_message(
+                        &rule_condition(required_on, rule.rule_config.inverted),
+                        proposed.iter().map(|(arn, _)| arn.as_str()),
+                        &rule.arn,
+                    ),
                 });
             }
         }
@@ -382,31 +386,46 @@ fn controls_required_on(config: &RuleConfig, evaluated: usize) -> Option<usize> 
     }
 }
 
+/// The condition a blocking safety rule imposes, in the words its `RuleConfig` reads as:
+/// the quoted clause of [`safety_rule_violation_message`].
+///
+/// `required_on` is how many of the controls the rule evaluates its configuration needs
+/// `On` ([`controls_required_on`]), so one clause covers every modelled `RuleType`: the
+/// `Threshold` of an `ATLEAST` rule, the number of controls of an `AND` rule and one for
+/// an `OR` rule, which the model defines as the same "at least N" with N fixed
+/// (`smithy_query(query="doc",shape="RuleType",model_path="services/service-com-amazonaws-route53recoverycontrolconfig-route53recoverycontrolconfig/smithy-model/com-amazonaws-route53recoverycontrolconfig-route53recoverycontrolconfig.json")`).
+/// `Inverted` is the logical negation of the rule ("if the rule would usually evaluate
+/// true, it's evaluated as false, and vice versa"), so it states the negated clause:
+/// fewer than N rather than at least N.
+fn rule_condition(required_on: usize, inverted: bool) -> String {
+    if inverted {
+        format!("Fewer than {required_on} routing controls must be On")
+    } else {
+        format!("At least {required_on} routing controls must be On")
+    }
+}
+
 /// The `ValidationException$Message` an update a safety rule refuses states.
 ///
-/// Names the rule that does not hold — its kind, its name and the ARN that overrides it —
-/// then the count of its controls that the transaction would leave `On` against the rule
-/// configuration that count has to satisfy. Every value comes from the stored rule and
-/// the proposed transaction.
-fn safety_rule_violation_message(
-    rule: &SafetyRuleRecord,
-    would_be_on: usize,
-    evaluated: usize,
+/// Route 53 ARC words this refusal as the condition that does not hold, quoted, then the
+/// remediation that gets the caller through it — the `AllowSafetyRulesOverride` guidance,
+/// which is what `SafetyRulesToOverride` on the request does — and then two labelled
+/// lines naming the routing controls the request asked to move and the rule that blocked
+/// it, so a caller can retry overriding exactly that rule. Everything outside those three
+/// slots is fixed text: the rule's name, how many of its controls are `On` and the raw
+/// `RuleConfig` members are not stated.
+fn safety_rule_violation_message<'a>(
+    condition: &str,
+    routing_control_arns: impl Iterator<Item = &'a str>,
+    safety_rule_arn: &str,
 ) -> String {
-    let (kind, controls) = match &rule.controls {
-        SafetyRuleControls::Assertion { .. } => ("assertion", "asserted"),
-        SafetyRuleControls::Gating { .. } => ("gating", "gating"),
-    };
+    let routing_controls: Vec<&str> = routing_control_arns.collect();
     format!(
-        "Routing control state update would violate the {kind} safety rule '{name}' ({arn}): \
-         {would_be_on} of its {evaluated} {controls} routing controls would be On, which does \
-         not satisfy its rule configuration (Type {rule_type}, Threshold {threshold}, Inverted \
-         {inverted}).",
-        name = rule.name,
-        arn = rule.arn,
-        rule_type = rule.rule_config.r#type,
-        threshold = rule.rule_config.threshold,
-        inverted = rule.rule_config.inverted,
+        "Can't update the routing control state because of a configured safety rule: \
+         \"{condition}.\" To override the rule and change the state, see the guidance for \
+         AllowSafetyRulesOverride in the Route 53 ARC Developer Guide. \nRouting control: \
+         [{controls}] \nSafety rule: {safety_rule_arn}",
+        controls = routing_controls.join(", "),
     )
 }
 
