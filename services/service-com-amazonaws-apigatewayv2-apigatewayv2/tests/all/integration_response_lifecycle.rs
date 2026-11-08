@@ -11,7 +11,7 @@
 //!   the request left out is reported as carrying nothing rather than as a value
 //!   invented for it.
 //! * An integration response's key identifies it WITHIN its integration: a second
-//!   create under the same key on the same integration is a 409, while the same key on
+//!   create under the same key on the same integration is a 400, while the same key on
 //!   another integration is a fresh integration response, and an id is only resolvable
 //!   through the integration that owns it.
 //! * An integration response is a WebSocket-only resource
@@ -38,6 +38,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::api_lifecycle::{as_str, assert_minted_id, call, emulator, error_code};
+use service_com_amazonaws_apigatewayv2_apigatewayv2::state::duplicate_identity::integration_response_key_in_use_message;
 
 /// The most integration responses one integration holds, after which a create is
 /// refused: the crate's own bound, so the test tracks it rather than restating a number.
@@ -391,13 +392,20 @@ async fn an_integration_response_belongs_to_the_one_integration_that_owns_it() {
     )
     .await;
     assert_eq!(
-        status, 409,
-        "expected 409 from a second integration response under one key, got {status} {conflict}"
+        status, 400,
+        "expected 400 from a second integration response under one key, got {status} \
+         {conflict}"
     );
     assert_eq!(
         error_code(&conflict),
-        "ConflictException",
-        "expected ConflictException, got {conflict}"
+        "BadRequestException",
+        "expected BadRequestException, got {conflict}"
+    );
+    assert_eq!(
+        as_str(&conflict, "message"),
+        integration_response_key_in_use_message("$default", &integration_id),
+        "expected the refusal to name the key and the integration it collided in, got \
+         {conflict}"
     );
 
     // Neither another integration of the same api nor another api resolves that id.

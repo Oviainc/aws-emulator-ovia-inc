@@ -270,7 +270,7 @@ async fn an_accepted_key_round_trips_through_the_integration_response_reader() {
     }
 
     // One key per integration: the second response under the same key would never be
-    // selected, so it is refused as a conflict rather than stored.
+    // selected, so the request is refused rather than stored.
     let (status, body) = call(
         &emulator,
         "POST",
@@ -279,8 +279,8 @@ async fn an_accepted_key_round_trips_through_the_integration_response_reader() {
     )
     .await;
     assert_eq!(
-        status, 409,
-        "expected 409 for a key the integration already holds, got {status} {body}"
+        status, 400,
+        "expected 400 for a key the integration already holds, got {status} {body}"
     );
 
     // The collection reader reports the keys each integration holds, and only its own.

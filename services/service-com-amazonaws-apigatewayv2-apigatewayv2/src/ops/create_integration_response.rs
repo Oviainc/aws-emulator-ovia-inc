@@ -260,21 +260,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The integration response key is what an integration response is SELECTED by
         // ("the result is compared against one or more selection keys to find a matching
         // key", `SelectionKey`), so one integration cannot carry two responses under one
-        // key.
+        // key. The refusal is this write's own (`BadRequestException`, 400) and its
+        // sentence names the key and the integration it collided in — see
+        // `crate::state::duplicate_identity`.
         if integration
             .integration_responses
             .values()
             .any(|response| response.integration_response_key == input.integration_response_key)
         {
-            return Err(CreateIntegrationResponseErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "Integration response with key {} already exists for this integration.",
-                        input.integration_response_key
-                    )),
-                },
-            )
-            .into());
+            return Err(bad_request(
+                &crate::state::duplicate_identity::integration_response_key_in_use_message(
+                    &input.integration_response_key,
+                    &input.integration_id,
+                ),
+            ));
         }
 
         // Bound the growth a caller drives: an integration holds at most

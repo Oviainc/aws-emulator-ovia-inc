@@ -141,7 +141,8 @@ fn rows() -> Vec<Row> {
                 "uri": "https://private.example.com",
                 "connectionType": "VPC_LINK"
             }),
-            reason: "ConnectionId is required for a connection of type VPC_LINK.".to_string(),
+            reason: "ConnectionId must be set to vpcLinkId for ConnectionType VPC_LINK"
+                .to_string(),
         },
         Row {
             case: "a timeout past the modelled range",

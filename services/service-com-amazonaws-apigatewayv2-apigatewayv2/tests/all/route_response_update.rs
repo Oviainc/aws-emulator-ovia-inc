@@ -12,7 +12,7 @@
 //! * What the update answers is what the store holds: a later `GetRouteResponse` reports
 //!   the same record, member for member.
 //! * A route response's key identifies it WITHIN its route, so an update cannot move a
-//!   response onto a key a sibling response of the same route already holds (409), while
+//!   response onto a key a sibling response of the same route already holds (400), while
 //!   re-sending its own key is accepted.
 //! * A route response is addressed only through the api and the route that own it: an
 //!   unknown api, route or route-response id is a 404 and writes nothing.
@@ -29,6 +29,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::api_lifecycle::{as_str, call, carries_nothing, emulator, error_code};
+use service_com_amazonaws_apigatewayv2_apigatewayv2::state::duplicate_identity::route_response_key_in_use_message;
 
 /// The route response every row starts from: every member the resource carries is set,
 /// so a row that omits one proves preservation rather than absence.
@@ -349,13 +350,18 @@ async fn update_route_response_cannot_take_a_key_a_sibling_response_holds() {
         )
         .await;
         assert_eq!(
-            status, 409,
-            "case {case:?}: expected 409 from UpdateRouteResponse, got {status} {body}"
+            status, 400,
+            "case {case:?}: expected 400 from UpdateRouteResponse, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
-            "ConflictException",
-            "case {case:?}: expected ConflictException, got {body}"
+            "BadRequestException",
+            "case {case:?}: expected BadRequestException, got {body}"
+        );
+        assert_eq!(
+            as_str(&body, "message"),
+            route_response_key_in_use_message(key),
+            "case {case:?}: expected the refusal to name the key that collided, got {body}"
         );
         let after = call(&emulator, "GET", &uri, None).await.1;
         assert_eq!(

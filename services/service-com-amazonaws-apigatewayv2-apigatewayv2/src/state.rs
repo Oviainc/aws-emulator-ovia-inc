@@ -23,6 +23,7 @@
 //! service that owns them in [`ec2_subnets`].
 
 pub mod authorizer_cache;
+pub mod duplicate_identity;
 pub mod ec2_subnets;
 pub mod integration_response_key;
 mod network;
@@ -2148,7 +2149,7 @@ pub fn validate_integration(
     )?;
     if connection_type == VPC_LINK_CONNECTION_TYPE && connection_id.is_none_or(str::is_empty) {
         return Err(format!(
-            "ConnectionId is required for a connection of type {VPC_LINK_CONNECTION_TYPE}."
+            "ConnectionId must be set to vpcLinkId for ConnectionType {VPC_LINK_CONNECTION_TYPE}"
         ));
     }
     if let Some(expression) = template_selection_expression {

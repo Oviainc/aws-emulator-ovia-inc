@@ -249,17 +249,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // A route key identifies the route within its api, so one api cannot carry two
-        // routes with the same key.
+        // routes with the same key. The sentence is the one every writer of a route key
+        // shares (`crate::state::duplicate_identity`).
         if api
             .routes
             .values()
             .any(|route| route.route_key == input.route_key)
         {
             return Err(CreateRouteErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Route with key {} already exists for this API",
-                    input.route_key
-                )),
+                message: Some(
+                    crate::state::duplicate_identity::route_key_in_use_message(
+                        &input.route_key,
+                    ),
+                ),
             })
             .into());
         }

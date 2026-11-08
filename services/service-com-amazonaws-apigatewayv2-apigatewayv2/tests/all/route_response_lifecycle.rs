@@ -10,7 +10,7 @@
 //!   through the store, and a member the request left out is reported as carrying
 //!   nothing rather than as a value invented for it.
 //! * A route response's key identifies it WITHIN its route: a second create under the
-//!   same key on the same route is a 409, while the same key on another route is a fresh
+//!   same key on the same route is a 400, while the same key on another route is a fresh
 //!   route response, and an id is only resolvable through the route that owns it.
 //! * A route response is a WebSocket-only resource
 //!   (`RouteResponse$ModelSelectionExpression`: "Supported only for WebSocket APIs"), so
@@ -30,6 +30,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::api_lifecycle::{as_str, assert_minted_id, call, carries_nothing, emulator, error_code};
+use service_com_amazonaws_apigatewayv2_apigatewayv2::state::duplicate_identity::route_response_key_in_use_message;
 
 /// The most route responses one route holds, after which a create is refused: the
 /// crate's own bound, so the test tracks it rather than restating a number.
@@ -275,13 +276,18 @@ async fn a_route_response_belongs_to_the_one_route_that_owns_it() {
     )
     .await;
     assert_eq!(
-        status, 409,
-        "expected 409 from a second route response under one key, got {status} {conflict}"
+        status, 400,
+        "expected 400 from a second route response under one key, got {status} {conflict}"
     );
     assert_eq!(
         error_code(&conflict),
-        "ConflictException",
-        "expected ConflictException, got {conflict}"
+        "BadRequestException",
+        "expected BadRequestException, got {conflict}"
+    );
+    assert_eq!(
+        as_str(&conflict, "message"),
+        route_response_key_in_use_message("$default"),
+        "expected the refusal to name the key that collided, got {conflict}"
     );
 
     // Neither another route of the same api nor another api resolves that id.

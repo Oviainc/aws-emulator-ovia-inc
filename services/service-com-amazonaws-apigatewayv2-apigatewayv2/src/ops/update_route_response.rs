@@ -236,19 +236,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // cannot carry two responses under one key: an update cannot move a response onto
         // a key a SIBLING response of the same route already holds. The response being
         // updated is excluded, so re-sending its own key is not a conflict with itself.
+        // The refusal is the one the create answers, through the one sentence both share
+        // (`crate::state::duplicate_identity`).
         if route.route_responses.iter().any(|(id, response)| {
             id != &input.route_response_id
                 && response.route_response_key == updated.route_response_key
         }) {
-            return Err(UpdateRouteResponseErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "Route response with key {} already exists for this route.",
-                        updated.route_response_key
-                    )),
-                },
-            )
-            .into());
+            return Err(bad_request(
+                &crate::state::duplicate_identity::route_response_key_in_use_message(
+                    &updated.route_response_key,
+                ),
+            ));
         }
 
         // Read the response back out of the STORE, so what the caller gets is what a

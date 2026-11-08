@@ -181,6 +181,8 @@ mod protocol_type_gating;
 mod quick_create_is_http_only;
 #[path = "all/quick_create_servable_set.rs"]
 mod quick_create_servable_set;
+#[path = "all/refusal_class_fidelity.rs"]
+mod refusal_class_fidelity;
 #[path = "all/refusal_message_text.rs"]
 mod refusal_message_text;
 #[path = "all/refusal_resource_identity.rs"]

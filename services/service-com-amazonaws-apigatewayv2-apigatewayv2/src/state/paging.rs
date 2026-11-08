@@ -24,9 +24,14 @@ pub const MAX_PAGE_SIZE: usize = 100;
 /// Resolve a `MaxResults` query value into the page size to serve.
 ///
 /// `MaxResults` is modelled as `__string` on these operations, so the numeric rule is
-/// the handler's to enforce: a positive decimal integer. The result is clamped to
-/// [`MAX_PAGE_SIZE`], which is also the page size an absent `MaxResults` gets, so the
-/// page size is always bounded server-side rather than by what the caller asked for.
+/// the handler's to enforce: a positive decimal integer. A value that is not one is
+/// refused with [`MAX_RESULTS_NOT_AN_INTEGER_MESSAGE`] rather than paged on a guess —
+/// the sentence API Gateway answers a `maxResults` it cannot read a number out of, which
+/// a value that reads as a number but names no page size (zero, a negative) takes too,
+/// since the service words one refusal for the member and none of this service's
+/// recordings shows a second. What is accepted is clamped to [`MAX_PAGE_SIZE`], which is
+/// also the page size an absent `MaxResults` gets, so the page size is always bounded
+/// server-side rather than by what the caller asked for.
 /// TOTAL over its input — every other string, however long or malformed, answers `Err`,
 /// which carries the message for the operation's `BadRequestException`.
 pub fn parse_max_results(raw: Option<&str>) -> Result<usize, String> {
@@ -35,11 +40,19 @@ pub fn parse_max_results(raw: Option<&str>) -> Result<usize, String> {
     };
     match raw.parse::<i64>() {
         Ok(n) if n >= 1 => Ok(usize::try_from(n).unwrap_or(MAX_PAGE_SIZE).min(MAX_PAGE_SIZE)),
-        _ => Err(format!(
-            "Invalid value for MaxResults: '{raw}'. MaxResults must be a positive integer."
-        )),
+        _ => Err(MAX_RESULTS_NOT_AN_INTEGER_MESSAGE.to_string()),
     }
 }
+
+/// The sentence a paginated reader refuses a `MaxResults` that is no page size it can
+/// read with.
+///
+/// Fixed text: it does NOT echo the value the request sent, so the refusal a caller sees
+/// does not vary with what it asked for, and a client matching on the sentence matches
+/// every one of them. Held here once, so every collection reader of this service — each
+/// of which resolves its page size through [`parse_max_results`] — refuses the same
+/// value the same way.
+pub const MAX_RESULTS_NOT_AN_INTEGER_MESSAGE: &str = "maxResults must be an integer.";
 
 /// Resolve a modelled-integer `MaxResults` into the page size to serve.
 ///
@@ -263,7 +276,8 @@ pub fn page<'a, V>(
 mod tests {
     use super::{
         first_page_token, page, page_in_creation_order, page_position, page_scope,
-        parse_max_results, resolve_max_results, token_is_for_scope, CreatedInOrder, MAX_PAGE_SIZE,
+        parse_max_results, resolve_max_results, token_is_for_scope, CreatedInOrder,
+        MAX_PAGE_SIZE, MAX_RESULTS_NOT_AN_INTEGER_MESSAGE,
     };
     use std::collections::BTreeMap;
 
@@ -434,7 +448,8 @@ mod tests {
     #[test]
     fn a_max_results_that_is_no_positive_integer_is_refused_rather_than_interpreted() {
         // The rows span the forms a caller can send: zero, negatives, other notations,
-        // a number past `i64`, text, padding, emptiness and non-ASCII digits.
+        // a number past `i64`, text, padding, emptiness and non-ASCII digits. Every one
+        // takes the SAME sentence, which echoes none of them back.
         let rows = [
             "0",
             "-1",
@@ -451,9 +466,11 @@ mod tests {
         ];
         for raw in rows {
             let resolved = parse_max_results(Some(raw));
-            assert!(
-                resolved.is_err(),
-                "case {raw:?}: expected a refusal, got {resolved:?}"
+            assert_eq!(
+                resolved,
+                Err(MAX_RESULTS_NOT_AN_INTEGER_MESSAGE.to_string()),
+                "case {raw:?}: expected the refusal of a value that is no page size, got \
+                 {resolved:?}"
             );
         }
     }

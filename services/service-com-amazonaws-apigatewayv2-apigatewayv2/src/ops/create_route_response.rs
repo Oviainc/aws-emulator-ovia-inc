@@ -198,21 +198,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The route response key is what a route response is SELECTED by ("the result
         // is compared against one or more selection keys to find a matching key",
-        // `SelectionKey`), so one route cannot carry two responses under one key.
+        // `SelectionKey`), so one route cannot carry two responses under one key. The
+        // refusal is this write's own (`BadRequestException`, 400) and its sentence is
+        // the one every writer of a route response key shares — see
+        // `crate::state::duplicate_identity`.
         if route
             .route_responses
             .values()
             .any(|response| response.route_response_key == input.route_response_key)
         {
-            return Err(CreateRouteResponseErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "Route response with key {} already exists for this route.",
-                        input.route_response_key
-                    )),
-                },
-            )
-            .into());
+            return Err(bad_request(
+                &crate::state::duplicate_identity::route_response_key_in_use_message(
+                    &input.route_response_key,
+                ),
+            ));
         }
 
         // Bound the growth a caller drives: a route holds at most

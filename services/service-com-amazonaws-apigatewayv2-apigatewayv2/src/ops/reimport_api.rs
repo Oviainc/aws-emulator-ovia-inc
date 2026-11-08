@@ -195,9 +195,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // The definition is read and bounded BEFORE the store lock is taken, so a body
-        // this operation cannot read never reaches the api's records at all — and the api
-        // it names is left exactly as it was.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("ReimportApi"));
+        };
+
+        // The api this PUT is addressed to is resolved FIRST, before a single member of
+        // the request is read: an `ApiId` that names no api is what the call could not
+        // resolve, whatever the body then turns out to say, so a caller whose
+        // create-if-missing logic keys on the 404 sees it. An api the store does not hold
+        // — one never created, or one a DeleteApi removed — is "the resource specified in
+        // the request was not found". The lock is held only for the lookup, so reading
+        // the body below costs no other caller of this service any latency.
+        let protocol_type = {
+            let store = state.lock();
+            let Some(existing) = store.apis.get(&input.api_id) else {
+                return Err(not_found(&input.api_id));
+            };
+            existing.protocol_type.clone()
+        };
+
+        // "The OpenAPI definition. Supported only for HTTP APIs" (`ReimportApi$Body`): a
+        // definition describes routes, integrations and a CORS configuration an api of the
+        // other protocol type has no behaviour for, so it is refused rather than written.
+        // The gate is the one every writer of a protocol-restricted member shares.
+        if let Err(message) = crate::state::validate_protocol_restricted_members(
+            &protocol_type,
+            &[crate::state::ProtocolRestrictedMember::http_only("Body", true)],
+        ) {
+            return Err(bad_request(message));
+        }
+
+        // The definition is read and bounded BEFORE anything is written, so a body this
+        // operation cannot read never reaches the api's records at all — and the api it
+        // names is left exactly as it was.
         let basepath =
             super::import_api::base_path_mode(input.basepath.as_deref()).map_err(bad_request)?;
         let definition =
@@ -212,33 +243,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            // Unreachable in the assembled emulator — see the note in `create_api`.
-            return Err(crate::scaffolded::Scaffolded::not_implemented("ReimportApi"));
-        };
-        let mut store = state.lock();
-
-        // An api the store does not hold — one never created, or one a DeleteApi removed
-        // — is "the resource specified in the request was not found".
-        let Some(existing) = store.apis.get_mut(&input.api_id) else {
-            return Err(ReimportApiErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::state::invalid_api_identifier_message(&input.api_id)),
-                resource_type: ::std::option::Option::None,
-            })
-            .into());
-        };
-
-        // "The OpenAPI definition. Supported only for HTTP APIs" (`ReimportApi$Body`): a
-        // definition describes routes, integrations and a CORS configuration an api of the
-        // other protocol type has no behaviour for, so it is refused rather than written.
-        // The gate is the one every writer of a protocol-restricted member shares.
-        if let Err(message) = crate::state::validate_protocol_restricted_members(
-            &existing.protocol_type,
-            &[crate::state::ProtocolRestrictedMember::http_only("Body", true)],
-        ) {
-            return Err(bad_request(message));
-        }
-
         // The same per-api quotas the import enforces, through the ONE check they share
         // (`super::import_api::definition_quota_exceeded`), checked against what the WHOLE
         // definition asks for before any of it is written: a reimport is one call, so it
@@ -248,6 +252,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(too_many_requests(limit_type, message));
         }
+
+        // The write takes the lock again and resolves the api once more: a `DeleteApi`
+        // that landed while the body was being read leaves nothing to put this definition
+        // over, and such a request is answered the way any other unresolved `ApiId` is.
+        let mut store = state.lock();
+        let Some(existing) = store.apis.get_mut(&input.api_id) else {
+            return Err(not_found(&input.api_id));
+        };
 
         // PUT, not PATCH: what a definition describes is REPLACED by what this one
         // describes, so a member the new document leaves out is left out of the api too —
@@ -302,6 +314,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 fn bad_request(message: String) -> ReimportApiError {
     ReimportApiErrorModeled::BadRequestException(BadRequestException {
         message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's refusal of an `ApiId` the account holds no api under: the modelled
+/// `NotFoundException` ("the resource specified in the request was not found"), worded the
+/// way every operation of this service reports an unresolved api
+/// ([`crate::state::invalid_api_identifier_message`]).
+///
+/// Answered for the lookup this PUT makes BEFORE it reads the body, and for the one it
+/// makes again before it writes, so both report the same unresolved identifier.
+fn not_found(api_id: &str) -> ReimportApiError {
+    ReimportApiErrorModeled::NotFoundException(NotFoundException {
+        message: Some(crate::state::invalid_api_identifier_message(api_id)),
+        resource_type: ::std::option::Option::None,
     })
     .into()
 }

@@ -317,10 +317,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .any(|(route_id, route)| route_id != &input.route_id && route.route_key == updated.route_key)
         {
             return Err(UpdateRouteErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Route with key {} already exists for this API",
-                    updated.route_key
-                )),
+                message: Some(
+                    crate::state::duplicate_identity::route_key_in_use_message(
+                        &updated.route_key,
+                    ),
+                ),
             })
             .into());
         }

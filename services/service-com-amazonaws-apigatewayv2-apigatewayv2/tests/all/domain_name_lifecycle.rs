@@ -38,6 +38,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_apigatewayv2_apigatewayv2::ops::types::{
     DOMAIN_NAME_STATUS_VALUES, ROUTING_MODE_VALUES,
 };
+use service_com_amazonaws_apigatewayv2_apigatewayv2::state::duplicate_identity::DOMAIN_NAME_ALREADY_EXISTS_MESSAGE;
 use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
     API_MAPPING_SELECTION_EXPRESSION, DEFAULT_ENDPOINT_TYPE, DEFAULT_IP_ADDRESS_TYPE,
     DEFAULT_ROUTING_MODE, DEFAULT_SECURITY_POLICY, DOMAIN_NAME_MAX_LENGTH, DOMAIN_NAME_MIGRATION,
@@ -696,7 +697,7 @@ async fn an_absent_domain_name_is_not_found() {
 }
 
 #[tokio::test]
-async fn a_name_the_account_already_holds_is_a_conflict() {
+async fn a_name_the_account_already_holds_is_refused() {
     let emulator = emulator();
     // The rows vary what the second create asks for: the same request, an entry naming
     // nothing itself, a different configuration, and different tags. None of them may
@@ -729,13 +730,19 @@ async fn a_name_the_account_already_holds_is_a_conflict() {
         }
         let (status, body) = create_domain_name(&emulator, &request).await;
         assert_eq!(
-            status, 409,
-            "case {label:?}: expected 409 from a second CreateDomainName, got {status} {body}"
+            status, 400,
+            "case {label:?}: expected 400 from a second CreateDomainName, got {status} {body}"
         );
         assert_eq!(
             error_code(&body),
-            "ConflictException",
-            "case {label:?}: expected ConflictException, got {body}"
+            "BadRequestException",
+            "case {label:?}: expected BadRequestException, got {body}"
+        );
+        assert_eq!(
+            as_str(&body, "message"),
+            DOMAIN_NAME_ALREADY_EXISTS_MESSAGE,
+            "case {label:?}: expected the refusal {DOMAIN_NAME_ALREADY_EXISTS_MESSAGE:?}, \
+             got {body}"
         );
 
         let (_, read) = get_domain_name(&emulator, domain).await;

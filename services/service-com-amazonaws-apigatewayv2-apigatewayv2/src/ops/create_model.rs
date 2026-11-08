@@ -201,12 +201,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // A model is referred to by NAME from a route's `RequestModels`/`ResponseModels`
         // and from a mapping template, so one api cannot carry two models of one name.
+        // The sentence is API Gateway's for this kind of resource — fixed text, naming
+        // neither the name nor the api — see `crate::state::duplicate_identity`.
         if api.models.values().any(|model| model.name == input.name) {
             return Err(CreateModelErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "Model with name {} already exists for this API.",
-                    input.name
-                )),
+                message: Some(
+                    crate::state::duplicate_identity::MODEL_NAME_ALREADY_EXISTS_MESSAGE
+                        .to_string(),
+                ),
             })
             .into());
         }

@@ -209,16 +209,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // The name identifies the resource, so a second create under a name the account
         // already holds would have to replace a domain name a caller can still reach.
+        // The refusal is this write's own (`BadRequestException`, 400) and its sentence
+        // is API Gateway's for this kind of resource — see
+        // `crate::state::duplicate_identity`.
         if store.domain_names.contains_key(&input.domain_name) {
-            return Err(CreateDomainNameErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "The domain name {} already exists.",
-                        input.domain_name
-                    )),
-                },
-            )
-            .into());
+            return Err(bad_request(
+                crate::state::duplicate_identity::DOMAIN_NAME_ALREADY_EXISTS_MESSAGE,
+            ));
         }
 
         // Bound the growth a caller drives: AWS's published quota is 120 custom domain

@@ -42,6 +42,7 @@ use service_com_amazonaws_apigatewayv2_apigatewayv2::state::{
     INTEGRATION_RESOURCE, INVALID_NEXT_TOKEN_MESSAGE, MAX_PAGE_SIZE, ROUTE_RESOURCE,
     ROUTE_RESPONSE_NOT_FOUND_MESSAGE, STAGE_RESOURCE, VPC_LINK_RESOURCE,
 };
+use service_com_amazonaws_apigatewayv2_apigatewayv2::state::paging::MAX_RESULTS_NOT_AN_INTEGER_MESSAGE;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::api_lifecycle::{as_str, assert_minted_id, call, emulator, error_code};
@@ -51,9 +52,9 @@ use crate::api_lifecycle::{as_str, assert_minted_id, call, emulator, error_code}
 const STAGE_NAME: &str = "prod";
 
 /// The sentence a paginated reader refuses a `MaxResults` that is no positive integer
-/// with. Built from the request, so it quotes the value the caller sent back at it.
-fn max_results_refusal(raw: &str) -> String {
-    format!("Invalid value for MaxResults: '{raw}'. MaxResults must be a positive integer.")
+/// with: fixed text, which echoes back none of the value the caller sent.
+fn max_results_refusal() -> String {
+    MAX_RESULTS_NOT_AN_INTEGER_MESSAGE.to_string()
 }
 
 /// Identifiers nothing minted, spanning the forms a client can send: an eleven-character
@@ -726,13 +727,13 @@ async fn the_route_response_list_reports_the_routes_responses_and_names_what_it_
     // the rows span the forms neither input takes, and every one is a 400 that leaves
     // the collection readable afterwards.
     let mut hostile: Vec<(String, String)> = vec![
-        ("maxResults=0".to_string(), max_results_refusal("0")),
-        ("maxResults=-1".to_string(), max_results_refusal("-1")),
-        ("maxResults=1.5".to_string(), max_results_refusal("1.5")),
-        ("maxResults=abc".to_string(), max_results_refusal("abc")),
+        ("maxResults=0".to_string(), max_results_refusal()),
+        ("maxResults=-1".to_string(), max_results_refusal()),
+        ("maxResults=1.5".to_string(), max_results_refusal()),
+        ("maxResults=abc".to_string(), max_results_refusal()),
         (
             format!("maxResults={}", "9".repeat(40)),
-            max_results_refusal(&"9".repeat(40)),
+            max_results_refusal(),
         ),
         (
             "nextToken=not-a-token".to_string(),

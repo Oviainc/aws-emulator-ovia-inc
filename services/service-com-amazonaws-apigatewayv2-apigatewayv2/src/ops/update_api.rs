@@ -411,9 +411,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .any(|(id, route)| id != &route_id && route.route_key == route_key)
             {
                 return Err(UpdateApiErrorModeled::ConflictException(ConflictException {
-                    message: Some(format!(
-                        "Route with key {route_key} already exists for this API"
-                    )),
+                    message: Some(
+                        crate::state::duplicate_identity::route_key_in_use_message(&route_key),
+                    ),
                 })
                 .into());
             }
