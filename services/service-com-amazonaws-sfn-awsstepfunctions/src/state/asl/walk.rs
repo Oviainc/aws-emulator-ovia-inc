@@ -421,12 +421,17 @@ impl Interpreter<'_> {
                 let chosen = self
                     .choose(state, language, &effective, &context)
                     .map_err(|failure| failure.at(at))?;
-                // "Output ... you can also specify Output in a Choice rule": the rule
-                // that MATCHED decides the state's output where it declares one, and
-                // the state's own `Output` otherwise.
-                let value = match chosen.output {
-                    Some(value) => value,
-                    None => self
+                // "Output ... you can also specify Output in a Choice rule", and the
+                // same for `Assign`: a JSONata `Choice` puts out what the SELECTED
+                // rule's own members decided, and what the state's own decided only
+                // where no rule matched ([`Interpreter::choice_output`]). A JSONPath
+                // rule carries neither, so that language's state puts out what every
+                // other state does.
+                let value = match language {
+                    JSONATA => self
+                        .choice_output(state, chosen.rule.as_ref(), &effective, &context)
+                        .map_err(|failure| failure.at(at))?,
+                    _ => self
                         .produced(state, language, &raw, &effective, None, &context, false)
                         .map_err(|failure| failure.at(at))?,
                 };
@@ -538,9 +543,13 @@ impl Interpreter<'_> {
     ///
     /// "Assign ... store values in variables": the assignments are evaluated FIRST,
     /// so a variable this state assigns is in scope for its own `Output`, and they
-    /// outlive the state — which is what a later state reads them through. A state
-    /// that declares no `Output` puts out what its work produced, and its own input
-    /// where its work produced nothing.
+    /// outlive the state — which is what a later state reads them through.
+    ///
+    /// A node that declares no `Output` puts out what the state's own data flow owes
+    /// at that point: "when a state reports an error and it matches a catcher, the
+    /// state's output is the error output", so a CATCHER that declares none puts out
+    /// the error output it was handed; a state whose work produced a result puts out
+    /// that result; and a state whose work produced none carries its own input through.
     ///
     /// A state that FAILS assigns nothing: where the `Output` those assignments feed
     /// cannot be built, the scope is put back as the state found it, so the states
@@ -562,7 +571,10 @@ impl Interpreter<'_> {
         let produced = self
             .jsonata_assign(state, input, result, error_output, context, &mut budget)
             .and_then(|()| match state.get("Output") {
-                None => Ok(result.cloned().unwrap_or_else(|| input.clone())),
+                None => Ok(error_output
+                    .or(result)
+                    .cloned()
+                    .unwrap_or_else(|| input.clone())),
                 Some(template) => {
                     let rendered = {
                         let bindings = self.bindings(input, context, result, error_output);
@@ -1315,9 +1327,10 @@ impl Interpreter<'_> {
     ///
     /// Each rule is tested in the language the state is written in: a `Variable` and
     /// one of the comparators in JSONPath, a boolean `Condition` expression in
-    /// JSONata. A JSONata rule may also carry an `Assign` and an `Output` of its own,
-    /// which are the matching rule's — so they are applied here, where the rule that
-    /// matched is known.
+    /// JSONata. The FIRST rule whose test holds wins, even where a later one's holds
+    /// too, and the rule that won is answered beside its `Next` — a JSONata rule's
+    /// own `Assign` and `Output` are the state's, and are applied where the state's
+    /// own are ([`Interpreter::choice_output`]) rather than before them.
     pub(super) fn choose(
         &mut self,
         state: &Map<String, Value>,
@@ -1372,35 +1385,20 @@ impl Interpreter<'_> {
             let next = rule.get("Next").and_then(Value::as_str).ok_or_else(|| {
                 runtime("a top-level choice rule must carry a string 'Next'".to_string())
             })?;
-            // The rule that matched is the one whose own `Assign` and `Output` apply;
-            // a JSONPath rule carries neither. Both spend from one allowance, as a
-            // state's own `Assign` and `Output` do.
-            let output = match language {
-                JSONATA => {
-                    let mut budget = self.jsonata_budget();
-                    self.jsonata_assign(rule, input, None, None, context, &mut budget)?;
-                    match rule.get("Output") {
-                        Some(template) => {
-                            let bindings = self.bindings(input, context, None, None);
-                            Some(
-                                super::super::jsonata::render(template, &bindings, &mut budget)
-                                    .map_err(jsonata_failure)?,
-                            )
-                        }
-                        None => None,
-                    }
-                }
-                _ => None,
-            };
             return Ok(Chosen {
                 next: next.to_string(),
-                output,
+                // The rule that matched is the one whose own `Assign` and `Output`
+                // apply; a JSONPath rule carries neither.
+                rule: match language {
+                    JSONATA => Some(rule.clone()),
+                    _ => None,
+                },
             });
         }
         match state.get("Default").and_then(Value::as_str) {
             Some(default) => Ok(Chosen {
                 next: default.to_string(),
-                output: None,
+                rule: None,
             }),
             // A `Choice` that no rule matched and that declares no `Default` decided
             // no next state, so the execution ends AT it — under the name the
@@ -1410,6 +1408,67 @@ impl Interpreter<'_> {
             // names itself around it, so the cause carries the stuck state and the
             // event it was entered at.
             None => Err(runtime(NO_NEXT_STATE.to_string())),
+        }
+    }
+
+    /// What a JSONata `Choice` state PUTS OUT, given the rule that was selected.
+    ///
+    /// "You can use Assign in a Choice rule": the assignments a `Choice` makes are the
+    /// SELECTED rule's. RECORDED: a rule matching is what decides it, so the
+    /// state-level `Assign` is applied only where NO rule matched and the `Default`
+    /// was taken — a matched rule that declares none assigns nothing, rather than
+    /// falling back on the state's.
+    ///
+    /// The `Output` those assignments feed is the selected rule's where it declares
+    /// one and the state's otherwise, and a state and rule that declare neither put
+    /// the state's own input through.
+    ///
+    /// As everywhere else, a state whose output cannot be BUILT assigns nothing: the
+    /// scope is put back as the state found it.
+    pub(super) fn choice_output(
+        &mut self,
+        state: &Map<String, Value>,
+        rule: Option<&Map<String, Value>>,
+        input: &Value,
+        context: &Value,
+    ) -> Result<Value, Failure> {
+        let scope = self.variables.clone();
+        let assigned = self.assigned.clone();
+        let produced = self.choice_assign_and_output(state, rule, input, context);
+        if produced.is_err() {
+            self.variables = scope;
+            self.assigned = assigned;
+        }
+        produced
+    }
+
+    /// [`Interpreter::choice_output`] without the roll-back, which that one adds.
+    fn choice_assign_and_output(
+        &mut self,
+        state: &Map<String, Value>,
+        rule: Option<&Map<String, Value>>,
+        input: &Value,
+        context: &Value,
+    ) -> Result<Value, Failure> {
+        // ONE allowance for the `Assign` that applies and the `Output` it feeds: they
+        // are the expressions of one visit to this state.
+        let mut budget = self.jsonata_budget();
+        // The `Assign` of whichever decided the transition: the rule that matched, or
+        // the state itself where none did.
+        self.jsonata_assign(rule.unwrap_or(state), input, None, None, context, &mut budget)?;
+        let template = rule
+            .and_then(|rule| rule.get("Output"))
+            .or_else(|| state.get("Output"))
+            .cloned();
+        match template {
+            None => Ok(input.clone()),
+            Some(template) => {
+                let rendered = {
+                    let bindings = self.bindings(input, context, None, None);
+                    super::super::jsonata::render(&template, &bindings, &mut budget)
+                };
+                rendered.map_err(jsonata_failure)
+            }
         }
     }
 

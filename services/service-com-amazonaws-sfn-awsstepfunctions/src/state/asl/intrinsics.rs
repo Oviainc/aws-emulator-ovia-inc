@@ -284,10 +284,8 @@ pub(super) fn apply_intrinsic(
             }
             Ok(Value::String(rendered))
         }
-        "States.StringToJson" => {
-            let text = string(0)?;
-            serde_json::from_str(&text).map_err(|error| format!("{text:?} is not JSON: {error}"))
-        }
+        "States.StringToJson" => serde_json::from_str(&string(0)?)
+            .map_err(|error| format!("the argument is not JSON: {error}")),
         "States.JsonToString" => Ok(Value::String(argument(0)?.to_string())),
         "States.Array" => Ok(Value::Array(arguments.to_vec())),
         "States.ArrayPartition" => {

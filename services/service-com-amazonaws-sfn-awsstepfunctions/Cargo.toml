@@ -31,7 +31,10 @@ aws-smithy-types = { workspace = true }
 tokio = { workspace = true, features = ["sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
-serde_json = { workspace = true }
+# `raw_value`: a document the DEFINITION writes is reported in the text it was written
+# as, so the walk keeps each sub-document's own bytes rather than re-encoding a parsed
+# copy (`state::asl::echo`).
+serde_json = { workspace = true, features = ["raw_value"] }
 # Percent-encodes the fields of the form an `awsQuery` service's request IS, over the
 # unreserved set AWS's own canonical request states.
 percent-encoding = "2"

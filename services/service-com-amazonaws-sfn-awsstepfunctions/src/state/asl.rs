@@ -155,12 +155,15 @@ use serde_json_path::JsonPath;
 use super::integration::{Failed, Tasks, TASK_FAILED_ERROR};
 
 mod diagnose;
+mod echo;
 mod intrinsics;
 mod walk;
 pub use diagnose::*;
-// The intrinsic-function evaluator is this module's own: `intrinsics` holds the parser
-// and the functions, and the names stay reachable unqualified from here and from the
-// walk, as they were when they lived in this file.
+// How a document a walk reports is ENCODED, and the intrinsic-function evaluator, are
+// this module's own: each holds one concern in its own file, and the names stay
+// reachable unqualified from here and from the walk, as they were when they lived in
+// this file.
+use echo::*;
 use intrinsics::*;
 
 /// The ASL predefined error name for a failure the interpreter itself raises
@@ -1438,11 +1441,15 @@ struct StateStep {
     next: Next,
 }
 
-/// What a `Choice` state decided: the state it transitions to, and the output the
-/// rule that matched declared, for a JSONata rule that declares one.
+/// What a `Choice` state decided: the state it transitions to, and the rule that
+/// decided it.
 struct Chosen {
     next: String,
-    output: Option<Value>,
+    /// The rule that MATCHED, for a JSONata `Choice`: its own `Assign` and `Output`
+    /// are the state's, applied over the state's own ([`Interpreter::choice_output`]).
+    /// `None` where the `Default` was taken, and for a JSONPath rule, which carries
+    /// neither.
+    rule: Option<Map<String, Value>>,
 }
 
 /// Where the walk goes after a state.
@@ -2270,12 +2277,13 @@ fn interpret(
         ),
     };
 
-    // The document the CALLER supplied to this walk, as they wrote it: what every
-    // payload this walk reports is echoed from ([`echoed_payload`]).
-    let supplied = Supplied {
-        value: input_value.clone(),
-        text: input.to_string(),
-    };
+    // The documents this walk was GIVEN as text, each with the bytes it is reported
+    // in: the caller's own input, and every document the definition itself writes
+    // ([`Supplied`]). The input is remembered LAST, so a document the caller sent and
+    // the definition also writes is reported in the caller's own bytes.
+    let mut supplied = Supplied::default();
+    supplied.definition(definition, 0);
+    supplied.supplied(input);
     let mut interpreter = Interpreter {
         budget: MAX_STATE_TRANSITIONS,
         depth: 0,
@@ -2845,35 +2853,9 @@ struct Interpreter<'tasks> {
     /// the member reports — so it is written by that state's `Assign` and taken by the
     /// event the state is left by ([`Interpreter::push_exited`]).
     assigned: BTreeMap<String, String>,
-    /// The document the CALLER supplied, with the bytes they wrote it as: what
-    /// [`Interpreter::echo`] echoes instead of re-encoding.
+    /// The documents this walk was GIVEN as text, with the bytes each is reported in:
+    /// what [`Interpreter::echo`] answers instead of re-encoding a parsed copy.
     supplied: Supplied,
-}
-
-/// A document a CALLER supplied, as they wrote it: the parsed value, beside the
-/// exact bytes they sent.
-///
-/// A JSON document has many encodings, so a value this service reports BACK to the
-/// caller is reported in the caller's own bytes rather than in a re-encoding of a
-/// parsed copy.
-#[derive(Clone)]
-struct Supplied {
-    value: Value,
-    text: String,
-}
-
-/// `value` as this service REPORTS it: the caller's own bytes when the document is
-/// the one they supplied — their whitespace and member order included — and the
-/// encoding the walk produced it in otherwise.
-///
-/// The ONE implementation of that rule, so every document this module reports
-/// follows it: a payload a caller hashes, signs or diffs against what it sent comes
-/// back byte for byte, while a document the definition BUILT is reported as built.
-fn echoed_payload(value: &Value, supplied: &Supplied) -> String {
-    if *value == supplied.value {
-        return supplied.text.clone();
-    }
-    value.to_string()
 }
 
 /// Where a walk applied an [`ActivityReply`]: the step its own events begin at, and
@@ -3999,6 +3981,14 @@ fn nested_conditions<'a>(
 }
 
 /// Evaluate one comparator of a choice rule.
+///
+/// Two kinds of problem are told apart here. A STRUCTURAL defect of the definition —
+/// a comparator name the language does not define, an operand that is not a JSONPath
+/// string for a `*Path` comparator, a path this service refuses — fails the execution,
+/// because the rule says nothing that can be decided. A judgement about the DATA does
+/// not: a comparator cannot be applied to operands that are not of the type it
+/// compares, so such a rule simply does NOT match, and the `And`/`Or`/`Not` around it
+/// and the rules after it go on being evaluated.
 fn compare(
     operator: &str,
     variable: &str,
@@ -4045,55 +4035,76 @@ fn compare(
         None => (operator, operand.clone()),
     };
 
-    let mismatch = |expected: &str| {
+    let undefined = || {
         runtime(format!(
-            "the choice rule on '{variable}' compares {value} with {operand} through \
-             '{operator}', which compares {expected}"
+            "'{operator}' is not a comparator this service evaluates"
         ))
     };
     if let Some(comparison) = family.strip_prefix("String") {
+        // "StringMatches […] a string that may contain one or more wildcards": the
+        // only comparator of this family that is not one of the four orderings.
         if comparison == "Matches" {
             let (Some(text), Some(pattern)) = (value.as_str(), operand.as_str()) else {
-                return Err(mismatch("strings"));
+                return Ok(false);
             };
             return glob_matches(pattern, text);
         }
+        if !is_ordering(comparison) {
+            return Err(undefined());
+        }
         let (Some(left), Some(right)) = (value.as_str(), operand.as_str()) else {
-            return Err(mismatch("strings"));
+            return Ok(false);
         };
-        return ordering(comparison, left.cmp(right)).ok_or_else(|| mismatch("strings"));
+        return Ok(ordering(comparison, left.cmp(right)).unwrap_or(false));
     }
     if let Some(comparison) = family.strip_prefix("Numeric") {
+        if !is_ordering(comparison) {
+            return Err(undefined());
+        }
         let (Some(left), Some(right)) = (value.as_f64(), operand.as_f64()) else {
-            return Err(mismatch("numbers"));
+            return Ok(false);
         };
-        let order = left
-            .partial_cmp(&right)
-            .ok_or_else(|| mismatch("numbers"))?;
-        return ordering(comparison, order).ok_or_else(|| mismatch("numbers"));
+        let Some(order) = left.partial_cmp(&right) else {
+            return Ok(false);
+        };
+        return Ok(ordering(comparison, order).unwrap_or(false));
     }
     if let Some(comparison) = family.strip_prefix("Boolean") {
-        let (Some(left), Some(right)) = (value.as_bool(), operand.as_bool()) else {
-            return Err(mismatch("booleans"));
-        };
+        // `BooleanEquals` is the whole family: the language defines no ordering over
+        // booleans.
         if comparison != "Equals" {
-            return Err(mismatch("booleans"));
+            return Err(undefined());
         }
+        let (Some(left), Some(right)) = (value.as_bool(), operand.as_bool()) else {
+            return Ok(false);
+        };
         return Ok(left == right);
     }
     if let Some(comparison) = family.strip_prefix("Timestamp") {
+        if !is_ordering(comparison) {
+            return Err(undefined());
+        }
         let (Some(left), Some(right)) = (value.as_str(), operand.as_str()) else {
-            return Err(mismatch("ISO 8601 timestamps"));
+            return Ok(false);
         };
-        let (left, right) = (
-            iso_millis(left).map_err(runtime)?,
-            iso_millis(right).map_err(runtime)?,
-        );
-        return ordering(comparison, left.cmp(&right)).ok_or_else(|| mismatch("timestamps"));
+        // A string that is no ISO 8601 timestamp is not a value of the type this
+        // family compares either, so it does not match rather than failing the run.
+        let (Ok(left), Ok(right)) = (iso_millis(left), iso_millis(right)) else {
+            return Ok(false);
+        };
+        return Ok(ordering(comparison, left.cmp(&right)).unwrap_or(false));
     }
-    Err(runtime(format!(
-        "'{operator}' is not a comparator this service evaluates"
-    )))
+    Err(undefined())
+}
+
+/// Whether `comparison` names one of the ordering comparisons [`ordering`] defines,
+/// which every value-comparator family but `StringMatches` and `BooleanEquals` takes.
+///
+/// Asked of [`ordering`] itself rather than restating its name list, so the set of
+/// comparisons the language defines lives in ONE place: what cannot be applied to an
+/// ordering is not a comparison this service evaluates.
+fn is_ordering(comparison: &str) -> bool {
+    ordering(comparison, std::cmp::Ordering::Equal).is_some()
 }
 
 /// Whether `order` satisfies one of ASL's four ordering comparisons.
@@ -4510,10 +4521,13 @@ pub fn test_state(test: &StateTest<'_>) -> Trial {
         // up is the scope around it.
         assigned: BTreeMap::new(),
         // The request's own input is the caller's document here, so what the trial
-        // reports of it is the bytes the request carried.
-        supplied: Supplied {
-            value: raw.clone(),
-            text: test.input.to_string(),
+        // reports of it is the bytes the request carried. The state under test
+        // arrives PARSED, so the text the definition wrote its own documents in is
+        // not one this walk was given.
+        supplied: {
+            let mut supplied = Supplied::default();
+            supplied.supplied(test.input);
+            supplied
         },
     };
     interpreter.trial(test, &raw, inspection)
@@ -4615,12 +4629,20 @@ impl Interpreter<'_> {
             Ok(result) => match language {
                 // A JSONata state's output is its `Output`, over the variables its
                 // own `Assign` has just written; there are no result-side filters to
-                // record stages for.
+                // record stages for. A `Choice` state's own `Assign` and the SELECTED
+                // rule's decide it together, exactly as they do in the walk.
                 JSONATA => {
                     if let Some(result) = result.as_ref() {
                         inspection.result = Some(result.to_string());
                     }
-                    self.jsonata_output(state, &effective, result.as_ref(), None, &context)
+                    match chosen.as_ref() {
+                        Some(chosen) => {
+                            self.choice_output(state, chosen.rule.as_ref(), &effective, &context)
+                        }
+                        None => {
+                            self.jsonata_output(state, &effective, result.as_ref(), None, &context)
+                        }
+                    }
                 }
                 _ => match result {
                     Some(result) => self.place_recorded(
@@ -4646,12 +4668,6 @@ impl Interpreter<'_> {
         if let Err(failure) = measure_payload(&output, SINGLE_STATE_LABEL) {
             return self.classify(test, language, raw, &context, failure, inspection);
         }
-        // A JSONata `Choice` rule that declares an `Output` of its own decides the
-        // state's output, exactly as it does in the walk.
-        let output = chosen
-            .as_ref()
-            .and_then(|chosen| chosen.output.clone())
-            .unwrap_or(output);
         inspection.variables = self.assigned_variables();
 
         let next_state = match chosen {
