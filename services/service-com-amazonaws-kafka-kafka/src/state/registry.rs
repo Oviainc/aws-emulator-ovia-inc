@@ -1439,8 +1439,67 @@ impl ComAmazonawsKafkaKafkaState {
             (channel.cluster_arn.clone(), channel.name.clone()),
             channel.arn.clone(),
         );
+        let channel_arn = channel.arn.clone();
+        let create_operation_arn = channel.cluster_operation_arn.clone();
+        let active_due = channel.active_due;
         self.channels.insert(channel.arn.clone(), channel);
+        // The create answers a `ClusterOperationArn`, so the record that ARN
+        // names is filed here, on the one insertion path: the operation finishes
+        // when the channel it created becomes `ACTIVE`, so it ends at the same
+        // instant the clock owes that transition.
+        self.file_channel_operation(
+            &channel_arn,
+            create_operation_arn,
+            OPERATION_TYPE_CREATE_CHANNEL,
+            active_due,
+            now,
+        );
         Ok(())
+    }
+
+    /// File the cluster operation a channel lifecycle call hands its caller, so
+    /// the ARN that caller polls names a record `DescribeClusterOperation` and
+    /// `DescribeClusterOperationV2` resolve rather than nothing.
+    ///
+    /// The operation is filed through [`Self::file_cluster_operation`], the one
+    /// filing path, so it appears in its cluster's history and bounds that
+    /// history exactly as every other cluster operation does. It reports no
+    /// mutable cluster attribute on either side because it changes none: a
+    /// channel operation acts on the CHANNEL, and an operation describes what it
+    /// touches. `end_due` is the instant the clock owes the channel transition
+    /// this operation carries out, so the operation and the channel cannot
+    /// disagree about when the work finished.
+    fn file_channel_operation(
+        &mut self,
+        channel_arn: &str,
+        operation_arn: String,
+        operation_type: &str,
+        end_due: SystemTime,
+        now: SystemTime,
+    ) {
+        let Some(channel) = self.channels.get(channel_arn) else {
+            return;
+        };
+        let cluster_arn = channel.cluster_arn.clone();
+        let region = channel.region.clone();
+        // Which kind of cluster the operation acted on, off that cluster's own
+        // record, as every other filed operation stores it.
+        let cluster_type = self
+            .clusters
+            .get(&cluster_arn)
+            .map(|cluster| cluster.cluster_type.clone())
+            .unwrap_or_default();
+        self.file_cluster_operation(ClusterOperation {
+            arn: operation_arn,
+            cluster_arn,
+            region,
+            cluster_type,
+            operation_type: operation_type.to_string(),
+            creation_time: now,
+            end_due,
+            source_cluster_info: MutableClusterInfo::default(),
+            target_cluster_info: MutableClusterInfo::default(),
+        });
     }
 
     /// Remove the channel `arn` names from every index, handing it back. The one
@@ -1561,8 +1620,59 @@ impl ComAmazonawsKafkaKafkaState {
     ) -> Option<&Channel> {
         self.settled_channel_in(region, cluster_arn, channel_arn, now)?;
         let channel = self.channels.get_mut(channel_arn)?;
+        // The delete is idempotent, so the operation is filed only for the call
+        // that actually accepted one: a repeat must not re-file the record under
+        // a later instant and move the completion the first call promised.
+        let accepting = channel.deletion_operation_arn.is_none();
         channel.begin_deletion(now);
-        Some(channel)
+        let filing = accepting
+            .then(|| (channel.deletion_operation_arn.clone(), channel.removal_due))
+            .and_then(|(arn, due)| Some((arn?, due?)));
+        if let Some((operation_arn, removal_due)) = filing {
+            self.file_channel_operation(
+                channel_arn,
+                operation_arn,
+                OPERATION_TYPE_DELETE_CHANNEL,
+                removal_due,
+                now,
+            );
+        }
+        self.channels.get(channel_arn)
+    }
+
+    /// Accept a destination change on the channel `channel_arn` names under
+    /// `cluster_arn`, as an endpoint for `region` sees it, handing back the
+    /// record as the caller must now see it: the new
+    /// `DataFreshnessInSeconds` written onto the destination it was created with,
+    /// `UPDATING`, with the instant the clock owes it `ACTIVE` again and the
+    /// update's own cluster operation filed.
+    ///
+    /// Answers `None` when this region holds no such channel under that cluster,
+    /// resolved exactly as every channel reader resolves it. The STATUS gate is
+    /// the caller's: this is the write path, and it is reached only for a channel
+    /// the handler has already found updatable.
+    pub fn begin_channel_update(
+        &mut self,
+        region: &str,
+        cluster_arn: &str,
+        channel_arn: &str,
+        now: SystemTime,
+        data_freshness_in_seconds: i32,
+    ) -> Option<&Channel> {
+        self.settled_channel_in(region, cluster_arn, channel_arn, now)?;
+        let channel = self.channels.get_mut(channel_arn)?;
+        let operation_arn = channel
+            .begin_update(now, data_freshness_in_seconds)
+            .to_string();
+        let end_due = channel.active_due;
+        self.file_channel_operation(
+            channel_arn,
+            operation_arn,
+            OPERATION_TYPE_UPDATE_CHANNEL,
+            end_due,
+            now,
+        );
+        self.channels.get(channel_arn)
     }
 
     /// Choose one page of this endpoint's clusters: the keys a listing reports,

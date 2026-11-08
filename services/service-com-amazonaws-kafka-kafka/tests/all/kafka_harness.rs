@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_kafka_kafka::state::{
-    CHANNEL_ACTIVATION_DELAY, CLUSTER_ACTIVATION_DELAY, CLUSTER_UPDATE_DELAY,
+    CHANNEL_ACTIVATION_DELAY, CHANNEL_UPDATE_DELAY, CLUSTER_ACTIVATION_DELAY, CLUSTER_UPDATE_DELAY,
     CONFIGURATION_ARN_NOT_FOUND_MESSAGE, CONFIGURATION_DELETION_DELAY,
     CONFIGURATION_STATES_A_CHANGE_IS_ACCEPTED_FROM, VPC_CONNECTION_ACTIVATION_DELAY,
 };
@@ -1024,6 +1024,12 @@ pub fn sleep_past_activation() {
 /// cluster ones.
 pub fn sleep_past_channel_activation() {
     std::thread::sleep(CHANNEL_ACTIVATION_DELAY + Duration::from_millis(250));
+}
+
+/// Sleep past the emulator's own `UPDATING` -> `ACTIVE` span for a CHANNEL, which
+/// is the span an accepted `UpdateChannel` leaves the channel in.
+pub fn sleep_past_channel_update() {
+    std::thread::sleep(CHANNEL_UPDATE_DELAY + Duration::from_millis(250));
 }
 
 /// One row of a `CreateConfiguration` table: the member values one request

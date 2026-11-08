@@ -23,6 +23,8 @@ mod broker_type_update;
 mod channel_admission;
 #[path = "all/channel_deletion.rs"]
 mod channel_deletion;
+#[path = "all/channel_destination_update.rs"]
+mod channel_destination_update;
 #[path = "all/channel_lifecycle.rs"]
 mod channel_lifecycle;
 #[path = "all/channel_listing.rs"]

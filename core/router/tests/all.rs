@@ -1084,3 +1084,5 @@ mod sesv2_probe2;
 mod sesv2_probe3;
 // `bedrock_agentcore_data_plane_parent_resources` — are each ALREADY declared above. Two
 // concurrent changes declared the same entry, which is a redefinition and stops this target
+// `bedrock_agentcore_data_plane_parent_resources` — are each ALREADY declared above in the
+// sorted head. Concurrent changes appended the same entry twice, which is a redefinition and

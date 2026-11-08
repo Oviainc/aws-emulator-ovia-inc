@@ -1,15 +1,45 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateChannel
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateChannel`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Applies a destination change to a channel of the cluster named in the request path:
+//! the `DataFreshnessInSeconds` the update payload carries is written onto the
+//! destination the channel was created with, the channel reports the non-terminal
+//! `UPDATING` until the clock owes it `ACTIVE` again
+//! ([`crate::state::CHANNEL_UPDATE_DELAY`]), and the cluster operation carrying the
+//! change out is filed so the `ClusterOperationArn` this call answers names a record
+//! `DescribeClusterOperation`/`DescribeClusterOperationV2` resolve.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateChannel::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Nothing else about the channel moves: its name, its tags, its topic list and the
+//! rest of its destination configuration are the stored record's, byte for byte, both
+//! before and after the change ([`crate::state::Channel::begin_update`]).
+//!
+//! The gates, in the order MSK takes them: the request-only checks first (the request
+//! must carry exactly one destination update — "Exactly one of icebergDestinationUpdate
+//! or s3DestinationUpdate must be supplied" — with a `dataFreshnessInSeconds` inside the
+//! range the member documents, [`crate::state::is_data_freshness_in_range`]), as
+//! `CreateChannel` takes them; then the cluster in the path, BEFORE the channel, so a
+//! well-formed `ClusterArn` naming no cluster of this endpoint's region is the service's
+//! one fixed `NotFoundException` rather than a complaint about the channel; then the
+//! channel, where an ARN that cluster holds no channel for is a `BadRequestException`
+//! ([`crate::state::invalid_channel_arn`]), since once the cluster resolves an unknown
+//! channel ARN is a bad identifier in the caller's own request. The update must then name
+//! the destination kind the channel actually has ("Use only when the channel was created
+//! with an Amazon S3 destination"), and only an `ACTIVE` channel is updatable
+//! ([`crate::state::channel_not_updatable`]).
+//!
+//! The operation is modelled `@idempotent`, so a repeat of an accepted update writes
+//! the same value again; it is nonetheless a new asynchronous change, so it files its
+//! own cluster operation rather than re-reporting an earlier one.
+//!
+//! Authentication is NOT this handler's business: the emulator verifies every
+//! request signature centrally (see `AGENTS.md`), so the modelled
+//! `UnauthorizedException`/`ForbiddenException` are raised by that path and never
+//! constructed here. Resource-scoped AUTHORIZATION is: this call asks for an action
+//! on the cluster its `ClusterArn` names, and that decision is taken on the ARN as
+//! submitted, before anything is resolved ([`crate::state::authorization`]).
+//!
+//! The scaffold notes below describe the framework; they are kept because they document
+//! the seams this handler uses.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +187,161 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateChannel` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateChannelErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateChannel"))
+        // Decided FIRST, on the ARN as submitted and from the request alone: the
+        // caller holds no resource-based policy over a cluster of another account,
+        // so such a request is refused rather than answered out of what this
+        // registry happens to hold under that ARN. See
+        // [`crate::state::authorization`].
+        crate::state::authorization::authorize_operation(Self::NAME, &input.cluster_arn)?;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UpdateChannelErrorModeled::InternalServerErrorException(
+                InternalServerErrorException {
+                    invalid_parameter: None,
+                    message: Some("the kafka service state is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(UpdateChannelErrorModeled::BadRequestException(
+                crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
+            )
+            .into());
+        }
+
+        // Request-only checks next: they depend on nothing in the registry. The
+        // cardinality of the destination payload and the value it carries are read
+        // in ONE step, so the request's shape is decided once and there is no arm
+        // for a state the decision has already excluded. Both payloads carry
+        // `dataFreshnessInSeconds` as a REQUIRED member under the same documented
+        // range, so the bound is checked wherever the member arrives rather than per
+        // destination kind — the same one reading `CreateChannel` applies.
+        let data_freshness_in_seconds = match (
+            input.s3_destination_update.as_ref(),
+            input.iceberg_destination_update.as_ref(),
+        ) {
+            (Some(update), None) => update.data_freshness_in_seconds,
+            (None, Some(update)) => update.data_freshness_in_seconds,
+            // Neither, or both: not one destination change the service can apply.
+            _ => {
+                return Err(
+                    UpdateChannelErrorModeled::BadRequestException(BadRequestException {
+                        // No single member is at fault — the request's fault is the
+                        // COMBINATION, and the sentence names both members itself.
+                        invalid_parameter: None,
+                        // This operation's own documentation, as the model words it.
+                        message: Some(
+                            "Exactly one of icebergDestinationUpdate or \
+                             s3DestinationUpdate must be supplied."
+                                .to_string(),
+                        ),
+                    })
+                    .into(),
+                );
+            }
+        };
+        if !crate::state::is_data_freshness_in_range(data_freshness_in_seconds) {
+            return Err(UpdateChannelErrorModeled::BadRequestException(
+                crate::state::data_freshness_out_of_range(),
+            )
+            .into());
+        }
+
+        let mut state = state.lock();
+        // One instant for the whole request, so the resolution, the status gate
+        // and the change the clock will finish all agree about when this call ran.
+        let now = std::time::SystemTime::now();
+
+        // The cluster in the path is the FIRST gate: a channel is addressed under
+        // its cluster, so a cluster this endpoint's region does not hold answers
+        // the service's one fixed not-found sentence before anything about the
+        // channel is looked at.
+        if state.cluster_in(&region, &input.cluster_arn).is_none() {
+            return Err(
+                UpdateChannelErrorModeled::NotFoundException(NotFoundException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                })
+                .into(),
+            );
+        }
+
+        // Resolved exactly as `DescribeChannel` resolves it, so the update and the
+        // reader cannot disagree about which channels exist. What the gates below
+        // need is read off the record here, so the write path is reached with no
+        // borrow of the registry outstanding.
+        let channel = state.settled_channel_in(&region, &input.cluster_arn, &input.channel_arn, now);
+        let Some((status, destination_type)) =
+            channel.map(|channel| (channel.status.clone(), channel.destination_type.clone()))
+        else {
+            return Err(UpdateChannelErrorModeled::BadRequestException(
+                crate::state::invalid_channel_arn(),
+            )
+            .into());
+        };
+        // A destination update applies to the destination the channel was created
+        // with: "Use only when the channel was created with an Apache Iceberg
+        // destination" / "with an Amazon S3 destination", documented on the two
+        // members. The record's destination type is derived from the create, so
+        // this compares what the request asks to change against what there is.
+        let asked_for = if input.iceberg_destination_update.is_some() {
+            crate::state::DESTINATION_TYPE_ICEBERG
+        } else {
+            crate::state::DESTINATION_TYPE_S3
+        };
+        if asked_for != destination_type {
+            return Err(
+                UpdateChannelErrorModeled::BadRequestException(BadRequestException {
+                    invalid_parameter: Some(match asked_for {
+                        crate::state::DESTINATION_TYPE_ICEBERG => "IcebergDestinationUpdate",
+                        _ => "S3DestinationUpdate",
+                    }
+                    .to_string()),
+                    // No recording of this refusal was available, so the sentence is
+                    // built from the two members' OWN documentation ("Use only when
+                    // the channel was created with an … destination") rather than
+                    // from a different refusal's wording; the destination kinds in it
+                    // are the record's and the request's, never a recorded value.
+                    message: Some(format!(
+                        "The channel was created with a {destination_type} destination, \
+                         so it cannot be updated with a {asked_for} destination update."
+                    )),
+                })
+                .into(),
+            );
+        }
+        // Only a settled channel is updatable: one still being created, one being
+        // updated already and one on its way out are each reported with the status
+        // they are in, and the refusal names it.
+        if status != crate::state::CHANNEL_STATUS_ACTIVE {
+            return Err(UpdateChannelErrorModeled::BadRequestException(
+                crate::state::channel_not_updatable(&status),
+            )
+            .into());
+        }
+
+        // Accepted through the one update path, which resolves the channel the way
+        // the reader does before it writes anything, so a refused update leaves the
+        // registry exactly as it was.
+        let Some(channel) = state.begin_channel_update(
+            &region,
+            &input.cluster_arn,
+            &input.channel_arn,
+            now,
+            data_freshness_in_seconds,
+        ) else {
+            return Err(UpdateChannelErrorModeled::BadRequestException(
+                crate::state::invalid_channel_arn(),
+            )
+            .into());
+        };
+        Ok(UpdateChannelOutput {
+            channel_arn: channel.arn.clone(),
+            // The operation carrying the change out, which the channel stores, so
+            // this answer and a `DescribeChannel` inside the `UPDATING` window
+            // report the same in-flight operation.
+            cluster_operation_arn: channel.update_operation_arn.clone(),
+        })
     }
 }

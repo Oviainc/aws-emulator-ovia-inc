@@ -176,6 +176,10 @@ mod cluster;
 /// The same for one replicator record.
 mod replicator;
 
+/// The same for one channel record: how it is minted, how its status settles, and
+/// the destination change an update applies to it.
+mod channel;
+
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
 use std::time::{Duration, SystemTime};
@@ -278,6 +282,18 @@ pub const OPERATION_TYPE_UPDATE_MONITORING: &str = "UPDATE_MONITORING";
 /// operation type Amazon MSK files such a call under, in the same
 /// SCREAMING_SNAKE_CASE form as the update types above.
 pub const OPERATION_TYPE_REBOOT_NODE: &str = "REBOOT_NODE";
+
+/// The `OperationType` the cluster operation behind a `CreateChannel` records,
+/// in the same SCREAMING_SNAKE_CASE form as the update types above: a channel
+/// lifecycle call is carried out by a cluster operation of its own, which is
+/// what the `ClusterOperationArn` each of those calls answers names.
+pub const OPERATION_TYPE_CREATE_CHANNEL: &str = "CREATE_CHANNEL";
+
+/// The `OperationType` the cluster operation behind an `UpdateChannel` records.
+pub const OPERATION_TYPE_UPDATE_CHANNEL: &str = "UPDATE_CHANNEL";
+
+/// The `OperationType` the cluster operation behind a `DeleteChannel` records.
+pub const OPERATION_TYPE_DELETE_CHANNEL: &str = "DELETE_CHANNEL";
 
 /// The state MSK reports for a cluster operation that is still running.
 pub const OPERATION_STATE_IN_PROGRESS: &str = "UPDATE_IN_PROGRESS";
@@ -486,6 +502,19 @@ pub const TOPIC_STATE_DELETING: &str = "DELETING";
 /// `CREATING` while a caller that waits sees `ACTIVE`.
 pub const CHANNEL_ACTIVATION_DELAY: Duration = Duration::from_millis(500);
 
+/// How long after an accepted `UpdateChannel` the channel leaves `UPDATING`.
+///
+/// CHOSEN, not documented, and set to the SAME span as
+/// [`CHANNEL_ACTIVATION_DELAY`] and [`CHANNEL_DELETION_DELAY`]: the destination
+/// change is applied asynchronously, so the channel reports the non-terminal
+/// `UPDATING` for a span and a caller that waits sees it `ACTIVE` again, and the
+/// project fixes an emulated clock-owed transition at 250–750 ms. Kept at the
+/// bottom of that band deliberately: a client polling a channel at an
+/// AWS-appropriate cadence pays its poll interval, not this span, for each
+/// transition, so the shorter this is the less of its budget the emulator's own
+/// asynchrony can consume.
+pub const CHANNEL_UPDATE_DELAY: Duration = Duration::from_millis(500);
+
 /// How long after `DeleteChannel` a channel marked `DELETING` is actually gone.
 ///
 /// CHOSEN, not documented, for the same reason: `DeleteChannel` is documented to
@@ -496,11 +525,14 @@ pub const CHANNEL_DELETION_DELAY: Duration = Duration::from_millis(500);
 
 /// The `ChannelStatus` values this emulator reports, spelled as the model's enum
 /// declares them. Named here so every channel operation reports the same
-/// spellings. (`UPDATING`, `FAILED`, `SUSPENDING` and `SUSPENDED`, the model's
-/// other values, belong to operations that are still scaffolds.)
+/// spellings. (`FAILED`, `SUSPENDING` and `SUSPENDED`, the model's other values,
+/// belong to failures and to a suspend surface this emulator does not serve.)
 pub const CHANNEL_STATUS_CREATING: &str = "CREATING";
 /// The status of a channel whose delivery pipeline is up.
 pub const CHANNEL_STATUS_ACTIVE: &str = "ACTIVE";
+/// The status of a channel an accepted destination change is still being applied
+/// to.
+pub const CHANNEL_STATUS_UPDATING: &str = "UPDATING";
 /// The status of a channel whose deletion has been accepted but not completed.
 pub const CHANNEL_STATUS_DELETING: &str = "DELETING";
 
@@ -2208,6 +2240,14 @@ pub struct Channel {
     /// `DescribeChannel` both report it: minted once with the channel and stored,
     /// so the two readers never disagree about it.
     pub cluster_operation_arn: String,
+    /// The cluster operation carrying out the destination change the most recent
+    /// accepted `UpdateChannel` asked for. `None` until one is accepted, so a
+    /// channel nobody has updated reports its create as its in-flight operation.
+    pub update_operation_arn: Option<String>,
+    /// How many destination changes this channel has accepted. Seeds the id of
+    /// each update's own cluster operation, so two updates of one channel are
+    /// two distinct operations rather than one ARN handed out twice.
+    pub updates_accepted: u64,
     /// The cluster operation carrying out this channel's delete, minted once when
     /// the delete is accepted. `None` until then, so `DeleteChannel` and a reader
     /// inside the `DELETING` window report the same in-flight operation however
@@ -2284,6 +2324,49 @@ pub fn channel_name_already_exists(name: &str) -> BadRequestException {
         invalid_parameter: Some("channelName".to_string()),
         message: Some(format!(
             "A channel with name '{name}' already exists for this cluster."
+        )),
+    }
+}
+
+/// What MSK answers a channel-scoped call whose `ChannelArn` the cluster in the
+/// request path holds no channel for: a `BadRequestException` (HTTP 400) whose
+/// sentence is fixed end to end, carrying nothing from the request — once the
+/// cluster resolves, a channel ARN it does not hold is a bad identifier in the
+/// caller's own request rather than a resource that went missing.
+///
+/// The sentence is MSK's own, from the RECORDED answer to a channel-scoped call
+/// carrying a well-formed channel ARN of an existing cluster that holds no such
+/// channel (MSK names a channel a "link" internally, which is the wording it
+/// refuses the identifier in); the model declares no shape for it, so it is written
+/// here, in one place, rather than per handler.
+pub fn invalid_channel_arn() -> BadRequestException {
+    BadRequestException {
+        // The member at fault, by the name the request carries it under — an
+        // `@httpLabel`, so the wire name and the member name are the same.
+        invalid_parameter: Some("ChannelArn".to_string()),
+        message: Some(
+            "The specified link ARN isn\u{2019}t valid. Specify a valid link ARN, and try again."
+                .to_string(),
+        ),
+    }
+}
+
+/// What MSK answers an `UpdateChannel` on a channel that is not `ACTIVE`: a
+/// `BadRequestException` (HTTP 400) naming the status the channel is in now and
+/// the one it has to be in to be updated.
+///
+/// The sentence is MSK's own, from the RECORDED refusal of an `UpdateChannel`
+/// against a channel whose status was not `ACTIVE`: "Channel cannot be updated in
+/// state " and ". Channel must be in ACTIVE state to be updated." are its fixed
+/// text, and the status token between them is the channel's CURRENT status, read
+/// from its own record at the instant the call is served — never a status from any
+/// one run.
+pub fn channel_not_updatable(status: &str) -> BadRequestException {
+    BadRequestException {
+        invalid_parameter: Some("ChannelArn".to_string()),
+        message: Some(format!(
+            "Channel cannot be updated in state {status}. Channel must be in \
+             {CHANNEL_STATUS_ACTIVE} state to be updated."
         )),
     }
 }
@@ -3680,196 +3763,6 @@ pub fn applied_replication_info(mut info: ReplicationInfo) -> ReplicationInfo {
         .consumer_group_offset_sync_mode
         .get_or_insert_with(|| DEFAULT_CONSUMER_GROUP_OFFSET_SYNC_MODE.to_string());
     info
-}
-
-impl Channel {
-    /// Mint a channel of `cluster`: derive its identity from `suffix` (the
-    /// registry's monotonic counter) and the cluster that holds it, and keep the
-    /// submitted configuration whole.
-    ///
-    /// `now` is the creation instant and `input` the submitted configuration as
-    /// `CreateChannel` deserialized it. The destination type is DERIVED from
-    /// which destination configuration the request carried; the handler has
-    /// already refused a request that carried both or neither, so a record can
-    /// never describe a destination it does not hold.
-    pub fn streaming(
-        cluster: &Cluster,
-        suffix: u64,
-        now: SystemTime,
-        input: CreateChannelInput,
-    ) -> Self {
-        let name = input.channel_name.as_str();
-        // The registry's counter, as a 1-based ordinal; the SAME value seeds both
-        // digests below, so a channel's id and its create operation's id follow
-        // from one number.
-        let ordinal = suffix + 1;
-        let channel_id = uuid_v4_shaped_from_digest(&stable_digest(&format!(
-            "{}:{}:channel:{name}:{ordinal}",
-            ::engine::emulator_account_id(),
-            cluster.arn
-        )));
-        let operation_id = uuid_v4_shaped_from_digest(&stable_digest(&format!(
-            "{}:{}:channel-operation:{name}:{ordinal}",
-            ::engine::emulator_account_id(),
-            cluster.arn
-        )));
-        // The cluster's own resource id, so a channel ARN names the cluster it
-        // belongs to the way an MSK sub-resource ARN does.
-        let cluster_id = cluster.arn.split('/').next_back().unwrap_or_default();
-        let destination_type = if input.iceberg_destination_configuration.is_some() {
-            DESTINATION_TYPE_ICEBERG
-        } else {
-            DESTINATION_TYPE_S3
-        };
-
-        Self {
-            arn: ::engine::emulator_arn(
-                "kafka",
-                &cluster.region,
-                &format!("channel/{}/{cluster_id}/{name}/{channel_id}", cluster.name),
-            ),
-            name: input.channel_name,
-            cluster_arn: cluster.arn.clone(),
-            region: cluster.region.clone(),
-            creation_time: now,
-            active_due: now + CHANNEL_ACTIVATION_DELAY,
-            status: CHANNEL_STATUS_CREATING.to_string(),
-            removal_due: None,
-            destination_type: destination_type.to_string(),
-            encryption_configuration: input.encryption_configuration,
-            iceberg_destination_configuration: input.iceberg_destination_configuration,
-            s3_destination_configuration: input.s3_destination_configuration,
-            topic_configuration_list: input.topic_configuration_list,
-            logging_info: input.logging_info,
-            tags: input.tags.unwrap_or_default().into_iter().collect(),
-            cluster_operation_arn: ::engine::emulator_arn(
-                "kafka",
-                &cluster.region,
-                &format!(
-                    "cluster-operation/{}/{cluster_id}/{operation_id}",
-                    cluster.name
-                ),
-            ),
-            deletion_operation_arn: None,
-        }
-    }
-
-    /// Apply the `CREATING` -> `ACTIVE` transition once `now` has reached
-    /// [`Self::active_due`]. Idempotent, and a no-op for every other status: only
-    /// a transition the clock already owed is materialised here. A channel that is
-    /// `DELETING` never goes back to `ACTIVE`.
-    pub fn settle(&mut self, now: SystemTime) {
-        if self.status == CHANNEL_STATUS_CREATING && now >= self.active_due {
-            self.status = CHANNEL_STATUS_ACTIVE.to_string();
-        }
-    }
-
-    /// Whether this channel is still part of the registry a caller at `now` sees:
-    /// a channel whose removal the clock already owes is gone, whether or not the
-    /// record has been dropped yet.
-    pub fn is_live(&self, now: SystemTime) -> bool {
-        self.removal_due.is_none_or(|due| now < due)
-    }
-
-    /// Accept this channel's deletion at `now`: move it to `DELETING`, record the
-    /// instant the clock owes its removal, and mint the cluster operation carrying
-    /// the delete out.
-    ///
-    /// Idempotent — a channel already `DELETING` keeps the removal instant and the
-    /// operation ARN it was given, so repeating the call cannot postpone the
-    /// removal or re-identify the operation.
-    pub fn begin_deletion(&mut self, now: SystemTime) {
-        if self.removal_due.is_some() {
-            return;
-        }
-        // The delete's operation id is derived from the channel's own identity, so
-        // it is distinct from the create's (a different digest input) and stable
-        // across repeats of this call. It lives under the same cluster as the
-        // create operation, so the ARN keeps that prefix and replaces only the
-        // operation id.
-        let operation_id = uuid_v4_shaped_from_digest(&stable_digest(&format!(
-            "{}:{}:channel-delete-operation",
-            ::engine::emulator_account_id(),
-            self.arn
-        )));
-        let prefix = self
-            .cluster_operation_arn
-            .rsplit_once('/')
-            .map_or(self.cluster_operation_arn.as_str(), |(head, _)| head);
-        self.deletion_operation_arn = Some(format!("{prefix}/{operation_id}"));
-        self.status = CHANNEL_STATUS_DELETING.to_string();
-        self.removal_due = Some(now + CHANNEL_DELETION_DELAY);
-    }
-
-    /// The cluster operation a reader reports as this channel's in-flight one
-    /// (`DescribeChannelResponse$ClusterOperationArn`, "the ARN of the in-flight
-    /// cluster operation"): the delete once one has been accepted, otherwise the
-    /// create that minted the channel.
-    pub fn in_flight_cluster_operation_arn(&self) -> &str {
-        self.deletion_operation_arn
-            .as_deref()
-            .unwrap_or(&self.cluster_operation_arn)
-    }
-
-    /// The channel as `DescribeChannel` reports it. Kept next to the record for
-    /// the same reason [`Cluster::to_cluster_info`] is: every reader of a channel
-    /// renders the one stored record the same way.
-    pub fn to_describe_output(&self) -> DescribeChannelOutput {
-        DescribeChannelOutput {
-            channel_arn: self.arn.clone(),
-            channel_name: self.name.clone(),
-            encryption_configuration: self.encryption_configuration.clone(),
-            iceberg_destination_configuration: self.iceberg_destination_configuration.clone(),
-            s3_destination_configuration: self.s3_destination_configuration.clone(),
-            status: self.status.clone(),
-            destination_type: self.destination_type.clone(),
-            creation_time: ::aws_smithy_types::DateTime::from(self.creation_time),
-            topic_configuration_list: self.topic_configuration_list.clone(),
-            logging_info: self.logging_info.clone(),
-            // `ChannelStateInfo` reports why a channel is in a state that needs
-            // explaining; nothing has gone wrong with a channel this emulator
-            // creates, so there is none to report.
-            state_info: None,
-            cluster_operation_arn: Some(self.in_flight_cluster_operation_arn().to_string()),
-            tags: Some(self.tags.clone().into_iter().collect()),
-        }
-    }
-
-    /// The channel as `ListChannels` summarises it, from the SAME stored record
-    /// `DescribeChannel` reports: a listing and a read of one channel can only
-    /// agree if they render the same fields of one record.
-    ///
-    /// `ClusterOperationArn` is "the ARN of the in-flight cluster operation.
-    /// Returned only while the channel is in CREATING, UPDATING, or DELETING"
-    /// (`ChannelInfo$ClusterOperationArn`), so a channel whose provisioning has
-    /// settled reports none: there is no operation in flight on it.
-    pub fn to_channel_info(&self) -> ChannelInfo {
-        ChannelInfo {
-            channel_arn: self.arn.clone(),
-            channel_name: self.name.clone(),
-            status: self.status.clone(),
-            creation_time: ::aws_smithy_types::DateTime::from(self.creation_time),
-            destination_type: self.destination_type.clone(),
-            cluster_operation_arn: (self.status != CHANNEL_STATUS_ACTIVE)
-                .then(|| self.in_flight_cluster_operation_arn().to_string()),
-        }
-    }
-
-    /// Whether this channel streams the topic called `name`.
-    ///
-    /// A channel names its source topics by ARN, and a topic's NAME is the final
-    /// segment of that ARN, so the comparison is made on that segment — which is
-    /// what `ListChannelsRequest$TopicNameFilter` ("Filters results to channels
-    /// whose topic name matches the specified value") is matched against.
-    pub fn streams_topic_named(&self, name: &str) -> bool {
-        self.topic_configuration_list.iter().any(|configuration| {
-            configuration
-                .topic_arn
-                .split('/')
-                .next_back()
-                .is_some_and(|topic| topic == name)
-        })
-    }
 }
 
 /// `<host>:<port>` for each host, comma-separated. The hosts are borrowed, so
