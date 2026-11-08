@@ -208,20 +208,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Region or an instant no record covers. The not-found errors this operation
         // models stay reserved for a request that names one resource to resolve.
         // A price list is in effect at the requested instant when it took effect on or
-        // before it; a RegionCode, when given, narrows the list to that Region.
+        // before it, and a Region's price list is reported at the ONE version in effect
+        // there — the newest the instant reaches. A RegionCode, when given, narrows the
+        // answer to that Region.
         let effective_at = input.effective_date.secs();
-        let matched: Vec<&crate::state::PriceListRecord> = state
-            .price_lists
-            .values()
-            .filter(|record| {
-                record.service_code == input.service_code
-                    && record.currency_code == input.currency_code
-                    && input.region_code.as_ref().is_none_or(|region| {
-                        record.region_code.as_deref() == Some(region.as_str())
-                    })
-                    && record.effective_epoch_secs() <= effective_at
-            })
-            .collect();
+        let matched = state.price_lists_in_effect(
+            &input.service_code,
+            &input.currency_code,
+            input.region_code.as_deref(),
+            effective_at,
+        );
 
         let fingerprint = crate::state::query_fingerprint(&[
             Self::NAME,

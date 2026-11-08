@@ -9,7 +9,7 @@
 //! by an opaque `NextToken`, and the `PriceListArn` `ListPriceLists` reports resolves
 //! to a stable URL serving a file rendered from the same catalog.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{json, Value};
 use service_com_amazonaws_pricing_awspricelistservice::state::{
@@ -17,9 +17,10 @@ use service_com_amazonaws_pricing_awspricelistservice::state::{
 };
 
 use super::pricing_support::{
-    attribute_values, call, err, is_loopback, list_member, offer_attribute, offer_documents, ok,
-    product_sku, product_skus, router, router_with_engine, service_codes, service_entry,
-    split_https_url, ARN_PREFIX, JAN_1_2022, JAN_1_2024, JUL_1_2024,
+    all_attribute_values, all_offer_documents, attribute_values, call, column_of, csv_rows, err,
+    is_loopback, list_member, offer_attribute, offer_documents, ok, product_sku, router,
+    router_with_engine, service_codes, service_entry, split_https_url, ARN_PREFIX, JAN_1_2022,
+    JAN_1_2024, JUL_1_2024,
 };
 
 #[tokio::test]
@@ -70,23 +71,17 @@ async fn describe_services_reports_the_catalog_and_its_attribute_names() {
         );
 
         // Every attribute name reported must have values, and those values must be the
-        // ones the service's own products carry.
-        let products = ok(
-            &router,
-            "GetProducts",
-            &json!({ "ServiceCode": service_code }),
-        )
-        .await;
-        let documents = offer_documents(&products);
+        // ones the service's own products carry. Both sides are PAGED to the end: a
+        // service whose products or values outrun one page would otherwise be compared
+        // on two different page boundaries.
+        let documents =
+            all_offer_documents(&router, &json!({ "ServiceCode": service_code })).await;
         for name in &names {
-            let values = attribute_values(
-                &ok(
-                    &router,
-                    "GetAttributeValues",
-                    &json!({ "ServiceCode": service_code, "AttributeName": name }),
-                )
-                .await,
-            );
+            let values = all_attribute_values(
+                &router,
+                &json!({ "ServiceCode": service_code, "AttributeName": name }),
+            )
+            .await;
             assert!(
                 !values.is_empty(),
                 "case {service_code}/{name}: an attribute DescribeServices reports must \
@@ -130,28 +125,19 @@ async fn get_attribute_values_returns_the_distinct_values_of_the_attribute() {
     // Rows differ in service, attribute and the number of distinct values the seeded
     // products carry for it; the expected sets come from those products, which the
     // previous test pins against GetProducts. Each list is sorted, which is the order
-    // the catalog reports its values in.
+    // the catalog reports its values in. An attribute whose published value set outruns
+    // one page — `instanceType` — is covered by `published_catalog.rs`, which pages it.
     let cases: &[(&str, &str, &[&str])] = &[
         (
+            // The instance families the Price List API reports for EC2 compute.
             "AmazonEC2",
-            "instanceType",
+            "instanceFamily",
             &[
-                "c5.large",
-                "c5.xlarge",
-                "m5.2xlarge",
-                "m5.large",
-                "m5.xlarge",
-                "m6g.large",
-                "r5.large",
-                "r5.xlarge",
-                "t2.medium",
-                "t2.micro",
-                "t2.small",
-                "t3.large",
-                "t3.medium",
-                "t3.micro",
-                "t3.nano",
-                "t3.small",
+                "Compute optimized",
+                "GPU instance",
+                "General purpose",
+                "Memory optimized",
+                "Storage optimized",
             ],
         ),
         ("AmazonEC2", "operatingSystem", &["Linux", "Windows"]),
@@ -168,7 +154,8 @@ async fn get_attribute_values_returns_the_distinct_values_of_the_attribute() {
             ],
         ),
         ("AmazonEC2", "locationType", &["AWS Region"]),
-        ("AmazonEC2", "tenancy", &["Shared"]),
+        // The tenancies the Price List API publishes a separate compute SKU for.
+        ("AmazonEC2", "tenancy", &["Dedicated", "Shared"]),
         (
             "AmazonS3",
             "storageClass",
@@ -294,7 +281,9 @@ async fn get_products_applies_every_filter_type() {
         Some("aws_v1"),
         "GetProducts must echo the catalog format version, got {unfiltered}"
     );
-    let documents = offer_documents(&unfiltered);
+    // The whole result set, paged to the end: the service prices more products than one
+    // page holds, so the universe a filter is judged against must be the whole catalog.
+    let documents = all_offer_documents(&router, &json!({ "ServiceCode": "AmazonEC2" })).await;
 
     // One row per filter type the model declares (FilterType: TERM_MATCH, EQUALS,
     // CONTAINS, ANY_OF, NONE_OF), over fields that differ in how many products they
@@ -331,16 +320,17 @@ async fn get_products_applies_every_filter_type() {
             expected.len(),
             documents.len()
         );
-        let response = ok(
+        let actual: BTreeSet<String> = all_offer_documents(
             &router,
-            "GetProducts",
             &json!({
                 "ServiceCode": "AmazonEC2",
                 "Filters": [{ "Type": filter_type, "Field": field, "Value": value }],
             }),
         )
-        .await;
-        let actual: BTreeSet<String> = product_skus(&response).into_iter().collect();
+        .await
+        .iter()
+        .map(product_sku)
+        .collect();
         assert_eq!(
             actual, expected,
             "case {filter_type} {field}={value}: expected {expected:?}, got {actual:?}"
@@ -348,9 +338,8 @@ async fn get_products_applies_every_filter_type() {
     }
 
     // Two filters that must BOTH hold select the intersection.
-    let both = ok(
+    let both: BTreeSet<String> = all_offer_documents(
         &router,
-        "GetProducts",
         &json!({
             "ServiceCode": "AmazonEC2",
             "Filters": [
@@ -359,8 +348,10 @@ async fn get_products_applies_every_filter_type() {
             ],
         }),
     )
-    .await;
-    let both: BTreeSet<String> = product_skus(&both).into_iter().collect();
+    .await
+    .iter()
+    .map(product_sku)
+    .collect();
     let expected: BTreeSet<String> = documents
         .iter()
         .filter(|document| {
@@ -422,7 +413,7 @@ async fn paginated_reads_walk_the_whole_result_set_once() {
         ("DescribeServices", json!({}), 25, "Services"),
         (
             "GetAttributeValues",
-            json!({ "ServiceCode": "AmazonEC2", "AttributeName": "instanceType" }),
+            json!({ "ServiceCode": "AmazonEC2", "AttributeName": "volumeType" }),
             2,
             "AttributeValues",
         ),
@@ -590,14 +581,30 @@ async fn list_price_lists_selects_by_service_currency_region_and_effective_date(
         }
     }
 
-    // A later instant sees every version an earlier one did, and more where a newer
-    // version was published since.
-    let price_list_arns = |response: &Value| -> BTreeSet<String> {
-        list_member(response, "PriceLists")
-            .iter()
-            .filter_map(|entry| entry.get("PriceListArn").and_then(Value::as_str))
-            .map(str::to_string)
-            .collect()
+    // The requested instant SELECTS a version rather than accumulating the history:
+    // each Region is reported exactly once, and the version the ARN names is the newest
+    // one in effect at that instant — so a later instant names a newer version where one
+    // was published since, and never an older one.
+    let entries_by_region = |response: &Value| -> BTreeMap<String, String> {
+        let mut by_region: BTreeMap<String, String> = BTreeMap::new();
+        for entry in list_member(response, "PriceLists") {
+            let region = entry
+                .get("RegionCode")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let arn = entry
+                .get("PriceListArn")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            assert!(
+                by_region.insert(region.clone(), arn).is_none(),
+                "case {region}: a Region's price list must be reported once, got \
+                 {response}"
+            );
+        }
+        by_region
     };
     for service_code in ["AmazonEC2", "AmazonS3", "AWSLambda"] {
         let query = |effective: i64| {
@@ -607,13 +614,34 @@ async fn list_price_lists_selects_by_service_currency_region_and_effective_date(
                 "EffectiveDate": effective,
             })
         };
-        let earlier = price_list_arns(&ok(&router, "ListPriceLists", &query(JAN_1_2024)).await);
-        let later = price_list_arns(&ok(&router, "ListPriceLists", &query(JUL_1_2024)).await);
+        let earlier = entries_by_region(&ok(&router, "ListPriceLists", &query(JAN_1_2024)).await);
+        let later = entries_by_region(&ok(&router, "ListPriceLists", &query(JUL_1_2024)).await);
         assert!(
-            earlier.is_subset(&later) && later.len() > earlier.len(),
-            "case {service_code}: a later EffectiveDate must see every earlier version and \
-             the newer one too, {earlier:?} then {later:?}"
+            !earlier.is_empty(),
+            "case {service_code}: the catalog must publish a price list at the earlier \
+             instant"
         );
+        assert_eq!(
+            earlier.keys().collect::<Vec<&String>>(),
+            later.keys().collect::<Vec<&String>>(),
+            "case {service_code}: both instants must cover the same Regions"
+        );
+        // The version is the ARN's next-to-last segment; it moves forward with the
+        // instant, never back.
+        let version = |arn: &str| -> String {
+            arn.rsplit('/')
+                .nth(1)
+                .unwrap_or_default()
+                .to_string()
+        };
+        for (region, earlier_arn) in &earlier {
+            let later_arn = &later[region];
+            assert!(
+                version(later_arn) > version(earlier_arn),
+                "case {service_code}/{region}: the later instant must name the newer \
+                 version, got {earlier_arn} then {later_arn}"
+            );
+        }
     }
 
     // The ARNs are stored, not minted per call: the same query answers identically.
@@ -800,11 +828,10 @@ async fn every_listed_price_list_arn_resolves_to_a_stable_file_url() {
         );
 
         // The products the price list covers: the ones GetProducts returns for its
-        // Region. The file must carry exactly these, priced as their offer documents
-        // price them.
-        let covered = ok(
+        // Region, paged to the end. The file must carry exactly these, priced as their
+        // offer documents price them.
+        let in_region: BTreeSet<String> = all_offer_documents(
             &router,
-            "GetProducts",
             &json!({
                 "ServiceCode": service_code,
                 "Filters": [{
@@ -814,8 +841,10 @@ async fn every_listed_price_list_arn_resolves_to_a_stable_file_url() {
                 }],
             }),
         )
-        .await;
-        let in_region: BTreeSet<String> = product_skus(&covered).into_iter().collect();
+        .await
+        .iter()
+        .map(product_sku)
+        .collect();
         assert!(
             !in_region.is_empty(),
             "case {service_code}/{region_code}: the Region must have products"
@@ -866,56 +895,101 @@ async fn every_listed_price_list_arn_resolves_to_a_stable_file_url() {
                     render_price_list_file(&state, &path).unwrap_or_else(|| {
                         panic!("case {arn}/{file_format}: nothing is served at {path:?}")
                     });
-                assert_eq!(
-                    file_format, "json",
-                    "case {arn}: unexpected file format {file_format:?}"
-                );
-                assert_eq!(
-                    content_type, "application/json",
-                    "case {arn}/{file_format}: wrong content type"
-                );
-                let file: Value = serde_json::from_str(&body).unwrap_or_else(|e| {
-                    panic!("case {arn}/{file_format}: the file must be JSON: {e}")
-                });
-                assert_eq!(
-                    file.get("offerCode").and_then(Value::as_str),
-                    Some(service_code),
-                    "case {arn}/{file_format}: the file must name its service, got {file}"
-                );
-                assert_eq!(
-                    file.get("currencyCode").and_then(Value::as_str),
-                    Some(currency_code),
-                    "case {arn}/{file_format}: the file must be denominated as listed"
-                );
-                // And denominated in that currency all the way down: a file priced in
-                // another currency than the one its header names cannot be read as a
-                // price list at all.
-                let rates = price_per_unit_currencies(&file);
-                assert!(
-                    !rates.is_empty(),
-                    "case {arn}/{file_format}: the file must carry priced dimensions"
-                );
-                assert_eq!(
-                    rates,
-                    BTreeSet::from([currency_code.to_string()]),
-                    "case {arn}/{file_format}: every rate must be in the file's currency"
-                );
-                let in_file: BTreeSet<String> = file
-                    .get("products")
-                    .and_then(Value::as_object)
-                    .map(|products| products.keys().cloned().collect())
-                    .unwrap_or_default();
-                assert_eq!(
-                    in_file, in_region,
-                    "case {arn}/{file_format}: the file must carry the products of its \
-                     Region"
-                );
-                for sku in &in_region {
-                    assert!(
-                        file.pointer(&format!("/terms/OnDemand/{sku}")).is_some(),
-                        "case {arn}/{file_format}: every product in the file must be \
-                         priced, {sku} is not"
-                    );
+                // Every format the entry lists is served, in that format's own media
+                // type, carrying the same products and the same currency.
+                match file_format.as_str() {
+                    "json" => {
+                        assert_eq!(
+                            content_type, "application/json",
+                            "case {arn}/{file_format}: wrong content type"
+                        );
+                        let file: Value = serde_json::from_str(&body).unwrap_or_else(|e| {
+                            panic!("case {arn}/{file_format}: the file must be JSON: {e}")
+                        });
+                        assert_eq!(
+                            file.get("offerCode").and_then(Value::as_str),
+                            Some(service_code),
+                            "case {arn}/{file_format}: the file must name its service, got \
+                             {file}"
+                        );
+                        assert_eq!(
+                            file.get("currencyCode").and_then(Value::as_str),
+                            Some(currency_code),
+                            "case {arn}/{file_format}: the file must be denominated as listed"
+                        );
+                        // And denominated in that currency all the way down: a file priced
+                        // in another currency than the one its header names cannot be read
+                        // as a price list at all.
+                        let rates = price_per_unit_currencies(&file);
+                        assert!(
+                            !rates.is_empty(),
+                            "case {arn}/{file_format}: the file must carry priced dimensions"
+                        );
+                        assert_eq!(
+                            rates,
+                            BTreeSet::from([currency_code.to_string()]),
+                            "case {arn}/{file_format}: every rate must be in the file's \
+                             currency"
+                        );
+                        let in_file: BTreeSet<String> = file
+                            .get("products")
+                            .and_then(Value::as_object)
+                            .map(|products| products.keys().cloned().collect())
+                            .unwrap_or_default();
+                        assert_eq!(
+                            in_file, in_region,
+                            "case {arn}/{file_format}: the file must carry the products of \
+                             its Region"
+                        );
+                        for sku in &in_region {
+                            assert!(
+                                file.pointer(&format!("/terms/OnDemand/{sku}")).is_some(),
+                                "case {arn}/{file_format}: every product in the file must be \
+                                 priced, {sku} is not"
+                            );
+                        }
+                    }
+                    "csv" => {
+                        assert_eq!(
+                            content_type, "text/csv",
+                            "case {arn}/{file_format}: wrong content type"
+                        );
+                        let (header, rows) = csv_rows(&body);
+                        for column in ["SKU", "RateCode", "TermType", "PricePerUnit", "Currency"] {
+                            assert!(
+                                header.iter().any(|name| name == column),
+                                "case {arn}/{file_format}: the header must carry the \
+                                 {column} column, got {header:?}"
+                            );
+                        }
+                        let priced: BTreeSet<String> =
+                            rows.iter().filter_map(|row| row.first().cloned()).collect();
+                        assert_eq!(
+                            priced, in_region,
+                            "case {arn}/{file_format}: the rows must price the products of \
+                             its Region"
+                        );
+                        let currencies: BTreeSet<String> = rows
+                            .iter()
+                            .filter_map(|row| column_of(&header, row, "Currency"))
+                            .collect();
+                        assert_eq!(
+                            currencies,
+                            BTreeSet::from([currency_code.to_string()]),
+                            "case {arn}/{file_format}: every row must be denominated as \
+                             listed, got {currencies:?}"
+                        );
+                        // Flat and nested are the same data: a row per price dimension.
+                        for row in &rows {
+                            let rate = column_of(&header, row, "PricePerUnit").unwrap_or_default();
+                            assert!(
+                                rate.parse::<f64>().is_ok(),
+                                "case {arn}/{file_format}: every row must state its rate, \
+                                 got {rate:?}"
+                            );
+                        }
+                    }
+                    other => panic!("case {arn}: unexpected file format {other:?}"),
                 }
 
                 // The same ARN and format must resolve to the same URL on every call.

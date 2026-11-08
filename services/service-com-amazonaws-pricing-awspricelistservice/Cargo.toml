@@ -26,6 +26,8 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Encodes/decodes the opaque NextToken payload.
 hex = { workspace = true }
+# Writes the CSV form of a price-list file.
+csv = "1.3"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

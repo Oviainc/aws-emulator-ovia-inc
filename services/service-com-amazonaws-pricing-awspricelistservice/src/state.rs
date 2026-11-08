@@ -97,7 +97,36 @@ const UPFRONT_FEE_UNIT: &str = "Quantity";
 const HOURS_PER_LEASE_YEAR: u64 = 8_760;
 
 /// The file formats each seeded price list is published in.
-const SEEDED_FILE_FORMATS: &[&str] = &["json"];
+///
+/// `GetPriceListFileUrl$FileFormat` is documented as a format "obtained from the
+/// ListPriceLists response", so this list is a CONTRACT: every format named here is one
+/// this catalog renders a file for ([`render_price_list_file`]) and
+/// `GetPriceListFileUrl` resolves. The Price List API publishes each price list both as
+/// the `aws_v1` offer document and as the flat CSV form of the same data; the offer
+/// document is the canonical form, so it is listed first.
+const SEEDED_FILE_FORMATS: &[&str] = &["json", "csv"];
+
+/// The fixed leading columns of a price-list file's CSV form: the identity of one price
+/// dimension, the term it belongs to and the rate it charges. The covered products' own
+/// attribute names follow, one column each, so the flat form carries every dimension
+/// the nested form does.
+const CSV_DIMENSION_COLUMNS: &[&str] = &[
+    "SKU",
+    "OfferTermCode",
+    "RateCode",
+    "TermType",
+    "PriceDescription",
+    "EffectiveDate",
+    "StartingRange",
+    "EndingRange",
+    "Unit",
+    "PricePerUnit",
+    "Currency",
+    "LeaseContractLength",
+    "PurchaseOption",
+    "OfferingClass",
+    "ProductFamily",
+];
 
 /// One product offer in the catalog.
 ///
@@ -273,6 +302,46 @@ impl ComAmazonawsPricingAwspricelistserviceState {
     pub fn publishes_currency(currency_code: &str) -> bool {
         SUPPORTED_CURRENCY_CODES.contains(&currency_code)
     }
+
+    /// The price lists a caller asking for `at_epoch_secs` is published: for each Region
+    /// the service publishes one in, the ONE version in effect at that instant — the
+    /// newest version that took effect on or before it.
+    ///
+    /// `ListPriceLists$EffectiveDate` is "The date that the Price List file prices are
+    /// effective from", so the instant SELECTS a version rather than accumulating the
+    /// history: a Region's price list is reported once, at the version a client asking
+    /// for that date would download. A Region whose earliest version takes effect later
+    /// than the instant has no price list yet, and `region_code` narrows the answer to
+    /// one Region.
+    pub fn price_lists_in_effect(
+        &self,
+        service_code: &str,
+        currency_code: &str,
+        region_code: Option<&str>,
+        at_epoch_secs: i64,
+    ) -> Vec<&PriceListRecord> {
+        let mut in_effect: BTreeMap<Option<String>, &PriceListRecord> = BTreeMap::new();
+        for record in self.price_lists.values() {
+            if record.service_code != service_code || record.currency_code != currency_code {
+                continue;
+            }
+            if region_code.is_some_and(|region| record.region_code.as_deref() != Some(region)) {
+                continue;
+            }
+            if record.effective_epoch_secs() > at_epoch_secs {
+                continue;
+            }
+            in_effect
+                .entry(record.region_code.clone())
+                .and_modify(|held| {
+                    if held.effective_epoch_secs() < record.effective_epoch_secs() {
+                        *held = record;
+                    }
+                })
+                .or_insert(record);
+        }
+        in_effect.into_values().collect()
+    }
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -372,8 +441,19 @@ impl ::emulator_server::HttpHandler for PriceListFileServer {
             if method != ::http::Method::GET && method != ::http::Method::HEAD {
                 return file_response(405, "text/plain", b"only GET and HEAD are served".to_vec());
             }
-            match render_price_list_file(&state, &path) {
-                Some((content_type, body)) => {
+            // The catalog is read under the lock and the file is rendered OFF it, on a
+            // blocking worker: rendering is synchronous CPU work over the whole price
+            // list, so holding the state lock — or the async worker — through it would
+            // make every other caller of this service wait behind one download.
+            let Some(source) = file_source(&state, &path) else {
+                return file_response(
+                    404,
+                    "text/plain",
+                    b"no price-list file at this path".to_vec(),
+                );
+            };
+            match ::tokio::task::spawn_blocking(move || render_file_source(&source)).await {
+                Ok(Some((content_type, body))) => {
                     let body = if method == ::http::Method::HEAD {
                         Vec::new()
                     } else {
@@ -381,7 +461,14 @@ impl ::emulator_server::HttpHandler for PriceListFileServer {
                     };
                     file_response(200, content_type, body)
                 }
-                None => file_response(404, "text/plain", b"no price-list file at this path".to_vec()),
+                // The path DOES name a published file, so neither a render that answered
+                // nothing (a format no renderer serves) nor one that failed outright is a
+                // missing file: both are this service's own fault.
+                Ok(None) | Err(_) => file_response(
+                    500,
+                    "text/plain",
+                    b"the price-list file could not be rendered".to_vec(),
+                ),
             }
         })
     }
@@ -407,11 +494,33 @@ fn file_response(status: u16, content_type: &str, body: Vec<u8>) -> ::http::Resp
 ///
 /// The body is rendered from the catalog on each read — the products the price list
 /// covers and the offer documents `GetProducts` returns for them — so the file and the
-/// API can never disagree.
+/// API can never disagree. The catalog is read under the lock ([`file_source`]) and the
+/// render runs with the lock released ([`render_file_source`]).
 pub fn render_price_list_file(
     state: &::engine::ServiceState<ComAmazonawsPricingAwspricelistserviceState>,
     path: &str,
 ) -> Option<(&'static str, String)> {
+    render_file_source(&file_source(state, path)?)
+}
+
+/// Everything one price-list file is rendered FROM, copied out of the catalog: the
+/// record that describes the file, the format it is published in, and the products it
+/// covers.
+///
+/// Copying is what lets the render run with no lock held. Its size is the price list's
+/// own — the catalog decides it, and no request field multiplies it.
+struct FileSource {
+    record: PriceListRecord,
+    file_format: String,
+    products: Vec<Product>,
+}
+
+/// What the file at `path` is rendered from, or `None` when no price list publishes a
+/// file there. Holds the state lock only for the lookup and the copy.
+fn file_source(
+    state: &::engine::ServiceState<ComAmazonawsPricingAwspricelistserviceState>,
+    path: &str,
+) -> Option<FileSource> {
     let state = state.lock();
     let (record, file_format) = state.price_lists.values().find_map(|record| {
         record
@@ -421,14 +530,32 @@ pub fn render_price_list_file(
             .map(|(format, _)| (record, format.clone()))
     })?;
     let catalog = state.catalog(&record.service_code)?;
-    let products: Vec<&Product> = catalog
+    let products: Vec<Product> = catalog
         .products
         .iter()
         .filter(|product| covers(record, product))
+        .cloned()
         .collect();
+    Some(FileSource {
+        record: record.clone(),
+        file_format,
+        products,
+    })
+}
 
-    match file_format.as_str() {
-        "json" => Some(("application/json", price_list_file_json(record, &products))),
+/// The file one [`FileSource`] renders to, as `(content type, body)`. Pure CPU work over
+/// data already copied out of the catalog, so it holds no lock.
+fn render_file_source(source: &FileSource) -> Option<(&'static str, String)> {
+    let products: Vec<&Product> = source.products.iter().collect();
+    match source.file_format.as_str() {
+        "json" => Some((
+            "application/json",
+            price_list_file_json(&source.record, &products),
+        )),
+        "csv" => Some((
+            "text/csv",
+            price_list_file_csv(&source.record, &products),
+        )),
         // Only the formats a record publishes have a path, so this is unreachable
         // unless a format is added to a record without a renderer for it.
         _ => None,
@@ -459,19 +586,17 @@ fn price_list_file_json(record: &PriceListRecord, products: &[&Product]) -> Stri
     let mut terms: BTreeMap<String, serde_json::Map<String, serde_json::Value>> = BTreeMap::new();
     let percent = currency_percent(&record.currency_code);
     for product in products {
-        let Ok(offer) = serde_json::from_str::<serde_json::Value>(&product.offer_json) else {
+        let Some(offer) = offer_of(product) else {
             continue;
         };
         if let Some(block) = offer.get("product") {
             product_blocks.insert(product.sku.clone(), block.clone());
         }
-        if let Some(offer_terms) = offer.get("terms").and_then(serde_json::Value::as_object) {
-            for (term_type, by_sku) in offer_terms {
-                terms.entry(term_type.clone()).or_default().insert(
-                    product.sku.clone(),
-                    term_in_currency(by_sku, &record.currency_code, percent),
-                );
-            }
+        for (term_type, by_term_code) in converted_terms(&offer, &record.currency_code, percent) {
+            terms
+                .entry(term_type)
+                .or_default()
+                .insert(product.sku.clone(), by_term_code);
         }
     }
     serde_json::json!({
@@ -486,6 +611,137 @@ fn price_list_file_json(record: &PriceListRecord, products: &[&Product]) -> Stri
         "terms": terms,
     })
     .to_string()
+}
+
+/// The `v1.0` price-list file in the CSV form the Price List API also publishes it in:
+/// the same header [`price_list_file_json`] writes, as leading `name,value` lines, then
+/// one ROW per price dimension of every product the price list covers.
+///
+/// It is the FLAT form of exactly the data the offer document nests — rendered from the
+/// same catalog, through the same currency re-denomination — so the two files can never
+/// disagree about what a price list holds.
+fn price_list_file_csv(record: &PriceListRecord, products: &[&Product]) -> String {
+    let percent = currency_percent(&record.currency_code);
+    let attribute_names: BTreeSet<&str> = products
+        .iter()
+        .flat_map(|product| product.attributes.keys().map(String::as_str))
+        .collect();
+    // Flexible: the file's leading header lines are `name,value` pairs, shorter than the
+    // dimension rows that follow them, exactly as the published files are laid out.
+    let mut writer = ::csv::WriterBuilder::new()
+        .flexible(true)
+        .from_writer(Vec::new());
+    for (name, value) in [
+        ("FormatVersion", FILE_FORMAT_VERSION.to_string()),
+        ("Disclaimer", FILE_DISCLAIMER.to_string()),
+        ("Publication Date", record.effective_date_text()),
+        ("Version", record.version()),
+        ("OfferCode", record.service_code.clone()),
+    ] {
+        let _ = writer.write_record([name, value.as_str()]);
+    }
+    let header: Vec<&str> = CSV_DIMENSION_COLUMNS
+        .iter()
+        .copied()
+        .chain(attribute_names.iter().copied())
+        .collect();
+    let _ = writer.write_record(&header);
+
+    for product in products {
+        let Some(offer) = offer_of(product) else {
+            continue;
+        };
+        let product_family = pointer_text(&offer, "/product/productFamily");
+        for (term_type, by_term_code) in converted_terms(&offer, &record.currency_code, percent) {
+            let Some(by_term_code) = by_term_code.as_object() else {
+                continue;
+            };
+            for term in by_term_code.values() {
+                let dimensions = term
+                    .pointer("/priceDimensions")
+                    .and_then(serde_json::Value::as_object);
+                for (rate_code, dimension) in dimensions.into_iter().flatten() {
+                    let mut row = vec![
+                        product.sku.clone(),
+                        pointer_text(term, "/offerTermCode"),
+                        rate_code.clone(),
+                        term_type.clone(),
+                        pointer_text(dimension, "/description"),
+                        pointer_text(term, "/effectiveDate"),
+                        pointer_text(dimension, "/beginRange"),
+                        pointer_text(dimension, "/endRange"),
+                        pointer_text(dimension, "/unit"),
+                        pointer_text(
+                            dimension,
+                            &format!("/pricePerUnit/{}", record.currency_code),
+                        ),
+                        record.currency_code.clone(),
+                        pointer_text(term, "/termAttributes/LeaseContractLength"),
+                        pointer_text(term, "/termAttributes/PurchaseOption"),
+                        pointer_text(term, "/termAttributes/OfferingClass"),
+                        product_family.clone(),
+                    ];
+                    // A product that does not carry one of the file's attributes leaves
+                    // that column empty, so every row has the same shape as the header.
+                    row.extend(attribute_names.iter().map(|name| {
+                        product
+                            .attributes
+                            .get(*name)
+                            .cloned()
+                            .unwrap_or_default()
+                    }));
+                    let _ = writer.write_record(&row);
+                }
+            }
+        }
+    }
+    // The writer writes into a Vec, so neither flushing it nor reading it back as UTF-8
+    // can fail; an empty body rather than a panic is the answer if it ever does.
+    writer
+        .into_inner()
+        .ok()
+        .and_then(|bytes| String::from_utf8(bytes).ok())
+        .unwrap_or_default()
+}
+
+/// The string a JSON pointer names, or the empty string when the document does not
+/// carry it.
+fn pointer_text(document: &serde_json::Value, pointer: &str) -> String {
+    document
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// The parsed `aws_v1` offer document of one product, or `None` when it does not parse.
+fn offer_of(product: &Product) -> Option<serde_json::Value> {
+    serde_json::from_str(&product.offer_json).ok()
+}
+
+/// Every term type an offer document prices its product under, re-denominated in
+/// `currency_code`: each value is that term type's `terms.<type>` block, keyed by offer
+/// term code, exactly as a price-list file nests it.
+fn converted_terms(
+    offer: &serde_json::Value,
+    currency_code: &str,
+    percent: u64,
+) -> BTreeMap<String, serde_json::Value> {
+    offer
+        .get("terms")
+        .and_then(serde_json::Value::as_object)
+        .map(|by_term_type| {
+            by_term_type
+                .iter()
+                .map(|(term_type, by_term_code)| {
+                    (
+                        term_type.clone(),
+                        term_in_currency(by_term_code, currency_code, percent),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// One SKU's terms of a single term type, re-denominated in `currency_code`.
@@ -811,7 +1067,36 @@ fn attributes(pairs: Vec<(&str, String)>) -> BTreeMap<String, String> {
 /// The catalog every emulator starts with: every service code the Price List API
 /// publishes here with the products that price it, plus one price-list file set per
 /// service, Region and published version.
+///
+/// The catalog itself is IMMUTABLE — no operation this service models creates a service,
+/// a product or a price-list file — so it is built ONCE per process
+/// ([`SEEDED_CATALOG`]) and each state takes a copy of it, rather than rendering every
+/// offer document again on each construction.
 fn seeded_catalog() -> ComAmazonawsPricingAwspricelistserviceState {
+    let (services, price_lists) = &*SEEDED_CATALOG;
+    ComAmazonawsPricingAwspricelistserviceState {
+        format_version: DEFAULT_FORMAT_VERSION.to_string(),
+        services: services.clone(),
+        price_lists: price_lists.clone(),
+        // Opened on the first GetPriceListFileUrl, not at construction: opening a
+        // listener is asynchronous and needs the shared engine.
+        file_server: None,
+    }
+}
+
+/// The seeded catalog, as `(services, price lists)`, built on first use.
+#[allow(clippy::type_complexity)]
+static SEEDED_CATALOG: ::std::sync::LazyLock<(
+    BTreeMap<String, ServiceCatalog>,
+    BTreeMap<String, PriceListRecord>,
+)> = ::std::sync::LazyLock::new(build_seeded_catalog);
+
+/// Build the seeded catalog: the services with the products that price them, and the
+/// price-list file sets derived from those products.
+fn build_seeded_catalog() -> (
+    BTreeMap<String, ServiceCatalog>,
+    BTreeMap<String, PriceListRecord>,
+) {
     let mut services: BTreeMap<String, ServiceCatalog> = BTreeMap::new();
     for (service_code, products) in [
         (EC2_SERVICE_CODE, ec2_products()),
@@ -830,15 +1115,7 @@ fn seeded_catalog() -> ComAmazonawsPricingAwspricelistserviceState {
     }
 
     let price_lists = seeded_price_lists(&services);
-
-    ComAmazonawsPricingAwspricelistserviceState {
-        format_version: DEFAULT_FORMAT_VERSION.to_string(),
-        services,
-        price_lists,
-        // Opened on the first GetPriceListFileUrl, not at construction: opening a
-        // listener is asynchronous and needs the shared engine.
-        file_server: None,
-    }
+    (services, price_lists)
 }
 
 /// Build a catalog product from a draft, including the offer document returned for
@@ -1319,25 +1596,220 @@ impl InstanceTypeSeed {
     }
 }
 
-/// The instance types the catalog prices, across every instance family the Price
-/// List API publishes a `instanceFamily` value for here.
+/// The instance types the catalog prices.
+///
+/// The NAMES are the instance types the Price List API publishes `instanceType` values
+/// for, and `vcpu`/`memory` are those types' published specifications; the families
+/// cover every `instanceFamily` the API reports for compute (general purpose, compute /
+/// memory / storage optimized and GPU), and both current- and previous-generation
+/// types. The RATES are this emulator's own, as every file it renders says
+/// ([`FILE_DISCLAIMER`]).
 const EC2_INSTANCE_TYPES: &[InstanceTypeSeed] = &[
+    // --- a1: general purpose, first-generation Graviton -------------------
+    InstanceTypeSeed::new("a1.medium", "General purpose", "1", "2 GiB", "AWS Graviton Processor", "Yes", 255_000_000),
+    InstanceTypeSeed::new("a1.large", "General purpose", "2", "4 GiB", "AWS Graviton Processor", "Yes", 510_000_000),
+    InstanceTypeSeed::new("a1.xlarge", "General purpose", "4", "8 GiB", "AWS Graviton Processor", "Yes", 1_020_000_000),
+    InstanceTypeSeed::new("a1.2xlarge", "General purpose", "8", "16 GiB", "AWS Graviton Processor", "Yes", 2_040_000_000),
+    InstanceTypeSeed::new("a1.4xlarge", "General purpose", "16", "32 GiB", "AWS Graviton Processor", "Yes", 4_080_000_000),
+    InstanceTypeSeed::new("a1.metal", "General purpose", "16", "32 GiB", "AWS Graviton Processor", "Yes", 4_080_000_000),
+    // --- t2 / t3 / t3a / t4g: burstable general purpose --------------------
+    InstanceTypeSeed::new("t2.nano", "General purpose", "1", "0.5 GiB", "Intel Xeon Family", "No", 58_000_000),
     InstanceTypeSeed::new("t2.micro", "General purpose", "1", "1 GiB", "Intel Xeon Family", "No", 116_000_000),
     InstanceTypeSeed::new("t2.small", "General purpose", "1", "2 GiB", "Intel Xeon Family", "No", 230_000_000),
     InstanceTypeSeed::new("t2.medium", "General purpose", "2", "4 GiB", "Intel Xeon Family", "No", 464_000_000),
+    InstanceTypeSeed::new("t2.large", "General purpose", "2", "8 GiB", "Intel Xeon Family", "No", 928_000_000),
+    InstanceTypeSeed::new("t2.xlarge", "General purpose", "4", "16 GiB", "Intel Xeon Family", "No", 1_856_000_000),
+    InstanceTypeSeed::new("t2.2xlarge", "General purpose", "8", "32 GiB", "Intel Xeon Family", "No", 3_712_000_000),
     InstanceTypeSeed::new("t3.nano", "General purpose", "2", "0.5 GiB", "Intel Skylake E5 2686 v5", "Yes", 52_000_000),
     InstanceTypeSeed::new("t3.micro", "General purpose", "2", "1 GiB", "Intel Skylake E5 2686 v5", "Yes", 104_000_000),
     InstanceTypeSeed::new("t3.small", "General purpose", "2", "2 GiB", "Intel Skylake E5 2686 v5", "Yes", 208_000_000),
     InstanceTypeSeed::new("t3.medium", "General purpose", "2", "4 GiB", "Intel Skylake E5 2686 v5", "Yes", 416_000_000),
     InstanceTypeSeed::new("t3.large", "General purpose", "2", "8 GiB", "Intel Skylake E5 2686 v5", "Yes", 832_000_000),
+    InstanceTypeSeed::new("t3.xlarge", "General purpose", "4", "16 GiB", "Intel Skylake E5 2686 v5", "Yes", 1_664_000_000),
+    InstanceTypeSeed::new("t3.2xlarge", "General purpose", "8", "32 GiB", "Intel Skylake E5 2686 v5", "Yes", 3_328_000_000),
+    InstanceTypeSeed::new("t3a.nano", "General purpose", "2", "0.5 GiB", "AMD EPYC 7571", "Yes", 47_000_000),
+    InstanceTypeSeed::new("t3a.micro", "General purpose", "2", "1 GiB", "AMD EPYC 7571", "Yes", 94_000_000),
+    InstanceTypeSeed::new("t3a.small", "General purpose", "2", "2 GiB", "AMD EPYC 7571", "Yes", 188_000_000),
+    InstanceTypeSeed::new("t3a.medium", "General purpose", "2", "4 GiB", "AMD EPYC 7571", "Yes", 376_000_000),
+    InstanceTypeSeed::new("t3a.large", "General purpose", "2", "8 GiB", "AMD EPYC 7571", "Yes", 752_000_000),
+    InstanceTypeSeed::new("t3a.xlarge", "General purpose", "4", "16 GiB", "AMD EPYC 7571", "Yes", 1_504_000_000),
+    InstanceTypeSeed::new("t3a.2xlarge", "General purpose", "8", "32 GiB", "AMD EPYC 7571", "Yes", 3_008_000_000),
+    InstanceTypeSeed::new("t4g.nano", "General purpose", "2", "0.5 GiB", "AWS Graviton2 Processor", "Yes", 42_000_000),
+    InstanceTypeSeed::new("t4g.micro", "General purpose", "2", "1 GiB", "AWS Graviton2 Processor", "Yes", 84_000_000),
+    InstanceTypeSeed::new("t4g.small", "General purpose", "2", "2 GiB", "AWS Graviton2 Processor", "Yes", 168_000_000),
+    InstanceTypeSeed::new("t4g.medium", "General purpose", "2", "4 GiB", "AWS Graviton2 Processor", "Yes", 336_000_000),
+    InstanceTypeSeed::new("t4g.large", "General purpose", "2", "8 GiB", "AWS Graviton2 Processor", "Yes", 672_000_000),
+    InstanceTypeSeed::new("t4g.xlarge", "General purpose", "4", "16 GiB", "AWS Graviton2 Processor", "Yes", 1_344_000_000),
+    InstanceTypeSeed::new("t4g.2xlarge", "General purpose", "8", "32 GiB", "AWS Graviton2 Processor", "Yes", 2_688_000_000),
+    // --- m4 / m5 / m5a / m5n / m6g / m6i: general purpose ------------------
+    InstanceTypeSeed::new("m4.large", "General purpose", "2", "8 GiB", "Intel Xeon E5-2676 v3 (Haswell)", "No", 1_000_000_000),
+    InstanceTypeSeed::new("m4.xlarge", "General purpose", "4", "16 GiB", "Intel Xeon E5-2676 v3 (Haswell)", "No", 2_000_000_000),
+    InstanceTypeSeed::new("m4.2xlarge", "General purpose", "8", "32 GiB", "Intel Xeon E5-2676 v3 (Haswell)", "No", 4_000_000_000),
+    InstanceTypeSeed::new("m4.4xlarge", "General purpose", "16", "64 GiB", "Intel Xeon E5-2676 v3 (Haswell)", "No", 8_000_000_000),
+    InstanceTypeSeed::new("m4.10xlarge", "General purpose", "40", "160 GiB", "Intel Xeon E5-2676 v3 (Haswell)", "No", 20_000_000_000),
+    InstanceTypeSeed::new("m4.16xlarge", "General purpose", "64", "256 GiB", "Intel Xeon E5-2676 v3 (Haswell)", "No", 32_000_000_000),
     InstanceTypeSeed::new("m5.large", "General purpose", "2", "8 GiB", "Intel Xeon Platinum 8175", "Yes", 960_000_000),
     InstanceTypeSeed::new("m5.xlarge", "General purpose", "4", "16 GiB", "Intel Xeon Platinum 8175", "Yes", 1_920_000_000),
     InstanceTypeSeed::new("m5.2xlarge", "General purpose", "8", "32 GiB", "Intel Xeon Platinum 8175", "Yes", 3_840_000_000),
+    InstanceTypeSeed::new("m5.4xlarge", "General purpose", "16", "64 GiB", "Intel Xeon Platinum 8175", "Yes", 7_680_000_000),
+    InstanceTypeSeed::new("m5.8xlarge", "General purpose", "32", "128 GiB", "Intel Xeon Platinum 8175", "Yes", 15_360_000_000),
+    InstanceTypeSeed::new("m5.12xlarge", "General purpose", "48", "192 GiB", "Intel Xeon Platinum 8175", "Yes", 23_040_000_000),
+    InstanceTypeSeed::new("m5.16xlarge", "General purpose", "64", "256 GiB", "Intel Xeon Platinum 8175", "Yes", 30_720_000_000),
+    InstanceTypeSeed::new("m5.24xlarge", "General purpose", "96", "384 GiB", "Intel Xeon Platinum 8175", "Yes", 46_080_000_000),
+    InstanceTypeSeed::new("m5.metal", "General purpose", "96", "384 GiB", "Intel Xeon Platinum 8175", "Yes", 46_080_000_000),
+    InstanceTypeSeed::new("m5a.large", "General purpose", "2", "8 GiB", "AMD EPYC 7571", "Yes", 860_000_000),
+    InstanceTypeSeed::new("m5a.xlarge", "General purpose", "4", "16 GiB", "AMD EPYC 7571", "Yes", 1_720_000_000),
+    InstanceTypeSeed::new("m5a.2xlarge", "General purpose", "8", "32 GiB", "AMD EPYC 7571", "Yes", 3_440_000_000),
+    InstanceTypeSeed::new("m5a.4xlarge", "General purpose", "16", "64 GiB", "AMD EPYC 7571", "Yes", 6_880_000_000),
+    InstanceTypeSeed::new("m5a.8xlarge", "General purpose", "32", "128 GiB", "AMD EPYC 7571", "Yes", 13_760_000_000),
+    InstanceTypeSeed::new("m5a.12xlarge", "General purpose", "48", "192 GiB", "AMD EPYC 7571", "Yes", 20_640_000_000),
+    InstanceTypeSeed::new("m5a.16xlarge", "General purpose", "64", "256 GiB", "AMD EPYC 7571", "Yes", 27_520_000_000),
+    InstanceTypeSeed::new("m5a.24xlarge", "General purpose", "96", "384 GiB", "AMD EPYC 7571", "Yes", 41_280_000_000),
+    InstanceTypeSeed::new("m5n.large", "General purpose", "2", "8 GiB", "Intel Xeon Platinum 8259 (Cascade Lake)", "Yes", 1_190_000_000),
+    InstanceTypeSeed::new("m5n.xlarge", "General purpose", "4", "16 GiB", "Intel Xeon Platinum 8259 (Cascade Lake)", "Yes", 2_380_000_000),
+    InstanceTypeSeed::new("m5n.2xlarge", "General purpose", "8", "32 GiB", "Intel Xeon Platinum 8259 (Cascade Lake)", "Yes", 4_760_000_000),
+    InstanceTypeSeed::new("m5n.4xlarge", "General purpose", "16", "64 GiB", "Intel Xeon Platinum 8259 (Cascade Lake)", "Yes", 9_520_000_000),
+    InstanceTypeSeed::new("m5n.8xlarge", "General purpose", "32", "128 GiB", "Intel Xeon Platinum 8259 (Cascade Lake)", "Yes", 19_040_000_000),
+    InstanceTypeSeed::new("m5n.12xlarge", "General purpose", "48", "192 GiB", "Intel Xeon Platinum 8259 (Cascade Lake)", "Yes", 28_560_000_000),
+    InstanceTypeSeed::new("m5n.16xlarge", "General purpose", "64", "256 GiB", "Intel Xeon Platinum 8259 (Cascade Lake)", "Yes", 38_080_000_000),
+    InstanceTypeSeed::new("m5n.24xlarge", "General purpose", "96", "384 GiB", "Intel Xeon Platinum 8259 (Cascade Lake)", "Yes", 57_120_000_000),
+    InstanceTypeSeed::new("m6g.medium", "General purpose", "1", "4 GiB", "AWS Graviton2 Processor", "Yes", 385_000_000),
+    InstanceTypeSeed::new("m6g.large", "General purpose", "2", "8 GiB", "AWS Graviton2 Processor", "Yes", 770_000_000),
+    InstanceTypeSeed::new("m6g.xlarge", "General purpose", "4", "16 GiB", "AWS Graviton2 Processor", "Yes", 1_540_000_000),
+    InstanceTypeSeed::new("m6g.2xlarge", "General purpose", "8", "32 GiB", "AWS Graviton2 Processor", "Yes", 3_080_000_000),
+    InstanceTypeSeed::new("m6g.4xlarge", "General purpose", "16", "64 GiB", "AWS Graviton2 Processor", "Yes", 6_160_000_000),
+    InstanceTypeSeed::new("m6g.8xlarge", "General purpose", "32", "128 GiB", "AWS Graviton2 Processor", "Yes", 12_320_000_000),
+    InstanceTypeSeed::new("m6g.12xlarge", "General purpose", "48", "192 GiB", "AWS Graviton2 Processor", "Yes", 18_480_000_000),
+    InstanceTypeSeed::new("m6g.16xlarge", "General purpose", "64", "256 GiB", "AWS Graviton2 Processor", "Yes", 24_640_000_000),
+    InstanceTypeSeed::new("m6g.metal", "General purpose", "64", "256 GiB", "AWS Graviton2 Processor", "Yes", 24_640_000_000),
+    InstanceTypeSeed::new("m6i.large", "General purpose", "2", "8 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 960_000_000),
+    InstanceTypeSeed::new("m6i.xlarge", "General purpose", "4", "16 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 1_920_000_000),
+    InstanceTypeSeed::new("m6i.2xlarge", "General purpose", "8", "32 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 3_840_000_000),
+    InstanceTypeSeed::new("m6i.4xlarge", "General purpose", "16", "64 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 7_680_000_000),
+    InstanceTypeSeed::new("m6i.8xlarge", "General purpose", "32", "128 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 15_360_000_000),
+    InstanceTypeSeed::new("m6i.12xlarge", "General purpose", "48", "192 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 23_040_000_000),
+    InstanceTypeSeed::new("m6i.16xlarge", "General purpose", "64", "256 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 30_720_000_000),
+    InstanceTypeSeed::new("m6i.24xlarge", "General purpose", "96", "384 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 46_080_000_000),
+    InstanceTypeSeed::new("m6i.32xlarge", "General purpose", "128", "512 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 61_440_000_000),
+    InstanceTypeSeed::new("m6i.metal", "General purpose", "128", "512 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 61_440_000_000),
+    // --- c1 / c3 / c4 / c5 / c5a / c5n / c6g / c6i: compute optimized ------
+    InstanceTypeSeed::new("c1.medium", "Compute optimized", "2", "1.7 GiB", "Intel Xeon Family", "No", 1_300_000_000),
+    InstanceTypeSeed::new("c1.xlarge", "Compute optimized", "8", "7 GiB", "Intel Xeon Family", "No", 5_200_000_000),
+    InstanceTypeSeed::new("c3.large", "Compute optimized", "2", "3.75 GiB", "Intel Xeon E5-2680 v2 (Ivy Bridge)", "No", 1_050_000_000),
+    InstanceTypeSeed::new("c3.xlarge", "Compute optimized", "4", "7.5 GiB", "Intel Xeon E5-2680 v2 (Ivy Bridge)", "No", 2_100_000_000),
+    InstanceTypeSeed::new("c3.2xlarge", "Compute optimized", "8", "15 GiB", "Intel Xeon E5-2680 v2 (Ivy Bridge)", "No", 4_200_000_000),
+    InstanceTypeSeed::new("c3.4xlarge", "Compute optimized", "16", "30 GiB", "Intel Xeon E5-2680 v2 (Ivy Bridge)", "No", 8_400_000_000),
+    InstanceTypeSeed::new("c3.8xlarge", "Compute optimized", "32", "60 GiB", "Intel Xeon E5-2680 v2 (Ivy Bridge)", "No", 16_800_000_000),
+    InstanceTypeSeed::new("c4.large", "Compute optimized", "2", "3.75 GiB", "Intel Xeon E5-2666 v3 (Haswell)", "No", 1_000_000_000),
+    InstanceTypeSeed::new("c4.xlarge", "Compute optimized", "4", "7.5 GiB", "Intel Xeon E5-2666 v3 (Haswell)", "No", 1_990_000_000),
+    InstanceTypeSeed::new("c4.2xlarge", "Compute optimized", "8", "15 GiB", "Intel Xeon E5-2666 v3 (Haswell)", "No", 3_980_000_000),
+    InstanceTypeSeed::new("c4.4xlarge", "Compute optimized", "16", "30 GiB", "Intel Xeon E5-2666 v3 (Haswell)", "No", 7_960_000_000),
+    InstanceTypeSeed::new("c4.8xlarge", "Compute optimized", "36", "60 GiB", "Intel Xeon E5-2666 v3 (Haswell)", "No", 15_910_000_000),
     InstanceTypeSeed::new("c5.large", "Compute optimized", "2", "4 GiB", "Intel Xeon Platinum 8124M", "Yes", 850_000_000),
     InstanceTypeSeed::new("c5.xlarge", "Compute optimized", "4", "8 GiB", "Intel Xeon Platinum 8124M", "Yes", 1_700_000_000),
+    InstanceTypeSeed::new("c5.2xlarge", "Compute optimized", "8", "16 GiB", "Intel Xeon Platinum 8124M", "Yes", 3_400_000_000),
+    InstanceTypeSeed::new("c5.4xlarge", "Compute optimized", "16", "32 GiB", "Intel Xeon Platinum 8124M", "Yes", 6_800_000_000),
+    InstanceTypeSeed::new("c5.9xlarge", "Compute optimized", "36", "72 GiB", "Intel Xeon Platinum 8124M", "Yes", 15_300_000_000),
+    InstanceTypeSeed::new("c5.12xlarge", "Compute optimized", "48", "96 GiB", "Intel Xeon Platinum 8275CL", "Yes", 20_400_000_000),
+    InstanceTypeSeed::new("c5.18xlarge", "Compute optimized", "72", "144 GiB", "Intel Xeon Platinum 8124M", "Yes", 30_600_000_000),
+    InstanceTypeSeed::new("c5.24xlarge", "Compute optimized", "96", "192 GiB", "Intel Xeon Platinum 8275CL", "Yes", 40_800_000_000),
+    InstanceTypeSeed::new("c5.metal", "Compute optimized", "96", "192 GiB", "Intel Xeon Platinum 8275CL", "Yes", 40_800_000_000),
+    InstanceTypeSeed::new("c5a.large", "Compute optimized", "2", "4 GiB", "AMD EPYC 7R32", "Yes", 770_000_000),
+    InstanceTypeSeed::new("c5a.xlarge", "Compute optimized", "4", "8 GiB", "AMD EPYC 7R32", "Yes", 1_540_000_000),
+    InstanceTypeSeed::new("c5a.2xlarge", "Compute optimized", "8", "16 GiB", "AMD EPYC 7R32", "Yes", 3_080_000_000),
+    InstanceTypeSeed::new("c5a.4xlarge", "Compute optimized", "16", "32 GiB", "AMD EPYC 7R32", "Yes", 6_160_000_000),
+    InstanceTypeSeed::new("c5a.8xlarge", "Compute optimized", "32", "64 GiB", "AMD EPYC 7R32", "Yes", 12_320_000_000),
+    InstanceTypeSeed::new("c5a.12xlarge", "Compute optimized", "48", "96 GiB", "AMD EPYC 7R32", "Yes", 18_480_000_000),
+    InstanceTypeSeed::new("c5a.16xlarge", "Compute optimized", "64", "128 GiB", "AMD EPYC 7R32", "Yes", 24_640_000_000),
+    InstanceTypeSeed::new("c5a.24xlarge", "Compute optimized", "96", "192 GiB", "AMD EPYC 7R32", "Yes", 36_960_000_000),
+    InstanceTypeSeed::new("c5n.large", "Compute optimized", "2", "5.25 GiB", "Intel Xeon Platinum 8124M", "Yes", 1_080_000_000),
+    InstanceTypeSeed::new("c5n.xlarge", "Compute optimized", "4", "10.5 GiB", "Intel Xeon Platinum 8124M", "Yes", 2_160_000_000),
+    InstanceTypeSeed::new("c5n.2xlarge", "Compute optimized", "8", "21 GiB", "Intel Xeon Platinum 8124M", "Yes", 4_320_000_000),
+    InstanceTypeSeed::new("c5n.4xlarge", "Compute optimized", "16", "42 GiB", "Intel Xeon Platinum 8124M", "Yes", 8_640_000_000),
+    InstanceTypeSeed::new("c5n.9xlarge", "Compute optimized", "36", "96 GiB", "Intel Xeon Platinum 8124M", "Yes", 19_440_000_000),
+    InstanceTypeSeed::new("c5n.18xlarge", "Compute optimized", "72", "192 GiB", "Intel Xeon Platinum 8124M", "Yes", 38_880_000_000),
+    InstanceTypeSeed::new("c5n.metal", "Compute optimized", "72", "192 GiB", "Intel Xeon Platinum 8124M", "Yes", 38_880_000_000),
+    InstanceTypeSeed::new("c6g.medium", "Compute optimized", "1", "2 GiB", "AWS Graviton2 Processor", "Yes", 340_000_000),
+    InstanceTypeSeed::new("c6g.large", "Compute optimized", "2", "4 GiB", "AWS Graviton2 Processor", "Yes", 680_000_000),
+    InstanceTypeSeed::new("c6g.xlarge", "Compute optimized", "4", "8 GiB", "AWS Graviton2 Processor", "Yes", 1_360_000_000),
+    InstanceTypeSeed::new("c6g.2xlarge", "Compute optimized", "8", "16 GiB", "AWS Graviton2 Processor", "Yes", 2_720_000_000),
+    InstanceTypeSeed::new("c6g.4xlarge", "Compute optimized", "16", "32 GiB", "AWS Graviton2 Processor", "Yes", 5_440_000_000),
+    InstanceTypeSeed::new("c6g.8xlarge", "Compute optimized", "32", "64 GiB", "AWS Graviton2 Processor", "Yes", 10_880_000_000),
+    InstanceTypeSeed::new("c6g.12xlarge", "Compute optimized", "48", "96 GiB", "AWS Graviton2 Processor", "Yes", 16_320_000_000),
+    InstanceTypeSeed::new("c6g.16xlarge", "Compute optimized", "64", "128 GiB", "AWS Graviton2 Processor", "Yes", 21_760_000_000),
+    InstanceTypeSeed::new("c6g.metal", "Compute optimized", "64", "128 GiB", "AWS Graviton2 Processor", "Yes", 21_760_000_000),
+    InstanceTypeSeed::new("c6i.large", "Compute optimized", "2", "4 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 850_000_000),
+    InstanceTypeSeed::new("c6i.xlarge", "Compute optimized", "4", "8 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 1_700_000_000),
+    InstanceTypeSeed::new("c6i.2xlarge", "Compute optimized", "8", "16 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 3_400_000_000),
+    InstanceTypeSeed::new("c6i.4xlarge", "Compute optimized", "16", "32 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 6_800_000_000),
+    InstanceTypeSeed::new("c6i.8xlarge", "Compute optimized", "32", "64 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 13_600_000_000),
+    InstanceTypeSeed::new("c6i.12xlarge", "Compute optimized", "48", "96 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 20_400_000_000),
+    InstanceTypeSeed::new("c6i.16xlarge", "Compute optimized", "64", "128 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 27_200_000_000),
+    InstanceTypeSeed::new("c6i.24xlarge", "Compute optimized", "96", "192 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 40_800_000_000),
+    InstanceTypeSeed::new("c6i.32xlarge", "Compute optimized", "128", "256 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 54_400_000_000),
+    InstanceTypeSeed::new("c6i.metal", "Compute optimized", "128", "256 GiB", "Intel Xeon 8375C (Ice Lake)", "Yes", 54_400_000_000),
+    // --- r4 / r5 / r6g / x1 / x1e / z1d: memory optimized ------------------
+    InstanceTypeSeed::new("r4.large", "Memory optimized", "2", "15.25 GiB", "Intel Xeon E5-2686 v4 (Broadwell)", "No", 1_330_000_000),
+    InstanceTypeSeed::new("r4.xlarge", "Memory optimized", "4", "30.5 GiB", "Intel Xeon E5-2686 v4 (Broadwell)", "No", 2_660_000_000),
+    InstanceTypeSeed::new("r4.2xlarge", "Memory optimized", "8", "61 GiB", "Intel Xeon E5-2686 v4 (Broadwell)", "No", 5_320_000_000),
+    InstanceTypeSeed::new("r4.4xlarge", "Memory optimized", "16", "122 GiB", "Intel Xeon E5-2686 v4 (Broadwell)", "No", 10_640_000_000),
+    InstanceTypeSeed::new("r4.8xlarge", "Memory optimized", "32", "244 GiB", "Intel Xeon E5-2686 v4 (Broadwell)", "No", 21_280_000_000),
+    InstanceTypeSeed::new("r4.16xlarge", "Memory optimized", "64", "488 GiB", "Intel Xeon E5-2686 v4 (Broadwell)", "No", 42_560_000_000),
     InstanceTypeSeed::new("r5.large", "Memory optimized", "2", "16 GiB", "Intel Xeon Platinum 8175", "Yes", 1_260_000_000),
     InstanceTypeSeed::new("r5.xlarge", "Memory optimized", "4", "32 GiB", "Intel Xeon Platinum 8175", "Yes", 2_520_000_000),
-    InstanceTypeSeed::new("m6g.large", "General purpose", "2", "8 GiB", "AWS Graviton2 Processor", "Yes", 770_000_000),
+    InstanceTypeSeed::new("r5.2xlarge", "Memory optimized", "8", "64 GiB", "Intel Xeon Platinum 8175", "Yes", 5_040_000_000),
+    InstanceTypeSeed::new("r5.4xlarge", "Memory optimized", "16", "128 GiB", "Intel Xeon Platinum 8175", "Yes", 10_080_000_000),
+    InstanceTypeSeed::new("r5.8xlarge", "Memory optimized", "32", "256 GiB", "Intel Xeon Platinum 8259 (Cascade Lake)", "Yes", 20_160_000_000),
+    InstanceTypeSeed::new("r5.12xlarge", "Memory optimized", "48", "384 GiB", "Intel Xeon Platinum 8175", "Yes", 30_240_000_000),
+    InstanceTypeSeed::new("r5.16xlarge", "Memory optimized", "64", "512 GiB", "Intel Xeon Platinum 8259 (Cascade Lake)", "Yes", 40_320_000_000),
+    InstanceTypeSeed::new("r5.24xlarge", "Memory optimized", "96", "768 GiB", "Intel Xeon Platinum 8175", "Yes", 60_480_000_000),
+    InstanceTypeSeed::new("r5.metal", "Memory optimized", "96", "768 GiB", "Intel Xeon Platinum 8175", "Yes", 60_480_000_000),
+    InstanceTypeSeed::new("r6g.medium", "Memory optimized", "1", "8 GiB", "AWS Graviton2 Processor", "Yes", 504_000_000),
+    InstanceTypeSeed::new("r6g.large", "Memory optimized", "2", "16 GiB", "AWS Graviton2 Processor", "Yes", 1_008_000_000),
+    InstanceTypeSeed::new("r6g.xlarge", "Memory optimized", "4", "32 GiB", "AWS Graviton2 Processor", "Yes", 2_016_000_000),
+    InstanceTypeSeed::new("r6g.2xlarge", "Memory optimized", "8", "64 GiB", "AWS Graviton2 Processor", "Yes", 4_032_000_000),
+    InstanceTypeSeed::new("r6g.4xlarge", "Memory optimized", "16", "128 GiB", "AWS Graviton2 Processor", "Yes", 8_064_000_000),
+    InstanceTypeSeed::new("r6g.8xlarge", "Memory optimized", "32", "256 GiB", "AWS Graviton2 Processor", "Yes", 16_128_000_000),
+    InstanceTypeSeed::new("r6g.12xlarge", "Memory optimized", "48", "384 GiB", "AWS Graviton2 Processor", "Yes", 24_192_000_000),
+    InstanceTypeSeed::new("r6g.16xlarge", "Memory optimized", "64", "512 GiB", "AWS Graviton2 Processor", "Yes", 32_256_000_000),
+    InstanceTypeSeed::new("r6g.metal", "Memory optimized", "64", "512 GiB", "AWS Graviton2 Processor", "Yes", 32_256_000_000),
+    InstanceTypeSeed::new("x1.16xlarge", "Memory optimized", "64", "976 GiB", "Intel Xeon E7-8880 v3 (Haswell)", "No", 66_690_000_000),
+    InstanceTypeSeed::new("x1.32xlarge", "Memory optimized", "128", "1952 GiB", "Intel Xeon E7-8880 v3 (Haswell)", "No", 133_380_000_000),
+    InstanceTypeSeed::new("x1e.xlarge", "Memory optimized", "4", "122 GiB", "Intel Xeon E7-8880 v3 (Haswell)", "No", 8_340_000_000),
+    InstanceTypeSeed::new("x1e.2xlarge", "Memory optimized", "8", "244 GiB", "Intel Xeon E7-8880 v3 (Haswell)", "No", 16_680_000_000),
+    InstanceTypeSeed::new("x1e.4xlarge", "Memory optimized", "16", "488 GiB", "Intel Xeon E7-8880 v3 (Haswell)", "No", 33_360_000_000),
+    InstanceTypeSeed::new("x1e.8xlarge", "Memory optimized", "32", "976 GiB", "Intel Xeon E7-8880 v3 (Haswell)", "No", 66_720_000_000),
+    InstanceTypeSeed::new("x1e.16xlarge", "Memory optimized", "64", "1952 GiB", "Intel Xeon E7-8880 v3 (Haswell)", "No", 133_440_000_000),
+    InstanceTypeSeed::new("x1e.32xlarge", "Memory optimized", "128", "3904 GiB", "Intel Xeon E7-8880 v3 (Haswell)", "No", 266_880_000_000),
+    InstanceTypeSeed::new("z1d.large", "Memory optimized", "2", "16 GiB", "Intel Xeon Platinum 8151", "Yes", 1_860_000_000),
+    InstanceTypeSeed::new("z1d.xlarge", "Memory optimized", "4", "32 GiB", "Intel Xeon Platinum 8151", "Yes", 3_720_000_000),
+    InstanceTypeSeed::new("z1d.2xlarge", "Memory optimized", "8", "64 GiB", "Intel Xeon Platinum 8151", "Yes", 7_440_000_000),
+    InstanceTypeSeed::new("z1d.3xlarge", "Memory optimized", "12", "96 GiB", "Intel Xeon Platinum 8151", "Yes", 11_160_000_000),
+    InstanceTypeSeed::new("z1d.6xlarge", "Memory optimized", "24", "192 GiB", "Intel Xeon Platinum 8151", "Yes", 22_320_000_000),
+    InstanceTypeSeed::new("z1d.12xlarge", "Memory optimized", "48", "384 GiB", "Intel Xeon Platinum 8151", "Yes", 44_640_000_000),
+    InstanceTypeSeed::new("z1d.metal", "Memory optimized", "48", "384 GiB", "Intel Xeon Platinum 8151", "Yes", 44_640_000_000),
+    // --- d2 / i3: storage optimized ---------------------------------------
+    InstanceTypeSeed::new("d2.xlarge", "Storage optimized", "4", "30.5 GiB", "Intel Xeon E5-2676 v3 (Haswell)", "No", 6_900_000_000),
+    InstanceTypeSeed::new("d2.2xlarge", "Storage optimized", "8", "61 GiB", "Intel Xeon E5-2676 v3 (Haswell)", "No", 13_800_000_000),
+    InstanceTypeSeed::new("d2.4xlarge", "Storage optimized", "16", "122 GiB", "Intel Xeon E5-2676 v3 (Haswell)", "No", 27_600_000_000),
+    InstanceTypeSeed::new("d2.8xlarge", "Storage optimized", "36", "244 GiB", "Intel Xeon E5-2676 v3 (Haswell)", "No", 55_200_000_000),
+    InstanceTypeSeed::new("i3.large", "Storage optimized", "2", "15.25 GiB", "Intel Xeon E5-2686 v4 (Broadwell)", "Yes", 1_560_000_000),
+    InstanceTypeSeed::new("i3.xlarge", "Storage optimized", "4", "30.5 GiB", "Intel Xeon E5-2686 v4 (Broadwell)", "Yes", 3_120_000_000),
+    InstanceTypeSeed::new("i3.2xlarge", "Storage optimized", "8", "61 GiB", "Intel Xeon E5-2686 v4 (Broadwell)", "Yes", 6_240_000_000),
+    InstanceTypeSeed::new("i3.4xlarge", "Storage optimized", "16", "122 GiB", "Intel Xeon E5-2686 v4 (Broadwell)", "Yes", 12_480_000_000),
+    InstanceTypeSeed::new("i3.8xlarge", "Storage optimized", "32", "244 GiB", "Intel Xeon E5-2686 v4 (Broadwell)", "Yes", 24_960_000_000),
+    InstanceTypeSeed::new("i3.16xlarge", "Storage optimized", "64", "488 GiB", "Intel Xeon E5-2686 v4 (Broadwell)", "Yes", 49_920_000_000),
+    InstanceTypeSeed::new("i3.metal", "Storage optimized", "72", "512 GiB", "Intel Xeon E5-2686 v4 (Broadwell)", "Yes", 49_920_000_000),
+    // --- g4dn / p3: GPU ----------------------------------------------------
+    InstanceTypeSeed::new("g4dn.xlarge", "GPU instance", "4", "16 GiB", "Intel Xeon Family", "Yes", 5_260_000_000),
+    InstanceTypeSeed::new("g4dn.2xlarge", "GPU instance", "8", "32 GiB", "Intel Xeon Family", "Yes", 7_520_000_000),
+    InstanceTypeSeed::new("g4dn.4xlarge", "GPU instance", "16", "64 GiB", "Intel Xeon Family", "Yes", 12_040_000_000),
+    InstanceTypeSeed::new("g4dn.8xlarge", "GPU instance", "32", "128 GiB", "Intel Xeon Family", "Yes", 21_760_000_000),
+    InstanceTypeSeed::new("g4dn.12xlarge", "GPU instance", "48", "192 GiB", "Intel Xeon Family", "Yes", 39_120_000_000),
+    InstanceTypeSeed::new("g4dn.16xlarge", "GPU instance", "64", "256 GiB", "Intel Xeon Family", "Yes", 43_520_000_000),
+    InstanceTypeSeed::new("p3.2xlarge", "GPU instance", "8", "61 GiB", "Intel Xeon E5-2686 v4 (Broadwell)", "Yes", 30_600_000_000),
+    InstanceTypeSeed::new("p3.8xlarge", "GPU instance", "32", "244 GiB", "Intel Xeon E5-2686 v4 (Broadwell)", "Yes", 122_400_000_000),
+    InstanceTypeSeed::new("p3.16xlarge", "GPU instance", "64", "488 GiB", "Intel Xeon E5-2686 v4 (Broadwell)", "Yes", 244_800_000_000),
 ];
 
 /// The instance type `name` names, or `None` when the catalog prices no such type.
@@ -1386,7 +1858,8 @@ struct ComputePlan {
     operation: &'static str,
     /// This operating system's rate as a percentage of the Linux rate.
     rate_percent: u64,
-    instance_types: &'static [&'static str],
+    /// The instance types this Region prices under this operating system.
+    instance_types: PlannedInstanceTypes,
 }
 
 impl ComputePlan {
@@ -1396,7 +1869,7 @@ impl ComputePlan {
         license_model: &'static str,
         operation: &'static str,
         rate_percent: u64,
-        instance_types: &'static [&'static str],
+        instance_types: PlannedInstanceTypes,
     ) -> Self {
         Self {
             region_code,
@@ -1409,16 +1882,113 @@ impl ComputePlan {
     }
 }
 
-/// The instance types every Region in the catalog prices under Linux: the entry-level
-/// burstable sizes, which AWS offers in every commercial Region. Every Region therefore
-/// prices them, so a filtered lookup for one of them matches a product per Region —
-/// more than one page's worth — and `location` enumerates every Region the catalog
-/// publishes.
-const BURSTABLE_EVERYWHERE: &[&str] = &["t3.nano", "t3.micro"];
+/// The instance types every Region in the catalog prices: one current-generation size
+/// per family the Price List API publishes, plus previous-generation ones, which AWS
+/// offers in every commercial Region. Every Region therefore prices them, so a filtered
+/// lookup for one of them matches products across the whole catalog — more than one
+/// page's worth — and `location` enumerates every Region the catalog publishes.
+const COMMON_INSTANCE_TYPES: &[&str] = &[
+    "t3.nano",
+    "t3.micro",
+    "t3.small",
+    "t3.medium",
+    "t2.micro",
+    "m5.large",
+    "m5.xlarge",
+    "m6g.large",
+    "c5.large",
+    "c5.xlarge",
+    "c6g.large",
+    "r5.large",
+    "r6g.large",
+    "m4.large",
+    "c4.large",
+    "i3.large",
+];
+
+/// Which instance types a [`ComputePlan`] prices.
+enum PlannedInstanceTypes {
+    /// Every instance type the catalog publishes — what AWS does in the Region it
+    /// launches the whole fleet in, and what makes
+    /// `GetAttributeValues(AmazonEC2, instanceType)` enumerate the published value set
+    /// rather than a sample of it.
+    Every,
+    /// Exactly the types named, of those the catalog publishes.
+    Named(&'static [&'static str]),
+}
+
+/// One compute SKU dimension beside the instance type, the Region and the operating
+/// system: who the hardware is dedicated to, and whether the hour is capacity in use or
+/// capacity a reservation holds unused.
+struct CapacitySeed {
+    /// The `tenancy` attribute.
+    tenancy: &'static str,
+    /// The `capacitystatus` attribute.
+    capacity_status: &'static str,
+    /// The usage this combination is billed under, which is what the `usagetype`
+    /// attribute names it by (`BoxUsage:<instance type>`).
+    usage_kind: &'static str,
+}
+
+/// The tenancy and capacity statuses the Price List API publishes a separate SKU for.
+///
+/// AWS bills a dedicated instance at the same hourly rate as a shared one (its
+/// dedicated charge is per Region, not per instance) and bills the hours a capacity
+/// reservation holds unused at the instance's own rate — so these differ in the usage
+/// they are billed under, not in the rate.
+const CAPACITY_SEEDS: &[CapacitySeed] = &[
+    CapacitySeed {
+        tenancy: "Shared",
+        capacity_status: "Used",
+        usage_kind: "BoxUsage",
+    },
+    CapacitySeed {
+        tenancy: "Shared",
+        capacity_status: "UnusedCapacityReservation",
+        usage_kind: "UnusedBox",
+    },
+    CapacitySeed {
+        tenancy: "Dedicated",
+        capacity_status: "Used",
+        usage_kind: "DedicatedUsage",
+    },
+    CapacitySeed {
+        tenancy: "Dedicated",
+        capacity_status: "UnusedCapacityReservation",
+        usage_kind: "UnusedDed",
+    },
+];
+
+/// The operating systems the launch Region prices the published fleet under, beyond
+/// Linux: a licensed platform's rate includes its license, which is the `licenseModel`
+/// the Price List API reports for it.
+const WINDOWS_INSTANCE_TYPES: &[&str] = &[
+    "t2.micro",
+    "t2.small",
+    "t2.medium",
+    "t3.nano",
+    "t3.micro",
+    "t3.small",
+    "t3.medium",
+    "t3.large",
+    "m4.large",
+    "m5.large",
+    "m5.xlarge",
+    "m5.2xlarge",
+    "m6i.large",
+    "c4.large",
+    "c5.large",
+    "c5.xlarge",
+    "c6i.large",
+    "r4.large",
+    "r5.large",
+    "r5.xlarge",
+    "z1d.large",
+];
 
 /// The compute instances the catalog prices. Every Region carries
-/// [`BURSTABLE_EVERYWHERE`]; the larger Regions carry more of the type list, and
-/// `us-east-1` carries all of it.
+/// [`COMMON_INSTANCE_TYPES`]; `us-east-1`, where AWS launches the whole fleet, carries
+/// every type the catalog publishes.
 const EC2_COMPUTE_PLAN: &[ComputePlan] = &[
     ComputePlan::new(
         "us-east-1",
@@ -1426,56 +1996,39 @@ const EC2_COMPUTE_PLAN: &[ComputePlan] = &[
         NO_LICENSE_REQUIRED,
         "RunInstances",
         100,
-        &[
-            "t3.nano",
-            "t3.micro",
-            "t2.micro",
-            "t2.small",
-            "t2.medium",
-            "t3.small",
-            "t3.medium",
-            "t3.large",
-            "m5.large",
-            "m5.xlarge",
-            "m5.2xlarge",
-            "c5.large",
-            "c5.xlarge",
-            "r5.large",
-            "r5.xlarge",
-            "m6g.large",
-        ],
+        PlannedInstanceTypes::Every,
     ),
-    ComputePlan::new("us-east-1", "Windows", LICENSE_INCLUDED, "RunInstances:0002", 200, &["t3.nano", "t3.micro", "m5.large"]),
-    ComputePlan::new("us-east-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.nano", "t3.micro", "m5.large"]),
-    ComputePlan::new("us-west-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("us-west-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.nano", "t3.micro", "m5.large", "c5.large"]),
-    ComputePlan::new("us-west-2", "Windows", LICENSE_INCLUDED, "RunInstances:0002", 200, &["m5.large"]),
-    ComputePlan::new("ca-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("ca-west-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("eu-west-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.nano", "t3.micro", "t3.small", "m5.large"]),
-    ComputePlan::new("eu-west-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("eu-west-3", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("eu-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.nano", "t3.micro", "m5.large"]),
-    ComputePlan::new("eu-central-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("eu-north-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("eu-south-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("ap-northeast-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, &["t3.nano", "t3.micro", "m5.large"]),
-    ComputePlan::new("ap-northeast-1", "Windows", LICENSE_INCLUDED, "RunInstances:0002", 200, &["m5.large"]),
-    ComputePlan::new("ap-northeast-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("ap-northeast-3", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("ap-southeast-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("ap-southeast-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("ap-southeast-3", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("ap-south-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("ap-south-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("ap-east-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("sa-east-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("af-south-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("il-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("me-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("me-south-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("cn-north-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
-    ComputePlan::new("cn-northwest-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, BURSTABLE_EVERYWHERE),
+    ComputePlan::new("us-east-1", "Windows", LICENSE_INCLUDED, "RunInstances:0002", 200, PlannedInstanceTypes::Named(WINDOWS_INSTANCE_TYPES)),
+    ComputePlan::new("us-east-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("us-west-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("us-west-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("us-west-2", "Windows", LICENSE_INCLUDED, "RunInstances:0002", 200, PlannedInstanceTypes::Named(&["m5.large"])),
+    ComputePlan::new("ca-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ca-west-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("eu-west-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("eu-west-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("eu-west-3", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("eu-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("eu-central-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("eu-north-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("eu-south-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ap-northeast-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ap-northeast-1", "Windows", LICENSE_INCLUDED, "RunInstances:0002", 200, PlannedInstanceTypes::Named(&["m5.large"])),
+    ComputePlan::new("ap-northeast-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ap-northeast-3", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ap-southeast-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ap-southeast-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ap-southeast-3", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ap-south-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ap-south-2", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("ap-east-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("sa-east-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("af-south-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("il-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("me-central-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("me-south-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("cn-north-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
+    ComputePlan::new("cn-northwest-1", "Linux", NO_LICENSE_REQUIRED, "RunInstances", 100, PlannedInstanceTypes::Named(COMMON_INSTANCE_TYPES)),
 ];
 
 // --- AmazonEC2: EBS volumes ------------------------------------------------
@@ -1493,53 +2046,145 @@ struct VolumeSeed {
     usagetype: &'static str,
     /// The us-east-1 rate per GB-month, in 1e-10 USD.
     rate_e10: u64,
+    /// The provisioned IOPS a volume whose IOPS are billed SEPARATELY from its storage
+    /// is priced per, as `(usage type, rate per IOPS-month in 1e-10 USD)`; `None` for a
+    /// volume whose IOPS are included in its storage rate.
+    provisioned_iops: Option<(&'static str, u64)>,
+    /// The provisioned throughput a volume whose throughput is billed separately is
+    /// priced per, as `(usage type, rate per MiBps-month in 1e-10 USD)`.
+    provisioned_throughput: Option<(&'static str, u64)>,
 }
 
 impl VolumeSeed {
-    const fn new(
-        volume_type: &'static str,
-        volume_api_name: &'static str,
-        storage_media: &'static str,
-        max_iops: &'static str,
-        max_throughput: &'static str,
-        usagetype: &'static str,
-        rate_e10: u64,
-    ) -> Self {
-        Self {
-            volume_type,
-            volume_api_name,
-            storage_media,
-            max_iops,
-            max_throughput,
-            usagetype,
-            rate_e10,
-        }
+    /// The provisioned dimensions this volume type is billed for beside its storage, in
+    /// the order the catalog publishes them.
+    fn provisioned(&self) -> Vec<(&'static ProvisionedKind, &'static str, u64)> {
+        [
+            (&IOPS_KIND, self.provisioned_iops),
+            (&THROUGHPUT_KIND, self.provisioned_throughput),
+        ]
+        .into_iter()
+        .filter_map(|(kind, provisioned)| {
+            provisioned.map(|(usagetype, rate_e10)| (kind, usagetype, rate_e10))
+        })
+        .collect()
     }
 }
 
-/// The EBS volume types the catalog prices, one per volume API name AWS publishes.
+/// The EBS volume types the catalog prices, one per volume API name AWS publishes, with
+/// the `volumeType` label the Price List API reports for it.
+///
+/// A volume whose provisioned IOPS or throughput are billed on their own carries those
+/// as SEPARATE priced products, as the Price List API publishes them (a `System
+/// Operation` / `Provisioned Throughput` product beside the `Storage` one).
 const EBS_VOLUMES: &[VolumeSeed] = &[
-    VolumeSeed::new("General Purpose", "gp3", "SSD-backed", "16000", "1000 MiB/s", "EBS:VolumeUsage.gp3", 800_000_000),
-    VolumeSeed::new("Provisioned IOPS", "io2", "SSD-backed", "64000", "1000 MiB/s", "EBS:VolumeUsage.io2", 1_250_000_000),
-    VolumeSeed::new("Magnetic", "standard", "HDD-backed", "40 - 200", "40 - 90 MB/sec", "EBS:VolumeUsage", 500_000_000),
-    VolumeSeed::new("Cold HDD", "sc1", "HDD-backed", "250", "250 MiB/s", "EBS:VolumeUsage.sc1", 150_000_000),
-    VolumeSeed::new("Throughput Optimized HDD", "st1", "HDD-backed", "500", "500 MiB/s", "EBS:VolumeUsage.st1", 450_000_000),
+    VolumeSeed {
+        volume_type: "General Purpose",
+        volume_api_name: "gp2",
+        storage_media: "SSD-backed",
+        max_iops: "16000",
+        max_throughput: "250 MiB/s",
+        usagetype: "EBS:VolumeUsage.gp2",
+        rate_e10: 1_000_000_000,
+        provisioned_iops: None,
+        provisioned_throughput: None,
+    },
+    VolumeSeed {
+        volume_type: "General Purpose",
+        volume_api_name: "gp3",
+        storage_media: "SSD-backed",
+        max_iops: "16000",
+        max_throughput: "1000 MiB/s",
+        usagetype: "EBS:VolumeUsage.gp3",
+        rate_e10: 800_000_000,
+        provisioned_iops: Some(("EBS:VolumeP-IOPS.gp3", 50_000_000)),
+        provisioned_throughput: Some(("EBS:VolumeP-Throughput.gp3", 400_000_000)),
+    },
+    VolumeSeed {
+        volume_type: "Provisioned IOPS",
+        volume_api_name: "io1",
+        storage_media: "SSD-backed",
+        max_iops: "64000",
+        max_throughput: "1000 MiB/s",
+        usagetype: "EBS:VolumeUsage.piops",
+        rate_e10: 1_250_000_000,
+        provisioned_iops: Some(("EBS:VolumeP-IOPS.piops", 650_000_000)),
+        provisioned_throughput: None,
+    },
+    VolumeSeed {
+        volume_type: "Provisioned IOPS",
+        volume_api_name: "io2",
+        storage_media: "SSD-backed",
+        max_iops: "64000",
+        max_throughput: "1000 MiB/s",
+        usagetype: "EBS:VolumeUsage.io2",
+        rate_e10: 1_250_000_000,
+        provisioned_iops: Some(("EBS:VolumeP-IOPS.io2", 650_000_000)),
+        provisioned_throughput: None,
+    },
+    VolumeSeed {
+        volume_type: "Magnetic",
+        volume_api_name: "standard",
+        storage_media: "HDD-backed",
+        max_iops: "40 - 200",
+        max_throughput: "40 - 90 MB/sec",
+        usagetype: "EBS:VolumeUsage",
+        rate_e10: 500_000_000,
+        provisioned_iops: None,
+        provisioned_throughput: None,
+    },
+    VolumeSeed {
+        volume_type: "Cold HDD",
+        volume_api_name: "sc1",
+        storage_media: "HDD-backed",
+        max_iops: "250",
+        max_throughput: "250 MiB/s",
+        usagetype: "EBS:VolumeUsage.sc1",
+        rate_e10: 150_000_000,
+        provisioned_iops: None,
+        provisioned_throughput: None,
+    },
+    VolumeSeed {
+        volume_type: "Throughput Optimized HDD",
+        volume_api_name: "st1",
+        storage_media: "HDD-backed",
+        max_iops: "500",
+        max_throughput: "500 MiB/s",
+        usagetype: "EBS:VolumeUsage.st1",
+        rate_e10: 450_000_000,
+        provisioned_iops: None,
+        provisioned_throughput: None,
+    },
 ];
 
-/// The volume type `api_name` names, or `None` when the catalog prices no such
-/// volume.
-fn volume_seed(api_name: &str) -> Option<&'static VolumeSeed> {
-    EBS_VOLUMES
-        .iter()
-        .find(|seed| seed.volume_api_name == api_name)
+/// The `productFamily` of a volume's storage product.
+const STORAGE_FAMILY: &str = "Storage";
+
+/// What a volume provisions beside its storage, as the Price List API publishes it: its
+/// own product family, the usage group reported on that product, and the unit it is
+/// priced per.
+struct ProvisionedKind {
+    product_family: &'static str,
+    group: &'static str,
+    group_description: &'static str,
+    unit: &'static str,
 }
 
-/// Which volume types the catalog prices in which Region, by volume API name.
-const EBS_VOLUME_PLAN: &[(&str, &[&str])] = &[
-    ("us-east-1", &["gp3", "io2", "standard", "sc1", "st1"]),
-    ("eu-west-1", &["gp3", "io2"]),
-    ("ap-northeast-1", &["gp3"]),
-];
+/// The product that prices a volume's provisioned IOPS.
+const IOPS_KIND: ProvisionedKind = ProvisionedKind {
+    product_family: "System Operation",
+    group: "EBS IOPS",
+    group_description: "IOPS",
+    unit: "IOPS-Mo",
+};
+
+/// The product that prices a volume's provisioned throughput.
+const THROUGHPUT_KIND: ProvisionedKind = ProvisionedKind {
+    product_family: "Provisioned Throughput",
+    group: "EBS Throughput",
+    group_description: "Throughput",
+    unit: "MiBps-mo",
+};
 
 // --- AmazonS3 ---------------------------------------------------------------
 
@@ -1695,91 +2340,151 @@ fn ec2_products() -> Vec<Product> {
         let Some(region) = region(plan.region_code) else {
             continue;
         };
-        for instance_type in plan.instance_types.iter().copied() {
-            let Some(instance) = instance_type_seed(instance_type) else {
-                continue;
-            };
-            let draft = ProductDraft {
-                sku: sku(&[instance.instance_type, region.code, plan.operating_system]),
-                product_family: "Compute Instance",
-                unit: "Hrs",
-                rate_e10: scale(
-                    scale(instance.rate_e10, region.rate_percent),
-                    plan.rate_percent,
-                ),
-                // AWS prices a compute instance both on demand and under a
-                // reservation, so its offer document carries both term types.
-                reserved: true,
-                attributes: attributes(vec![
-                    ("capacitystatus", "Used".to_string()),
-                    ("currentGeneration", instance.current_generation.to_string()),
-                    ("instanceFamily", instance.instance_family.to_string()),
-                    ("instanceType", instance.instance_type.to_string()),
-                    ("licenseModel", plan.license_model.to_string()),
-                    ("location", region.location.to_string()),
-                    ("locationType", AWS_REGION_LOCATION_TYPE.to_string()),
-                    ("memory", instance.memory.to_string()),
-                    (
-                        "normalizationSizeFactor",
-                        normalization_size_factor(instance.instance_type),
+        // A plan prices either every type the catalog publishes or exactly the types it
+        // names, of those the catalog publishes.
+        let instance_types: Vec<&'static InstanceTypeSeed> = match plan.instance_types {
+            PlannedInstanceTypes::Every => EC2_INSTANCE_TYPES.iter().collect(),
+            PlannedInstanceTypes::Named(names) => names
+                .iter()
+                .filter_map(|name| instance_type_seed(name))
+                .collect(),
+        };
+        for instance in instance_types {
+            for capacity in CAPACITY_SEEDS {
+                let draft = ProductDraft {
+                    sku: sku(&[
+                        instance.instance_type,
+                        region.code,
+                        plan.operating_system,
+                        capacity.tenancy,
+                        capacity.capacity_status,
+                    ]),
+                    product_family: "Compute Instance",
+                    unit: "Hrs",
+                    rate_e10: scale(
+                        scale(instance.rate_e10, region.rate_percent),
+                        plan.rate_percent,
                     ),
-                    ("operatingSystem", plan.operating_system.to_string()),
-                    ("operation", plan.operation.to_string()),
-                    ("physicalProcessor", instance.physical_processor.to_string()),
-                    ("preInstalledSw", "NA".to_string()),
-                    ("regionCode", region.code.to_string()),
-                    ("servicecode", EC2_SERVICE_CODE.to_string()),
-                    ("servicename", EC2_SERVICE_NAME.to_string()),
-                    ("tenancy", "Shared".to_string()),
-                    (
-                        "usagetype",
-                        format!(
-                            "{}BoxUsage:{}",
-                            region.usage_prefix, instance.instance_type
+                    // AWS prices a compute instance both on demand and under a
+                    // reservation, so its offer document carries both term types.
+                    reserved: true,
+                    attributes: attributes(vec![
+                        ("capacitystatus", capacity.capacity_status.to_string()),
+                        ("currentGeneration", instance.current_generation.to_string()),
+                        ("instanceFamily", instance.instance_family.to_string()),
+                        ("instanceType", instance.instance_type.to_string()),
+                        ("licenseModel", plan.license_model.to_string()),
+                        ("location", region.location.to_string()),
+                        ("locationType", AWS_REGION_LOCATION_TYPE.to_string()),
+                        ("memory", instance.memory.to_string()),
+                        (
+                            "normalizationSizeFactor",
+                            normalization_size_factor(instance.instance_type),
                         ),
-                    ),
-                    ("vcpu", instance.vcpu.to_string()),
-                ]),
-            };
-            products.push(product_from_draft(EC2_SERVICE_CODE, draft));
+                        ("operatingSystem", plan.operating_system.to_string()),
+                        ("operation", plan.operation.to_string()),
+                        ("physicalProcessor", instance.physical_processor.to_string()),
+                        ("preInstalledSw", "NA".to_string()),
+                        ("regionCode", region.code.to_string()),
+                        ("servicecode", EC2_SERVICE_CODE.to_string()),
+                        ("servicename", EC2_SERVICE_NAME.to_string()),
+                        ("tenancy", capacity.tenancy.to_string()),
+                        (
+                            "usagetype",
+                            format!(
+                                "{}{}:{}",
+                                region.usage_prefix, capacity.usage_kind, instance.instance_type
+                            ),
+                        ),
+                        ("vcpu", instance.vcpu.to_string()),
+                    ]),
+                };
+                products.push(product_from_draft(EC2_SERVICE_CODE, draft));
+            }
         }
     }
-    for (region_code, volume_names) in EBS_VOLUME_PLAN.iter().copied() {
-        let Some(region) = region(region_code) else {
-            continue;
-        };
-        for volume_name in volume_names.iter().copied() {
-            let Some(volume) = volume_seed(volume_name) else {
-                continue;
-            };
-            let draft = ProductDraft {
-                sku: sku(&["EBS", volume.volume_api_name, region.code]),
-                product_family: "Storage",
-                unit: "GB-Mo",
-                rate_e10: scale(volume.rate_e10, region.rate_percent),
-                // A volume is priced on demand only.
-                reserved: false,
-                attributes: attributes(vec![
-                    ("location", region.location.to_string()),
-                    ("locationType", AWS_REGION_LOCATION_TYPE.to_string()),
-                    ("maxIopsvolume", volume.max_iops.to_string()),
-                    ("maxThroughputvolume", volume.max_throughput.to_string()),
-                    ("regionCode", region.code.to_string()),
-                    ("servicecode", EC2_SERVICE_CODE.to_string()),
-                    ("servicename", EC2_SERVICE_NAME.to_string()),
-                    ("storageMedia", volume.storage_media.to_string()),
-                    (
-                        "usagetype",
-                        format!("{}{}", region.usage_prefix, volume.usagetype),
-                    ),
-                    ("volumeApiName", volume.volume_api_name.to_string()),
-                    ("volumeType", volume.volume_type.to_string()),
-                ]),
-            };
-            products.push(product_from_draft(EC2_SERVICE_CODE, draft));
+    // AWS publishes the EBS volume types in every Region, and prices a volume's
+    // provisioned IOPS and throughput as products of their own where they are billed
+    // separately from its storage.
+    for region in REGIONS {
+        for volume in EBS_VOLUMES {
+            products.push(product_from_draft(
+                EC2_SERVICE_CODE,
+                volume_storage_draft(region, volume),
+            ));
+            for (kind, usagetype, rate_e10) in volume.provisioned() {
+                products.push(product_from_draft(
+                    EC2_SERVICE_CODE,
+                    volume_provisioned_draft(region, volume, kind, usagetype, rate_e10),
+                ));
+            }
         }
     }
     products
+}
+
+/// The `Storage` product of one EBS volume type in one Region: the volume itself,
+/// priced per GB-month.
+fn volume_storage_draft(region: &RegionSeed, volume: &VolumeSeed) -> ProductDraft {
+    ProductDraft {
+        sku: sku(&["EBS", volume.volume_api_name, region.code]),
+        product_family: STORAGE_FAMILY,
+        unit: "GB-Mo",
+        rate_e10: scale(volume.rate_e10, region.rate_percent),
+        // A volume is priced on demand only.
+        reserved: false,
+        attributes: attributes(vec![
+            ("location", region.location.to_string()),
+            ("locationType", AWS_REGION_LOCATION_TYPE.to_string()),
+            ("maxIopsvolume", volume.max_iops.to_string()),
+            ("maxThroughputvolume", volume.max_throughput.to_string()),
+            ("regionCode", region.code.to_string()),
+            ("servicecode", EC2_SERVICE_CODE.to_string()),
+            ("servicename", EC2_SERVICE_NAME.to_string()),
+            ("storageMedia", volume.storage_media.to_string()),
+            (
+                "usagetype",
+                format!("{}{}", region.usage_prefix, volume.usagetype),
+            ),
+            ("volumeApiName", volume.volume_api_name.to_string()),
+            ("volumeType", volume.volume_type.to_string()),
+        ]),
+    }
+}
+
+/// The product that prices what a volume provisions beside its storage — its IOPS or
+/// its throughput — in one Region: a product of its own, in the family and usage group
+/// the Price List API reports for it, carrying the same `volumeType` so a filter on the
+/// volume type selects everything that volume is billed for.
+fn volume_provisioned_draft(
+    region: &RegionSeed,
+    volume: &VolumeSeed,
+    kind: &ProvisionedKind,
+    usagetype: &str,
+    rate_e10: u64,
+) -> ProductDraft {
+    ProductDraft {
+        sku: sku(&["EBS", usagetype, region.code]),
+        product_family: kind.product_family,
+        unit: kind.unit,
+        rate_e10: scale(rate_e10, region.rate_percent),
+        reserved: false,
+        attributes: attributes(vec![
+            ("group", kind.group.to_string()),
+            ("groupDescription", kind.group_description.to_string()),
+            ("location", region.location.to_string()),
+            ("locationType", AWS_REGION_LOCATION_TYPE.to_string()),
+            ("regionCode", region.code.to_string()),
+            ("servicecode", EC2_SERVICE_CODE.to_string()),
+            ("servicename", EC2_SERVICE_NAME.to_string()),
+            (
+                "usagetype",
+                format!("{}{}", region.usage_prefix, usagetype),
+            ),
+            ("volumeApiName", volume.volume_api_name.to_string()),
+            ("volumeType", volume.volume_type.to_string()),
+        ]),
+    }
 }
 
 /// The seeded `AmazonS3` products: one per storage class and Region.

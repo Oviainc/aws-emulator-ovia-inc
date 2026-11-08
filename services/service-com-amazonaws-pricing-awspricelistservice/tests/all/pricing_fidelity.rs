@@ -16,8 +16,9 @@ use std::collections::BTreeSet;
 use serde_json::{json, Value};
 
 use super::pricing_support::{
-    attribute_values, err, error_message, list_member, offer_attribute, offer_documents, ok,
-    product_skus, router, service_codes, service_entry, JAN_1_2024, JUL_1_2024,
+    all_offer_documents, attribute_values, err, error_message, list_member, offer_attribute,
+    offer_documents, ok, product_skus, router, service_codes, service_entry, JAN_1_2024,
+    JUL_1_2024,
 };
 
 /// The documented EC2 on-demand filter set: the members a cost-estimation client pins
@@ -439,16 +440,16 @@ async fn a_reservable_product_carries_every_term_type_it_is_offered_under() {
         "a filter on a field no product carries selects nothing, got {compute}"
     );
 
-    let compute = ok(
+    // The Region's whole matched set, paged to the end: it prices more products than
+    // one page holds, and the rule is about every one of them.
+    let documents = all_offer_documents(
         &router,
-        "GetProducts",
         &json!({
             "ServiceCode": "AmazonEC2",
             "Filters": [{ "Type": "TERM_MATCH", "Field": "location", "Value": "US East (N. Virginia)" }],
         }),
     )
     .await;
-    let documents = offer_documents(&compute);
     assert!(
         documents.len() > 10,
         "the Region must price enough products for this rule to span a set, got {}",
@@ -790,7 +791,7 @@ async fn a_price_list_file_that_resolves_to_nothing_is_not_found() {
             "arn:aws:pricing:::price-list/aws/NotAService/USD/20230101000000/us-east-1",
             "json",
         ),
-        ("a known ARN in a format it is not published in", &known_arn, "csv"),
+        ("a known ARN in a format it is not published in", &known_arn, "parquet"),
         ("a known ARN in another unpublished format", &known_arn, "xml"),
     ];
 
@@ -810,20 +811,40 @@ async fn a_price_list_file_that_resolves_to_nothing_is_not_found() {
         );
     }
 
-    // The same pair in a format it IS published in resolves.
-    let resolved = ok(
-        &router,
-        "GetPriceListFileUrl",
-        &json!({ "PriceListArn": known_arn, "FileFormat": "json" }),
-    )
-    .await;
+    // Every format the entry DOES list resolves: `FileFormat` is documented as a value
+    // "obtained from the ListPriceLists response", so the refusal above is reached only
+    // for a pair the service never listed.
+    let listed_formats: Vec<String> = list_member(&listed, "PriceLists")
+        .first()
+        .map(|entry| {
+            list_member(entry, "FileFormats")
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
     assert!(
-        resolved
-            .get("Url")
-            .and_then(Value::as_str)
-            .is_some_and(|url| url.ends_with(".json")),
-        "case the published format: expected a URL, got {resolved}"
+        listed_formats.len() > 1,
+        "case the published formats: a price list is published in more than one format, \
+         got {listed_formats:?}"
     );
+    for file_format in &listed_formats {
+        let resolved = ok(
+            &router,
+            "GetPriceListFileUrl",
+            &json!({ "PriceListArn": known_arn, "FileFormat": file_format }),
+        )
+        .await;
+        assert!(
+            resolved
+                .get("Url")
+                .and_then(Value::as_str)
+                .is_some_and(|url| url.ends_with(&format!(".{file_format}"))),
+            "case {file_format}: a listed format must resolve to a URL for it, got \
+             {resolved}"
+        );
+    }
 }
 
 #[tokio::test]

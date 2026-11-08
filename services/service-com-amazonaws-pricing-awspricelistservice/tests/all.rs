@@ -21,5 +21,7 @@ mod pricing_catalog;
 mod pricing_fidelity;
 #[path = "all/pricing_support.rs"]
 mod pricing_support;
+#[path = "all/published_catalog.rs"]
+mod published_catalog;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

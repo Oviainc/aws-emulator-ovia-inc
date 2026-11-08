@@ -114,6 +114,66 @@ pub fn list_member(response: &Value, member: &str) -> Vec<Value> {
         .unwrap_or_default()
 }
 
+/// The largest page every paginated Price List operation accepts (`MaxResults` 1..100
+/// on `DescribeServices`, `GetProducts` and `ListPriceLists`).
+pub const MAX_PAGE: i64 = 100;
+
+/// Every item of a paginated listing, by walking it to the end at the largest page the
+/// operations accept.
+///
+/// A single call answers at most one page, so a rule about a result set LARGER than one
+/// page (the catalog's instance types, a Region's products) must page to see it whole.
+pub async fn all_items(
+    router: &MultiServiceRouter,
+    operation: &str,
+    body: &Value,
+    items_member: &str,
+) -> Vec<Value> {
+    let mut body = body.clone();
+    body["MaxResults"] = Value::from(MAX_PAGE);
+    let mut collected: Vec<Value> = Vec::new();
+    let mut pages = 0usize;
+    loop {
+        let page = ok(router, operation, &body).await;
+        collected.extend(list_member(&page, items_member));
+        pages += 1;
+        let Some(token) = page.get("NextToken").and_then(Value::as_str) else {
+            break;
+        };
+        body["NextToken"] = Value::from(token);
+        assert!(
+            pages < 200,
+            "case {operation}: paging must terminate, still holding a token after \
+             {pages} pages"
+        );
+    }
+    collected
+}
+
+/// Every offer document a `GetProducts` query matches, paged to the end.
+pub async fn all_offer_documents(router: &MultiServiceRouter, body: &Value) -> Vec<Value> {
+    all_items(router, "GetProducts", body, "PriceList")
+        .await
+        .iter()
+        .map(|item| {
+            let text = item
+                .as_str()
+                .expect("every PriceList element is a JSON string");
+            serde_json::from_str(text).expect("every PriceList element parses as JSON")
+        })
+        .collect()
+}
+
+/// Every value `GetAttributeValues` publishes for an attribute, paged to the end.
+pub async fn all_attribute_values(router: &MultiServiceRouter, body: &Value) -> Vec<String> {
+    all_items(router, "GetAttributeValues", body, "AttributeValues")
+        .await
+        .iter()
+        .filter_map(|value| value.get("Value").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
+}
+
 /// The service codes a `DescribeServices` response reports.
 pub fn service_codes(response: &Value) -> Vec<String> {
     list_member(response, "Services")
@@ -179,6 +239,34 @@ pub fn offer_attribute(document: &Value, name: &str) -> Option<String> {
         .get(name)?
         .as_str()
         .map(str::to_string)
+}
+
+/// The header row and the dimension rows of a price-list file's CSV form.
+///
+/// The published layout carries the file header in leading `name,value` lines, so the
+/// header row is the record that opens the columns (`SKU` first) and everything after
+/// it is one price dimension.
+pub fn csv_rows(body: &str) -> (Vec<String>, Vec<Vec<String>>) {
+    let mut reader = ::csv::ReaderBuilder::new()
+        .flexible(true)
+        .has_headers(false)
+        .from_reader(body.as_bytes());
+    let records: Vec<Vec<String>> = reader
+        .records()
+        .filter_map(Result::ok)
+        .map(|record| record.iter().map(str::to_string).collect())
+        .collect();
+    records
+        .iter()
+        .position(|record| record.first().is_some_and(|first| first == "SKU"))
+        .map(|index| (records[index].clone(), records[index + 1..].to_vec()))
+        .unwrap_or_default()
+}
+
+/// One named column of a CSV row, or `None` when the header does not carry it.
+pub fn column_of(header: &[String], row: &[String], column: &str) -> Option<String> {
+    let index = header.iter().position(|name| name == column)?;
+    row.get(index).cloned()
 }
 
 /// Split an `https://host[:port]/path` URL into its authority and its path.
