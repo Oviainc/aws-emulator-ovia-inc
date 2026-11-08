@@ -259,7 +259,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Every controller the request asks for, in placement order, from the cursor on.
-        let vpc_id = directory.vpc_id().map(str::to_string);
+        // Each one is rendered against the directory it resides in, which is where its
+        // network — the VPC, its subnet's Availability Zone and the address it answers DNS
+        // at — is recorded.
         let mut selected: Vec<(u64, DomainController)> = directory
             .domain_controllers_in_placement_order()
             .into_iter()
@@ -269,12 +271,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .as_ref()
                     .is_none_or(|ids| ids.contains(&controller.domain_controller_id))
             })
-            .map(|controller| {
-                (
-                    controller.seq,
-                    controller.to_domain_controller(&input.directory_id, vpc_id.as_deref()),
-                )
-            })
+            .map(|controller| (controller.seq, controller.to_domain_controller(directory)))
             .collect();
         drop(store);
 

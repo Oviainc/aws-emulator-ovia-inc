@@ -214,6 +214,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|tag| (tag.key, tag.value))
             .collect();
 
+        // WHERE the connector's servers go: the subnets the request names, resolved against
+        // the service that OWNS subnets, so each connector server can be given an address
+        // out of its own subnet's block — the `ConnectIps` this directory reports. Asked
+        // BEFORE the store lock below is taken, so no guard is held across the hop; an
+        // identifier the owner reports no subnet for contributes nothing, and the create
+        // still stores the placement the request named.
+        let subnet_networks = crate::state::resolve_subnet_networks(
+            ctx,
+            &crate::state::region_from_request(ctx.parts()),
+            &input.connect_settings.subnet_ids,
+        )
+        .await;
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.advance_clock(now);
@@ -261,15 +274,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 vpc_id: Some(input.connect_settings.vpc_id),
                 subnet_ids: Some(input.connect_settings.subnet_ids),
                 customer_user_name: Some(input.connect_settings.customer_user_name),
-                // The security group, the availability zones and the addresses of the
-                // connector servers are chosen by the VPC data plane this emulator does
-                // not have, so they stay absent rather than invented. The customer DNS
-                // addresses the request named are not members of this structure at all.
+                // The security group names an EC2 security group this create does not make,
+                // so it stays absent rather than invented. The Availability Zones and the
+                // addresses of the connector servers are REPORTED from the subnets resolved
+                // above (`Directory::availability_zones` / `Directory::server_addresses`);
+                // the IPv6 half belongs to a connector placed on an IPv6 block, which no
+                // create here records one for.
                 security_group_id: None,
                 availability_zones: None,
                 connect_ips: None,
                 connect_ips_v6: None,
             }),
+            // The subnets this connector's servers are placed in, as the owner of subnets
+            // reported them: the blocks their addresses are counted out of.
+            subnet_networks,
+            // An AD Connector serves no DNS of its own: the servers a client points a
+            // resolver at are the self-managed directory's, which this create names
+            // (`DirectoryConnectSettings$CustomerDnsIps`) and `DnsIpAddrs` reports.
+            customer_dns_ips: input.connect_settings.customer_dns_ips.unwrap_or_default(),
             // `NetworkType`'s own documentation: "The default value is IPv4 or IPv6 based
             // on the provided subnet capabilities" — a choice made by the VPC data plane
             // this emulator does not have, so an unspecified network type stays absent

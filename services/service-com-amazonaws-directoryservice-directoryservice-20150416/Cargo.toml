@@ -41,6 +41,15 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # shared inventory of the account's directories, which this control plane creates and
 # deletes and the Directory Service DATA plane reads.
 service-common = { path = "../common" }
+# The AWS SDK for EC2, driven over the in-process callback
+# (`OperationContext::callback`): the subnets a directory's servers are placed in are EC2's
+# resources, so `state::directory_network` asks EC2 which block and zone each one carries
+# rather than deciding it here. Only the generated client is needed — the emulator supplies
+# the transport.
+aws-sdk-ec2 = { version = "1", default-features = false }
+# Reads a subnet's CIDR block, so a directory server's address is counted out of the block
+# its subnet really carries (`state::directory_network::server_address`).
+ipnet = "2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -55,6 +64,11 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 # Builds the self-signed certificates the certificate suite registers, so each row's
 # common name and expiry come from a real certificate rather than a fixed blob.
 rcgen = "0.13"
+# The EC2 service, mounted beside this one in the test harness: that a directory's servers
+# hold addresses out of the subnets a client minted with `ec2:CreateSubnet` can only be
+# driven end to end with the owner of subnets on the same engine. DEV-ONLY: `src/` reaches
+# EC2 over the in-process callback and names no other service's crate.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 
 [lints]
 workspace = true

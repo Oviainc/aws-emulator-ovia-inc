@@ -216,6 +216,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(|tag| (tag.key, tag.value))
             .collect();
 
+        // WHERE the directory's servers go: the subnets the request names, resolved against
+        // the service that OWNS subnets, so each server can be given an address out of its
+        // own subnet's block — the `DnsIpAddrs` this directory serves. Asked BEFORE the
+        // store lock below is taken, so no guard is held across the hop; an identifier the
+        // owner reports no subnet for contributes nothing, and the create still stores the
+        // placement the request named.
+        let subnet_networks = match input.vpc_settings.as_ref() {
+            Some(requested) => {
+                crate::state::resolve_subnet_networks(ctx, &primary_region, &requested.subnet_ids)
+                    .await
+            }
+            None => ::std::collections::BTreeMap::new(),
+        };
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.advance_clock(now);
@@ -256,15 +270,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|requested| DirectoryVpcSettingsDescription {
                     vpc_id: Some(requested.vpc_id),
                     subnet_ids: Some(requested.subnet_ids),
-                    // The security group and availability zones are chosen by the VPC
-                    // data plane this emulator does not have, so they stay absent
-                    // rather than invented.
+                    // The security group names an EC2 security group this create does
+                    // not make, so it stays absent rather than invented; the
+                    // Availability Zones are REPORTED from the subnets resolved above,
+                    // through `Directory::availability_zones`.
                     security_group_id: None,
                     availability_zones: None,
                 }),
             // Only an AD Connector carries connection settings; `ConnectDirectory` is
             // what persists them.
             connect_settings: None,
+            // The subnets this directory's servers are placed in, as the owner of subnets
+            // reported them: the blocks their addresses are counted out of.
+            subnet_networks,
+            // A Simple AD directory serves DNS from its own directory servers, not from a
+            // self-managed directory's.
+            customer_dns_ips: Vec::new(),
             network_type: input.network_type,
             // `EnableSso` (still scaffolded) is what turns this on.
             sso_enabled: false,

@@ -39,6 +39,8 @@ mod conditional_forwarders;
 mod directory_data_access;
 #[path = "all/directory_data_access_disable.rs"]
 mod directory_data_access_disable;
+#[path = "all/directory_dns_addresses.rs"]
+mod directory_dns_addresses;
 #[path = "all/directory_lifecycle.rs"]
 mod directory_lifecycle;
 #[path = "all/directory_limits.rs"]

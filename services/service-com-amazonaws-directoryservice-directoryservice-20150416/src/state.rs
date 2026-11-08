@@ -55,12 +55,18 @@
 //!   group its log subscription names — the forwarding half of
 //!   `CreateLogSubscription`, reached by this service's own writes and by the Directory
 //!   Service DATA plane's.
+//! * [`directory_network`], where a directory's servers sit on the account's network: the
+//!   subnets a create places them in, as the service that OWNS subnets reports them, and the
+//!   address each server answers DNS at, counted out of its own subnet's CIDR block.
 //!
 //! The administrator `Password` `CreateDirectory` is called with is deliberately NOT a
 //! field here: the model marks it `@sensitive`, no operation reports it back, and state
 //! this emulator does not need is state it must not hold.
 
+pub mod directory_network;
 pub mod security_log;
+
+pub use directory_network::{resolve_subnet_networks, server_address, SubnetNetwork};
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1580,6 +1586,12 @@ pub struct DomainControllerRecord {
     /// The subnet of the directory's VPC settings this controller was placed in; `None`
     /// only for a directory stored without VPC settings, which has no subnet to name.
     pub subnet_id: Option<String>,
+    /// The address this controller answers DNS at: one out of its own subnet's CIDR block,
+    /// counted at placement time ([`Directory::server_address_in`]) from the record the
+    /// create resolved against the service that owns subnets. `None` for a controller whose
+    /// subnet could not be resolved, which then serves no address rather than an invented
+    /// one.
+    pub dns_ip_addr: Option<String>,
     /// One of the modelled `DomainControllerStatus` values.
     pub status: String,
     /// When the status transition the placement owes falls due; `None` once there is
@@ -1596,29 +1608,30 @@ pub struct DomainControllerRecord {
 }
 
 impl DomainControllerRecord {
-    /// This controller as the modelled `DomainController`, reported for the directory it
+    /// This controller as the modelled `DomainController`, reported for the `directory` it
     /// resides in.
     ///
+    /// Its network comes from the directory's own placement: the VPC the create named, the
+    /// subnet this controller was placed in, that subnet's Availability Zone and the address
+    /// counted out of its block — so what `DescribeDomainControllers` reports about a
+    /// controller agrees with the `DnsIpAddrs` the directory serves.
+    ///
     /// The members this slice has no record behind are left absent rather than invented:
-    /// `DnsIpAddr` / `DnsIpv6Addr` ("the IP address of the domain controller") and
-    /// `AvailabilityZone` are allocated by the VPC data plane this emulator does not
-    /// have — the same reason `DirectoryVpcSettingsDescription$AvailabilityZones` stays
-    /// absent — and `StatusReason` ("a description of the domain controller state")
-    /// describes a controller whose status needs explaining, which no status this
-    /// emulator records does.
-    pub fn to_domain_controller(
-        &self,
-        directory_id: &str,
-        vpc_id: Option<&str>,
-    ) -> DomainController {
+    /// `DnsIpv6Addr` ("the IPv6 address of the domain controller"), which belongs to a
+    /// directory placed on an IPv6 block, and `StatusReason` ("a description of the domain
+    /// controller state"), which describes a controller whose status needs explaining, which
+    /// no status this emulator records does.
+    pub fn to_domain_controller(&self, directory: &Directory) -> DomainController {
         DomainController {
-            directory_id: Some(directory_id.to_string()),
+            directory_id: Some(directory.directory_id.clone()),
             domain_controller_id: Some(self.domain_controller_id.clone()),
-            dns_ip_addr: None,
+            dns_ip_addr: self.dns_ip_addr.clone(),
             dns_ipv6_addr: None,
-            vpc_id: vpc_id.map(str::to_string),
+            vpc_id: directory.vpc_id().map(str::to_string),
             subnet_id: self.subnet_id.clone(),
-            availability_zone: None,
+            availability_zone: directory
+                .subnet_network(self.subnet_id.as_deref())
+                .and_then(|network| network.availability_zone.clone()),
             status: Some(self.status.clone()),
             status_reason: None,
             launch_time: Some(as_timestamp(self.launch_time)),
@@ -2067,6 +2080,18 @@ pub struct Directory {
     /// self-managed directory with. `None` for every other directory type, which carries
     /// [`Self::vpc_settings`] alone.
     pub connect_settings: Option<DirectoryConnectSettingsDescription>,
+    /// The network of each subnet this directory's servers are placed in, keyed by subnet
+    /// id, as Amazon EC2 — the service that owns subnets — reported it to the create (see
+    /// [`directory_network`]). The blocks the directory's addresses are counted out of
+    /// ([`Self::server_addresses`]) and the zones it reports; a subnet the owner of subnets
+    /// could not be asked about is simply absent, and its server then holds no address.
+    pub subnet_networks: BTreeMap<String, SubnetNetwork>,
+    /// The DNS servers of the SELF-MANAGED directory an AD Connector forwards to, as
+    /// `ConnectDirectory` was called with them (`DirectoryConnectSettings$CustomerDnsIps`):
+    /// what `DirectoryDescription$DnsIpAddrs` reports for a connector, whose DNS is served
+    /// by the directory it connects to rather than by any server of this account. Empty for
+    /// every other directory type, which serves its own ([`Self::dns_ip_addrs`]).
+    pub customer_dns_ips: Vec<String>,
     pub network_type: Option<String>,
     pub sso_enabled: bool,
     /// Reported only for AWS Managed Microsoft AD, so it stays `None` for Simple AD:
@@ -2190,16 +2215,99 @@ impl Directory {
         format!("{alias}{ACCESS_URL_SUFFIX}", alias = self.effective_alias())
     }
 
-    /// The DNS server that answers for this directory, as this emulator can name it.
-    ///
-    /// A directory's DNS is served by its domain controllers, whose addresses the VPC data
-    /// plane allocates — which this emulator does not have, and which is why
-    /// `DirectoryDescription$DnsIpAddrs` and `DomainController$DnsIpAddr` stay absent
-    /// rather than carrying invented ones. So where a diagnostic names the server that
-    /// answered for this directory's DNS, it is named by the DNS domain the directory
-    /// serves: stored state, and nothing invented.
+    /// The DNS server that answers for this directory, as a diagnostic names it: the DNS
+    /// domain the directory serves, which is the zone its own servers are authoritative
+    /// for. Stored state, and nothing invented; the ADDRESSES those servers answer at are
+    /// [`Self::dns_ip_addrs`].
     pub fn dns_server(&self) -> &str {
         &self.name
+    }
+
+    /// The network of the subnet `subnet_id`, as the create resolved it against the service
+    /// that owns subnets; `None` for a subnet this directory was not placed in, or one that
+    /// could not be resolved.
+    pub fn subnet_network(&self, subnet_id: Option<&str>) -> Option<&SubnetNetwork> {
+        self.subnet_networks.get(subnet_id?)
+    }
+
+    /// The address the `ordinal`-th server this directory places in the subnet `subnet_id`
+    /// holds: an address out of THAT subnet's own CIDR block ([`server_address`]).
+    ///
+    /// `None` when the subnet was not resolved — a directory created where the owner of
+    /// subnets could not be asked serves no address rather than an invented one.
+    pub fn server_address_in(&self, subnet_id: Option<&str>, ordinal: u32) -> Option<String> {
+        let network = self.subnet_network(subnet_id)?;
+        server_address(network.cidr_block.as_deref()?, ordinal)
+    }
+
+    /// The addresses of the servers this directory places ITSELF: one per subnet of its
+    /// settings block, in the order the create named them, each out of that subnet's own
+    /// CIDR block.
+    ///
+    /// `DirectoryVpcSettings$SubnetIds`' own documentation: "Directory Service creates a
+    /// directory server and a DNS server in each of these subnets" — so a directory whose
+    /// servers this service runs holds one server per chosen subnet, and the first
+    /// assignable address of each block is that server's.
+    pub fn server_addresses(&self) -> Vec<String> {
+        self.subnet_ids()
+            .iter()
+            .filter_map(|subnet_id| self.server_address_in(Some(subnet_id), 0))
+            .collect()
+    }
+
+    /// The addresses this directory's DNS servers answer at, as
+    /// `DirectoryDescription$DnsIpAddrs` reports them.
+    ///
+    /// THE one place that member is derived, so every operation that reports a directory
+    /// reports the same addresses. From the member's own documentation: "The IP addresses of
+    /// the DNS servers for the directory. For a Simple AD or Microsoft AD directory, these
+    /// are the IP addresses of the Simple AD or Microsoft AD directory servers. For an AD
+    /// Connector directory, these are the IP addresses of self-managed directory to which
+    /// the AD Connector is connected." So:
+    ///
+    /// * a directory whose servers are reported INDIVIDUALLY as domain controllers serves
+    ///   DNS at those controllers' own addresses, in placement order — which is why adding
+    ///   one with `UpdateNumberOfDomainControllers` adds a DNS address and retiring one
+    ///   takes its address away;
+    /// * a directory whose servers this service runs but does not report one by one serves
+    ///   DNS at [`Self::server_addresses`], one per subnet of its settings block;
+    /// * an AD Connector serves no DNS of its own: it answers with the self-managed
+    ///   directory's servers, which is what its create named ([`Self::customer_dns_ips`]).
+    pub fn dns_ip_addrs(&self) -> Vec<String> {
+        if self.directory_type == TYPE_AD_CONNECTOR {
+            return self.customer_dns_ips.clone();
+        }
+        if self.manages_domain_controllers() {
+            return self
+                .domain_controllers_in_placement_order()
+                .into_iter()
+                .filter(|controller| controller.status != DOMAIN_CONTROLLER_STATUS_DELETING)
+                .filter_map(|controller| controller.dns_ip_addr.clone())
+                .collect();
+        }
+        self.server_addresses()
+    }
+
+    /// The Availability Zones this directory is in, as the zones of the subnets its servers
+    /// were placed in: `DirectoryVpcSettingsDescription$AvailabilityZones` and
+    /// `DirectoryConnectSettingsDescription$AvailabilityZones`.
+    ///
+    /// Read off the records the owner of subnets answered the create with, in zone order,
+    /// each named once — a directory's servers sit in two zones, and that is the list rather
+    /// than one entry per subnet.
+    pub fn availability_zones(&self) -> Vec<String> {
+        let mut zones: Vec<String> = self
+            .subnet_ids()
+            .iter()
+            .filter_map(|subnet_id| {
+                self.subnet_network(Some(subnet_id))?
+                    .availability_zone
+                    .clone()
+            })
+            .collect();
+        zones.sort();
+        zones.dedup();
+        zones
     }
 
     /// This directory's associations as the modelled `EventTopics` list, in topic-name
@@ -2265,19 +2373,32 @@ impl Directory {
         DOMAIN_CONTROLLER_DIRECTORY_TYPES.contains(&self.directory_type.as_str())
     }
 
-    /// The VPC this directory's servers were placed in, from its stored VPC settings.
+    /// The VPC this directory's servers were placed in, from the settings block its own
+    /// type reports the placement as: the VPC settings of a directory this service runs the
+    /// servers of, or the connection settings of an AD Connector, whose connector servers
+    /// are placed the same way.
     pub fn vpc_id(&self) -> Option<&str> {
-        self.vpc_settings
-            .as_ref()
-            .and_then(|settings| settings.vpc_id.as_deref())
+        match (self.vpc_settings.as_ref(), self.connect_settings.as_ref()) {
+            (Some(settings), _) => settings.vpc_id.as_deref(),
+            (None, Some(settings)) => settings.vpc_id.as_deref(),
+            (None, None) => None,
+        }
     }
 
-    /// The subnets this directory's servers are placed across, from its stored VPC
-    /// settings: the `SubnetIds` the create named, in the order it named them.
+    /// The subnets this directory's servers are placed across: the `SubnetIds` the create
+    /// named, in the order it named them, read from whichever settings block this
+    /// directory's type reports its placement as ([`Self::vpc_id`]).
     pub fn subnet_ids(&self) -> Vec<String> {
-        self.vpc_settings
+        let from_vpc_settings = self
+            .vpc_settings
             .as_ref()
-            .and_then(|settings| settings.subnet_ids.clone())
+            .and_then(|settings| settings.subnet_ids.clone());
+        from_vpc_settings
+            .or_else(|| {
+                self.connect_settings
+                    .as_ref()
+                    .and_then(|settings| settings.subnet_ids.clone())
+            })
             .unwrap_or_default()
     }
 
@@ -2549,10 +2670,12 @@ impl Directory {
 
     /// This directory as the modelled `DirectoryDescription`.
     ///
-    /// The members this slice has no record behind — the DNS addresses of directory
-    /// servers, RADIUS, sharing, regions, the owner description — are left absent
-    /// rather than invented: the operations that would populate them are still
-    /// scaffolded.
+    /// The members this slice has no record behind — RADIUS, sharing, regions, the owner
+    /// description — are left absent rather than invented: the operations that would
+    /// populate them are still scaffolded. The placement members are REPORTED rather than
+    /// echoed: the DNS addresses ([`Self::dns_ip_addrs`]) and the Availability Zones
+    /// ([`Self::availability_zones`]) come from the subnets the create resolved against the
+    /// service that owns them, so the directory reports the network it was really placed in.
     pub fn to_description(&self) -> DirectoryDescription {
         DirectoryDescription {
             directory_id: Some(self.directory_id.clone()),
@@ -2563,17 +2686,45 @@ impl Directory {
             alias: Some(self.effective_alias().to_string()),
             access_url: Some(self.access_url()),
             description: self.description.clone(),
+            dns_ip_addrs: optional_list(&self.dns_ip_addrs()),
             stage: Some(self.stage.clone()),
             launch_time: Some(as_timestamp(self.launch_time)),
             stage_last_updated_date_time: Some(as_timestamp(self.stage_last_updated)),
             r#type: Some(self.directory_type.clone()),
-            vpc_settings: self.vpc_settings.clone(),
-            connect_settings: self.connect_settings.clone(),
+            vpc_settings: self.described_vpc_settings(),
+            connect_settings: self.described_connect_settings(),
             sso_enabled: self.sso_enabled,
             desired_number_of_domain_controllers: self.desired_number_of_domain_controllers,
             network_type: self.network_type.clone(),
             ..DirectoryDescription::default()
         }
+    }
+
+    /// This directory's placement as the modelled `DirectoryVpcSettingsDescription`: the VPC
+    /// and subnets the create named, with the Availability Zones read off the subnets it
+    /// resolved. `None` for a directory stored without VPC settings, which reports its
+    /// placement as connection settings instead.
+    fn described_vpc_settings(&self) -> Option<DirectoryVpcSettingsDescription> {
+        let settings = self.vpc_settings.as_ref()?;
+        Some(DirectoryVpcSettingsDescription {
+            availability_zones: optional_list(&self.availability_zones()),
+            ..settings.clone()
+        })
+    }
+
+    /// An AD Connector's placement as the modelled `DirectoryConnectSettingsDescription`:
+    /// the VPC, subnets and service account the connect named, with the Availability Zones
+    /// of the subnets it resolved and the addresses of the connector servers themselves
+    /// (`ConnectIps`, "the IP addresses of the AD Connector servers") — one per chosen
+    /// subnet, out of that subnet's own block, placed exactly as a directory server is
+    /// ([`Self::server_addresses`]). `None` for every other directory type.
+    fn described_connect_settings(&self) -> Option<DirectoryConnectSettingsDescription> {
+        let settings = self.connect_settings.as_ref()?;
+        Some(DirectoryConnectSettingsDescription {
+            availability_zones: optional_list(&self.availability_zones()),
+            connect_ips: optional_list(&self.server_addresses()),
+            ..settings.clone()
+        })
     }
 }
 
@@ -3110,8 +3261,12 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// there are subnets: `DirectoryVpcSettings$SubnetIds`' own documentation says
     /// "Directory Service creates a directory server and a DNS server in each of these
     /// subnets", so a controller resides in a subnet of the directory rather than
-    /// nowhere. Each one is placed in [`DOMAIN_CONTROLLER_STATUS_CREATING`] with the move
-    /// to [`DOMAIN_CONTROLLER_STATUS_ACTIVE`] owed by the clock one [`TRANSITION_SPAN`]
+    /// nowhere. Each one holds an address out of THAT subnet's own CIDR block
+    /// ([`Directory::server_address_in`]), counted so that two controllers of one directory
+    /// in one subnet never share one — and those addresses are what the directory serves
+    /// DNS at ([`Directory::dns_ip_addrs`]). Each one is placed in
+    /// [`DOMAIN_CONTROLLER_STATUS_CREATING`] with the move to
+    /// [`DOMAIN_CONTROLLER_STATUS_ACTIVE`] owed by the clock one [`TRANSITION_SPAN`]
     /// later, so a caller that describes them immediately still sees the transient
     /// status.
     ///
@@ -3120,33 +3275,42 @@ impl ComAmazonawsDirectoryserviceDirectoryservice20150416State {
     /// directory already holds — and nothing is placed for an id that names no stored
     /// directory: there is nothing to place controllers in.
     pub fn place_domain_controllers(&mut self, directory_id: &str, count: usize, now: SystemTime) {
-        let Some((subnets, already_placed)) = self
-            .directories
-            .get(directory_id)
-            .map(|directory| (directory.subnet_ids(), directory.domain_controllers.len()))
-        else {
+        let Some(directory) = self.directories.get(directory_id) else {
             return;
         };
+        let subnets = directory.subnet_ids();
+        let already_placed = directory.domain_controllers.len();
         // The number of controllers to place is clamped BEFORE anything is allocated from
         // it, and against the controllers the directory ALREADY holds, so no sequence of
         // calls carrying a caller-supplied number can take one directory's set past the
         // per-directory limit.
         let count = count.min(MAX_DOMAIN_CONTROLLERS_PER_DIRECTORY.saturating_sub(already_placed));
+        // Where each new controller goes, read off the directory's own placement: the next
+        // subnet in the round and the address it holds out of that subnet's block. The round
+        // over the subnets continues from the controllers the directory already holds, so a
+        // controller added to a directory in service lands in the next subnet rather than
+        // doubling up on the first one — and the second controller of one subnet takes the
+        // next address of its block rather than the first one again.
+        let subnets_in_round = subnets.len().max(1);
+        let placements: Vec<(Option<String>, Option<String>)> = (0..count)
+            .map(|index| {
+                let position = already_placed + index;
+                let subnet_id = subnets.get(position % subnets_in_round).cloned();
+                let ordinal = u32::try_from(position / subnets_in_round).unwrap_or(u32::MAX);
+                let address = directory.server_address_in(subnet_id.as_deref(), ordinal);
+                (subnet_id, address)
+            })
+            .collect();
         // The ids and the placement ranks come from the service-wide seeds, so they are
         // minted before the directory is borrowed mutably below.
         let mut placed: Vec<DomainControllerRecord> = Vec::with_capacity(count);
-        for index in 0..count {
+        for (subnet_id, dns_ip_addr) in placements {
             let domain_controller_id = self.mint_domain_controller_id();
             let seq = self.next_seq();
             placed.push(DomainControllerRecord {
                 domain_controller_id,
-                // The round over the subnets continues from the controllers the
-                // directory already holds, so a controller added to a directory in
-                // service lands in the next subnet rather than doubling up on the
-                // first one.
-                subnet_id: subnets
-                    .get((already_placed + index) % subnets.len().max(1))
-                    .cloned(),
+                subnet_id,
+                dns_ip_addr,
                 status: DOMAIN_CONTROLLER_STATUS_CREATING.to_string(),
                 status_due_at: Some(now + TRANSITION_SPAN),
                 launch_time: now,

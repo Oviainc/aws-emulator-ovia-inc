@@ -23,7 +23,12 @@ pub struct CreateDeploymentInput {
 #[derive(Debug, Clone, Default)]
 pub struct CreateDeploymentOutput {
     pub job_id: Option<String>,
-    pub file_upload_urls: std::collections::HashMap<String, String>,
+    // An ORDERED map, so the destinations the answer carries come out in the order of the
+    // record they are built from (`crate::state::PendingDeployment::files`, keyed by file
+    // name) rather than in a hash order that differs from one answer to the next. The map's
+    // key order carries no meaning to a client, but a body that is a different sequence of
+    // the same members on every call cannot be compared, cached or asserted on.
+    pub file_upload_urls: std::collections::BTreeMap<String, String>,
     pub zip_upload_url: String,
 }
 

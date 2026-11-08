@@ -21,6 +21,11 @@
 //!   `Creating` until the transition this create owes falls due, which is what
 //!   `DescribeDomainControllers` then reports.
 //!
+//! Those controllers are the directory's DNS servers, so the create also resolves the
+//! requested subnets against the service that OWNS subnets ([`crate::state::directory_network`])
+//! and gives each controller an address out of its own subnet's CIDR block — the addresses
+//! `DescribeDirectories` reports as `DnsIpAddrs`.
+//!
 //! The directory is persisted in the modelled `Requested` stage with the move to
 //! `Active` owed by the clock one [`crate::state::TRANSITION_SPAN`] later, so a caller
 //! that describes it immediately still sees the transient stage.
@@ -236,6 +241,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => default_short_name(&input.name),
         };
 
+        // WHERE the directory's servers go: the subnets the request names, resolved against
+        // the service that OWNS subnets, so each server can be given an address out of its
+        // own subnet's block. Asked BEFORE the store lock below is taken, so no guard is
+        // held across the hop; an identifier the owner reports no subnet for contributes
+        // nothing, and the create still stores the placement the request named.
+        let subnet_networks = crate::state::resolve_subnet_networks(
+            ctx,
+            &crate::state::region_from_request(ctx.parts()),
+            &input.vpc_settings.subnet_ids,
+        )
+        .await;
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         store.advance_clock(now);
@@ -282,12 +299,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vpc_settings: Some(DirectoryVpcSettingsDescription {
                 vpc_id: Some(input.vpc_settings.vpc_id),
                 subnet_ids: Some(input.vpc_settings.subnet_ids),
-                // The security group and availability zones are chosen by the VPC data
-                // plane this emulator does not have, so they stay absent rather than
-                // invented.
+                // The security group names an EC2 security group this create does not make,
+                // so it stays absent rather than invented; the Availability Zones are
+                // REPORTED from the subnets resolved above, through
+                // `Directory::availability_zones`.
                 security_group_id: None,
                 availability_zones: None,
             }),
+            // The subnets the directory's servers are placed in, as the owner of subnets
+            // reported them: the blocks their addresses — the `DnsIpAddrs` the directory
+            // serves — are counted out of.
+            subnet_networks,
+            // A Managed Microsoft AD directory serves DNS from its own domain controllers,
+            // not from a self-managed directory's servers.
+            customer_dns_ips: Vec::new(),
             // Only an AD Connector carries connection settings; `ConnectDirectory` is
             // what persists them.
             connect_settings: None,
