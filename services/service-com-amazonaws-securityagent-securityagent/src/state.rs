@@ -43,7 +43,7 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AWSResources, AgentSpace, ApplicationSummary, Artifact, ArtifactSummary,
+    AWSResources, AgentSpace, ApplicationSummary, Artifact, ArtifactMetadataItem, ArtifactSummary,
     BatchCreateSecurityRequirementResult, BatchGetSecurityRequirementResult, CodeReviewSettings,
     DnsVerification, HttpVerification, IdCConfiguration, PrivateConnectionSummary,
     SecurityRequirementPackSummary, SecurityRequirementSummary, TargetDomain,
@@ -639,6 +639,22 @@ impl ArtifactRecord {
         Artifact {
             contents: self.contents(),
             r#type: self.artifact_type.clone(),
+        }
+    }
+
+    /// This artifact projected onto the [`ArtifactMetadataItem`] shape a metadata read
+    /// answers: the pair of ids the record resolved to, the file name it was stored
+    /// under and the instant it was last written — the artifact's metadata, which is
+    /// every member of that shape and carries none of its content.
+    ///
+    /// Stated here beside [`Self::modelled`] so a metadata read and a full read of one
+    /// artifact report the SAME stored record rather than two projections of it.
+    pub fn metadata(&self) -> ArtifactMetadataItem {
+        ArtifactMetadataItem {
+            agent_space_id: self.agent_space_id.clone(),
+            artifact_id: self.artifact_id.clone(),
+            file_name: self.file_name.clone(),
+            updated_at: timestamp(self.updated_at),
         }
     }
 

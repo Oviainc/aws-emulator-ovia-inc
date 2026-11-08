@@ -23,6 +23,8 @@ mod agent_space_update;
 mod application_lifecycle;
 #[path = "all/artifact_deletion.rs"]
 mod artifact_deletion;
+#[path = "all/artifact_metadata_batch_read.rs"]
+mod artifact_metadata_batch_read;
 #[path = "all/artifact_listing.rs"]
 mod artifact_listing;
 #[path = "all/artifact_storage.rs"]

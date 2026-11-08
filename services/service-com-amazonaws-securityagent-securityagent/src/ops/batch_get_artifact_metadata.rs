@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetArtifactMetadata
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetArtifactMetadata`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetArtifactMetadata::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Retrieves the metadata of several artifacts of one agent space in a single call:
+//! resolves each requested `artifactId` inside the named space and projects the stored
+//! record's metadata, reporting the artifacts that were FOUND and writing nothing — so a
+//! later caller sees exactly what this call saw.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +147,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetArtifactMetadata` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetArtifactMetadataErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchGetArtifactMetadataErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the artifact store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // `agentSpaceId` is `@required` but carries no `@length` in the model, so an
+        // empty one reaches the handler. It names no agent space and never could, so it
+        // is a bad request rather than a missing resource — the same split every
+        // operation of this service that looks an id up applies.
+        if input.agent_space_id.is_empty() {
+            return Err(refused("agentSpaceId", "member must not be empty"));
+        }
+        // Every entry of `artifactIds` targets `ArtifactId`, which carries no `@length`
+        // either, so an empty id reaches the handler as a list member. It names no
+        // artifact and never could, so the whole call is a bad request naming the entry
+        // that failed — not an id silently left out of the answer.
+        for (index, artifact_id) in input.artifact_ids.iter().enumerate() {
+            if artifact_id.is_empty() {
+                return Err(refused(
+                    &format!("artifactIds[{index}]"),
+                    "member must not be empty",
+                ));
+            }
+        }
+
+        // A read: it resolves the requested records and projects them, and writes
+        // nothing — artifacts carry no transition the clock owes.
+        let state = state.lock();
+
+        // The artifacts are read FROM an agent space, so a space the account does not
+        // hold has no artifact metadata to report: the operation's own
+        // `ResourceNotFoundException` (HTTP 404), with the service's fixed sentence for
+        // an agent space it cannot resolve, before any artifact id is looked at.
+        if !state.agent_spaces.contains_key(&input.agent_space_id) {
+            return Err(BatchGetArtifactMetadataErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::AGENT_SPACE_NOT_FOUND.to_string(),
+                },
+            )
+            .into());
+        }
+
+        // "The list of artifact metadata items that were FOUND": the output models no
+        // place for an id that resolves to nothing and this operation reports no failure
+        // for one, so an id the space holds no artifact for — including one that names an
+        // artifact of ANOTHER agent space — simply contributes no entry, exactly as that
+        // pair resolves for a single read (`crate::state::State::artifact_in`).
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetArtifactMetadata"))
+        // The caller's order is kept, and each id is answered once at the position it
+        // was first asked at: a repeat of an id already answered adds no second entry, so
+        // the list is the set of artifacts found and stays bounded by what the space
+        // holds however long the request's id list is.
+        let mut artifact_metadata_list = Vec::new();
+        let mut answered = ::std::collections::BTreeSet::new();
+        for artifact_id in &input.artifact_ids {
+            if !answered.insert(artifact_id.as_str()) {
+                continue;
+            }
+            if let Some(record) = state.artifact_in(&input.agent_space_id, artifact_id) {
+                // The stored record's own metadata — the ids it resolved to, the file
+                // name it was uploaded with and the instant it was last written — rather
+                // than anything off the request.
+                artifact_metadata_list.push(record.metadata());
+            }
+        }
+
+        Ok(BatchGetArtifactMetadataOutput {
+            artifact_metadata_list,
+        })
     }
+}
+
+/// The operation's `ValidationException` (HTTP 400) for a required member whose value
+/// cannot name anything, naming the member and the constraint it failed — the form every
+/// client-input refusal of this service takes.
+fn refused(path: &str, violation: &str) -> BatchGetArtifactMetadataError {
+    BatchGetArtifactMetadataErrorModeled::ValidationException(ValidationException {
+        message: format!(
+            "1 validation error detected: value for '{path}' failed to satisfy \
+             constraint: {violation}"
+        ),
+        field_list: Some(vec![ValidationExceptionField {
+            path: path.to_string(),
+            message: violation.to_string(),
+        }]),
+    })
+    .into()
 }

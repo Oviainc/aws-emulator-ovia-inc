@@ -18,13 +18,49 @@ pub struct BatchGetArtifactMetadataInput {
     pub artifact_ids: Vec<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#BatchGetArtifactMetadataOutput")]
+/// `BatchGetArtifactMetadataOutput`, with its schema and serializer written out instead
+/// of derived — the machinery lives in `super::wire_shape`.
+///
+/// WHY it is not `#[smithy_macros::smithy(shape = ...)]` like the input beside it: the
+/// list it carries holds [`ArtifactMetadataItem`], whose `updatedAt` is a
+/// `@timestampFormat("date-time")` member the derive drops, so each element has to be
+/// written against THAT shape's hand-written schema.
+///
+/// `artifactMetadataList` is `@required` (`smithy_query(query="operation",
+/// operation="BatchGetArtifactMetadata",
+/// model_path="services/service-com-amazonaws-securityagent-securityagent/smithy-model/com-amazonaws-securityagent-securityagent.json")`),
+/// so it is a plain `Vec`: a batch that resolved no id answers it as an empty array
+/// rather than omitting it, which is why a caller can iterate it unconditionally.
 #[derive(Debug, Clone, Default)]
 pub struct BatchGetArtifactMetadataOutput {
     pub artifact_metadata_list: Vec<ArtifactMetadataItem>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#ArtifactMetadataItem")]
+sa_schema_and_codec!(
+    BatchGetArtifactMetadataOutput,
+    BATCH_GET_ARTIFACT_METADATA_OUTPUT_SCHEMA,
+    "com.amazonaws.securityagent#BatchGetArtifactMetadataOutput",
+    "com.amazonaws.securityagent",
+    "BatchGetArtifactMetadataOutput",
+    modelled: [
+        (
+            M_ARTIFACT_METADATA_LIST,
+            artifact_metadata_list,
+            "artifactMetadataList",
+            0,
+            req,
+            list_of_struct(ArtifactMetadataItem)
+        ),
+    ],
+    recorded: [],
+);
+
+/// `ArtifactMetadataItem`, with its schema and serializer written out instead of derived,
+/// for the reason `GetArtifactOutput` carries: `updatedAt` is
+/// `@timestampFormat("date-time")` (`smithy_query(query="shape",
+/// shape="ArtifactMetadataItem")`), which the derive drops, so it would go out as an
+/// epoch-second NUMBER where the model — and every SDK's generated deserializer —
+/// requires an RFC 3339 string. Every member is `@required`, so each is a plain field.
 #[derive(Debug, Clone)]
 pub struct ArtifactMetadataItem {
     pub agent_space_id: String,
@@ -32,4 +68,19 @@ pub struct ArtifactMetadataItem {
     pub file_name: String,
     pub updated_at: ::aws_smithy_types::DateTime,
 }
+
+sa_schema_and_codec!(
+    ArtifactMetadataItem,
+    ARTIFACT_METADATA_ITEM_SCHEMA,
+    "com.amazonaws.securityagent#ArtifactMetadataItem",
+    "com.amazonaws.securityagent",
+    "ArtifactMetadataItem",
+    modelled: [
+        (M_AGENT_SPACE_ID, agent_space_id, "agentSpaceId", 0, req, string),
+        (M_ARTIFACT_ID, artifact_id, "artifactId", 1, req, string),
+        (M_FILE_NAME, file_name, "fileName", 2, req, string),
+        (M_UPDATED_AT, updated_at, "updatedAt", 3, req, date_time),
+    ],
+    recorded: [],
+);
 
