@@ -113,6 +113,8 @@ mod jsonata_states;
 mod lambda_function_timeout;
 #[path = "all/lambda_task_control_flow.rs"]
 mod lambda_task_control_flow;
+#[path = "all/lambda_task_function_metrics.rs"]
+mod lambda_task_function_metrics;
 #[path = "all/list_state_machine_aliases_pages.rs"]
 mod list_state_machine_aliases_pages;
 #[path = "all/map_item_batcher.rs"]

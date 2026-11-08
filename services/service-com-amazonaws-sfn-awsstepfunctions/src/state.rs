@@ -1520,6 +1520,19 @@ pub struct EventDetails {
     /// wrote any. Empty where none are, so the member is absent rather than an empty
     /// map.
     pub assigned_variables: BTreeMap<String, String>,
+    /// How long the work this event CLOSED really ran, in whole milliseconds, for an
+    /// event that closes a `Task` state's attempt ([`asl::Interpreter::stamp_work_span`]).
+    ///
+    /// It is the span the walk was blocked in the call the attempt made, which is the
+    /// span the series measuring a task's run report
+    /// ([`observability::LAMBDA_FUNCTION_RUN_TIME_METRIC`]). The walk's own offsets
+    /// cannot carry it — they are the logical clock a definition's `Wait` states
+    /// advance, shared by the branches of a `Parallel`, which no call may move — so the
+    /// measurement is kept on the event that reports the work ending. `None` for every
+    /// event that closes no call of its own, and no modelled detail member reports it:
+    /// it is a MEASUREMENT of the work rather than something the history states about
+    /// it.
+    pub work_millis: Option<u64>,
 }
 
 impl EventDetails {
@@ -1774,6 +1787,15 @@ pub struct Execution {
     /// The bytes of the whole list are RESERVED by [`Execution::measure`] at
     /// admission, so remembering a cursor never grows what the store accounts for.
     pub issued_page_cursors: Vec<HistoryPageCursor>,
+    /// How many of this execution's history events have been counted into the series
+    /// its `Task` states' own work publishes
+    /// ([`ComAmazonawsSfnAwsstepfunctionsState::observe_task_work`]).
+    ///
+    /// The history only ever grows — a redriven execution "append[s] their event
+    /// history to the existing event history" — so the count is a cursor into it: the
+    /// events past it are the ones not counted yet, which is what makes an event
+    /// counted exactly once however many times the store is settled.
+    pub observed_events: usize,
 }
 
 /// How many distinct READS one execution's history remembers handing cursors out

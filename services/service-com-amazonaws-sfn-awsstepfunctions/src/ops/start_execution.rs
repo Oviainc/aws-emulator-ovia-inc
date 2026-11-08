@@ -568,6 +568,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             retained_bytes: 0,
             // No read of this execution's history has handed a page cursor out yet.
             issued_page_cursors: Vec::new(),
+            // Nothing of this execution's history has been counted into the series its
+            // tasks publish yet.
+            observed_events: 0,
         };
 
         // Phase 3, under the lock again: admit it. Every check is re-made, because

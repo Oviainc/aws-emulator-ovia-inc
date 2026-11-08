@@ -1910,7 +1910,15 @@ pub(super) const JSONPATH_ONLY_MEMBERS: &[&str] = &[
 
 /// The members that declare a state machine of their own, walked as one rather than
 /// scanned as this state's data.
-pub(super) const NESTED_MACHINE_MEMBERS: &[&str] = &["Branches", "ItemProcessor", "Iterator"];
+///
+/// `pub(in crate::state)`, not private to this module: every reader that has to descend
+/// a definition's nested state lists — the diagnostics here, the one that echoes a
+/// document the definition wrote, the one that finds the state an event belongs to —
+/// descends the SAME members, so there is one statement of which they are. A member
+/// naming ONE machine carries it as an object and `Branches` carries a list of them, so
+/// a reader takes both shapes.
+pub(in crate::state) const NESTED_MACHINE_MEMBERS: &[&str] =
+    &["Branches", "ItemProcessor", "Iterator"];
 
 /// The member a state hands a failure to, whose own `Assign` and `Output` are the
 /// only ones the error output is in scope in.

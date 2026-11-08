@@ -1002,6 +1002,26 @@ impl Interpreter<'_> {
         });
     }
 
+    /// Record on the event that CLOSED a `Task` state's attempt how long the call that
+    /// attempt made really took, for a step that is such an event.
+    ///
+    /// The span is the work's own duration — the walk was blocked in the call for it —
+    /// and it is the span the series that measure a task's run report
+    /// ([`super::super::observability`]). It is kept on the EVENT because that is where
+    /// the walk's knowledge of the call ends: the walk's offsets are a logical clock no
+    /// call advances, and an attempt that was not closed by a call (one whose work was
+    /// never handed over, or one that handed it over and is waiting) carries no span at
+    /// all.
+    pub(super) fn stamp_work_span(&mut self, spent: Duration) {
+        let Some(step) = self.steps.last_mut() else {
+            return;
+        };
+        if !super::super::observability::closes_task_work(step.event_type) {
+            return;
+        }
+        step.details.work_millis = Some(u64::try_from(spent.as_millis()).unwrap_or(u64::MAX));
+    }
+
     /// The event one attempt of a `Task` state's work failed with: the language's own
     /// timeout event where the work ran out of the time the state allowed it, and the
     /// task's own failure event otherwise, both carrying the work that failed and the
@@ -1793,14 +1813,13 @@ impl Interpreter<'_> {
             }
             let began = super::super::now();
             let answered = me.tasks.perform(&call, &request, within);
+            let spent = super::super::now()
+                .duration_since(began)
+                .unwrap_or_default();
             // The span the walk spent BLOCKED in that call is not interpretation, so it
             // is credited back to the deadline and charged to the allowance that bounds
             // the waiting one run may do ([`Interpreter::spent_calling`]).
-            me.spent_calling(
-                super::super::now()
-                    .duration_since(began)
-                    .unwrap_or_default(),
-            );
+            me.spent_calling(spent);
             // The identifier of the job a run-a-job call STARTED is read from the
             // answer as the invoked model spells it, before that answer becomes the
             // task's result in the convention the `Resource` reports it in
@@ -1915,6 +1934,12 @@ impl Interpreter<'_> {
                     me.push_submit_failure(name, &resource_type, &action, failure, at, &call)
                 }
             }
+            // The span that call really took belongs to the event that CLOSED this
+            // attempt: the work ran for exactly that span, and a walk OFFSET cannot
+            // carry it — the offsets are the logical clock the definition's own `Wait`
+            // states and `Retry` intervals advance, which the branches of a `Parallel`
+            // share because they all begin together, so no call may move it.
+            me.stamp_work_span(spent);
             (attempt, at)
         });
         match outcome {

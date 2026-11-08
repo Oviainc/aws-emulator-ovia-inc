@@ -516,6 +516,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // "This API action is not supported by EXPRESS state machines" either, so
             // no read of this run's history hands a page cursor out.
             issued_page_cursors: Vec::new(),
+            // The run's history arrives complete, and is counted into the series its
+            // tasks publish as the record is stored.
+            observed_events: 0,
         };
 
         // `inputDetails`/`outputDetails` say whether the data itself is included: it

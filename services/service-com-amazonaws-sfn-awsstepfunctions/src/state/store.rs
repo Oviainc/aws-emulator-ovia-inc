@@ -134,6 +134,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
         // of those sites, so none of them can forget; the events themselves are
         // published with no lock held ([`events::publish`]).
         events::record_status_changes(self, now);
+        // And every history event the steps above made reportable owes the series the
+        // work it reports is counted in, recorded here for the same reason.
+        self.observe_task_work();
     }
 
     // -----------------------------------------------------------------------
@@ -2166,6 +2169,9 @@ impl ComAmazonawsSfnAwsstepfunctionsState {
                 retained_bytes: 0,
                 // No read of this child's history has handed a page cursor out yet.
                 issued_page_cursors: Vec::new(),
+                // Nothing of this child's history has been counted into the series its
+                // tasks publish yet.
+                observed_events: 0,
             };
             recorded.push(record.arn.clone());
             self.insert_child_execution(record);
