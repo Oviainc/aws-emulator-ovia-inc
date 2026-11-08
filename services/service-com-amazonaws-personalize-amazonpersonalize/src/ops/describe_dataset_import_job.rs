@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeDatasetImportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeDatasetImportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeDatasetImportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports the stored dataset import job, whose `status` is a function of
+//! the instant the clock owes the job its terminal state and of what the import actually
+//! did: `ACTIVE` for an import that read its data, `CREATE FAILED` with the
+//! `failureReason` the run recorded otherwise.
 //!
 //! ## Shape of an operation
 //!
@@ -138,20 +133,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeDatasetImportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeDatasetImportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeDatasetImportJob"))
+        // See `create_schema.rs`: this operation models no server-side error, so a
+        // stateless mount is reported through the scaffold channel.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "DescribeDatasetImportJob",
+            ));
+        };
+
+        // A pure read. The reported status is a function of the stored due instant, the
+        // outcome the import recorded and the current time, so nothing is written and
+        // two callers reading at one instant agree.
+        let state = state.lock();
+        let Some(record) = state
+            .dataset_import_jobs
+            .get(&input.dataset_import_job_arn)
+        else {
+            return Err(
+                DescribeDatasetImportJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::resource_not_found_message(
+                            crate::state::MissingResource::DatasetImportJob,
+                            &input.dataset_import_job_arn,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(DescribeDatasetImportJobOutput {
+            dataset_import_job: Some(crate::state::pipeline::dataset_import_job_of(record)),
+        })
     }
 }

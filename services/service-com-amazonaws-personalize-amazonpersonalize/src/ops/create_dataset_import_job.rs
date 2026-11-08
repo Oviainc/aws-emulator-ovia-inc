@@ -1,15 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateDatasetImportJob
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateDatasetImportJob`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints
+//! `arn:aws:personalize:<region>:<account>:dataset-import-job/<jobName>` and RUNS the
+//! import — it reads the CSV files the `dataSource` names out of the emulator's own
+//! Amazon S3 (in process, through the framework's callback) and stores the records it
+//! read on the dataset, which is the data a solution version is later trained on.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateDatasetImportJob::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The job's terminal status is therefore the outcome of work that actually ran:
+//! `ACTIVE` when the data was read, and `CREATE FAILED` with a `failureReason` naming
+//! what stopped it otherwise (no object at the path, a file whose rows do not match its
+//! header, or one of this emulator's read bounds). Nothing is imported for a job that
+//! failed.
+//!
+//! As on AWS the submission answers before the import is complete: "Importing takes
+//! time. You must wait until the status shows as ACTIVE before training a model using
+//! the dataset", so the record carries the instant the clock owes it its terminal status
+//! and `DescribeDatasetImportJob` reports the progression.
 //!
 //! ## Shape of an operation
 //!
@@ -109,6 +116,18 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::import;
+use crate::state::pipeline::{
+    already_exists_message, dataset_import_job_arn, due_after, limit_reached_message,
+    not_active_yet_message, DatasetImportJobRecord, DEFAULT_IMPORT_MODE, INCREMENTAL_IMPORT_MODE,
+};
+use crate::state::{
+    creation_status, resource_not_found_message, MissingResource, MAX_DATASET_IMPORT_JOBS,
+    STATUS_ACTIVE,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -182,18 +201,185 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateDatasetImportJob` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateDatasetImportJobErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateDatasetImportJob"))
+        // See `create_schema.rs`: this operation models no server-side error, so a
+        // stateless mount is reported through the scaffold channel.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateDatasetImportJob",
+            ));
+        };
+        let region = crate::state::request_region(ctx.parts());
+        let now = SystemTime::now();
+
+        // 1. What the REQUEST alone settles: the data location has to name storage this
+        //    emulator can read at all. `dataLocation`'s modelled pattern admits `http`
+        //    and `https` too, and a job pointed at one of those is a job that cannot be
+        //    carried out, so it is refused at the submission rather than recorded as a
+        //    run that imported nothing.
+        let Some(path) = import::present_data_location(&input.data_source) else {
+            return Err(invalid_input(
+                "Provide the Amazon S3 path of the data to import in \
+                 'dataSource.dataLocation'.",
+            ));
+        };
+        if import::parse_data_location(&path).is_none() {
+            return Err(invalid_input(format!(
+                "The data source {path} names no Amazon S3 bucket; Amazon Personalize imports \
+                 data from Amazon S3."
+            )));
+        }
+        // "The default import mode is FULL."
+        let import_mode = input
+            .import_mode
+            .clone()
+            .unwrap_or_else(|| DEFAULT_IMPORT_MODE.to_string());
+
+        // 2. Everything the submission is judged against, read under ONE lock.
+        let (arn, dataset_active_at, imported_before) = {
+            let store = state.lock();
+            let Some(dataset) = store.datasets.get(&input.dataset_arn) else {
+                return Err(not_found(&input.dataset_arn));
+            };
+            let arn = dataset_import_job_arn(&region, &input.job_name);
+            if let Some(taken) = taken(&store, &arn, &input.job_name) {
+                return Err(taken);
+            }
+            // A dataset takes one bulk import at a time: a second job submitted while
+            // the first is still running would race it for the dataset's records.
+            if let Some(running) = store.dataset_import_jobs.values().find(|job| {
+                job.dataset_arn == input.dataset_arn
+                    && creation_status(job.active_at) != STATUS_ACTIVE
+            }) {
+                return Err(
+                    CreateDatasetImportJobErrorModeled::ResourceInUseException(
+                        ResourceInUseException {
+                            message: Some(not_active_yet_message(
+                                "Dataset import job",
+                                &running.dataset_import_job_arn,
+                                creation_status(running.active_at),
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            let imported_before = store.dataset_import_jobs.values().any(|job| {
+                job.dataset_arn == input.dataset_arn && job.failure_reason.is_none()
+            });
+            (arn, dataset.active_at, imported_before)
+        };
+
+        // "If you haven't imported bulk records into the dataset previously, you can
+        // only specify FULL."
+        if import_mode == INCREMENTAL_IMPORT_MODE && !imported_before {
+            return Err(invalid_input(format!(
+                "No bulk records have been imported into {} yet, so the import mode must be \
+                 {DEFAULT_IMPORT_MODE}.",
+                input.dataset_arn
+            )));
+        }
+
+        // 3. The import itself, awaited with NO store lock held.
+        let outcome = import::run_import(ctx, &region, &path).await;
+
+        let mut store = state.lock();
+        // Everything this submission was judged against is re-checked here, under the
+        // lock that inserts the record: the import's S3 work was awaited without the
+        // lock, so the dataset may have been deleted and the name or the ceiling may
+        // have been taken by another submission in between. Two concurrent submissions
+        // of one name therefore cannot both land, with the later silently overwriting
+        // the earlier.
+        if let Some(taken) = taken(&store, &arn, &input.job_name) {
+            return Err(taken);
+        }
+        let Some(dataset) = store.datasets.get_mut(&input.dataset_arn) else {
+            return Err(not_found(&input.dataset_arn));
+        };
+        let (imported_rows, failure_reason) = match outcome {
+            Ok(rows) => match import::apply_import(dataset, rows, &import_mode) {
+                Ok(imported) => (imported, None),
+                Err(reason) => (0, Some(reason)),
+            },
+            Err(reason) => (0, Some(reason)),
+        };
+        if failure_reason.is_none() {
+            // The dataset's bulk content changed, which is what "the date and time the
+            // dataset was last updated" reports.
+            dataset.last_updated_date_time = now;
+        }
+
+        store.dataset_import_jobs.insert(
+            arn.clone(),
+            DatasetImportJobRecord {
+                job_name: input.job_name,
+                dataset_import_job_arn: arn.clone(),
+                dataset_arn: input.dataset_arn,
+                data_location: Some(path),
+                role_arn: input.role_arn,
+                import_mode,
+                publish_attribution_metrics_to_s3: input.publish_attribution_metrics_to_s3,
+                imported_rows,
+                creation_date_time: now,
+                last_updated_date_time: now,
+                // An import into a dataset whose own create is still pending completes
+                // after that create does, so the job is never ACTIVE before the dataset
+                // it imported into.
+                active_at: due_after(now, dataset_active_at),
+                failure_reason,
+                tags: input.tags.unwrap_or_default(),
+            },
+        );
+
+        Ok(CreateDatasetImportJobOutput {
+            dataset_import_job_arn: Some(arn),
+        })
     }
+}
+
+/// The refusal for a job name, or a store, that cannot take this submission: the ARN is
+/// minted from the name, so a name already in use collides on it.
+fn taken(
+    store: &crate::state::ComAmazonawsPersonalizeAmazonpersonalizeState,
+    arn: &str,
+    job_name: &str,
+) -> Option<CreateDatasetImportJobError> {
+    if store.dataset_import_jobs.contains_key(arn) {
+        return Some(
+            CreateDatasetImportJobErrorModeled::ResourceAlreadyExistsException(
+                ResourceAlreadyExistsException {
+                    message: Some(already_exists_message("dataset import job", job_name)),
+                },
+            )
+            .into(),
+        );
+    }
+    if store.dataset_import_jobs.len() >= MAX_DATASET_IMPORT_JOBS {
+        return Some(
+            CreateDatasetImportJobErrorModeled::LimitExceededException(LimitExceededException {
+                message: Some(limit_reached_message(
+                    "dataset import jobs",
+                    MAX_DATASET_IMPORT_JOBS,
+                )),
+            })
+            .into(),
+        );
+    }
+    None
+}
+
+/// This operation's modelled `InvalidInputException`, carrying `message`.
+fn invalid_input(message: impl Into<String>) -> CreateDatasetImportJobError {
+    CreateDatasetImportJobErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// This operation's modelled `ResourceNotFoundException` for a `datasetArn` this service
+/// holds no dataset for, worded the way every lookup of a dataset words the class.
+fn not_found(arn: &str) -> CreateDatasetImportJobError {
+    CreateDatasetImportJobErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(resource_not_found_message(MissingResource::Dataset, arn)),
+    })
+    .into()
 }

@@ -317,6 +317,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // CREATE IN_PROGRESS > ACTIVE".
                 active_at: active_at(now),
                 tags: input.tags.clone().unwrap_or_default(),
+                // "Creates an EMPTY dataset": its bulk content arrives with a
+                // `CreateDatasetImportJob`, and until one runs the dataset holds no
+                // records of its own.
+                imported: Vec::new(),
             },
         );
 

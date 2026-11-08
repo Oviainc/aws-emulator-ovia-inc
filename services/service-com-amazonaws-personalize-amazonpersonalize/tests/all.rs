@@ -21,6 +21,8 @@ mod dataset_group_lifecycle;
 mod dataset_type_casing;
 #[path = "all/dataset_type_echo.rs"]
 mod dataset_type_echo;
+#[path = "all/inference_pipeline.rs"]
+mod inference_pipeline;
 #[path = "all/list_schemas.rs"]
 mod list_schemas;
 #[path = "all/refusal_wording.rs"]

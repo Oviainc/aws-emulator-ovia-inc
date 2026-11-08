@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateFilter
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateFilter`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints `arn:aws:personalize:<region>:<account>:filter/<name>` and
+//! registers the filter in the Amazon Personalize Runtime inference registry, on the
+//! same shared engine, so a `filterArn` a client created over the wire is one
+//! `GetRecommendations` / `GetPersonalizedRanking` / `GetActionRecommendations` can
+//! apply.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateFilter::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The expression is PARSED here, by the registry's own parser: "Filter expression must
+//! follow specific format rules", so an expression the runtime could not apply is
+//! refused where the filter is created rather than quietly filtering nothing at
+//! inference time.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +83,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use ::service_com_amazonaws_personalizeruntime_amazonpersonalizeruntime::state as runtime;
+
+use crate::state::pipeline::{
+    already_exists_message, due_after, filter_arn, limit_reached_message, FilterRecord,
+};
+use crate::state::{resource_not_found_message, MissingResource, MAX_FILTERS};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -152,20 +162,95 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateFilter` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateFilterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateFilter"))
+        // See `create_schema.rs`: this operation models no server-side error, so a
+        // stateless mount is reported through the scaffold channel. It is also the only
+        // engine on which the inference registry below is unreachable.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateFilter",
+            ));
+        };
+        let now = SystemTime::now();
+
+        // LOCK ORDER: this service's store first, the inference registry second.
+        let mut state = state.lock();
+
+        // "The ARN of the dataset group that the filter will belong to": a filter
+        // belongs to a group that exists.
+        let Some(group) = state.dataset_groups.get(&input.dataset_group_arn) else {
+            return Err(
+                CreateFilterErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(resource_not_found_message(
+                        MissingResource::DatasetGroup,
+                        &input.dataset_group_arn,
+                    )),
+                })
+                .into(),
+            );
+        };
+        let region = group.region.clone();
+        let group_active_at = group.active_at;
+        let arn = filter_arn(&region, &input.name);
+
+        if state.filters.contains_key(&arn) {
+            return Err(already_exists(&input.name));
+        }
+        if state.filters.len() >= MAX_FILTERS {
+            return Err(
+                CreateFilterErrorModeled::LimitExceededException(LimitExceededException {
+                    message: Some(limit_reached_message("filters", MAX_FILTERS)),
+                })
+                .into(),
+            );
+        }
+
+        // Register in the inference registry, which PARSES the expression: a filter the
+        // runtime could not apply is refused here, naming what the parser could not
+        // read, rather than accepted and silently ignored at inference time.
+        match runtime::register_filter(&*self.engine, &arn, &input.filter_expression) {
+            Ok(true) => {}
+            // The engine is the shared in-memory one (the mount check above), so a
+            // declined registration is an ARN the registry already holds.
+            Ok(false) => return Err(already_exists(&input.name)),
+            Err(reason) => {
+                return Err(
+                    CreateFilterErrorModeled::InvalidInputException(InvalidInputException {
+                        message: Some(format!("Invalid filter expression: {reason}")),
+                    })
+                    .into(),
+                )
+            }
+        }
+
+        state.filters.insert(
+            arn.clone(),
+            FilterRecord {
+                name: input.name.clone(),
+                filter_arn: arn.clone(),
+                dataset_group_arn: input.dataset_group_arn.clone(),
+                filter_expression: input.filter_expression.clone(),
+                creation_date_time: now,
+                last_updated_date_time: now,
+                // A filter is "CREATE PENDING > CREATE IN_PROGRESS > ACTIVE"
+                // (`Filter$status`), and cannot be ready before its dataset group is.
+                active_at: due_after(now, group_active_at),
+                tags: input.tags.clone().unwrap_or_default(),
+            },
+        );
+
+        Ok(CreateFilterOutput {
+            filter_arn: Some(arn),
+        })
     }
+}
+
+/// This operation's modelled `ResourceAlreadyExistsException` for a filter name that is
+/// taken: the ARN is minted from the name, so the name's uniqueness IS the ARN's.
+fn already_exists(name: &str) -> CreateFilterError {
+    CreateFilterErrorModeled::ResourceAlreadyExistsException(ResourceAlreadyExistsException {
+        message: Some(already_exists_message("filter", name)),
+    })
+    .into()
 }

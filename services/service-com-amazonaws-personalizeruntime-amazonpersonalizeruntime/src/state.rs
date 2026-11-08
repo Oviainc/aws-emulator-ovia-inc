@@ -30,13 +30,17 @@
 //! Personalize CONTROL PLANE (`CreateCampaign`, `CreateRecommender`, `CreateFilter`)
 //! — operations this runtime service does not serve. So this emulator registers them
 //! through three seams, [`register_campaign`], [`register_recommender`] and
-//! [`register_filter`], which an emulator-internal caller (a test, or the sibling
-//! control-plane crate once it stops answering 501) calls on the shared engine.
+//! [`register_filter`], which an emulator-internal caller calls on the shared engine:
+//! the sibling control-plane crate's own `CreateCampaign` and `CreateFilter` handlers
+//! do exactly that, so a client provisioning a pipeline over the wire is what makes a
+//! campaign exist here.
 //!
 //! The rule, stated once so no handler has to re-decide it:
 //!
-//! * A campaign, recommender or filter exists **only** after its seam registered it.
-//!   There is deliberately NO auto-registration on first reference: auto-registration
+//! * A campaign, recommender or filter exists **only** after its seam registered it,
+//!   and a campaign is served only once the clock has completed its create
+//!   ([`Campaign::active_at`]). There is deliberately NO auto-registration on first
+//!   reference: auto-registration
 //!   would make `GetRecommendations` answer 200 for a campaign that was never
 //!   created, which is the one answer the real service never gives.
 //! * The item and action catalogs are stored with the campaign or recommender that
@@ -293,6 +297,18 @@ pub struct Campaign {
     pub items: Vec<Item>,
     /// The Actions catalog a `PERSONALIZED_ACTIONS` campaign recommends from.
     pub actions: Vec<Action>,
+    /// The instant the campaign's own create is due to complete, after which — and only
+    /// after which — the inference plane serves it.
+    ///
+    /// A campaign is "CREATE PENDING > CREATE IN_PROGRESS > ACTIVE" on the control plane
+    /// (`Campaign$status`), and the inference plane serves a campaign only once it is
+    /// ACTIVE, which is exactly what the refusal for an unresolvable ARN states (see
+    /// [`Denied::unresolvable`]). A seam that registered a campaign the clock has not
+    /// finished creating therefore carries that due instant, so the registry can tell
+    /// "created, not ACTIVE yet" from "ACTIVE" without being told again at read time.
+    /// A campaign registered as READY (the seam's default) carries the instant it was
+    /// registered at.
+    pub active_at: SystemTime,
 }
 
 impl Campaign {
@@ -312,6 +328,9 @@ impl Campaign {
             metadata_enabled: false,
             items,
             actions: Vec::new(),
+            // Ready as registered; a caller whose campaign is still being created says
+            // so with [`Campaign::active_from`].
+            active_at: SystemTime::now(),
         }
     }
 
@@ -330,6 +349,28 @@ impl Campaign {
     pub fn with_metadata_enabled(mut self) -> Self {
         self.metadata_enabled = true;
         self
+    }
+
+    /// The same campaign with the solution version it deploys named, and the instant its
+    /// own create completes.
+    ///
+    /// For the control-plane seam: a `CreateCampaign` answers before the campaign is
+    /// ACTIVE, so what it registers is the campaign AND the instant the clock owes it
+    /// that status ([`Campaign::active_at`]).
+    pub fn deployed(
+        mut self,
+        solution_version_arn: impl Into<String>,
+        active_at: SystemTime,
+    ) -> Self {
+        self.solution_version_arn = solution_version_arn.into();
+        self.active_at = active_at;
+        self
+    }
+
+    /// Whether the inference plane serves this campaign at `now`: a campaign is served
+    /// once its create is complete, and refused as "not active yet" before then.
+    pub fn is_active(&self, now: SystemTime) -> bool {
+        now >= self.active_at
     }
 
     /// Which personalization input a `GetRecommendations` call against this campaign
@@ -459,9 +500,16 @@ impl ComAmazonawsPersonalizeruntimeAmazonpersonalizeruntimeState {
     }
 
     /// The registered campaign under `arn`, or [`Denied::unresolvable`].
+    ///
+    /// A campaign whose create the clock has not completed yet resolves to the SAME
+    /// refusal as one that was never registered: the inference plane serves a campaign
+    /// only once it is ACTIVE and cannot tell the two apart, which is what that refusal
+    /// states (see [`Denied::unresolvable`] and [`Campaign::active_at`]). A pure read —
+    /// whether the create is due is a function of the stored instant and the clock.
     pub fn campaign(&self, arn: &str) -> Result<&Campaign, Denied> {
         self.campaigns
             .get(arn)
+            .filter(|campaign| campaign.is_active(SystemTime::now()))
             .ok_or_else(|| Denied::unresolvable(arn))
     }
 

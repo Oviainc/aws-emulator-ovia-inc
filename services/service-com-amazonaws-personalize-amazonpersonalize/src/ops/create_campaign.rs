@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCampaign
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCampaign`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints `arn:aws:personalize:<region>:<account>:campaign/<name>` and
+//! DEPLOYS the solution version — it registers the campaign, the recipe type its
+//! solution version was trained with and the catalog that training fitted in the Amazon
+//! Personalize Runtime inference registry, on the same shared engine, so
+//! `GetRecommendations` / `GetPersonalizedRanking` / `GetActionRecommendations` serve a
+//! campaign a client created over the wire.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCampaign::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Both records carry the SAME due instant: a campaign is "CREATE PENDING > CREATE
+//! IN_PROGRESS > ACTIVE" (`Campaign$status`), the inference plane serves it only once it
+//! is ACTIVE, and a campaign deploying a version that is still training becomes ACTIVE
+//! only after that version does.
 //!
 //! ## Shape of an operation
 //!
@@ -116,6 +118,17 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use ::service_com_amazonaws_personalizeruntime_amazonpersonalizeruntime::state as runtime;
+
+use crate::state::pipeline::{
+    already_exists_message, campaign_arn, catalog_limit_reached_message, due_after,
+    limit_reached_message, recipe, CampaignRecord, DEFAULT_MIN_PROVISIONED_TPS,
+    MAX_RETAINED_CATALOG_ENTRIES,
+};
+use crate::state::{resource_not_found_message, MissingResource, MAX_CAMPAIGNS};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -189,18 +202,162 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCampaign` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCampaignErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCampaign"))
+        // See `create_schema.rs`: this operation models no server-side error, so a
+        // stateless mount is reported through the scaffold channel. It is also the only
+        // engine on which the inference registry below is unreachable, so every later
+        // step can count on reaching it.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateCampaign",
+            ));
+        };
+        let now = SystemTime::now();
+        // "We recommend starting with 1 for minProvisionedTPS (the default)."
+        let min_provisioned_tps = input
+            .min_provisioned_tps
+            .unwrap_or(DEFAULT_MIN_PROVISIONED_TPS);
+        // "Whether metadata with recommendations is enabled for the campaign. If
+        // enabled, you can specify the columns from your Items dataset in your request
+        // for recommendations" (`CampaignConfig$enableMetadataWithRecommendations`).
+        let metadata_enabled = input
+            .campaign_config
+            .as_ref()
+            .and_then(|config| config.enable_metadata_with_recommendations)
+            .unwrap_or(false);
+
+        // LOCK ORDER: this service's store first, the inference registry second (the
+        // registration below); the runtime handlers take only their own store, so the
+        // order cannot invert.
+        let mut state = state.lock();
+
+        let Some(version) = state.solution_versions.get(&input.solution_version_arn) else {
+            return Err(not_found(
+                MissingResource::SolutionVersion,
+                &input.solution_version_arn,
+            ));
+        };
+        // A campaign "describes the deployment of a solution version", so there has to
+        // BE a trained model to deploy: a version whose training run failed is not one.
+        if let Some(reason) = version.failure_reason.clone() {
+            return Err(invalid_input(format!(
+                "Solution version {} did not train successfully: {reason}",
+                input.solution_version_arn
+            )));
+        }
+        // WHICH inference operation serves the campaign is the recipe's property, and a
+        // recipe whose results are read in batch is not deployed in a campaign at all.
+        let Some(served_by) = recipe(&version.recipe_arn).and_then(|entry| entry.served_by) else {
+            return Err(invalid_input(format!(
+                "A solution version created with recipe {} cannot be deployed in a campaign.",
+                version.recipe_arn
+            )));
+        };
+        let solution_arn = version.solution_arn.clone();
+        let version_active_at = version.active_at;
+        let trained = version.trained.clone();
+
+        // The campaign is minted in the region of the pipeline it deploys, so every
+        // resource of one pipeline carries one region whichever region this request was
+        // signed for.
+        let region = state
+            .solutions
+            .get(&solution_arn)
+            .map(|solution| solution.region.clone())
+            .unwrap_or_else(|| crate::state::request_region(ctx.parts()));
+        let arn = campaign_arn(&region, &input.name);
+
+        if state.campaigns.contains_key(&arn) {
+            return Err(already_exists(&input.name));
+        }
+        if state.campaigns.len() >= MAX_CAMPAIGNS {
+            return Err(CreateCampaignErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(limit_reached_message("campaigns", MAX_CAMPAIGNS)),
+                },
+            )
+            .into());
+        }
+        // A deployed campaign keeps a COPY of its solution version's catalog in the
+        // inference registry, so what the engine retains across every campaign is
+        // bounded as well as what one campaign holds. Checked before anything is
+        // registered, so a create past it allocates nothing.
+        let catalog_entries = trained.entries();
+        let retained: usize = state
+            .campaigns
+            .values()
+            .map(|campaign| campaign.catalog_entries)
+            .sum();
+        if retained.saturating_add(catalog_entries) > MAX_RETAINED_CATALOG_ENTRIES {
+            return Err(CreateCampaignErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(catalog_limit_reached_message("campaign")),
+                },
+            )
+            .into());
+        }
+
+        let active_at = due_after(now, version_active_at);
+        // DEPLOY: the inference registry is seeded BEFORE the campaign is recorded here,
+        // so a campaign this control plane reports is always one the data plane can
+        // serve. It carries the catalog the solution version was trained on and the
+        // same due instant, so what `DescribeCampaign` reports ACTIVE is what the
+        // runtime serves.
+        let mut campaign = runtime::Campaign::new(&arn, &input.name, served_by, trained.items);
+        campaign.actions = trained.actions;
+        let mut campaign = campaign.deployed(&input.solution_version_arn, active_at);
+        if metadata_enabled {
+            campaign = campaign.with_metadata_enabled();
+        }
+        // The engine is the shared in-memory one (the mount check above), so the only
+        // way the seam declines is an ARN the registry already holds.
+        if !runtime::register_campaign(&*self.engine, campaign) {
+            return Err(already_exists(&input.name));
+        }
+
+        state.campaigns.insert(
+            arn.clone(),
+            CampaignRecord {
+                name: input.name.clone(),
+                campaign_arn: arn.clone(),
+                solution_version_arn: input.solution_version_arn.clone(),
+                min_provisioned_tps,
+                campaign_config: input.campaign_config.clone(),
+                catalog_entries,
+                creation_date_time: now,
+                last_updated_date_time: now,
+                active_at,
+                tags: input.tags.clone().unwrap_or_default(),
+            },
+        );
+
+        Ok(CreateCampaignOutput {
+            campaign_arn: Some(arn),
+        })
     }
+}
+
+/// This operation's modelled `ResourceAlreadyExistsException` for a campaign name that
+/// is taken: the ARN is minted from the name, so the name's uniqueness IS the ARN's.
+fn already_exists(name: &str) -> CreateCampaignError {
+    CreateCampaignErrorModeled::ResourceAlreadyExistsException(ResourceAlreadyExistsException {
+        message: Some(already_exists_message("campaign", name)),
+    })
+    .into()
+}
+
+/// This operation's modelled `InvalidInputException`, carrying `message`.
+fn invalid_input(message: impl Into<String>) -> CreateCampaignError {
+    CreateCampaignErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// This operation's modelled `ResourceNotFoundException`, worded the way every lookup of
+/// that kind of resource words the class.
+fn not_found(resource: MissingResource, arn: &str) -> CreateCampaignError {
+    CreateCampaignErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(resource_not_found_message(resource, arn)),
+    })
+    .into()
 }

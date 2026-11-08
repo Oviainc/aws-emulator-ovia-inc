@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSolutionVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSolutionVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: mints
+//! `arn:aws:personalize:<region>:<account>:solution/<solution name>/<version id>` and
+//! TRAINS the version on the dataset group's own records — the rows a dataset import job
+//! read out of object storage and the records the Amazon Personalize Events data plane
+//! ingested — storing the catalog it fitted ([`crate::state::training`]), which is what a
+//! campaign deploying this version recommends from.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSolutionVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The version's terminal status is therefore the outcome of work that actually ran:
+//! `ACTIVE` when the group held interactions to fit a model to, and `CREATE FAILED` with
+//! a `failureReason` naming what was missing otherwise. As on AWS the submission answers
+//! before training is finished, so the record carries the instant the clock owes it its
+//! terminal status and `DescribeSolutionVersion` reports the progression.
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +100,17 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::pipeline::{
+    already_exists_message, catalog_limit_reached_message, due_after, limit_reached_message, recipe,
+    solution_version_arn, SolutionVersionRecord, DEFAULT_TRAINING_MODE, MANUAL_TRAINING_TYPE,
+    MAX_RETAINED_CATALOG_ENTRIES, UPDATE_TRAINING_MODE,
+};
+use crate::state::{
+    resource_not_found_message, training, MissingResource, MAX_SOLUTION_VERSIONS,
+};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -168,20 +182,172 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSolutionVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSolutionVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSolutionVersion"))
+        // See `create_schema.rs`: this operation models no server-side error, so a
+        // stateless mount is reported through the scaffold channel.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateSolutionVersion",
+            ));
+        };
+        let now = SystemTime::now();
+        // "A FULL training considers all of the data in your dataset group" — and is the
+        // scope a request that names no mode asks for.
+        let training_mode = input
+            .training_mode
+            .clone()
+            .unwrap_or_else(|| DEFAULT_TRAINING_MODE.to_string());
+
+        let mut state = state.lock();
+
+        let Some(solution) = state.solutions.get(&input.solution_arn) else {
+            return Err(not_found(MissingResource::Solution, &input.solution_arn));
+        };
+        // Everything the version inherits from its solution: a version trains with the
+        // solution's recipe, on the solution's dataset group.
+        let region = solution.region.clone();
+        let solution_name = solution.name.clone();
+        let recipe_arn = solution.recipe_arn.clone();
+        let dataset_group_arn = solution.dataset_group_arn.clone();
+        let solution_active_at = solution.active_at;
+        let ordinal = solution.versions_created.saturating_add(1);
+        let perform_hpo = solution.perform_hpo;
+        let perform_auto_ml = solution.perform_auto_ml;
+        let perform_incremental_update = solution.perform_incremental_update;
+        let event_type = solution.event_type.clone();
+        let solution_config = solution.solution_config.clone();
+
+        // "An UPDATE processes only the data that has changed since the latest training.
+        // Only solution versions created with the User-Personalization recipe can use
+        // UPDATE" (`SolutionVersion$trainingMode`), so the recipe decides whether the
+        // mode this request asks for is available at all.
+        if training_mode == UPDATE_TRAINING_MODE
+            && !recipe(&recipe_arn).is_some_and(|entry| entry.supports_update)
+        {
+            return Err(invalid_input(format!(
+                "Training mode {UPDATE_TRAINING_MODE} is only available for a solution created \
+                 with a recipe that supports incremental training; solution {} was created with \
+                 {recipe_arn}.",
+                input.solution_arn
+            )));
+        }
+
+        let arn = solution_version_arn(&region, &solution_name, ordinal);
+        if state.solution_versions.contains_key(&arn) {
+            return Err(
+                CreateSolutionVersionErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(already_exists_message("solution version", &arn)),
+                    },
+                )
+                .into(),
+            );
+        }
+        if state.solution_versions.len() >= MAX_SOLUTION_VERSIONS {
+            return Err(CreateSolutionVersionErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(limit_reached_message(
+                        "solution versions",
+                        MAX_SOLUTION_VERSIONS,
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // TRAIN: the catalog is read from the records the dataset group actually holds —
+        // the bulk rows an import job stored and the records the ingestion data plane
+        // took. Both stores are read under the documented lock order (this service's
+        // store first, the ingestion registry second).
+        let trained = match crate::state::ingestion_registry(&*self.engine) {
+            Some(ingestion) => {
+                let ingested = ingestion.lock();
+                training::train(&state, &dataset_group_arn, Some(&ingested))
+            }
+            None => training::train(&state, &dataset_group_arn, None),
+        };
+        // A model cannot be fitted to a dataset group that holds no interactions: "Only
+        // the Item interactions dataset is required in order to train a model"
+        // (`CreateDataset` doc). The version is recorded, and reports the modelled
+        // `CREATE FAILED` with the reason, exactly as a training run that found no
+        // usable data does on AWS.
+        let failure_reason = (trained.interactions == 0).then(|| {
+            format!(
+                "No interaction records were found in dataset group {dataset_group_arn}. Import \
+                 or record interactions before creating a solution version."
+            )
+        });
+        // A trained version KEEPS its catalog, so what the store retains across every
+        // version is bounded as well as what one version holds: the check runs before
+        // the record is inserted, so a create past it allocates nothing.
+        let retained: usize = state
+            .solution_versions
+            .values()
+            .map(|version| version.trained.entries())
+            .sum();
+        if retained.saturating_add(trained.entries()) > MAX_RETAINED_CATALOG_ENTRIES {
+            return Err(CreateSolutionVersionErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(catalog_limit_reached_message("solution version")),
+                },
+            )
+            .into());
+        }
+
+        state.solution_versions.insert(
+            arn.clone(),
+            SolutionVersionRecord {
+                name: input.name.clone(),
+                solution_version_arn: arn.clone(),
+                solution_arn: input.solution_arn.clone(),
+                dataset_group_arn,
+                recipe_arn,
+                perform_hpo,
+                perform_auto_ml,
+                perform_incremental_update,
+                event_type,
+                solution_config,
+                training_mode,
+                // "Whether the solution version was created automatically or manually":
+                // this one was asked for.
+                training_type: MANUAL_TRAINING_TYPE.to_string(),
+                creation_date_time: now,
+                last_updated_date_time: now,
+                // Training completes after the solution it belongs to does, so a
+                // version created while the solution is still pending is never ACTIVE
+                // before its solution.
+                active_at: due_after(now, solution_active_at),
+                failure_reason,
+                trained,
+                tags: input.tags.clone().unwrap_or_default(),
+            },
+        );
+        // The ordinal this version took is what the NEXT version's id is minted from.
+        if let Some(solution) = state.solutions.get_mut(&input.solution_arn) {
+            solution.versions_created = ordinal;
+            solution.last_updated_date_time = now;
+        }
+
+        Ok(CreateSolutionVersionOutput {
+            solution_version_arn: Some(arn),
+        })
     }
+}
+
+/// This operation's modelled `InvalidInputException`, carrying `message`.
+fn invalid_input(message: impl Into<String>) -> CreateSolutionVersionError {
+    CreateSolutionVersionErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// This operation's modelled `ResourceNotFoundException`, worded the way every lookup of
+/// that kind of resource words the class.
+fn not_found(resource: MissingResource, arn: &str) -> CreateSolutionVersionError {
+    CreateSolutionVersionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(resource_not_found_message(resource, arn)),
+    })
+    .into()
 }

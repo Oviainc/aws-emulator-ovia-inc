@@ -14,6 +14,10 @@
 //! ARN minting, the create-status clock, the page/token codec and the shared value
 //! checks — so the handlers of the dataset-group lifecycle cannot drift from each other.
 
+pub mod import;
+pub mod pipeline;
+pub mod training;
+
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
@@ -85,6 +89,15 @@ pub struct DatasetRecord {
     /// The instant the clock owes this dataset its `ACTIVE` status.
     pub active_at: SystemTime,
     pub tags: Vec<Tag>,
+    /// The records a `CreateDatasetImportJob` actually read out of object storage and
+    /// imported into this dataset, each row keyed by its CSV column name.
+    ///
+    /// This is the dataset's BULK content: "a dataset import job replaces any existing
+    /// data in the dataset that you imported in bulk" (`CreateDatasetImportJob` doc), so
+    /// a `FULL` import replaces it and an `INCREMENTAL` one adds to it. It is what a
+    /// solution version is later trained on ([`training::train`]), so no campaign ever
+    /// recommends an item no import and no ingestion put there.
+    pub imported: Vec<import::Row>,
 }
 
 /// Per-service state for com-amazonaws-personalize-amazonpersonalize. A handler reaches it through [`service_state`].
@@ -96,6 +109,16 @@ pub struct ComAmazonawsPersonalizeAmazonpersonalizeState {
     pub dataset_groups: BTreeMap<String, DatasetGroupRecord>,
     /// Datasets, keyed by `datasetArn`.
     pub datasets: BTreeMap<String, DatasetRecord>,
+    /// Dataset import jobs, keyed by `datasetImportJobArn`.
+    pub dataset_import_jobs: BTreeMap<String, pipeline::DatasetImportJobRecord>,
+    /// Solutions, keyed by `solutionArn`.
+    pub solutions: BTreeMap<String, pipeline::SolutionRecord>,
+    /// Solution versions, keyed by `solutionVersionArn`.
+    pub solution_versions: BTreeMap<String, pipeline::SolutionVersionRecord>,
+    /// Campaigns, keyed by `campaignArn`.
+    pub campaigns: BTreeMap<String, pipeline::CampaignRecord>,
+    /// Filters, keyed by `filterArn`.
+    pub filters: BTreeMap<String, pipeline::FilterRecord>,
 }
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
@@ -158,6 +181,26 @@ pub const MAX_DATASET_GROUPS: usize = 10_000;
 
 /// The same bound for datasets. See [`MAX_SCHEMAS`].
 pub const MAX_DATASETS: usize = 50_000;
+
+/// The same bound for dataset import jobs. See [`MAX_SCHEMAS`].
+pub const MAX_DATASET_IMPORT_JOBS: usize = 1_000;
+
+/// The same bound for solutions. See [`MAX_SCHEMAS`].
+pub const MAX_SOLUTIONS: usize = 1_000;
+
+/// The same bound for solution versions. See [`MAX_SCHEMAS`].
+///
+/// Lower than the resource bounds above because a solution version retains the CATALOG
+/// it was trained on, so each one costs memory rather than a record; how much in total is
+/// bounded by [`pipeline::MAX_RETAINED_CATALOG_ENTRIES`].
+pub const MAX_SOLUTION_VERSIONS: usize = 500;
+
+/// The same bound for campaigns, which keep a copy of their solution version's catalog
+/// in the inference registry. See [`MAX_SOLUTION_VERSIONS`].
+pub const MAX_CAMPAIGNS: usize = 500;
+
+/// The same bound for filters. See [`MAX_SCHEMAS`].
+pub const MAX_FILTERS: usize = 1_000;
 
 // ---------------------------------------------------------------------------
 // Request-derived values
@@ -228,6 +271,12 @@ pub enum MissingResource {
     Schema,
     DatasetGroup,
     Dataset,
+    DatasetImportJob,
+    Recipe,
+    Solution,
+    SolutionVersion,
+    Campaign,
+    Filter,
 }
 
 /// What a lookup that resolves to nothing answers for `arn`, in the wording Personalize
@@ -238,6 +287,14 @@ pub fn resource_not_found_message(resource: MissingResource, arn: &str) -> Strin
         MissingResource::Schema => format!("Resource Arn {arn} does not exist."),
         MissingResource::DatasetGroup => format!("The given dataset group does not exist: {arn}"),
         MissingResource::Dataset => format!("The given dataset does not exist: {arn}"),
+        // Every other kind this service addresses by ARN reads the same sentence: the
+        // ARN the caller named is its one variable part.
+        MissingResource::DatasetImportJob
+        | MissingResource::Recipe
+        | MissingResource::Solution
+        | MissingResource::SolutionVersion
+        | MissingResource::Campaign
+        | MissingResource::Filter => format!("Resource Arn {arn} does not exist."),
     }
 }
 
@@ -281,6 +338,11 @@ pub const STATUS_CREATE_PENDING: &str = "CREATE PENDING";
 pub const STATUS_CREATE_IN_PROGRESS: &str = "CREATE IN_PROGRESS";
 /// `ACTIVE`: the terminal status of a successful create.
 pub const STATUS_ACTIVE: &str = "ACTIVE";
+/// `CREATE FAILED`: the terminal status of a create whose own work did not succeed —
+/// the import a dataset import job could not read, the training a solution version had
+/// no data for. The model documents it as the alternative terminal state of those
+/// progressions ("CREATE PENDING > CREATE IN_PROGRESS > ACTIVE -or- CREATE FAILED").
+pub const STATUS_CREATE_FAILED: &str = "CREATE FAILED";
 
 /// How long after a create this emulator takes to report the new resource `ACTIVE`.
 ///
@@ -312,6 +374,19 @@ pub fn creation_status(active_at: SystemTime) -> &'static str {
     match active_at.checked_sub(CREATE_SPAN / 2) {
         Some(in_progress_at) if now >= in_progress_at => STATUS_CREATE_IN_PROGRESS,
         _ => STATUS_CREATE_PENDING,
+    }
+}
+
+/// The status of a resource whose own work could FAIL: `ACTIVE` once the clock has made
+/// its completion due and the work succeeded, `CREATE FAILED` once it is due and the
+/// work did not, and the transient statuses of [`creation_status`] before then.
+///
+/// `failure_reason` is the reason the work recorded when it ran, so the terminal status
+/// is a function of what actually happened plus the clock — never of the read.
+pub fn terminal_status(active_at: SystemTime, failure_reason: Option<&str>) -> &'static str {
+    match creation_status(active_at) {
+        STATUS_ACTIVE if failure_reason.is_some() => STATUS_CREATE_FAILED,
+        status => status,
     }
 }
 

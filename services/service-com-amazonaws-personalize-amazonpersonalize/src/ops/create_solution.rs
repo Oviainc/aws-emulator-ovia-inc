@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateSolution
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateSolution`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateSolution::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: mints `arn:aws:personalize:<region>:<account>:solution/<name>` and
+//! records the recipe the solution trains with — the `recipeArn` the request named,
+//! resolved against the recipes this emulator knows
+//! ([`crate::state::pipeline::RECIPES`]), or the recipe an AutoML search settles on when
+//! `performAutoML` is true. The recipe is what decides which inference operation serves
+//! a campaign on this solution's versions, so an ARN that names no recipe is refused
+//! here rather than at inference time.
 //!
 //! ## Shape of an operation
 //!
@@ -144,6 +142,14 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+use std::time::SystemTime;
+
+use crate::state::pipeline::{
+    already_exists_message, auto_ml_recipe, due_after, limit_reached_message, recipe,
+    SolutionRecord, AUTO_ML_RECIPE_TYPE,
+};
+use crate::state::{resource_not_found_message, MissingResource, MAX_SOLUTIONS};
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -215,20 +221,139 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateSolution` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateSolutionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateSolution"))
+        // See `create_schema.rs`: this operation models no server-side error, so a
+        // stateless mount is reported through the scaffold channel.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "CreateSolution",
+            ));
+        };
+        let now = SystemTime::now();
+
+        // The RECIPE the solution trains with. "When true, Amazon Personalize performs a
+        // search for the best USER_PERSONALIZATION recipe from the list specified in the
+        // solution configuration (recipeArn must not be specified). When false (the
+        // default), Amazon Personalize uses recipeArn for training"
+        // (`performAutoML`), and `recipeArn` "is required when performAutoML is false".
+        let (recipe_arn, auto_ml_result) = match (input.perform_auto_ml, &input.recipe_arn) {
+            (true, Some(named)) => {
+                return Err(invalid_input(format!(
+                    "recipeArn {named} must not be specified when performAutoML is true."
+                )))
+            }
+            (true, None) => {
+                let candidates = input
+                    .solution_config
+                    .as_ref()
+                    .and_then(|config| config.auto_ml_config.as_ref())
+                    .and_then(|config| config.recipe_list.as_deref());
+                // A `recipeList` that names no recipe the search can choose from leaves
+                // AutoML with nothing to train the solution with.
+                let Some(entry) = auto_ml_recipe(candidates) else {
+                    return Err(invalid_input(format!(
+                        "No {AUTO_ML_RECIPE_TYPE} recipe to search was found; name one in \
+                         solutionConfig.autoMLConfig.recipeList or set recipeArn."
+                    )));
+                };
+                (entry.arn.to_string(), true)
+            }
+            (false, None) => {
+                return Err(invalid_input(
+                    "recipeArn is required when performAutoML is false.",
+                ))
+            }
+            (false, Some(named)) => {
+                // A recipe this emulator does not hold is a resource that does not
+                // exist, reported the way every ARN lookup of this service reports one.
+                if recipe(named).is_none() {
+                    return Err(not_found(MissingResource::Recipe, named));
+                }
+                (named.clone(), false)
+            }
+        };
+
+        let mut state = state.lock();
+
+        // "The Amazon Resource Name (ARN) of the dataset group that provides the
+        // training data": a solution trains on the data of a group that exists.
+        let Some(group) = state.dataset_groups.get(&input.dataset_group_arn) else {
+            return Err(not_found(
+                MissingResource::DatasetGroup,
+                &input.dataset_group_arn,
+            ));
+        };
+        let region = group.region.clone();
+        let group_active_at = group.active_at;
+        let arn = crate::state::pipeline::solution_arn(&region, &input.name);
+
+        if state.solutions.contains_key(&arn) {
+            return Err(
+                CreateSolutionErrorModeled::ResourceAlreadyExistsException(
+                    ResourceAlreadyExistsException {
+                        message: Some(already_exists_message("solution", &input.name)),
+                    },
+                )
+                .into(),
+            );
+        }
+        if state.solutions.len() >= MAX_SOLUTIONS {
+            return Err(CreateSolutionErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(limit_reached_message("solutions", MAX_SOLUTIONS)),
+                },
+            )
+            .into());
+        }
+
+        state.solutions.insert(
+            arn.clone(),
+            SolutionRecord {
+                name: input.name.clone(),
+                solution_arn: arn.clone(),
+                dataset_group_arn: input.dataset_group_arn.clone(),
+                region,
+                // "Whether to perform hyperparameter optimization (HPO) on the chosen
+                // recipe. The default is false."
+                perform_hpo: input.perform_hpo.unwrap_or(false),
+                perform_auto_ml: input.perform_auto_ml,
+                perform_auto_training: input.perform_auto_training,
+                perform_incremental_update: input.perform_incremental_update,
+                recipe_arn,
+                auto_ml_result,
+                event_type: input.event_type.clone(),
+                solution_config: input.solution_config.clone(),
+                creation_date_time: now,
+                last_updated_date_time: now,
+                // A solution is not created ready: "CREATE PENDING > CREATE IN_PROGRESS
+                // > ACTIVE" (`Solution$status`), and it cannot be ready before the
+                // dataset group whose data it trains on is.
+                active_at: due_after(now, group_active_at),
+                versions_created: 0,
+                tags: input.tags.clone().unwrap_or_default(),
+            },
+        );
+
+        Ok(CreateSolutionOutput {
+            solution_arn: Some(arn),
+        })
     }
+}
+
+/// This operation's modelled `InvalidInputException`, carrying `message`.
+fn invalid_input(message: impl Into<String>) -> CreateSolutionError {
+    CreateSolutionErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message.into()),
+    })
+    .into()
+}
+
+/// This operation's modelled `ResourceNotFoundException` for an ARN this service holds
+/// no resource of that kind for, worded the way every lookup of that kind words it.
+fn not_found(resource: MissingResource, arn: &str) -> CreateSolutionError {
+    CreateSolutionErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(resource_not_found_message(resource, arn)),
+    })
+    .into()
 }

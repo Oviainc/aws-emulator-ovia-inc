@@ -27,8 +27,24 @@ hex = { workspace = true }
 # UUID form its own ids take — minted by the maintained crate, not laid out by hand.
 uuid = { version = "1", features = ["v4"] }
 # The ingestion registry `CreateDataset` seeds and `DeleteDataset` clears, so a dataset
-# created over the wire is a target Amazon Personalize Events can ingest into.
+# created over the wire is a target Amazon Personalize Events can ingest into. Its
+# records are also part of what a solution version is trained on.
 service-com-amazonaws-personalizeevents-amazonpersonalizeevents = { workspace = true }
+# The Amazon Personalize Runtime INFERENCE registry `CreateCampaign` and `CreateFilter`
+# seed, so a campaign created over the wire is one `GetRecommendations`,
+# `GetPersonalizedRanking` and `GetActionRecommendations` can serve. One shared engine,
+# so this is a path dependency on the crate that owns that registry's type.
+service-com-amazonaws-personalizeruntime-amazonpersonalizeruntime = { workspace = true }
+# Amazon S3 client a dataset import job reads its CSV training data with, over the
+# in-process callback into this same emulator (no network client feature is enabled:
+# the transport is the emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = [
+    "rt-tokio",
+    "behavior-version-latest",
+] }
+# CSV reader for the import files `CreateDatasetImportJob`'s `dataSource` names, with
+# the RFC 4180 quoting a Personalize import file may use.
+csv = "1.3"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -36,6 +52,14 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The pipeline suite mounts S3 and the inference data plane beside this control plane on
+# ONE engine: a dataset import job reads its CSV out of S3 by calling it in process, and
+# `GetPersonalizedRanking` is what proves a created campaign reached the runtime
+# registry.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+# `tokio::time::sleep` is how a test waits out the span the clock owes a created
+# resource before it becomes ACTIVE.
+tokio = { workspace = true, features = ["time"] }
 
 [lints]
 workspace = true
