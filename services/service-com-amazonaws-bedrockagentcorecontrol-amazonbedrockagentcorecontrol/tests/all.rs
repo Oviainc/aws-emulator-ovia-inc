@@ -17,6 +17,8 @@ mod agent_runtime_endpoint_lifecycle;
 mod agent_runtime_endpoint_listing;
 #[path = "all/agent_runtime_lifecycle.rs"]
 mod agent_runtime_lifecycle;
+#[path = "all/api_key_credential_provider_lifecycle.rs"]
+mod api_key_credential_provider_lifecycle;
 #[path = "all/browser_lifecycle.rs"]
 mod browser_lifecycle;
 #[path = "all/browser_profile_lifecycle.rs"]

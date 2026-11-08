@@ -37,6 +37,10 @@ aws-sdk-s3 = { version = "1", default-features = false }
 # own CloudWatch Logs, through the in-process callback
 # (src/state/runtime_logs.rs).
 aws-sdk-cloudwatchlogs = { version = "1", default-features = false }
+# Stores a managed API key credential provider's key in — and resolves an external
+# one's secret against — the emulator's own Secrets Manager, through the in-process
+# callback (src/state/api_key_credential_providers.rs).
+aws-sdk-secretsmanager = { version = "1", default-features = false }
 # Encodes the opaque `nextToken` ListAgentRuntimes pages with.
 hex = { workspace = true }
 
@@ -50,6 +54,9 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 # Mounted beside this service in the vended-log-group suite, so the group a create
 # provisions is one the emulator's CloudWatch Logs really holds.
 service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
+# Mounted beside this service in the API-key-credential-provider suite, so the secret
+# a create stores the key in is one the emulator's Secrets Manager really holds.
+service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
 
 [lints]
 workspace = true

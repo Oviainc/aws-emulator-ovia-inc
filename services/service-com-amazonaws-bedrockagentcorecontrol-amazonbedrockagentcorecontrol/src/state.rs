@@ -42,6 +42,11 @@
 //! * the token vault ([`TokenVaults`]): the KMS configuration each vault of the
 //!   account is encrypted under, so `SetTokenVaultCMK` and `GetTokenVault`
 //!   answer from one store;
+//! * the API key credential provider (`/identities/`): one
+//!   [`ApiKeyCredentialProviderRecord`] per provider `name`, holding the ARN of
+//!   the Secrets Manager secret the key lives in and the source that secret
+//!   came from, so a create and every later read of the provider answer from one
+//!   store while the credential itself stays in Secrets Manager;
 //! * the tools the SERVICE provides ([`SystemTools`]): the browser and the code
 //!   interpreter every account holds without having created one, so a read of
 //!   either reports it, while a delete — which addresses only what this account
@@ -1735,6 +1740,12 @@ mod resource_policies;
 /// `crate::state::…` for it exactly as it does for the object-storage and IAM
 /// resolutions beside it.
 pub mod runtime_logs;
+/// The API key credential providers of this account's token vault: the record a
+/// create persists, the ARNs it mints and the Secrets Manager secret the API key
+/// itself lives in. Re-exported, so a handler names `crate::state::…` for it
+/// exactly as it does for the token vault the providers belong to.
+pub mod api_key_credential_providers;
+pub use api_key_credential_providers::*;
 pub use memory_strategies::*;
 pub use resource_policies::*;
 pub use runtime_logs::*;
@@ -3003,9 +3014,11 @@ impl ConfigurationBundleRecord {
 /// [`MAX_CONFIGURATION_BUNDLES`] the configuration bundles (and with them their
 /// 1:1 name index), [`MAX_VERSIONS_PER_CONFIGURATION_BUNDLE`] the versions one
 /// bundle accumulates and
-/// [`MAX_WORKLOAD_IDENTITIES`] the workload identities, the resource policies
-/// are capped by the resources they attach to (one per runtime or gateway at
-/// most, and the entry of a resource that is gone is dropped), and the
+/// [`MAX_WORKLOAD_IDENTITIES`] the workload identities,
+/// [`MAX_API_KEY_CREDENTIAL_PROVIDERS`] the API key credential providers, the
+/// resource policies are capped by the resources they attach to (one per runtime
+/// or gateway at most, and the entry of a resource that is gone is dropped), and
+/// the
 /// idempotency records are capped at [`MAX_REMEMBERED_CLIENT_TOKENS`] with
 /// oldest-first eviction plus removal when the resource they name is deleted.
 #[derive(Debug, Default)]
@@ -3195,6 +3208,15 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// were first recorded, so the oldest record is the one evicted at the
     /// ceiling.
     configuration_bundle_idempotency_order: VecDeque<String>,
+    /// Every API key credential provider of this account's default token vault,
+    /// keyed by `name` — the identifier every API-key-credential-provider route
+    /// addresses it by, and what the provider's own ARN ends in. The key order is
+    /// the deterministic list order a provider listing pages over.
+    ///
+    /// The API KEY itself is not here: a provider's key lives in a Secrets
+    /// Manager secret (see [`api_key_credential_providers`]), and the record
+    /// holds the ARN of that secret rather than the credential.
+    pub api_key_credential_providers: BTreeMap<String, ApiKeyCredentialProviderRecord>,
     /// The account's token vaults, keyed by `tokenVaultId`. Bounded by its own
     /// type: no operation of this service creates a vault, so the map holds the
     /// one default vault [`TokenVaults`] seeds and never grows.

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateApiKeyCredentialProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateApiKeyCredentialProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateApiKeyCredentialProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -189,18 +180,203 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateApiKeyCredentialProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateApiKeyCredentialProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateApiKeyCredentialProviderErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the credential provider store is unavailable".to_string()),
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+        let vault = crate::state::DEFAULT_TOKEN_VAULT_ID;
+
+        // Which secret the provider's key lives in, and therefore what this
+        // create has to do about it: the service manages the secret it stores
+        // the caller's `apiKey` in, or the caller manages their own and the
+        // request references it.
+        let source = crate::state::effective_secret_source(
+            input.api_key_secret_source.as_deref(),
+            input.api_key_secret_config.is_some(),
+        )
+        .to_string();
+        let api_key = input.api_key.as_deref().unwrap_or_default();
+
+        // Two rules the model states in prose on the members themselves, so the
+        // framework's constraint walk cannot refuse them: the secret reference
+        // "is required when apiKeySecretSource is set to EXTERNAL", and a
+        // service-managed secret is the place the `apiKey` is "encrypted and
+        // stored securely" — there is nothing to store without one.
+        let external_reference = if source == crate::state::SECRET_SOURCE_EXTERNAL {
+            let Some(reference) = input.api_key_secret_config.clone() else {
+                return Err(CreateApiKeyCredentialProviderErrorModeled::ValidationException(
+                    crate::state::field_validation_failed(
+                        crate::state::API_KEY_SECRET_CONFIG_MEMBER,
+                        &format!(
+                            "is required when apiKeySecretSource is {}",
+                            crate::state::SECRET_SOURCE_EXTERNAL
+                        ),
+                    ),
+                )
+                .into());
+            };
+            Some(reference)
+        } else {
+            None
+        };
+        if external_reference.is_none() && api_key.is_empty() {
+            return Err(CreateApiKeyCredentialProviderErrorModeled::ValidationException(
+                crate::state::field_validation_failed(
+                    crate::state::API_KEY_MEMBER,
+                    &format!(
+                        "is required when apiKeySecretSource is {}",
+                        crate::state::SECRET_SOURCE_MANAGED
+                    ),
+                ),
+            )
+            .into());
+        }
+
+        // The name this account already holds a provider under, and this
+        // emulator's own ceiling, are both decided before anything is minted:
+        // nothing is stored in Secrets Manager for a request that is refused.
+        // The guard is dropped before the awaits below.
+        {
+            let store = state.lock();
+            if store.api_key_credential_providers.contains_key(&input.name) {
+                return Err(name_taken(&input.name).into());
+            }
+            if store.api_key_credential_providers.len()
+                >= crate::state::MAX_API_KEY_CREDENTIAL_PROVIDERS
+            {
+                return Err(
+                    CreateApiKeyCredentialProviderErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: Some(format!(
+                                "this account already holds the maximum of {} API key \
+                                 credential providers",
+                                crate::state::MAX_API_KEY_CREDENTIAL_PROVIDERS
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // The secret the provider reports is a secret Secrets Manager really
+        // holds: the one this create puts the caller's key into for a managed
+        // provider, or the one the request references for an external one. The
+        // ARN is `@required` on this operation's own answer, so a provider is not
+        // recorded — and no success is reported — when there is no secret to name.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateApiKeyCredentialProvider"))
+        // An external provider's secret is the CALLER's: nothing is written into
+        // it, so an `apiKey` sent alongside the reference is not stored anywhere.
+        // The model states no rule making the two members exclusive, so the
+        // request is served rather than refused over it.
+        let (api_key_secret_arn, api_key_secret_json_key) = match external_reference {
+            Some(reference) => {
+                let arn = crate::state::external_api_key_secret_arn(
+                    ctx,
+                    &region,
+                    &reference.secret_id,
+                )
+                .await
+                .map_err(|problem| secret_problem(problem, &reference.secret_id))?;
+                (arn, Some(reference.json_key))
+            }
+            None => {
+                let arn = crate::state::store_managed_api_key(
+                    ctx,
+                    &region,
+                    vault,
+                    &input.name,
+                    api_key,
+                )
+                .await
+                .map_err(|problem| secret_problem(problem, &input.name))?;
+                // A managed secret carries the key under the service's own JSON
+                // key, which is what a client extracts it with.
+                (arn, Some(crate::state::MANAGED_SECRET_JSON_KEY.to_string()))
+            }
+        };
+
+        let record = crate::state::ApiKeyCredentialProviderRecord {
+            credential_provider_arn: crate::state::api_key_credential_provider_arn(
+                &region,
+                vault,
+                &input.name,
+            ),
+            name: input.name,
+            api_key_secret_arn,
+            api_key_secret_json_key,
+            api_key_secret_source: source,
+            tags: crate::state::sorted_map(input.tags),
+            created_at: now,
+            updated_at: now,
+        };
+
+        let mut store = state.lock();
+        // The name was free when this request started, and the secret resolution
+        // above awaited: a provider stored under that name in the meantime is the
+        // one the account holds, so the later request is refused rather than
+        // replacing it. That is what makes the name unique under concurrent
+        // creates.
+        if store.api_key_credential_providers.contains_key(&record.name) {
+            return Err(name_taken(&record.name).into());
+        }
+        let output = record.create_output();
+        store
+            .api_key_credential_providers
+            .insert(record.name.clone(), record);
+
+        Ok(output)
+    }
+}
+
+/// The refusal of a create whose `name` this account already holds a provider
+/// under: "The name must be unique within your account", so a repeated name is a
+/// conflict rather than a second provider that later reads — which address a
+/// provider by name — could not tell apart.
+fn name_taken(name: &str) -> CreateApiKeyCredentialProviderErrorModeled {
+    CreateApiKeyCredentialProviderErrorModeled::ConflictException(ConflictException {
+        message: Some(format!(
+            "an API key credential provider named {name} already exists in this account"
+        )),
+    })
+}
+
+/// How a create answers when the secret the provider's key lives in could not be
+/// reported: the reference names no secret of this account, which is the modelled
+/// 404 for "a resource referenced by the operation does not exist"; anything else
+/// is this emulator failing to reach Secrets Manager, which is a server failure
+/// rather than a statement about the request.
+fn secret_problem(
+    problem: crate::state::ApiKeySecretProblem,
+    reference: &str,
+) -> CreateApiKeyCredentialProviderError {
+    match problem {
+        crate::state::ApiKeySecretProblem::Absent => {
+            CreateApiKeyCredentialProviderErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(crate::state::RESOURCE_SECRET),
+            )
+            .into()
+        }
+        crate::state::ApiKeySecretProblem::Unavailable(detail) => {
+            ::tracing::warn!(
+                %reference,
+                %detail,
+                "the API key credential provider's secret could not be stored in or resolved \
+                 against Secrets Manager, so no provider was created",
+            );
+            CreateApiKeyCredentialProviderErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the API key could not be stored in Secrets Manager".to_string(),
+                    ),
+                },
+            )
+            .into()
+        }
     }
 }
