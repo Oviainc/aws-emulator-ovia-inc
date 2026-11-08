@@ -239,7 +239,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreateAssetErrorModeled::UnprocessableEntityException(
                 UnprocessableEntityException {
                     message: Some(crate::scaffolded::already_exists_message(
-                        "Asset", &input.id,
+                        crate::scaffolded::ASSET_LABEL,
+                        &input.id,
                     )),
                 },
             )

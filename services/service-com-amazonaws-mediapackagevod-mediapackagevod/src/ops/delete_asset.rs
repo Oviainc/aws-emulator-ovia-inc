@@ -166,7 +166,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = store.lock();
         let Some(removed) = state.remove_asset(&region, &input.id) else {
             return Err(DeleteAssetErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::scaffolded::not_found_message("Asset", &input.id)),
+                message: Some(crate::scaffolded::not_found_message(
+                    crate::scaffolded::ASSET_LABEL,
+                    &input.id,
+                )),
             })
             .into());
         };

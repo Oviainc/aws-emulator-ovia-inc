@@ -370,19 +370,31 @@ fn snake_case(member: &str) -> String {
     out
 }
 
-/// The resource-type label a NOT-FOUND message about a PackagingConfiguration names
-/// it by.
+/// The resource-type label every message about an Asset names that type by.
 ///
-/// NOT the modelled resource name, and NOT a service-wide label: the recorded AWS
-/// not-found message for a PackagingConfiguration is `PackagingConfig with id=<id> not
-/// found` (behavioral unit
-/// `mediapackage-vod.delete-packaging-configuration-state-transition`), so the
-/// abbreviated label is what [`not_found_message`] is called with. It covers that
-/// message form ONLY: no recording shows how the service words a CONFLICT about a
-/// configuration, so `CreatePackagingConfiguration` keeps the modelled resource name in
-/// [`already_exists_message`] until one does. It lives here because both operations
-/// that address a configuration by id — the delete and the describe — must word the
-/// same failure the same way.
+/// One constant per resource type, so the label cannot drift between the operations
+/// that word a failure about the same resource; see
+/// [`PACKAGING_CONFIGURATION_LABEL`] for why a label is not read off the modelled
+/// shape name.
+pub const ASSET_LABEL: &str = "Asset";
+
+/// The resource-type label every message about a PackagingGroup names that type by;
+/// see [`ASSET_LABEL`].
+pub const PACKAGING_GROUP_LABEL: &str = "PackagingGroup";
+
+/// The resource-type label every message about a PackagingConfiguration names that
+/// type by.
+///
+/// NOT the modelled shape or operation noun: this API words its messages about this
+/// one resource type with the abbreviation `PackagingConfig` — recorded both in the
+/// not-found of an unheld id (`PackagingConfig with id=<id> not found`, behavioral
+/// unit `mediapackage-vod.delete-packaging-configuration-state-transition`) and in
+/// the conflict a duplicate create is refused with (`PackagingConfig with id=<id>
+/// already exists`, behavioral unit
+/// `mediapackage-vod.concurrent-packaging-configuration-duplicate-id-contention`).
+/// Every message of this crate that names the type — the creates, the describe and
+/// the delete, by `Id` or by ARN — takes it from here, so one resource type reads as
+/// one noun whichever operation answered.
 pub const PACKAGING_CONFIGURATION_LABEL: &str = "PackagingConfig";
 
 /// The message a `NotFoundException` carries for a resource the request named and
@@ -390,8 +402,8 @@ pub const PACKAGING_CONFIGURATION_LABEL: &str = "PackagingConfig";
 ///
 /// Built from the id the REQUEST asked for, never from a stored record — there is no
 /// stored record to read. `resource` is the label this service names that resource
-/// type by in a message (`Asset`, `PackagingGroup`, and
-/// [`PACKAGING_CONFIGURATION_LABEL`] for a PackagingConfiguration).
+/// type by in a message: [`ASSET_LABEL`], [`PACKAGING_GROUP_LABEL`] or
+/// [`PACKAGING_CONFIGURATION_LABEL`], never a shape or operation name.
 pub fn not_found_message(resource: &str, id: &str) -> String {
     format!("{resource} with id={id} not found")
 }
@@ -399,8 +411,9 @@ pub fn not_found_message(resource: &str, id: &str) -> String {
 /// The message the conflict refusal carries when a create re-uses an id this service
 /// already holds: `<ResourceType> with id=<requested id> already exists`.
 ///
-/// Same binding form as [`not_found_message`], so a client extracting the id from
-/// either rejection parses one form.
+/// Same binding form as [`not_found_message`], and `resource` is the same per-type
+/// label, so one resource type reads as one noun whether the request named an id
+/// this service holds none of or one it already holds.
 pub fn already_exists_message(resource: &str, id: &str) -> String {
     format!("{resource} with id={id} already exists")
 }

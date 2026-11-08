@@ -208,7 +208,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(CreatePackagingGroupErrorModeled::UnprocessableEntityException(
                 UnprocessableEntityException {
                     message: Some(crate::scaffolded::already_exists_message(
-                        "PackagingGroup",
+                        crate::scaffolded::PACKAGING_GROUP_LABEL,
                         &input.id,
                     )),
                 },

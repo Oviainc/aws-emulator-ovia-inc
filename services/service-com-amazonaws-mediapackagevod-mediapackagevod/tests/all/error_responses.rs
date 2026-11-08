@@ -326,7 +326,7 @@ async fn a_whole_request_violation_is_attributed_to_base() {
         );
         assert_eq!(
             answer.message(),
-            "PackagingConfiguration must include one single type of packaging settings",
+            "PackagingConfig must include one single type of packaging settings",
             "case {case:?}: expected the resource-and-constraint message, got {:?}",
             answer.message()
         );
@@ -517,7 +517,9 @@ async fn a_duplicate_id_conflict_message_binds_the_requested_id() {
                 "CreatePackagingConfiguration",
                 "/packaging_configurations",
                 config,
-                "PackagingConfiguration",
+                // The abbreviated label AWS words its messages about this resource
+                // type with, the same one its not-found messages use.
+                "PackagingConfig",
             ),
             ("CreateAsset", "/assets", asset, "Asset"),
         ];

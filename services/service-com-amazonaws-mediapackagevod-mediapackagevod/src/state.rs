@@ -228,18 +228,23 @@ pub const ARN_KIND_PACKAGING_GROUPS: &str = "packaging-groups";
 /// segment of that resource's ARN, the label a message about that resource names it
 /// by)`.
 ///
-/// The segments are the ones the creates mint an ARN with ([`resource_arn`]), and
-/// the labels the ones this service's own not-found messages already use — `Asset`,
-/// `PackagingGroup` and [`crate::scaffolded::PACKAGING_CONFIGURATION_LABEL`] — so an
-/// operation that resolves a caller-supplied ARN words its refusal exactly as the
-/// operation that resolves the same resource by `Id` does.
+/// The segments are the ones the creates mint an ARN with ([`resource_arn`]), and the
+/// labels the per-type constants every message of this crate words a resource type
+/// with — [`crate::scaffolded::ASSET_LABEL`],
+/// [`crate::scaffolded::PACKAGING_CONFIGURATION_LABEL`] and
+/// [`crate::scaffolded::PACKAGING_GROUP_LABEL`] — so an operation that resolves a
+/// caller-supplied ARN words its refusal exactly as the operation that resolves the
+/// same resource by `Id` does.
 pub const ARN_RESOURCE_KINDS: [(&str, &str); 3] = [
-    (ARN_KIND_ASSETS, "Asset"),
+    (ARN_KIND_ASSETS, crate::scaffolded::ASSET_LABEL),
     (
         ARN_KIND_PACKAGING_CONFIGURATIONS,
         crate::scaffolded::PACKAGING_CONFIGURATION_LABEL,
     ),
-    (ARN_KIND_PACKAGING_GROUPS, "PackagingGroup"),
+    (
+        ARN_KIND_PACKAGING_GROUPS,
+        crate::scaffolded::PACKAGING_GROUP_LABEL,
+    ),
 ];
 
 /// The smallest page a listing returns: the minimum of the `MaxResults` `range`

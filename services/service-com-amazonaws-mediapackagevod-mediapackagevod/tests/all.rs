@@ -49,6 +49,8 @@ mod packaging_group_update;
 mod packaging_lifecycle;
 #[path = "all/region_scoping.rs"]
 mod region_scoping;
+#[path = "all/resource_noun_in_refusals.rs"]
+mod resource_noun_in_refusals;
 #[path = "all/resource_tag_addition.rs"]
 mod resource_tag_addition;
 #[path = "all/resource_tag_listing.rs"]

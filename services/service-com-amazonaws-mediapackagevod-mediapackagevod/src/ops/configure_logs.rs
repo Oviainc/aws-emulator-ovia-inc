@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(stored) = state.packaging_group_mut(&region, &input.id) else {
             return Err(ConfigureLogsErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::scaffolded::not_found_message(
-                    "PackagingGroup",
+                    crate::scaffolded::PACKAGING_GROUP_LABEL,
                     &input.id,
                 )),
             })

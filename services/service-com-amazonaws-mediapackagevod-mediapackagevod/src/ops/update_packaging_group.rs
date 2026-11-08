@@ -200,7 +200,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(UpdatePackagingGroupErrorModeled::NotFoundException(
                 NotFoundException {
                     message: Some(crate::scaffolded::not_found_message(
-                        "PackagingGroup",
+                        crate::scaffolded::PACKAGING_GROUP_LABEL,
                         &input.id,
                     )),
                 },

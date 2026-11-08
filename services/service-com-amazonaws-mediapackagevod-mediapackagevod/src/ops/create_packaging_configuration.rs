@@ -203,7 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         if package_blocks != 1 {
             return Err(crate::scaffolded::UnprocessableEntity::request(
-                "PackagingConfiguration",
+                crate::scaffolded::PACKAGING_CONFIGURATION_LABEL,
                 "must include one single type of packaging settings",
             )
             .into());
@@ -245,12 +245,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The id is this Region's only name for a configuration, so a create that
+        // re-uses one is refused. The check and the insert below run under the one
+        // `state` lock taken above, so of N callers racing on the same id exactly one
+        // stores a record and every other is refused here. The refusal names the
+        // resource type by this service's own label for it, NOT by the modelled shape
+        // or operation noun.
         if state.has_packaging_configuration(&region, &input.id) {
             return Err(
                 CreatePackagingConfigurationErrorModeled::UnprocessableEntityException(
                     UnprocessableEntityException {
                         message: Some(crate::scaffolded::already_exists_message(
-                            "PackagingConfiguration",
+                            crate::scaffolded::PACKAGING_CONFIGURATION_LABEL,
                             &input.id,
                         )),
                     },
@@ -267,9 +273,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreatePackagingConfigurationErrorModeled::TooManyRequestsException(
                     TooManyRequestsException {
                         message: Some(format!(
-                            "This account already holds the maximum of {} \
-                             PackagingConfigurations.",
-                            crate::state::MAX_PACKAGING_CONFIGURATIONS
+                            "This account already holds the maximum of {} {}s.",
+                            crate::state::MAX_PACKAGING_CONFIGURATIONS,
+                            crate::scaffolded::PACKAGING_CONFIGURATION_LABEL
                         )),
                     },
                 )
@@ -283,10 +289,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 CreatePackagingConfigurationErrorModeled::TooManyRequestsException(
                     TooManyRequestsException {
                         message: Some(format!(
-                            "PackagingGroup {} already holds the maximum of {} \
-                             PackagingConfigurations.",
+                            "{} {} already holds the maximum of {} {}s.",
+                            crate::scaffolded::PACKAGING_GROUP_LABEL,
                             input.packaging_group_id,
-                            crate::state::MAX_PACKAGING_CONFIGURATIONS_PER_GROUP
+                            crate::state::MAX_PACKAGING_CONFIGURATIONS_PER_GROUP,
+                            crate::scaffolded::PACKAGING_CONFIGURATION_LABEL
                         )),
                     },
                 )
@@ -326,9 +333,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreatePackagingConfigurationErrorModeled::InternalServerErrorException(
                     InternalServerErrorException {
-                        message: Some(
-                            "the PackagingConfiguration could not be read back".to_string(),
-                        ),
+                        message: Some(format!(
+                            "the {} could not be read back",
+                            crate::scaffolded::PACKAGING_CONFIGURATION_LABEL
+                        )),
                     },
                 )
                 .into(),

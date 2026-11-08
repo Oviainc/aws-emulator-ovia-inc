@@ -169,7 +169,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = store.lock();
         let Some(stored) = state.asset(&region, &input.id) else {
             return Err(DescribeAssetErrorModeled::NotFoundException(NotFoundException {
-                message: Some(crate::scaffolded::not_found_message("Asset", &input.id)),
+                message: Some(crate::scaffolded::not_found_message(
+                    crate::scaffolded::ASSET_LABEL,
+                    &input.id,
+                )),
             })
             .into());
         };
