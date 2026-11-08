@@ -215,28 +215,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Who the request speaks for, resolved before this service's own store is
         // locked, so only one store is ever held at a time.
         let caller = crate::state::authorization::caller(&*self.engine, ctx);
-        let store = state.lock();
-        let index = store.index(&bucket_name, &index_name).map_err(refusal)?;
 
-        // The vector bucket's own resource policy decides this call before it reads
-        // anything: an explicit Deny of the action refuses it. Listing vector KEYS is
-        // this operation's own permission, while "if you set returnData or returnMetadata
-        // to true, you must have both s3vectors:ListVectors and s3vectors:GetVectors
-        // permissions", so a request that asks for either also stands on GetVectors.
+        // Listing vector KEYS is this operation's own permission, while "if you set
+        // returnData or returnMetadata to true, you must have both s3vectors:ListVectors
+        // and s3vectors:GetVectors permissions", so a request that asks for either also
+        // stands on GetVectors.
         let mut operations = vec![Self::NAME];
         if input.return_data || input.return_metadata {
             operations.push(crate::state::authorization::GET_VECTORS_OPERATION);
         }
-        if let Some(message) = store
-            .authorization_target(&bucket_name, Some(&index_name))
-            .map_err(refusal)?
-            .refusal(&caller, &operations)
+
+        let store = state.lock();
+
+        // ONE authorization decision, taken before anything is read: the caller's own
+        // identity-based policies and the vector bucket's resource policy together, as IAM
+        // evaluates them — a deny on either side refuses, and a grant from either
+        // suffices. A principal they do not permit is refused without being told whether
+        // the index it named exists.
+        if let Some(message) =
+            crate::state::authorization::target(&store, ctx, &bucket_name, Some(&index_name))
+                .refusal(&caller, &operations)
         {
             return Err(ListVectorsErrorModeled::AccessDeniedException(
                 AccessDeniedException { message },
             )
             .into());
         }
+        let index = store.index(&bucket_name, &index_name).map_err(refusal)?;
 
         // The segments partition the index: every vector belongs to exactly one, by
         // its position in stored order, so listing all `segmentCount` segments lists

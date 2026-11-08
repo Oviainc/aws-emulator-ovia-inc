@@ -81,9 +81,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3vectors-s3vectors.jso
 // here — hence the `ListVectorBucketsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3vectors#ListVectorBuckets")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3vectors#ListVectorBuckets",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum ListVectorBucketsErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
 
@@ -138,7 +142,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListVectorBucketsErrorModeled::ServiceUnavailableException(
                 ServiceUnavailableException {
@@ -147,6 +150,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         };
+
+        // What the CALLER may do, decided before anything is reported. This action is
+        // published with no resource type — it reports "the vector buckets that are owned
+        // by the authenticated sender of the request", the account's own — so a statement
+        // about it names no ARN, no bucket's own policy is about it, and the refusal
+        // states no resource clause.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
+        if let Some(message) =
+            crate::state::authorization::Target::account().refusal(&caller, &[Self::NAME])
+        {
+            return Err(ListVectorBucketsErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
 
         let store = state.lock();
         let names: Vec<&str> = store.buckets.keys().map(String::as_str).collect();

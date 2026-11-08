@@ -162,12 +162,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let caller = crate::state::authorization::caller(&*self.engine, ctx);
         let mut store = state.lock();
 
-        // The vector bucket's own resource policy decides this call before it changes
-        // anything: an explicit Deny of the action refuses it. Resolving the target is
-        // also what refuses a bucket this account does not hold.
-        if let Some(message) = store
-            .authorization_target(&bucket_name, None)
-            .map_err(refusal)?
+        // ONE authorization decision, taken before anything is changed: the caller's own
+        // identity-based policies and the vector bucket's resource policy together, as IAM
+        // evaluates them — a deny on either side refuses, and a grant from either
+        // suffices. A principal they do not permit is refused without being told whether
+        // the bucket it named exists; a bucket this account does not hold is refused by
+        // the write below.
+        if let Some(message) = crate::state::authorization::target(&store, ctx, &bucket_name, None)
             .refusal(&caller, &[Self::NAME])
         {
             return Err(PutVectorBucketDefaultIndexModeErrorModeled::AccessDeniedException(

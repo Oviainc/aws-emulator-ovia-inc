@@ -158,23 +158,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // locked, so only one store is ever held at a time.
         let caller = crate::state::authorization::caller(&*self.engine, ctx);
         let store = state.lock();
-        let arn = store
-            .tagged_resource_arn("resourceArn", &input.resource_arn)
-            .map_err(refusal)?;
 
-        // The resource policy of the vector bucket the ARN names — the bucket itself, or
-        // the bucket of the index it names — decides this call before it reports
-        // anything: an explicit Deny of the action refuses it.
-        if let Some(message) = store
-            .authorization_target_for_arn("resourceArn", &input.resource_arn)
-            .map_err(refusal)?
-            .refusal(&caller, &[Self::NAME])
+        // ONE authorization decision, taken before anything is reported: the caller's own
+        // identity-based policies and the resource policy of the vector bucket the ARN
+        // names — the bucket itself, or the bucket of the index it names — together, as
+        // IAM evaluates them. The resource the action is taken on is the ARN the request
+        // addressed, as it carried it, so a principal they do not permit is refused
+        // without being told whether that resource exists.
+        if let Some(message) =
+            crate::state::authorization::target_for_arn(&store, &input.resource_arn)
+                .refusal(&caller, &[Self::NAME])
         {
             return Err(ListTagsForResourceErrorModeled::AccessDeniedException(
                 AccessDeniedException { message },
             )
             .into());
         }
+        let arn = store
+            .tagged_resource_arn("resourceArn", &input.resource_arn)
+            .map_err(refusal)?;
         // `tags` is a required output member, so a resource carrying none reports an
         // EMPTY map rather than an absent one.
         let tags = store

@@ -187,20 +187,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // locked, so only one store is ever held at a time.
         let caller = crate::state::authorization::caller(&*self.engine, ctx);
         let store = state.lock();
-        let index = store.index(&bucket_name, &index_name).map_err(refusal)?;
 
-        // The vector bucket's own resource policy decides this call before it reads
-        // anything: an explicit Deny of the action refuses it.
-        if let Some(message) = store
-            .authorization_target(&bucket_name, Some(&index_name))
-            .map_err(refusal)?
-            .refusal(&caller, &[Self::NAME])
+        // ONE authorization decision, taken before anything is read or written: the
+        // caller's own identity-based policies and the vector bucket's resource policy
+        // together, as IAM evaluates them — a deny on either side refuses, and a grant
+        // from either suffices. A principal they do not permit is refused without being
+        // told whether the resource it named exists.
+        if let Some(message) =
+            crate::state::authorization::target(&store, ctx, &bucket_name, Some(&index_name))
+                .refusal(&caller, &[Self::NAME])
         {
             return Err(GetVectorsErrorModeled::AccessDeniedException(
                 AccessDeniedException { message },
             )
             .into());
         }
+        let index = store.index(&bucket_name, &index_name).map_err(refusal)?;
 
         // Reported in the order the request asked for, each key at most once. A key
         // the index does not hold is simply absent from the result.

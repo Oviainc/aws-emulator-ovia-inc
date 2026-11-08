@@ -173,30 +173,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Who the request speaks for, resolved before this service's own store is
         // locked, so only one store is ever held at a time.
         let caller = crate::state::authorization::caller(&*self.engine, ctx);
+
         // The read-modify-write this call makes is taken under the resource's own
         // optimistic lock, which the guard is dropped before the commit span is waited
         // out so another caller can reach the store and be told about the conflict.
         let (arn, write) = {
             let mut store = state.lock();
-            // The resource must exist for its tags to be removed: an ARN naming a vector
-            // bucket or vector index this store does not hold is the modelled 404, which
-            // is what an ARN of an already deleted resource answers too.
-            let arn = store
-                .tagged_resource_arn("resourceArn", &input.resource_arn)
-                .map_err(refusal)?;
 
-            // The resource policy of the vector bucket the ARN names decides this call
-            // before it removes anything: an explicit Deny of the action refuses it.
-            if let Some(message) = store
-                .authorization_target_for_arn("resourceArn", &input.resource_arn)
-                .map_err(refusal)?
-                .refusal(&caller, &[Self::NAME])
+            // ONE authorization decision, taken before anything is removed: the caller's
+            // own identity-based policies and the resource policy of the vector bucket the
+            // ARN names together, as IAM evaluates them — a deny on either side refuses,
+            // and a grant from either suffices. The resource the action is taken on is the
+            // ARN the request addressed, as it carried it, so a principal they do not
+            // permit is refused without being told whether that resource exists.
+            if let Some(message) =
+                crate::state::authorization::target_for_arn(&store, &input.resource_arn)
+                    .refusal(&caller, &[Self::NAME])
             {
                 return Err(UntagResourceErrorModeled::AccessDeniedException(
                     AccessDeniedException { message },
                 )
                 .into());
             }
+
+            // The resource must exist for its tags to be removed: an ARN naming a vector
+            // bucket or vector index this store does not hold is the modelled 404, which
+            // is what an ARN of an already deleted resource answers too.
+            let arn = store
+                .tagged_resource_arn("resourceArn", &input.resource_arn)
+                .map_err(refusal)?;
 
             // The lock is released however this request ends, including at the commit
             // span below, which is a point the request can be dropped at.

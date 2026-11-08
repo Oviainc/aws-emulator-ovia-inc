@@ -215,34 +215,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(refusal)?;
 
-        // Every match a query finds fits in the one page `topK` bounds, so this
-        // operation issues no `nextToken`; a token it never minted cannot be
-        // continued from.
-        if let Some(next_token) = input.next_token.as_deref() {
-            return Err(refusal(crate::state::LookupError::invalid(
-                "nextToken",
-                format!("`nextToken` is not a pagination token this service issued: {next_token}"),
-            )));
-        }
+        // A `nextToken` names a position in the result set this query's own ranking has,
+        // so it is read against that ranking once it is computed below.
 
         // Who the request speaks for, resolved before this service's own store is
         // locked, so only one store is ever held at a time.
         let caller = crate::state::authorization::caller(&*self.engine, ctx);
-        let store = state.lock();
-        let index = store.index(&bucket_name, &index_name).map_err(refusal)?;
 
-        // The vector bucket's own resource policy decides this call before it searches
-        // anything: an explicit Deny of the action refuses it.
-        if let Some(message) = store
-            .authorization_target(&bucket_name, Some(&index_name))
-            .map_err(refusal)?
-            .refusal(&caller, &[Self::NAME])
+        // Retrieving keys and distances is this operation's own permission, while "if you
+        // specify a metadata filter or set returnMetadata to true, you must have both
+        // s3vectors:QueryVectors and s3vectors:GetVectors permissions", so a query that
+        // filters on metadata or asks for it also stands on GetVectors.
+        let mut operations = vec![Self::NAME];
+        if input.filter.is_some() || input.return_metadata {
+            operations.push(crate::state::authorization::GET_VECTORS_OPERATION);
+        }
+
+        let store = state.lock();
+
+        // ONE authorization decision, taken before anything is searched: the caller's own
+        // identity-based policies and the vector bucket's resource policy together, as IAM
+        // evaluates them — a deny on either side refuses, and a grant from either
+        // suffices. A principal they do not permit is refused without being told whether
+        // the index it named exists.
+        if let Some(message) =
+            crate::state::authorization::target(&store, ctx, &bucket_name, Some(&index_name))
+                .refusal(&caller, &operations)
         {
             return Err(QueryVectorsErrorModeled::AccessDeniedException(
                 AccessDeniedException { message },
             )
             .into());
         }
+        let index = store.index(&bucket_name, &index_name).map_err(refusal)?;
         let VectorData::Float32(query) = &input.query_vector;
         // The vector a query is run with is held to the same rules as a stored one,
         // and the member it travelled in is the path the refusal names.
@@ -295,14 +300,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         });
         scored.truncate(usize::try_from(input.top_k.max(0)).unwrap_or(0));
 
-        let vectors = scored
+        // The result SET this query has: the surviving ranking, in distance order. One
+        // response carries at most `QUERY_RESULTS_PER_PAGE` of it, so a `topK` above that
+        // is drained over pages (the model makes this operation `@paginated` with
+        // `nextToken` and `vectors`), and the ranking is recomputed the same way on every
+        // call, so a later page continues the order the earlier one reported in.
+        let ranked: Vec<(f32, &crate::state::StoredVector)> = scored
             .into_iter()
             .filter(|(_, _, live)| *live)
-            .map(|(distance, stored, _)| QueryOutputVector {
+            .map(|(distance, stored, _)| (distance, stored))
+            .collect();
+
+        // Where this page starts: at the result after the one the token names, which is
+        // the last result the previous page reported. A token naming no result of this
+        // query's ranking is not a position this operation offered.
+        let start = match input.next_token.as_deref() {
+            None => 0,
+            Some(token) => match ranked.iter().position(|(_, stored)| stored.key == token) {
+                Some(position) => position + 1,
+                None => {
+                    return Err(refusal(crate::state::LookupError::invalid(
+                        "nextToken",
+                        format!(
+                            "`nextToken` is not a pagination token this service issued: {token}"
+                        ),
+                    )))
+                }
+            },
+        };
+        let end = ranked
+            .len()
+            .min(start + crate::state::QUERY_RESULTS_PER_PAGE);
+        let page = ranked.get(start..end).unwrap_or_default();
+        // A token is minted only while results are left, and names the last result this
+        // page reported — the position the next page resumes after.
+        let next_token = (end < ranked.len())
+            .then(|| page.last().map(|(_, stored)| stored.key.clone()))
+            .flatten();
+
+        let vectors = page
+            .iter()
+            .map(|(distance, stored)| QueryOutputVector {
                 key: stored.key.clone(),
                 // Both flags default to false, and each member is populated ONLY
                 // when its own flag is set.
-                distance: input.return_distance.then_some(distance),
+                distance: input.return_distance.then_some(*distance),
                 metadata: input.return_metadata.then(|| stored.metadata.clone()),
             })
             .collect();
@@ -311,7 +353,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             vectors,
             // Echoed from the stored index definition, never from the request.
             distance_metric: index.distance_metric.clone(),
-            next_token: None,
+            next_token,
         })
     }
 }

@@ -9,6 +9,7 @@
 //! one place a helper several operations need can live.
 
 pub mod authorization;
+pub mod metadata_budget;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::time::{Duration, Instant, SystemTime};
@@ -80,6 +81,16 @@ pub const DISTANCE_METRIC_EUCLIDEAN: &str = "euclidean";
 /// `ListIndexes$maxResults` are `range 1..500`), so a caller that asks for no
 /// page size gets as much as one page can hold.
 pub const DEFAULT_LIST_PAGE_SIZE: usize = 500;
+
+/// How many results ONE `QueryVectors` response carries, whatever `topK` asks for.
+///
+/// `QueryVectors` is `@paginated` (`inputToken`/`outputToken` `nextToken`, `items`
+/// `vectors`) but takes no page-size member, so the per-response limit is the service's:
+/// a query for more than this many nearest neighbours is drained over pages, each
+/// continuing the distance order the previous one reported in. This is the size the real
+/// service answered with for a `topK` above it in the recorded response (100 results plus
+/// a `nextToken` for a `topK` of 130).
+pub const QUERY_RESULTS_PER_PAGE: usize = 100;
 
 /// Ceilings on how much this emulator stores.
 ///
@@ -872,50 +883,6 @@ impl ComAmazonawsS3vectorsS3vectorsState {
         } else {
             let bucket = bucket_from_arn(member, arn)?;
             Ok(self.bucket(&bucket)?.arn.clone())
-        }
-    }
-
-    /// What the authorization decision for a request against `bucket` — and, when it
-    /// addresses one, `index` — is made from: the bucket's stored resource policy and the
-    /// ARNs the request acts on. See [`authorization`].
-    ///
-    /// A request that addresses an index resolves the INDEX first, so a target it
-    /// cannot resolve is refused as the index the caller asked for rather than as its
-    /// parent bucket — the same rule [`Self::index`] follows. A resolved index implies
-    /// its parent bucket, so the bucket lookup below cannot then miss.
-    pub fn authorization_target(
-        &self,
-        bucket: &str,
-        index: Option<&str>,
-    ) -> Result<authorization::Target, LookupError> {
-        // The resource the action is taken on comes first: see `authorization::Target`.
-        let mut resources = match index {
-            Some(index) => vec![self.index(bucket, index)?.arn.clone()],
-            None => Vec::new(),
-        };
-        let record = self.bucket(bucket)?;
-        resources.push(record.arn.clone());
-        Ok(authorization::Target {
-            policy: record.policy.clone(),
-            resources,
-        })
-    }
-
-    /// [`Self::authorization_target`] for a request that names its resource by ARN — a
-    /// tagging request, whose `resourceArn` is either a vector bucket or a vector index —
-    /// resolved through the same two ARN parsers as [`Self::tagged_resource_arn`].
-    pub fn authorization_target_for_arn(
-        &self,
-        member: &str,
-        arn: &str,
-    ) -> Result<authorization::Target, LookupError> {
-        let names_index = arn_resource(arn).is_some_and(|resource| resource.contains("/index/"));
-        if names_index {
-            let (bucket, index) = index_from_arn(member, arn)?;
-            self.authorization_target(&bucket, Some(&index))
-        } else {
-            let bucket = bucket_from_arn(member, arn)?;
-            self.authorization_target(&bucket, None)
         }
     }
 

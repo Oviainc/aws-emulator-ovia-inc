@@ -77,11 +77,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3vectors-s3vectors.jso
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.s3vectors#PutVectorBucketPolicy",
-    extra_errors = ["ValidationException"]
+    extra_errors = ["ValidationException", "AccessDeniedException"]
 )]
 #[derive(Debug)]
 pub enum PutVectorBucketPolicyErrorModeled {
     ValidationException(ValidationException),
+    AccessDeniedException(AccessDeniedException),
     NotFoundException(NotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
@@ -137,7 +138,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(PutVectorBucketPolicyErrorModeled::ServiceUnavailableException(
                 ServiceUnavailableException {
@@ -153,6 +153,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(refusal)?;
         crate::state::validate_bucket_policy(&input.policy).map_err(refusal)?;
+
+        // What the CALLER may do, decided before the document is stored. The bucket's own
+        // policy is NOT read for this call — that is the owner's escape hatch from a
+        // document that locks everyone out — but the caller's identity-based policies are:
+        // a principal they do not grant this action to cannot replace a bucket's policy.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
+        if let Some(message) =
+            crate::state::authorization::target_without_bucket_policy(ctx, &bucket_name)
+                .refusal(&caller, &[Self::NAME])
+        {
+            return Err(PutVectorBucketPolicyErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
 
         // The document is stored as the service reports it back: the service's own
         // rendering of the policy it was handed, not the bytes the request happened to

@@ -36,6 +36,10 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The IAM store the identity-based authorization suite seeds: the user, its access key
+# and its inline policies are the records `iam:CreateUser`, `iam:CreateAccessKey`,
+# `iam:PutUserPolicy` and `iam:PutRolePolicy` write.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [lints]
 workspace = true

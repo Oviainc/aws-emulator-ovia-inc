@@ -165,13 +165,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // locked, so only one store is ever held at a time.
         let caller = crate::state::authorization::caller(&*self.engine, ctx);
         let mut store = state.lock();
-        let bucket = store.bucket(&bucket_name).map_err(refusal)?;
 
-        // The vector bucket's own resource policy decides this call before it deletes
-        // anything: an explicit Deny of the action refuses it.
-        if let Some(message) = store
-            .authorization_target(&bucket_name, None)
-            .map_err(refusal)?
+        // ONE authorization decision, taken before anything is deleted: the caller's own
+        // identity-based policies and the vector bucket's resource policy together, as IAM
+        // evaluates them — a deny on either side refuses, and a grant from either
+        // suffices. A principal they do not permit is refused without being told whether
+        // the bucket it named exists.
+        if let Some(message) = crate::state::authorization::target(&store, ctx, &bucket_name, None)
             .refusal(&caller, &[Self::NAME])
         {
             return Err(DeleteVectorBucketErrorModeled::AccessDeniedException(
@@ -179,6 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        let bucket = store.bucket(&bucket_name).map_err(refusal)?;
         // "All vector indexes in the vector bucket must be deleted before the vector
         // bucket can be deleted" — so a non-empty bucket is refused rather than
         // silently dropping the indexes it holds. The refusal is the service's one

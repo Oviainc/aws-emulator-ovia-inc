@@ -78,11 +78,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3vectors-s3vectors.jso
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.s3vectors#GetVectorBucketPolicy",
-    extra_errors = ["ValidationException"]
+    extra_errors = ["ValidationException", "AccessDeniedException"]
 )]
 #[derive(Debug)]
 pub enum GetVectorBucketPolicyErrorModeled {
     ValidationException(ValidationException),
+    AccessDeniedException(AccessDeniedException),
     NotFoundException(NotFoundException),
     ServiceUnavailableException(ServiceUnavailableException),
 }
@@ -138,7 +139,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(GetVectorBucketPolicyErrorModeled::ServiceUnavailableException(
                 ServiceUnavailableException {
@@ -153,6 +153,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.vector_bucket_arn.as_deref(),
         )
         .map_err(refusal)?;
+
+        // What the CALLER may do, decided before the document is reported. The bucket's
+        // own policy is NOT read for this call — that is the owner's escape hatch from a
+        // document that locks everyone out — but the caller's identity-based policies are:
+        // a principal they do not grant this action to cannot read a bucket's policy.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
+        if let Some(message) =
+            crate::state::authorization::target_without_bucket_policy(ctx, &bucket_name)
+                .refusal(&caller, &[Self::NAME])
+        {
+            return Err(GetVectorBucketPolicyErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
 
         let store = state.lock();
         let bucket = store.bucket(&bucket_name).map_err(refusal)?;

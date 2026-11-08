@@ -15,8 +15,12 @@
 mod bucket_policy;
 #[path = "all/bucket_policy_enforcement.rs"]
 mod bucket_policy_enforcement;
+#[path = "all/identity_authorization.rs"]
+mod identity_authorization;
 #[path = "all/index_mode.rs"]
 mod index_mode;
+#[path = "all/metadata_budget.rs"]
+mod metadata_budget;
 #[path = "all/modelled_input_validation.rs"]
 mod modelled_input_validation;
 #[path = "all/policy_document_bytes.rs"]
@@ -25,6 +29,8 @@ mod policy_document_bytes;
 mod policy_not_found_message;
 #[path = "all/query_candidate_slots.rs"]
 mod query_candidate_slots;
+#[path = "all/query_pagination.rs"]
+mod query_pagination;
 #[path = "all/refusal_sentence_wording.rs"]
 mod refusal_sentence_wording;
 #[path = "all/refusal_wording.rs"]

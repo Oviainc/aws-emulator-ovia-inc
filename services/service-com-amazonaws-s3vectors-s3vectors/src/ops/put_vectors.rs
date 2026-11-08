@@ -194,13 +194,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let caller = crate::state::authorization::caller(&*self.engine, ctx);
         let mut store = state.lock();
 
-        // The vector bucket's own resource policy decides this call before it writes
-        // anything: an explicit Deny of the action refuses it. The target resolves the
-        // index too, so a put into an index that is not there is still the modelled 404.
-        if let Some(message) = store
-            .authorization_target(&bucket_name, Some(&index_name))
-            .map_err(refusal)?
-            .refusal(&caller, &[Self::NAME])
+        // ONE authorization decision, taken before anything is written: the caller's own
+        // identity-based policies and the vector bucket's resource policy together, as IAM
+        // evaluates them — a deny on either side refuses, and a grant from either
+        // suffices. A principal they do not permit is refused without being told whether
+        // the index it named exists.
+        if let Some(message) =
+            crate::state::authorization::target(&store, ctx, &bucket_name, Some(&index_name))
+                .refusal(&caller, &[Self::NAME])
         {
             return Err(PutVectorsErrorModeled::AccessDeniedException(
                 AccessDeniedException { message },
@@ -208,6 +209,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
         let index = store.index(&bucket_name, &index_name).map_err(refusal)?;
+        // Which of a vector's metadata keys are FILTERABLE is the index's own
+        // declaration, so the budget each key's bytes count against is read from the
+        // index rather than from the request.
+        let non_filterable: &[String] = index
+            .non_filterable_metadata_keys
+            .as_deref()
+            .unwrap_or_default();
 
         // Every vector in the batch is checked against the index BEFORE anything is
         // written, so a refused batch leaves the index exactly as it was. A record the
@@ -227,6 +235,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             let metadata = crate::state::normalized_metadata(vector.metadata);
             if let Some(defect) = crate::state::metadata_defect(&metadata) {
+                return Err(refusal(crate::state::LookupError::invalid_record(
+                    &element,
+                    &vector.key,
+                    defect,
+                )));
+            }
+            // How much metadata ONE vector may carry, in bytes: the filterable part of
+            // the document — every key this index does not declare non-filterable — has
+            // its own budget, and the whole document a larger one.
+            if let Some(defect) = crate::state::metadata_budget::metadata_budget_defect(
+                &metadata,
+                non_filterable,
+            ) {
                 return Err(refusal(crate::state::LookupError::invalid_record(
                     &element,
                     &vector.key,

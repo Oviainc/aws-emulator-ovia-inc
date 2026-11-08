@@ -95,11 +95,12 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3vectors-s3vectors.jso
 // to construct until the model says otherwise.
 #[smithy_macros::operation_error(
     "com.amazonaws.s3vectors#CreateVectorBucket",
-    extra_errors = ["ValidationException"]
+    extra_errors = ["ValidationException", "AccessDeniedException"]
 )]
 #[derive(Debug)]
 pub enum CreateVectorBucketErrorModeled {
     ValidationException(ValidationException),
+    AccessDeniedException(AccessDeniedException),
     ConflictException(ConflictException),
     ServiceQuotaExceededException(ServiceQuotaExceededException),
     ServiceUnavailableException(ServiceUnavailableException),
@@ -192,7 +193,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let arn = crate::state::bucket_arn(&region, &input.vector_bucket_name);
 
+        // A create that carries TAGS writes tags too: "you must have the
+        // s3vectors:TagResource permission in addition to s3vectors:CreateVectorBucket
+        // permission to create a vector bucket with tags", so such a request also stands
+        // on TagResource, while one carrying none stands on this action alone.
+        let caller = crate::state::authorization::caller(&*self.engine, ctx);
+        let mut operations = vec![Self::NAME];
+        if input.tags.as_ref().is_some_and(|tags| !tags.is_empty()) {
+            operations.push(crate::state::authorization::TAG_RESOURCE_OPERATION);
+        }
+
         let mut store = state.lock();
+
+        // ONE authorization decision, taken before anything is created: the caller's own
+        // identity-based policies and — for a name this account already holds a bucket
+        // under — that bucket's resource policy together, as IAM evaluates them. The
+        // resource the action is taken on is the bucket this call would create, named by
+        // the ARN it would carry.
+        if let Some(message) =
+            crate::state::authorization::target(&store, ctx, &input.vector_bucket_name, None)
+                .refusal(&caller, &operations)
+        {
+            return Err(CreateVectorBucketErrorModeled::AccessDeniedException(
+                AccessDeniedException { message },
+            )
+            .into());
+        }
+
         // A name this account already holds a vector bucket under is the modelled 409,
         // worded as the service words it: the one fixed sentence for this resource
         // kind, carrying no value from the request.

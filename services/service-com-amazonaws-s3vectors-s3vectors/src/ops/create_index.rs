@@ -208,21 +208,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Who the request speaks for, resolved before this service's own store is
         // locked, so only one store is ever held at a time.
         let caller = crate::state::authorization::caller(&*self.engine, ctx);
-        let mut store = state.lock();
-        let bucket = store.bucket(&bucket_name).map_err(refusal)?;
 
-        // The vector bucket's own resource policy decides this call before it creates
-        // anything: an explicit Deny of the action refuses it.
-        if let Some(message) = store
-            .authorization_target(&bucket_name, None)
-            .map_err(refusal)?
-            .refusal(&caller, &[Self::NAME])
+        // A create that carries TAGS writes tags too: "you must have the
+        // s3vectors:TagResource permission in addition to s3vectors:CreateIndex permission
+        // to create a vector index with tags", so such a request also stands on
+        // TagResource, while one carrying none stands on this action alone.
+        let mut operations = vec![Self::NAME];
+        if input.tags.as_ref().is_some_and(|tags| !tags.is_empty()) {
+            operations.push(crate::state::authorization::TAG_RESOURCE_OPERATION);
+        }
+
+        let mut store = state.lock();
+
+        // ONE authorization decision, taken before anything is created: the caller's own
+        // identity-based policies and the vector bucket's resource policy together, as IAM
+        // evaluates them — a deny on either side refuses, and a grant from either
+        // suffices. The index this call creates does not exist yet, so the resource the
+        // action is taken on is the vector bucket it would be created in.
+        if let Some(message) = crate::state::authorization::target(&store, ctx, &bucket_name, None)
+            .refusal(&caller, &operations)
         {
             return Err(CreateIndexErrorModeled::AccessDeniedException(
                 AccessDeniedException { message },
             )
             .into());
         }
+        let bucket = store.bucket(&bucket_name).map_err(refusal)?;
         // A name this bucket already holds an index under is the modelled 409, worded
         // as the service words it: the one fixed sentence for this resource kind,
         // carrying neither the index name nor the bucket name the request named.
