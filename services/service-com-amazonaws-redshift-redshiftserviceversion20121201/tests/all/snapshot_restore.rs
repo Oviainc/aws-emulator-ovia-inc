@@ -141,14 +141,17 @@ async fn seeded_emulator() -> (Emulator, String) {
     }
 
     // A restore into a VPC resolves its `ClusterSubnetGroupName` against the
-    // store, so the group one case names has to exist before it is named.
+    // store, so the group one case names has to exist before it is named. Its
+    // subnet is one EC2 minted for the account: a Redshift subnet group resolves
+    // every `SubnetIds` entry against the service that owns subnets.
+    let account_subnets = emulator.subnet_ids("seed subnet group", 1).await;
     let subnets = emulator
         .call(
             "CreateClusterSubnetGroup",
             &[
                 ("ClusterSubnetGroupName", SUBNET_GROUP),
                 ("Description", "the subnet group a restore case names"),
-                ("SubnetIds.SubnetIdentifier.1", "subnet-restore-a"),
+                ("SubnetIds.SubnetIdentifier.1", &account_subnets[0]),
             ],
         )
         .await;
@@ -481,13 +484,22 @@ async fn a_request_member_overrides_the_captured_value() {
             "case {case}: expected 200, got {} with body {}",
             answer.status, answer.body
         );
+        // The VPC id is the one the SUBNET GROUP holds — the VPC its subnets are
+        // in, as the service that owns subnets answered for them — so it is asked
+        // of the group rather than spelled out here.
+        let group = emulator
+            .call(
+                "DescribeClusterSubnetGroups",
+                &[("ClusterSubnetGroupName", SUBNET_GROUP)],
+            )
+            .await;
+        let group_vpc = group.text("VpcId").unwrap_or_else(|| {
+            panic!("case {case}: the subnet group must report its VPC, got body {}", group.body)
+        });
         let described = describe(&emulator, target).await;
         for (member, expected) in expectations {
-            // The VPC id is the one the SUBNET GROUP holds, so the row names the
-            // group and the expectation is derived the same way the group's own
-            // record was rather than spelled out.
             let expected = if member == "VpcId" {
-                state::derived_vpc_id(SUBNET_GROUP)
+                group_vpc.clone()
             } else {
                 expected.to_string()
             };

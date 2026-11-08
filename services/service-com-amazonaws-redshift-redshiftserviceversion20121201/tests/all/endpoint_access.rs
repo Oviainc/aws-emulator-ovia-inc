@@ -95,12 +95,13 @@ pub(crate) async fn available_cluster(emulator: &Emulator, identifier: &str) {
     settle().await;
 }
 
-/// Create one cluster subnet group holding `subnet_ids`.
-pub(crate) async fn create_subnet_group(
-    emulator: &Emulator,
-    name: &str,
-    subnet_ids: &[&str],
-) -> Answer {
+/// Create one cluster subnet group over `count` subnets of the account.
+///
+/// The subnets are ones EC2 minted (see [`Emulator::subnet_ids`]): a Redshift
+/// subnet group resolves every `SubnetIds` entry against the service that owns
+/// subnets, so a group is only created over subnets the account really has.
+pub(crate) async fn create_subnet_group(emulator: &Emulator, name: &str, count: usize) -> Answer {
+    let subnet_ids = emulator.subnet_ids(name, count).await;
     let mut params: Vec<(String, String)> = vec![
         ("ClusterSubnetGroupName".to_string(), name.to_string()),
         ("Description".to_string(), format!("subnets for {name}")),
@@ -108,7 +109,7 @@ pub(crate) async fn create_subnet_group(
     for (index, subnet_id) in subnet_ids.iter().enumerate() {
         params.push((
             format!("SubnetIds.SubnetIdentifier.{}", index + 1),
-            (*subnet_id).to_string(),
+            subnet_id.clone(),
         ));
     }
     emulator
@@ -192,7 +193,7 @@ async fn an_unresolvable_name_is_that_resources_own_modelled_fault_in_every_oper
     available_cluster(&emulator, "endpoint-host").await;
     assert_served(
         "seed subnet group",
-        &create_subnet_group(&emulator, "endpoint-subnets", &["subnet-a", "subnet-b"]).await,
+        &create_subnet_group(&emulator, "endpoint-subnets", 2).await,
     );
     assert_served(
         "seed endpoint",
@@ -451,7 +452,7 @@ async fn an_unresolvable_name_is_that_resources_own_modelled_fault_in_every_oper
 async fn a_created_endpoint_is_reported_exactly_as_stored_and_round_trips() {
     let emulator = Emulator::new();
     available_cluster(&emulator, "round-trip-host").await;
-    let group = create_subnet_group(&emulator, "Round-Trip-Subnets", &["subnet-a", "subnet-b"]).await;
+    let group = create_subnet_group(&emulator, "Round-Trip-Subnets", 2).await;
     assert_served("seed subnet group", &group);
 
     // The cluster's own connection port, which the endpoint reports rather than

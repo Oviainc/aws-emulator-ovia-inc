@@ -9,6 +9,7 @@
 //! documented `MaxRecords` window, the cluster-type/node-count agreement, the
 //! retention-period ranges, and the state a write leaves for a later read.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,8 +25,9 @@ use smithy_server_runtime::MultiServiceRouter;
 /// the region from here rather than repeating the literal.
 pub(crate) const REGION: &str = "us-west-2";
 
-/// One emulator: a single shared engine behind a router mounting Redshift, and
-/// optionally the KMS service a handler resolves a key through.
+/// One emulator: a single shared engine behind a router mounting Redshift and
+/// Amazon EC2 — the service that owns the subnets a cluster subnet group is made
+/// of — and optionally the KMS service a handler resolves a key through.
 ///
 /// `pub(crate)` so a sibling suite under `tests/all/` drives requests through the
 /// same harness instead of writing a second copy of it.
@@ -146,6 +148,21 @@ impl Emulator {
         smithy_server_runtime::EmbeddedEmulator::from_router(self.router.clone())
     }
 
+    /// An emulator with Redshift ALONE: the service that owns subnets is not
+    /// mounted, so a handler that resolves a subnet identifier gets no answer at
+    /// all.
+    ///
+    /// That is the "EC2 said nothing" deployment, and what a cluster subnet group
+    /// does with it is part of the contract (`services/common/src/network.rs`),
+    /// so a suite about that case needs an emulator without it.
+    pub(crate) fn without_subnet_owner() -> Self {
+        let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        let mut router = MultiServiceRouter::new();
+        router.set_request_authentication(false);
+        router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        Self { router, engine }
+    }
+
     fn build(with_kms: bool) -> Self {
         // The one shared engine, exactly as `router/src/lib.rs` builds it: every
         // request in this suite observes the same store.
@@ -153,12 +170,135 @@ impl Emulator {
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(Arc::clone(&engine)));
+        // Amazon EC2 beside Redshift on the SAME engine, exactly as the assembled
+        // emulator mounts them: a subnet, the VPC that contains it and the zone it
+        // lies in are EC2's facts, and a cluster subnet group resolves the subnets
+        // a request names against that service — so a suite that creates one needs
+        // it to reach.
+        router.register_service(service_com_amazonaws_ec2_amazonec2::EmulatedService::new(
+            Arc::clone(&engine),
+        ));
         if with_kms {
             router.register_service(
                 service_com_amazonaws_kms_trentservice::EmulatedService::new(Arc::clone(&engine)),
             );
         }
         Self { router, engine }
+    }
+
+    /// An EC2 client for [`REGION`] over this emulator's own in-process callback —
+    /// the very seam the Redshift handlers resolve a subnet through.
+    pub(crate) fn ec2(&self) -> ::aws_sdk_ec2::Client {
+        let callback = self.callback();
+        let config = ::aws_sdk_ec2::Config::builder()
+            .behavior_version(::aws_sdk_ec2::config::BehaviorVersion::latest())
+            .region(::aws_sdk_ec2::config::Region::new(REGION.to_string()))
+            .endpoint_url(format!("https://ec2.{REGION}.amazonaws.com"))
+            .credentials_provider(callback.aws_credentials_provider())
+            .http_client(callback.http_client())
+            .retry_config(::aws_sdk_ec2::config::retry::RetryConfig::disabled())
+            .timeout_config(::aws_sdk_ec2::config::timeout::TimeoutConfig::disabled())
+            .identity_cache(::aws_sdk_ec2::config::IdentityCache::no_cache())
+            .stalled_stream_protection(
+                ::aws_sdk_ec2::config::StalledStreamProtectionConfig::disabled(),
+            )
+            .build();
+        ::aws_sdk_ec2::Client::from_conf(config)
+    }
+
+    /// The subnets the ACCOUNT has in [`REGION`], as EC2 reports them: the default
+    /// VPC's own subnets, in zone order.
+    ///
+    /// ASKED, never assumed — every id is one EC2 minted, which is what a Redshift
+    /// subnet group resolves a `SubnetIds` entry against, so no id a case names can
+    /// pass itself off as one the account holds.
+    pub(crate) async fn account_subnets(&self) -> Vec<String> {
+        let described = self
+            .ec2()
+            .describe_subnets()
+            .send()
+            .await
+            .expect("EC2 must report the account's subnets");
+        let mut reported: Vec<(String, String)> = described
+            .subnets()
+            .iter()
+            .filter_map(|subnet| {
+                Some((
+                    subnet.availability_zone()?.to_string(),
+                    subnet.subnet_id()?.to_string(),
+                ))
+            })
+            .filter(|(zone, _)| zone.starts_with(REGION))
+            .collect();
+        reported.sort();
+        reported.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// `count` subnet ids of the account, minted by EC2 in a VPC of their OWN.
+    ///
+    /// A cluster subnet group covers subnets of one VPC, so each call mints its
+    /// own `/16` and carves a `/24` per subnet out of it: two groups built from
+    /// two calls are in two different VPCs, exactly as a client that builds two
+    /// networks sees them. The zones are the Region's, assigned round-robin — a
+    /// Region has several and AWS admits more than one subnet per zone.
+    pub(crate) async fn subnet_ids(&self, case: &str, count: usize) -> Vec<String> {
+        // One RFC 1918 `/16` per call, numbered from a counter shared by the whole
+        // test binary so two calls never ask for the same block.
+        static NEXT_BLOCK: AtomicUsize = AtomicUsize::new(0);
+        let block = NEXT_BLOCK.fetch_add(1, Ordering::Relaxed);
+        assert!(
+            block < 256 && count <= 256,
+            "case {case:?}: the suite's RFC 1918 range holds 256 VPCs of 256 subnets"
+        );
+        let ec2 = self.ec2();
+        let zones: Vec<String> = ec2
+            .describe_availability_zones()
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("case {case:?}: EC2 must report the Region's zones: {error:?}")
+            })
+            .availability_zones()
+            .iter()
+            .filter_map(|zone| zone.zone_name().map(str::to_string))
+            .collect();
+        assert!(
+            !zones.is_empty(),
+            "case {case:?}: EC2 must report at least one Availability Zone in {REGION}"
+        );
+        let vpc = ec2
+            .create_vpc()
+            .cidr_block(format!("10.{block}.0.0/16"))
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("case {case:?}: EC2 must create the VPC: {error:?}"))
+            .vpc()
+            .and_then(::aws_sdk_ec2::types::Vpc::vpc_id)
+            .unwrap_or_else(|| panic!("case {case:?}: CreateVpc must report the VPC it minted"))
+            .to_string();
+        let mut minted = Vec::with_capacity(count);
+        for index in 0..count {
+            let created = ec2
+                .create_subnet()
+                .vpc_id(&vpc)
+                .cidr_block(format!("10.{block}.{index}.0/24"))
+                .availability_zone(&zones[index % zones.len()])
+                .send()
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("case {case:?}: EC2 must create subnet {index}: {error:?}")
+                });
+            minted.push(
+                created
+                    .subnet()
+                    .and_then(::aws_sdk_ec2::types::Subnet::subnet_id)
+                    .unwrap_or_else(|| {
+                        panic!("case {case:?}: CreateSubnet must report the subnet it minted")
+                    })
+                    .to_string(),
+            );
+        }
+        minted
     }
 
     /// Mint a KMS key in `region` through the mounted KMS service and answer its

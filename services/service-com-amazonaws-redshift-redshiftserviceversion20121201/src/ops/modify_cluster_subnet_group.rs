@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyClusterSubnetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyClusterSubnetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyClusterSubnetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Replaces the subnets a cluster subnet group holds — "the operation replaces
+//! the existing list of subnets with the new list of subnets" — and, when the
+//! request carries one, its description; then reports the group as every later
+//! read will. The new subnets, the VPC they are in and the zone each one lies in
+//! are resolved against the service that owns subnets
+//! (`crate::state::ec2_subnets`), exactly as the create resolves them, so a
+//! modified group reports the network it really covers.
 //!
 //! ## Shape of an operation
 //!
@@ -105,7 +104,14 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `ModifyClusterSubnetGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#ModifyClusterSubnetGroup")]
+// `DependentServiceUnavailableFault` is widened in, as on every other operation
+// of this service: the model does not list it here, but the service declares the
+// shape and it is the only modelled way to say "the control-plane store could not
+// be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#ModifyClusterSubnetGroup",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum ModifyClusterSubnetGroupErrorModeled {
     ClusterSubnetGroupNotFoundFault(ClusterSubnetGroupNotFoundFault),
@@ -114,6 +120,7 @@ pub enum ModifyClusterSubnetGroupErrorModeled {
     InvalidSubnet(InvalidSubnet),
     SubnetAlreadyInUse(SubnetAlreadyInUse),
     UnauthorizedOperation(UnauthorizedOperation),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -167,18 +174,137 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyClusterSubnetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyClusterSubnetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                ModifyClusterSubnetGroupErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = st::request_region(ctx);
+
+        // The request's own values first: a subnet list longer than one group may
+        // hold, and a list that would leave the group covering no Availability
+        // Zone at all, are answered before anything is resolved or changed.
+        if input.subnet_ids.len() > st::SUBNETS_PER_SUBNET_GROUP_QUOTA {
+            return Err(
+                ModifyClusterSubnetGroupErrorModeled::ClusterSubnetQuotaExceededFault(
+                    ClusterSubnetQuotaExceededFault {
+                        message: Some(st::subnet_quota_exceeded_message()),
+                    },
+                )
+                .into(),
+            );
+        }
+        if input.subnet_ids.is_empty() {
+            return Err(ModifyClusterSubnetGroupErrorModeled::InvalidSubnet(
+                InvalidSubnet {
+                    message: Some(st::SUBNET_LIST_IS_EMPTY.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Where the subnets the request names ARE is a fact of the service that
+        // owns them, resolved with no lock held and exactly as the create
+        // resolves it: an identifier the account has no subnet for is refused,
+        // and the group's VPC and per-subnet zones are read off EC2's own
+        // records.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyClusterSubnetGroup"))
+        // Resolved BEFORE the group the call modifies: recorded behaviour shows a
+        // request naming both subnets the account does not have and a group it
+        // does not hold refused on the SUBNETS, so the list is judged first.
+        let resolved = match st::resolve_requested_subnets(ctx, &region, &input.subnet_ids).await {
+            st::SubnetResolution::Resolved(resolved) => resolved,
+            st::SubnetResolution::Unresolved(unresolved) => {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    st::invalid_subnets_message(&unresolved),
+                ))
+            }
+            // Nothing is known about any identifier the request named, which is
+            // not the caller's doing: the modelled "a dependent internal service
+            // is temporarily unavailable" fault says so, and the group keeps the
+            // subnets it has.
+            st::SubnetResolution::Unavailable => {
+                return Err(
+                    ModifyClusterSubnetGroupErrorModeled::DependentServiceUnavailableFault(
+                        DependentServiceUnavailableFault {
+                            message: Some(st::SUBNETS_UNRESOLVABLE.to_string()),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+        // "The requested subnet is not valid, or not all of the subnets are in
+        // the same VPC" — `InvalidSubnet`'s own documented sentence
+        // (`smithy_query(query="shape", shape="InvalidSubnet")`), which is the
+        // fixed text of this refusal: a group has ONE VpcId, so a list whose
+        // subnets belong to two VPCs is not a group at all.
+        if resolved
+            .iter()
+            .any(|subnet| subnet.vpc_id != resolved[0].vpc_id)
+        {
+            return Err(ModifyClusterSubnetGroupErrorModeled::InvalidSubnet(
+                InvalidSubnet {
+                    message: Some(st::SUBNETS_NOT_IN_ONE_VPC.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // The group being modified has to exist: it is the target of the call.
+        // The account's ambient `default` group is materialised first, so a
+        // request naming it finds it.
+        st::materialize_default_subnet_group(ctx, &*self.engine, &region).await;
+
+        let mut store = state.lock();
+        // Resolved under the WRITE lock, and the record composed from what it
+        // finds there: the group may have been deleted or modified while the
+        // subnets were being resolved, so a modify neither re-creates a group
+        // that is gone nor writes back a description or a tag list that has
+        // moved on.
+        let Some(position) = store.subnet_group_position(&input.cluster_subnet_group_name) else {
+            return Err(
+                ModifyClusterSubnetGroupErrorModeled::ClusterSubnetGroupNotFoundFault(
+                    ClusterSubnetGroupNotFoundFault {
+                        message: Some(st::subnet_group_not_found_message(
+                            st::SubnetGroupNotFoundWording::DoesNotExist,
+                            &input.cluster_subnet_group_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let stored = &store.subnet_groups[position];
+
+        // The group as it stands from now on: its own stored name and tags, the
+        // description the request carried or the one it already had ("A text
+        // description of the subnet group to be modified" is optional, so a
+        // request that carries none changes none), and the new subnet list.
+        let group = st::subnet_group_record(
+            stored
+                .cluster_subnet_group_name
+                .as_deref()
+                .unwrap_or_default(),
+            input
+                .description
+                .as_deref()
+                .or(stored.description.as_deref())
+                .unwrap_or_default(),
+            &resolved,
+            stored.tags.clone().unwrap_or_default(),
+        );
+        store.subnet_groups[position] = group.clone();
+
+        Ok(ModifyClusterSubnetGroupOutput {
+            cluster_subnet_group: Some(group),
+        })
     }
 }

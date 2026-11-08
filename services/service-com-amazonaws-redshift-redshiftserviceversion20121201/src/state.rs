@@ -93,8 +93,12 @@ mod tags;
 mod derived;
 /// The syntax every name this service admits has to satisfy.
 mod naming;
+/// The subnets a cluster subnet group is made of, resolved against the service
+/// that owns them.
+mod ec2_subnets;
 
 pub use clusters::*;
+pub use ec2_subnets::*;
 pub use derived::*;
 pub use events::*;
 pub use naming::*;

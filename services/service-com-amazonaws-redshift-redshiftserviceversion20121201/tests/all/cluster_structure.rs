@@ -87,7 +87,9 @@ struct Case {
     node_roles: Vec<String>,
     /// The `ClusterSubnetGroupName` the cluster must report.
     subnet_group: String,
-    /// The `VpcSecurityGroupId` of every VPC security group it must report.
+    /// The `VpcSecurityGroupId` of every VPC security group it must report, or
+    /// EMPTY for a row that names none — which must report the default security
+    /// group of its own VPC, the VPC its subnet group's subnets are in.
     security_groups: Vec<String>,
     /// The `KmsKeyId` it must report, or `None` when it must report none.
     kms_key_id: Option<String>,
@@ -121,8 +123,6 @@ async fn a_reported_cluster_carries_every_member_derived_from_its_configuration(
     let emulator = Emulator::new();
 
     let default_subnet_group = state::DEFAULT_CLUSTER_SUBNET_GROUP.to_string();
-    let default_security_group =
-        |subnet_group: &str| state::default_vpc_security_group_id(&state::derived_vpc_id(subnet_group));
 
     let cases: Vec<Case> = vec![
         Case {
@@ -130,7 +130,7 @@ async fn a_reported_cluster_carries_every_member_derived_from_its_configuration(
             params: vec![("ClusterType".to_string(), "single-node".to_string())],
             node_roles: vec![state::NODE_ROLE_SHARED.to_string()],
             subnet_group: default_subnet_group.clone(),
-            security_groups: vec![default_security_group(&default_subnet_group)],
+            security_groups: Vec::new(),
             // "Default: true" is this service's documented encryption default,
             // and an encrypted cluster that named no key is encrypted under the
             // key Amazon Web Services owns.
@@ -145,7 +145,7 @@ async fn a_reported_cluster_carries_every_member_derived_from_its_configuration(
             ],
             node_roles: multi_node_roles(2),
             subnet_group: default_subnet_group.clone(),
-            security_groups: vec![default_security_group(&default_subnet_group)],
+            security_groups: Vec::new(),
             kms_key_id: Some(state::AWS_OWNED_KMS_KEY.to_string()),
             parameter_group: state::cluster_default_parameter_group(),
         },
@@ -157,7 +157,7 @@ async fn a_reported_cluster_carries_every_member_derived_from_its_configuration(
             ],
             node_roles: multi_node_roles(8),
             subnet_group: default_subnet_group.clone(),
-            security_groups: vec![default_security_group(&default_subnet_group)],
+            security_groups: Vec::new(),
             kms_key_id: Some(state::AWS_OWNED_KMS_KEY.to_string()),
             parameter_group: state::cluster_default_parameter_group(),
         },
@@ -169,7 +169,7 @@ async fn a_reported_cluster_carries_every_member_derived_from_its_configuration(
             )],
             node_roles: vec![state::NODE_ROLE_SHARED.to_string()],
             subnet_group: "analytics-subnets".to_string(),
-            security_groups: vec![default_security_group("analytics-subnets")],
+            security_groups: Vec::new(),
             kms_key_id: Some(state::AWS_OWNED_KMS_KEY.to_string()),
             parameter_group: state::cluster_default_parameter_group(),
         },
@@ -199,7 +199,7 @@ async fn a_reported_cluster_carries_every_member_derived_from_its_configuration(
             params: vec![("Encrypted".to_string(), "false".to_string())],
             node_roles: vec![state::NODE_ROLE_SHARED.to_string()],
             subnet_group: default_subnet_group.clone(),
-            security_groups: vec![default_security_group(&default_subnet_group)],
+            security_groups: Vec::new(),
             kms_key_id: None,
             parameter_group: state::cluster_default_parameter_group(),
         },
@@ -212,7 +212,7 @@ async fn a_reported_cluster_carries_every_member_derived_from_its_configuration(
             )],
             node_roles: vec![state::NODE_ROLE_SHARED.to_string()],
             subnet_group: default_subnet_group.clone(),
-            security_groups: vec![default_security_group(&default_subnet_group)],
+            security_groups: Vec::new(),
             kms_key_id: Some(
                 "arn:aws:kms:us-west-2:123456789012:key/7c9eb2f9-0000-4000-8000-0123456789ab"
                     .to_string(),
@@ -233,7 +233,7 @@ async fn a_reported_cluster_carries_every_member_derived_from_its_configuration(
             ],
             node_roles: vec![state::NODE_ROLE_SHARED.to_string()],
             subnet_group: default_subnet_group.clone(),
-            security_groups: vec![default_security_group(&default_subnet_group)],
+            security_groups: Vec::new(),
             kms_key_id: Some(state::AWS_OWNED_KMS_KEY.to_string()),
             parameter_group: "structure-group".to_string(),
         },
@@ -261,14 +261,15 @@ async fn a_reported_cluster_carries_every_member_derived_from_its_configuration(
     );
 
     // Likewise the subnet group one row names: a cluster is only launched into a
-    // group the account holds.
+    // group the account holds, over subnets EC2 minted for it.
+    let account_subnets = emulator.subnet_ids("seed analytics-subnets", 1).await;
     let created_subnet_group = emulator
         .call(
             "CreateClusterSubnetGroup",
             &[
                 ("ClusterSubnetGroupName", "analytics-subnets"),
                 ("Description", "the subnets one row names"),
-                ("SubnetIds.SubnetIdentifier.1", "subnet-0123456789abcdef0"),
+                ("SubnetIds.SubnetIdentifier.1", &account_subnets[0]),
             ],
         )
         .await;
@@ -290,7 +291,21 @@ async fn a_reported_cluster_carries_every_member_derived_from_its_configuration(
             case.case, created.status, created.body
         );
 
-        assert_structure(&created, case, &identifier);
+        // The VPC the cluster must report is the one its subnet group reports:
+        // asked of the group itself rather than computed here.
+        let group = emulator
+            .call(
+                "DescribeClusterSubnetGroups",
+                &[("ClusterSubnetGroupName", case.subnet_group.as_str())],
+            )
+            .await;
+        let subnet_group_vpc = group.text("VpcId").unwrap_or_else(|| {
+            panic!(
+                "case {}: the subnet group {} must report the VPC its subnets are in, got body {}",
+                case.case, case.subnet_group, group.body
+            )
+        });
+        assert_structure(&created, case, &identifier, &subnet_group_vpc);
 
         // The read path reports the SAME structure the create path did: the
         // whole `Cluster` subtree, member for member.
@@ -379,17 +394,36 @@ async fn a_reported_cluster_carries_every_member_derived_from_its_configuration(
             "case {name}: expected the endpoint interface to be in the cluster's zone, got {zones:?}"
         );
         let reported_vpcs = all_text(&serving.body, "VpcId");
-        let vpc_id = state::derived_vpc_id(&case.subnet_group);
+        // The VPC the endpoint is in is the cluster's own: the VPC its subnet
+        // group reports, asked of that group rather than computed here.
+        let group = emulator
+            .call(
+                "DescribeClusterSubnetGroups",
+                &[("ClusterSubnetGroupName", case.subnet_group.as_str())],
+            )
+            .await;
+        let vpc_id = group.text("VpcId").unwrap_or_else(|| {
+            panic!(
+                "case {name}: the subnet group {} must report the VPC its subnets are in, got \
+                 body {}",
+                case.subnet_group, group.body
+            )
+        });
         assert!(
             reported_vpcs.len() == 2 && reported_vpcs.iter().all(|reported| *reported == vpc_id),
-            "case {name}: expected the endpoint to be in the cluster's VPC {vpc_id:?}, got {reported_vpcs:?}"
+            "case {name}: expected the endpoint to be in the cluster's VPC {vpc_id:?}, got \
+             {reported_vpcs:?}"
         );
     }
 }
 
 /// Assert the whole rule on one reported cluster: the row's own expectations,
 /// then every member the rule says a cluster always carries.
-fn assert_structure(answer: &Answer, case: &Case, identifier: &str) {
+///
+/// `subnet_group_vpc` is the `VpcId` the cluster's own subnet group reports — the
+/// VPC its subnets belong to, as the service that owns subnets answered for them
+/// — which is the VPC the cluster must report too.
+fn assert_structure(answer: &Answer, case: &Case, identifier: &str, subnet_group_vpc: &str) {
     let name = case.case;
 
     assert_eq!(
@@ -432,18 +466,24 @@ fn assert_structure(answer: &Answer, case: &Case, identifier: &str) {
     );
     // The cluster's VPC is its subnet group's VPC, and the VPC its connection
     // endpoint is reached through is the same one.
-    let vpc_id = state::derived_vpc_id(&case.subnet_group);
+    let vpc_id = subnet_group_vpc;
     let reported_vpcs = all_text(&answer.body, "VpcId");
     assert!(
-        !reported_vpcs.is_empty() && reported_vpcs.iter().all(|reported| *reported == vpc_id),
+        !reported_vpcs.is_empty() && reported_vpcs.iter().all(|reported| reported == vpc_id),
         "case {name}: expected every VpcId to be {vpc_id:?}, got {reported_vpcs:?}"
     );
 
+    // The VPC security groups: the ones the row named, or the default security
+    // group of the cluster's own VPC when it named none.
+    let expected_groups: Vec<String> = if case.security_groups.is_empty() {
+        vec![state::default_vpc_security_group_id(subnet_group_vpc)]
+    } else {
+        case.security_groups.clone()
+    };
     assert_eq!(
         all_text(&answer.body, "VpcSecurityGroupId"),
-        case.security_groups,
-        "case {name}: expected the VPC security groups {:?}, got {:?}",
-        case.security_groups,
+        expected_groups,
+        "case {name}: expected the VPC security groups {expected_groups:?}, got {:?}",
         all_text(&answer.body, "VpcSecurityGroupId")
     );
 

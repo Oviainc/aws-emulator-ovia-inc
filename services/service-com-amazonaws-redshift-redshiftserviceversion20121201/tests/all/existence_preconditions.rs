@@ -42,8 +42,10 @@ fn borrowed(params: &[(String, String)]) -> Vec<(&str, &str)> {
 /// the `(status, error code)` the service must answer with.
 type PreconditionCase = (String, Vec<(String, String)>, u16, &'static str);
 
-/// Create one cluster subnet group holding `subnet_ids`.
-async fn create_subnet_group(emulator: &Emulator, name: &str, subnet_ids: &[&str]) -> Answer {
+/// Create one cluster subnet group holding `subnet_ids` — ids EC2 minted for the
+/// account, because a Redshift subnet group resolves every `SubnetIds` entry
+/// against the service that owns subnets.
+async fn create_subnet_group(emulator: &Emulator, name: &str, subnet_ids: &[String]) -> Answer {
     let mut params: Vec<(String, String)> = vec![
         ("ClusterSubnetGroupName".to_string(), name.to_string()),
         (
@@ -54,7 +56,7 @@ async fn create_subnet_group(emulator: &Emulator, name: &str, subnet_ids: &[&str
     for (index, subnet_id) in subnet_ids.iter().enumerate() {
         params.push((
             format!("SubnetIds.SubnetIdentifier.{}", index + 1),
-            (*subnet_id).to_string(),
+            subnet_id.clone(),
         ));
     }
     emulator
@@ -116,7 +118,12 @@ async fn a_create_naming_an_absent_subnet_group_is_refused_and_allocates_nothing
     let emulator = Emulator::new();
     // One group that DOES exist, so the table's refusals cannot be an "every
     // name is refused" artefact.
-    let created = create_subnet_group(&emulator, "present-subnets", &["subnet-a"]).await;
+    let created = create_subnet_group(
+        &emulator,
+        "present-subnets",
+        &emulator.subnet_ids("seed present-subnets", 1).await,
+    )
+    .await;
     assert_eq!(
         created.status, 200,
         "case seed present-subnets: expected 200, got {} with body {}",
@@ -202,7 +209,12 @@ async fn a_create_naming_an_absent_subnet_group_is_refused_and_allocates_nothing
 #[tokio::test]
 async fn an_absent_reference_is_that_resources_own_fault_in_every_operation() {
     let emulator = Emulator::new();
-    let created = create_subnet_group(&emulator, "shared-subnets", &["subnet-a", "subnet-b"]).await;
+    let created = create_subnet_group(
+        &emulator,
+        "shared-subnets",
+        &emulator.subnet_ids("seed shared-subnets", 2).await,
+    )
+    .await;
     assert_eq!(
         created.status, 200,
         "case seed shared-subnets: expected 200, got {} with body {}",
@@ -333,38 +345,36 @@ async fn an_absent_reference_is_that_resources_own_fault_in_every_operation() {
 #[tokio::test]
 async fn a_created_subnet_group_is_reported_exactly_as_stored() {
     let emulator = Emulator::new();
-    // The documented maximum: "A maximum of 20 subnets can be modified in a
-    // single request" (`CreateClusterSubnetGroupMessage$SubnetIds`).
-    let many: Vec<String> = (0..state::SUBNETS_PER_SUBNET_GROUP_QUOTA)
-        .map(|index| format!("subnet-{index:04}"))
-        .collect();
-    let many: Vec<&str> = many.iter().map(String::as_str).collect();
 
-    // (case, requested name, subnet ids, the name the group must be STORED under)
-    let rows: Vec<(&str, &str, Vec<&str>, &str)> = vec![
-        ("one subnet", "one-subnet-group", vec!["subnet-a"], "one-subnet-group"),
+    // (case, requested name, how many subnets of the account, the name the group
+    // must be STORED under). The documented maximum is "A maximum of 20 subnets
+    // can be modified in a single request"
+    // (`CreateClusterSubnetGroupMessage$SubnetIds`).
+    let rows: Vec<(&str, &str, usize, &str)> = vec![
+        ("one subnet", "one-subnet-group", 1, "one-subnet-group"),
         (
             "several subnets",
             "three-subnet-group",
-            vec!["subnet-a", "subnet-b", "subnet-c"],
+            3,
             "three-subnet-group",
         ),
         (
             "the documented maximum number of subnets",
             "max-subnet-group",
-            many.clone(),
+            state::SUBNETS_PER_SUBNET_GROUP_QUOTA,
             "max-subnet-group",
         ),
         (
             // "Amazon Redshift stores the value as a lowercase string."
             "mixed case is folded",
             "Mixed-Case-Group",
-            vec!["subnet-a"],
+            1,
             "mixed-case-group",
         ),
     ];
 
-    for (case, requested, subnet_ids, stored) in rows {
+    for (case, requested, count, stored) in rows {
+        let subnet_ids = emulator.subnet_ids(case, count).await;
         let created = create_subnet_group(&emulator, requested, &subnet_ids).await;
         assert_eq!(
             created.status, 200,
@@ -400,10 +410,7 @@ async fn a_created_subnet_group_is_reported_exactly_as_stored() {
         );
         assert_eq!(
             all_text(&described.body, "SubnetIdentifier"),
-            subnet_ids
-                .iter()
-                .map(|id| (*id).to_string())
-                .collect::<Vec<String>>(),
+            subnet_ids,
             "case {case}: expected the subnets in request order, got body {}",
             described.body
         );
@@ -416,32 +423,33 @@ async fn a_created_subnet_group_is_reported_exactly_as_stored() {
                 described.text(member)
             );
         }
-        // Every subnet reports an Availability Zone of the Region the request
-        // was signed for. The report also carries each zone's supported
-        // platforms, whose own element is `<Name>` too, so the names are
-        // partitioned rather than counted blindly.
+        // Every subnet reports one Availability Zone — the zone of the Region
+        // the subnets belong to — and nothing else carries a `<Name>`: a
+        // `Subnet` is `{SubnetIdentifier, SubnetAvailabilityZone, SubnetStatus}`
+        // and the zone carries its name alone.
         let zones = state::region_availability_zones("us-west-2");
         let names = all_text(&described.body, "Name");
-        let (zone_names, platform_names): (Vec<String>, Vec<String>) =
-            names.into_iter().partition(|name| zones.contains(name));
         assert_eq!(
-            zone_names.len(),
+            names.len(),
             subnet_ids.len(),
-            "case {case}: expected one Availability Zone of us-west-2 per subnet, got \
-             {zone_names:?} beside {platform_names:?}"
+            "case {case}: expected exactly one zone name per subnet, got {names:?}"
         );
-        for platform in &platform_names {
-            assert_eq!(
-                platform, state::PLATFORM_VPC,
-                "case {case}: expected every other <Name> to be a supported platform, got \
-                 {platform:?}"
+        for name in &names {
+            assert!(
+                zones.contains(name),
+                "case {case}: expected every zone name to be one of {zones:?}, got {name:?}"
             );
         }
     }
 
     // A second create under the stored name is the group's own "already exists"
     // fault, not a second record.
-    let repeat = create_subnet_group(&emulator, "ONE-SUBNET-GROUP", &["subnet-a"]).await;
+    let repeat = create_subnet_group(
+        &emulator,
+        "ONE-SUBNET-GROUP",
+        &emulator.subnet_ids("a repeat create of a stored subnet group", 1).await,
+    )
+    .await;
     assert_refused(
         "a repeat create of a stored subnet group",
         &repeat,

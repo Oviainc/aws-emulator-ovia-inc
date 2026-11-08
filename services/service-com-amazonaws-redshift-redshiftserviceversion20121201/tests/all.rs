@@ -41,6 +41,8 @@ mod cluster_request_validation;
 mod cluster_security_groups;
 #[path = "all/cluster_structure.rs"]
 mod cluster_structure;
+#[path = "all/cluster_subnet_group_network.rs"]
+mod cluster_subnet_group_network;
 #[path = "all/cluster_transition_convergence.rs"]
 mod cluster_transition_convergence;
 #[path = "all/cluster_versions.rs"]

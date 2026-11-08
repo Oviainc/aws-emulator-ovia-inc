@@ -144,8 +144,7 @@ async fn every_endpoint_operation_words_its_endpoint_not_found_refusal_its_own_w
     available_cluster(&emulator, "wording-endpoint-host").await;
     assert_served(
         "seed subnet group",
-        &create_subnet_group(&emulator, "wording-endpoint-subnets", &["subnet-a", "subnet-b"])
-            .await,
+        &create_subnet_group(&emulator, "wording-endpoint-subnets", 2).await,
     );
     assert_served(
         "seed the present endpoint",

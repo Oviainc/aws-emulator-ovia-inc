@@ -6,7 +6,10 @@
 //! back: the folded name, the description as given, the VPC the group's subnets
 //! are in, each subnet with the Availability Zone it resolves to, and the tags
 //! the request carried. A second create under the same name is refused with
-//! `ClusterSubnetGroupAlreadyExistsFault`.
+//! `ClusterSubnetGroupAlreadyExistsFault`, and a `SubnetIds` entry the account
+//! has no subnet for is refused before anything is stored — the subnets, their
+//! VPC and their zones are resolved against the service that owns them
+//! (`crate::state::ec2_subnets`), never derived here.
 //!
 //! The group is what `CreateCluster` and `RestoreFromClusterSnapshot` resolve a
 //! `ClusterSubnetGroupName` against, so a cluster can only be launched into a
@@ -217,10 +220,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateClusterSubnetGroupErrorModeled::ClusterSubnetQuotaExceededFault(
                     ClusterSubnetQuotaExceededFault {
-                        message: Some(format!(
-                            "The request would exceed the allowed number of subnets in a cluster subnet group ({}).",
-                            st::SUBNETS_PER_SUBNET_GROUP_QUOTA
-                        )),
+                        message: Some(st::subnet_quota_exceeded_message()),
                     },
                 )
                 .into(),
@@ -232,9 +232,51 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.subnet_ids.is_empty() {
             return Err(CreateClusterSubnetGroupErrorModeled::InvalidSubnet(
                 InvalidSubnet {
-                    message: Some(
-                        "SubnetIds must name at least one subnet of your VPC.".to_string(),
-                    ),
+                    message: Some(st::SUBNET_LIST_IS_EMPTY.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // Where those subnets ARE is a fact of the service that owns them: each
+        // identifier the request named is resolved against EC2 — before the
+        // store is touched, and with no lock held — so an identifier the account
+        // has no subnet for is refused and the group's VPC and per-subnet zones
+        // are read off EC2's own records (`crate::state::ec2_subnets`).
+        let resolved = match st::resolve_requested_subnets(ctx, &region, &input.subnet_ids).await {
+            st::SubnetResolution::Resolved(resolved) => resolved,
+            st::SubnetResolution::Unresolved(unresolved) => {
+                return Err(crate::scaffolded::Scaffolded::invalid_parameter_value(
+                    st::invalid_subnets_message(&unresolved),
+                ))
+            }
+            // Nothing is known about any identifier the request named, which is
+            // not the caller's doing: the modelled "a dependent internal service
+            // is temporarily unavailable" fault says so, and no group is stored
+            // over subnets nobody could confirm.
+            st::SubnetResolution::Unavailable => {
+                return Err(
+                    CreateClusterSubnetGroupErrorModeled::DependentServiceUnavailableFault(
+                        DependentServiceUnavailableFault {
+                            message: Some(st::SUBNETS_UNRESOLVABLE.to_string()),
+                        },
+                    )
+                    .into(),
+                )
+            }
+        };
+        // "The requested subnet is not valid, or not all of the subnets are in
+        // the same VPC" — `InvalidSubnet`'s own documented sentence
+        // (`smithy_query(query="shape", shape="InvalidSubnet")`), which is the
+        // fixed text of this refusal: a group has ONE VpcId, so a list whose
+        // subnets belong to two VPCs is not a group at all.
+        if resolved
+            .iter()
+            .any(|subnet| subnet.vpc_id != resolved[0].vpc_id)
+        {
+            return Err(CreateClusterSubnetGroupErrorModeled::InvalidSubnet(
+                InvalidSubnet {
+                    message: Some(st::SUBNETS_NOT_IN_ONE_VPC.to_string()),
                 },
             )
             .into());
@@ -271,27 +313,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // The record a later `DescribeClusterSubnetGroups` reports verbatim, and
-        // the one a cluster launched into this group reads its VPC from.
-        let group = ClusterSubnetGroup {
-            cluster_subnet_group_name: Some(name.clone()),
-            description: Some(input.description.clone()),
-            vpc_id: Some(st::derived_vpc_id(&name)),
-            subnet_group_status: Some(st::SUBNET_GROUP_STATUS_COMPLETE.to_string()),
-            subnets: Some(
-                input
-                    .subnet_ids
-                    .iter()
-                    .map(|subnet_id| st::subnet_record(subnet_id, &region))
-                    .collect(),
-            ),
-            tags: Some(input.tags.clone().unwrap_or_default()),
-            supported_cluster_ip_address_types: Some(
-                st::SUPPORTED_CLUSTER_IP_ADDRESS_TYPES
-                    .iter()
-                    .map(|kind| (*kind).to_string())
-                    .collect(),
-            ),
-        };
+        // the one a cluster launched into this group reads its VPC from. Built by
+        // the one builder every subnet-group record is built by, over the subnets
+        // EC2 answered for, so nothing about this group's network is invented
+        // here.
+        let group = st::subnet_group_record(
+            &name,
+            &input.description,
+            &resolved,
+            input.tags.clone().unwrap_or_default(),
+        );
         store.subnet_groups.push(group.clone());
 
         Ok(CreateClusterSubnetGroupOutput {

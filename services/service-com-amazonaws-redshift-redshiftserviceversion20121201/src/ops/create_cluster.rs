@@ -383,6 +383,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // Every provisioned cluster is created in a VPC, through the subnet group
+        // the request named or the account's DEFAULT group — which the account has
+        // before anybody creates one, over its default VPC's subnets. Resolving
+        // those subnets is an in-process call into the service that owns them, so
+        // it happens here, before the create takes the store's lock.
+        crate::state::materialize_default_subnet_group(
+            ctx,
+            &*self.engine,
+            &crate::state::request_region(ctx),
+        )
+        .await;
+
         // The create holds the store's lock; the event it raises is published
         // once that lock is released, because a publish is an in-process call
         // into another service and must not run under it.
@@ -579,11 +591,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
         // this service does not model yet (their creates are still 501 stubs), so
         // there is no state to resolve those names against and a request naming
         // one is taken at its word.
-        // Every provisioned cluster is created in a VPC, through the subnet group
-        // the request named or the account's DEFAULT group — which exists before
-        // anybody creates one, so it is materialised here and a request naming
-        // `default` finds it too.
-        let default_subnet_group = store.ensure_default_subnet_group(&region);
+        // The subnet group the cluster is launched into: the one the request
+        // named, or the account's default group (materialised by `handle`, before
+        // this lock was taken), whose record carries the VPC its subnets are in.
         let subnet_group = match input.cluster_subnet_group_name.as_deref() {
             Some(requested) => match store.subnet_group(requested) {
                 Some(group) => Some(group.clone()),
@@ -591,8 +601,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
                     return Err(
                         CreateClusterErrorModeled::ClusterSubnetGroupNotFoundFault(
                             ClusterSubnetGroupNotFoundFault {
-                                message: Some(format!(
-                                    "Cluster subnet group '{requested}' does not exist."
+                                message: Some(st::subnet_group_not_found_message(
+                                    st::SubnetGroupNotFoundWording::DoesNotExist,
+                                    requested,
                                 )),
                             },
                         )
@@ -600,7 +611,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
                     )
                 }
             },
-            None => Some(default_subnet_group),
+            None => store.default_subnet_group(),
         };
         // "Default: The default Amazon Redshift cluster parameter group" — the
         // default group of the parameter group family this service's clusters

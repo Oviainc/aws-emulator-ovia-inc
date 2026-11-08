@@ -144,7 +144,10 @@ struct ResourceCase {
 }
 
 /// One row per resource type an ARN can name in this store.
-fn resource_cases() -> Vec<ResourceCase> {
+///
+/// `subnet_id` is a subnet EC2 minted for the account: a cluster subnet group is
+/// only created over subnets the service that owns them answers for.
+fn resource_cases(subnet_id: &str) -> Vec<ResourceCase> {
     let owned = |pairs: &[(&str, &str)]| -> Params {
         pairs
             .iter()
@@ -219,7 +222,7 @@ fn resource_cases() -> Vec<ResourceCase> {
                 owned(&[
                     ("ClusterSubnetGroupName", "tags-subnets"),
                     ("Description", "the subnets a case tags"),
-                    ("SubnetIds.SubnetIdentifier.1", "subnet-0123456789abcdef0"),
+                    ("SubnetIds.SubnetIdentifier.1", subnet_id),
                 ]),
             )],
             arn: state::subnet_group_arn("tags-subnets", REGION),
@@ -236,7 +239,8 @@ fn resource_cases() -> Vec<ResourceCase> {
 async fn tags_round_trip_through_every_resource_type_an_arn_names() {
     let emulator = Emulator::new();
 
-    for case in resource_cases() {
+    let subnet_id = emulator.subnet_ids("a cluster subnet group", 1).await;
+    for case in resource_cases(&subnet_id[0]) {
         for (action, params) in &case.create {
             let created = emulator.call(action, &borrowed(params)).await;
             assert_eq!(

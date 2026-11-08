@@ -171,8 +171,32 @@ async fn a_cluster_publishes_its_endpoint_only_once_it_is_serving() {
             serving.text("Port")
         );
         // The VPC interface endpoint the cluster is reached through, in the
-        // cluster's own VPC and zone.
-        let vpc_id = state::derived_vpc_id(state::DEFAULT_CLUSTER_SUBNET_GROUP);
+        // cluster's own VPC and zone. The VPC is the one the cluster's subnet
+        // group reports — the VPC its subnets are in, as the service that owns
+        // subnets answered for them — asked of that group rather than computed
+        // here.
+        let group = emulator
+            .call(
+                "DescribeClusterSubnetGroups",
+                &[(
+                    "ClusterSubnetGroupName",
+                    state::DEFAULT_CLUSTER_SUBNET_GROUP,
+                )],
+            )
+            .await;
+        let vpc_id = group.text("VpcId").unwrap_or_else(|| {
+            panic!(
+                "case {}: the default subnet group must report its VPC, got body {}",
+                row.case, group.body
+            )
+        });
+        assert_eq!(
+            serving.text("VpcId").as_deref(),
+            Some(vpc_id.as_str()),
+            "case {}: expected the cluster in its subnet group's VPC {vpc_id:?}, got {:?}",
+            row.case,
+            serving.text("VpcId")
+        );
         let zone = row.zone.map(str::to_string).unwrap_or_else(|| {
             state::default_availability_zone(row.identifier, REGION)
         });

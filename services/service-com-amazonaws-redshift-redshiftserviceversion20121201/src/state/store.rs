@@ -1246,22 +1246,52 @@ impl ComAmazonawsRedshiftRedshiftserviceversion20121201State {
             .find(|g| g.cluster_subnet_group_name.as_deref() == Some(wanted.as_str()))
     }
 
-    /// The account's DEFAULT cluster subnet group, materialised into this store
-    /// the first time a cluster needs it.
+    /// The POSITION of the stored cluster subnet group with this name, if any —
+    /// the same match [`Self::subnet_group`] makes, for an operation that has to
+    /// REMOVE the record it found.
+    pub fn subnet_group_position(&self, name: &str) -> Option<usize> {
+        let wanted = normalized_subnet_group_name(name);
+        self.subnet_groups
+            .iter()
+            .position(|g| g.cluster_subnet_group_name.as_deref() == Some(wanted.as_str()))
+    }
+
+    /// Whether anything is using the cluster subnet group `name` — a resource of
+    /// this control plane that was placed in it.
+    ///
+    /// `name` is the STORED (folded) form. A cluster launched into the group, or
+    /// a Redshift-managed VPC endpoint deployed from it, is using it; that is
+    /// what makes the group undeletable while that resource exists.
+    pub fn subnet_group_in_use(&self, name: &str) -> bool {
+        let used_by_cluster = self.clusters.iter().any(|stored| {
+            stored
+                .cluster
+                .cluster_subnet_group_name
+                .as_deref()
+                .is_some_and(|group| normalized_subnet_group_name(group) == name)
+        });
+        used_by_cluster
+            || self.endpoint_accesses.iter().any(|stored| {
+                stored
+                    .endpoint
+                    .subnet_group_name
+                    .as_deref()
+                    .is_some_and(|group| normalized_subnet_group_name(group) == name)
+            })
+    }
+
+    /// The account's DEFAULT cluster subnet group, as this store holds it — or
+    /// `None` in a Region whose default network nobody could resolve.
     ///
     /// An account has this group before anybody creates one (see
     /// [`default_subnet_group`]), so a cluster that named no subnet group — and a
-    /// request that names `default` — must find it. It is materialised here
-    /// rather than seeded with the store because its subnets carry the
-    /// Availability Zones of a REGION, which only a request carries; the record
-    /// is inserted once and every later call reads that same record.
-    pub fn ensure_default_subnet_group(&mut self, region: &str) -> ClusterSubnetGroup {
-        if let Some(existing) = self.subnet_group(DEFAULT_CLUSTER_SUBNET_GROUP) {
-            return existing.clone();
-        }
-        let group = default_subnet_group(region);
-        self.subnet_groups.push(group.clone());
-        group
+    /// request that names `default` — must find it. It is not seeded with the
+    /// store because it covers the subnets of the account's default VPC, which
+    /// only the service that OWNS subnets can answer for: it is materialised by
+    /// [`materialize_default_subnet_group`], outside the lock, and this reader
+    /// reports the record that left.
+    pub fn default_subnet_group(&self) -> Option<ClusterSubnetGroup> {
+        self.subnet_group(DEFAULT_CLUSTER_SUBNET_GROUP).cloned()
     }
 
     /// The total storage the snapshots this store holds occupy, in megabytes.

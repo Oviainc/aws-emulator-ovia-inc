@@ -210,16 +210,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the request is judged, so a name that resolves to nothing is answered
         // with that resource's own modelled fault rather than with a refusal of
         // the request's shape.
-        let mut store = state.lock();
-        store.settle(started);
-
+        //
         // The account HAS a default cluster subnet group before anybody creates
         // one, so a request naming it resolves whether or not a cluster has
-        // materialised that record yet.
+        // materialised that record yet. The hop that resolves its subnets is made
+        // before the store is locked.
         let requested_group = st::normalized_subnet_group_name(&input.subnet_group_name);
         if requested_group == st::DEFAULT_CLUSTER_SUBNET_GROUP {
-            store.ensure_default_subnet_group(&region);
+            st::materialize_default_subnet_group(ctx, &*self.engine, &region).await;
         }
+
+        let mut store = state.lock();
+        store.settle(started);
 
         // "The subnet group from which Amazon Redshift chooses the subnet to
         // deploy the endpoint": resolved BEFORE the cluster, which is the order
@@ -230,9 +232,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateEndpointAccessErrorModeled::ClusterSubnetGroupNotFoundFault(
                     ClusterSubnetGroupNotFoundFault {
-                        message: Some(format!(
-                            "Cluster subnet group '{}' does not exist.",
-                            input.subnet_group_name
+                        message: Some(st::subnet_group_not_found_message(
+                            st::SubnetGroupNotFoundWording::DoesNotExist,
+                            &input.subnet_group_name,
                         )),
                     },
                 )
@@ -351,12 +353,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Where the endpoint lands: the VPC of its subnet group, and the one
-        // subnet of that group the service chooses for it.
+        // subnet of that group the service chooses for it. The VPC is the one the
+        // group reports — resolved from its subnets when the group was created —
+        // so the endpoint is in the network its subnet group really is in.
         let subnet = st::endpoint_deployment_subnet(&subnet_group, &input.endpoint_name);
-        let vpc_id = subnet_group
-            .vpc_id
-            .clone()
-            .unwrap_or_else(|| st::derived_vpc_id(&requested_group));
+        let vpc_id = subnet_group.vpc_id.clone().unwrap_or_default();
         let availability_zone = subnet
             .as_ref()
             .and_then(|subnet| subnet.subnet_availability_zone.as_ref())

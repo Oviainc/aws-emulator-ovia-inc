@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteClusterSubnetGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteClusterSubnetGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteClusterSubnetGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one cluster subnet group from this service's store, so every later
+//! read of its name reports it absent. A name that names no group is
+//! `ClusterSubnetGroupNotFoundFault`, and a group a cluster or a
+//! Redshift-managed VPC endpoint was launched into is IN USE: it is refused with
+//! `InvalidClusterSubnetGroupStateFault` and stays.
 //!
 //! ## Shape of an operation
 //!
@@ -97,12 +94,20 @@ impl ::aws_smithy_schema::serde::SerializableStruct for DeleteClusterSubnetGroup
 // here — hence the `DeleteClusterSubnetGroupError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DeleteClusterSubnetGroup")]
+// `DependentServiceUnavailableFault` is widened in, as on every other operation
+// of this service: the model does not list it here, but the service declares the
+// shape and it is the only modelled way to say "the control-plane store could not
+// be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DeleteClusterSubnetGroup",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DeleteClusterSubnetGroupErrorModeled {
     ClusterSubnetGroupNotFoundFault(ClusterSubnetGroupNotFoundFault),
     InvalidClusterSubnetGroupStateFault(InvalidClusterSubnetGroupStateFault),
     InvalidClusterSubnetStateFault(InvalidClusterSubnetStateFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -156,18 +161,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteClusterSubnetGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteClusterSubnetGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteClusterSubnetGroup"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DeleteClusterSubnetGroupErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = st::request_region(ctx);
+
+        // A request naming the account's ambient `default` group is about a group
+        // that exists whether or not anybody has read it yet, so it is
+        // materialised first and then refused as the group in use it is (below) —
+        // never answered as absent.
+        st::materialize_default_subnet_group(ctx, &*self.engine, &region).await;
+
+        let mut store = state.lock();
+
+        // The stored name is the folded form, so the caller's spelling resolves
+        // the group whatever its case; a name that resolves to nothing is the
+        // group's own modelled NotFound fault, before anything is removed.
+        let Some(position) = store.subnet_group_position(&input.cluster_subnet_group_name) else {
+            return Err(
+                DeleteClusterSubnetGroupErrorModeled::ClusterSubnetGroupNotFoundFault(
+                    ClusterSubnetGroupNotFoundFault {
+                        message: Some(st::subnet_group_not_found_message(
+                            st::SubnetGroupNotFoundWording::DoesNotExist,
+                            &input.cluster_subnet_group_name,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        };
+        let name = st::normalized_subnet_group_name(&input.cluster_subnet_group_name);
+
+        // "The cluster subnet group cannot be deleted because it is in use" —
+        // `InvalidClusterSubnetGroupStateFault`'s own documented sentence
+        // (`smithy_query(query="shape",
+        // shape="InvalidClusterSubnetGroupStateFault")`), which is the fixed text
+        // of this refusal. A group a cluster was launched into, or one a
+        // Redshift-managed VPC endpoint was deployed from, is in use by that
+        // resource — and the account's own default group is in use by the
+        // account, which has it before anybody creates one and launches into it
+        // whichever cluster names no group.
+        if name == st::DEFAULT_CLUSTER_SUBNET_GROUP || store.subnet_group_in_use(&name) {
+            return Err(
+                DeleteClusterSubnetGroupErrorModeled::InvalidClusterSubnetGroupStateFault(
+                    InvalidClusterSubnetGroupStateFault {
+                        message: Some(st::SUBNET_GROUP_IN_USE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        store.subnet_groups.remove(position);
+
+        Ok(DeleteClusterSubnetGroupOutput)
     }
 }

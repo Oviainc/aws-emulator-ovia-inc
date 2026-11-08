@@ -4,8 +4,11 @@
 //!
 //! Reports the cluster subnet groups this service's store holds, one page at a
 //! time: all of them by default, or the one a `ClusterSubnetGroupName` names, and
-//! only those the request's tag filters admit. A pure report — it writes nothing,
-//! and a name that names no group is `ClusterSubnetGroupNotFoundFault`.
+//! only those the request's tag filters admit. The account's ambient `default`
+//! group — the one it has over its default VPC's subnets before anybody creates
+//! a group — is among them. A report: it changes nothing a later caller would
+//! not have seen anyway, and a name that names no group is
+//! `ClusterSubnetGroupNotFoundFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -175,7 +178,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        _ctx: &smithy_server_runtime::OperationContext<'_>,
+        ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state as st;
 
@@ -189,9 +192,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
+        let region = st::request_region(ctx);
 
-        // A pure report: nothing here changes what a later caller sees, and a
-        // subnet group has no status the clock owes a transition on.
+        // The account HAS a `default` cluster subnet group before anybody creates
+        // one — over the subnets of its default VPC — so this read must find it
+        // like any other group. Materialising it writes a record owed since the
+        // account existed rather than one this read created, so it changes
+        // nothing a later caller would not have seen anyway; the hop that
+        // resolves those subnets is made with no lock held, and once only.
+        st::materialize_default_subnet_group(ctx, &*self.engine, &region).await;
+
+        // A pure report past here: nothing below changes what a later caller
+        // sees, and a subnet group has no status the clock owes a transition on.
         let store = state.lock();
 
         // Refuse before doing any work: a name that names no group is answered
@@ -206,8 +218,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     DescribeClusterSubnetGroupsErrorModeled::ClusterSubnetGroupNotFoundFault(
                         ClusterSubnetGroupNotFoundFault {
-                            message: Some(format!(
-                                "Cluster subnet group '{requested}' does not exist."
+                            message: Some(st::subnet_group_not_found_message(
+                                st::SubnetGroupNotFoundWording::NotFound,
+                                requested,
                             )),
                         },
                     )

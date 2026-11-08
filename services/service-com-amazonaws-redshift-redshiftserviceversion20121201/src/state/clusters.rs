@@ -177,40 +177,56 @@ pub fn pending_master_user_password(password: Option<&str>) -> PendingModifiedVa
     }
 }
 
-/// The account's DEFAULT cluster subnet group, as a Region's default VPC presents
-/// it: one subnet per Availability Zone of the Region, in the VPC
-/// [`derived_vpc_id`] gives the group's name.
+/// The account's DEFAULT cluster subnet group, over the subnets of the Region's
+/// default VPC as the service that owns them reports them (see
+/// [`default_vpc_subnets`]).
 ///
 /// Amazon Redshift creates every provisioned cluster in a VPC, and an account
 /// that names no subnet group gets the default one (see
 /// [`DEFAULT_CLUSTER_SUBNET_GROUP`]), so this record is what a cluster that named
 /// no group is launched into — and what a `DescribeClusterSubnetGroups` naming
-/// `default` reports. Built by the same helpers
+/// `default` reports. Built by the same builder
 /// `CreateClusterSubnetGroup` builds a caller's group with, so the two records
-/// cannot disagree about a group's shape.
-pub fn default_subnet_group(region: &str) -> ClusterSubnetGroup {
+/// cannot disagree about a group's shape or about where its subnets are.
+pub fn default_subnet_group(subnets: &[ResolvedSubnet]) -> ClusterSubnetGroup {
+    subnet_group_record(
+        DEFAULT_CLUSTER_SUBNET_GROUP,
+        "Default cluster subnet group",
+        subnets,
+        Vec::new(),
+    )
+}
+
+/// The record a cluster subnet group is STORED and reported as: its name, its
+/// description, the VPC its subnets belong to, one [`Subnet`] per subnet it was
+/// made of and the tags it carries.
+///
+/// ONE builder for every path that writes such a record — the create, the
+/// account's ambient default group — so the create path and the read path cannot
+/// report different members for one group, and the network it reports is in
+/// every case the one EC2 answered with: `VpcId` is the VPC that CONTAINS those
+/// subnets ("The VPC ID of the cluster subnet group"), read off their own
+/// records, and never derived from the group's name.
+///
+/// `SubnetGroupStatus` is [`SUBNET_GROUP_STATUS_COMPLETE`]: every subnet of the
+/// list resolved, which is what makes a group complete rather than `Incomplete`
+/// or `Invalid`.
+pub fn subnet_group_record(
+    name: &str,
+    description: &str,
+    subnets: &[ResolvedSubnet],
+    tags: Vec<crate::ops::types::Tag>,
+) -> ClusterSubnetGroup {
     ClusterSubnetGroup {
-        cluster_subnet_group_name: Some(DEFAULT_CLUSTER_SUBNET_GROUP.to_string()),
-        description: Some("Default cluster subnet group".to_string()),
-        vpc_id: Some(derived_vpc_id(DEFAULT_CLUSTER_SUBNET_GROUP)),
+        cluster_subnet_group_name: Some(name.to_string()),
+        description: Some(description.to_string()),
+        // Every subnet of one group belongs to one VPC (`InvalidSubnet` is what
+        // a list spanning two earns), so the group's VPC is the VPC of its
+        // subnets — taken from the first resolved record, not from the name.
+        vpc_id: subnets.first().map(|subnet| subnet.vpc_id.clone()),
         subnet_group_status: Some(SUBNET_GROUP_STATUS_COMPLETE.to_string()),
-        subnets: Some(
-            region_availability_zones(region)
-                .iter()
-                .map(|zone| Subnet {
-                    subnet_identifier: Some(format!(
-                        "subnet-{}",
-                        short_digest(
-                            &format!("subnet/{DEFAULT_CLUSTER_SUBNET_GROUP}/{zone}"),
-                            17
-                        )
-                    )),
-                    subnet_availability_zone: Some(availability_zone(zone)),
-                    subnet_status: Some(SUBNET_STATUS_ACTIVE.to_string()),
-                })
-                .collect(),
-        ),
-        tags: Some(Vec::new()),
+        subnets: Some(subnets.iter().map(subnet_record).collect()),
+        tags: Some(tags),
         supported_cluster_ip_address_types: Some(
             SUPPORTED_CLUSTER_IP_ADDRESS_TYPES
                 .iter()
@@ -220,22 +236,105 @@ pub fn default_subnet_group(region: &str) -> ClusterSubnetGroup {
     }
 }
 
-/// The subnet record a cluster subnet group reports for one of its subnet ids.
+/// The subnet record a cluster subnet group reports for one of its subnets.
 ///
-/// The Availability Zone is derived from the subnet id and the Region the group
-/// was created in, so the same subnet always reports the same zone and a group
-/// spanning several subnets spans the zones they resolve to. This service models
-/// no EC2 subnet inventory, so the id a request names is the id the group holds.
-pub fn subnet_record(subnet_identifier: &str, region: &str) -> Subnet {
-    let zones = region_availability_zones(region);
-    let index = digest_byte(&format!("subnet/{subnet_identifier}")) as usize % zones.len();
+/// `Subnet` is exactly `{SubnetIdentifier, SubnetAvailabilityZone, SubnetStatus}`
+/// (`smithy_query(query="shape", shape="Subnet")`), and the zone is the one EC2
+/// reports that subnet lies in — so a client cross-checking the group against
+/// `ec2:DescribeSubnets` sees one answer. The zone carries its NAME alone on this
+/// path: the platforms a zone supports are not a fact about a subnet, and a
+/// subnet group does not report them.
+pub fn subnet_record(subnet: &ResolvedSubnet) -> Subnet {
     Subnet {
-        subnet_identifier: Some(subnet_identifier.to_string()),
-        // Built by the one helper every `AvailabilityZone` this service emits is
-        // built by, so a subnet's zone reports the same platforms as the same
-        // zone reported anywhere else.
-        subnet_availability_zone: Some(availability_zone(&zones[index])),
+        subnet_identifier: Some(subnet.subnet_id.clone()),
+        subnet_availability_zone: Some(AvailabilityZone {
+            name: Some(subnet.availability_zone.clone()),
+            supported_platforms: None,
+        }),
         subnet_status: Some(SUBNET_STATUS_ACTIVE.to_string()),
+    }
+}
+
+/// Why a `SubnetIds` list whose subnets do not all belong to one VPC is refused.
+///
+/// `smithy_query(query="shape", shape="InvalidSubnet")` — "The requested subnet
+/// is not valid, or not all of the subnets are in the same VPC." The fault's own
+/// documented sentence is the fixed text of the refusal: a cluster subnet group
+/// has ONE `VpcId`, so there is nothing about the request left to say.
+pub const SUBNETS_NOT_IN_ONE_VPC: &str =
+    "The requested subnet is not valid, or not all of the subnets are in the same VPC.";
+
+/// Why a `SubnetIds` list naming no subnet at all is refused, under the same
+/// fault: "You must provide a list of one or more subnets in your existing Amazon
+/// Virtual Private Cloud (Amazon VPC) when creating Amazon Redshift subnet group"
+/// (`smithy_query(query="doc", operation="CreateClusterSubnetGroup")`) — a group
+/// with no subnet covers no Availability Zone, so there is nothing to launch a
+/// cluster into. One sentence for the create and the modify, which take the same
+/// list.
+pub const SUBNET_LIST_IS_EMPTY: &str = "SubnetIds must name at least one subnet of your VPC.";
+
+/// Why a cluster subnet group something was placed in cannot be deleted.
+///
+/// `smithy_query(query="shape", shape="InvalidClusterSubnetGroupStateFault")` —
+/// "The cluster subnet group cannot be deleted because it is in use." The
+/// fault's own documented sentence is the fixed text of the refusal.
+pub const SUBNET_GROUP_IN_USE: &str =
+    "The cluster subnet group cannot be deleted because it is in use.";
+
+/// Why a `SubnetIds` list longer than one group may hold is refused, naming the
+/// allowance it exceeds.
+///
+/// `smithy_query(query="shape", shape="ClusterSubnetQuotaExceededFault")` — "The
+/// request would result in user exceeding the allowed number of subnets in a
+/// cluster subnet groups." One sentence for the create and the modify, which hold
+/// the same list to the same allowance ([`SUBNETS_PER_SUBNET_GROUP_QUOTA`]).
+pub fn subnet_quota_exceeded_message() -> String {
+    format!(
+        "The request would exceed the allowed number of subnets in a cluster subnet group ({SUBNETS_PER_SUBNET_GROUP_QUOTA})."
+    )
+}
+
+/// Which sentence a `ClusterSubnetGroupNotFoundFault` is worded with.
+///
+/// The same split as [`ClusterParameterGroupNotFoundWording`]: the fault's status
+/// (400) and awsQuery code (`ClusterSubnetGroupNotFoundFault`) are what the model
+/// fixes, while the fixed text around the name the request named is an attribute
+/// of the OPERATION. Recorded refusals show both sentences below in use, so
+/// naming each one here keeps the choice at the handler that makes it and no
+/// operation can quietly inherit another one's sentence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubnetGroupNotFoundWording {
+    /// `Cluster Subnet group '<name>' not found.` — what the group LISTING,
+    /// `DescribeClusterSubnetGroups`, answers when its `ClusterSubnetGroupName`
+    /// filter names no group (capital `S` on `Subnet`).
+    NotFound,
+    /// `Cluster subnet group '<name>' does not exist.` — what every operation
+    /// that DEREFERENCES a group answers: the delete whose target is the group
+    /// itself, and the operations configured from one (`CreateCluster`,
+    /// `RestoreFromClusterSnapshot`, `CreateEndpointAccess`).
+    DoesNotExist,
+}
+
+/// How an operation that resolves a `ClusterSubnetGroupName` to nothing says so,
+/// quoting the name as the REQUEST spelled it — the caller has to recognise what
+/// it asked for.
+///
+/// Recorded Amazon Redshift wording for `ClusterSubnetGroupNotFoundFault` ("The
+/// cluster subnet group name does not refer to an existing cluster subnet
+/// group"), per [`SubnetGroupNotFoundWording`]. One function for every path that
+/// raises the fault, so two operations that word it the same way cannot drift
+/// apart.
+pub fn subnet_group_not_found_message(
+    wording: SubnetGroupNotFoundWording,
+    requested: &str,
+) -> String {
+    match wording {
+        SubnetGroupNotFoundWording::NotFound => {
+            format!("Cluster Subnet group '{requested}' not found.")
+        }
+        SubnetGroupNotFoundWording::DoesNotExist => {
+            format!("Cluster subnet group '{requested}' does not exist.")
+        }
     }
 }
 

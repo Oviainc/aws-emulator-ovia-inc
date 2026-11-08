@@ -379,6 +379,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // A restore that names no subnet group is launched into the account's
+        // DEFAULT group, over its default VPC's subnets. Resolving those subnets
+        // is an in-process call into the service that owns them, so it happens
+        // here, before the restore takes the store's lock.
+        crate::state::materialize_default_subnet_group(
+            ctx,
+            &*self.engine,
+            &crate::state::request_region(ctx),
+        )
+        .await;
+
         // The restore holds the store's lock; the event it raises is published
         // once that lock is released, because a publish is an in-process call
         // into another service and must not run under it.
@@ -782,8 +793,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
             .or_else(|| source.and_then(|cluster| cluster.cluster_subnet_group_name.clone()));
         // The account's DEFAULT group exists before anybody creates one, so a
         // restore that names none is launched into it and a request naming
-        // `default` finds it.
-        let default_subnet_group = store.ensure_default_subnet_group(&region);
+        // `default` finds it (materialised by `handle`, before this lock was
+        // taken).
         let subnet_group = match requested_subnet_group.as_deref() {
             Some(requested) => match store.subnet_group(requested) {
                 Some(group) => Some(group.clone()),
@@ -791,8 +802,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
                     return Err(
                         RestoreFromClusterSnapshotErrorModeled::ClusterSubnetGroupNotFoundFault(
                             ClusterSubnetGroupNotFoundFault {
-                                message: Some(format!(
-                                    "Cluster subnet group '{requested}' does not exist."
+                                message: Some(st::subnet_group_not_found_message(
+                                    st::SubnetGroupNotFoundWording::DoesNotExist,
+                                    requested,
                                 )),
                             },
                         )
@@ -800,7 +812,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
                     )
                 }
             },
-            None => Some(default_subnet_group),
+            None => store.default_subnet_group(),
         };
 
         // Where the restored cluster is, decided before the record is built: the

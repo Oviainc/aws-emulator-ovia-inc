@@ -36,6 +36,14 @@ aws-sdk-kms = { version = "1", default-features = false, features = ["rt-tokio",
 # published catalog lists for it, and every subscription scoped to that event is
 # published to on its topic.
 aws-sdk-sns = { version = "1", default-features = false }
+# The EC2 client a cluster subnet group's subnets are resolved through, over the
+# same in-process callback: a subnet, the VPC that contains it and the
+# Availability Zone it lies in are EC2's facts, so `state::ec2_subnets` asks EC2
+# what the account has rather than deriving a network of its own.
+aws-sdk-ec2 = { version = "1", default-features = false }
+# The Region-label grammar the EC2 endpoint a hop addresses is read under, shared
+# by every service that resolves a caller-supplied Region into an endpoint URL.
+service-common = { path = "../common" }
 # The Redshift Serverless client the SERVERLESS arm of a namespace registration
 # change is resolved through, over the same in-process callback: a serverless
 # namespace and its workgroup are resources of that control plane, so whether
@@ -64,6 +72,11 @@ service-com-amazonaws-kms-trentservice = { workspace = true }
 # engine, because a raised Redshift event is published onto the subscription's
 # Amazon SNS topic. Another workspace member this repository already locks.
 service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
+# The subnet-group suites mount Amazon EC2 beside Redshift on one engine, because
+# the subnets a cluster subnet group is made of are ITS resources: a suite mints
+# them there and names them here. Another workspace member this repository
+# already locks.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # The namespace-registration suite mounts the Redshift Serverless control plane
 # beside Redshift on one engine, because the serverless namespace and workgroup a
 # registration change names are ITS resources: the suite creates them there and
