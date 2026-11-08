@@ -84,23 +84,33 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             if let Some(due) = task.running_due_at {
                 if due <= now {
                     task.running_due_at = None;
-                    task.last_status = STATUS_RUNNING.to_string();
-                    task.started_at = Some(DateTime::from(due));
-                    for container in &mut task.containers {
-                        container.advance_to(STATUS_RUNNING);
+                    // The images a task's containers run are fetched where the task is
+                    // placed, and this placement reaches no registry that holds one
+                    // ([`evaluate_image_pulls`]): the containers never start, so Amazon
+                    // ECS stops the task instead of running it, with the stop code for a
+                    // task that failed before it started.
+                    match task.launch_failure.clone() {
+                        Some(reason) => task.fail_launch(&reason, due),
+                        None => {
+                            task.last_status = STATUS_RUNNING.to_string();
+                            task.started_at = Some(DateTime::from(due));
+                            for container in &mut task.containers {
+                                container.advance_to(STATUS_RUNNING);
+                            }
+                            // A task does not run before the interface it was allocated is
+                            // in place, so by this instant Amazon ECS has created and
+                            // attached it: the attachment reports `ATTACHED` and the
+                            // interface's own id, MAC address and private IPv4 address
+                            // ([`AttachmentRecord::attach_allocated_interface`]).
+                            for attachment in &mut task.attachments {
+                                attachment.attach_allocated_interface();
+                            }
+                            // A task that shares the networking of the host that runs it
+                            // is on the network once it has started there.
+                            task.report_connected(due);
+                            task.version += 1;
+                        }
                     }
-                    // A task does not run before the interface it was allocated is in
-                    // place, so by this instant Amazon ECS has created and attached it:
-                    // the attachment reports `ATTACHED` and the interface's own id, MAC
-                    // address and private IPv4 address
-                    // ([`AttachmentRecord::attach_allocated_interface`]).
-                    for attachment in &mut task.attachments {
-                        attachment.attach_allocated_interface();
-                    }
-                    // A task that shares the networking of the host that runs it is on the
-                    // network once it has started there.
-                    task.report_connected(due);
-                    task.version += 1;
                 }
             }
             if let Some(due) = task.stopped_due_at {
@@ -3208,6 +3218,16 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
             // Nothing is on the network before the networking it runs with is in place.
             connectivity: None,
             connectivity_at: None,
+            // The networking the placement runs under, which for a service's task is the
+            // service's own — the placement the image fetch is decided against.
+            awsvpc_configuration: placement
+                .network_configuration
+                .as_ref()
+                .and_then(|configuration| configuration.awsvpc_configuration.clone()),
+            // Whether the images this task's containers run can be fetched from that
+            // placement is the launching call's to decide, with this store's guard
+            // dropped ([`crate::state::evaluate_image_pulls`]).
+            launch_failure: None,
         };
         self.tasks.insert(task_arn, record);
     }

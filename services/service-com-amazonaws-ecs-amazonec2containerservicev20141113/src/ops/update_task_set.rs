@@ -311,6 +311,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what asks for a task set's tags ("If this field is omitted, tags aren't
         // included"), so the updated task set is reported without them.
         let view = guard.task_set_view(&updated, crate::state::TaskSetFields::default());
+        // The image fetch a task this update placed needs is attempted from where the
+        // scheduler placed it: a placement with no path to the registry cannot make it,
+        // which is what settles such a task into STOPPED. Read with OUR guard dropped,
+        // since it takes the Amazon EC2 store's lock
+        // ([`crate::state::evaluate_image_pulls`]).
+        drop(guard);
+        crate::state::evaluate_image_pulls(&*self.engine);
         Ok(UpdateTaskSetOutput {
             task_set: Some(view),
         })

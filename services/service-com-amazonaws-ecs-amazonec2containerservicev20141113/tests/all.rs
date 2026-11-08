@@ -79,6 +79,8 @@ mod exec_task_role_resolution;
 mod express_gateway_services;
 #[path = "all/forced_service_delete_status.rs"]
 mod forced_service_delete_status;
+#[path = "all/image_pull_placement.rs"]
+mod image_pull_placement;
 #[path = "all/inactive_cluster_refusals.rs"]
 mod inactive_cluster_refusals;
 #[path = "all/integer_bound_refusals.rs"]

@@ -23,6 +23,13 @@ service-com-amazonaws-elasticloadbalancingv2-elasticloadbalancing-v10 = { worksp
 # cross-service READ rather than a copy kept here. No cycle: that crate depends on no
 # service crate.
 service-com-amazonaws-servicediscovery-route53autonaming-v20170314 = { workspace = true }
+# The Amazon EC2 service, for ONE read of the Amazon VPC networking a launch placed a task
+# in: whether that placement has a path to the registry the task's images are fetched from,
+# which decides whether the task can be launched at all (`crate::state::evaluate_image_pulls`).
+# The subnets, route tables, NAT gateways and VPC endpoints it reads are that service's own
+# resources, held in its own store in the shared engine, so this is a cross-service READ
+# rather than a copy kept here. No cycle: that crate depends on no service crate.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }

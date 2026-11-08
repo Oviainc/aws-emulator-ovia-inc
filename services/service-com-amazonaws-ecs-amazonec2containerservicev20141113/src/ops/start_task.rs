@@ -538,12 +538,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // place: the interface it was allocated has to be attached first.
                 connectivity: None,
                 connectivity_at: None,
+                // The networking this placement launches the task with — the placement
+                // the image fetch is decided against.
+                awsvpc_configuration: input
+                    .network_configuration
+                    .as_ref()
+                    .and_then(|configuration| configuration.awsvpc_configuration.clone()),
+                // Whether the images the task's containers run can be fetched from that
+                // placement is decided below, with the guard dropped
+                // ([`crate::state::evaluate_image_pulls`]).
+                launch_failure: None,
             };
             // `StartTask` has no `include` member to narrow the response with, so the
             // task it just created is reported with the tags it was created with.
             started.push(record.view(true));
             guard.tasks.insert(task_arn, record);
         }
+
+        // The image fetch each task just placed needs is attempted from where it was
+        // placed: a placement with no path to the registry cannot make it, which is what
+        // settles such a task into STOPPED. Read with OUR guard dropped, since it takes
+        // the Amazon EC2 store's lock ([`crate::state::evaluate_image_pulls`]).
+        drop(guard);
+        crate::state::evaluate_image_pulls(&*self.engine);
 
         Ok(StartTaskOutput {
             tasks: Some(started),

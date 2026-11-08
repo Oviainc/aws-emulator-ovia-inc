@@ -651,6 +651,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             guard.task_set_view(stored, crate::state::TaskSetFields::all()),
             &service.arn,
         );
+        // The image fetch a task this create placed needs is attempted from where the
+        // scheduler placed it: a placement with no path to the registry cannot make it,
+        // which is what settles such a task into STOPPED. Read with OUR guard dropped,
+        // since it takes the Amazon EC2 store's lock
+        // ([`crate::state::evaluate_image_pulls`]).
+        drop(guard);
+        crate::state::evaluate_image_pulls(&*self.engine);
         Ok(CreateTaskSetOutput {
             task_set: Some(view),
         })

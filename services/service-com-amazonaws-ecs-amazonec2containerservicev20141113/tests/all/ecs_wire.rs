@@ -391,3 +391,81 @@ pub(crate) async fn cloud_map(
     );
     parsed
 }
+
+/// A router carrying this service AND the Amazon EC2 service over ONE shared engine — the
+/// two stores the image-fetch rule reads across, mounted the way the production router
+/// mounts them.
+pub(crate) fn emulator_with_ec2() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(
+        service_com_amazonaws_ecs_amazonec2containerservicev20141113::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(
+        service_com_amazonaws_ec2_amazonec2::EmulatedService::new(engine),
+    );
+    router
+}
+
+/// The Amazon EC2 API version an `ec2Query` body carries.
+const EC2_API_VERSION: &str = "2016-11-15";
+
+/// One `ec2Query` call to the Amazon EC2 service, returning the XML body it answered.
+///
+/// EC2 speaks `ec2Query`: an `application/x-www-form-urlencoded` POST whose body carries
+/// `Action=<Operation>`, answered with XML. Every network resource an ECS rule reads is
+/// created through EC2's OWN API, never written into a store by hand.
+pub(crate) async fn ec2(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, &str)],
+    case: &str,
+) -> String {
+    let mut body = format!("Action={action}&Version={EC2_API_VERSION}");
+    for (name, value) in params {
+        body.push('&');
+        body.push_str(name);
+        body.push('=');
+        body.push_str(value);
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://ec2.{SIGNED_REGION}.amazonaws.com/"))
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDECSTEST/20260101/{SIGNED_REGION}\
+                 /ec2/aws4_request, SignedHeaders=host;x-amz-date, Signature=00"
+            ),
+        )
+        .body(bytes::Bytes::from(body))
+        .expect("a well-formed ec2Query request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let payload = String::from_utf8_lossy(response.body()).to_string();
+    assert_eq!(
+        status, 200,
+        "case {case:?}: expected EC2 {action} to answer 200, got {status} with {payload}"
+    );
+    payload
+}
+
+/// The text of the FIRST `<name>` element of an `ec2Query` response — the minted id a
+/// create answers with.
+pub(crate) fn ec2_element(xml: &str, name: &str, case: &str) -> String {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = xml
+        .find(&open)
+        .unwrap_or_else(|| panic!("case {case:?}: no <{name}> in {xml}"))
+        + open.len();
+    let end = xml[start..]
+        .find(&close)
+        .unwrap_or_else(|| panic!("case {case:?}: no </{name}> in {xml}"))
+        + start;
+    xml[start..end].to_string()
+}

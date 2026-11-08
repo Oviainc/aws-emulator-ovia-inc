@@ -139,6 +139,12 @@ pub use validation::*;
 mod task_interfaces;
 pub use task_interfaces::*;
 
+/// Whether a launched task can fetch the images its containers run from where it was
+/// placed — read off the Amazon VPC networking the launch named — and the stop a task that
+/// cannot earns.
+mod image_pull;
+pub use image_pull::*;
+
 /// The Cloud Map instances Amazon ECS registers for the tasks of a service that names a
 /// `serviceRegistries` entry.
 mod service_discovery;
@@ -3427,6 +3433,21 @@ pub struct TaskRecord {
     /// `Task$connectivityAt`: "The Unix timestamp for the time when the task last went
     /// into `CONNECTED` status", and `None` for a task that has not.
     pub connectivity_at: Option<DateTime>,
+    /// The `awsvpc` networking this task was LAUNCHED with
+    /// (`NetworkConfiguration$awsvpcConfiguration`: the subnets its interface is placed
+    /// in and whether it is given a public address), and `None` for a launch that named
+    /// none — a task that shares the networking of the host that runs it.
+    ///
+    /// Kept on the task because it is the placement THIS task runs under: a later update
+    /// of the service that placed it moves the service's configuration, not the networking
+    /// an already-launched task was given. It is what the image fetch is decided against
+    /// ([`TaskLaunch`]).
+    pub awsvpc_configuration: Option<AwsVpcConfiguration>,
+    /// Why the containers of this task cannot be launched where it is placed: the
+    /// `stoppedReason` Amazon ECS stops it with at the instant it would otherwise have
+    /// started ([`TaskRecord::fail_launch`]), and `None` for a task nothing is known to
+    /// block.
+    pub launch_failure: Option<String>,
 }
 
 impl TaskRecord {

@@ -442,10 +442,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // the instance it names was not counted while it was deregistered — so the
             // tasks parked on it are placed from here too.
             guard.place_tasks_awaiting_capacity(&cluster_name, now);
-            return Ok(RegisterContainerInstanceOutput {
-                container_instance: guard
-                    .container_instance_view(&arn, crate::state::ContainerInstanceFields::all()),
-            });
+            let container_instance = guard
+                .container_instance_view(&arn, crate::state::ContainerInstanceFields::all());
+            // A task this registration placed fetches its images from where it was
+            // placed: a placement with no path to the registry cannot make that fetch,
+            // which is what settles such a task into STOPPED. Read with OUR guard
+            // dropped, since it takes the Amazon EC2 store's lock
+            // ([`crate::state::evaluate_image_pulls`]).
+            drop(guard);
+            crate::state::evaluate_image_pulls(&*self.engine);
+            return Ok(RegisterContainerInstanceOutput { container_instance });
         }
 
         if guard.container_instances.len() >= crate::state::MAX_CONTAINER_INSTANCES {
@@ -499,9 +505,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // task is now owed is recorded here and materialised by the clock.
         guard.place_tasks_awaiting_capacity(&registered_into, now);
 
-        Ok(RegisterContainerInstanceOutput {
-            container_instance: guard
-                .container_instance_view(&arn, crate::state::ContainerInstanceFields::all()),
-        })
+        let container_instance =
+            guard.container_instance_view(&arn, crate::state::ContainerInstanceFields::all());
+        // A task this registration placed fetches its images from where it was placed: a
+        // placement with no path to the registry cannot make that fetch, which is what
+        // settles such a task into STOPPED. Read with OUR guard dropped, since it takes
+        // the Amazon EC2 store's lock ([`crate::state::evaluate_image_pulls`]).
+        drop(guard);
+        crate::state::evaluate_image_pulls(&*self.engine);
+
+        Ok(RegisterContainerInstanceOutput { container_instance })
     }
 }

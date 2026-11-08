@@ -1073,6 +1073,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let registrations = guard.cloud_map_registrations();
         drop(guard);
         crate::state::reconcile_cloud_map_instances(&*self.engine, &registrations);
+        // The image fetch a task this create placed needs is attempted from where the
+        // scheduler placed it: a placement with no path to the registry cannot make it,
+        // which is what settles such a task into STOPPED. Read with OUR guard dropped,
+        // since it takes the Amazon EC2 store's lock
+        // ([`crate::state::evaluate_image_pulls`]).
+        crate::state::evaluate_image_pulls(&*self.engine);
         Ok(CreateServiceOutput {
             service: Some(view),
         })
