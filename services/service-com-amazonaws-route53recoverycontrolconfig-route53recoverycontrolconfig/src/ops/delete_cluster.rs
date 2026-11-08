@@ -216,6 +216,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         guard.control_panels.remove(&default_panel_arn);
         guard.clusters.remove(&input.cluster_arn);
+        // A resource policy does not outlive the cluster it was attached to.
+        guard.detach_resource_policy(&input.cluster_arn);
         // Both resources are gone, so the tokens that created them are released too.
         guard.forget_tokens_for(&default_panel_arn);
         guard.forget_tokens_for(&input.cluster_arn);

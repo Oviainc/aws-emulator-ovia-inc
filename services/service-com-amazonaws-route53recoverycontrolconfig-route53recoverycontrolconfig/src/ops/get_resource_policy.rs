@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetResourcePolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetResourcePolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetResourcePolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the resource policy attached to the resource the request's `ResourceArn`
+//! names. A resource that carries no policy is reported with the EMPTY policy document
+//! ([`crate::state::EMPTY_RESOURCE_POLICY`]) rather than with no document: the read
+//! answers for the resource, and an ARN this store holds no resource under is what is
+//! refused with `ResourceNotFoundException` (404).
+//!
+//! A recovery-control resource policy is attached OUTSIDE this API — sharing a cluster
+//! with another account is what creates one — so this read answers from the store alone
+//! ([`crate::state::Store::resource_policy_of`]) and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -66,6 +67,8 @@
 //!   service error. Retry the request.
 //! * `ResourceNotFoundException` (HTTP 404) — 404 response - MalformedQueryString. The query
 //!   string contains a syntax error or resource not found.
+//! * `AccessDeniedException` (HTTP 403) — widened in through `extra_errors` (see below):
+//!   403 response - You do not have sufficient access to perform this action.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -81,9 +84,18 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-route53recoverycontrolc
 // here — hence the `GetResourcePolicyError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.route53recoverycontrolconfig#GetResourcePolicy")]
+//
+// `AccessDeniedException` — a shape this SERVICE models, and one every operation that
+// resolves a caller-supplied ARN declares, though this operation's own `errors` list omits
+// it — is widened in through `extra_errors`, so an ARN of another account is refused with
+// the same 403 the rest of this service answers it with rather than with another status.
+#[smithy_macros::operation_error(
+    "com.amazonaws.route53recoverycontrolconfig#GetResourcePolicy",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum GetResourcePolicyErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
     ResourceNotFoundException(ResourceNotFoundException),
 }
@@ -139,18 +151,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetResourcePolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetResourcePolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetResourcePolicy"))
+        let _ = ctx;
+        // Whether the caller may act on the resource an ARN names is decided from the
+        // request alone, so it is decided BEFORE the ARN is looked up: an ARN of another
+        // account is refused without the answer saying whether a policy is stored there.
+        crate::state::authorize_resource_arn(Self::NAME, &input.resource_arn)
+            .map_err(GetResourcePolicyErrorModeled::AccessDeniedException)?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetResourcePolicyErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the route53-recovery-control-config store is unavailable on this \
+                              engine"
+                        .to_string(),
+                },
+            )
+            .into());
+        };
+
+        // A read: the answer is what the store holds, and nothing about the resource or
+        // its policy changes because it was read.
+        let guard = state.lock();
+        if !guard.holds_resource(&input.resource_arn) {
+            return Err(GetResourcePolicyErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: crate::state::not_found_message(
+                        crate::state::noun_for_arn(&input.resource_arn),
+                        &input.resource_arn,
+                    ),
+                },
+            )
+            .into());
+        }
+
+        // The document the resource carries, or the empty policy document when nothing
+        // has attached one to it.
+        Ok(GetResourcePolicyOutput {
+            policy: Some(
+                guard
+                    .resource_policy_of(&input.resource_arn)
+                    .unwrap_or(crate::state::EMPTY_RESOURCE_POLICY)
+                    .to_string(),
+            ),
+        })
     }
 }

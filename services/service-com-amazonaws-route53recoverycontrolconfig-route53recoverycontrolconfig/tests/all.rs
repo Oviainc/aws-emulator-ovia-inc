@@ -29,6 +29,8 @@ mod recovery_control_lifecycle;
 mod rejection_error_classes;
 #[path = "all/reported_regex.rs"]
 mod reported_regex;
+#[path = "all/resource_policy.rs"]
+mod resource_policy;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/safety_rules.rs"]

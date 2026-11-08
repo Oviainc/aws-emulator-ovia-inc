@@ -508,6 +508,15 @@ pub struct ComAmazonawsRoute53recoverycontrolconfigRoute53recoverycontrolconfigS
     pub routing_controls: BTreeMap<String, RoutingControlRecord>,
     /// Every created safety rule, of either kind, keyed by its ARN.
     pub safety_rules: BTreeMap<String, SafetyRuleRecord>,
+    /// The resource policy attached to a cluster, keyed by that cluster's ARN — what
+    /// `GetResourcePolicy` reports.
+    ///
+    /// A recovery-control resource policy is attached OUTSIDE this API (sharing a
+    /// cluster with another account is what creates one), so no operation of this model
+    /// writes this map: it is written through [`Store::attach_resource_policy`] and read
+    /// through [`Store::resource_policy_of`], and a cluster nothing has attached a policy
+    /// to simply holds no entry here.
+    resource_policies: BTreeMap<String, String>,
     /// `"<Operation>#<ClientToken>"` -> the resource that token created. Held to
     /// [`MAX_IDEMPOTENCY_TOKENS`] by [`Self::remember_token`].
     idempotency: BTreeMap<String, IdempotencyRecord>,
@@ -776,6 +785,53 @@ impl ComAmazonawsRoute53recoverycontrolconfigRoute53recoverycontrolconfigState {
         self.idempotency.len()
     }
 
+    /// Whether this store holds a resource of ANY kind under `arn`.
+    ///
+    /// The one ARN -> record resolution across every kind is [`Self::tags_of`], which the
+    /// tagging operations resolve their `ResourceArn` through; an operation that only
+    /// needs to know whether the resource exists asks here rather than repeating that
+    /// walk.
+    pub fn holds_resource(&self, arn: &str) -> bool {
+        self.tags_of(arn).is_some()
+    }
+
+    /// The resource policy attached to the cluster `arn` names, or `None` when that
+    /// cluster holds none — and `None` for an ARN this store holds no cluster under, so no
+    /// read can report a policy for a resource that is gone.
+    ///
+    /// `GetResourcePolicy` is documented as the policy "for a cluster", so only a cluster
+    /// ARN can resolve to one.
+    pub fn resource_policy_of(&self, arn: &str) -> Option<&str> {
+        if !self.clusters.contains_key(arn) {
+            return None;
+        }
+        self.resource_policies.get(arn).map(String::as_str)
+    }
+
+    /// Attach `policy` to the cluster `cluster_arn` names, replacing whatever it held,
+    /// and answer whether that cluster exists — the write [`Self::resource_policy_of`]
+    /// is the read of.
+    ///
+    /// NOT dead code and not reachable from any operation of this model: a recovery-control
+    /// resource policy is created when a cluster is SHARED with another account, which
+    /// happens outside this API, so this is where such an attachment enters the store (and
+    /// what this crate's tests attach through). The read is the only thing this model
+    /// serves.
+    pub fn attach_resource_policy(&mut self, cluster_arn: &str, policy: &str) -> bool {
+        if !self.clusters.contains_key(cluster_arn) {
+            return false;
+        }
+        self.resource_policies
+            .insert(cluster_arn.to_string(), policy.to_string());
+        true
+    }
+
+    /// Forget the policy attached to the cluster `cluster_arn` names, so a policy does not
+    /// outlive the cluster it was attached to. Called by the delete of a cluster.
+    pub fn detach_resource_policy(&mut self, cluster_arn: &str) {
+        self.resource_policies.remove(cluster_arn);
+    }
+
     /// The tags stored on the resource `arn` names, whatever kind of resource it is, or
     /// `None` when this store holds no resource under that ARN.
     ///
@@ -879,6 +935,14 @@ pub const ROUTING_CONTROL_NOUN: &str = "routing control";
 
 /// The noun a safety rule is named by in a not-found diagnosis.
 pub const SAFETY_RULE_NOUN: &str = "safety rule";
+
+/// The policy document a resource with NO policy attached to it reports.
+///
+/// `GetResourcePolicy` answers such a resource with the empty JSON policy document rather
+/// than with no document at all: the model bounds `__policy` at `length 2..10240`
+/// (`smithy_query(query="operation",operation="GetResourcePolicy")`), and two characters is
+/// exactly this document, the shortest one the member can carry.
+pub const EMPTY_RESOURCE_POLICY: &str = "{}";
 
 /// The noun a resource whose kind the request does not say is named by in a not-found
 /// diagnosis: what the tagging operations' `ResourceArn` is documented as, "the resource

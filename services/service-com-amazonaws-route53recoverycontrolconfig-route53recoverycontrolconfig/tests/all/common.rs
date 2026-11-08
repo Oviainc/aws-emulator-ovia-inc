@@ -22,11 +22,18 @@ pub const REGION: &str = "us-west-2";
 
 /// A router with only this service mounted, over a fresh engine.
 pub fn router() -> MultiServiceRouter {
+    router_with_engine().0
+}
+
+/// The same router, together with the engine it is mounted on — for a suite that has to
+/// reach this service's store directly, because the state it reads is written from
+/// outside this API.
+pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(engine));
-    router
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    (router, engine)
 }
 
 /// An ARN as one path segment or query value: every character an ARN can hold that is
