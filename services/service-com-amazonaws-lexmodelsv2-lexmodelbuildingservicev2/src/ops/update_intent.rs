@@ -306,6 +306,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         intent.dialog_code_hook = input.dialog_code_hook;
         intent.fulfillment_code_hook = input.fulfillment_code_hook;
         intent.intent_confirmation_setting = input.intent_confirmation_setting;
+        if let Some(setting) = intent.intent_confirmation_setting.as_mut() {
+            // The replacement prompt is stored with the same server-side prompt defaults
+            // a create stores, so the two write paths leave the same record behind.
+            crate::state::normalize_intent_confirmation_setting(setting);
+        }
         intent.intent_closing_setting = input.intent_closing_setting;
         intent.input_contexts = input.input_contexts.unwrap_or_default();
         intent.output_contexts = input.output_contexts.unwrap_or_default();

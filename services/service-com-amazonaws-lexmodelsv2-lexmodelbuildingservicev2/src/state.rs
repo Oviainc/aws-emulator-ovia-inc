@@ -24,6 +24,10 @@
 //! a slot is defined inside one intent of one locale of one bot version, so every record
 //! carries those four identifiers and every read is scoped by them.
 //!
+//! A prompt specification is normalized as it is stored — see [`prompt_defaults`] — so
+//! every operation that reports a resource holding one reports the server-side defaults
+//! Amazon Lex materialized onto it.
+//!
 //! The version slice (`CreateBotVersion`, `DescribeBotVersion`) is served out of
 //! `bot_versions`, keyed by the bot and the number the version was created under. A
 //! version is an immutable SNAPSHOT of the version each of its locales was taken from,
@@ -35,6 +39,13 @@
 //! The alias slice (`ListBotAliases`) is served out of `bot_aliases`, keyed by the bot
 //! and the alias id: a bot is created with the alias Amazon Lex keeps for testing it, so
 //! a bot the store holds always has at least that one alias to report.
+
+mod prompt_defaults;
+
+pub use prompt_defaults::{
+    normalize_intent_confirmation_setting, normalize_slot_value_elicitation_setting,
+    normalize_sub_slot_setting,
+};
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime};

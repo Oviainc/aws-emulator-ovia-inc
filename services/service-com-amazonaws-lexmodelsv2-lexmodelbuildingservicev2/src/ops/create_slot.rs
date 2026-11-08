@@ -331,6 +331,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let slot_id = store.mint_slot_id();
+        // Amazon Lex materializes the prompt's server-side defaults onto the prompt
+        // specification it STORES, so the record this create keeps — and therefore what
+        // every later read of the slot reports — carries them. What the request supplied
+        // is left exactly as it supplied it.
+        let mut value_elicitation_setting = input.value_elicitation_setting;
+        crate::state::normalize_slot_value_elicitation_setting(&mut value_elicitation_setting);
+        let mut sub_slot_setting = input.sub_slot_setting;
+        if let Some(setting) = sub_slot_setting.as_mut() {
+            crate::state::normalize_sub_slot_setting(setting);
+        }
         let slot = crate::state::Slot {
             slot_id: slot_id.clone(),
             slot_name: input.slot_name,
@@ -340,10 +350,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             intent_id: input.intent_id,
             description: input.description,
             slot_type_id: input.slot_type_id,
-            value_elicitation_setting: input.value_elicitation_setting,
+            value_elicitation_setting,
             obfuscation_setting: input.obfuscation_setting,
             multiple_values_setting: input.multiple_values_setting,
-            sub_slot_setting: input.sub_slot_setting,
+            sub_slot_setting,
             creation_date_time: now,
             last_updated_date_time: now,
         };

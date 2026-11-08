@@ -35,6 +35,8 @@ mod response_media_type;
 mod service_claim;
 #[path = "all/slot_constraints.rs"]
 mod slot_constraints;
+#[path = "all/slot_prompt_defaults.rs"]
+mod slot_prompt_defaults;
 #[path = "all/slot_type.rs"]
 mod slot_type;
 #[path = "all/slot_type_listing.rs"]

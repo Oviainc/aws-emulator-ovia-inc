@@ -81,6 +81,45 @@ pub(crate) fn slot_body(name: &str, extra: Value) -> Value {
     body
 }
 
+/// Assert `reported` carries every member of the `valueElicitationSetting` that
+/// `request` supplied — including every member of its `promptSpecification` — whatever
+/// the service filled in beside them.
+pub(crate) fn supplied_elicitation_survives(
+    case: &str,
+    request: &Value,
+    reported: &Value,
+    reader: &str,
+) {
+    let supplied = member(request, "valueElicitationSetting");
+    let stored = member(reported, "valueElicitationSetting");
+    for (name, value) in supplied
+        .as_object()
+        .expect("the request's valueElicitationSetting is a JSON object")
+    {
+        if name == "promptSpecification" {
+            let stored_prompt = member(&stored, name);
+            for (prompt_member, prompt_value) in value
+                .as_object()
+                .expect("the request's promptSpecification is a JSON object")
+            {
+                assert_eq!(
+                    &member(&stored_prompt, prompt_member),
+                    prompt_value,
+                    "case {case:?}: {reader} must report the stored \
+                     promptSpecification.{prompt_member}, got {stored_prompt:?}"
+                );
+            }
+            continue;
+        }
+        assert_eq!(
+            &member(&stored, name),
+            value,
+            "case {case:?}: {reader} must report the stored \
+             valueElicitationSetting.{name}, got {stored:?}"
+        );
+    }
+}
+
 /// The `slotSummaries` `ListSlots` reports for one intent, by slot name.
 pub(crate) async fn listed_slot_names(
     router: &MultiServiceRouter,
@@ -264,11 +303,15 @@ async fn a_created_slot_is_stored_and_read_back_through_its_own_intent() {
     .await;
 
     // The members a create reports back and a describe reports again, unchanged.
-    const ECHOED_BY_DESCRIBE: [&str; 6] = [
+    //
+    // `valueElicitationSetting` is deliberately absent: it is reported off the stored
+    // record, which carries the prompt defaults the service materializes onto the prompt
+    // specification it stores, so it is checked with [`supplied_elicitation_survives`]
+    // instead (the defaulting itself is pinned by the `slot_prompt_defaults` suite).
+    const ECHOED_BY_DESCRIBE: [&str; 5] = [
         "slotName",
         "description",
         "slotTypeId",
-        "valueElicitationSetting",
         "obfuscationSetting",
         "multipleValuesSetting",
     ];
@@ -347,6 +390,7 @@ async fn a_created_slot_is_stored_and_read_back_through_its_own_intent() {
                 "case {case:?}: CreateSlot must report the stored {name}, got {answered:?}"
             );
         }
+        supplied_elicitation_survives(case, &request, &answered, "CreateSlot");
         assert_eq!(
             text(&answered, "intentId"),
             intent_id,
@@ -377,6 +421,13 @@ async fn a_created_slot_is_stored_and_read_back_through_its_own_intent() {
                 "case {case:?}: DescribeSlot must report the stored {name}, got {described:?}"
             );
         }
+        supplied_elicitation_survives(case, &request, &described, "DescribeSlot");
+        assert_eq!(
+            member(&described, "valueElicitationSetting"),
+            member(&answered, "valueElicitationSetting"),
+            "case {case:?}: DescribeSlot must report the elicitation setting CreateSlot \
+             stored, got {described:?}"
+        );
         assert_eq!(
             text(&described, "slotId"),
             slot_id,

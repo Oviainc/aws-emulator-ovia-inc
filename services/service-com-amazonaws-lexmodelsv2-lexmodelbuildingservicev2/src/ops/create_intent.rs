@@ -334,6 +334,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let intent_id = store.mint_intent_id();
+        // The prompt the intent asks the user to confirm it with is stored with the
+        // prompt defaults Amazon Lex materializes onto every prompt specification it
+        // keeps, so what a later read of the intent reports is what was stored.
+        let mut intent_confirmation_setting = input.intent_confirmation_setting;
+        if let Some(setting) = intent_confirmation_setting.as_mut() {
+            crate::state::normalize_intent_confirmation_setting(setting);
+        }
         let intent = crate::state::Intent {
             intent_id: intent_id.clone(),
             intent_name: input.intent_name,
@@ -350,7 +357,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             slot_priorities: Vec::new(),
             dialog_code_hook: input.dialog_code_hook,
             fulfillment_code_hook: input.fulfillment_code_hook,
-            intent_confirmation_setting: input.intent_confirmation_setting,
+            intent_confirmation_setting,
             intent_closing_setting: input.intent_closing_setting,
             input_contexts: input.input_contexts.unwrap_or_default(),
             output_contexts: input.output_contexts.unwrap_or_default(),
