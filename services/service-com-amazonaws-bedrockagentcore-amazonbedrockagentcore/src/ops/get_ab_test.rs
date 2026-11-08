@@ -1,15 +1,23 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetABTest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetABTest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the A/B test `CreateABTest` stored, from [`crate::state`]. Reporting only:
+//! it writes nothing.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetABTest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! `status` is read off the clock — the transient status the last create or update put
+//! the test in until that transition falls due, `ACTIVE` afterwards
+//! ([`crate::state::ABTestRecord::status_as_of`]) — and every other member is the one
+//! the create or the last update supplied. An `abTestId` this service holds no test for
+//! is a 404 `ResourceNotFoundException`
+//! ([`crate::state::ab_test_not_found_message`]), which is what a read after
+//! `DeleteABTest` gets.
+//!
+//! Three members are absent from every answer, because nothing in this emulator produces
+//! them: `currentRunId` and `errorDetails` describe a RUN of the test, and `results` are
+//! the statistics an online evaluation of that run computes — no traffic is split and no
+//! evaluator runs here, so no run id, failure or metric is reported for work nothing
+//! performed. `maxDurationExpiresAt` likewise: no member of any A/B-test request sets a
+//! maximum duration, so there is no instant one expires at.
 //!
 //! ## Shape of an operation
 //!
@@ -193,18 +201,49 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetABTest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetABTestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetABTest"))
+        // Request metadata is not read by this operation: the `abTestId` is bound into
+        // `input` by the centralized request walk, and the ARN this reports is the one
+        // minted when the test was created.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetABTestErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the shared engine does not carry this service's state".to_string()),
+            })
+        })?;
+
+        let store = state.lock();
+        let test = store
+            .resolve_ab_test(&input.ab_test_id)
+            .map_err(|message| {
+                GetABTestErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+                    message: Some(message),
+                })
+            })?;
+
+        Ok(GetABTestOutput {
+            ab_test_id: test.ab_test_id.clone(),
+            ab_test_arn: test.ab_test_arn.clone(),
+            name: test.name.clone(),
+            description: test.description.clone(),
+            status: test.status_as_of(::std::time::SystemTime::now()).to_string(),
+            execution_status: test.execution_status.clone(),
+            gateway_arn: test.gateway_arn.clone(),
+            variants: test.variants.clone(),
+            gateway_filter: test.gateway_filter.clone(),
+            evaluation_config: test.evaluation_config.clone(),
+            role_arn: Some(test.role_arn.clone()),
+            // No traffic is split and no evaluator runs in this emulator, so there is
+            // no run to name, no failure to report and no statistic to publish.
+            current_run_id: None,
+            error_details: None,
+            started_at: test.started_at.map(::aws_smithy_types::DateTime::from),
+            stopped_at: test.stopped_at.map(::aws_smithy_types::DateTime::from),
+            // No member of any A/B-test request sets a maximum duration, so no test has
+            // an instant it expires at.
+            max_duration_expires_at: None,
+            created_at: ::aws_smithy_types::DateTime::from(test.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(test.updated_at),
+            results: None,
+        })
     }
 }

@@ -27,13 +27,7 @@
 //!
 //! The engine is held on `self` (constructor-injected), NOT passed per request — so
 //! engine access is guaranteed by the time any request runs. Reach the store through
-//! [`crate::state::service_state`] and read and write it through the guard it hands back:
-//!
-//! ```ignore
-//!     let state = crate::state::service_state(&*self.engine)
-//!         .ok_or(/* a modelled server error */)?;
-//!     state.lock().your_field = /* ... */;
-//! ```
+//! [`crate::state::service_state`] and read and write it through the guard it hands back.
 //!
 //! `ctx` ([`smithy_server_runtime::OperationContext`]) carries request metadata only —
 //! headers, URI, method, and anything middleware placed in `ctx.parts().extensions`.
@@ -248,17 +242,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `VariantList` is modelled exactly two long, and the two are documented as a
         // control and a treatment whose weights are percentages of the gateway's
-        // traffic: anything else is not a split this service can route.
+        // traffic: anything else is not a split this service can route. Both sentences
+        // are the store's, so this operation and `UpdateABTest` word the refusal the
+        // same way.
         if !crate::state::names_one_control_and_one_treatment(&input.variants) {
             return Err(variants_refused(
-                "Variants must be one control variant named C and one treatment variant named T1",
+                &crate::state::variant_pair_required_message(),
             ));
         }
         let weight = crate::state::total_variant_weight(&input.variants);
         if weight != crate::state::TOTAL_VARIANT_WEIGHT {
-            return Err(variants_refused(&format!(
-                "Variant weights must sum to {}, but they sum to {weight}",
-                crate::state::TOTAL_VARIANT_WEIGHT
+            return Err(variants_refused(&crate::state::variant_weight_total_message(
+                weight,
             )));
         }
 

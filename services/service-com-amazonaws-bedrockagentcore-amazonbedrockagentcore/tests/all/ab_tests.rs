@@ -20,131 +20,13 @@
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 use std::collections::BTreeSet;
-use std::sync::Arc;
 use std::time::Duration;
 
 use service_com_amazonaws_bedrockagentcore_amazonbedrockagentcore as agentcore;
 
-/// A gateway whose traffic a test splits, in the form `GatewayArn` publishes as its
-/// pattern (source: smithy_query query="operation" operation="CreateABTest").
-const GATEWAY_ARN: &str =
-    "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/demo-gateway-0a1b2c3d4e";
-/// A second gateway, so a case can show the gateway is reported from the record rather
-/// than from one fixed value.
-const OTHER_GATEWAY_ARN: &str =
-    "arn:aws:bedrock-agentcore:us-east-1:123456789012:gateway/other-gateway-1b2c3d4e5f";
-/// The role the test runs under, in the form `RoleArn` publishes as its pattern.
-const ROLE_ARN: &str = "arn:aws:iam::123456789012:role/AgentCoreABTest";
-/// An online evaluation configuration, in the form `OnlineEvaluationConfigArn` publishes
-/// as its pattern (source: smithy_query query="shape"
-/// shape="ABTestEvaluationConfig").
-const EVALUATION_CONFIG_ARN: &str =
-    "arn:aws:bedrock-agentcore:us-east-1:123456789012:online-evaluation-config/quality-0a1b2c3d4e";
-/// A second evaluation configuration, for the per-variant member of that union.
-const TREATMENT_EVALUATION_CONFIG_ARN: &str =
-    "arn:aws:bedrock-agentcore:us-east-1:123456789012:online-evaluation-config/latency-1b2c3d4e5f";
-/// A configuration bundle a variant can be configured from, in the form
-/// `ConfigurationBundleRef` publishes as its patterns (source: smithy_query
-/// query="shape" shape="ConfigurationBundleRef").
-const BUNDLE_ARN: &str =
-    "arn:aws:bedrock-agentcore:us-east-1:123456789012:configuration-bundle/bundle-0a1b2c3d4e";
-/// A bundle version, which that shape publishes as a UUID pattern.
-const BUNDLE_VERSION: &str = "0a1b2c3d-4e5f-6a7b-8c9d-0e1f2a3b4c5d";
-
-/// The emulator, with request authentication off so a test signs nothing, plus the
-/// shared engine so a case can age a stored test's clock without sleeping.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(agentcore::EmulatedService::new(Arc::clone(&engine)));
-    (router, engine)
-}
-
-/// Send one request and return its status and parsed JSON body (`Value::Null` for an
-/// empty body). The SigV4 credential scope is what routes the request to this service.
-async fn send(
-    router: &MultiServiceRouter,
-    method: &str,
-    path: &str,
-    body: Option<Value>,
-) -> (u16, Value) {
-    let payload = body.map_or_else(bytes::Bytes::new, |v| bytes::Bytes::from(v.to_string()));
-    let request = http::Request::builder()
-        .method(method)
-        .uri(format!("https://bedrock-agentcore.us-east-1.amazonaws.com{path}"))
-        .header(
-            "authorization",
-            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/bedrock-agentcore/aws4_request, \
-             SignedHeaders=host, Signature=0",
-        )
-        .header("content-type", "application/json")
-        .body(payload)
-        .expect("build the request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
-    (status, parsed)
-}
-
-/// `CreateABTest`: `POST /ab-tests`.
-async fn create_ab_test(router: &MultiServiceRouter, body: Value) -> (u16, Value) {
-    send(router, "POST", "/ab-tests", Some(body)).await
-}
-
-/// `ListABTests`: `GET /ab-tests` with `maxResults` / `nextToken` as query parameters.
-async fn list_ab_tests(router: &MultiServiceRouter, query: &str) -> (u16, Value) {
-    let path = if query.is_empty() {
-        "/ab-tests".to_string()
-    } else {
-        format!("/ab-tests?{query}")
-    };
-    send(router, "GET", &path, None).await
-}
-
-fn member<'a>(body: &'a Value, name: &str) -> &'a Value {
-    body.get(name).unwrap_or(&Value::Null)
-}
-
-fn text<'a>(body: &'a Value, name: &str) -> &'a str {
-    member(body, name).as_str().unwrap_or("")
-}
-
-fn error_code(body: &Value) -> &str {
-    body.get("__type").and_then(Value::as_str).unwrap_or("")
-}
-
-/// One variant, as `Variant` models it: the name, its share of the traffic and the
-/// configuration traffic routed to it uses (source: smithy_query query="shape"
-/// shape="Variant,VariantConfiguration").
-fn variant(name: &str, weight: i64, configuration: Value) -> Value {
-    json!({"name": name, "weight": weight, "variantConfiguration": configuration})
-}
-
-/// A variant configured from a gateway target.
-fn target_configuration(target: &str) -> Value {
-    json!({"target": {"name": target}})
-}
-
-/// A variant configured from a version of a configuration bundle.
-fn bundle_configuration() -> Value {
-    json!({"configurationBundle": {"bundleArn": BUNDLE_ARN, "bundleVersion": BUNDLE_VERSION}})
-}
-
-/// The smallest `CreateABTest` request the model admits: every `@required` member and
-/// nothing else, with an even split between the two variants.
-fn minimal_request(name: &str) -> Value {
-    json!({
-        "name": name,
-        "gatewayArn": GATEWAY_ARN,
-        "roleArn": ROLE_ARN,
-        "variants": [
-            variant("C", 50, target_configuration("control")),
-            variant("T1", 50, target_configuration("treatment")),
-        ],
-        "evaluationConfig": {"onlineEvaluationConfigArn": EVALUATION_CONFIG_ARN},
-    })
-}
+// The emulator, the request sender, the four routes of the family, the JSON readers and
+// the fixture ARNs are shared with the lifecycle suite rather than written twice.
+use super::ab_test_support::*;
 
 /// `ABTestId`'s modelled pattern, `^[a-zA-Z][a-zA-Z0-9-_]{0,99}-[a-zA-Z0-9]{10}$`,
 /// checked without a regex dependency: the discriminator is the last ten characters

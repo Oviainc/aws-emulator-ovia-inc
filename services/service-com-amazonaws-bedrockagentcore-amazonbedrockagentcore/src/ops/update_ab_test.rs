@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UpdateABTest
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UpdateABTest`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Applies an update to the A/B test stored in [`crate::state`] and reports it back:
+//! only the members the request carried are changed, the rest are left as they were.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UpdateABTest::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The update puts the test into `UPDATING`; the clock owes it `ACTIVE` one
+//! [`crate::state::AB_TEST_PROVISIONING_SPAN`] later, so a `GetABTest` straight after
+//! an update sees the transient status and the already-applied change, and sees
+//! `ACTIVE` once the transition falls due.
+//!
+//! The refusals, all from the model's own list: an `abTestId` no test is held for is a
+//! 404 `ResourceNotFoundException` ([`crate::state::ab_test_not_found_message`]); a
+//! `variants` list that is not one control and one treatment variant whose weights sum
+//! to 100 is a 400 `ValidationException`, the same two rules the create holds; and a
+//! `name` another test already holds is a 409 `ConflictException`, since an
+//! `ABTestName` is unique within an account.
+//!
+//! `clientToken` is an `@idempotencyToken` on an `@idempotent` operation, so a replayed
+//! token answers with the update it already applied rather than applying it a second
+//! time.
 //!
 //! ## Shape of an operation
 //!
@@ -155,6 +164,52 @@ impl From<UpdateABTestErrorModeled> for UpdateABTestError {
     }
 }
 
+/// This operation's modelled 400 `ValidationException`, for an input the boundary
+/// validator passed and this service still cannot act on.
+///
+/// `reason` is `ValidationExceptionReason`'s `FieldValidationFailed` (source:
+/// smithy_query query="shape" shape="ValidationExceptionReason", values CannotParse |
+/// FieldValidationFailed | IdempotentParameterMismatchException | EventInOtherSession |
+/// ResourceConflict), which is the member-level failure every case here is.
+fn validation(message: String) -> UpdateABTestError {
+    UpdateABTestErrorModeled::ValidationException(ValidationException {
+        message: message.clone(),
+        reason: "FieldValidationFailed".to_string(),
+        field_list: Some(vec![ValidationExceptionField {
+            name: "variants".to_string(),
+            message,
+        }]),
+    })
+    .into()
+}
+
+/// The modelled 404 for an `abTestId` this service holds no test for, worded by the
+/// store so every A/B-test operation reports it in one sentence.
+fn not_found(message: String) -> UpdateABTestError {
+    UpdateABTestErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(message),
+    })
+    .into()
+}
+
+/// This operation's answer about `test`: the identifiers it was created with, the
+/// status it is in at `now`, and the `updatedAt` of the update being reported — the
+/// instant of THIS update, or the instant of the one a replayed `clientToken` already
+/// made.
+fn answer(
+    test: &crate::state::ABTestRecord,
+    updated_at: ::std::time::SystemTime,
+    now: ::std::time::SystemTime,
+) -> UpdateABTestOutput {
+    UpdateABTestOutput {
+        ab_test_id: test.ab_test_id.clone(),
+        ab_test_arn: test.ab_test_arn.clone(),
+        status: test.status_as_of(now).to_string(),
+        execution_status: test.execution_status.clone(),
+        updated_at: ::aws_smithy_types::DateTime::from(updated_at),
+    }
+}
+
 /// The `UpdateABTest` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -191,18 +246,106 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UpdateABTest` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UpdateABTestErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UpdateABTest"))
+        // Request metadata is not read by this operation: every member it needs is
+        // bound into `input` by the centralized request walk, and the ARN it reports is
+        // the one minted when the test was created.
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            UpdateABTestErrorModeled::InternalServerException(InternalServerException {
+                message: Some("the shared engine does not carry this service's state".to_string()),
+            })
+        })?;
+
+        // The same two rules `CreateABTest` holds the variants to, in the store's own
+        // sentences, since an update replaces the split the create set up:
+        // `VariantList` is one control and one treatment variant whose weights are
+        // percentages summing to 100. Checked BEFORE anything is read or replayed, so a
+        // request this service cannot act on is refused whether or not its token has
+        // been seen.
+        if let Some(variants) = input.variants.as_deref() {
+            if !crate::state::names_one_control_and_one_treatment(variants) {
+                return Err(validation(crate::state::variant_pair_required_message()));
+            }
+            let weight = crate::state::total_variant_weight(variants);
+            if weight != crate::state::TOTAL_VARIANT_WEIGHT {
+                return Err(validation(crate::state::variant_weight_total_message(
+                    weight,
+                )));
+            }
+        }
+
+        let mut store = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // What this update has to be checked against, read in ONE lookup before
+        // anything is changed: the test must exist, a replayed token answers with the
+        // update it already made, and a rename is checked against the name the test
+        // holds now.
+        let (replayed, current_name) = {
+            let test = store.resolve_ab_test(&input.ab_test_id).map_err(not_found)?;
+            let replayed = input
+                .client_token
+                .as_deref()
+                .and_then(|token| test.update_tokens.get(token))
+                .map(|updated_at| answer(test, *updated_at, now));
+            (replayed, test.name.clone())
+        };
+
+        // The update this token already made has already been applied, so it is
+        // answered rather than applied a second time — before the conflict check, which
+        // is about taking a name this request may already hold.
+        if let Some(replayed) = replayed {
+            return Ok(replayed);
+        }
+
+        // An `ABTestName` is unique within an account, so a rename onto a name another
+        // test holds is the conflict the model declares; renaming a test to the name it
+        // already has changes nothing and conflicts with nothing.
+        if let Some(renamed) = input.name.as_deref() {
+            if renamed != current_name && store.ab_test_named(renamed).is_some() {
+                return Err(UpdateABTestErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "An A/B test with the name {renamed} already exists"
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        let test = store
+            .resolve_ab_test_mut(&input.ab_test_id)
+            .map_err(not_found)?;
+        // Only the members the request carried are changed: every one of them is
+        // optional on this operation, and an absent member is "not updated" rather
+        // than "cleared".
+        if let Some(name) = input.name {
+            test.name = name;
+        }
+        if let Some(description) = input.description {
+            test.description = Some(description);
+        }
+        if let Some(variants) = input.variants {
+            test.variants = variants;
+        }
+        if let Some(gateway_filter) = input.gateway_filter {
+            test.gateway_filter = Some(gateway_filter);
+        }
+        if let Some(evaluation_config) = input.evaluation_config {
+            test.evaluation_config = evaluation_config;
+        }
+        if let Some(role_arn) = input.role_arn {
+            test.role_arn = role_arn;
+        }
+        if let Some(execution_status) = input.execution_status {
+            test.set_execution_status(execution_status, now);
+        }
+        test.begin_update(now);
+        if let Some(token) = input.client_token {
+            test.remember_update_token(token, now);
+        }
+
+        Ok(answer(test, now, now))
     }
 }
