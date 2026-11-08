@@ -18,9 +18,8 @@
 //!    non-terminal `MERGE_SCHEDULED` status and reaches `MERGE_SUCCESS` once the clock
 //!    has made that merge due, with no call in between;
 //! 3. the pair is linked at most once no matter which side the request addresses: a
-//!    second association of the same pair is refused through EITHER operation — 409
-//!    `ConcurrentModificationException` while the scheduled merge is still owed, 400
-//!    `BadRequestException` once it has been performed;
+//!    second association of the same pair is refused 400 `BadRequestException` through
+//!    EITHER operation, with the service's own duplicate sentence;
 //! 4. an identifier that cannot name an API is a 400 `BadRequestException`, one that
 //!    names no API this account holds a 404 `NotFoundException`, and an API on the
 //!    wrong side of the association a 400.
@@ -252,8 +251,8 @@ async fn an_association_created_from_the_merged_api_side_is_persisted_as_configu
         );
 
         // The pair is linked at most once, so a second association of it has nothing
-        // to create while the scheduled merge is still owed — asked for from THIS side
-        // and from the other one, since both create the same link.
+        // to create — asked for from THIS side and from the other one, since both
+        // create the same link.
         let again = call(
             &router,
             "POST",
@@ -274,21 +273,20 @@ async fn an_association_created_from_the_merged_api_side_is_persisted_as_configu
         ] {
             assert_eq!(
                 (refused.status, refused.error_type.as_str()),
-                (409, "ConcurrentModificationException"),
-                "case {:?}: expected a 409 ConcurrentModificationException for the second \
+                (400, "BadRequestException"),
+                "case {:?}: expected a 400 BadRequestException for the second \
                  association through {side}, got {} {} {:?}",
                 case.label,
                 refused.status,
                 refused.error_type,
                 refused.body
             );
-            // The conflict is scoped to the Merged API whose associations are being
-            // updated, so the refusal names it however the request addressed it.
+            // The refusal states the association that is in the way, whichever side
+            // the request addressed it from.
             assert_eq!(
                 refused.body["message"].as_str(),
-                Some(state::associations_being_updated_message(&merged.id).as_str()),
-                "case {:?}: expected the association-scoped concurrent-modification text from \
-                 {side}, got {:?}",
+                Some("SourceApiAssociation already exists."),
+                "case {:?}: expected the duplicate-association text from {side}, got {:?}",
                 case.label,
                 refused.body["message"]
             );

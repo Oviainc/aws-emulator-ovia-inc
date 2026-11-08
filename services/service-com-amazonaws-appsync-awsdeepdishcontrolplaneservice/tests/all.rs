@@ -79,6 +79,8 @@ mod graphql_api_update;
 mod graphql_types;
 #[path = "all/list_apis.rs"]
 mod list_apis;
+#[path = "all/merged_api_association_topology.rs"]
+mod merged_api_association_topology;
 #[path = "all/merged_api_disassociation.rs"]
 mod merged_api_disassociation;
 #[path = "all/resource_tags.rs"]

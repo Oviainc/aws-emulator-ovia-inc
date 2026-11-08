@@ -1523,9 +1523,9 @@ pub enum AssociationRefusal {
 /// with the association it found is its own business.
 ///
 /// Which SIDE of the pair resolved to nothing is kept apart, because the operations do
-/// not all answer the two the same way: an absent Merged API is a not-found to every
-/// one of them, while an `associationId` that names no association of it is a not-found
-/// to the read and the merge and a BAD REQUEST to `UpdateSourceApiAssociation`.
+/// not all name the refused resource the same way: an absent Merged API carries the
+/// not-found text every operation answers for an API, while an `associationId` that
+/// names no association of it carries the association's own not-found text.
 #[derive(Debug, Clone)]
 pub enum AssociationLookupRefusal {
     /// The request names an identifier that cannot name an API at all:
@@ -1567,9 +1567,12 @@ impl From<AssociationLookupRefusal> for AssociationRefusal {
 ///   named it by, and an identifier that resolves to nothing is a not-found;
 /// * an association links a standard GraphQL API (the source) to a Merged API, so an
 ///   API on the wrong side of it is a bad request;
-/// * a source API is linked to a Merged API at most once, so a pair that is already
-///   associated leaves the call nothing to create: 409 while the existing
-///   association's merge is still owed, 400 once it has been performed;
+/// * a source API is linked to a Merged API at most once and to ONE Merged API, so a
+///   pair that is already associated leaves the call nothing to create (400, the
+///   service's own fixed [`ASSOCIATION_EXISTS_MESSAGE`]) and a source API already
+///   associated with another Merged API cannot take a second one (400,
+///   [`SOURCE_API_ALREADY_MERGED_MESSAGE`]) — both decided from the association state
+///   alone, never from what the clock still owes;
 /// * the association's `associationId` is drawn from the state's own counter and its
 ///   ARN sits under the Merged API, and creating it SCHEDULES the merge — so it is
 ///   stored in the non-terminal [`MERGE_SCHEDULED`] status with the due instant the
@@ -1635,15 +1638,25 @@ pub fn create_source_api_association(
         )));
     }
 
-    if let Some(existing) = state.association_for_pair(&merged_api_id, &source_api_id) {
-        if existing.modification_pending() {
-            return Err(AssociationRefusal::ConcurrentModification(
-                associations_being_updated_message(&merged_api_id),
-            ));
-        }
-        return Err(AssociationRefusal::BadRequest(format!(
-            "Source API {source_api_id} is already associated with Merged API {merged_api_id}"
-        )));
+    // The pair is already linked, so there is nothing left to create. A duplicate is a
+    // permanent property of the REQUEST, so it is decided before anything the clock
+    // still owes on the existing association is consulted: a caller that repeats a
+    // duplicate request must not be told to retry.
+    if state
+        .association_for_pair(&merged_api_id, &source_api_id)
+        .is_some()
+    {
+        return Err(AssociationRefusal::BadRequest(
+            ASSOCIATION_EXISTS_MESSAGE.to_string(),
+        ));
+    }
+
+    // A source API belongs to ONE Merged API: it is already a side of an association
+    // with another Merged API, so this one cannot be created either.
+    if state.association_of_source_api(&source_api_id).is_some() {
+        return Err(AssociationRefusal::BadRequest(
+            SOURCE_API_ALREADY_MERGED_MESSAGE.to_string(),
+        ));
     }
 
     // The id is drawn from the state's own counter, never from the request, so
@@ -1872,7 +1885,33 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
         })
     }
 
-    /// The association `association_id` names OF the Merged API `merged_api_identifier`
+    /// The association the source API `source_api_id` already takes part in, or `None`
+    /// when it is associated with no Merged API.
+    ///
+    /// A source API belongs to one Merged API, so this is the whole merged-API
+    /// membership of a source API: the link that makes a second one impossible.
+    pub fn association_of_source_api(
+        &self,
+        source_api_id: &str,
+    ) -> Option<&SourceApiAssociationRecord> {
+        self.source_api_associations
+            .values()
+            .find(|association| association.source_api_id == source_api_id)
+    }
+
+    /// Whether the API `api_id` is the SOURCE side of an association that is not being
+    /// torn down, i.e. whether it is still a source API of a Merged API.
+    ///
+    /// An association whose deletion the clock already owes is on its way out, so it no
+    /// longer holds the source API: a caller that has asked for the disassociation is
+    /// free to delete the API without waiting for the deletion to come due.
+    pub fn is_source_api_of_a_merged_api(&self, api_id: &str) -> bool {
+        self.source_api_associations
+            .values()
+            .any(|association| association.source_api_id == api_id && !association.deletion_pending())
+    }
+
+
     /// addresses, or the refusal the pair meets.
     ///
     /// The rule every operation that addresses one association by that pair follows, in
@@ -1880,11 +1919,14 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
     ///
     /// * an identifier that is neither an API id nor an ARN names no API at all, so the
     ///   request is malformed rather than pointed at a missing resource;
+    /// * an `associationId` that is not a reference the service itself could have issued
+    ///   ([`is_association_id`]) is likewise malformed, and names the rejected id
+    ///   ([`invalid_association_id_message`]);
     /// * the Merged API is resolved in either identifier form, and one that resolves to
     ///   nothing is a not-found;
-    /// * an `associationId` names an association OF the Merged API addressed, so one
-    ///   that belongs to another Merged API — or to none — resolves to nothing under
-    ///   this one, which each operation answers in its own way
+    /// * a well-formed `associationId` names an association OF the Merged API addressed,
+    ///   so one that belongs to another Merged API — or to none — resolves to nothing
+    ///   under this one, which each operation answers in its own way
     ///   ([`AssociationLookupRefusal`]).
     pub fn resolve_association(
         &self,
@@ -1895,6 +1937,12 @@ impl ComAmazonawsAppsyncAwsdeepdishcontrolplaneserviceState {
             return Err(AssociationLookupRefusal::BadRequest(invalid_api_id_message(
                 merged_api_identifier,
             )));
+        }
+
+        if !is_association_id(association_id) {
+            return Err(AssociationLookupRefusal::BadRequest(
+                invalid_association_id_message(association_id),
+            ));
         }
 
         let merged = api_by_identifier(&self.graphql_apis, merged_api_identifier).ok_or_else(
@@ -2402,18 +2450,55 @@ pub const INVALID_PAGINATION_TOKEN_MESSAGE: &str = "Invalid pagination token giv
 /// pair by the same rule.
 pub const ASSOCIATION_NOT_FOUND_MESSAGE: &str = "No source API association was found";
 
+/// The text `BadRequestException` (HTTP 400) carries for a create that names a pair this
+/// account already holds an association for.
+///
+/// AppSync's own fixed sentence for the duplicate: it states the resource that is in the
+/// way and names nothing of the request, so it has no variable part to fill. Shared by
+/// both association creates, which create ONE and the same link.
+pub const ASSOCIATION_EXISTS_MESSAGE: &str = "SourceApiAssociation already exists.";
+
+/// The text `BadRequestException` (HTTP 400) carries for a create that would give a
+/// source API a SECOND Merged API.
+///
+/// A source API is merged into one Merged API, so the topology the request asks for
+/// cannot exist. AppSync's own fixed sentence, naming neither API of the request.
+pub const SOURCE_API_ALREADY_MERGED_MESSAGE: &str =
+    "Source Api can not be associated with multiple Merged APIs.";
+
+/// The text `BadRequestException` (HTTP 400) carries for a `DeleteGraphqlApi` naming an
+/// API that is still a source API of a Merged API.
+///
+/// An association names two APIs and cannot outlive either, so AppSync refuses to leave
+/// a Merged API pointing at a source API that is gone: the source API has to be
+/// disassociated first. The sentence is fixed and names neither API.
+pub const API_ASSOCIATED_TO_MERGED_API_MESSAGE: &str =
+    "API can not be deleted as it is associated to a Merged API";
+
 /// Whether `candidate` is a recognizable source-API association reference, i.e. whether
 /// it could be an `associationId` the AppSync service generated.
 ///
 /// An `associationId` is "the ID generated by the AppSync service for the source API
-/// association" (`DisassociateSourceGraphqlApiRequest$associationId`) — one of the
-/// service's own opaque ids ([`is_opaque_id`]), never a value a caller chose. A value of
-/// another shape therefore references nothing the service could have issued, which is a
-/// defect of the REQUEST rather than an association this account no longer holds; a
-/// well-formed one is a reference the service could have issued, so a request carrying it
-/// is well formed whether or not the association is still there.
+/// association" (`DisassociateSourceGraphqlApiRequest$associationId`), never a value a
+/// caller chose, and AppSync generates it as a UUID in the canonical hyphenated form.
+/// A value of neither that form nor the opaque form this service's own id counter mints
+/// ([`is_opaque_id`]) references nothing the service could have issued, which is a defect
+/// of the REQUEST rather than an association this account no longer holds; a well-formed
+/// one is a reference the service could have issued, so a request carrying it is well
+/// formed whether or not the association is still there, and the absent association is
+/// then reported as the missing resource it is ([`ASSOCIATION_NOT_FOUND_MESSAGE`]).
 pub fn is_association_id(candidate: &str) -> bool {
-    is_opaque_id(candidate)
+    is_uuid(candidate) || is_opaque_id(candidate)
+}
+
+/// Whether `candidate` is a UUID written in the canonical hyphenated lowercase form,
+/// i.e. the form the AppSync service's generated identifiers take on the wire.
+///
+/// Parsed by the `uuid` crate rather than by a hand-rolled scan, and compared back
+/// against the canonical rendering so only that one spelling of a UUID is accepted.
+fn is_uuid(candidate: &str) -> bool {
+    ::uuid::Uuid::parse_str(candidate)
+        .is_ok_and(|parsed| parsed.hyphenated().to_string() == candidate)
 }
 
 /// AppSync's refusal text for an `associationId` that resolves to no association of the

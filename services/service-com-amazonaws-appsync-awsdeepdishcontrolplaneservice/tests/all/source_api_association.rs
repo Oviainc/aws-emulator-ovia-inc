@@ -18,9 +18,9 @@
 //!    has made that merge due — with no call in between, and with a merge date that
 //!    does not move on a later read;
 //! 3. a source API is linked to a Merged API at most once: a second association of the
-//!    same pair is refused — 409 `ConcurrentModificationException` while the scheduled
-//!    merge is still owed, 400 `BadRequestException` once it has been performed — so
-//!    racing callers leave exactly one winner and one association;
+//!    same pair is refused 400 `BadRequestException` with the service's own duplicate
+//!    sentence, whatever the clock still owes on the existing association — so racing
+//!    callers leave exactly one winner and one association;
 //! 4. an identifier that cannot name an API is a 400 `BadRequestException`, one that
 //!    names no API this account holds (or an association under the wrong Merged API) a
 //!    404 `NotFoundException`, and an API on the wrong side of the association a 400.
@@ -377,8 +377,8 @@ async fn an_association_is_persisted_as_the_request_configured_it() {
             case.label, read.body["sourceApiAssociation"]
         );
 
-        // A second association of the same pair has nothing to create while the
-        // scheduled merge is still owed.
+        // A second association of the same pair has nothing to create: the pair is
+        // already associated, whatever the clock still owes on that association.
         let again = call(
             &router,
             "POST",
@@ -388,20 +388,20 @@ async fn an_association_is_persisted_as_the_request_configured_it() {
         .await;
         assert_eq!(
             (again.status, again.error_type.as_str()),
-            (409, "ConcurrentModificationException"),
-            "case {:?}: expected a 409 ConcurrentModificationException for the second \
+            (400, "BadRequestException"),
+            "case {:?}: expected a 400 BadRequestException for the second \
              association, got {} {} {:?}",
             case.label,
             again.status,
             again.error_type,
             again.body
         );
-        // The conflict is scoped to the Merged API whose associations are being
-        // updated, so the refusal names it.
+        // The refusal states the association that is in the way and names nothing of
+        // the request.
         assert_eq!(
             again.body["message"].as_str(),
-            Some(state::associations_being_updated_message(&merged.id).as_str()),
-            "case {:?}: expected the association-scoped concurrent-modification text, got {:?}",
+            Some("SourceApiAssociation already exists."),
+            "case {:?}: expected the duplicate-association text, got {:?}",
             case.label,
             again.body["message"]
         );
@@ -474,8 +474,8 @@ async fn the_scheduled_merge_is_owed_by_the_clock_alone() {
         reread.body["sourceApiAssociation"]
     );
 
-    // The pair is associated and no modification is in progress any more, so a
-    // further association of it is simply a bad request.
+    // The pair is associated, so a further association of it is a bad request naming
+    // the association that already exists.
     let again = call(
         &router,
         "POST",
@@ -529,8 +529,8 @@ async fn racing_callers_leave_exactly_one_association() {
     for loser in answers.iter().filter(|answer| answer.status != 200) {
         assert_eq!(
             (loser.status, loser.error_type.as_str()),
-            (409, "ConcurrentModificationException"),
-            "case race: expected every loser to be a 409 ConcurrentModificationException, got \
+            (400, "BadRequestException"),
+            "case race: expected every loser to be a 400 BadRequestException, got \
              {} {} {:?}",
             loser.status,
             loser.error_type,
@@ -538,8 +538,8 @@ async fn racing_callers_leave_exactly_one_association() {
         );
         assert_eq!(
             loser.body["message"].as_str(),
-            Some(state::associations_being_updated_message(&merged.id).as_str()),
-            "case race: expected the association-scoped concurrent-modification text, got {:?}",
+            Some("SourceApiAssociation already exists."),
+            "case race: expected the duplicate-association text, got {:?}",
             loser.body["message"]
         );
     }

@@ -9,9 +9,9 @@
 //! Merged API, so the association is reported in the non-terminal `MERGE_SCHEDULED`
 //! status and the clock owes its move to `MERGE_SUCCESS` one
 //! [`crate::state::MERGE_SPAN`] later. A source API is linked to a Merged API at most
-//! once, so a second association of the same pair is refused: with
-//! `ConcurrentModificationException` while that merge is still owed, and with
-//! `BadRequestException` once it has been performed.
+//! once and to ONE Merged API, so a second association of the same pair and an
+//! association of a source API that already has a Merged API are both refused with
+//! `BadRequestException`.
 //!
 //! AppSync creates ONE link from either side, so the rule itself lives in
 //! [`crate::state::create_source_api_association`], which `AssociateSourceGraphqlApi`

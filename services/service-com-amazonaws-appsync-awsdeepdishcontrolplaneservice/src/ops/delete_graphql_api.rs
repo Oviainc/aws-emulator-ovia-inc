@@ -5,6 +5,14 @@
 //! held under it) from [`crate::state`]. This is the ONLY file to touch for this
 //! operation.
 //!
+//! An association names two APIs and cannot outlive either, so an API that is still a
+//! SOURCE API of a Merged API cannot be deleted: the call is refused 400
+//! `BadRequestException` (`crate::state::API_ASSOCIATED_TO_MERGED_API_MESSAGE`) until
+//! the association is disassociated. A deletion the clock already owes on an
+//! association no longer holds its source API, so a caller that has asked for the
+//! disassociation can delete the API straight away; the Merged API side is deleted with
+//! its links, which go with it.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -165,12 +173,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `ListApiKeys` on the same id answers `NotFoundException` too. An association
         // names two APIs, so the links this API was a side of go with it.
         let mut guard = state.lock();
-        if guard.graphql_apis.remove(&input.api_id).is_none() {
+        // Decide against the association state of THIS instant: an association whose
+        // deletion the clock has already made due holds nothing any more.
+        guard.settle_associations(std::time::SystemTime::now());
+        if !guard.graphql_apis.contains_key(&input.api_id) {
             return Err(DeleteGraphqlApiErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
             })
             .into());
         }
+
+        // An association cannot outlive either side, and AppSync will not leave a
+        // Merged API pointing at a source API that is gone: while this API is still a
+        // source API of a Merged API, the deletion is refused and the caller is left to
+        // disassociate it first.
+        if guard.is_source_api_of_a_merged_api(&input.api_id) {
+            return Err(DeleteGraphqlApiErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::API_ASSOCIATED_TO_MERGED_API_MESSAGE.to_string()),
+                ..Default::default()
+            })
+            .into());
+        }
+
+        guard.graphql_apis.remove(&input.api_id);
         guard.remove_api_associations(&input.api_id);
 
         Ok(DeleteGraphqlApiOutput {})

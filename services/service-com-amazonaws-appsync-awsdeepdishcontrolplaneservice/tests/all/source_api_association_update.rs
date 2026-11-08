@@ -16,12 +16,15 @@
 //!    `MergeType` values, a config object without a `mergeType`, no config at all,
 //!    `description` present, empty, non-ASCII and absent, and associations that were
 //!    created with and without either choice;
-//! 2. an `associationId` that resolves to no association of the addressed Merged API is
-//!    refused 400 `BadRequestException` naming the rejected id, an identifier that
-//!    cannot name an API at all 400, and a Merged API this account does not hold 404 —
-//!    over a table spanning an id never minted, one in another form entirely, a real
-//!    association addressed under another Merged API and under a standard one, an
-//!    over-long identifier and an API id nothing holds. A refused update writes nothing;
+//! 2. an `associationId` that is not a reference the service could have issued is
+//!    refused 400 `BadRequestException` naming the rejected id, while a well-formed one
+//!    that resolves to no association of the addressed Merged API is the absent
+//!    association it is — 404 `NotFoundException` with the fixed text; an identifier that
+//!    cannot name an API at all is a 400, and a Merged API this account does not hold a
+//!    404 — over a table spanning an id never minted in either issued form, a reference
+//!    of no issued form at all, a real association addressed under another Merged API and
+//!    under a standard one, an over-long identifier and an API id nothing holds. A
+//!    refused update writes nothing;
 //! 3. the update configures the association and nothing else: it neither performs nor
 //!    cancels the merge the clock owes, so that merge still comes due with no further
 //!    call, and an association whose DELETION the clock owes is being destroyed, so an
@@ -446,7 +449,8 @@ async fn an_update_of_an_association_being_deleted_is_refused() {
     );
 
     // The refusal left the deletion where it was, so the clock still carries it out —
-    // and the association the update could not configure stops existing.
+    // and the association the update could not configure stops existing, which the next
+    // update of the same reference reports as the absent association it now is.
     tokio::time::sleep(state::DELETION_SPAN + PAST_THE_MERGE).await;
     let gone = call(
         &router,
@@ -457,12 +461,18 @@ async fn an_update_of_an_association_being_deleted_is_refused() {
     .await;
     assert_eq!(
         (gone.status, gone.error_type.as_str()),
-        (400, "BadRequestException"),
-        "case deleted: expected a 400 BadRequestException once the deletion came due, got {} {} \
+        (404, "NotFoundException"),
+        "case deleted: expected a 404 NotFoundException once the deletion came due, got {} {} \
          {:?}",
         gone.status,
         gone.error_type,
         gone.body
+    );
+    assert_eq!(
+        gone.body["message"].as_str(),
+        Some(state::ASSOCIATION_NOT_FOUND_MESSAGE),
+        "case deleted: expected the fixed not-found text, got {:?}",
+        gone.body["message"]
     );
 }
 
@@ -483,49 +493,56 @@ struct Refusal {
 }
 
 /// Every way an update can name no association: an `associationId` that was never
-/// minted — in this service's own id form and in another form entirely — and a real
-/// association addressed under the wrong Merged API, whether another Merged API or a
-/// standard one, each a BAD REQUEST naming the rejected id; an identifier that can name
-/// no API at all, also a bad request; and a Merged API this account does not hold, which
-/// is the absent resource every operation reports as one.
+/// minted — in each form the service issues one in — and a real association addressed
+/// under the wrong Merged API, whether another Merged API or a standard one, each the
+/// absent association it is; a reference of no issued form at all, which is a bad
+/// request naming the rejected value; an identifier that can name no API at all, also a
+/// bad request; and a Merged API this account does not hold, which is the absent
+/// resource every operation reports as one.
 ///
 /// The over-long identifier is one character past the 26 an AppSync API id has
 /// (`state::API_ID_LEN`), the bound `state::is_api_id` publishes.
 fn refusals() -> Vec<Refusal> {
     vec![
         Refusal {
-            label: "association id never minted",
+            label: "association id never minted, opaque form",
             merged_api_identifier: "{merged}",
             association_id: "abcdefghijklmnopqrstuvwxyz",
-            status: 400,
-            error_type: "BadRequestException",
-            message: Some("Invalid SourceApi Association ID abcdefghijklmnopqrstuvwxyz"),
+            status: 404,
+            error_type: "NotFoundException",
+            message: Some("No source API association was found"),
         },
         Refusal {
-            label: "association id in another form entirely",
+            label: "association id never minted, uuid form",
             merged_api_identifier: "{merged}",
             association_id: "3f1b9c7e-5a24-4d8f-9b61-0c2e7d84af53",
+            status: 404,
+            error_type: "NotFoundException",
+            message: Some("No source API association was found"),
+        },
+        Refusal {
+            label: "association id of no form the service issues",
+            merged_api_identifier: "{merged}",
+            association_id: "assoc-does-not-exist-1234",
             status: 400,
             error_type: "BadRequestException",
-            message: Some(
-                "Invalid SourceApi Association ID 3f1b9c7e-5a24-4d8f-9b61-0c2e7d84af53",
-            ),
+            message: Some("Invalid SourceApi Association ID assoc-does-not-exist-1234"),
         },
         Refusal {
             label: "a real association under another merged api",
             merged_api_identifier: "{other}",
             association_id: "{association}",
-            status: 400,
-            error_type: "BadRequestException",
-            message: Some("Invalid SourceApi Association ID {association}"),
+            status: 404,
+            error_type: "NotFoundException",
+            message: Some("No source API association was found"),
         },
         Refusal {
             label: "a real association under a standard api",
             merged_api_identifier: "{graphql}",
             association_id: "{association}",
-            status: 400,
-            error_type: "BadRequestException",
-            message: Some("Invalid SourceApi Association ID {association}"),
+            status: 404,
+            error_type: "NotFoundException",
+            message: Some("No source API association was found"),
         },
         Refusal {
             label: "merged identifier too long to be one",

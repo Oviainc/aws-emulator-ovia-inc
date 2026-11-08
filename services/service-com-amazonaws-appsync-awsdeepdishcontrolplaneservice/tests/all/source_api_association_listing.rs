@@ -114,9 +114,9 @@ async fn associate(
 }
 
 /// The association graph rule 1 is asserted over: a Merged API holding three source
-/// APIs, a source API associated with two Merged APIs, a Merged API and a source API in
-/// no association at all, both sides a link can be created from, and `description`
-/// present and absent.
+/// APIs, a second Merged API holding one of its own (a source API belongs to ONE Merged
+/// API, so no source API appears twice), a Merged API and a source API in no association
+/// at all, both sides a link can be created from, and `description` present and absent.
 fn links() -> Vec<Link> {
     vec![
         Link {
@@ -138,10 +138,10 @@ fn links() -> Vec<Link> {
             description: Some("troisième — déjà associée"),
         },
         Link {
-            source: 0,
+            source: 3,
             merged: 1,
             from_the_source_side: false,
-            description: Some("the same source API, a second Merged API"),
+            description: Some("a source API of its own, under a second Merged API"),
         },
     ]
 }
@@ -244,7 +244,7 @@ async fn list_ids(
 #[tokio::test]
 async fn a_listing_reports_every_association_of_the_api_it_addresses() {
     let router = router();
-    let (sources, mergeds) = create_apis(&router, "graph", 4, 3).await;
+    let (sources, mergeds) = create_apis(&router, "graph", 5, 3).await;
 
     let links = links();
     let mut created: Vec<Created> = Vec::new();

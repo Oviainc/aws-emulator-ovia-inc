@@ -14,10 +14,12 @@
 //! 2. a modification of a Merged API's source-API associations that is still in
 //!    progress refuses the next one 409 `ConcurrentModificationException` whose message
 //!    names THAT Merged API — asserted over every association operation that can meet
-//!    the conflict (`AssociateMergedGraphqlApi`, `AssociateSourceGraphqlApi`,
-//!    `StartSchemaMerge`, `UpdateSourceApiAssociation`), over both kinds of modification
-//!    the clock can still owe (a scheduled merge, a scheduled deletion), and with the
-//!    contended Merged API named by either identifier form.
+//!    the conflict (`StartSchemaMerge`, `UpdateSourceApiAssociation`), with the
+//!    contended Merged API named by either identifier form;
+//! 3. a create that finds the pair already associated is refused 400
+//!    `BadRequestException` with the duplicate sentence — never the retryable conflict —
+//!    whatever the clock still owes on the association it found, and the association it
+//!    found is left where it was.
 //!
 //! Every row drives the router the production emulator mounts, through the harness the
 //! Merged-API-side suite carries, so routing, restJson1 (de)serialization, the handlers
@@ -227,108 +229,58 @@ async fn an_api_on_the_wrong_side_is_refused_by_the_type_that_side_requires() {
     }
 }
 
-/// Which modification the clock still owes when a row makes its conflicting call.
-#[derive(Debug, Clone, Copy)]
-enum Owed {
-    /// The merge the create scheduled.
-    Merge,
-    /// The deletion a disassociate scheduled.
-    Deletion,
-}
-
 /// Which association operation a row makes its conflicting call through.
+///
+/// Every row runs into the same modification: the deletion a disassociate scheduled,
+/// which leaves the association modifiable by nobody until it comes due.
+///
+/// The two creates are NOT here: a pair that is already associated leaves a create
+/// nothing to do whatever the clock still owes, so it answers the duplicate refusal
+/// rather than a conflict (asserted in
+/// `a_duplicate_association_is_a_bad_request_rather_than_a_conflict`).
 #[derive(Debug, Clone, Copy)]
 enum Conflicting {
-    /// `AssociateMergedGraphqlApi`: the Merged API is a body member, so this row also
-    /// carries the identifier FORM it names it by.
-    AssociateFromSource(Form),
-    /// `AssociateSourceGraphqlApi`.
-    AssociateFromMerged,
     /// `StartSchemaMerge`.
     StartMerge,
     /// `UpdateSourceApiAssociation`.
     Update,
 }
 
-/// One row of the conflict table: what the clock still owes, and which operation runs
-/// into it.
+/// One row of the conflict table: which operation runs into the modification the clock
+/// still owes.
 #[derive(Debug)]
 struct ConflictCase {
     label: &'static str,
-    owed: Owed,
     through: Conflicting,
 }
 
 /// The conflict table: every operation that can meet a modification of a Merged API's
-/// associations already in progress, against both kinds of modification the clock can
-/// still owe, with the contended Merged API named by either identifier form.
+/// associations already in progress, with the contended Merged API named by either
+/// identifier form.
 ///
-/// The two associates meet it while the scheduled MERGE is owed (a second association
-/// of the pair) and while a scheduled DELETION is; the merge and the update meet it
-/// while the deletion is, a merge or an update being what the scheduled merge already
-/// is or configures.
+/// The merge and the update meet it while the scheduled DELETION is owed, a merge or an
+/// update being what the scheduled merge already is or configures.
 fn conflict_cases() -> Vec<ConflictCase> {
     vec![
         ConflictCase {
-            label: "second associate from the source side while the merge is owed",
-            owed: Owed::Merge,
-            through: Conflicting::AssociateFromSource(Form::Id),
-        },
-        ConflictCase {
-            label: "second associate naming the merged api by arn while the merge is owed",
-            owed: Owed::Merge,
-            through: Conflicting::AssociateFromSource(Form::Arn),
-        },
-        ConflictCase {
-            label: "second associate from the merged side while the merge is owed",
-            owed: Owed::Merge,
-            through: Conflicting::AssociateFromMerged,
-        },
-        ConflictCase {
-            label: "associate while the deletion is owed",
-            owed: Owed::Deletion,
-            through: Conflicting::AssociateFromSource(Form::Id),
-        },
-        ConflictCase {
             label: "merge while the deletion is owed",
-            owed: Owed::Deletion,
             through: Conflicting::StartMerge,
         },
         ConflictCase {
             label: "update while the deletion is owed",
-            owed: Owed::Deletion,
             through: Conflicting::Update,
         },
     ]
 }
 
-/// Make `case`'s conflicting call against the pair and association given.
+/// Make `case`'s conflicting call against the association given.
 async fn conflicting_call(
     router: &MultiServiceRouter,
     case: &ConflictCase,
-    source: &Api,
     merged: &Api,
     association_id: &str,
 ) -> Answer {
     match case.through {
-        Conflicting::AssociateFromSource(form) => {
-            call(
-                router,
-                "POST",
-                &from_the_source_side(&source.id),
-                Some(json!({"mergedApiIdentifier": form.of(merged)})),
-            )
-            .await
-        }
-        Conflicting::AssociateFromMerged => {
-            call(
-                router,
-                "POST",
-                &from_the_merged_side(&merged.id),
-                Some(json!({"sourceApiIdentifier": source.id})),
-            )
-            .await
-        }
         Conflicting::StartMerge => {
             call(router, "POST", &merge_path(&merged.id, association_id), None).await
         }
@@ -370,22 +322,22 @@ async fn a_conflict_on_an_association_names_the_merged_api_it_is_scoped_to() {
             .unwrap_or_default()
             .to_string();
 
-        if matches!(case.owed, Owed::Deletion) {
-            let deleted = call(
-                &router,
-                "DELETE",
-                &association_path(&merged.id, &association_id),
-                None,
-            )
-            .await;
-            assert_eq!(
-                deleted.status, 200,
-                "case {:?}: expected the deletion to be scheduled, got {} {:?}",
-                case.label, deleted.status, deleted.body
-            );
-        }
+        // The deletion the row's conflicting call runs into: scheduled, not performed,
+        // so the clock still owes it while that call is made.
+        let deleted = call(
+            &router,
+            "DELETE",
+            &association_path(&merged.id, &association_id),
+            None,
+        )
+        .await;
+        assert_eq!(
+            deleted.status, 200,
+            "case {:?}: expected the deletion to be scheduled, got {} {:?}",
+            case.label, deleted.status, deleted.body
+        );
 
-        let refused = conflicting_call(&router, &case, &source, &merged, &association_id).await;
+        let refused = conflicting_call(&router, &case, &merged, &association_id).await;
         assert_eq!(
             (refused.status, refused.error_type.as_str()),
             (409, "ConcurrentModificationException"),
@@ -421,10 +373,12 @@ async fn a_conflict_on_an_association_names_the_merged_api_it_is_scoped_to() {
     }
 }
 
-/// A refusal that is NOT a conflict keeps its own text, so the conflict message is not
-/// simply what every association refusal answers.
+/// A create that finds the pair already associated is the DUPLICATE it is rather than a
+/// conflict, whatever the clock still owes on the existing association: the refusal is
+/// asserted both while the scheduled merge is owed and once it has been performed, so a
+/// permanently duplicate request is never answered with a retryable signal.
 #[tokio::test]
-async fn a_pair_whose_merge_is_done_is_a_bad_request_rather_than_a_conflict() {
+async fn a_duplicate_association_is_a_bad_request_rather_than_a_conflict() {
     let router = router();
     let (source, merged) = create_pair(&router, "settled").await;
     let created = call(
@@ -440,41 +394,44 @@ async fn a_pair_whose_merge_is_done_is_a_bad_request_rather_than_a_conflict() {
         created.status, created.body
     );
 
-    // Nothing is owed any more once the clock has made the scheduled merge due.
-    tokio::time::sleep(state::MERGE_SPAN + std::time::Duration::from_millis(250)).await;
-
-    let again = call(
-        &router,
-        "POST",
-        &from_the_source_side(&source.id),
-        Some(json!({"mergedApiIdentifier": merged.id})),
-    )
-    .await;
-    assert_eq!(
-        (again.status, again.error_type.as_str()),
-        (400, "BadRequestException"),
-        "case settled: expected a 400 BadRequestException once the merge is done, got {} {} {:?}",
-        again.status,
-        again.error_type,
-        again.body
-    );
-    let message: &str = again.body["message"].as_str().unwrap_or_default();
-    assert_ne!(
-        message,
-        state::associations_being_updated_message(&merged.id),
-        "case settled: expected the duplicate-association text rather than the conflict one, \
-         got {message:?}"
-    );
-    assert!(
-        message.contains(&merged.id) && message.contains(&source.id),
-        "case settled: expected the refusal to name both sides of the pair, got {message:?}"
-    );
+    // Twice: once while the create's own scheduled merge is still owed, and once past
+    // the instant the clock made it due.
+    for case in ["while the merge is owed", "once the merge is done"] {
+        if case == "once the merge is done" {
+            tokio::time::sleep(state::MERGE_SPAN + std::time::Duration::from_millis(250)).await;
+        }
+        let again = call(
+            &router,
+            "POST",
+            &from_the_source_side(&source.id),
+            Some(json!({"mergedApiIdentifier": merged.id})),
+        )
+        .await;
+        assert_eq!(
+            (again.status, again.error_type.as_str()),
+            (400, "BadRequestException"),
+            "case {case:?}: expected a 400 BadRequestException for the duplicate, got {} {} {:?}",
+            again.status,
+            again.error_type,
+            again.body
+        );
+        let message: &str = again.body["message"].as_str().unwrap_or_default();
+        assert_eq!(
+            message, "SourceApiAssociation already exists.",
+            "case {case:?}: expected the duplicate-association text, got {message:?}"
+        );
+        assert!(
+            !message.contains(&merged.id) && !message.contains(&source.id),
+            "case {case:?}: expected the duplicate refusal to name neither API of the request, \
+             got {message:?}"
+        );
+    }
 }
 
-/// The Merged API the conflict names is the one the association is stored under, so a
-/// listing of that API reports exactly the association the refusal was scoped to.
+/// The duplicate refusal leaves the association it found where it was, so a listing of
+/// the Merged API still reports exactly the one association.
 #[tokio::test]
-async fn the_conflict_names_the_merged_api_the_association_is_stored_under() {
+async fn a_refused_duplicate_leaves_the_one_association_it_found() {
     let router = router();
     let (source, merged) = create_pair(&router, "stored-under").await;
     let created = call(
@@ -490,6 +447,8 @@ async fn the_conflict_names_the_merged_api_the_association_is_stored_under() {
         created.status, created.body
     );
 
+    // The same pair, named by the other accepted identifier form: one association
+    // either way, so the duplicate is recognised whichever form the request used.
     let refused = call(
         &router,
         "POST",
@@ -498,9 +457,17 @@ async fn the_conflict_names_the_merged_api_the_association_is_stored_under() {
     )
     .await;
     assert_eq!(
+        (refused.status, refused.error_type.as_str()),
+        (400, "BadRequestException"),
+        "case stored-under: expected a 400 BadRequestException, got {} {} {:?}",
+        refused.status,
+        refused.error_type,
+        refused.body
+    );
+    assert_eq!(
         refused.body["message"].as_str(),
-        Some(state::associations_being_updated_message(&merged.id).as_str()),
-        "case stored-under: expected the conflict to name the Merged API, got {:?}",
+        Some("SourceApiAssociation already exists."),
+        "case stored-under: expected the duplicate-association text, got {:?}",
         refused.body["message"]
     );
 
@@ -512,14 +479,13 @@ async fn the_conflict_names_the_merged_api_the_association_is_stored_under() {
     assert_eq!(
         summaries.len(),
         1,
-        "case stored-under: expected the one association the conflict was scoped to, got \
+        "case stored-under: expected the one association the duplicate was refused against, got \
          {summaries:?}"
     );
     assert_eq!(
         summaries[0]["mergedApiId"].as_str(),
         Some(merged.id.as_str()),
-        "case stored-under: expected the stored association to name the Merged API the \
-         conflict did, got {:?}",
+        "case stored-under: expected the stored association to name the Merged API, got {:?}",
         summaries[0]
     );
 }

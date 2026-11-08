@@ -26,6 +26,9 @@ url = "2"
 # Parses a caller-supplied GraphQL type definition (SDL), which `CreateType` and
 # `UpdateType` carry.
 apollo-parser = "0.8"
+# Parses an `associationId` to decide whether it has the UUID form the AppSync service
+# issues its source-API association references in.
+uuid = "1"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -13,10 +13,11 @@
 //! owes is neither performed nor re-scheduled here, so the status, its detail and the
 //! merge date are left where the clock put them.
 //!
-//! An `associationId` that resolves to no association of the addressed Merged API is a
-//! MALFORMED request to this operation: it is refused 400 `BadRequestException` naming
-//! the rejected id (`crate::state::invalid_association_id_message`), where the read and
-//! the merge report the absent association as a 404.
+//! An `associationId` that is not a reference the service could have issued is a
+//! MALFORMED request: it is refused 400 `BadRequestException` naming the rejected id
+//! (`crate::state::invalid_association_id_message`). A well-formed one that names no
+//! association of the addressed Merged API is the absent association it is — 404
+//! `NotFoundException` with the fixed text, exactly as the read and the merge report it.
 //!
 //! ## Shape of an operation
 //!
@@ -190,23 +191,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Which association the pair names, by the rule the read follows too. The id is
         // the STORED record's key, so the write below reaches the record the lookup
-        // resolved.
-        //
-        // An `associationId` that resolves to no association of the Merged API
-        // addressed is a MALFORMED request to this operation rather than an absent
-        // resource: the refusal is a 400 naming the rejected id
-        // (`crate::state::invalid_association_id_message`), while an absent Merged API
-        // stays the not-found every operation answers for one.
+        // resolved. Every refusal the lookup can meet is answered exactly as the read
+        // answers it: a reference the service could not have issued is a malformed
+        // request, and a well-formed one that names no association of the Merged API
+        // addressed is the absent association it is.
         let association_id =
             match guard.resolve_association(&input.merged_api_identifier, &input.association_id) {
                 Ok(association) => association.association_id.clone(),
-                Err(crate::state::AssociationLookupRefusal::AssociationNotFound(
-                    association_id,
-                )) => {
-                    return Err(refuse(crate::state::AssociationRefusal::BadRequest(
-                        crate::state::invalid_association_id_message(&association_id),
-                    )))
-                }
                 Err(refusal) => return Err(refuse(refusal.into())),
             };
 
@@ -246,8 +237,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// the pair lookup's, and the update's own.
 ///
 /// Each variant keeps the status the model gives its shape and carries the rule's own
-/// text: the bad request this operation builds for an unresolvable `associationId`
-/// names that id, while a not-found names no identifier at all.
+/// text: the bad request names the reference that was refused, while a not-found names
+/// no identifier at all.
 fn refuse(refusal: crate::state::AssociationRefusal) -> UpdateSourceApiAssociationError {
     match refusal {
         crate::state::AssociationRefusal::BadRequest(message) => {
