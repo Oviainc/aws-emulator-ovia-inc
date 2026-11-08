@@ -63,6 +63,15 @@ const BRANCH_NULL_WHEN_EMPTY: &[&str] = &[
 /// (`AppProjection::reported` / `BranchProjection::reported`).
 const REPORTED_ONLY_MEMBER: &str = "tags";
 
+/// The members a write does not ECHO: `basicAuthCredentials` is `@sensitive`
+/// (`smithy_query(query="shape",shape="BasicAuthCredentials")`), and what the service
+/// reports for it is a non-reversible reference to the credential it kept rather than the
+/// credential the request sent — so a supplied value reads back as something that is
+/// neither empty nor the submitted value. What the reference IS is pinned by
+/// `tests/all/hosted_site_access_control.rs`; here the rule is only that it is not an
+/// echo.
+const NEVER_ECHOED_MEMBERS: &[&str] = &["basicAuthCredentials"];
+
 /// Is `value` the empty value of its type — what the projection reports as `null`?
 fn is_empty_value(value: &Value) -> bool {
     match value {
@@ -134,7 +143,11 @@ fn base_app_request() -> Value {
         "enableBranchAutoDeletion": true,
         "enableBasicAuth": true,
         "basicAuthCredentials": "dXNlcjpwYXNz",
-        "customHeaders": "customHeaders:\n  - pattern: '**'\n",
+        // The custom-header document in the form the API REPORTS it (the rules as JSON),
+        // which is a document it also reads — so what a reader is answered with is what
+        // was submitted. A document written as YAML is reported as the equivalent JSON,
+        // which `tests/all/hosted_site_custom_headers.rs` pins.
+        "customHeaders": "[{\"pattern\":\"**/*\",\"headers\":[{\"key\":\"X-Base\",\"value\":\"1\"}]}]",
         "buildSpec": "version: 1\n",
         "cacheConfig": { "type": "AMPLIFY_MANAGED" },
         "jobConfig": { "buildComputeType": "STANDARD_8GB" },
@@ -187,6 +200,19 @@ fn assert_update_applied(
                 !after.contains_key(member),
                 "case {label:?}: `{member}` is not stored, so the record must not carry it, \
                  got {:?}",
+                after.get(member)
+            );
+            continue;
+        }
+        if NEVER_ECHOED_MEMBERS.contains(&member.as_str()) {
+            let reported = after.get(member).and_then(Value::as_str).unwrap_or_default();
+            let submitted = supplied.as_str().unwrap_or_default();
+            assert!(
+                !reported.is_empty()
+                    && reported != submitted
+                    && !reported.contains(submitted),
+                "case {label:?}: `{member}` must be reported as a reference to the \
+                 credential rather than as the submitted {submitted:?}, got {:?}",
                 after.get(member)
             );
             continue;
@@ -307,7 +333,7 @@ fn app_update_cases() -> Vec<(&'static str, Value)> {
                     { "source": "/<*>", "target": "/index.html", "status": "404-200" },
                     { "source": "/old", "target": "/new" },
                 ],
-                "customHeaders": "customHeaders:\n  - pattern: '/*'\n",
+                "customHeaders": "[{\"pattern\":\"/*\",\"headers\":[]}]",
                 "buildSpec": "version: 2\n",
             }),
         ),

@@ -23,6 +23,7 @@
 //!    nothing has deployed to serves nothing, and a visit straight after
 //!    `StartDeployment` still sees the site as it was.
 
+use std::collections::BTreeMap;
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -48,6 +49,19 @@ pub(crate) struct Visited {
     pub(crate) content_type: Option<String>,
     pub(crate) body: Vec<u8>,
     pub(crate) location: Option<String>,
+    /// Every header the answer carried, by lowercased name — what a suite asserting a
+    /// challenge or a configured custom header reads.
+    headers: BTreeMap<String, String>,
+}
+
+impl Visited {
+    /// The value of one answered header, by name (compared case-insensitively, as a
+    /// header name is).
+    pub(crate) fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .get(&name.to_ascii_lowercase())
+            .map(String::as_str)
+    }
 }
 
 /// A deployed branch: the emulator, the app and branch it was created on, and the host
@@ -101,13 +115,39 @@ impl Hosted {
     /// Visit `path` on `host` exactly as a browser does: the method and the URL, and no
     /// credential of any kind.
     pub(crate) async fn visit_host(&self, method: &str, host: &str, path: &str) -> Visited {
-        let request = http::Request::builder()
+        self.visit_with(method, host, path, &[]).await
+    }
+
+    /// The same visit carrying `headers` — what a browser sends once it has been
+    /// challenged for the site's basic-authorization credentials.
+    pub(crate) async fn visit_with(
+        &self,
+        method: &str,
+        host: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> Visited {
+        let mut request = http::Request::builder()
             .method(method)
             .uri(format!("https://{host}{path}"))
-            .header("host", host)
+            .header("host", host);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        let request = request
             .body(bytes::Bytes::new())
             .expect("a site URL is well formed");
         let response = self.emulator.dispatch(request).await;
+        let headers = response
+            .headers()
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|value| (name.as_str().to_ascii_lowercase(), value.to_string()))
+            })
+            .collect();
         Visited {
             status: response.status().as_u16(),
             content_type: response
@@ -120,6 +160,7 @@ impl Hosted {
                 .get("location")
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_string),
+            headers,
             body: response.into_body().to_vec(),
         }
     }

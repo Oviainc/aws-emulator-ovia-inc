@@ -137,7 +137,11 @@ fn app_projection_cases() -> Vec<AppProjectionCase> {
                 "enableAutoBranchCreation": true,
                 "enableBranchAutoDeletion": true,
                 "autoBranchCreationPatterns": ["feature/*"],
-                "customHeaders": "customHeaders:\n  - pattern: '**'\n",
+                // `customHeaders` carries a DOCUMENT, which the service parses: what it
+                // reports is the rule list it read, as JSON, whatever notation the
+                // request wrote it in (here YAML). `customRules` is a modelled LIST and
+                // is echoed element for element.
+                "customHeaders": "[{\"pattern\":\"**\",\"headers\":[]}]",
                 "customRules": [{ "source": "/old", "target": "/new", "status": "301" }],
                 "cacheConfig": { "type": "AMPLIFY_MANAGED_NO_COOKIES" },
                 "jobConfig": { "buildComputeType": "STANDARD_8GB" },

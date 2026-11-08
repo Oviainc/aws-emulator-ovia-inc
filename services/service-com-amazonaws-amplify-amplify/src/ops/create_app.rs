@@ -241,6 +241,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // Three members of the request are INGESTED rather than stored as sent, each by
+        // the one reader of its member in this crate:
+        //
+        // * the basic-authorization credentials for this app's branches, of which only a
+        //   verifier is kept — the record reports the reference every reader is answered
+        //   with, never the credentials the request sent (`BasicAuthCredentials` is
+        //   `@sensitive`; see `crate::state::basic_auth`);
+        // * the same `@sensitive` member inside the auto-branch-creation configuration;
+        // * the custom-header document, which is a DOCUMENT: the rules it declares are
+        //   parsed here, once, and the record reports them re-serialized as JSON (see
+        //   `crate::state::custom_headers`).
+        //
+        // The document is read — and a document declaring more rules than one app may
+        // carry refused — BEFORE anything is minted or stored, so a refused create leaves
+        // the store exactly as it was, exactly like the rewrite-rule bound above.
+        let (reported_headers, header_rules) =
+            match crate::state::ingest_custom_headers(input.custom_headers) {
+                crate::state::IngestedCustomHeaders::TooManyRules(supplied) => {
+                    return Err(CreateAppErrorModeled::LimitExceededException(
+                        LimitExceededException {
+                            message: Some(crate::state::custom_header_rules_limit_message(
+                                &input.name,
+                                supplied,
+                            )),
+                        },
+                    )
+                    .into())
+                }
+                crate::state::IngestedCustomHeaders::Declared { document, rules } => {
+                    (document, rules)
+                }
+                // The record always carries the member: an app created without a document
+                // carries the empty one, which declares no rule.
+                crate::state::IngestedCustomHeaders::Unsupplied => (String::new(), Vec::new()),
+            };
+        let mut kept_credentials = None;
+        let reported_credentials =
+            crate::state::ingest_basic_auth(&mut kept_credentials, input.basic_auth_credentials);
+        let mut auto_branch_creation_config = input.auto_branch_creation_config;
+        crate::state::ingest_auto_branch_basic_auth(&mut auto_branch_creation_config);
+
         let app_id = store.mint_app_id();
 
         let app = App {
@@ -272,7 +313,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `false`, never nothing at all.
             enable_branch_auto_deletion: Some(input.enable_branch_auto_deletion.unwrap_or(false)),
             enable_basic_auth: input.enable_basic_auth.unwrap_or(false),
-            basic_auth_credentials: input.basic_auth_credentials,
+            basic_auth_credentials: reported_credentials,
             // The redirect/rewrite rules and the custom header document are
             // collections the app always has: empty until a request supplies one.
             custom_rules: Some(input.custom_rules.unwrap_or_default()),
@@ -280,10 +321,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // has no branches at all.
             production_branch: None,
             build_spec: input.build_spec,
-            custom_headers: Some(input.custom_headers.unwrap_or_default()),
+            custom_headers: Some(reported_headers),
             enable_auto_branch_creation: Some(input.enable_auto_branch_creation.unwrap_or(false)),
             auto_branch_creation_patterns: input.auto_branch_creation_patterns,
-            auto_branch_creation_config: input.auto_branch_creation_config,
+            auto_branch_creation_config,
             // `repositoryCloneMethod` is documented "for internal use": Amplify sets
             // it from the credential kind it used to reach the repository, and this
             // emulator reaches no repository.
@@ -306,9 +347,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `accessToken` / `oauthToken` are deliberately NOT persisted: both members
         // document "The token is not stored.", and neither appears on `App`.
-        store
-            .apps
-            .insert(app.app_id.clone(), crate::state::AmplifyApp::new(app.clone()));
+        store.apps.insert(
+            app.app_id.clone(),
+            crate::state::AmplifyApp::created(app.clone(), kept_credentials, header_rules),
+        );
 
         Ok(CreateAppOutput {
             app: AppProjection::written(app),

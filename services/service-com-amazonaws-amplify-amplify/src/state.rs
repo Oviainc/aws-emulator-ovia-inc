@@ -19,9 +19,27 @@
 //! branch's.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::sync::Arc;
 
 use crate::ops::types::{
     App, BackendEnvironment, Branch, CustomRule, DomainAssociation, Job, Step, Webhook,
+};
+
+/// The access control an app configures on its branches: what a configured
+/// basic-authorization credential is kept and reported as, and how the hosting edge
+/// verifies the one a visitor presents.
+pub mod basic_auth;
+/// The custom HTTP headers an app configures: the document a caller submits, the rules it
+/// declares, and the headers those rules add to a response the hosting edge serves.
+pub mod custom_headers;
+
+pub use basic_auth::{
+    ingest_auto_branch_basic_auth, ingest_basic_auth, presented_credentials, BasicAuthCredentials,
+};
+pub use custom_headers::{
+    custom_header_rules, custom_header_rules_limit_message, custom_headers_document,
+    ingest_custom_headers, matched_headers, CustomHeaderRule, IngestedCustomHeaders,
+    MAX_CUSTOM_HEADER_RULES_PER_APP,
 };
 
 /// One Amplify app as this service persists it: the modelled record it hands back,
@@ -61,17 +79,47 @@ pub struct AmplifyApp {
     /// the app rather than in a store-wide map: the same environment name created on
     /// two apps is two records, and neither app's reader can reach the other's.
     pub backend_environments: BTreeMap<String, BackendEnvironment>,
+    /// The basic-authorization credential configured for this app's branches
+    /// (`App$basicAuthCredentials`), as the only thing this service keeps of one: a
+    /// verifier, never the credential itself (see [`basic_auth`]). `App$basicAuthCredentials`
+    /// itself reports the reference every reader is answered with.
+    pub basic_auth: Option<BasicAuthCredentials>,
+    /// The custom-header rules this app's `customHeaders` document declares, parsed at
+    /// the write that supplied the document (see [`custom_headers`]).
+    ///
+    /// Held beside the record because the record reports the DOCUMENT while the hosting
+    /// edge resolves a request against the RULES: parsing once at the write keeps the two
+    /// in step and keeps a visit from re-reading a document per request. SHARED, so a
+    /// visit can take the list out of the store's critical section without copying a rule
+    /// and match it against the request path with the lock released.
+    pub custom_header_rules: Arc<[CustomHeaderRule]>,
 }
 
 impl AmplifyApp {
     /// A newly created app with no branches, webhooks, domains or backend environments.
     pub fn new(app: App) -> Self {
+        Self::created(app, None, Vec::new())
+    }
+
+    /// A newly created app carrying what its create INGESTED: the verifier for the
+    /// basic-authorization credentials the request supplied, and the rules its
+    /// custom-header document declared.
+    ///
+    /// The record and the two parsed halves are set in ONE place, so an app cannot end up
+    /// reporting a credential or a header rule it does not hold.
+    pub fn created(
+        app: App,
+        basic_auth: Option<BasicAuthCredentials>,
+        custom_header_rules: Vec<CustomHeaderRule>,
+    ) -> Self {
         Self {
             app,
             branches: BTreeMap::new(),
             domains: BTreeMap::new(),
             webhooks: BTreeMap::new(),
             backend_environments: BTreeMap::new(),
+            basic_auth,
+            custom_header_rules: custom_header_rules.into(),
         }
     }
 }
@@ -134,6 +182,13 @@ pub struct AmplifyBranch {
     /// when the call that started it answers, so the files wait here until the clock
     /// has settled that job — which [`Self::settle`] materialises.
     pub staged_site: Option<StagedSite>,
+    /// The basic-authorization credential configured on this branch
+    /// (`Branch$basicAuthCredentials`), as the only thing this service keeps of one: a
+    /// verifier, never the credential itself (see [`basic_auth`]).
+    ///
+    /// This is what the hosting edge checks an `Authorization: Basic` header against;
+    /// `Branch$basicAuthCredentials` reports the reference every reader is answered with.
+    pub basic_auth: Option<BasicAuthCredentials>,
 }
 
 /// The files one started deployment publishes, and the job whose settling publishes
@@ -149,6 +204,15 @@ pub struct StagedSite {
 impl AmplifyBranch {
     /// A newly created branch, which has never been built and so holds no jobs.
     pub fn new(branch: Branch) -> Self {
+        Self::created(branch, None)
+    }
+
+    /// A newly created branch carrying the access control its create configured: the
+    /// verifier for the basic-authorization credentials the request supplied, if any.
+    ///
+    /// The record and the verifier are set in ONE place, so a branch cannot end up
+    /// reporting a credential it does not hold (or holding one it does not report).
+    pub fn created(branch: Branch, basic_auth: Option<BasicAuthCredentials>) -> Self {
         Self {
             branch,
             deployments: BTreeMap::new(),
@@ -157,6 +221,7 @@ impl AmplifyBranch {
             started_jobs: 0,
             site: BTreeMap::new(),
             staged_site: None,
+            basic_auth,
         }
     }
 
@@ -1453,10 +1518,20 @@ impl ComAmazonawsAmplifyAmplifyState {
     ///
     /// `&mut` on the branch because serving a request REPORTS on it, and reporting
     /// materialises what the clock already owes it ([`AmplifyBranch::settle`]) — never
-    /// anything else. The resolution happens HERE, where the rules and the files both
-    /// live, so a visit copies neither: the rules are configured on the APP
-    /// (`App$customRules`) and applied by the edge of each of its branches.
-    pub fn hosted_visit(&mut self, host: &str, path: &str) -> Option<HostedAnswer> {
+    /// anything else. The resolution happens HERE, where the access control, the rules
+    /// and the files all live, so a visit copies none of them: both the access control
+    /// (`App$enableBasicAuth` "enables basic authorization for the Amplify app's
+    /// branches") and the rules are configured on the APP as well as on the branch, and
+    /// applied by the edge of each of its branches.
+    ///
+    /// `presented` is the `user:password` pair the request's `Authorization: Basic`
+    /// header carried, which is what the branch's access control is verified against.
+    pub fn hosted_visit(
+        &mut self,
+        host: &str,
+        path: &str,
+        presented: Option<&[u8]>,
+    ) -> Option<HostedVisit> {
         let host = hosted_site_host(host);
         self.apps.values_mut().find_map(|app| {
             let domain = app.app.default_domain.to_ascii_lowercase();
@@ -1469,9 +1544,22 @@ impl ComAmazonawsAmplifyAmplifyState {
             // is read, so a visitor sees the deployment that has finished rather than
             // the one before it.
             app.branches.get_mut(&hosted)?.settle();
-            let rules = app.app.custom_rules.as_deref().unwrap_or_default();
             let branch = app.branches.get(&hosted)?;
-            Some(resolve_hosted_request(rules, &branch.site, path))
+            // Access control comes FIRST: a protected site tells an unauthenticated
+            // visitor nothing about what it carries, not even whether a path exists.
+            if !site_is_open_to(app, branch, presented) {
+                return Some(HostedVisit::unauthorized());
+            }
+            let rules = app.app.custom_rules.as_deref().unwrap_or_default();
+            Some(HostedVisit {
+                answer: resolve_hosted_request(rules, &branch.site, path),
+                // The header rules are handed BACK rather than resolved here: matching
+                // them against the path is bounded work on caller text
+                // ([`matched_headers`]), and it happens after this lock is released, so
+                // no other caller of this service waits on it. The list is shared, so
+                // handing it over copies no rule.
+                header_rules: Arc::clone(&app.custom_header_rules),
+            })
         })
     }
 
@@ -1791,6 +1879,54 @@ pub fn custom_rule_status(status: Option<&str>) -> Option<CustomRuleStatus> {
     }
 }
 
+/// What a hosting edge answers one request with, once the branch's access control, the
+/// app's rules and the branch's published files have all been consulted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostedVisit {
+    /// What answers the request.
+    pub answer: HostedAnswer,
+    /// The app's custom-header rules, which the edge resolves against the request path
+    /// ([`matched_headers`]) once the store's lock is released.
+    pub header_rules: Arc<[CustomHeaderRule]>,
+}
+
+impl HostedVisit {
+    /// The visit of a site whose access control this request did not satisfy: nothing
+    /// about the site is answered, and none of its configured headers is served either —
+    /// a challenge is not one of the site's own responses.
+    fn unauthorized() -> Self {
+        Self {
+            answer: HostedAnswer::Unauthorized,
+            header_rules: Vec::new().into(),
+        }
+    }
+}
+
+/// Whether the site of `branch` is served to a request presenting `presented` — the
+/// `user:password` pair its `Authorization: Basic` header carried, if any.
+///
+/// Basic authorization is required when the BRANCH has it enabled, or when its app does:
+/// `App$enableBasicAuth` "enables basic authorization for the Amplify app's branches"
+/// (`smithy_query(query="doc",shape="App",member="enableBasicAuth")`). The credential
+/// verified against is the branch's own where it configured one, and otherwise the app's
+/// — `App$basicAuthCredentials` is "the basic authorization credentials for branches for
+/// the Amplify app". A site with access control enabled and no credential configured
+/// anywhere admits NOBODY: there is nothing a visitor could present, and a site that was
+/// asked to be protected is not served openly.
+fn site_is_open_to(
+    app: &AmplifyApp,
+    branch: &AmplifyBranch,
+    presented: Option<&[u8]>,
+) -> bool {
+    if !app.app.enable_basic_auth && !branch.branch.enable_basic_auth {
+        return true;
+    }
+    let Some(required) = branch.basic_auth.as_ref().or(app.basic_auth.as_ref()) else {
+        return false;
+    };
+    presented.is_some_and(|presented| required.accepts(presented))
+}
+
 /// What a hosting edge answers one request with, once the app's rules and the branch's
 /// published files have both been consulted.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1813,6 +1949,10 @@ pub enum HostedAnswer {
     },
     /// Neither a rule nor a published file answers this path.
     NotFound,
+    /// The branch's site is under basic authorization and this request presented no
+    /// credential, or not the configured one: the visitor is challenged for one and told
+    /// nothing else.
+    Unauthorized,
 }
 
 /// Which redirect a rule answers with — the two [`CustomRuleStatus`] carries.

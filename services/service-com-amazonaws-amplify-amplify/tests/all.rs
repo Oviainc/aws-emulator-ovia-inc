@@ -47,6 +47,10 @@ mod empty_response_status;
 mod hosted_branch_rewrites;
 #[path = "all/hosted_branch_site.rs"]
 mod hosted_branch_site;
+#[path = "all/hosted_site_access_control.rs"]
+mod hosted_site_access_control;
+#[path = "all/hosted_site_custom_headers.rs"]
+mod hosted_site_custom_headers;
 #[path = "all/hosted_site_custom_rules.rs"]
 mod hosted_site_custom_rules;
 #[path = "all/request_refusal_wording.rs"]

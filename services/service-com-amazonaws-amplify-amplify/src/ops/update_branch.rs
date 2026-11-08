@@ -209,10 +209,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
         })?;
-        let branch = app
+        let stored = app
             .branches
             .get_mut(&input.branch_name)
-            .map(|stored| &mut stored.branch)
             .ok_or_else(|| {
                 UpdateBranchErrorModeled::NotFoundException(NotFoundException {
                     message: Some(crate::state::not_found_message(
@@ -251,6 +250,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             compute_role_arn,
         } = input;
 
+        // The basic-authorization credentials this request configures are INGESTED rather
+        // than stored: the verifier the hosting edge checks a visitor against is kept on
+        // the branch, and what the record reports is the reference every reader is
+        // answered with — never the credentials the request sent (`BasicAuthCredentials`
+        // is `@sensitive`). An omitted member leaves both alone, like every other member
+        // of a partial update. See `crate::state::basic_auth`.
+        let reported_credentials =
+            crate::state::ingest_basic_auth(&mut stored.basic_auth, basic_auth_credentials);
+        let branch = &mut stored.branch;
+
         // The @required members of `Branch`: a supplied value replaces the stored one.
         crate::state::apply(&mut branch.description, description);
         crate::state::apply(&mut branch.framework, framework);
@@ -269,7 +278,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The optional members of `Branch`: a supplied value replaces the stored one,
         // and an omitted member leaves it alone — including when it is currently unset.
         crate::state::apply_optional(&mut branch.enable_skew_protection, enable_skew_protection);
-        crate::state::apply_optional(&mut branch.basic_auth_credentials, basic_auth_credentials);
+        crate::state::apply_optional(&mut branch.basic_auth_credentials, reported_credentials);
         crate::state::apply_optional(&mut branch.enable_performance_mode, enable_performance_mode);
         crate::state::apply_optional(&mut branch.build_spec, build_spec);
         crate::state::apply_optional(

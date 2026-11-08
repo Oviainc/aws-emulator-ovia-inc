@@ -258,6 +258,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The basic-authorization credentials the request configured are INGESTED rather
+        // than stored: what is kept is the verifier the hosting edge checks a visitor's
+        // credentials against, and what the record reports is the reference every reader
+        // is answered with — never the credentials the request sent
+        // (`BasicAuthCredentials` is `@sensitive`). See `crate::state::basic_auth`.
+        let mut kept_credentials = None;
+        let reported_credentials =
+            crate::state::ingest_basic_auth(&mut kept_credentials, input.basic_auth_credentials);
+
         let branch = Branch {
             branch_arn: format!("{}/branches/{}", app.app.app_arn, input.branch_name),
             // `displayName` "is used as the default domain prefix", and a branch's
@@ -292,7 +301,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             enable_performance_mode: Some(input.enable_performance_mode.unwrap_or(false)),
             // The thumbnail is a screenshot of a deployed branch.
             thumbnail_url: None,
-            basic_auth_credentials: input.basic_auth_credentials,
+            basic_auth_credentials: reported_credentials,
             build_spec: input.build_spec,
             ttl: input.ttl.unwrap_or_else(|| DEFAULT_TTL_SECONDS.to_string()),
             associated_resources: None,
@@ -311,7 +320,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         app.branches.insert(
             branch.branch_name.clone(),
-            crate::state::AmplifyBranch::new(branch.clone()),
+            crate::state::AmplifyBranch::created(branch.clone(), kept_credentials),
         );
 
         Ok(CreateBranchOutput {

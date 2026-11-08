@@ -82,12 +82,18 @@
 //!
 //! The edge READS: a request for a path the site carries is answered with those bytes
 //! and that file's own media type, a request for the root (or for a directory) with the
-//! site's root document, and anything else with a 404. Before any of that, the request
-//! path is resolved against the owning app's rewrite and redirect rules
-//! (`App$customRules`), which is what makes a rewritten path serve the object its target
-//! names (`crate::state::resolve_hosted_request`). The only state it touches is the
-//! settling the clock already owes the branch (`crate::state::AmplifyBranch::settle`),
-//! which publishes the site of a deployment whose job the clock has finished.
+//! site's root document, and anything else with a 404. Before any of that, the branch's
+//! ACCESS CONTROL decides whether the request is served at all — a branch whose (or whose
+//! app's) `enableBasicAuth` is set is served only to a request presenting the configured
+//! `basicAuthCredentials`, and every other request is answered with a 401 and the `Basic`
+//! challenge that asks for them (`crate::state::basic_auth`) — and the request path is
+//! resolved against the owning app's rewrite and redirect rules (`App$customRules`),
+//! which is what makes a rewritten path serve the object its target names
+//! (`crate::state::resolve_hosted_request`). A served file carries the headers the app's
+//! `App$customHeaders` rules state for its path (`crate::state::custom_headers`). The
+//! only state the edge touches is the settling the clock already owes the branch
+//! (`crate::state::AmplifyBranch::settle`), which publishes the site of a deployment
+//! whose job the clock has finished.
 //!
 //! ## How an answer that carries no content is framed
 //!
@@ -334,13 +340,21 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// successful deployment published, as the owning app's rewrite and redirect rules
     /// resolve it.
     ///
-    /// A `GET` (or a `HEAD`, which is the same answer without the body) is answered by
-    /// the first of the app's `customRules` whose `source` matches the path — a rewrite
+    /// Before anything is served, the branch's ACCESS CONTROL decides: a branch (or an
+    /// app) with basic authorization enabled is served only to a request presenting the
+    /// configured credentials, and answers anything else with a 401 carrying the `Basic`
+    /// challenge that asks for them.
+    ///
+    /// A `GET` (or a `HEAD`, which is the same answer without the body) is then answered
+    /// by the first of the app's `customRules` whose `source` matches the path — a rewrite
     /// with the object its `target` names, a redirect with that target as the `Location`
     /// — and otherwise with the file the path names, the site's root document for the
     /// root or a directory, and a 404 for a path neither a rule nor the deployment
     /// answers, including every path of a branch nothing has been deployed to yet. Any
     /// other method is refused: a hosting edge serves a site, it does not take writes.
+    ///
+    /// A served file additionally carries the headers the app's `customHeaders` rules
+    /// state for its path, which is what that document configures them for.
     fn serve_hosted_site(&self, req: &RtRequest, host: &str) -> RtResponse {
         let method = req.method();
         if method != "GET" && method != "HEAD" {
@@ -350,17 +364,21 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             return plane_error(500, "InternalFailureException", SITE_STORE_MESSAGE);
         };
         let path = ::service_common::request_path(req.uri()).to_string();
+        // The credentials the visitor presents are read from the request here, so the
+        // store is handed the pair to verify and never the header.
+        let presented =
+            crate::state::presented_credentials(req.headers().get("authorization"));
         // The store is read, and what the clock owes the branch materialised, under the
         // lock; the answer is BUILT after it is released, so no response construction
         // happens while other callers are waiting on the one store.
-        let answer = {
+        let visit = {
             let mut store = state.lock();
-            match store.hosted_visit(host, &path) {
-                Some(answer) => answer,
+            match store.hosted_visit(host, &path, presented.as_deref()) {
+                Some(visit) => visit,
                 None => return plane_error(404, "NotFound", SITE_NOT_FOUND_MESSAGE),
             }
         };
-        match answer {
+        match visit.answer {
             crate::state::HostedAnswer::File { key, content } => {
                 let length = content.len();
                 let mut resp = RtResponse::new(
@@ -377,6 +395,15 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                     .insert("content-type", crate::state::hosted_file_media_type(&key));
                 resp.headers_mut()
                     .insert("content-length", length.to_string());
+                // The app's configured headers are resolved HERE — after the store lock
+                // is released — and added to the file's own: a header the document states
+                // for this path REPLACES the one above where it names the same field,
+                // which is what configuring it asks for. A key or value no response can
+                // carry — the document's text is caller text — is left out rather than
+                // failing the whole answer.
+                for (key, value) in crate::state::matched_headers(&visit.header_rules, &path) {
+                    let _ = resp.headers_mut().try_insert(key, value);
+                }
                 resp
             }
             crate::state::HostedAnswer::Redirect { redirect, location } => {
@@ -402,6 +429,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             crate::state::HostedAnswer::NotFound => {
                 plane_error(404, "NotFound", SITE_NOT_FOUND_MESSAGE)
             }
+            crate::state::HostedAnswer::Unauthorized => site_unauthorized(),
         }
     }
 }
@@ -647,6 +675,33 @@ const SITE_NOT_FOUND_MESSAGE: &str = "The requested file was not found";
 
 /// The body of a hosting-edge refusal of a method other than the read of a file.
 const SITE_METHOD_MESSAGE: &str = "This site is read by GET or HEAD";
+
+/// What a branch's site answers a request that does not satisfy its access control: the
+/// `401` and the challenge that asks for the credentials.
+///
+/// RFC 9110 requires a `WWW-Authenticate` challenge on a `401`, and it is the challenge
+/// that makes a browser ask the visitor for the `user:password` pair the branch's
+/// `basicAuthCredentials` configured. The realm is a constant of this module and the body
+/// carries nothing from the request or from the site: a visitor without credentials is
+/// told to present some, and nothing about what the branch publishes.
+fn site_unauthorized() -> RtResponse {
+    let mut resp = plane_error(401, "Unauthorized", SITE_UNAUTHORIZED_MESSAGE);
+    resp.headers_mut().insert(
+        "www-authenticate",
+        format!(
+            "{} realm=\"{SITE_REALM}\"",
+            crate::state::basic_auth::BASIC_SCHEME
+        ),
+    );
+    resp
+}
+
+/// The body of that refusal.
+const SITE_UNAUTHORIZED_MESSAGE: &str = "This site requires basic authorization credentials";
+
+/// The protection space the challenge names: the access control of a branch's site, as a
+/// constant carrying nothing from the request.
+const SITE_REALM: &str = "Amplify Hosting";
 
 /// The body of a hosting-edge answer when this service's store is unreachable.
 const SITE_STORE_MESSAGE: &str = "the Amplify hosting store is unavailable";

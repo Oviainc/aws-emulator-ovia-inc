@@ -219,18 +219,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `UpdateApp` updates an EXISTING app, so an unknown `appId` is a 404 rather
         // than an app created on the way.
-        let app = &mut store
-            .apps
-            .get_mut(&input.app_id)
-            .ok_or_else(|| {
-                UpdateAppErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(crate::state::not_found_message(
-                        crate::state::APP_ENTITY,
-                        &input.app_id,
-                    )),
-                })
-            })?
-            .app;
+        let stored = store.apps.get_mut(&input.app_id).ok_or_else(|| {
+            UpdateAppErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::not_found_message(
+                    crate::state::APP_ENTITY,
+                    &input.app_id,
+                )),
+            })
+        })?;
 
         // Every member the request CARRIES replaces the stored one; a member it omits
         // is left as it was. That is what makes an update partial: a caller that sends
@@ -243,7 +239,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Destructuring rather than reading `input.<member>` is deliberate: a member
         // added to the model fails to compile here instead of being silently dropped.
         let UpdateAppInput {
-            app_id: _,
+            app_id,
             name,
             description,
             platform,
@@ -270,6 +266,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             cache_config,
         } = input;
 
+        // Three members are INGESTED rather than stored as sent, each by the one reader of
+        // its member in this crate (the same ones `CreateApp` ingests): the
+        // basic-authorization credentials for this app's branches, of which only a
+        // verifier is kept and a reference reported; the same `@sensitive` member inside
+        // the auto-branch-creation configuration; and the custom-header DOCUMENT, whose
+        // rules are parsed here once and reported re-serialized as JSON. An omitted member
+        // leaves both the record and the parsed half alone, like every other member of a
+        // partial update.
+        //
+        // The document is read — and a document declaring more rules than one app may
+        // carry refused — BEFORE anything is written, so a refused update leaves the app
+        // exactly as it was, like the rewrite-rule bound above. `UpdateApp` models no
+        // limit error, so the refusal is its `BadRequestException`.
+        let ingested_headers = crate::state::ingest_custom_headers(custom_headers);
+        if let crate::state::IngestedCustomHeaders::TooManyRules(supplied) = ingested_headers {
+            return Err(UpdateAppErrorModeled::BadRequestException(BadRequestException {
+                message: Some(crate::state::custom_header_rules_limit_message(
+                    &app_id, supplied,
+                )),
+            })
+            .into());
+        }
+        let reported_credentials =
+            crate::state::ingest_basic_auth(&mut stored.basic_auth, basic_auth_credentials);
+        let mut auto_branch_creation_config = auto_branch_creation_config;
+        crate::state::ingest_auto_branch_basic_auth(&mut auto_branch_creation_config);
+        let reported_headers = match ingested_headers {
+            crate::state::IngestedCustomHeaders::Declared { document, rules } => {
+                stored.custom_header_rules = rules.into();
+                Some(document)
+            }
+            _ => None,
+        };
+        let app = &mut stored.app;
+
         // The @required members of `App`: a supplied value replaces the stored one.
         crate::state::apply(&mut app.name, name);
         crate::state::apply(&mut app.description, description);
@@ -287,10 +318,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &mut app.enable_branch_auto_deletion,
             enable_branch_auto_deletion,
         );
-        crate::state::apply_optional(&mut app.basic_auth_credentials, basic_auth_credentials);
+        crate::state::apply_optional(&mut app.basic_auth_credentials, reported_credentials);
         crate::state::apply_optional(&mut app.custom_rules, custom_rules);
         crate::state::apply_optional(&mut app.build_spec, build_spec);
-        crate::state::apply_optional(&mut app.custom_headers, custom_headers);
+        crate::state::apply_optional(&mut app.custom_headers, reported_headers);
         crate::state::apply_optional(
             &mut app.enable_auto_branch_creation,
             enable_auto_branch_creation,

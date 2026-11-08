@@ -23,6 +23,18 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
+# Serializes the custom-header rules this service parsed out of an app's `customHeaders`
+# document into the JSON a reader is answered with, in the order each rule states its
+# members (`src/state/custom_headers.rs`).
+serde = { workspace = true }
+# `sha2` digests a configured basic-authorization credential: the digest is the only thing
+# this service keeps of one, and what it reports for the `@sensitive` member is derived
+# from it (`src/state/basic_auth.rs`).
+sha2 = { workspace = true }
+# Reads an app's `customHeaders` document, which callers write in YAML (of which JSON is a
+# subset); `yaml-rust2` is the pure-Rust YAML reader the cloudformation, configservice and
+# greengrassv2 crates already read caller-supplied YAML with.
+yaml-rust2 = { version = "0.10", default-features = false }
 tracing = { workspace = true }
 # Amazon S3 client a manual deployment's source is read through: `StartDeployment` reads
 # the source bucket's policy and its objects over the in-process callback into this same
@@ -36,7 +48,6 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
-sha2 = { workspace = true }
 hex = { workspace = true }
 # Percent-encodes an ARN into the single `@httpLabel` path segment the tagging
 # operations bind it to, the way an AWS SDK client does (tests/all/resource_tags.rs).
