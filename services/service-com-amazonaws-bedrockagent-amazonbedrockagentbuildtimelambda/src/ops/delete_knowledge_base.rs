@@ -163,40 +163,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-        // A knowledge base whose earlier deletion the clock has already made due
-        // is gone before this call looks for it.
-        state.materialise_due_transitions(now);
+        let removal = {
+            let mut state = state.lock();
+            // A knowledge base whose earlier deletion the clock has already made
+            // due is gone before this call looks for it.
+            state.materialise_due_transitions(now);
 
-        let Some(record) = state.knowledge_bases.get(&input.knowledge_base_id) else {
-            return Err(DeleteKnowledgeBaseErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::knowledge_base_not_found_message(
-                        &input.knowledge_base_id,
-                    )),
-                },
-            )
-            .into());
+            let Some(record) = state.knowledge_bases.get(&input.knowledge_base_id) else {
+                return Err(DeleteKnowledgeBaseErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::knowledge_base_not_found_message(
+                            &input.knowledge_base_id,
+                        )),
+                    },
+                )
+                .into());
+            };
+            let already_deleting = record.is_deleting();
+            let binding = crate::state::s3_vectors_binding(record.storage_configuration.as_ref());
+
+            // Deleting a knowledge base deletes the data sources inside it, so
+            // each one's own `dataDeletionPolicy` decides what becomes of the
+            // vectors its documents were converted into: DELETE removes them
+            // "upon deletion of a knowledge base or data source resource", and
+            // RETAIN leaves them in the vector store. Read while the data
+            // sources are still here to read them off.
+            let uris: Vec<String> = if already_deleting {
+                Vec::new()
+            } else {
+                let targeted: Vec<String> = state
+                    .data_sources
+                    .values()
+                    .filter(|data_source| {
+                        data_source.knowledge_base_id == input.knowledge_base_id
+                            && data_source.data_deletion_policy.as_deref().is_some_and(
+                                |policy| policy == crate::state::DATA_DELETION_POLICY_DELETE,
+                            )
+                    })
+                    .map(|data_source| data_source.data_source_id.clone())
+                    .collect();
+                targeted
+                    .iter()
+                    .flat_map(|data_source_id| {
+                        state.ingested_source_uris(&input.knowledge_base_id, data_source_id)
+                    })
+                    .collect()
+            };
+
+            // The deletion is ACCEPTED here (202) and the knowledge base reports
+            // `DELETING` from now on; the record, and every data source inside it,
+            // are removed once the span the clock owes has passed, so a caller that
+            // deletes and then polls observes the status the modelled
+            // `KnowledgeBase$status` documents ("DELETING – The knowledge base is
+            // being deleted") and then the modelled 404, rather than a resource that
+            // vanished mid-call.
+            //
+            // `DeleteKnowledgeBase` is `@idempotent`, so a repeat while the deletion
+            // is still under way reports that same knowledge base instead of
+            // re-arming the clock.
+            //
+            // No agent check: this operation documents disassociating the knowledge
+            // base from the agents it is associated with as something the CALLER
+            // should do first, and no operation in this slice associates one, so no
+            // knowledge base here is in use.
+            if !already_deleting {
+                state.begin_knowledge_base_deletion(&input.knowledge_base_id, now);
+            }
+            binding
+                .filter(|_| !uris.is_empty())
+                .map(|binding| (binding, uris))
         };
 
-        // The deletion is ACCEPTED here (202) and the knowledge base reports
-        // `DELETING` from now on; the record, and every data source inside it,
-        // are removed once the span the clock owes has passed, so a caller that
-        // deletes and then polls observes the status the modelled
-        // `KnowledgeBase$status` documents ("DELETING – The knowledge base is
-        // being deleted") and then the modelled 404, rather than a resource that
-        // vanished mid-call.
-        //
-        // `DeleteKnowledgeBase` is `@idempotent`, so a repeat while the deletion
-        // is still under way reports that same knowledge base instead of
-        // re-arming the clock.
-        //
-        // No agent check: this operation documents disassociating the knowledge
-        // base from the agents it is associated with as something the CALLER
-        // should do first, and no operation in this slice associates one, so no
-        // knowledge base here is in use.
-        if !record.is_deleting() {
-            state.begin_knowledge_base_deletion(&input.knowledge_base_id, now);
+        // The vectors leave the store that OWNS them, with no guard of this
+        // service's store held.
+        if let Some((binding, uris)) = removal {
+            crate::state::remove_source_vectors(&*self.engine, &binding, &uris);
         }
 
         Ok(DeleteKnowledgeBaseOutput {

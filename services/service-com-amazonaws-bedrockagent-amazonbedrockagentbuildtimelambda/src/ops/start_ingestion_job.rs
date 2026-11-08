@@ -8,6 +8,13 @@
 //! `IN_PROGRESS` and then `COMPLETE` is owed by the CLOCK alone, so
 //! `GetIngestionJob` reports whatever status the stored record has reached.
 //!
+//! The WORK is done here: the data source's source documents are enumerated in
+//! the service that owns them, each becomes a document of the data source and a
+//! vector in the index the knowledge base is bound to, and the
+//! `IngestionJobStatistics` the job reports once it completes are measured from
+//! that — a document whose vector the bound store did not take is reported
+//! failed rather than indexed (`crate::state::ingestion`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -171,135 +178,217 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-        state.materialise_due_transitions(now);
+        let token_key = client_token_key(&input);
+        let (
+            ingestion_job_id,
+            ingestion_job,
+            data_source_configuration,
+            storage_configuration,
+            ingested,
+        ) = {
+            let mut state = state.lock();
+            state.materialise_due_transitions(now);
 
-        // A job ingests one data source of one knowledge base, so both have to
-        // exist: a data source is identified by the pair, which makes an id of
-        // another knowledge base's data source as absent here as one nothing
-        // holds. A resource a delete has already been accepted for is as absent
-        // too: it serves no ingestion it would not serve after its removal.
-        if state.live_knowledge_base(&input.knowledge_base_id).is_none() {
-            return Err(StartIngestionJobErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::knowledge_base_not_found_message(
-                        &input.knowledge_base_id,
-                    )),
-                },
-            )
-            .into());
-        }
-        if state
-            .live_data_source_of(&input.knowledge_base_id, &input.data_source_id)
-            .is_none()
-        {
-            return Err(StartIngestionJobErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::data_source_not_found_message(
-                        &input.data_source_id,
-                    )),
-                },
-            )
-            .into());
-        }
-
-        // `clientToken` is an @idempotencyToken: a repeat of the same request
-        // returns the job it already started rather than starting a second one.
-        // The index is keyed by the whole request scope, so the same token used
-        // for another data source names its own job instead of displacing this
-        // one.
-        let token_key = input.client_token.as_ref().map(|token| {
-            (
-                input.knowledge_base_id.clone(),
-                input.data_source_id.clone(),
-                token.clone(),
-            )
-        });
-        let replayed = token_key
-            .as_ref()
-            .and_then(|key| state.ingestion_job_client_tokens.get(key))
-            .cloned();
-        if let Some(existing) = replayed.as_deref().and_then(|ingestion_job_id| {
-            state.ingestion_job_of(
-                &input.knowledge_base_id,
-                &input.data_source_id,
-                ingestion_job_id,
-            )
-        }) {
-            return Ok(StartIngestionJobOutput {
-                ingestion_job: existing.to_ingestion_job(),
-            });
-        }
-
-        // A data source is ingested by one job at a time: while a job of this
-        // data source has not reached a terminal status, starting another is
-        // the conflict this operation models. Checked AFTER the idempotency
-        // replay above, so a retry of the accepted start is still served.
-        if let Some(running) =
-            state.running_ingestion_job(&input.knowledge_base_id, &input.data_source_id)
-        {
-            return Err(StartIngestionJobErrorModeled::ConflictException(
-                ConflictException {
-                    message: Some(format!(
-                        "Ingestion job {} is already in progress for data source {} in \
-                         knowledge base {}",
-                        running.ingestion_job_id,
-                        input.data_source_id,
-                        input.knowledge_base_id
-                    )),
-                },
-            )
-            .into());
-        }
-
-        // The store is bounded: past its quota a start is refused rather than
-        // adding another record, and `ServiceQuotaExceededException` is the
-        // modelled refusal for exactly that.
-        if state.ingestion_job_count(&input.knowledge_base_id, &input.data_source_id)
-            >= crate::state::INGESTION_JOB_QUOTA
-        {
-            return Err(
-                StartIngestionJobErrorModeled::ServiceQuotaExceededException(
-                    ServiceQuotaExceededException {
-                        message: Some(format!(
-                            "data source {} of knowledge base {} has already run the maximum \
-                             of {} ingestion jobs",
-                            input.data_source_id,
-                            input.knowledge_base_id,
-                            crate::state::INGESTION_JOB_QUOTA
+            // A job ingests one data source of one knowledge base, so both have
+            // to exist: a data source is identified by the pair, which makes an
+            // id of another knowledge base's data source as absent here as one
+            // nothing holds. A resource a delete has already been accepted for
+            // is as absent too: it serves no ingestion it would not serve after
+            // its removal.
+            let Some(knowledge_base) = state.live_knowledge_base(&input.knowledge_base_id) else {
+                return Err(StartIngestionJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::knowledge_base_not_found_message(
+                            &input.knowledge_base_id,
                         )),
                     },
                 )
-                .into(),
-            );
-        }
+                .into());
+            };
+            let storage_configuration = knowledge_base.storage_configuration.clone();
+            let Some(data_source) =
+                state.live_data_source_of(&input.knowledge_base_id, &input.data_source_id)
+            else {
+                return Err(StartIngestionJobErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::data_source_not_found_message(
+                            &input.data_source_id,
+                        )),
+                    },
+                )
+                .into());
+            };
+            let data_source_configuration = data_source.data_source_configuration.clone();
 
-        let Some(ingestion_job_id) = state.mint_ingestion_job_id(now) else {
-            return Err(StartIngestionJobErrorModeled::InternalServerException(
-                InternalServerException {
-                    message: Some("could not mint an unused ingestionJobId".to_string()),
-                },
+            // `clientToken` is an @idempotencyToken: a repeat of the same
+            // request returns the job it already started rather than starting a
+            // second one. The index is keyed by the whole request scope, so the
+            // same token used for another data source names its own job instead
+            // of displacing this one.
+            let replayed = token_key
+                .as_ref()
+                .and_then(|key| state.ingestion_job_client_tokens.get(key))
+                .cloned();
+            if let Some(existing) = replayed.as_deref().and_then(|ingestion_job_id| {
+                state.ingestion_job_of(
+                    &input.knowledge_base_id,
+                    &input.data_source_id,
+                    ingestion_job_id,
+                )
+            }) {
+                return Ok(StartIngestionJobOutput {
+                    ingestion_job: existing.to_ingestion_job(),
+                });
+            }
+
+            // A data source is ingested by one job at a time: while a job of
+            // this data source has not reached a terminal status, starting
+            // another is the conflict this operation models. Checked AFTER the
+            // idempotency replay above, so a retry of the accepted start is
+            // still served.
+            if let Some(running) =
+                state.running_ingestion_job(&input.knowledge_base_id, &input.data_source_id)
+            {
+                return Err(StartIngestionJobErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "Ingestion job {} is already in progress for data source {} in \
+                             knowledge base {}",
+                            running.ingestion_job_id,
+                            input.data_source_id,
+                            input.knowledge_base_id
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // The store is bounded: past its quota a start is refused rather
+            // than adding another record, and `ServiceQuotaExceededException`
+            // is the modelled refusal for exactly that.
+            if state.ingestion_job_count(&input.knowledge_base_id, &input.data_source_id)
+                >= crate::state::INGESTION_JOB_QUOTA
+            {
+                return Err(
+                    StartIngestionJobErrorModeled::ServiceQuotaExceededException(
+                        ServiceQuotaExceededException {
+                            message: Some(format!(
+                                "data source {} of knowledge base {} has already run the \
+                                 maximum of {} ingestion jobs",
+                                input.data_source_id,
+                                input.knowledge_base_id,
+                                crate::state::INGESTION_JOB_QUOTA
+                            )),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            // The job is RESERVED here, under the acquisition that decided it:
+            // the record is in the store before the work starts, so a
+            // concurrent start of the same data source sees it as the running
+            // job and no refusal below can happen after the work has touched
+            // another service's store. What the run measures is written onto
+            // this record once the work is done.
+            let Some(ingestion_job_id) = state.mint_ingestion_job_id(now) else {
+                return Err(StartIngestionJobErrorModeled::InternalServerException(
+                    InternalServerException {
+                        message: Some("could not mint an unused ingestionJobId".to_string()),
+                    },
+                )
+                .into());
+            };
+            let record = crate::state::IngestionJobRecord::starting(
+                input.knowledge_base_id.clone(),
+                input.data_source_id.clone(),
+                ingestion_job_id.clone(),
+                input.description,
+                input.client_token.clone(),
+                now,
+            );
+            let ingestion_job = record.to_ingestion_job();
+            if let Some(key) = token_key {
+                state
+                    .ingestion_job_client_tokens
+                    .insert(key, ingestion_job_id.clone());
+            }
+            state
+                .ingestion_jobs
+                .insert(ingestion_job_id.clone(), record);
+            (
+                ingestion_job_id,
+                ingestion_job,
+                data_source_configuration,
+                storage_configuration,
+                state.ingested_source_uris(&input.knowledge_base_id, &input.data_source_id),
             )
-            .into());
         };
 
-        let record = crate::state::IngestionJobRecord::starting(
-            input.knowledge_base_id,
-            input.data_source_id,
-            ingestion_job_id.clone(),
-            input.description,
-            input.client_token,
-            now,
+        // The job's work, with NO guard of this service's store held: the bound
+        // index's dimension, then the data source's source documents in the
+        // service that owns them, then the vectors for them written into that
+        // index. Each store is reached on its own, which is what keeps a lock
+        // cycle between them unreachable.
+        let binding = crate::state::s3_vectors_binding(storage_configuration.as_ref());
+        let dimension = binding
+            .as_ref()
+            .and_then(|binding| crate::state::bound_index_dimension(&*self.engine, binding));
+        let crawled = crate::state::crawl_data_source(
+            &*self.engine,
+            &data_source_configuration,
+            dimension,
         );
-
-        let ingestion_job = record.to_ingestion_job();
-        if let Some(key) = token_key {
-            state
-                .ingestion_job_client_tokens
-                .insert(key, ingestion_job_id.clone());
+        let mut indexed = crate::state::IndexedVectors::NotReconciled;
+        if let (Some(crawled), Some(binding)) = (crawled.as_ref(), binding.as_ref()) {
+            // A document the source no longer offers is gone from the knowledge
+            // base too, so the vector it was held under leaves the bound store
+            // with it.
+            let gone: Vec<String> = ingested
+                .into_iter()
+                .filter(|uri| !crawled.documents.iter().any(|document| &document.uri == uri))
+                .collect();
+            crate::state::remove_source_vectors(&*self.engine, binding, &gone);
+            indexed =
+                crate::state::index_source_vectors(&*self.engine, binding, &crawled.documents);
         }
-        state.ingestion_jobs.insert(ingestion_job_id, record);
+
+        let mut state = state.lock();
+        // What the run measured, written onto the job this call reserved: the
+        // documents it took from the data source's own source, or — for a data
+        // source that names no source of its own — the documents pushed into
+        // it, which are its source documents. The job reports them once the
+        // clock completes it.
+        let completed_statistics = match crawled {
+            Some(crawled) => state.record_ingestion(
+                &input.knowledge_base_id,
+                &input.data_source_id,
+                &crawled,
+                &indexed,
+                now,
+            ),
+            None => state
+                .pushed_ingestion_statistics(&input.knowledge_base_id, &input.data_source_id),
+        };
+        // A job whose data source was deleted while the work ran is gone from
+        // the store with it, and nothing is put back: the delete is what the
+        // caller's next read answers.
+        if let Some(record) = state.ingestion_jobs.get_mut(&ingestion_job_id) {
+            record.completed_statistics = completed_statistics;
+        }
 
         Ok(StartIngestionJobOutput { ingestion_job })
     }
+}
+
+/// The key this request's `@idempotencyToken` is remembered under: the whole
+/// request scope, so the same token used for another data source names its own
+/// job instead of displacing this one.
+fn client_token_key(input: &StartIngestionJobInput) -> Option<(String, String, String)> {
+    input.client_token.as_ref().map(|token| {
+        (
+            input.knowledge_base_id.clone(),
+            input.data_source_id.clone(),
+            token.clone(),
+        )
+    })
 }

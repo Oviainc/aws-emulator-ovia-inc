@@ -6,6 +6,12 @@
 //! projected from the stored record, so a following `GetKnowledgeBase` reports
 //! the same knowledge base.
 //!
+//! What the request binds the knowledge base to is resolved BEFORE anything is
+//! written: the `embeddingModelArn` has to name a model whose published output
+//! is an embedding, and the index its `storageConfiguration` names has to be an
+//! index of the named vector bucket whose dimension that model's vectors fit.
+//! Each refusal leaves no knowledge base behind (`crate::state::vector_store`).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -197,6 +203,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // documents in `storageConfiguration`. A request that does not satisfy
         // its own discriminator is a bad request, not a missing resource.
         if let Some(problem) = crate::state::knowledge_base_configuration_problem(
+            &input.knowledge_base_configuration,
+            input.storage_configuration.as_ref(),
+        ) {
+            return Err(CreateKnowledgeBaseErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(problem.message()),
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
+        // The embedding model is what creates the knowledge base's vectors, so
+        // a model that produces something else cannot be it: the published
+        // catalog is what says which does. Checked before anything is written,
+        // so a mis-pasted model ARN leaves no knowledge base behind.
+        if let Some(embedding_model_arn) = input
+            .knowledge_base_configuration
+            .vector_knowledge_base_configuration
+            .as_ref()
+            .and_then(crate::state::unsupported_embedding_model)
+        {
+            return Err(CreateKnowledgeBaseErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::unsupported_embedding_model_message(
+                        embedding_model_arn,
+                    )),
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
+        // The vector store the knowledge base writes into has to be able to
+        // take its vectors: the index named in `storageConfiguration` is
+        // resolved in the service that owns it, and that service's own refusal
+        // is carried through. Resolved with no guard of this service's store
+        // held, and before any record is written, so a mis-wired binding leaves
+        // no knowledge base behind.
+        if let Some(problem) = crate::state::s3_vectors_binding_problem(
+            &*self.engine,
             &input.knowledge_base_configuration,
             input.storage_configuration.as_ref(),
         ) {

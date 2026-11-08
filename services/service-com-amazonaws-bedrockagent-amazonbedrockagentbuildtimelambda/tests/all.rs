@@ -37,6 +37,8 @@ mod flow_version_prepare_ordering;
 mod flow_version_snapshots;
 #[path = "all/immutable_configuration_members.rs"]
 mod immutable_configuration_members;
+#[path = "all/ingestion_crawl.rs"]
+mod ingestion_crawl;
 #[path = "all/ingestion_job_lifecycle.rs"]
 mod ingestion_job_lifecycle;
 #[path = "all/knowledge_base_document_listing.rs"]
@@ -51,3 +53,7 @@ mod managed_connector_defaults;
 mod state_roundtrip;
 #[path = "all/update_round_trip.rs"]
 mod update_round_trip;
+#[path = "all/vector_store_binding.rs"]
+mod vector_store_binding;
+#[path = "all/vector_store_fixture.rs"]
+mod vector_store_fixture;

@@ -87,6 +87,15 @@ struct Emulator {
 impl Emulator {
     fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        // The knowledge bases here bind to an S3 Vectors index, which
+        // `CreateKnowledgeBase` resolves in the service that owns it — so the
+        // index is created first, as a caller creates it first against AWS.
+        crate::vector_store_fixture::seed_index(
+            &engine,
+            "arn:aws:s3vectors:::bucket/connector-defaults-vectors",
+            "connector-defaults-index",
+            crate::vector_store_fixture::EMBEDDING_DIMENSION,
+        );
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(engine));

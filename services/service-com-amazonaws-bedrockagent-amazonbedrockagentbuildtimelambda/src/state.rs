@@ -34,9 +34,15 @@
 //! as the one place the listing's order and paging live.
 //!
 //! The knowledge-base lifecycle (`CreateKnowledgeBase`, `UpdateKnowledgeBase`,
-//! `GetKnowledgeBase`) is backed by the
+//! `GetKnowledgeBase`, `ListKnowledgeBases`) is backed by the
 //! [`knowledge_bases`](ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::knowledge_bases)
-//! map, with [`KnowledgeBaseRecord::to_knowledge_base`] as its single projection.
+//! map, with [`KnowledgeBaseRecord::to_knowledge_base`] and
+//! [`KnowledgeBaseRecord::to_summary`] as its only two projections and
+//! [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::page_of_knowledge_bases`]
+//! as the one place the listing's order and paging live. What a knowledge base's
+//! `storageConfiguration` binds it to is resolved in the service that owns that
+//! vector store, in the `vector_store` module beside this one, so no knowledge
+//! base is created against an index that is not there.
 //!
 //! A knowledge base's data sources (`CreateDataSource`, `UpdateDataSource`,
 //! `GetDataSource`) are backed by the
@@ -81,7 +87,10 @@
 //! source pair it ran for, with [`IngestionJobRecord::to_ingestion_job`] as its
 //! single projection. A job's status advances on the CLOCK alone, through
 //! [`ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState::materialise_due_transitions`],
-//! so every reader of the job observes the same progression.
+//! so every reader of the job observes the same progression. What the job DID —
+//! the source documents it enumerated, the vectors it wrote and the
+//! `IngestionJobStatistics` that measure them — lives in the `ingestion` module
+//! beside this one.
 //!
 //! The documents pushed straight into a data source
 //! (`IngestKnowledgeBaseDocuments`, `GetKnowledgeBaseDocuments`) are backed by
@@ -106,7 +115,17 @@
 /// resolution of an alias identifier and of an alias's routing target.
 mod flow_aliases;
 
+/// What an ingestion job does over a data source's source, and the accounting
+/// it reports for it.
+mod ingestion;
+
+/// The vector store a knowledge base is bound to, and the embedding model that
+/// writes into it.
+mod vector_store;
+
 pub use flow_aliases::*;
+pub use ingestion::*;
+pub use vector_store::*;
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
@@ -120,9 +139,9 @@ use crate::ops::types::{
     CustomOrchestration, DataSource, DataSourceConfiguration, DocumentContent, DocumentIdentifier,
     DocumentMetadata, FlowDefinition, FlowValidation, FlowVersionSummary, GetFlowOutput,
     GuardrailConfiguration, ImageExtractionConfiguration, IngestionJob, IngestionJobStatistics,
-    KnowledgeBase, KnowledgeBaseConfiguration, KnowledgeBaseDocumentDetail,
-    MediaExtractionConfiguration, MemoryConfiguration, PromptOverrideConfiguration, S3Location,
-    ServerSideEncryptionConfiguration, StorageConfiguration, UpdateFlowOutput,
+    KnowledgeBase, KnowledgeBaseConfiguration, KnowledgeBaseDocumentDetail, KnowledgeBaseSummary,
+    MediaExtractionConfiguration, MemoryConfiguration, PromptOverrideConfiguration, S3Content,
+    S3Location, ServerSideEncryptionConfiguration, StorageConfiguration, UpdateFlowOutput,
     VectorIngestionConfiguration,
 };
 
@@ -987,6 +1006,77 @@ impl KnowledgeBaseRecord {
                 .then(|| self.failure_reasons.clone()),
         }
     }
+
+    /// This record as the modelled `KnowledgeBaseSummary` shape, which is what
+    /// `ListKnowledgeBases` reports: every member comes from the same stored
+    /// value the full projection reports it from.
+    pub fn to_summary(&self) -> KnowledgeBaseSummary {
+        KnowledgeBaseSummary {
+            knowledge_base_id: self.knowledge_base_id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            status: self.status.as_wire().to_string(),
+            updated_at: to_date_time(self.updated_at),
+        }
+    }
+
+    /// The total order `ListKnowledgeBases` pages over: when the knowledge base
+    /// was created, ties broken by its minted id.
+    ///
+    /// A knowledge base's creation instant and id never change, so this order is
+    /// stable — which is what lets a page resume exactly after the one before
+    /// it.
+    fn sort_key(&self) -> (u128, &str) {
+        (
+            epoch_nanos(self.created_at),
+            self.knowledge_base_id.as_str(),
+        )
+    }
+
+    /// The `nextToken` a page ending at this knowledge base hands out.
+    pub fn page_cursor(&self) -> String {
+        let (created_at_nanos, knowledge_base_id) = self.sort_key();
+        format!("{created_at_nanos}-{knowledge_base_id}")
+    }
+}
+
+/// The most knowledge bases one `ListKnowledgeBases` page reports when the
+/// request names no `maxResults`.
+///
+/// CHOSEN, not documented: AWS publishes no default page size for the listing.
+/// It is the upper bound of the modelled `maxResults` range (1..1000,
+/// `smithy_query(query="operation",operation="ListKnowledgeBases")`), so
+/// `maxResults` alone decides how short a page is, and it matches
+/// [`KNOWLEDGE_BASE_QUOTA`]: an account holds no more knowledge bases than one
+/// default page can carry.
+pub const MAX_KNOWLEDGE_BASES_PER_PAGE: usize = KNOWLEDGE_BASE_QUOTA;
+
+/// A `ListKnowledgeBases` resume cursor, decoded back into the position in the
+/// listing's order that it names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnowledgeBasePageCursor {
+    created_at_nanos: u128,
+    knowledge_base_id: String,
+}
+
+impl KnowledgeBasePageCursor {
+    /// Decode a `nextToken` a previous page handed out. `None` when the token
+    /// was not produced by [`KnowledgeBaseRecord::page_cursor`].
+    pub fn parse(token: &str) -> Option<Self> {
+        let (nanos, knowledge_base_id) = token.split_once('-')?;
+        if knowledge_base_id.is_empty() {
+            return None;
+        }
+        Some(Self {
+            created_at_nanos: nanos.parse().ok()?,
+            knowledge_base_id: knowledge_base_id.to_string(),
+        })
+    }
+
+    /// Whether `record` sorts after this cursor, i.e. belongs on the next page.
+    fn precedes(&self, record: &KnowledgeBaseRecord) -> bool {
+        (self.created_at_nanos, self.knowledge_base_id.as_str()) < record.sort_key()
+    }
 }
 
 /// The `ResourceNotFoundException` message a knowledge-base operation answers
@@ -1673,6 +1763,14 @@ pub struct IngestionJobRecord {
     /// the store holds none. Nothing here is a number about documents the
     /// emulator never took in.
     pub statistics: IngestionJobStatistics,
+    /// The accounting the job's run measured, which it reports once it has
+    /// finished.
+    ///
+    /// The modelled members are the service's accounting OF A RUN, and the run
+    /// is over only when the job reaches [`IngestionJobStatus::Complete`] — so
+    /// what a job still in flight reports is the modelled defaults, and the
+    /// measured counts take their place at the instant the clock completes it.
+    pub completed_statistics: IngestionJobStatistics,
     /// Reasons the job failed; empty while nothing has failed.
     pub failure_reasons: Vec<String>,
     pub started_at: SystemTime,
@@ -1703,11 +1801,13 @@ impl IngestionJobRecord {
             description,
             status: IngestionJobStatus::Starting,
             pending_status: Some((now + INGESTION_JOB_START_SPAN, IngestionJobStatus::InProgress)),
-            // The documents this store holds for the data source are what a job
-            // can scan, and it holds none until a document-level operation
-            // persists one — so every count keeps the default the model gives
-            // it rather than a number nothing counted.
+            // A run that has not finished has accounted for nothing yet, so
+            // every count is the default the model gives it until the clock
+            // completes the job and the measured accounting takes its place.
             statistics: IngestionJobStatistics::default(),
+            // What the run measures is written here once the work is done; a
+            // job that measured nothing reports the defaults.
+            completed_statistics: IngestionJobStatistics::default(),
             // Nothing has failed on a job this call just started.
             failure_reasons: Vec::new(),
             started_at: now,
@@ -1950,6 +2050,13 @@ impl DocumentKey {
         }
     }
 
+    /// The document's own id within its data source: the id a custom document
+    /// was given, or the URI an S3 document lives at.
+    pub fn identity(&self) -> &str {
+        let (_, identity) = self.sort_key();
+        identity
+    }
+
     /// This identity as the modelled `DocumentIdentifier` shape, which is what
     /// every document detail reports it as.
     pub fn to_identifier(&self) -> DocumentIdentifier {
@@ -1986,6 +2093,14 @@ pub struct DocumentRecord {
     pub content: DocumentContent,
     /// The metadata the ingestion associated with the content, if any.
     pub metadata: Option<DocumentMetadata>,
+    /// The digest of the source object this document was taken FROM, for a
+    /// document an ingestion job enumerated in its data source's own source;
+    /// `None` for one pushed in through the service's document API, which
+    /// carries its content in the request instead.
+    ///
+    /// It is what tells a re-crawl that a source document has not changed from
+    /// one that was modified since it was last ingested.
+    pub source_digest: Option<u64>,
     pub updated_at: SystemTime,
     pub client_token: Option<String>,
 }
@@ -2010,8 +2125,49 @@ impl DocumentRecord {
             pending_status: Some((now + DOCUMENT_INGESTION_SPAN, DocumentStatus::InProgress)),
             content,
             metadata,
+            source_digest: None,
             updated_at: now,
             client_token,
+        }
+    }
+
+    /// A document an ingestion job took from its data source's own source:
+    /// `STARTING`, with the same progression the clock owes a pushed one, and
+    /// the digest of the source object it was read from.
+    ///
+    /// Its content is where it lives: an S3 source document IS the object at
+    /// that URI, so the record points at it rather than copying its bytes, and
+    /// `ListKnowledgeBaseDocuments` reports exactly the identity the job
+    /// ingested.
+    pub fn crawled(
+        knowledge_base_id: String,
+        data_source_id: String,
+        key: DocumentKey,
+        source_digest: u64,
+        now: SystemTime,
+    ) -> Self {
+        let content = DocumentContent {
+            data_source_type: S3_CONTENT_TYPE.to_string(),
+            custom: None,
+            s3: Some(S3Content {
+                s3_location: S3Location {
+                    uri: key.identity().to_string(),
+                },
+            }),
+        };
+        Self {
+            knowledge_base_id,
+            data_source_id,
+            key,
+            status: DocumentStatus::Starting,
+            pending_status: Some((now + DOCUMENT_INGESTION_SPAN, DocumentStatus::InProgress)),
+            content,
+            metadata: None,
+            source_digest: Some(source_digest),
+            updated_at: now,
+            // No request named this document: the job found it in the data
+            // source's source.
+            client_token: None,
         }
     }
 
@@ -2535,6 +2691,9 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
                 job.updated_at = due;
                 if next == IngestionJobStatus::Complete {
                     job.text_ready_at = Some(due);
+                    // The run is over, so what it measured is what the job
+                    // reports from here on.
+                    job.statistics = job.completed_statistics.clone();
                 }
                 job.pending_status = next
                     .owed_next()
@@ -2705,6 +2864,37 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
         (page.iter().map(|record| record.to_summary()).collect(), next_token)
     }
 
+    /// One `ListKnowledgeBases` page: the knowledge bases after `cursor` in
+    /// creation order, at most `page_size` of them, plus the token to resume
+    /// from when more remain.
+    ///
+    /// Every knowledge base this account holds is reported, whatever its
+    /// status — including one a delete has been accepted for, which reports the
+    /// modelled `DELETING` until the removal the clock owes comes due, exactly
+    /// as a read of it does. One nothing holds is in no listing: a refused
+    /// create leaves no knowledge base to report.
+    pub fn page_of_knowledge_bases(
+        &self,
+        cursor: Option<&KnowledgeBasePageCursor>,
+        page_size: usize,
+    ) -> (Vec<KnowledgeBaseSummary>, Option<String>) {
+        let mut ordered: Vec<&KnowledgeBaseRecord> = self
+            .knowledge_bases
+            .values()
+            .filter(|record| cursor.is_none_or(|cursor| cursor.precedes(record)))
+            .collect();
+        ordered.sort_by(|left, right| left.sort_key().cmp(&right.sort_key()));
+
+        let page: Vec<&KnowledgeBaseRecord> = ordered.iter().take(page_size.max(1)).copied().collect();
+        let next_token = (ordered.len() > page.len())
+            .then(|| page.last().map(|record| record.page_cursor()))
+            .flatten();
+        (
+            page.iter().map(|record| record.to_summary()).collect(),
+            next_token,
+        )
+    }
+
     /// One `ListFlowVersions` page: this flow's versions after `after` in
     /// listing order, at most `page_size` of them, plus the token to resume from
     /// when more remain.
@@ -2827,16 +3017,44 @@ impl ComAmazonawsBedrockagentAmazonbedrockagentbuildtimelambdaState {
 /// different value in a member its own contract documents as unchangeable once
 /// the resource exists.
 ///
-/// The member path the request carries is the one variable part, so one template
-/// serves every such member: `UpdateDataSource` documents "You can't change the
-/// chunkingConfiguration after you create the data source connector. Specify the
-/// existing chunkingConfiguration", and `UpdateKnowledgeBase` documents the same
-/// of `knowledgeBaseConfiguration` and `storageConfiguration`
-/// (`smithy_query(query="doc",shape="UpdateDataSource")` /
-/// `smithy_query(query="doc",shape="UpdateKnowledgeBase")`).
+/// Each such member has its OWN sentence, entirely fixed text with nothing
+/// interpolated from the request or from state: within a generic
+/// `ValidationException` the message is the only discriminator a client has, so
+/// a client that branches on "recreate the knowledge base" rather than
+/// "re-point the storage" needs the two refusals worded apart.
+/// [`IMMUTABLE_MEMBER_MESSAGES`] is the table of the sentences AWS words, and a
+/// member not in it — one no recorded refusal words a sentence for — is refused
+/// by naming the member path the request carried, which is the one thing known
+/// about it.
 pub fn immutable_member_message(member: &str) -> String {
-    format!("{member} cannot be updated once created.")
+    IMMUTABLE_MEMBER_MESSAGES
+        .iter()
+        .find(|(name, _)| *name == member)
+        .map_or_else(
+            || format!("{member} cannot be updated once created."),
+            |(_, message)| (*message).to_string(),
+        )
 }
+
+/// The sentence AWS words for each member an update cannot change, by the
+/// member path the request carries it in.
+///
+/// `UpdateKnowledgeBase` documents both of its own ("You can't change the
+/// knowledgeBaseConfiguration or storageConfiguration fields, so you must
+/// specify the same configurations as when you created the knowledge base",
+/// `smithy_query(query="doc",shape="UpdateKnowledgeBase")`) without publishing
+/// the wording of either refusal, so the sentences are RECORDED: they are what
+/// the service answers, and each is fixed text.
+pub const IMMUTABLE_MEMBER_MESSAGES: [(&str, &str); 2] = [
+    (
+        "knowledgeBaseConfiguration",
+        "You cannot modify the Vector knowledge base configuration once it is created.",
+    ),
+    (
+        "storageConfiguration",
+        "You cannot modify the storage configuration of the Vector knowledge base once created.",
+    ),
+];
 
 /// The `ValidationException` message `UpdateKnowledgeBase` answers when the
 /// update would leave a different `knowledgeBaseConfiguration.type` than the

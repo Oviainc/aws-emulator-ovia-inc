@@ -24,6 +24,16 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The S3 Vectors store a knowledge base binds to: this service resolves the vector
+# bucket and index its `storageConfiguration` names in the service that OWNS them, and
+# writes the ingested vectors there.
+service-com-amazonaws-s3vectors-s3vectors = { workspace = true }
+# The object store an S3 data source is crawled from: an ingestion job enumerates the
+# objects under the configured bucket and prefix in the service that owns them.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+# The published foundation-model catalog, which is what says whether the ARN a
+# knowledge base names as its embedding model is an embedding model at all.
+service-com-amazonaws-bedrock-amazonbedrockcontrolplaneservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

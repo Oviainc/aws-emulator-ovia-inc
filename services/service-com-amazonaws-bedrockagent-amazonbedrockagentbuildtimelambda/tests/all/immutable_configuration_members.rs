@@ -95,6 +95,24 @@ struct Emulator {
 impl Emulator {
     fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+        // The knowledge bases here bind to an S3 Vectors index, which
+        // `CreateKnowledgeBase` resolves in the service that owns it — so every
+        // index a row names is created first, as a caller creates it first
+        // against AWS.
+        for index in [
+            "immutable-members-index",
+            "resupplied-chunking-index",
+            "no-chunking-index",
+            "stored-kb-index",
+            "another-kb-index",
+        ] {
+            crate::vector_store_fixture::seed_index(
+                &engine,
+                "arn:aws:s3vectors:::bucket/immutable-members-vectors",
+                index,
+                crate::vector_store_fixture::EMBEDDING_DIMENSION,
+            );
+        }
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(engine));
@@ -207,10 +225,26 @@ impl Emulator {
 }
 
 /// The refusal message the service answers for a member that cannot change once
-/// the resource exists: one sentence whose only variable part is the member path
-/// the request carries.
+/// the resource exists.
+///
+/// Each member AWS words a sentence for has its OWN, entirely fixed text — the
+/// message is the only discriminator a client has inside a generic
+/// `ValidationException`, so an immutability refusal of the knowledge base's
+/// configuration must not read like one of its storage configuration. A member
+/// AWS words none for is refused by naming the member path the request carried.
 fn immutable_member_message(member: &str) -> String {
-    format!("{member} cannot be updated once created.")
+    match member {
+        "knowledgeBaseConfiguration" => {
+            "You cannot modify the Vector knowledge base configuration once it is created."
+                .to_string()
+        }
+        "storageConfiguration" => {
+            "You cannot modify the storage configuration of the Vector knowledge base once \
+             created."
+                .to_string()
+        }
+        other => format!("{other} cannot be updated once created."),
+    }
 }
 
 /// The sentence AWS words when an update would change the knowledge base's

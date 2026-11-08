@@ -200,6 +200,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The embedding model is what creates the knowledge base's vectors, so
+        // a model that produces something else cannot be it — the same gate
+        // `CreateKnowledgeBase` applies to the same member, since this
+        // operation re-sends the whole configuration.
+        if let Some(embedding_model_arn) = input
+            .knowledge_base_configuration
+            .vector_knowledge_base_configuration
+            .as_ref()
+            .and_then(crate::state::unsupported_embedding_model)
+        {
+            return Err(UpdateKnowledgeBaseErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(crate::state::unsupported_embedding_model_message(
+                        embedding_model_arn,
+                    )),
+                    field_list: None,
+                },
+            )
+            .into());
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut state = state.lock();
         state.materialise_due_transitions(now);

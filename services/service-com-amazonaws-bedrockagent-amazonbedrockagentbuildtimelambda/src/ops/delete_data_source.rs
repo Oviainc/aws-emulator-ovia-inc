@@ -164,50 +164,90 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
-        let mut state = state.lock();
-        // A resource whose earlier deletion the clock has already made due is
-        // gone before this call looks for it.
-        state.materialise_due_transitions(now);
+        let removal = {
+            let mut state = state.lock();
+            // A resource whose earlier deletion the clock has already made due
+            // is gone before this call looks for it.
+            state.materialise_due_transitions(now);
 
-        // The resource this operation acts on is the DATA SOURCE the pair of
-        // path labels addresses, so that pair is what is resolved and that data
-        // source is the resource reported missing: a knowledge base nothing
-        // holds, one itself on its way out of the store, and an id belonging to
-        // another knowledge base's data source all leave the same addressed data
-        // source unresolvable, and the refusal names both identifiers of the
-        // pair rather than the enclosing knowledge base alone.
-        let unresolved = state.live_knowledge_base(&input.knowledge_base_id).is_none();
-        let record = if unresolved {
-            None
-        } else {
-            state.data_source_of(&input.knowledge_base_id, &input.data_source_id)
-        };
-        let Some(record) = record else {
-            return Err(DeleteDataSourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(
-                        crate::state::data_source_of_knowledge_base_not_found_message(
-                            &input.data_source_id,
-                            &input.knowledge_base_id,
+            // The resource this operation acts on is the DATA SOURCE the pair of
+            // path labels addresses, so that pair is what is resolved and that data
+            // source is the resource reported missing: a knowledge base nothing
+            // holds, one itself on its way out of the store, and an id belonging to
+            // another knowledge base's data source all leave the same addressed data
+            // source unresolvable, and the refusal names both identifiers of the
+            // pair rather than the enclosing knowledge base alone.
+            let unresolved = state.live_knowledge_base(&input.knowledge_base_id).is_none();
+            let record = if unresolved {
+                None
+            } else {
+                state.data_source_of(&input.knowledge_base_id, &input.data_source_id)
+            };
+            let Some(record) = record else {
+                return Err(DeleteDataSourceErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(
+                            crate::state::data_source_of_knowledge_base_not_found_message(
+                                &input.data_source_id,
+                                &input.knowledge_base_id,
+                            ),
                         ),
-                    ),
-                },
-            )
-            .into());
+                    },
+                )
+                .into());
+            };
+            let already_deleting = record.is_deleting();
+            // The data source's own `dataDeletionPolicy` decides what becomes of
+            // the vectors its documents were converted into: DELETE "deletes all
+            // data from your data source that's converted into vector embeddings
+            // upon deletion of a knowledge base or data source resource", and
+            // RETAIN leaves them in the vector store.
+            let deletes_vectors = record
+                .data_deletion_policy
+                .as_deref()
+                .is_some_and(|policy| policy == crate::state::DATA_DELETION_POLICY_DELETE);
+
+            // Which vectors this delete takes out of the vector store, read
+            // while the data source is still here to read them off.
+            let removal = (!already_deleting && deletes_vectors)
+                .then(|| {
+                    let uris = state
+                        .ingested_source_uris(&input.knowledge_base_id, &input.data_source_id);
+                    state
+                        .live_knowledge_base(&input.knowledge_base_id)
+                        .and_then(|knowledge_base| {
+                            crate::state::s3_vectors_binding(
+                                knowledge_base.storage_configuration.as_ref(),
+                            )
+                        })
+                        .map(|binding| (binding, uris))
+                })
+                .flatten();
+
+            // The deletion is ACCEPTED here (202) and the data source reports
+            // `DELETING` from now on; the record is removed once the span the clock
+            // owes has passed, so a caller that deletes and then polls observes the
+            // status the modelled `DataSource$status` documents ("Deleting – The
+            // data source is being deleted") and then the modelled 404, rather than
+            // a resource that vanished mid-call.
+            //
+            // `DeleteDataSource` is `@idempotent`, so a repeat while the deletion is
+            // still under way reports that same data source instead of re-arming the
+            // clock.
+            if !already_deleting {
+                state.begin_data_source_deletion(
+                    &input.knowledge_base_id,
+                    &input.data_source_id,
+                    now,
+                );
+            }
+            removal
         };
 
-        // The deletion is ACCEPTED here (202) and the data source reports
-        // `DELETING` from now on; the record is removed once the span the clock
-        // owes has passed, so a caller that deletes and then polls observes the
-        // status the modelled `DataSource$status` documents ("Deleting – The
-        // data source is being deleted") and then the modelled 404, rather than
-        // a resource that vanished mid-call.
-        //
-        // `DeleteDataSource` is `@idempotent`, so a repeat while the deletion is
-        // still under way reports that same data source instead of re-arming the
-        // clock.
-        if !record.is_deleting() {
-            state.begin_data_source_deletion(&input.knowledge_base_id, &input.data_source_id, now);
+        // The vectors leave the store that OWNS them, with no guard of this
+        // service's store held.
+        if let Some((binding, uris)) = removal {
+            crate::state::remove_source_vectors(&*self.engine, &binding, &uris);
         }
 
         Ok(DeleteDataSourceOutput {
