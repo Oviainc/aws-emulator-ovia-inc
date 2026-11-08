@@ -932,6 +932,28 @@ pub const UNSUPPORTED_SOURCE_TABLE_PROPERTIES: &str =
 /// schema lookup, so one operation's miss cannot drift from another's.
 pub const SCHEMA_NOT_FOUND: &str = "Schema is not found.";
 
+/// Any schema-registry operation whose request resolves a schema set but names a VERSION
+/// of it this endpoint holds none of — the miss of a version READ, whether it was
+/// addressed by `SchemaVersionId` or by a version number of a schema set.
+///
+/// NOT recorded: it states the miss in the fixed words of the schema miss above, one
+/// resource level down, and echoes back neither the version the request named nor the
+/// schema set it was named in. Shared by every version lookup, so one operation's miss
+/// cannot drift from another's.
+pub const SCHEMA_VERSION_NOT_FOUND: &str = "Schema version is not found.";
+
+/// `RegisterSchemaVersion` against a schema set whose recorded `Compatibility` admits no
+/// further version. Stated by `CreateSchema`: "Compatibility mode 'DISABLED' restricts any
+/// additional schema versions from being added after the first schema version."
+///
+/// RECORDED template: the fixed sentence plus two variable parts — the mode recorded on
+/// the schema set the request resolved to, and the `SchemaId` the request addressed it by,
+/// rendered member for member ([`super::schema_id_description`]) because the mode is a
+/// property of the schema set and the caller only sent the reference to it.
+pub fn compatibility_does_not_allow_versioning(compatibility: &str, schema_id: &str) -> String {
+    format!("Compatibility {compatibility} does not allow versioning. SchemaId: {schema_id}")
+}
+
 /// `CreateSchema` for a `SchemaName` its registry already holds.
 ///
 /// Recorded template: the fixed collision sentence followed by the MEMBER the create

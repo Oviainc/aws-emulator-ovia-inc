@@ -267,6 +267,8 @@ mod response_members;
 mod schema_registry;
 #[path = "all/schema_version_deletion.rs"]
 mod schema_version_deletion;
+#[path = "all/schema_version_registration.rs"]
+mod schema_version_registration;
 #[path = "all/search_tables.rs"]
 mod search_tables;
 #[path = "all/security_configurations.rs"]

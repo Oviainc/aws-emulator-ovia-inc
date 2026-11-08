@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSchemaVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSchemaVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSchemaVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Reports ONE version of a schema set, read from
+//! [`crate::state::ComAmazonawsGlueAwsglueState::registries`] — so what `CreateSchema` or
+//! `RegisterSchemaVersion` stored is what this reads back, definition included. A
+//! reporting operation: it writes nothing.
+//!
+//! A version is addressed either by its own `SchemaVersionId`, which names it on its own,
+//! or by a `SchemaId` plus the `SchemaVersionNumber` saying which of that set's versions is
+//! meant — "either this or the `SchemaId` wrapper has to be provided"
+//! (`GetSchemaVersionInput$SchemaVersionId`). A request that addresses no version that way
+//! is refused with `InvalidInputException`; one that addresses a version this endpoint
+//! holds none of is refused with `EntityNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +169,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSchemaVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSchemaVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSchemaVersion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(GetSchemaVersionErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue schema registry store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // Reporting only: the stored version is projected out and nothing is written.
+        let store = state.lock();
+        // A `SchemaVersionId` is minted per version and addresses it on its own, so a
+        // request carrying one is answered from it: the id already names one version of one
+        // schema set.
+        let (schema, version) = match input
+            .schema_version_id
+            .as_deref()
+            // An absent `SchemaVersionId` and one sent as `""` say the same thing about
+            // which member the request addressed a version by, and `""` satisfies the
+            // member's modelled pattern no more than it names a version.
+            .filter(|version_id| !version_id.is_empty())
+        {
+            Some(version_id) => match store.schema_version_by_id(version_id) {
+                Some(found) => found,
+                None => return Err(version_not_found()),
+            },
+            // Otherwise the version is addressed within a schema set: the set by its
+            // `SchemaId`, and which of its versions by the `SchemaVersionNumber`.
+            None => {
+                let (Some(schema_id), Some(version_number)) =
+                    (input.schema_id.as_ref(), input.schema_version_number.as_ref())
+                else {
+                    return Err(invalid_input(
+                        crate::state::SCHEMA_VERSION_REQUIRES_ID_OR_NUMBER.to_string(),
+                    ));
+                };
+                let reference = match crate::state::schema_reference(schema_id, &region) {
+                    Ok(reference) => reference,
+                    Err(message) => return Err(invalid_input(message)),
+                };
+                // A schema ARN of another account or another Region names a schema of an
+                // estate this endpoint does not serve, so it names none here whatever this
+                // store holds under that name.
+                let (registry_name, schema_name) = match reference {
+                    crate::state::Reference::Local(names) => names,
+                    crate::state::Reference::Elsewhere(_) => return Err(schema_not_found()),
+                };
+                let Some(schema) = store.schema(&registry_name, &schema_name) else {
+                    return Err(schema_not_found());
+                };
+                // "The latest version available for the schema" or "the version number of
+                // the schema": exactly one of the two names a version, so a value carrying
+                // neither names none and one carrying both names two.
+                let version = match (version_number.latest_version, version_number.version_number)
+                {
+                    (true, None) => schema.latest_version(),
+                    (false, Some(number)) => schema.version(number),
+                    _ => {
+                        return Err(invalid_input(
+                            crate::state::SCHEMA_VERSION_NUMBER_REQUIRES_ONE.to_string(),
+                        ))
+                    }
+                };
+                let Some(version) = version else {
+                    return Err(version_not_found());
+                };
+                (schema, version)
+            }
+        };
+
+        Ok(GetSchemaVersionOutput {
+            schema_version_id: Some(version.version_id.clone()),
+            schema_definition: Some(version.definition.clone()),
+            // The format and the ARN belong to the schema SET the version was registered
+            // against: a version is written "using the DataFormat setting for the
+            // SchemaName", and the ARN is minted for the Region the call is served in, the
+            // way every other schema-registry read mints it.
+            data_format: Some(schema.data_format.clone()),
+            schema_arn: Some(crate::state::schema_arn(
+                &region,
+                &schema.registry_name,
+                &schema.name,
+            )),
+            version_number: Some(version.version_number),
+            status: Some(version.status.clone()),
+            created_time: Some(crate::state::to_timestamp_string(version.created_time)),
+        })
     }
+}
+
+/// This operation's modelled refusal for a request it cannot act on: "The input provided
+/// was not valid."
+fn invalid_input(message: String) -> GetSchemaVersionError {
+    GetSchemaVersionErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
+}
+
+/// This operation's modelled refusal for a `SchemaId` that resolves to a schema set this
+/// endpoint holds none of — the same wording every schema-registry miss answers.
+fn schema_not_found() -> GetSchemaVersionError {
+    GetSchemaVersionErrorModeled::EntityNotFoundException(EntityNotFoundException {
+        message: Some(crate::state::messages::SCHEMA_NOT_FOUND.to_string()),
+        from_federation_source: None,
+    })
+    .into()
+}
+
+/// The same for a request that resolves a schema set but names a version of it this
+/// endpoint holds none of, and for a `SchemaVersionId` no stored version carries.
+fn version_not_found() -> GetSchemaVersionError {
+    GetSchemaVersionErrorModeled::EntityNotFoundException(EntityNotFoundException {
+        message: Some(crate::state::messages::SCHEMA_VERSION_NOT_FOUND.to_string()),
+        from_federation_source: None,
+    })
+    .into()
 }

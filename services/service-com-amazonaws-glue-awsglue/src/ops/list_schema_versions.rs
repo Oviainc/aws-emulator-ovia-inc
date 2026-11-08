@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSchemaVersions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSchemaVersions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSchemaVersions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Reports the versions one schema set holds, read from
+//! [`crate::state::ComAmazonawsGlueAwsglueState::registries`] — so what `CreateSchema` and
+//! `RegisterSchemaVersion` stored is what this lists, one `MaxResults`-sized page at a
+//! time, in registration order. "Empty results will be returned if there are no schema
+//! versions available", so a schema set holding none answers an EMPTY list rather than a
+//! refusal, while a `SchemaId` naming no schema set at all is refused with
+//! `EntityNotFoundException`. A reporting operation: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +83,15 @@
 #[allow(unused_imports)]
 use super::types::*;
 
+/// The page size a request that names no `MaxResults` is served, documented by the member
+/// itself: "Maximum number of results required per page. If the value is not supplied, this
+/// will be defaulted to 25 per page" (`ListSchemaVersionsInput$MaxResults`).
+const DEFAULT_PAGE_SIZE: i32 = 25;
+
+/// The largest page `MaxResults` accepts, from the member's own range
+/// (`MaxResultsNumber`, range 1..100).
+const MAX_PAGE_SIZE: i32 = 100;
+
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
 // expansion fails with `cannot find macro 'smithy' in this scope` and the
@@ -153,18 +163,131 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSchemaVersions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSchemaVersionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSchemaVersions"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(ListSchemaVersionsErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue schema registry store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+        // A schema's ARN is minted for the Region the call is served in, the way every
+        // other schema-registry read mints it.
+        let region = crate::state::request_region(ctx.parts());
+
+        // The schema set this listing is of is resolved the way every schema-registry
+        // operation resolves one: by name or by ARN, and a reference that names neither is a
+        // bad parameter rather than a miss.
+        let reference = match crate::state::schema_reference(&input.schema_id, &region) {
+            Ok(reference) => reference,
+            Err(message) => {
+                return Err(ListSchemaVersionsErrorModeled::InvalidInputException(
+                    InvalidInputException {
+                        message: Some(message),
+                        from_federation_source: None,
+                    },
+                )
+                .into())
+            }
+        };
+        // A schema ARN of another account or another Region names a schema of an estate
+        // this endpoint does not serve, so it names none here whatever this store holds
+        // under that name.
+        let (registry_name, schema_name) = match reference {
+            crate::state::Reference::Local(names) => names,
+            crate::state::Reference::Elsewhere(_) => return Err(schema_not_found()),
+        };
+
+        // Absent, the page is the size the member documents as its default — which is
+        // SMALLER than the largest it accepts; the clamp re-states the modelled range here
+        // so the page size is never 0 even if the boundary validator ever stops enforcing
+        // it.
+        let page_size = usize::try_from(input.max_results.unwrap_or(DEFAULT_PAGE_SIZE))
+            .unwrap_or(DEFAULT_PAGE_SIZE as usize)
+            .clamp(1, MAX_PAGE_SIZE as usize);
+
+        // Reporting only: the stored versions are projected out and nothing is written.
+        let store = state.lock();
+        let Some(schema) = store.schema(&registry_name, &schema_name) else {
+            return Err(schema_not_found());
+        };
+        let schema_arn = crate::state::schema_arn(&region, &schema.registry_name, &schema.name);
+
+        // The versions are held in registration order, so their numbers ascend and one page
+        // follows another deterministically. "A continuation token, if this is a
+        // continuation call": it is the last version number of the previous page, so this
+        // page resumes at the first version strictly after it — which stays correct across
+        // versions registered or deleted between two calls.
+        let start = match input.next_token.as_deref() {
+            Some(cursor) => match crate::state::parse_version_counter(cursor) {
+                Some(resume_after) => schema.versions.partition_point(|version| {
+                    // A stored version number is positive ([`FIRST_SCHEMA_VERSION`]), so
+                    // the conversion holds for every version the set can carry.
+                    u64::try_from(version.version_number).is_ok_and(|number| number <= resume_after)
+                }),
+                // Only this service ever writes the token, and it writes a version number;
+                // a value that spells none names no place in the listing.
+                None => {
+                    return Err(ListSchemaVersionsErrorModeled::InvalidInputException(
+                        InvalidInputException {
+                            message: Some(crate::state::messages::parameter_value_not_valid(
+                                NEXT_TOKEN_MEMBER,
+                            )),
+                            from_federation_source: None,
+                        },
+                    )
+                    .into())
+                }
+            },
+            None => 0,
+        };
+        // Taken with `skip`/`take` rather than by slicing, so a cursor the request chose can
+        // never index outside the set.
+        let page: Vec<SchemaVersionListItem> = schema
+            .versions
+            .iter()
+            .skip(start)
+            .take(page_size)
+            .map(|version| SchemaVersionListItem {
+                schema_arn: Some(schema_arn.clone()),
+                schema_version_id: Some(version.version_id.clone()),
+                version_number: Some(version.version_number),
+                status: Some(version.status.clone()),
+                created_time: Some(crate::state::to_timestamp_string(version.created_time)),
+            })
+            .collect();
+        let end = start.saturating_add(page.len());
+        // "A continuation token … returned if the current segment of the list is not the
+        // last": it names the last entry of the page, taken from the page itself so there is
+        // no index arithmetic to underflow on an empty page.
+        let next_token = if end < schema.versions.len() {
+            page.last()
+                .and_then(|item| item.version_number)
+                .map(|version_number| version_number.to_string())
+        } else {
+            None
+        };
+
+        // "Empty results will be returned if there are no schema versions available": the
+        // member is the empty LIST, not an absent member and not a refusal.
+        Ok(ListSchemaVersionsOutput {
+            schemas: Some(page),
+            next_token,
+        })
     }
+}
+
+/// The member a malformed continuation token is refused on, spelled as the model spells it.
+const NEXT_TOKEN_MEMBER: &str = "NextToken";
+
+/// This operation's modelled refusal for a `SchemaId` that resolves to a schema set this
+/// endpoint holds none of — the same wording every schema-registry miss answers.
+fn schema_not_found() -> ListSchemaVersionsError {
+    ListSchemaVersionsErrorModeled::EntityNotFoundException(EntityNotFoundException {
+        message: Some(crate::state::messages::SCHEMA_NOT_FOUND.to_string()),
+        from_federation_source: None,
+    })
+    .into()
 }

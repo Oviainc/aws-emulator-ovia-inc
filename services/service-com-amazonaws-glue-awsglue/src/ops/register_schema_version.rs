@@ -1,15 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RegisterSchemaVersion
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RegisterSchemaVersion`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RegisterSchemaVersion::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
+//!
+//! Adds a version to a schema set the schema registry already holds: the `SchemaId` is
+//! resolved to the stored schema set, and the version is written to it in
+//! [`crate::state::ComAmazonawsGlueAwsglueState::registries`], so `GetSchemaVersion` and
+//! `ListSchemaVersions` in a later request observe exactly what was registered.
+//!
+//! The operation "will not create a new schema set" — a `SchemaId` this endpoint holds no
+//! schema set for is refused with `EntityNotFoundException`, and so is a well-formed
+//! `SchemaArn` of another account or another Region.
+//!
+//! Which registrations a schema set takes is decided by the `Compatibility` mode recorded
+//! on it: [`crate::state::COMPATIBILITY_DISABLED`] "restricts any additional schema
+//! versions from being added after the first schema version" (`CreateSchema`), so a
+//! registration against such a set is refused with `InvalidInputException` and the set's
+//! version list is left exactly as it was. A registration whose `SchemaDefinition` is one
+//! the set already holds a version of registers nothing either and reports THAT version —
+//! "if the same schema definition is already stored in Schema Registry as a version, the
+//! schema ID of the existing schema is returned to the caller". Otherwise the version is
+//! minted: a fresh `SchemaVersionId`, the set's next `VersionNumber`, and the status every
+//! stored version carries.
 //!
 //! ## Shape of an operation
 //!
@@ -166,18 +179,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RegisterSchemaVersion` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RegisterSchemaVersionErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RegisterSchemaVersion"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported as
+            // that rather than as a client error the caller could act on.
+            return Err(
+                RegisterSchemaVersionErrorModeled::InternalServiceException(
+                    InternalServiceException {
+                        message: Some("the Glue schema registry store is unavailable".into()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // The schema set this registration addresses is resolved first: `SchemaId` may name
+        // it by name or by ARN, and a reference that names neither is a bad parameter
+        // rather than a miss. The ONE resolution every schema-registry operation shares.
+        let reference = match crate::state::schema_reference(&input.schema_id, &region) {
+            Ok(reference) => reference,
+            Err(message) => return Err(invalid_input(message)),
+        };
+        // A schema ARN of another account or another Region names a schema of an estate
+        // this endpoint does not serve, so it names none here whatever this store holds
+        // under that name.
+        let (registry_name, schema_name) = match reference {
+            crate::state::Reference::Local(names) => names,
+            crate::state::Reference::Elsewhere(_) => return Err(schema_not_found()),
+        };
+
+        let now = ::std::time::SystemTime::now();
+        let mut store = state.lock();
+        // "This API will not create a new schema set": a `SchemaId` naming none is a miss.
+        let Some(schema) = store.schema_mut(&registry_name, &schema_name) else {
+            return Err(schema_not_found());
+        };
+
+        // The schema set's own mode decides whether it takes a further version at all, and
+        // a refused registration must leave its version list untouched — so this is
+        // answered before anything is written.
+        if !schema.allows_another_version() {
+            return Err(invalid_input(
+                crate::state::messages::compatibility_does_not_allow_versioning(
+                    &schema.compatibility,
+                    &crate::state::schema_id_description(&input.schema_id),
+                ),
+            ));
+        }
+
+        // "If the same schema definition is already stored in Schema Registry as a version,
+        // the schema ID of the existing schema is returned to the caller": the registration
+        // asks for a version the set already holds, so nothing is added and THAT version is
+        // what the answer reports.
+        if let Some(held) = schema.version_with_definition(&input.schema_definition) {
+            return Ok(RegisterSchemaVersionOutput {
+                schema_version_id: Some(held.version_id.clone()),
+                version_number: Some(held.version_number),
+                status: Some(held.status.clone()),
+            });
+        }
+
+        // The store is resident memory and this registration is reachable by any caller, so
+        // the number of definitions one schema set will hold is bounded.
+        if !schema.can_store_version() {
+            return Err(
+                RegisterSchemaVersionErrorModeled::ResourceNumberLimitExceededException(
+                    ResourceNumberLimitExceededException {
+                        message: Some(format!(
+                            "Schema {schema_name} cannot take another version: a schema set \
+                             holds at most {} versions, numbered up to {}",
+                            crate::state::MAX_VERSIONS_PER_SCHEMA,
+                            crate::state::MAX_SCHEMA_VERSION_NUMBER
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Nothing here is provisioned asynchronously — the definition is stored by the time
+        // this call answers — so the version is readable at once and reports the status
+        // every stored version carries rather than passing through `PENDING`.
+        let registered = schema.register_version(input.schema_definition.clone(), now);
+        let output = RegisterSchemaVersionOutput {
+            schema_version_id: Some(registered.version_id.clone()),
+            version_number: Some(registered.version_number),
+            status: Some(registered.status.clone()),
+        };
+        ::tracing::info!(
+            operation = "RegisterSchemaVersion",
+            registry = %registry_name,
+            schema = %schema_name,
+            version = registered.version_number,
+            "registered a version of a Glue schema set"
+        );
+        Ok(output)
     }
+}
+
+/// This operation's modelled refusal for a request it cannot act on: "The input provided
+/// was not valid."
+fn invalid_input(message: String) -> RegisterSchemaVersionError {
+    RegisterSchemaVersionErrorModeled::InvalidInputException(InvalidInputException {
+        message: Some(message),
+        from_federation_source: None,
+    })
+    .into()
+}
+
+/// This operation's modelled refusal for a `SchemaId` that resolves to a schema set this
+/// endpoint holds none of — the same wording every schema-registry miss answers.
+fn schema_not_found() -> RegisterSchemaVersionError {
+    RegisterSchemaVersionErrorModeled::EntityNotFoundException(EntityNotFoundException {
+        message: Some(crate::state::messages::SCHEMA_NOT_FOUND.to_string()),
+        from_federation_source: None,
+    })
+    .into()
 }

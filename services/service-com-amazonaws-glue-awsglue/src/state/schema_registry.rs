@@ -62,6 +62,27 @@ pub const SCHEMA_VERSION_STATUS_AVAILABLE: &str = "AVAILABLE";
 /// [`SchemaEntry::checkpoint`] records a change of.
 pub const DEFAULT_COMPATIBILITY: &str = "BACKWARD";
 
+/// The `Compatibility` mode that admits no version beyond the first.
+///
+/// Stated by `CreateSchema`: "Compatibility mode 'DISABLED' restricts any additional
+/// schema versions from being added after the first schema version. For all other
+/// compatibility modes, validation of compatibility settings will be applied only from the
+/// second version onwards when the RegisterSchemaVersion API is used." It is named here
+/// because the mode is recorded on the schema set and read back by every registration.
+pub const COMPATIBILITY_DISABLED: &str = "DISABLED";
+
+/// Ceiling on the versions one schema set may hold, for the same reason as
+/// [`MAX_STORED_SCHEMAS`]: every registered `SchemaDefinition` is kept verbatim and the
+/// modelled `SchemaDefinitionString` admits 170000 characters apiece, so the number of
+/// them one schema set accumulates is bounded against a registration any caller can reach.
+/// A registration past it is refused with the operation's own modelled
+/// `ResourceNumberLimitExceededException`.
+pub const MAX_VERSIONS_PER_SCHEMA: usize = 1_000;
+
+/// The highest version number a schema set can report, from the modelled
+/// `VersionLongNumber` every member carrying one targets (range 1..100000).
+pub const MAX_SCHEMA_VERSION_NUMBER: i64 = 100_000;
+
 /// The number of the first version registered against a schema set, which is also the
 /// minimum the modelled `VersionLongNumber` admits (range 1..100000).
 pub const FIRST_SCHEMA_VERSION: i64 = 1;
@@ -177,6 +198,44 @@ pub const REGISTRY_ID_REQUIRES_ONE: &str =
 /// The same for a `SchemaId`, from `SchemaId$SchemaArn`: "One of `SchemaArn` or
 /// `SchemaName` has to be provided."
 pub const SCHEMA_ID_REQUIRES_ONE: &str = "One of SchemaArn or SchemaName has to be provided.";
+
+/// The sentence a refusal carries for a version READ that addresses no version at all.
+/// Stated by the model: "This field is required for fetching by schema ID. Either this or
+/// the `SchemaId` wrapper has to be provided" (`GetSchemaVersionInput$SchemaVersionId`) —
+/// so a version is addressed either by its own id or by a schema set plus which of its
+/// versions is meant.
+pub const SCHEMA_VERSION_REQUIRES_ID_OR_NUMBER: &str =
+    "One of SchemaVersionId or SchemaId and SchemaVersionNumber has to be provided.";
+
+/// The sentence a refusal carries for a `SchemaVersionNumber` that names neither of its
+/// two members, or both of them: one says "the latest version available for the schema"
+/// and the other "the version number of the schema" (`SchemaVersionNumber`), so a value
+/// carrying neither names no version and one carrying both names two.
+pub const SCHEMA_VERSION_NUMBER_REQUIRES_ONE: &str =
+    "One of LatestVersion or VersionNumber has to be provided.";
+
+/// How a member the request did not carry is spelled where a refusal renders the whole
+/// `SchemaId` wrapper back ([`schema_id_description`]).
+const ABSENT_MEMBER: &str = "null";
+
+/// A `SchemaId` as a refusal renders it: the wrapper's own name and its three members, in
+/// the lower-camel spelling the service uses inside a message, each carrying the value the
+/// request sent for it or [`ABSENT_MEMBER`] for one it did not carry.
+///
+/// The ONE rendering of the wrapper, so two refusals cannot disagree about it. Every part
+/// is read off the request, which is what makes the sentence reproducible: the caller sees
+/// the reference it sent, member for member.
+pub fn schema_id_description(schema_id: &SchemaId) -> String {
+    fn member(value: Option<&str>) -> &str {
+        non_empty(value).unwrap_or(ABSENT_MEMBER)
+    }
+    format!(
+        "SchemaId(schemaArn={}, schemaName={}, registryName={})",
+        member(schema_id.schema_arn.as_deref()),
+        member(schema_id.schema_name.as_deref()),
+        member(schema_id.registry_name.as_deref())
+    )
+}
 
 /// The registry a `RegistryId` names, as served in `region`.
 ///
@@ -393,6 +452,91 @@ impl SchemaEntry {
     /// The last version registered against this schema set.
     pub fn latest_version(&self) -> Option<&SchemaVersionEntry> {
         self.versions.last()
+    }
+
+    /// The version this schema set holds under `version_number`, or `None` when it holds
+    /// no such version — one never registered, or one a delete removed.
+    pub fn version(&self, version_number: i64) -> Option<&SchemaVersionEntry> {
+        self.versions
+            .iter()
+            .find(|version| version.version_number == version_number)
+    }
+
+    /// The version whose stored `SchemaDefinition` is exactly `definition`, or `None` when
+    /// this schema set holds no version of it.
+    ///
+    /// Compared byte for byte, as stored: a definition is the artefact a registration
+    /// submitted, and the registry documents no normalisation of it.
+    pub fn version_with_definition(&self, definition: &str) -> Option<&SchemaVersionEntry> {
+        self.versions
+            .iter()
+            .find(|version| version.definition == definition)
+    }
+
+    /// Whether this schema set's recorded `Compatibility` admits a FURTHER version:
+    /// [`COMPATIBILITY_DISABLED`] "restricts any additional schema versions from being
+    /// added after the first schema version", so a set already holding one admits none —
+    /// while a set holding none still takes its first, which is the version every other
+    /// mode's compatibility validation is applied "only from the second version onwards"
+    /// against.
+    pub fn allows_another_version(&self) -> bool {
+        self.compatibility != COMPATIBILITY_DISABLED || self.versions.is_empty()
+    }
+
+    /// Whether this schema set can hold another version: below
+    /// [`MAX_VERSIONS_PER_SCHEMA`], and with a next version number the modelled
+    /// `VersionLongNumber` still admits — version numbers only ever climb
+    /// ([`Self::next_schema_version`]), so a set whose versions have been deleted and
+    /// re-registered many times over can reach the top of that range while holding few.
+    pub fn can_store_version(&self) -> bool {
+        self.versions.len() < MAX_VERSIONS_PER_SCHEMA
+            && self.next_schema_version() <= MAX_SCHEMA_VERSION_NUMBER
+    }
+
+    /// Register `definition` as this schema set's next version, at `now`, and report the
+    /// version stored.
+    ///
+    /// The ONE write that adds a version, so a registration and a create cannot disagree
+    /// about what one is: the number is [`Self::next_schema_version`] and the version is
+    /// appended, which keeps [`Self::versions`] in registration order. The schema set's
+    /// `UpdatedTime` moves with it, because the set now holds something it did not. Its
+    /// `SchemaCheckpoint` does NOT: that records "the last time the compatibility mode was
+    /// changed", which a registration does not change.
+    pub fn register_version(
+        &mut self,
+        definition: String,
+        now: SystemTime,
+    ) -> SchemaVersionEntry {
+        let version_number = self.next_schema_version();
+        let registered = SchemaVersionEntry::new(version_number, definition, now);
+        self.versions.push(registered.clone());
+        self.updated_time = now;
+        registered
+    }
+}
+
+impl ComAmazonawsGlueAwsglueState {
+    /// The schema set and the version a `SchemaVersionId` names, or `None` when this store
+    /// holds no version under that id.
+    ///
+    /// A `SchemaVersionId` is minted per version and addresses it on its own
+    /// (`GetSchemaVersion$SchemaVersionId`), so the search is over every schema set of
+    /// every registry — bounded by [`MAX_STORED_SCHEMAS`] sets of
+    /// [`MAX_VERSIONS_PER_SCHEMA`] versions. The schema set is reported beside the version
+    /// because a read of a version reports its schema's ARN and `DataFormat` too.
+    pub fn schema_version_by_id(
+        &self,
+        version_id: &str,
+    ) -> Option<(&SchemaEntry, &SchemaVersionEntry)> {
+        self.registries.values().find_map(|registry| {
+            registry.schemas.values().find_map(|schema| {
+                schema
+                    .versions
+                    .iter()
+                    .find(|version| version.version_id == version_id)
+                    .map(|version| (schema, version))
+            })
+        })
     }
 }
 
