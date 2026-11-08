@@ -26,6 +26,11 @@ mod cloudformation_asset_bucket_publishing_role;
 #[path = "all/cloudformation_wafv2_protection_stack.rs"]
 mod cloudformation_wafv2_protection_stack;
 // Declared here, in this same head region, for the reason the entry above records: the
+// appended tail and the sorted `c…` span (where every cloudformation suite lands) are both
+// regions concurrently landing suites add their line to.
+#[path = "all/cloudformation_sfn_reference_starts_execution.rs"]
+mod cloudformation_sfn_reference_starts_execution;
+// Declared here, in this same head region, for the reason the entry above records: the
 // appended tail and the sorted `r…` span are both regions concurrently landing suites add
 // their line to.
 #[path = "all/rds_s3_snapshot_export_flow.rs"]
