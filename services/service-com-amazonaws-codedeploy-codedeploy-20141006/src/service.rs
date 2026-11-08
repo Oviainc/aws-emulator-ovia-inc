@@ -45,6 +45,12 @@ use smithy_server_runtime::{
 };
 use std::sync::Arc;
 
+/// What a deployment group's create and update answer BEFORE a refusal of the
+/// request body: the service role the group is to run as. The framework's walk
+/// refuses a modelled constraint before any handler runs, so this is the one seam
+/// where that order can be kept.
+pub mod role_precedence;
+
 /// The answer for a member the request did not give: the modelled error's code,
 /// and the fixed sentence that error carries.
 type AbsentAnswer = Option<(&'static str, &'static str)>;
@@ -358,6 +364,9 @@ fn refusal_answer(violation: &Violation) -> Option<RefusalAnswer> {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The role-precedence layer, held so [`Service::override_operation`] can hand
+    /// the router a borrow of it.
+    role_precedence: role_precedence::RolePrecedence<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -366,7 +375,8 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            role_precedence: role_precedence::RolePrecedence::new(engine),
         }
     }
 }
@@ -397,7 +407,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // correctly; `None` (the default) lets the generated routing table resolve
         // it. `req` is the whole request, so a decision that depends on the body —
         // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
+        //
+        // EDITED HERE, because the decision needs the OPERATION, which only this
+        // seam knows: a request whose body the framework's validating walk would
+        // refuse, sent to an operation that judges the service role a deployment
+        // group is to run as BEFORE it judges the body. The walk runs before any
+        // handler does, so without this seam the member refusal pre-empts the
+        // modelled `InvalidRoleException`. See [`role_precedence`], which claims
+        // nothing else; every other request keeps the generated routing table as
+        // its only source.
+        let protocol = self.entry.protocol();
+        let key = protocol.routing_key(req).ok()?;
+        if self.role_precedence.has_a_question(key, protocol, req) {
+            return Some(&self.role_precedence as &dyn ErasedOperation);
+        }
         None
     }
 

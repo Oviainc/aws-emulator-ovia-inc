@@ -38,6 +38,11 @@ service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = t
 # the move is written there through the shared engine, which needs the owning
 # service's state TYPE (`state::lambda_traffic_shift`).
 service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
+# A deployment group's `serviceRoleArn` is resolved against the account's IAM
+# records before the group is stored — the trust policy of the very role
+# `CreateRole` wrote — which needs the owning service's state TYPE
+# (`state::service_role`).
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 # An Lambda revision IS the AppSpec file, "formatted as JSON or YAML stored as a
 # RawString", so the function, alias and versions a deployment shifts are read
 # out of it with a maintained YAML 1.2 implementation (YAML 1.2 is a superset of
@@ -53,6 +58,9 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 # `time` for the test that waits on a clock-owed deployment transition.
 tokio = { workspace = true, features = ["time"] }
+# Percent-encodes the query-protocol form fields the IAM fixture in the shared test
+# harness sends (`Emulator::iam_query`).
+percent-encoding = "2.3"
 
 [lints]
 workspace = true

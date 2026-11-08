@@ -193,18 +193,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         let _ = ctx;
-        // A deployment group only names a group WITHIN an application, so filtering on
-        // one without the other cannot be resolved. What the request is missing is the
-        // application name, so this is that member's `ApplicationNameRequiredException`
-        // carrying the one sentence that shape owns: the sentence is DELIBERATELY the
-        // same one every other site answers, and says nothing about the paired
-        // `deploymentGroupName` that made the name necessary — a client branches on the
-        // code, and one error shape may not be worded two ways.
+        // The two filters are a PAIR: "If applicationName is specified, then
+        // deploymentGroupName must be specified. If it is not specified, then
+        // deploymentGroupName must not be specified"
+        // (`smithy_query(query="doc",shape="ListDeploymentsInput",member="applicationName")`).
+        // Either one alone names no deployment group within an application, so
+        // it is refused through the member the request is MISSING, each carrying
+        // the one sentence that shape owns: the sentences are DELIBERATELY the
+        // ones every other site answers, and say nothing about the paired member
+        // that made the missing one necessary — a client branches on the code,
+        // and one error shape may not be worded two ways.
         if input.deployment_group_name.is_some() && input.application_name.is_none() {
             return Err(
                 ListDeploymentsErrorModeled::ApplicationNameRequiredException(
                     ApplicationNameRequiredException {
                         message: Some(crate::state::APPLICATION_NAME_MISSING.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+        if input.application_name.is_some() && input.deployment_group_name.is_none() {
+            return Err(
+                ListDeploymentsErrorModeled::DeploymentGroupNameRequiredException(
+                    DeploymentGroupNameRequiredException {
+                        message: Some(crate::state::DEPLOYMENT_GROUP_NAME_MISSING.to_string()),
                     },
                 )
                 .into(),

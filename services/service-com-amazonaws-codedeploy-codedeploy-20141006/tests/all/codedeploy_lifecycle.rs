@@ -27,7 +27,16 @@ pub(crate) struct Emulator {
 
 impl Emulator {
     pub(crate) fn new() -> Self {
-        Self::mounted(false, false)
+        Self::mounted(false, false, false)
+    }
+
+    /// One emulator with IAM mounted beside CodeDeploy on the SAME engine.
+    ///
+    /// The role a deployment group runs as belongs to IAM, so a suite about that
+    /// role creates it through IAM's own front door rather than reaching into its
+    /// store.
+    pub(crate) fn with_iam() -> Self {
+        Self::mounted(false, false, true)
     }
 
     /// One emulator with CloudWatch mounted beside CodeDeploy on the SAME engine.
@@ -36,7 +45,7 @@ impl Emulator {
     /// them drives both services through this one front door — the way the router
     /// mounts them — rather than reaching into either store.
     pub(crate) fn with_cloudwatch() -> Self {
-        Self::mounted(true, false)
+        Self::mounted(true, false, false)
     }
 
     /// One emulator with AWS Lambda mounted beside CodeDeploy on the SAME engine.
@@ -45,19 +54,19 @@ impl Emulator {
     /// suite about that shift creates the function and reads the alias through
     /// Lambda's own front door rather than reaching into its store.
     pub(crate) fn with_lambda() -> Self {
-        Self::mounted(false, true)
+        Self::mounted(false, true, false)
     }
 
     /// One emulator with CloudWatch *and* AWS Lambda mounted beside CodeDeploy on
     /// the SAME engine, for a suite about a shift an ALARM interrupts: the alarm
     /// belongs to one of them and the alias to the other.
     pub(crate) fn with_lambda_and_cloudwatch() -> Self {
-        Self::mounted(true, true)
+        Self::mounted(true, true, false)
     }
 
-    /// The one constructor behind all of them: CodeDeploy, and each of CloudWatch
-    /// and AWS Lambda the caller asks for, on one shared engine.
-    fn mounted(cloudwatch: bool, lambda: bool) -> Self {
+    /// The one constructor behind all of them: CodeDeploy, and each of CloudWatch,
+    /// AWS Lambda and IAM the caller asks for, on one shared engine.
+    fn mounted(cloudwatch: bool, lambda: bool, iam: bool) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
         // The suite signs nothing; routing is by `X-Amz-Target`.
@@ -79,6 +88,13 @@ impl Emulator {
                 service_com_amazonaws_lambda_awsgirapiservice::EmulatedService::new(Arc::clone(
                     &engine,
                 )),
+            );
+        }
+        if iam {
+            router.register_service(
+                service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
+                    Arc::clone(&engine),
+                ),
             );
         }
         Self { router, engine }
@@ -171,6 +187,37 @@ impl Emulator {
         serde_json::from_slice(response.body()).unwrap_or(Value::Null)
     }
 
+    /// One `awsQuery` request against the IAM emulator through the same front
+    /// door, answering its HTTP status and XML body.
+    ///
+    /// IAM's model declares `awsQuery` (`smithy_query(query="service_info")`), so
+    /// its parameters travel as a form body and its answer comes back as XML; the
+    /// SigV4 credential scope is what routes it to the `iam` signing name, and the
+    /// suite verifies no signature. Only meaningful on an [`Emulator::with_iam`].
+    pub(crate) async fn iam_query(&self, action: &str, params: &[(&str, &str)]) -> (u16, String) {
+        let mut body = format!("Action={action}&Version=2010-05-08");
+        for (name, value) in params {
+            body.push('&');
+            body.push_str(&form_encode(name));
+            body.push('=');
+            body.push_str(&form_encode(value));
+        }        let request = ::http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "iam.amazonaws.com")
+            .header("content-type", "application/x-www-form-urlencoded")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/us-east-1/iam/\
+                 aws4_request, SignedHeaders=host, Signature=0000",
+            )
+            .body(bytes::Bytes::from(body))
+            .expect("the request is well formed");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        (status, String::from_utf8_lossy(response.body()).to_string())
+    }
+
     /// One `restJson1` request against the LAMBDA emulator through the same front
     /// door, answering its HTTP status and parsed body.
     ///
@@ -231,6 +278,56 @@ pub(crate) fn error_code(body: &Value) -> String {
         .next()
         .unwrap_or("<no __type>")
         .to_string()
+}
+
+/// Percent-encode one form value the way an AWS SDK encodes an `awsQuery` body, for
+/// [`Emulator::iam_query`]: the crate that owns percent-encoding, over the set that
+/// escapes everything outside the unreserved characters.
+fn form_encode(value: &str) -> String {
+    ::percent_encoding::utf8_percent_encode(value, ::percent_encoding::NON_ALPHANUMERIC).to_string()
+}
+
+/// A trust policy that lets `principal`, and only `principal`, assume the role it is
+/// attached to — the document the IAM fixtures of this target create their roles with.
+pub(crate) fn trust_policy(principal: &str) -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": {"Service": principal},
+            "Action": "sts:AssumeRole",
+        }],
+    })
+    .to_string()
+}
+
+/// Create one IAM role named `name` with `trust` as its trust document, through IAM's
+/// own `CreateRole`, and answer the ARN IAM persisted for it. Only meaningful on an
+/// [`Emulator::with_iam`].
+pub(crate) async fn given_role(emulator: &Emulator, name: &str, trust: &str) -> String {
+    let (status, created) = emulator
+        .iam_query(
+            "CreateRole",
+            &[("RoleName", name), ("AssumeRolePolicyDocument", trust)],
+        )
+        .await;
+    assert_eq!(
+        status, 200,
+        "CreateRole {name} must succeed, got {status} with {created}"
+    );
+    xml_field(&created, "Arn")
+        .unwrap_or_else(|| panic!("CreateRole {name} answered no Arn: {created}"))
+}
+
+/// The text of the first `<name>` element of an `awsQuery` XML answer — IAM speaks
+/// that protocol, so a fixture reading one value back out of its response reads it
+/// here rather than searching the document twice.
+pub(crate) fn xml_field(document: &str, name: &str) -> Option<String> {
+    let open = format!("<{name}>");
+    let close = format!("</{name}>");
+    let start = document.find(&open)? + open.len();
+    let end = document[start..].find(&close)? + start;
+    Some(document[start..end].to_string())
 }
 
 /// An `s3Location` revision, the form the AWS CLI's `--s3-location` sends.
@@ -1380,12 +1477,14 @@ async fn listing_deployments_orders_and_filters_by_the_stored_records() {
     // Rows differ along which filter is applied.
     let cases: &[(&str, Value, Vec<String>)] = &[
         (
-            "by application",
-            json!({"applicationName": "alpha"}),
+            "by application and its other group",
+            json!({"applicationName": "alpha", "deploymentGroupName": "alpha-other"}),
             created
                 .iter()
                 .rev()
-                .filter(|(application, _, _)| application == "alpha")
+                .filter(|(application, group, _)| {
+                    application == "alpha" && group == "alpha-other"
+                })
                 .map(|(_, _, id)| id.clone())
                 .collect(),
         ),
@@ -1449,8 +1548,13 @@ async fn listing_deployments_orders_and_filters_by_the_stored_records() {
             "ApplicationNameRequiredException",
         ),
         (
+            "an application without a group",
+            json!({"applicationName": "alpha"}),
+            "DeploymentGroupNameRequiredException",
+        ),
+        (
             "an unknown application",
-            json!({"applicationName": "ghost"}),
+            json!({"applicationName": "ghost", "deploymentGroupName": "ghost-dg"}),
             "ApplicationDoesNotExistException",
         ),
         (

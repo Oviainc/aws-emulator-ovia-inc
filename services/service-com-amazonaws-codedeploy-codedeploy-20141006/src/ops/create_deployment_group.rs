@@ -307,16 +307,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
         // `applicationName` and `deploymentGroupName` carry modelled length and
         // pattern constraints the boundary has already enforced. `serviceRoleArn` is
-        // @required but carries none, so an empty one reaches the handler and is what
-        // `RoleRequiredException` is for.
-        if input.service_role_arn.trim().is_empty() {
-            return Err(CreateDeploymentGroupErrorModeled::RoleRequiredException(
-                RoleRequiredException {
-                    message: Some(crate::state::ROLE_MISSING.to_string()),
-                },
-            )
-            .into());
+        // @required but carries none, so an empty one — and one that is no role
+        // ARN at all — reaches the handler: the syntax is gated HERE, before
+        // anything is stored, so a group whose role could never let CodeDeploy
+        // act is refused at the call that named it rather than created.
+        match crate::state::check_service_role_arn(&input.service_role_arn) {
+            Ok(()) => {}
+            Err(crate::state::RoleRefusal::Missing) => {
+                return Err(CreateDeploymentGroupErrorModeled::RoleRequiredException(
+                    RoleRequiredException {
+                        message: Some(crate::state::ROLE_MISSING.to_string()),
+                    },
+                )
+                .into());
+            }
+            Err(refusal) => {
+                return Err(CreateDeploymentGroupErrorModeled::InvalidRoleException(
+                    InvalidRoleException {
+                        message: Some(crate::state::invalid_role_message(
+                            refusal,
+                            &input.service_role_arn,
+                        )),
+                    },
+                )
+                .into());
+            }
         }
+        // A group acts as the role it names, so the role is resolved against the
+        // account's own IAM records before anything is stored: a role whose trust
+        // policy does not let CodeDeploy assume it could never deploy. The verdict
+        // is read here, with this service's store unlocked — the two stores are
+        // never held at once — and APPLIED below, once the application the request
+        // names has been resolved, because an application the account does not
+        // hold is answered first. A role the IAM store holds nothing for is no
+        // evidence either way; see `crate::state::service_role`.
+        let role_trust_refusal = crate::state::service_role::unassumable_role_message(
+            &*self.engine,
+            input.service_role_arn.trim(),
+        );
         // The same alarm rules `UpdateDeploymentGroup` enforces, from the one
         // place they live: a deployment group's alarm configuration is bounded
         // and well-formed however it was set.
@@ -418,6 +446,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     ),
                 );
             };
+            // The role the group would run as, now that the application it is
+            // created under has been resolved.
+            if let Some(message) = role_trust_refusal {
+                return Err(CreateDeploymentGroupErrorModeled::InvalidRoleException(
+                    InvalidRoleException {
+                        message: Some(message),
+                    },
+                ));
+            }
             if application
                 .deployment_groups
                 .contains_key(&deployment_group_name)

@@ -71,6 +71,8 @@ mod list_deployment_groups;
 mod list_deployment_instances;
 #[path = "all/list_deployment_targets.rs"]
 mod list_deployment_targets;
+#[path = "all/list_deployments_filter_pair.rs"]
+mod list_deployments_filter_pair;
 #[path = "all/list_on_premises_instances.rs"]
 mod list_on_premises_instances;
 #[path = "all/on_premises_instances.rs"]
@@ -95,6 +97,8 @@ mod refusal_sentence_templates;
 mod resource_tag_removal;
 #[path = "all/resource_tagging.rs"]
 mod resource_tagging;
+#[path = "all/service_role_validation.rs"]
+mod service_role_validation;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stop_deployment.rs"]
@@ -105,3 +109,5 @@ mod success_response_members;
 mod tagging_arn_resource_types;
 #[path = "all/update_application.rs"]
 mod update_application;
+#[path = "all/zz_diag.rs"]
+mod zz_diag;

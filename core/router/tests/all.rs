@@ -15,17 +15,14 @@
 // are where concurrently landing suites add their line, so a declaration placed there
 // collides with every one of them. The head of the list is the one region nothing
 // else appends to.
-// Declared in this same head region, for the reason the note above records.
-#[path = "all/bedrock_agentcore_data_plane_parent_resources.rs"]
-mod bedrock_agentcore_data_plane_parent_resources;
 #[path = "all/cloudformation_fifo_resource_generated_names.rs"]
 mod cloudformation_fifo_resource_generated_names;
+// Declared here, in this same head region, for the reason the entry above records: what a
+// deployed `AWS_IAM` method makes of the credential its request presents, on a router that
+// verifies request signatures.
+#[path = "all/apigateway_iam_authenticated_invoke.rs"]
+mod apigateway_iam_authenticated_invoke;
 // Declared here, in this same head region, for the reason the entry above records.
-#[path = "all/cloudformation_asset_bucket_publishing_role.rs"]
-mod cloudformation_asset_bucket_publishing_role;
-#[path = "all/cloudformation_wafv2_protection_stack.rs"]
-mod cloudformation_wafv2_protection_stack;
-// Declared here, in this same head region, for the reason the entry above records: the
 #[path = "all/cloudformation_rollback_triggers_revert_the_operation.rs"]
 mod cloudformation_rollback_triggers_revert_the_operation;
 // Declared here, in this same head region, for the reason the entry above records: this
@@ -33,6 +30,9 @@ mod cloudformation_rollback_triggers_revert_the_operation;
 // service's span of the sorted list.
 #[path = "all/workspace_lockfile_covers_every_manifest.rs"]
 mod workspace_lockfile_covers_every_manifest;
+#[path = "all/cloudformation_asset_bucket_publishing_role.rs"]
+mod cloudformation_asset_bucket_publishing_role;
+// Declared here, in this same head region, for the reason the entry above records: the
 // appended tail and the sorted `c…` span (where every cloudformation suite lands) are both
 // regions concurrently landing suites add their line to.
 #[path = "all/cloudformation_sfn_reference_starts_execution.rs"]
@@ -52,9 +52,14 @@ mod directory_realm_follows_its_create;
 // Declared here, in this same head region, for the reason the entries above record.
 #[path = "all/directory_data_access_cycle.rs"]
 mod directory_data_access_cycle;
+// Declared here, in this same head region, for the reason the entries above record: the
+#[path = "all/cloudformation_lambda_ssm_sourced_update.rs"]
+mod cloudformation_lambda_ssm_sourced_update;
 // appended tail and the sorted `k…` span are both regions concurrently landing suites add
 #[path = "all/kinesisvideo_discovered_data_plane.rs"]
 mod kinesisvideo_discovered_data_plane;
+#[path = "all/lambda_sqs_event_source_batching_window.rs"]
+mod lambda_sqs_event_source_batching_window;
 #[path = "all/codebuild_service_role_trust.rs"]
 mod codebuild_service_role_trust;
 #[path = "all/codebuild_artifacts_override_bucket.rs"]
@@ -417,10 +422,11 @@ mod cloudformation_provisions_scheduler_schedules;
 mod cloudformation_provisions_stack_resources;
 #[path = "all/cloudfront_api_call_events.rs"]
 mod cloudfront_api_call_events;
-// Declared HERE, in sorted position beside the other CloudFront suites, rather than appended
-// at the end of this file: the tail is where every suite landing in the same window appends.
-#[path = "all/cloudfront_edge_metrics_drive_the_alarm_chain.rs"]
-mod cloudfront_edge_metrics_drive_the_alarm_chain;
+// Declared HERE, in the sorted list beside the other CloudFront suites, rather than
+// appended at the end of this file: the tail is where every suite landing in the same
+// window appends, so a line added there conflicts with all of them.
+#[path = "all/cloudfront_edge_cache_refresh.rs"]
+mod cloudfront_edge_cache_refresh;
 #[path = "all/cloudfront_key_value_store_handshake.rs"]
 mod cloudfront_key_value_store_handshake;
 // Declared HERE, in the sorted list beside the other CloudFront suite, rather than appended
@@ -603,7 +609,6 @@ mod iot_command_deprecation_is_observable_on_the_data_plane;
 #[path = "all/iot_command_execution_lifecycle.rs"]
 mod iot_command_execution_lifecycle;
 // Declared HERE, beside the command-execution suite it is the sibling of, rather than
-// appended at the end of this file: the tail is where every suite landing in the same
 // window appends, so it is the contended region, while these neighbouring lines are
 #[path = "all/iot_command_executions_are_listed_across_planes.rs"]
 mod iot_command_executions_are_listed_across_planes;
@@ -874,6 +879,8 @@ mod cloudformation_provisions_elastic_beanstalk_resources;
 mod cloudformation_provisions_sqs_queue_policies;
 #[path = "all/cloudformation_provisions_sqs_queues.rs"]
 mod cloudformation_provisions_sqs_queues;
+#[path = "all/cloudformation_imports_an_existing_queue.rs"]
+mod cloudformation_imports_an_existing_queue;
 #[path = "all/opensearchserverless_cloudformation_resources.rs"]
 mod opensearchserverless_cloudformation_resources;
 #[path = "all/cloudformation_provisions_container_platform_resources.rs"]
@@ -964,6 +971,11 @@ mod apigateway_account_cloudwatch_role;
 // Service control plane and its data plane over one engine.
 #[path = "all/ds_data_plane_access_and_realm.rs"]
 mod ds_data_plane_access_and_realm;
+// Declared here, in this quiet span rather than in the contended tail: a log group's
+// subscription filter, the Firehose stream it forwards to and the object that stream
+// delivers.
+#[path = "all/logs_subscription_filter_to_firehose_s3.rs"]
+mod logs_subscription_filter_to_firehose_s3;
 #[path = "all/zz_probe_whole_emulator.rs"]
 mod zz_probe_whole_emulator;
 #[path = "all/cloudformation_provisions_cognito_identity_pools.rs"]
@@ -978,21 +990,27 @@ mod sns_lambda_cdk_subscription_delivery;
 // and the log group the invocation that path makes writes its run to.
 #[path = "all/apigateway_proxy_lambda_ddb_pipeline.rs"]
 mod apigateway_proxy_lambda_ddb_pipeline;
-// Declared here, in this same head region, for the reason the entry above records: what a
-// deployed `AWS_IAM` method makes of the credential its request presents, on a router that
-// verifies request signatures.
-#[path = "all/apigateway_iam_authenticated_invoke.rs"]
-mod apigateway_iam_authenticated_invoke;
-#[path = "all/lambda_sqs_event_source_batching_window.rs"]
-mod lambda_sqs_event_source_batching_window;
 // Declared here, in the appended tail: what a DICOM import job leaves in its data store,
 // read from the objects Amazon S3 holds under the role IAM holds.
 #[path = "all/medical_imaging_dicom_import.rs"]
 mod medical_imaging_dicom_import;
+#[path = "all/cloudformation_wafv2_protection_stack.rs"]
+mod cloudformation_wafv2_protection_stack;
 // Declared here, in the appended tail: what REPEATED requests to one deployed stage are each
 // answered with, and the one stream record each new item they write carries.
 #[path = "all/apigateway_repeated_stage_requests.rs"]
 mod apigateway_repeated_stage_requests;
+// Declared HERE, beside the sibling suites above in the same quiet `n`/`o` gap, for the
+// reason those entries record: the appended tail at the end of this file and the `e…` span
+#[path = "all/eks_control_plane_logs.rs"]
+mod eks_control_plane_logs;
+// Declared in this same head region, for the reason the note above records.
+#[path = "all/bedrock_agentcore_data_plane_parent_resources.rs"]
+mod bedrock_agentcore_data_plane_parent_resources;
+// Declared HERE, in sorted position beside the other CloudFront suites, rather than appended
+// at the end of this file: the tail is where every suite landing in the same window appends.
+#[path = "all/cloudfront_edge_metrics_drive_the_alarm_chain.rs"]
+mod cloudfront_edge_metrics_drive_the_alarm_chain;
 // The five suites that stood here — `apigateway_iam_authenticated_invoke`,
 // `cloudformation_rollback_triggers_revert_the_operation`,
 // `cloudformation_wafv2_protection_stack`, `lambda_sqs_event_source_batching_window` and
@@ -1001,10 +1019,6 @@ mod apigateway_repeated_stage_requests;
 // concurrent changes appended the same entry, which is a redefinition and stops this target
 // from compiling; the duplicate lines are removed here and the first declaration of each
 // stands.
-// Declared HERE, beside the sibling suites above in the same quiet `n`/`o` gap, for the
-// reason those entries record: the appended tail at the end of this file and the `e…` span
-#[path = "all/eks_control_plane_logs.rs"]
-mod eks_control_plane_logs;
 // Declared here, in the appended tail, for the reason the entries above record: the tail and
 // the sorted `c…` span (where every cloudformation and codepipeline suite would land) are
 #[path = "all/cloudformation_provisions_codebuild_projects.rs"]
@@ -1013,20 +1027,6 @@ mod cloudformation_provisions_codebuild_projects;
 mod ecr_push_triggers_its_pipeline;
 #[path = "all/codepipeline_build_action_invokes_codebuild.rs"]
 mod codepipeline_build_action_invokes_codebuild;
-// Declared here, in this same head region, for the reason the entries above record: the
-#[path = "all/cloudformation_lambda_ssm_sourced_update.rs"]
-mod cloudformation_lambda_ssm_sourced_update;
-// Declared HERE, in the sorted list beside the other CloudFront suites, rather than
-// window appends, so a line added there conflicts with all of them.
-#[path = "all/cloudfront_edge_cache_refresh.rs"]
-mod cloudfront_edge_cache_refresh;
-#[path = "all/cloudformation_imports_an_existing_queue.rs"]
-mod cloudformation_imports_an_existing_queue;
-// Declared here, in this quiet span rather than in the contended tail: a log group's
-// subscription filter, the Firehose stream it forwards to and the object that stream
-// delivers.
-#[path = "all/logs_subscription_filter_to_firehose_s3.rs"]
-mod logs_subscription_filter_to_firehose_s3;
 #[path = "all/zz_opensearch_fgac_probe.rs"]
 mod zz_opensearch_fgac_probe;
 // Declared here, in this same head region, for the reason the entries above record: this

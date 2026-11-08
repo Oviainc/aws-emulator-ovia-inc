@@ -276,7 +276,12 @@ async fn renaming_an_application_moves_the_record_and_everything_that_names_it()
             "case {case}: expected the deployment listed under the new name, got {listed:?}"
         );
         let (status, body) = emulator
-            .call("ListDeployments", json!({"applicationName": old}))
+            .call(
+                "ListDeployments",
+                // The two filters are a pair the model requires together, so the
+                // old name is asked about with the group it used to hold.
+                json!({"applicationName": old, "deploymentGroupName": GROUP}),
+            )
             .await;
         assert_eq!(
             (status, error_code(&body).as_str()),

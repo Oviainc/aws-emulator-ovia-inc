@@ -130,7 +130,12 @@ async fn an_unknown_application_is_named_after_the_delimiter() {
         // listing, and the two creates that resolve an application.
         let requests: Vec<(&str, Value)> = vec![
             ("GetApplication", json!({"applicationName": ghost})),
-            ("ListDeployments", json!({"applicationName": ghost})),
+            (
+                // `ListDeployments` takes `applicationName` and
+                // `deploymentGroupName` as a pair, so the listing names both.
+                "ListDeployments",
+                json!({"applicationName": ghost, "deploymentGroupName": "any-group"}),
+            ),
             (
                 "GetDeploymentGroup",
                 json!({"applicationName": ghost, "deploymentGroupName": "any-group"}),
@@ -619,7 +624,7 @@ async fn a_member_the_request_did_not_give_is_answered_with_its_own_sentence() {
             "GetDeploymentGroup",
             json!({"applicationName": "required-members", "deploymentGroupName": ""}),
             "DeploymentGroupNameRequiredException",
-            "Deployment group name is missing",
+            "Deployment Group name is missing",
         ),
         (
             // The handler refuses this one: `deploymentGroupName` is modelled
@@ -628,7 +633,7 @@ async fn a_member_the_request_did_not_give_is_answered_with_its_own_sentence() {
             "CreateDeployment",
             json!({"applicationName": "required-members", "revision": revision}),
             "DeploymentGroupNameRequiredException",
-            "Deployment group name is missing",
+            "Deployment Group name is missing",
         ),
         (
             "GetDeployment",

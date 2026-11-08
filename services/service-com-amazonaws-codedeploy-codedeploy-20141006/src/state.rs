@@ -48,6 +48,10 @@ pub mod lambda_traffic_shift;
 /// this service.
 pub mod deployment_clock;
 
+/// The service role a deployment group runs under, resolved against the
+/// account's own IAM records: the one place a `serviceRoleArn` is asked about.
+pub mod service_role;
+
 use crate::ops::types::{
     AlarmConfiguration, AutoRollbackConfiguration, BlueGreenDeploymentConfiguration,
     DeploymentStyle, EC2DeploymentOptions, EC2TagFilter, EC2TagSet, ECSService, LoadBalancerInfo,
@@ -481,8 +485,9 @@ pub const APPLICATION_NAME_MISSING: &str = "Application name is missing";
 
 /// `DeploymentGroupNameRequiredException` (HTTP 400). See
 /// [`APPLICATION_NAME_MISSING`]: one fixed sentence per required-member error,
-/// naming the member in prose and interpolating nothing.
-pub const DEPLOYMENT_GROUP_NAME_MISSING: &str = "Deployment group name is missing";
+/// naming the member in prose and interpolating nothing. CodeDeploy capitalises
+/// the resource in its own prose, as `deployment_group_already_exists` does.
+pub const DEPLOYMENT_GROUP_NAME_MISSING: &str = "Deployment Group name is missing";
 
 /// `DeploymentConfigNameRequiredException` (HTTP 400). See
 /// [`APPLICATION_NAME_MISSING`].
@@ -3358,6 +3363,82 @@ pub fn is_iam_user_arn(candidate: &str) -> bool {
 /// `RegisterOnPremisesInstance$iamSessionArn` associates with the instance.
 pub fn is_iam_session_arn(candidate: &str) -> bool {
     is_arn_of(candidate, "sts", "assumed-role")
+}
+
+/// Whether `candidate` is an IAM role ARN —
+/// `arn:<partition>:iam::<account>:role/<name>`, the form the IAM User Guide
+/// gives for a role resource and the only thing a deployment group's
+/// `serviceRoleArn` ("A service role Amazon Resource Name (ARN) that allows
+/// CodeDeploy to act on the user's behalf",
+/// `smithy_query(query="doc",shape="CreateDeploymentGroupInput",member="serviceRoleArn")`)
+/// can name.
+pub fn is_iam_role_arn(candidate: &str) -> bool {
+    is_arn_of(candidate, "iam", "role")
+}
+
+/// The prefix every ARN opens with, whatever it names.
+const ARN_PREFIX: &str = "arn:";
+
+/// Why CodeDeploy will not take a value as a deployment group's service role.
+///
+/// The operations that SET one — creating a group, and replacing a group's role
+/// — share this verdict, so a role the one accepts is a role the other accepts,
+/// and each maps it to the modelled error IT declares for the case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleRefusal {
+    /// The request carried no role at all: absent, empty, or only whitespace.
+    Missing,
+    /// The value is not an ARN: it does not even open with [`ARN_PREFIX`].
+    NotAnArn,
+    /// The value IS an ARN, but not one naming an IAM role.
+    NotAnIamRole,
+}
+
+/// Read `candidate` as a deployment group's service role ARN.
+///
+/// The syntax is checked BEFORE anything is stored: a deployment group whose
+/// service role is not a role ARN could never deploy, so the value is refused at
+/// the call that named it rather than kept and failed far from there. The model
+/// puts no `@pattern` on `Role` (`smithy_query(query="shape",shape="Role")`), so
+/// the form a value must satisfy is the documented ARN form — and for a service
+/// role, an IAM role's ([`is_iam_role_arn`]).
+pub fn check_service_role_arn(candidate: &str) -> Result<(), RoleRefusal> {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return Err(RoleRefusal::Missing);
+    }
+    if !candidate.starts_with(ARN_PREFIX) {
+        return Err(RoleRefusal::NotAnArn);
+    }
+    if !is_iam_role_arn(candidate) {
+        return Err(RoleRefusal::NotAnIamRole);
+    }
+    Ok(())
+}
+
+/// `InvalidRoleException` (HTTP 400): the sentence that refusal carries for each
+/// way a service role ARN can fail [`check_service_role_arn`], so every
+/// operation taking one refuses it in the same words. The value the caller sent
+/// is quoted back bounded by [`echoed`], since `Role` carries no modelled
+/// maximum length.
+///
+/// A value that is not an ARN at all is refused by the rule every ARN is read
+/// by, which is the sentence AWS states for it; the other two are about the ARN
+/// naming the wrong thing, which is what the error's own documented sentence
+/// ("The service role ARN was specified in an invalid format") describes.
+pub fn invalid_role_message(refusal: RoleRefusal, candidate: &str) -> String {
+    match refusal {
+        RoleRefusal::Missing => {
+            "The service role ARN was specified in an invalid format: it is empty".to_string()
+        }
+        RoleRefusal::NotAnArn => {
+            format!("ARNs must start with '{ARN_PREFIX}': {}", echoed(candidate))
+        }
+        RoleRefusal::NotAnIamRole => format!(
+            "The service role ARN {} was specified in an invalid format",
+            echoed(candidate)
+        ),
+    }
 }
 
 /// The resource-type segment of an application's ARN:

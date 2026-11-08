@@ -423,22 +423,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // `serviceRoleArn` carries no modelled constraint, so a blank
         // replacement reaches the handler; a group always has a service role, so
-        // this is a replacement in an invalid format rather than a removal.
-        if input
-            .service_role_arn
-            .as_ref()
-            .is_some_and(|arn| arn.trim().is_empty())
-        {
-            return Err(UpdateDeploymentGroupErrorModeled::InvalidRoleException(
-                InvalidRoleException {
-                    message: Some(
-                        "The service role ARN was specified in an invalid format: it is empty"
-                            .to_string(),
-                    ),
-                },
-            )
-            .into());
-        }
+        // this is a replacement in an invalid format rather than a removal. The
+        // same gate `CreateDeploymentGroup` applies answers every other way a
+        // replacement can fail to name a role: one rule for the role a group
+        // runs under, however it was set.
+        let role_trust_refusal = match input.service_role_arn.as_deref() {
+            Some(arn) => {
+                if let Err(refusal) = crate::state::check_service_role_arn(arn) {
+                    return Err(UpdateDeploymentGroupErrorModeled::InvalidRoleException(
+                        InvalidRoleException {
+                            message: Some(crate::state::invalid_role_message(refusal, arn)),
+                        },
+                    )
+                    .into());
+                }
+                // And the replacement is resolved against the account's own IAM
+                // records exactly as a created group's role is: a group may not
+                // be moved onto a role CodeDeploy cannot assume either. The
+                // verdict is read with this service's store unlocked and applied
+                // below, once the group being updated has been resolved.
+                crate::state::service_role::unassumable_role_message(&*self.engine, arn.trim())
+            }
+            None => None,
+        };
 
         let outcome = crate::state::with_state(&*self.engine, |state| {
             // Resolving a NAMED configuration is a read of the configuration
@@ -485,6 +492,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         },
                     ),
                 );
+            }
+            // The role the group would run as, now that the group being updated
+            // has been resolved.
+            if let Some(message) = role_trust_refusal {
+                return Err(UpdateDeploymentGroupErrorModeled::InvalidRoleException(
+                    InvalidRoleException {
+                        message: Some(message),
+                    },
+                ));
             }
             // A `newDeploymentGroupName` equal to the current one asks for no
             // rename at all, so it is not a collision with itself.
