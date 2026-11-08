@@ -36,6 +36,31 @@ use smithy_server_runtime::MultiServiceRouter;
 /// `tests/all/sub_resource_content_scope.rs`).
 pub(crate) const REGION: &str = "us-west-2";
 
+/// The S3 bucket a harvest job's destination names in this crate's suites, and the second
+/// one an idempotency row switches to.
+///
+/// `CreateHarvestJob` refuses a destination the object store does not hold (see
+/// `state::harvest_destination`), so an emulator a suite submits a harvest job to has to
+/// HOLD these buckets. `pub(crate)` with [`hold_harvest_destinations`]: the one place the
+/// crate's suites name a destination, so the body `rejection_rule_and_negative_paths`
+/// builds and the bucket seeded here cannot drift apart.
+pub(crate) const HARVEST_BUCKET: &str = "harvest-bucket";
+/// See [`HARVEST_BUCKET`].
+pub(crate) const ALTERNATE_HARVEST_BUCKET: &str = "another-harvest-bucket";
+
+/// Record the destination buckets of [`HARVEST_BUCKET`] and [`ALTERNATE_HARVEST_BUCKET`] in
+/// `region`, in Amazon S3's OWN store in this engine — the store `CreateHarvestJob` resolves
+/// a harvest destination against, written through the object store's own `create_bucket`, so
+/// what a suite provisions is what a real `CreateBucket` would have left there.
+pub(crate) fn hold_harvest_destinations(engine: &engine::InMemoryEngine, region: &str) {
+    let buckets = service_com_amazonaws_s3_amazons3::state::service_state(engine)
+        .expect("the shared engine holds Amazon S3's store");
+    let mut store = buckets.lock();
+    for bucket in [HARVEST_BUCKET, ALTERNATE_HARVEST_BUCKET] {
+        store.create_bucket(bucket, region);
+    }
+}
+
 /// A MediaPackageV2 emulator plus a tiny restJson1 client for it.
 ///
 /// `pub(crate)` so the crate's other suites drive the emulator through this one client
@@ -60,6 +85,10 @@ impl Emulator {
                 Arc::clone(&engine),
             ),
         );
+        // A harvest job exports to a bucket Amazon S3 owns, and a create whose destination
+        // the object store does not hold is refused, so the destinations this crate's
+        // harvest-job bodies name are held before any suite submits one.
+        hold_harvest_destinations(&engine, REGION);
         Self { router, engine }
     }
 
@@ -117,6 +146,39 @@ impl Emulator {
         region: &str,
         headers: &[(&str, &str)],
     ) -> (u16, Value) {
+        let response = self
+            .dispatch_in_region(method, path, body, host, region, headers)
+            .await;
+        let status = response.status().as_u16();
+        let bytes = response.into_body();
+        let parsed = if bytes.is_empty() {
+            Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+                panic!(
+                    "{method} {path} answered {status} with a body that is not JSON: {e}: {}",
+                    String::from_utf8_lossy(&bytes)
+                )
+            })
+        };
+        (status, parsed)
+    }
+
+    /// As [`Emulator::send_in_region`], with the WHOLE response kept — its status, its
+    /// headers and its body bytes.
+    ///
+    /// `pub(crate)` because how an answer is FRAMED is a property of the response rather
+    /// than of the body it carries, and the parsing clients above drop the headers that
+    /// state it (see `tests/all/empty_response_framing.rs`).
+    pub(crate) async fn dispatch_in_region(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+        host: &str,
+        region: &str,
+        headers: &[(&str, &str)],
+    ) -> http::Response<bytes::Bytes> {
         let payload = body.map(|b| b.to_string()).unwrap_or_default();
         let mut builder = http::Request::builder()
             .method(method)
@@ -136,20 +198,26 @@ impl Emulator {
         let request = builder
             .body(bytes::Bytes::from(payload))
             .expect("a well-formed test request");
-        let response = self.router.dispatch(request).await;
-        let status = response.status().as_u16();
-        let bytes = response.into_body();
-        let parsed = if bytes.is_empty() {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-                panic!(
-                    "{method} {path} answered {status} with a body that is not JSON: {e}: {}",
-                    String::from_utf8_lossy(&bytes)
-                )
-            })
-        };
-        (status, parsed)
+        self.router.dispatch(request).await
+    }
+
+    /// [`Emulator::dispatch_in_region`] against this suite's control-plane host and Region,
+    /// which is what every control-plane case addresses.
+    pub(crate) async fn dispatch(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<Value>,
+    ) -> http::Response<bytes::Bytes> {
+        self.dispatch_in_region(
+            method,
+            path,
+            body,
+            &format!("mediapackagev2.{REGION}.amazonaws.com"),
+            REGION,
+            &[],
+        )
+        .await
     }
 
     pub(crate) async fn create_group(&self, name: &str, body: Value) -> (u16, Value) {

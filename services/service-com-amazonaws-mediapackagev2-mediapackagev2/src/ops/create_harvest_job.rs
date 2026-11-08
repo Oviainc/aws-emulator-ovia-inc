@@ -17,9 +17,13 @@
 //! `INVALID_HARVEST_JOB_DURATION`; an unresolved parent chain is
 //! `ResourceNotFoundException` (404) with the service's fixed per-resource sentence; a
 //! channel that receives no ingest of its own has no content to export, so a job against
-//! one of its endpoints is `MULTIVIEW_INPUT_TYPE_WITH_HARVEST_JOB`; a name already taken
-//! anywhere in that CHANNEL is `ConflictException` (409); a harvested manifest the endpoint
-//! does not publish is `HARVESTED_MANIFEST_NOT_FOUND_ON_ENDPOINT`; an endpoint already
+//! one of its endpoints is `MULTIVIEW_INPUT_TYPE_WITH_HARVEST_JOB`; a harvested manifest
+//! the endpoint does not publish is `HARVESTED_MANIFEST_NOT_FOUND_ON_ENDPOINT`; a
+//! destination the harvest could not be written to is
+//! `HARVEST_JOB_UNABLE_TO_WRITE_TO_S3_DESTINATION`, read off the object store that would
+//! have to take the export (see `state::harvest_destination`); a name already taken
+//! anywhere in that CHANNEL is
+//! `ConflictException` (409); an endpoint already
 //! holding as many jobs as it may is `ServiceQuotaExceededException` (402), worded by the
 //! crate's one quota refusal builder like every sibling create's.
 //!
@@ -318,6 +322,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@pattern ^[\S]+$`). There is no destination the validator admits that this
         // handler could still call incomplete.
 
+        // Whether the harvest could be WRITTEN where the submission says is read off the
+        // object store that would have to take its output — in memory, from Amazon S3's own
+        // state in this same shared engine (`state::harvest_destination`), whose guard is
+        // taken and released before this service's is, so no two orders of the same two
+        // locks exist. The verdict is held until the endpoint the job would harvest has
+        // resolved below, so a submission that fails both is told to fix the resource it
+        // addressed rather than the destination.
+        let destination_refusal = crate::state::harvest_destination::destination_refusal(
+            &*self.engine,
+            &region,
+            &input.destination.s3_destination.bucket_name,
+        );
+
         let mut store = state.lock();
         let Some(group) = store.channel_group_mut(&region, &input.channel_group_name) else {
             return Err(CreateHarvestJobErrorModeled::ResourceNotFoundException(
@@ -376,6 +393,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 ),
             )
             .into());
+        }
+
+        // The endpoint the job would harvest holds up its end, so the destination is now
+        // the thing the caller has to fix: the verdict read off the object store above is
+        // reported here, before any token is spent or any name is taken, so a refused
+        // submission leaves the store exactly as it found it.
+        if let Some(refusal) = destination_refusal {
+            return Err(CreateHarvestJobErrorModeled::ValidationException(refusal).into());
         }
 
         // The request's own fingerprint: every member it carried EXCEPT the token that

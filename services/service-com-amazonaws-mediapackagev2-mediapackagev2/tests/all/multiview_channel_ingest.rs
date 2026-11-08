@@ -155,7 +155,17 @@ fn published_urls(body: &Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// [`GROUP`] with its [`SOURCES`] in place, so the multiview rows resolve, reporting the
+/// The DNS every ingest hostname of a group shares: everything from the `.ingest.` label
+/// onwards of a hostname the service published. Each ingest ENDPOINT carries its own first
+/// label in front of it.
+fn ingest_dns(host: &str) -> &str {
+    let at = host
+        .find(".ingest.")
+        .unwrap_or_else(|| panic!("a published ingest hostname carries the ingest label, got {host}"));
+    &host[at..]
+}
+
+/// [`GROUP`] with its [`SOURCES`] in place, so the multiview rows resolve, reporting one
 /// ingest hostname the group's channels publish their URLs on.
 ///
 /// The hostname is read off a published URL rather than built here: a path this suite
@@ -251,18 +261,33 @@ async fn only_a_channel_that_receives_ingest_of_its_own_publishes_ingest_endpoin
                 "case {label:?}: a channel that receives ingest publishes a redundant pair of \
                  ingest endpoints, got {published:?}"
             );
+            let dns = ingest_dns(&host);
+            let mut hosts: Vec<String> = Vec::new();
             for (position, url) in published.iter().enumerate() {
                 let (url_host, path) = split_url(url);
-                assert_eq!(
-                    url_host, host,
-                    "case {label:?}: published URL {position} must be on the group's ingest \
-                     hostname, got {url}"
+                assert!(
+                    url_host.ends_with(dns),
+                    "case {label:?}: published URL {position} must be on the group's ingest DNS \
+                     {dns}, got {url}"
                 );
                 assert!(
                     path.contains(&format!("/{}/", row.channel)),
                     "case {label:?}: published URL {position} must name the channel, got {url}"
                 );
+                hosts.push(url_host);
             }
+            // Each endpoint of the pair is a separate ingest TARGET, so each is published
+            // on a host of its own: two publishers sending to the redundant pair address
+            // different hostnames rather than one host under two paths.
+            let mut distinct = hosts.clone();
+            distinct.sort();
+            distinct.dedup();
+            assert_eq!(
+                distinct.len(),
+                hosts.len(),
+                "case {label:?}: each published ingest endpoint must have its own hostname, got \
+                 {hosts:?}"
+            );
         } else {
             assert!(
                 published.is_empty(),

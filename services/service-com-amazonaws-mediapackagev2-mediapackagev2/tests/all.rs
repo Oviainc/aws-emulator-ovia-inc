@@ -150,3 +150,11 @@ mod multiview_epoch_locking;
 mod tag_key_character_bound;
 #[path = "all/sub_resource_content_scope.rs"]
 mod sub_resource_content_scope;
+#[path = "all/empty_response_framing.rs"]
+mod empty_response_framing;
+#[path = "all/entity_tag_encoding.rs"]
+mod entity_tag_encoding;
+#[path = "all/ingest_endpoint_hosts.rs"]
+mod ingest_endpoint_hosts;
+#[path = "all/harvest_destination.rs"]
+mod harvest_destination;

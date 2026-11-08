@@ -53,7 +53,7 @@ const ORIGIN_ENDPOINT_NOT_FOUND: &str = "MediaPackage can't process your request
      can't find your origin endpoint. Verify your origin endpoint name or add an origin \
      endpoint and then try again";
 const HARVEST_JOB_NOT_FOUND: &str = "MediaPackage can't process your request because we \
-     can't find your harvest job. Verify your harvest job name or add a harvest job and \
+     can't find your harvest job. Verify your harvest job id or create a harvest job and \
      then try again";
 const RESOURCE_ALREADY_EXISTS: &str = "MediaPackage can't create the resource you requested \
      because a resource with that name already exists. Verify the name of the resource and \
@@ -113,8 +113,14 @@ impl Emulator {
         // This suite signs nothing: it exercises handler behaviour, not authentication.
         router.set_request_authentication(false);
         router.register_service(
-            service_com_amazonaws_mediapackagev2_mediapackagev2::EmulatedService::new(engine),
+            service_com_amazonaws_mediapackagev2_mediapackagev2::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
         );
+        // A harvest job exports to a bucket Amazon S3 owns, and a create whose destination
+        // the object store does not hold is refused, so the destinations [`harvest_body`]
+        // names are held before any suite submits one.
+        crate::channel_lifecycle::hold_harvest_destinations(&engine, REGION);
         Self { router }
     }
 
@@ -1159,7 +1165,10 @@ pub(crate) fn harvest_body(start: f64, end: f64, manifests: &[&str]) -> Value {
         },
         "ScheduleConfiguration": {"StartTime": start, "EndTime": end},
         "Destination": {
-            "S3Destination": {"BucketName": "harvest-bucket", "DestinationPath": "out/"},
+            "S3Destination": {
+                "BucketName": crate::channel_lifecycle::HARVEST_BUCKET,
+                "DestinationPath": "out/",
+            },
         },
     })
 }

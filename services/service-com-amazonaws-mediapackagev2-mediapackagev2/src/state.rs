@@ -48,6 +48,17 @@ use crate::ops::types::{
     ServiceQuotaExceededException, ValidationException,
 };
 
+/// The CDN-authorization, segment-encryption and key-provider-URL rules of an origin
+/// endpoint, grouped in their own file. Re-exported here so every caller keeps reaching
+/// them at `crate::state::…`.
+mod endpoint_security;
+pub use endpoint_security::*;
+
+/// Pre-flighting a harvest job's destination against the object store that would have to
+/// take its output. Reached as `crate::state::harvest_destination::…`, like the rest of
+/// this module's parts.
+pub mod harvest_destination;
+
 /// The signing name (and ARN service namespace) of this service, from the model's
 /// `awsService.sigv4Name`.
 pub const SIGNING_NAME: &str = "mediapackagev2";
@@ -1295,11 +1306,11 @@ fn derived_harvest_job_name(
     at: ::aws_smithy_types::DateTime,
     salt: usize,
 ) -> String {
-    let digest = etag(&[
+    let digest = hex::encode(field_digest(&[
         seed.to_string(),
         at.as_secs_f64().to_string(),
         salt.to_string(),
-    ]);
+    ]));
     digest[..DERIVED_HARVEST_JOB_NAME_CHARS].to_string()
 }
 
@@ -2457,6 +2468,13 @@ pub fn parse_ingest_path(path: &str) -> Option<IngestTarget> {
 /// [`is_multiview_input_type`]) — a channel with no ingest stream of its own has no URL
 /// for a contributing encoder to push to, and `IngestEndpoints` carries no `@required` on
 /// any channel shape, so reporting none is what the model represents that with.
+///
+/// Each endpoint of the pair is a SEPARATE ingest target, so each is published on its own
+/// hostname: the group's ingest DNS ([`ingest_domain`]) with a first label of its own,
+/// built from the channel's identity and that endpoint's ordinal
+/// ([`ingest_endpoint_label`]). Two redundant endpoints that differed only in their URL
+/// PATH would be one host to a client that pins or load-balances per ingest endpoint,
+/// which cannot distinguish the two publishers MediaPackage hands them to.
 pub fn ingest_endpoints(
     egress_domain: &str,
     group: &str,
@@ -2466,14 +2484,39 @@ pub fn ingest_endpoints(
     if is_multiview_input_type(input_type) {
         return Vec::new();
     }
-    let host = ingest_domain(egress_domain);
+    let domain = ingest_domain(egress_domain);
+    // Everything after the group's own first label: the DNS both halves of a group's data
+    // plane share, which is what each endpoint's own label is prefixed onto.
+    let group_dns = domain
+        .split_once('.')
+        .map_or(domain.as_str(), |(_label, rest)| rest);
     (1..=INGEST_ENDPOINTS_PER_CHANNEL)
-        .map(|index| IngestEndpoint {
-            id: Some(index.to_string()),
-            url: Some(format!("https://{host}/in/v1/{group}/{index}/{channel}/index")),
+        .map(|index| {
+            let host = format!("{}.{group_dns}", ingest_endpoint_label(&domain, channel, index));
+            IngestEndpoint {
+                id: Some(index.to_string()),
+                url: Some(format!("https://{host}/in/v1/{group}/{index}/{channel}/index")),
+            }
         })
         .collect()
 }
+
+/// The first label of ONE ingest endpoint's hostname: a label derived from the channel's
+/// identity, carrying that endpoint's ordinal.
+///
+/// A function of the resource and the ordinal, so the host is stable across reads, distinct
+/// per endpoint of a channel and distinct per channel of a group — never of the moment the
+/// channel was created. The digest part is this emulator's own opaque label; what the
+/// service guarantees about it is that the endpoints of one channel differ in it.
+fn ingest_endpoint_label(ingest_domain: &str, channel: &str, ordinal: u8) -> String {
+    format!(
+        "{}-{ordinal}",
+        short_digest(&[ingest_domain, channel], INGEST_ENDPOINT_LABEL_CHARS)
+    )
+}
+
+/// How many digest characters an ingest endpoint's own label carries before its ordinal.
+const INGEST_ENDPOINT_LABEL_CHARS: usize = 6;
 
 /// The container-format suffix a manifest's URL ends in.
 ///
@@ -2707,19 +2750,36 @@ pub fn attached_multiview_channels(group: &ChannelGroup, channel_name: &str) -> 
 
 /// A length-prefixed digest over the fields the caller supplies.
 ///
-/// The one hashing primitive this module has: each resource's `recompute_etag` (and
-/// [`origin_endpoint_etag`]) builds an entity tag with it, and [`request_fingerprint`] a
-/// create's idempotency fingerprint. The length prefix is what makes two different field
-/// sequences unable to collide, so what the digest means is decided entirely by which
-/// fields the caller passes.
-pub fn etag(fields: &[String]) -> String {
+/// The one hashing primitive this module has: [`etag`] renders an entity tag from it and
+/// [`request_fingerprint`] a create's idempotency fingerprint. The length prefix is what
+/// makes two different field sequences unable to collide, so what the digest means is
+/// decided entirely by which fields the caller passes.
+fn field_digest(fields: &[String]) -> [u8; 32] {
     let mut hasher = Sha256::new();
     for field in fields {
         // Length-prefixed, so ["a", "bc"] and ["ab", "c"] cannot hash alike.
         hasher.update(field.len().to_le_bytes());
         hasher.update(field.as_bytes());
     }
-    hex::encode(hasher.finalize())
+    hasher.finalize().into()
+}
+
+/// The entity tag over the fields the caller supplies: the BASE64 of their digest
+/// ([`field_digest`]).
+///
+/// Each resource's `recompute_etag` (and [`origin_endpoint_etag`]) builds its `ETag` here,
+/// so the whole service hands entity tags out in one encoding. That encoding is base64 of
+/// the 32 digest bytes — the form every `ETag` MediaPackage issues takes, a 44-character
+/// token ending in the base64 padding character — rather than the digest's hex, which
+/// would make a token this emulator issues twice as long as the real service's and so not
+/// interchangeable with one a client recorded, persisted or pattern-checked. The modelled
+/// `EntityTag` (`@length` 1..256, `@pattern ^[\S]+$`) admits the base64 alphabet, padding
+/// included.
+pub fn etag(fields: &[String]) -> String {
+    ::base64::Engine::encode(
+        &::base64::engine::general_purpose::STANDARD,
+        field_digest(fields),
+    )
 }
 
 /// A tag map rendered in a canonical order, for feeding to [`etag`]. A `HashMap`
@@ -2795,9 +2855,11 @@ pub fn match_client_token<'a>(
 /// flattened to one field, a repeat that submitted that default would ask for a different
 /// resource under the first attempt's fingerprint.
 pub fn request_fingerprint(fields: &[String]) -> String {
-    // The same length-prefixed digest an ETag is built with, for the same reason: no two
-    // different field sequences may collide.
-    etag(fields)
+    // The same length-prefixed digest an ETag is built from, for the same reason: no two
+    // different field sequences may collide. A fingerprint is never on the wire — it is
+    // only ever compared with another fingerprint of this store — so it is rendered in hex
+    // rather than in the base64 an `ETag` has to be handed out in.
+    hex::encode(field_digest(fields))
 }
 
 /// The conflict a repeat create under a token that was used for a DIFFERENT request is
@@ -2885,6 +2947,22 @@ impl ResourceKind {
         }
     }
 
+    /// How a not-found sentence asks the caller to check this kind, and what it tells them
+    /// to do about it: the identifier the resource is ADDRESSED by, and the verb that
+    /// brings one into being.
+    ///
+    /// A harvest job is addressed by an id and is created; every other kind of this
+    /// hierarchy is addressed by a name and is added. The recorded `GetHarvestJob` and
+    /// `CancelHarvestJob` 404s word it that way, and the other kinds' recorded 404s word it
+    /// the other, so the sentence is a property of the KIND rather than one phrasing for
+    /// all of them.
+    fn not_found_remedy(self) -> (&'static str, &'static str) {
+        match self {
+            Self::HarvestJob => ("id", "create"),
+            Self::ChannelGroup | Self::Channel | Self::OriginEndpoint => ("name", "add"),
+        }
+    }
+
     /// The 404 for a resource of this kind the service cannot find.
     ///
     /// The sentence names the KIND and nothing else: a caller's resource names are not
@@ -2893,10 +2971,12 @@ impl ResourceKind {
     pub fn not_found(self) -> ResourceNotFoundException {
         let noun = self.noun();
         let article = self.article();
+        let (identifier, remedy) = self.not_found_remedy();
         ResourceNotFoundException {
             message: Some(format!(
                 "MediaPackage can't process your request because we can't find your {noun}. \
-                 Verify your {noun} name or add {article} {noun} and then try again"
+                 Verify your {noun} {identifier} or {remedy} {article} {noun} and then try \
+                 again"
             )),
             resource_type_not_found: Some(self.resource_type_not_found().to_string()),
         }
@@ -4275,598 +4355,6 @@ fn element_path(list_path: &str, index: usize) -> String {
     format!("{list_path}.{}.member", index + 1)
 }
 
-/// Refuse a `CdnAuthConfiguration` whose ARNs are not ones this service could ever read.
-///
-/// CDN authorization makes MediaPackage fetch the named secrets through the named role, so
-/// each entry of `CdnIdentifierSecretArns` has to be the ARN of a Secrets Manager secret in
-/// the SAME account and Region as the endpoint the policy is attached to (the account every
-/// resource here belongs to, [`::engine::emulator_account_id`], and `region`, the Region the
-/// request is served in), the list must name each secret once, and `SecretsRoleArn` has to
-/// be the ARN of an IAM role. A value outside that is an input failure whose
-/// `ValidationExceptionType` names which of those it is, and `None` means the block is one
-/// the service could act on.
-///
-/// How MANY secrets the list may carry is the model's own `@length 1..100` on
-/// `CdnIdentifierSecretArns`, so the boundary validator refuses a list outside it before any
-/// handler runs; this reads only what the model says nothing about.
-pub fn cdn_auth_rejection(
-    configuration: &CdnAuthConfiguration,
-    region: &str,
-) -> Option<ValidationException> {
-    /// The wire path of the block's members, under the member the request carries it at.
-    const SECRETS: &str = "cdnAuthConfiguration.cdnIdentifierSecretArns";
-    const ROLE: &str = "cdnAuthConfiguration.secretsRoleArn";
-
-    let account = ::engine::emulator_account_id();
-    for (index, secret) in configuration.cdn_identifier_secret_arns.iter().enumerate() {
-        let path = element_path(SECRETS, index);
-        let Some(arn) = ::service_common::arn::parse(secret)
-            .filter(|_| SECRETS_MANAGER_SECRET_ARN.admits(secret))
-        else {
-            return Some(validation_failed(
-                &path,
-                &arn_requirement_detail(SECRETS_MANAGER_SECRET_ARN),
-                VALIDATION_MALFORMED_SECRET_ARN,
-            ));
-        };
-        if arn.region != region {
-            return Some(validation_failed(
-                &path,
-                &arn_scope_detail("the Region", region),
-                VALIDATION_SECRET_FROM_DIFFERENT_REGION,
-            ));
-        }
-        if arn.account != account {
-            return Some(validation_failed(
-                &path,
-                &arn_scope_detail("the account", account),
-                VALIDATION_SECRET_FROM_DIFFERENT_ACCOUNT,
-            ));
-        }
-    }
-
-    // Repetition is judged after the forms are, so a list of junk is told what an entry has
-    // to BE before it is told it sent one twice. The model puts no `@uniqueItems` on the
-    // list, so this is the handler's to read.
-    let mut named: BTreeSet<&str> = BTreeSet::new();
-    for (index, secret) in configuration.cdn_identifier_secret_arns.iter().enumerate() {
-        if !named.insert(secret.as_str()) {
-            let requirement = format!(
-                "Member must name a secret the list does not already name. {CHECK_THE_VALUE}"
-            );
-            return Some(validation_failed(
-                &element_path(SECRETS, index),
-                &requirement,
-                VALIDATION_DUPLICATED_SECRET,
-            ));
-        }
-    }
-
-    (!IAM_ROLE_ARN.admits(&configuration.secrets_role_arn)).then(|| {
-        validation_failed(
-            ROLE,
-            &arn_requirement_detail(IAM_ROLE_ARN),
-            VALIDATION_ROLE_ARN_INVALID_FORMAT,
-        )
-    })
-}
-
-/// Refuse a segment whose SPEKE key provider names something other than an IAM role.
-///
-/// `SpekeKeyProvider$RoleArn` is the role MediaPackage ASSUMES to reach the key provider, so
-/// the same rule as the CDN authorization role applies to it: a value that is not the ARN of
-/// an IAM role names no role to assume. Shared by the writers of an endpoint's segment
-/// (`CreateOriginEndpoint` and `UpdateOriginEndpoint`) so both read it the same way.
-/// `SpekeKeyProvider$CertificateArn` states its own `@pattern` in the model, so the boundary
-/// validator reads that one and this does not.
-pub fn speke_role_arn_rejection(segment: Option<&Segment>) -> Option<ValidationException> {
-    let role_arn = &segment?.encryption.as_ref()?.speke_key_provider.role_arn;
-    (!IAM_ROLE_ARN.admits(role_arn)).then(|| {
-        validation_failed(
-            "segment.encryption.spekeKeyProvider.roleArn",
-            &arn_requirement_detail(IAM_ROLE_ARN),
-            VALIDATION_ROLE_ARN_INVALID_FORMAT,
-        )
-    })
-}
-
-// =============================================================================
-// Validation: the encryption settings an origin endpoint's segment carries
-// =============================================================================
-
-/// `ValidationExceptionType` values a refused `Segment.Encryption` carries, from the
-/// model's `ValidationExceptionType` enum.
-///
-/// The enum names one value per way the block can be a configuration the service could not
-/// act on: the encryption METHOD against the endpoint's container format
-/// ([`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`]), the constant
-/// initialization vector against that method ([`VALIDATION_CENC_IV_INCOMPATIBLE`]), the
-/// DRM systems against it ([`VALIDATION_DRM_SYSTEMS_ENCRYPTION_METHOD_INCOMPATIBLE`]), key
-/// rotation against the container ([`VALIDATION_ISM_CONTAINER_WITH_KEY_ROTATION`]), the
-/// encryption contract's presets against each other and against the container
-/// ([`VALIDATION_ENCRYPTION_CONTRACT_UNENCRYPTED`],
-/// [`VALIDATION_ENCRYPTION_CONTRACT_SHARED`],
-/// [`VALIDATION_ENCRYPTION_CONTRACT_WITH_ISM_CONTAINER_INCOMPATIBLE`]) and the content-key
-/// period timing against the SPEKE version and key rotation it needs
-/// ([`VALIDATION_CONTENT_KEY_PERIOD_TIMING_REQUIRES_SPEKE_V2_1`],
-/// [`VALIDATION_CONTENT_KEY_PERIOD_TIMING_WITHOUT_KEY_ROTATION`]).
-pub const VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH: &str =
-    "ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH";
-/// See [`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`].
-pub const VALIDATION_CENC_IV_INCOMPATIBLE: &str = "CENC_IV_INCOMPATIBLE";
-/// See [`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`].
-pub const VALIDATION_DRM_SYSTEMS_ENCRYPTION_METHOD_INCOMPATIBLE: &str =
-    "DRM_SYSTEMS_ENCRYPTION_METHOD_INCOMPATIBLE";
-/// See [`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`].
-pub const VALIDATION_ISM_CONTAINER_WITH_KEY_ROTATION: &str = "ISM_CONTAINER_WITH_KEY_ROTATION";
-/// See [`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`].
-pub const VALIDATION_ENCRYPTION_CONTRACT_UNENCRYPTED: &str = "ENCRYPTION_CONTRACT_UNENCRYPTED";
-/// See [`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`].
-pub const VALIDATION_ENCRYPTION_CONTRACT_SHARED: &str = "ENCRYPTION_CONTRACT_SHARED";
-/// See [`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`].
-pub const VALIDATION_ENCRYPTION_CONTRACT_WITH_ISM_CONTAINER_INCOMPATIBLE: &str =
-    "ENCRYPTION_CONTRACT_WITH_ISM_CONTAINER_INCOMPATIBLE";
-/// See [`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`].
-pub const VALIDATION_CONTENT_KEY_PERIOD_TIMING_REQUIRES_SPEKE_V2_1: &str =
-    "CONTENT_KEY_PERIOD_TIMING_REQUIRES_SPEKE_V2_1";
-/// See [`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`].
-pub const VALIDATION_CONTENT_KEY_PERIOD_TIMING_WITHOUT_KEY_ROTATION: &str =
-    "CONTENT_KEY_PERIOD_TIMING_WITHOUT_KEY_ROTATION";
-
-/// The wire path of the encryption block, under the member the request carries it at.
-const ENCRYPTION_MEMBER: &str = "segment.encryption";
-
-/// The `EncryptionMethod` member an endpoint of this container type carries its method in,
-/// and the container format that member names.
-///
-/// `EncryptionMethod` declares exactly one member per container format the service
-/// packages — `TsEncryptionMethod`, `CmafEncryptionMethod`, `IsmEncryptionMethod`
-/// (`smithy_query(query="shape",shape="EncryptionMethod")`) — so which of them an endpoint
-/// may carry is decided by its `ContainerType` (TS | CMAF | ISM), and the model's
-/// `ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH` is the refusal of any other. `None` for a
-/// container value the model does not name; the boundary validator has already refused one
-/// against the `ContainerType` enum.
-fn encryption_method_member(container: &str) -> Option<&'static str> {
-    match container {
-        "TS" => Some("tsEncryptionMethod"),
-        "CMAF" => Some("cmafEncryptionMethod"),
-        CONTAINER_TYPE_ISM => Some("ismEncryptionMethod"),
-        _ => None,
-    }
-}
-
-/// Every `EncryptionMethod` member the request set, as `(member, value)` pairs in the
-/// order the model declares them.
-fn submitted_encryption_methods(method: &EncryptionMethod) -> Vec<(&'static str, &str)> {
-    [
-        ("tsEncryptionMethod", method.ts_encryption_method.as_deref()),
-        (
-            "cmafEncryptionMethod",
-            method.cmaf_encryption_method.as_deref(),
-        ),
-        (
-            "ismEncryptionMethod",
-            method.ism_encryption_method.as_deref(),
-        ),
-    ]
-    .into_iter()
-    .filter_map(|(member, value)| value.map(|value| (member, value)))
-    .collect()
-}
-
-/// The `DrmSystem` values an encryption method can protect content with, or an empty slice
-/// for a method value the model does not name.
-///
-/// Each encryption method is a packaging of ONE content-protection scheme, and each DRM
-/// system supports the schemes its vendor implements: `AES_128` is HLS AES-128 with a key
-/// the player fetches in the clear, which is what `CLEAR_KEY_AES_128` names; `SAMPLE_AES`
-/// is Apple's sample encryption, used by `FAIRPLAY`; `CENC` and `CBCS` are the two Common
-/// Encryption schemes, and of them FairPlay signals only `cbcs`, while the Common
-/// Encryption systems (`PLAYREADY`, `WIDEVINE`, `IRDETO`) carry both. The model's
-/// `DRM_SYSTEMS_ENCRYPTION_METHOD_INCOMPATIBLE` is the refusal of a pair outside that, and
-/// the values are the model's own (`smithy_query(query="shape",shape="DrmSystem,
-/// CmafEncryptionMethod,TsEncryptionMethod,IsmEncryptionMethod")`).
-fn drm_systems_for_encryption_method(method: &str) -> &'static [&'static str] {
-    match method {
-        "AES_128" => &["CLEAR_KEY_AES_128"],
-        "SAMPLE_AES" => &["FAIRPLAY"],
-        ENCRYPTION_METHOD_CENC => &["PLAYREADY", "WIDEVINE", "IRDETO"],
-        "CBCS" => &["FAIRPLAY", "PLAYREADY", "WIDEVINE", "IRDETO"],
-        _ => &[],
-    }
-}
-
-/// The Common Encryption method value both the CMAF and the ISM container name, from the
-/// model's `CmafEncryptionMethod` and `IsmEncryptionMethod` enums.
-const ENCRYPTION_METHOD_CENC: &str = "CENC";
-
-/// The `PresetSpeke20Audio` / `PresetSpeke20Video` value that asks for ONE content key
-/// across every audio and video track ("SHARED - Use the same content key for all of the
-/// audio and video tracks in your stream").
-const PRESET_SHARED: &str = "SHARED";
-
-/// The preset value that asks for no encryption of its track group ("UNENCRYPTED - Don't
-/// encrypt any of the audio tracks in your stream").
-const PRESET_UNENCRYPTED: &str = "UNENCRYPTED";
-
-/// The `ContentKeyPeriodTiming` values whose doc states that they signal the start and end
-/// times a content key is used for, and therefore "Requires `SpekeVersion` `V2_1`" and key
-/// rotation ("Signaling start and end times … also requires key rotation to be enabled",
-/// `smithy_query(query="doc",shape="ContentKeyPeriodConfiguration",member="ContentKeyPeriodTiming")`).
-const CONTENT_KEY_PERIOD_TIMINGS_WITH_START_END: &[&str] =
-    &["START_END_ONLY", "INDEX_WITH_START_END"];
-
-/// The `SpekeVersion` those timings require, from the model's `SpekeVersion` enum.
-const SPEKE_VERSION_WITH_KEY_PERIOD_TIMING: &str = "V2_1";
-
-/// The `SpekeVersion` an endpoint's key provider is read as when the request names none
-/// ("If you don't specify a value, the default is `V2_0`").
-const DEFAULT_SPEKE_VERSION: &str = "V2_0";
-
-/// Refuse a segment whose encryption settings are a configuration the service could not
-/// act on, or `None` when the block is one it can.
-///
-/// `Segment.Encryption` is a cross-member configuration: the method, the initialization
-/// vector, the DRM systems, the encryption contract and the key-provider endpoint only make
-/// sense together and against the endpoint's `ContainerType`, and the model states each way
-/// they can disagree as its own `ValidationExceptionType` (see
-/// [`VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH`]) — none of which the boundary
-/// validator can decide, since each is about two members at once. Shared by the writers of
-/// an endpoint's segment (`CreateOriginEndpoint` and `UpdateOriginEndpoint`) so both read
-/// the block the same way, and decided before anything is stored: an endpoint persisted
-/// with settings the key provider could never serve publishes manifests no player can
-/// decrypt.
-///
-/// `SpekeKeyProvider$RoleArn` is read by [`speke_role_arn_rejection`], beside the other
-/// caller-supplied ARN of this model.
-pub fn segment_encryption_rejection(
-    segment: Option<&Segment>,
-    container: &str,
-) -> Option<ValidationException> {
-    let encryption = segment?.encryption.as_ref()?;
-    let provider = &encryption.speke_key_provider;
-    // The member this endpoint's container format configures its method through. `None`
-    // for a container value the model does not name — the method rules below then decide
-    // nothing, while the rules that are about the block alone still do.
-    let expected_member = encryption_method_member(container);
-    let submitted = submitted_encryption_methods(&encryption.encryption_method);
-
-    // The method first: every later rule is about the method the endpoint encrypts with.
-    if let Some(expected_member) = expected_member {
-        for (member, _) in &submitted {
-            if *member != expected_member {
-                return Some(validation_failed(
-                    &format!("{ENCRYPTION_MEMBER}.encryptionMethod.{member}"),
-                    &format!(
-                        "An encryption method of a {container} container endpoint is \
-                         configured through {expected_member}. {CHECK_THE_VALUE}"
-                    ),
-                    VALIDATION_ENCRYPTION_METHOD_CONTAINER_TYPE_MISMATCH,
-                ));
-            }
-        }
-    }
-    let method = expected_member.and_then(|expected_member| {
-        submitted
-            .iter()
-            .find_map(|(member, value)| (*member == expected_member).then_some(*value))
-    });
-
-    if let Some(method) = method {
-        // Common Encryption derives each sample's initialization vector from the content
-        // key, so a CENC endpoint has no constant one to be given.
-        if encryption.constant_initialization_vector.is_some()
-            && method == ENCRYPTION_METHOD_CENC
-        {
-            return Some(validation_failed(
-                &format!("{ENCRYPTION_MEMBER}.constantInitializationVector"),
-                &format!(
-                    "A constant initialization vector can't be combined with the \
-                     {method} encryption method. Remove the vector, or encrypt with a \
-                     method that takes one"
-                ),
-                VALIDATION_CENC_IV_INCOMPATIBLE,
-            ));
-        }
-        let carried = drm_systems_for_encryption_method(method);
-        let incompatible = provider
-            .drm_systems
-            .iter()
-            .find(|system| !carried.contains(&system.as_str()));
-        // A method value the model does not name constrains nothing here; the boundary
-        // validator has already refused one against the method's own enum.
-        if let Some(system) = incompatible.filter(|_| !carried.is_empty()) {
-            return Some(validation_failed(
-                &format!("{ENCRYPTION_MEMBER}.spekeKeyProvider.drmSystems"),
-                &format!(
-                    "The {system} DRM system can't be combined with the {method} \
-                     encryption method. The DRM systems that method supports are {}",
-                    carried.join(", ")
-                ),
-                VALIDATION_DRM_SYSTEMS_ENCRYPTION_METHOD_INCOMPATIBLE,
-            ));
-        }
-    }
-
-    // Key rotation, and then the encryption contract, against the container.
-    if is_ism_container(container) && encryption.key_rotation_interval_seconds.is_some() {
-        return Some(validation_failed(
-            &format!("{ENCRYPTION_MEMBER}.keyRotationIntervalSeconds"),
-            &format!(
-                "An {container} container endpoint can't rotate content keys. Remove the \
-                 rotation interval, or create an origin endpoint whose container type \
-                 rotates keys"
-            ),
-            VALIDATION_ISM_CONTAINER_WITH_KEY_ROTATION,
-        ));
-    }
-    let contract = &provider.encryption_contract_configuration;
-    let audio = contract.preset_speke20_audio.as_str();
-    let video = contract.preset_speke20_video.as_str();
-    let contract_member = format!("{ENCRYPTION_MEMBER}.spekeKeyProvider.encryptionContractConfiguration");
-    if audio == PRESET_UNENCRYPTED && video == PRESET_UNENCRYPTED {
-        return Some(validation_failed(
-            &contract_member,
-            &format!(
-                "An encryption contract that leaves both the audio and the video tracks \
-                 {PRESET_UNENCRYPTED} encrypts nothing. Choose a preset for the audio or \
-                 the video tracks, or remove the encryption settings"
-            ),
-            VALIDATION_ENCRYPTION_CONTRACT_UNENCRYPTED,
-        ));
-    }
-    if (audio == PRESET_SHARED) != (video == PRESET_SHARED) {
-        return Some(validation_failed(
-            &contract_member,
-            &format!(
-                "The {PRESET_SHARED} preset uses one content key for all of the audio and \
-                 video tracks, so it has to be the preset of both. {CHECK_THE_VALUE}"
-            ),
-            VALIDATION_ENCRYPTION_CONTRACT_SHARED,
-        ));
-    }
-    if is_ism_container(container) && !(audio == PRESET_SHARED && video == PRESET_SHARED) {
-        return Some(validation_failed(
-            &contract_member,
-            &format!(
-                "An {container} container endpoint encrypts every track with one content \
-                 key, so its encryption contract must use the {PRESET_SHARED} preset for \
-                 the audio and the video tracks. {CHECK_THE_VALUE}"
-            ),
-            VALIDATION_ENCRYPTION_CONTRACT_WITH_ISM_CONTAINER_INCOMPATIBLE,
-        ));
-    }
-
-    // The content-key period timing, against the two things its doc says it needs.
-    let timing = provider
-        .content_key_period_configuration
-        .as_ref()
-        .and_then(|configuration| configuration.content_key_period_timing.as_deref());
-    if let Some(timing) = timing.filter(|timing| {
-        CONTENT_KEY_PERIOD_TIMINGS_WITH_START_END.contains(timing)
-    }) {
-        let timing_member =
-            format!("{ENCRYPTION_MEMBER}.spekeKeyProvider.contentKeyPeriodConfiguration.contentKeyPeriodTiming");
-        let speke_version = provider
-            .speke_version
-            .as_deref()
-            .unwrap_or(DEFAULT_SPEKE_VERSION);
-        if speke_version != SPEKE_VERSION_WITH_KEY_PERIOD_TIMING {
-            return Some(validation_failed(
-                &timing_member,
-                &format!(
-                    "Signaling the times a content key is used for requires SpekeVersion \
-                     {SPEKE_VERSION_WITH_KEY_PERIOD_TIMING}. Use SpekeVersion \
-                     {SPEKE_VERSION_WITH_KEY_PERIOD_TIMING}, or signal {timing} only as \
-                     the content key index"
-                ),
-                VALIDATION_CONTENT_KEY_PERIOD_TIMING_REQUIRES_SPEKE_V2_1,
-            ));
-        }
-        if encryption.key_rotation_interval_seconds.is_none() {
-            return Some(validation_failed(
-                &timing_member,
-                &format!(
-                    "Signaling the times a content key is used for requires key rotation \
-                     to be enabled. Specify KeyRotationIntervalSeconds, or signal \
-                     {timing} only as the content key index"
-                ),
-                VALIDATION_CONTENT_KEY_PERIOD_TIMING_WITHOUT_KEY_ROTATION,
-            ));
-        }
-    }
-
-    key_provider_url_rejection(&provider.url)
-}
-
-/// `ValidationExceptionType` values a refused `SpekeKeyProvider$Url` carries, from the
-/// model's `ValidationExceptionType` enum.
-///
-/// The enum names one value per way the value can fail to be an endpoint the service could
-/// fetch content keys from: what it IS ([`VALIDATION_URL_INVALID`]), the scheme
-/// ([`VALIDATION_URL_SCHEME`]), the credentials ([`VALIDATION_URL_USER_INFO`]) and port
-/// ([`VALIDATION_URL_PORT`]) it carries, and the host it names
-/// ([`VALIDATION_URL_UNKNOWN_HOST`], [`VALIDATION_URL_LOOPBACK_ADDRESS`],
-/// [`VALIDATION_URL_LOCAL_ADDRESS`], [`VALIDATION_URL_LINK_LOCAL_ADDRESS`],
-/// [`VALIDATION_URL_MULTICAST_ADDRESS`]).
-pub const VALIDATION_URL_INVALID: &str = "URL_INVALID";
-/// See [`VALIDATION_URL_INVALID`].
-pub const VALIDATION_URL_SCHEME: &str = "URL_SCHEME";
-/// See [`VALIDATION_URL_INVALID`].
-pub const VALIDATION_URL_USER_INFO: &str = "URL_USER_INFO";
-/// See [`VALIDATION_URL_INVALID`].
-pub const VALIDATION_URL_PORT: &str = "URL_PORT";
-/// See [`VALIDATION_URL_INVALID`].
-pub const VALIDATION_URL_UNKNOWN_HOST: &str = "URL_UNKNOWN_HOST";
-/// See [`VALIDATION_URL_INVALID`].
-pub const VALIDATION_URL_LOOPBACK_ADDRESS: &str = "URL_LOOPBACK_ADDRESS";
-/// See [`VALIDATION_URL_INVALID`].
-pub const VALIDATION_URL_LOCAL_ADDRESS: &str = "URL_LOCAL_ADDRESS";
-/// See [`VALIDATION_URL_INVALID`].
-pub const VALIDATION_URL_LINK_LOCAL_ADDRESS: &str = "URL_LINK_LOCAL_ADDRESS";
-/// See [`VALIDATION_URL_INVALID`].
-pub const VALIDATION_URL_MULTICAST_ADDRESS: &str = "URL_MULTICAST_ADDRESS";
-
-/// The scheme a key-provider URL has to use: `SpekeKeyProvider$Url` is "The URL of the API
-/// Gateway proxy that you set up to talk to your key server", which "must start with
-/// https://".
-const KEY_PROVIDER_URL_SCHEME: &str = "https";
-
-/// The `ValidationExceptionType` for an IP address a service endpoint may not be at, or
-/// `None` for an address outside those classes.
-///
-/// The model names one value per class of address that is not a reachable, public endpoint
-/// of a key server: the loopback of whoever resolves it, an address private to a network,
-/// a link-local address and a multicast group. Both IP versions, since a URL may carry
-/// either.
-fn local_address_class(address: ::std::net::IpAddr) -> Option<&'static str> {
-    match address {
-        ::std::net::IpAddr::V4(address) => {
-            if address.is_loopback() {
-                Some(VALIDATION_URL_LOOPBACK_ADDRESS)
-            } else if address.is_link_local() {
-                Some(VALIDATION_URL_LINK_LOCAL_ADDRESS)
-            } else if address.is_multicast() {
-                Some(VALIDATION_URL_MULTICAST_ADDRESS)
-            } else if address.is_private() || address.is_unspecified() {
-                Some(VALIDATION_URL_LOCAL_ADDRESS)
-            } else {
-                None
-            }
-        }
-        ::std::net::IpAddr::V6(address) => {
-            if address.is_loopback() {
-                Some(VALIDATION_URL_LOOPBACK_ADDRESS)
-            } else if address.is_multicast() {
-                Some(VALIDATION_URL_MULTICAST_ADDRESS)
-            } else if address.segments()[0] & 0xffc0 == 0xfe80 {
-                Some(VALIDATION_URL_LINK_LOCAL_ADDRESS)
-            } else if address.segments()[0] & 0xfe00 == 0xfc00 || address.is_unspecified() {
-                Some(VALIDATION_URL_LOCAL_ADDRESS)
-            } else {
-                None
-            }
-        }
-    }
-}
-
-/// The host NAMES that resolve to the loopback of whoever resolves them, so a URL naming
-/// one addresses the resolver itself rather than a key server: `localhost` and anything
-/// under it (RFC 6761 reserves the whole `.localhost` tree for exactly this).
-///
-/// Names only — an address literal is read as an address
-/// ([`local_address_class`]) — and a reading of a MODELLED member's value, which is why it
-/// is not the framework's inbound-listener guard: that one decides which `Host` header a
-/// listener answers, over a whole authority including literals and zone ids.
-fn is_loopback_domain_name(host: &str) -> bool {
-    let host = host.trim_end_matches('.').to_ascii_lowercase();
-    host == "localhost" || host.ends_with(".localhost")
-}
-
-/// The port a key server is reached at: the default port of [`KEY_PROVIDER_URL_SCHEME`],
-/// which is the only one a URL that names the scheme's own endpoint can carry.
-const KEY_PROVIDER_URL_PORT: u16 = 443;
-
-/// Refuse a SPEKE key-provider URL that is not an endpoint this service could fetch
-/// content keys from, or `None` when it is one.
-///
-/// The service RESOLVES this URL and calls it for every content key, so what it names has
-/// to be a reachable key server: the model documents the value as "The URL of the API
-/// Gateway proxy that you set up to talk to your key server", which "must reside in the
-/// same AWS Region as MediaPackage and must start with https://", and its
-/// `ValidationExceptionType` names one value per way the value fails that (see
-/// [`VALIDATION_URL_INVALID`]). A URL carrying credentials or a port of its own does not
-/// name that endpoint, and one naming a host that is not a public name — the resolver's own
-/// loopback, a private, link-local or multicast address, or a name that is not a
-/// fully-qualified one — names no key server reachable from the service at all.
-///
-/// Every class is decided from the VALUE: the emulator serves inbound requests and
-/// resolves nothing, so what the host classes cover is what the text itself settles — the
-/// address literals, and a single-label name, which is not a name the public DNS this
-/// endpoint has to be reachable through can answer. The URI grammar itself is read by the
-/// `http` crate's parser, the one every request's own URI is read with, rather than by a
-/// hand-rolled split.
-pub fn key_provider_url_rejection(url: &str) -> Option<ValidationException> {
-    let member = format!("{ENCRYPTION_MEMBER}.spekeKeyProvider.url");
-    let refused = |requirement: String, exception_type: &str| {
-        Some(validation_failed(&member, &requirement, exception_type))
-    };
-    let parsed = url.parse::<::http::Uri>().ok().and_then(|parsed| {
-        let scheme = parsed.scheme_str()?.to_string();
-        let authority = parsed.authority()?.clone();
-        Some((scheme, authority))
-    });
-    // A value the grammar does not admit, or one naming no scheme or no authority, is not
-    // an endpoint at all rather than an endpoint of the wrong kind.
-    let Some((scheme, authority)) = parsed else {
-        return refused(
-            format!("Member must be a URL naming a scheme and a host. {CHECK_THE_VALUE}"),
-            VALIDATION_URL_INVALID,
-        );
-    };
-    if scheme != KEY_PROVIDER_URL_SCHEME {
-        return refused(
-            format!(
-                "Member must be a {KEY_PROVIDER_URL_SCHEME} URL. {CHECK_THE_VALUE}"
-            ),
-            VALIDATION_URL_SCHEME,
-        );
-    }
-    // The authority carries any userinfo ahead of the host, which the host itself does not.
-    if authority.as_str().contains('@') {
-        return refused(
-            format!("Member must not carry user information. {CHECK_THE_VALUE}"),
-            VALIDATION_URL_USER_INFO,
-        );
-    }
-    if authority
-        .port_u16()
-        .is_some_and(|port| port != KEY_PROVIDER_URL_PORT)
-    {
-        return refused(
-            format!(
-                "Member must not name a port other than {KEY_PROVIDER_URL_PORT}. \
-                 {CHECK_THE_VALUE}"
-            ),
-            VALIDATION_URL_PORT,
-        );
-    }
-    let host = authority.host();
-    if is_loopback_domain_name(host) {
-        return refused(
-            format!(
-                "Member must name a host that is not the loopback of the service \
-                 resolving it. {CHECK_THE_VALUE}"
-            ),
-            VALIDATION_URL_LOOPBACK_ADDRESS,
-        );
-    }
-    // An IPv6 literal is bracketed in an authority, which is where its own colons live.
-    let literal = host
-        .strip_prefix('[')
-        .and_then(|host| host.strip_suffix(']'))
-        .unwrap_or(host);
-    match literal.parse::<::std::net::IpAddr>() {
-        Ok(address) => local_address_class(address).and_then(|exception_type| {
-            refused(
-                format!(
-                    "Member must name a host that is reachable from the service. \
-                     {CHECK_THE_VALUE}"
-                ),
-                exception_type,
-            )
-        }),
-        // A single-label name is not a name the service can resolve to a key server.
-        Err(_) => (!host.trim_end_matches('.').contains('.')).then(|| {
-            validation_failed(
-                &member,
-                &format!("Member must name a host that resolves. {CHECK_THE_VALUE}"),
-                VALIDATION_URL_UNKNOWN_HOST,
-            )
-        }),
-    }
-}
-
 /// The collection a pagination token was issued for.
 ///
 /// A token names a position in ONE collection, so what it resumes has to be read against
@@ -5040,808 +4528,5 @@ fn short_digest(parts: &[&str], len: usize) -> String {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
+mod tests;
 
-    /// Every not-found sentence names the KIND of resource and never a resource name,
-    /// and carries the discriminator for that kind.
-    #[test]
-    fn a_not_found_names_the_resource_kind_and_no_identifier() {
-        for (kind, expected_type, noun) in [
-            (ResourceKind::ChannelGroup, "CHANNEL_GROUP", "channel group"),
-            (ResourceKind::Channel, "CHANNEL", "channel"),
-            (
-                ResourceKind::OriginEndpoint,
-                "ORIGIN_ENDPOINT",
-                "origin endpoint",
-            ),
-        ] {
-            let error = kind.not_found();
-            let message = error.message.clone().unwrap_or_default();
-            assert!(
-                message.contains(noun),
-                "case {kind:?}: expected a message naming {noun:?}, got {message:?}"
-            );
-            assert_eq!(
-                error.resource_type_not_found.as_deref(),
-                Some(expected_type),
-                "case {kind:?}: wrong ResourceTypeNotFound, got {:?}",
-                error.resource_type_not_found
-            );
-        }
-        // "an origin endpoint", not "a origin endpoint".
-        let endpoint = ResourceKind::OriginEndpoint
-            .not_found()
-            .message
-            .unwrap_or_default();
-        assert!(
-            endpoint.contains("add an origin endpoint"),
-            "case OriginEndpoint: expected the `an` article, got {endpoint:?}"
-        );
-    }
-
-    /// Each constraint class maps to its own `ValidationExceptionType`, and the message
-    /// names the member path that failed without echoing the value that failed it.
-    #[test]
-    fn a_violation_sets_both_modeled_members() {
-        let cases = [
-            (
-                ViolationKind::Pattern("^[a-zA-Z0-9_-]+$".to_string()),
-                "MEMBER_DOES_NOT_MATCH_PATTERN",
-            ),
-            (ViolationKind::MissingRequiredMember, "MEMBER_MISSING"),
-            (ViolationKind::MinLength(1), "MEMBER_MIN_LENGTH"),
-            (ViolationKind::MaxLength(256), "MEMBER_MAX_LENGTH"),
-            (
-                ViolationKind::MinValue("1".to_string()),
-                "MEMBER_MIN_VALUE",
-            ),
-            (
-                ViolationKind::MaxValue("100".to_string()),
-                "MEMBER_MAX_VALUE",
-            ),
-            (
-                ViolationKind::EnumValue(vec!["CMAF".to_string()]),
-                "MEMBER_INVALID_ENUM_VALUE",
-            ),
-            (ViolationKind::UniqueItems, "MEMBER_INVALID"),
-        ];
-        for (kind, expected_type) in cases {
-            let violation = Violation {
-                path: "channelGroupName".to_string(),
-                kind: kind.clone(),
-                value: Some("bad name!".to_string()),
-                sensitive: false,
-            };
-            let error = member_validation_failed(&violation);
-            assert_eq!(
-                error.validation_exception_type.as_deref(),
-                Some(expected_type),
-                "case {kind:?}: wrong ValidationExceptionType, got {:?}",
-                error.validation_exception_type
-            );
-            let message = error.message.clone().unwrap_or_default();
-            assert!(
-                message.starts_with("Validation error encountered at request.channelGroupName: "),
-                "case {kind:?}: expected the member path in the message, got {message:?}"
-            );
-            assert!(
-                !message.contains("bad name!"),
-                "case {kind:?}: the rejected value must not be echoed, got {message:?}"
-            );
-        }
-    }
-
-    /// The character-set rendering a `@pattern` refusal states, over the pattern forms
-    /// this service's model uses plus the ones it must decline to describe.
-    #[test]
-    fn a_character_class_pattern_is_stated_as_its_supported_characters() {
-        let cases = [
-            // `ResourceName`, the shape every resource-name member targets.
-            (
-                "^[a-zA-Z0-9_-]+$",
-                Some("A-Z, a-z, 0-9, _ (underscore), and - (hyphen)"),
-            ),
-            // A two-item class, which joins with `and` and no comma.
-            ("^[a-z0-9]+$", Some("a-z and 0-9")),
-            // A one-item class.
-            ("^[A-Z]+$", Some("A-Z")),
-            // A leading `-` is the literal hyphen, and the ranges are listed first.
-            ("^[-a-z]+$", Some("a-z and - (hyphen)")),
-            // A range that is not one run of letters or digits (regex reads `_-x` as the
-            // code points between them) has no listing, so the whole pattern declines.
-            ("^[a-z_-x]+$", None),
-            // A descending range is not a range a message can state either.
-            ("^[z-a]+$", None),
-            // `EntityTag` / `IdempotencyToken`: an escape names no listable set.
-            (r"^[\S]+$", None),
-            // A negated class states what is forbidden, not what is supported.
-            ("^[^a-z]+$", None),
-            // Not a single character class at all.
-            ("^arn:aws:mediapackagev2:", None),
-        ];
-        for (pattern, expected) in cases {
-            let rendered = pattern_character_set(pattern);
-            assert_eq!(
-                rendered.as_deref(),
-                expected,
-                "case {pattern:?}: expected {expected:?}, got {rendered:?}"
-            );
-        }
-    }
-
-    /// A `@pattern` violation is stated as the characters the member may hold, and every
-    /// other constraint class as the bound it broke — each followed by the sentence
-    /// telling the caller to check the value it sent.
-    #[test]
-    fn a_constraint_detail_states_the_bound_that_was_broken() {
-        let cases = [
-            (
-                ViolationKind::Pattern("^[a-zA-Z0-9_-]+$".to_string()),
-                "Member must contain only supported characters. Supported characters are \
-                 A-Z, a-z, 0-9, _ (underscore), and - (hyphen). Check the value you \
-                 specified in your request and then try again",
-            ),
-            (
-                ViolationKind::Pattern(r"^[\S]+$".to_string()),
-                "Member must satisfy regular expression pattern: ^[\\S]+$. Check the \
-                 value you specified in your request and then try again",
-            ),
-            (
-                ViolationKind::MaxLength(256),
-                "Member must have length less than or equal to 256. Check the value you \
-                 specified in your request and then try again",
-            ),
-            (
-                ViolationKind::MissingRequiredMember,
-                "Member must not be null. Check the value you specified in your request \
-                 and then try again",
-            ),
-        ];
-        for (kind, expected) in cases {
-            let detail = constraint_detail(&kind);
-            assert_eq!(
-                detail, expected,
-                "case {kind:?}: expected {expected:?}, got {detail:?}"
-            );
-        }
-    }
-
-    /// Every collection a paged list of this service walks, as a token is bound to it.
-    fn page_scopes() -> Vec<PageScope<'static>> {
-        vec![
-            PageScope::ChannelGroups {
-                region: "us-east-1",
-            },
-            PageScope::ChannelGroups {
-                region: "eu-west-1",
-            },
-            PageScope::Channels {
-                region: "us-east-1",
-                channel_group: "grp",
-            },
-            PageScope::OriginEndpoints {
-                region: "us-east-1",
-                channel_group: "grp",
-                channel: "chan",
-            },
-            PageScope::HarvestJobs {
-                region: "us-east-1",
-                channel_group: "grp",
-            },
-        ]
-    }
-
-    #[test]
-    fn a_page_token_round_trips_the_name_it_stopped_after() {
-        for scope in page_scopes() {
-            for name in ["a", "endpoint-1", "A_long_Name-with-9-digits"] {
-                let token = page_token(scope, name);
-                assert_eq!(
-                    page_resume_after(scope, &token).as_deref(),
-                    Some(name),
-                    "case {scope:?}/{name:?}: the token {token:?} must decode back to the name"
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn a_token_this_service_did_not_issue_does_not_decode() {
-        let scope = PageScope::ChannelGroups {
-            region: "us-east-1",
-        };
-        let issued = page_token(scope, "grp");
-        // Tokens differing in FORM, none of them one this service issued: prose, non-hex
-        // characters, an odd-length hex run, a base64-shaped string, a bare hex run that
-        // decodes to a name but carries no binding digest, a digest with no cursor behind
-        // it, and an issued token with its cursor truncated.
-        for token in [
-            "not-a-token",
-            "zzzz",
-            "abc",
-            "eyJrZXkiOiAidmFsdWUifQ==",
-            "6d",
-            &issued[..PAGE_TOKEN_DIGEST_LEN],
-            &issued[..issued.len() - 2],
-        ] {
-            assert!(
-                page_resume_after(scope, token).is_none(),
-                "case {token:?}: a token this service did not issue must not decode"
-            );
-        }
-        // And a token this service DID issue, for another of its collections: the digest
-        // binds the cursor to the collection, so it is not readable outside it.
-        for other in page_scopes().into_iter().skip(1) {
-            let token = page_token(other, "grp");
-            assert!(
-                page_resume_after(scope, &token).is_none(),
-                "case {other:?}: a token issued for another collection must not decode, \
-                 got {:?}",
-                page_resume_after(scope, &token)
-            );
-        }
-    }
-
-    #[test]
-    fn a_policy_document_is_a_json_object_with_a_statement() {
-        for accepted in [
-            r#"{"Statement":[]}"#,
-            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow"}]}"#,
-            "{\n  \"Statement\": {\"Effect\": \"Deny\"}\n}",
-        ] {
-            assert!(
-                is_policy_document(accepted),
-                "case {accepted:?}: expected a valid policy document"
-            );
-        }
-        for refused in [
-            "",
-            "not json at all",
-            r#"{"Statement":[]"#,
-            r#"[{"Statement":[]}]"#,
-            r#""{\"Statement\":[]}""#,
-            r#"{"Version":"2012-10-17"}"#,
-        ] {
-            assert!(
-                !is_policy_document(refused),
-                "case {refused:?}: expected to be refused as a policy document"
-            );
-        }
-    }
-
-    #[test]
-    fn an_arn_pattern_matches_the_way_iam_resource_patterns_do() {
-        // `*` is any run of characters (including none) and `?` is exactly one; the match
-        // is anchored at both ends.
-        let arn = "arn:aws:mediapackagev2:us-west-2:000000000000:channelGroup/g/channel/c\
-                   /originEndpoint/e";
-        for pattern in [
-            arn,
-            "*",
-            "arn:aws:mediapackagev2:*",
-            "arn:aws:mediapackagev2:us-west-2:000000000000:channelGroup/g/channel/c*",
-            "arn:*:mediapackagev2:*:*:channelGroup/g/*/originEndpoint/e",
-            "arn:aws:mediapackagev2:us-west-?:000000000000:channelGroup/g/channel/c\
-             /originEndpoint/e",
-        ] {
-            assert!(
-                arn_pattern_matches(pattern, arn),
-                "case {pattern:?}: expected it to match {arn}"
-            );
-        }
-        for pattern in [
-            "arn:aws:mediapackagev2:us-west-2:000000000000:channelGroup/g/channel/c\
-             /originEndpoint/other",
-            "arn:aws:s3:*",
-            "arn:aws:mediapackagev2:us-west-2:000000000000:channelGroup/g",
-            // `?` is exactly one character, so it cannot swallow a whole Region.
-            "arn:aws:mediapackagev2:?:000000000000:channelGroup/g/channel/c\
-             /originEndpoint/e",
-        ] {
-            assert!(
-                !arn_pattern_matches(pattern, arn),
-                "case {pattern:?}: expected it NOT to match {arn}"
-            );
-        }
-    }
-
-    #[test]
-    fn an_anonymous_grant_needs_an_effect_an_action_a_principal_and_a_reachable_resource() {
-        let arn = "arn:aws:mediapackagev2:us-west-2:000000000000:channelGroup/g/channel/c\
-                   /originEndpoint/e";
-        let action = "mediapackagev2:GetObject";
-        let statement = |members: &str| format!("{{\"Statement\":[{members}]}}");
-
-        for granting in [
-            r#"{"Effect":"Allow","Principal":"*","Action":"mediapackagev2:GetObject"}"#,
-            r#"{"Effect":"Allow","Principal":{"AWS":"*"},"Action":["mediapackagev2:*"]}"#,
-            r#"{"Effect":"Allow","Principal":"*","Action":"*","Resource":"*"}"#,
-        ] {
-            assert!(
-                policy_allows_anonymous(&statement(granting), action, arn),
-                "case {granting:?}: expected an anonymous grant"
-            );
-        }
-        for refusing in [
-            // A named principal is not the anonymous one.
-            r#"{"Effect":"Allow","Principal":{"AWS":"arn:aws:iam::000000000000:root"},
-                 "Action":"mediapackagev2:GetObject"}"#,
-            // A different action.
-            r#"{"Effect":"Allow","Principal":"*","Action":"mediapackagev2:PutObject"}"#,
-            // A resource this request does not address.
-            r#"{"Effect":"Allow","Principal":"*","Action":"mediapackagev2:GetObject",
-                 "Resource":"arn:aws:mediapackagev2:us-west-2:000000000000:channelGroup/other"}"#,
-            // A member the evaluator cannot judge: it must not grant past it.
-            r#"{"Effect":"Allow","Principal":"*","Action":"mediapackagev2:GetObject",
-                 "Condition":{"Bool":{"aws:SecureTransport":"true"}}}"#,
-            r#"{"Effect":"Deny","Principal":"*","Action":"mediapackagev2:GetObject"}"#,
-        ] {
-            assert!(
-                !policy_allows_anonymous(&statement(refusing), action, arn),
-                "case {refusing:?}: expected no anonymous grant"
-            );
-        }
-        // Deny beats Allow, whichever order they are written in.
-        let both = r#"{"Effect":"Allow","Principal":"*","Action":"mediapackagev2:GetObject"},
-             {"Effect":"Deny","Principal":"*","Action":"mediapackagev2:GetObject"}"#;
-        assert!(
-            !policy_allows_anonymous(&statement(both), action, arn),
-            "a Deny of the same action must beat the Allow"
-        );
-    }
-
-    #[test]
-    fn an_etag_separates_fields() {
-        assert_ne!(
-            etag(&["a".to_string(), "bc".to_string()]),
-            etag(&["ab".to_string(), "c".to_string()]),
-            "field boundaries must be part of the digest"
-        );
-    }
-
-    #[test]
-    fn materialization_fills_only_what_the_caller_left_out() {
-        let submitted = Segment {
-            segment_duration_seconds: Some(12),
-            ts_include_dvb_subtitles: Some(false),
-            ..Segment::default()
-        };
-        // On a channel whose output locking mode carries no output-timestamp mode, so the
-        // member stays absent; the carrying case is the table in
-        // `tests/all/segment_output_timestamp_mode.rs`.
-        let materialized = materialized_segment(Some(submitted), Some(DEFAULT_OUTPUT_LOCKING_MODE));
-        assert_eq!(
-            materialized.segment_duration_seconds,
-            Some(12),
-            "a submitted duration must survive materialization"
-        );
-        assert_eq!(
-            materialized.ts_include_dvb_subtitles,
-            Some(false),
-            "a submitted toggle must survive materialization, even when it is off"
-        );
-        assert_eq!(
-            materialized.segment_name.as_deref(),
-            Some(DEFAULT_SEGMENT_NAME),
-            "an omitted segment name must come out as the service's default"
-        );
-        assert!(
-            materialized.scte.is_none() && materialized.output_timestamp_mode.is_none(),
-            "materialization must not invent members the service reports only when configured"
-        );
-    }
-
-    #[test]
-    fn the_ingest_host_shares_the_groups_dns() {
-        let egress = egress_domain("us-west-2", "group");
-        let endpoints = ingest_endpoints(&egress, "group", "channel", DEFAULT_INPUT_TYPE);
-        let suffix = egress.split_once(".egress.").expect("an egress label").1;
-        assert!(
-            !endpoints.is_empty(),
-            "a channel that receives ingest must publish ingest endpoints"
-        );
-        for endpoint in &endpoints {
-            let url = endpoint.url.as_deref().expect("an ingest url");
-            assert!(
-                url.contains(suffix),
-                "ingest url {url} must share the group's DNS suffix {suffix}"
-            );
-        }
-        assert!(
-            ingest_endpoints(&egress, "group", "channel", INPUT_TYPE_MULTIVIEW).is_empty(),
-            "a channel that receives no ingest of its own must publish no ingest endpoint"
-        );
-    }
-
-    /// One row of the input-type restriction table: which member a request carries, the
-    /// channel's input type, and the `ValidationExceptionType` the combination is refused
-    /// with (`None` when the input type may carry it).
-    type RestrictionCase = (
-        &'static str,
-        &'static str,
-        fn(&mut SubmittedChannelMembers),
-        Option<&'static str>,
-    );
-
-    /// A member the model restricts to particular `InputType`s is refused on every other
-    /// input type, with that member's own discriminator — and `CreateChannel` and
-    /// `UpdateChannel` read the SAME table, so the two cannot disagree about it.
-    ///
-    /// One row per restriction the model states, on an input type that forbids it and on
-    /// one that allows it.
-    #[test]
-    fn a_member_is_refused_on_an_input_type_that_may_not_carry_it() {
-        let cases: &[RestrictionCase] = &[
-            (
-                "output locking mode on HLS",
-                "HLS",
-                |present| present.output_locking_mode = true,
-                Some("ONLY_CMAF_INPUT_TYPE_ALLOW_OUTPUT_LOCKING_MODE"),
-            ),
-            (
-                "output locking mode on CMAF",
-                "CMAF",
-                |present| present.output_locking_mode = true,
-                None,
-            ),
-            (
-                "output locking mode on MULTIVIEW",
-                "MULTIVIEW",
-                |present| present.output_locking_mode = true,
-                None,
-            ),
-            (
-                "MQCS switching on HLS",
-                "HLS",
-                |present| present.mqcs_input_switching = true,
-                Some("ONLY_CMAF_INPUT_TYPE_ALLOW_MQCS_INPUT_SWITCHING"),
-            ),
-            (
-                "MQCS switching on CMAF",
-                "CMAF",
-                |present| present.mqcs_input_switching = true,
-                None,
-            ),
-            (
-                "preferred input on MULTIVIEW",
-                "MULTIVIEW",
-                |present| present.preferred_input = true,
-                Some("ONLY_CMAF_INPUT_TYPE_ALLOW_PREFERRED_INPUT_CONFIGURATION"),
-            ),
-            (
-                "CMSD publication on HLS",
-                "HLS",
-                |present| present.publish_mqcs = true,
-                Some("ONLY_CMAF_INPUT_TYPE_ALLOW_MQCS_OUTPUT_CONFIGURATION"),
-            ),
-            (
-                "multiview configuration on CMAF",
-                "CMAF",
-                |present| present.multiview_configuration = true,
-                Some("MULTIVIEW_CONFIGURATION_NOT_ALLOWED"),
-            ),
-            (
-                "multiview configuration on MULTIVIEW",
-                "MULTIVIEW",
-                |present| present.multiview_configuration = true,
-                None,
-            ),
-            (
-                "no restricted member at all on HLS",
-                "HLS",
-                |_| {},
-                None,
-            ),
-        ];
-
-        for (label, input_type, carry, expected) in cases {
-            let mut submitted = SubmittedChannelMembers::default();
-            carry(&mut submitted);
-            let violation = channel_input_type_violation(submitted, input_type);
-            match expected {
-                Some(expected) => {
-                    let violation = violation.unwrap_or_else(|| {
-                        panic!("case {label:?}: expected a refusal, got none")
-                    });
-                    assert_eq!(
-                        violation.validation_exception_type.as_deref(),
-                        Some(*expected),
-                        "case {label:?}: expected {expected}, got {violation:?}"
-                    );
-                    assert!(
-                        violation
-                            .message
-                            .as_deref()
-                            .unwrap_or_default()
-                            .starts_with("Validation error encountered at request"),
-                        "case {label:?}: expected this service's message form, got {:?}",
-                        violation.message
-                    );
-                }
-                None => assert!(
-                    violation.is_none(),
-                    "case {label:?}: expected no refusal, got {violation:?}"
-                ),
-            }
-        }
-    }
-
-    /// A VALUE an input type that CARRIES a member may not take is refused on that input
-    /// type and accepted on the ones the restriction does not name — the whole
-    /// `InputType` enum against the whole `OutputLockingMode` enum, plus the absent case.
-    ///
-    /// The catalogues are the model's own
-    /// (`smithy_query(query="shape", shape="InputType,OutputLockingMode")`): `InputType`
-    /// is HLS | CMAF | MULTIVIEW and `OutputLockingMode` is EPOCH_LOCKED |
-    /// NON_EPOCH_LOCKED.
-    #[test]
-    fn a_value_an_input_type_may_not_take_is_refused_on_that_input_type() {
-        for input_type in ["HLS", "CMAF", INPUT_TYPE_MULTIVIEW] {
-            for submitted in [None, Some(DEFAULT_OUTPUT_LOCKING_MODE), Some("NON_EPOCH_LOCKED")] {
-                let label = format!("{input_type} with {submitted:?}");
-                let violation = channel_output_locking_mode_value_violation(submitted, input_type);
-                let refused = submitted == Some(MULTIVIEW_REFUSED_OUTPUT_LOCKING_MODE)
-                    && input_type == INPUT_TYPE_MULTIVIEW;
-                assert_eq!(
-                    violation.is_some(),
-                    refused,
-                    "case {label:?}: this combination being refused is {refused}, got \
-                     {violation:?}"
-                );
-                let Some(violation) = violation else { continue };
-                assert_eq!(
-                    violation.validation_exception_type.as_deref(),
-                    Some(VALIDATION_MULTIVIEW_INPUT_TYPE_WITH_NON_EPOCH_LOCKED),
-                    "case {label:?}: expected \
-                     {VALIDATION_MULTIVIEW_INPUT_TYPE_WITH_NON_EPOCH_LOCKED}, got \
-                     {violation:?}"
-                );
-                let message = violation.message.as_deref().unwrap_or_default();
-                assert!(
-                    message.starts_with(&format!(
-                        "Validation error encountered at request.{OUTPUT_LOCKING_MODE_MEMBER}:"
-                    )),
-                    "case {label:?}: expected this service's message form at the member \
-                     the refusal is about, got {message:?}"
-                );
-            }
-        }
-    }
-
-    /// An endpoint member the model restricts to particular parent-channel input types is
-    /// materialised only under a channel whose input type may carry it: the documented
-    /// default is applied there and withheld everywhere else, and a SUBMITTED value is
-    /// refused where the member may not be carried — both read off the one allowed-input-type
-    /// list, so they cannot disagree.
-    ///
-    /// The input-type catalogue is the model's own `InputType` enum
-    /// (`smithy_query(query="shape", shape="InputType")` — HLS | CMAF | MULTIVIEW), and the
-    /// submitted modes are the whole `StreamNameOutputMode` enum.
-    #[test]
-    fn a_restricted_endpoint_member_is_materialised_only_where_it_may_be_carried() {
-        for input_type in ["HLS", "CMAF", "MULTIVIEW"] {
-            let carries = input_type_carries_stream_name_output_mode(input_type);
-            for submitted in [None, Some("INDEX"), Some("PASSTHROUGH_NAME")] {
-                let label = format!("{input_type} with {submitted:?}");
-                let stored = materialized_stream_name_output_mode(
-                    submitted.map(str::to_string),
-                    input_type,
-                );
-                let expected = if carries {
-                    Some(submitted.unwrap_or(DEFAULT_STREAM_NAME_OUTPUT_MODE).to_string())
-                } else {
-                    None
-                };
-                assert_eq!(
-                    stored, expected,
-                    "case {label:?}: expected {expected:?}, got {stored:?}"
-                );
-
-                let violation = stream_name_output_mode_input_type_violation(submitted, input_type);
-                match (submitted, carries) {
-                    (Some(_), false) => {
-                        let violation = violation.unwrap_or_else(|| {
-                            panic!("case {label:?}: expected a refusal, got none")
-                        });
-                        assert_eq!(
-                            violation.validation_exception_type.as_deref(),
-                            Some("ONLY_HLS_INPUT_TYPE_ALLOW_STREAM_NAME_OUTPUT_MODE"),
-                            "case {label:?}: expected the input-type discriminator, got \
-                             {violation:?}"
-                        );
-                    }
-                    _ => assert!(
-                        violation.is_none(),
-                        "case {label:?}: expected no refusal, got {violation:?}"
-                    ),
-                }
-            }
-        }
-    }
-
-    /// A stored origin-endpoint record, as the baseline of the table below.
-    fn sample_endpoint() -> OriginEndpoint {
-        let at = now();
-        OriginEndpoint {
-            name: "endpoint".to_string(),
-            channel_name: "channel".to_string(),
-            group_name: "group".to_string(),
-            arn: origin_endpoint_arn("us-west-2", "group", "channel", "endpoint"),
-            container_type: "TS".to_string(),
-            segment: materialized_segment(None, None),
-            description: None,
-            startover_window_seconds: materialized_startover_window_seconds(
-                None,
-                DEFAULT_INPUT_TYPE,
-            ),
-            hls_manifests: Vec::new(),
-            low_latency_hls_manifests: Vec::new(),
-            dash_manifests: Vec::new(),
-            mss_manifests: Vec::new(),
-            force_endpoint_error_configuration: None,
-            uri_separator: materialized_uri_separator(None),
-            stream_name_output_mode: materialized_stream_name_output_mode(
-                None,
-                DEFAULT_INPUT_TYPE,
-            ),
-            created_at: at,
-            modified_at: at,
-            reset_at: None,
-            version: 1,
-            etag: String::new(),
-            tags: HashMap::new(),
-            client_token: None,
-            fingerprint: String::new(),
-            policy: None,
-            harvest_jobs: BTreeMap::new(),
-        }
-    }
-
-    /// One row of the per-member ETag table: the member's name, and the mutation that
-    /// changes it on an origin-endpoint record. A `fn` pointer rather than a closure, so
-    /// a row carries no captured state.
-    type EndpointMutation = (&'static str, fn(&mut OriginEndpoint));
-
-    /// One row per member an `Update*` or a `Create*` writes on an origin endpoint.
-    #[test]
-    fn a_change_to_any_member_of_an_origin_endpoint_moves_its_entity_tag() {
-        let baseline = sample_endpoint();
-        let mutations: [EndpointMutation; 12] = [
-            ("container_type", |e| {
-                e.container_type = "CMAF".to_string()
-            }),
-            ("description", |e| e.description = Some("a".to_string())),
-            ("startover_window_seconds", |e| {
-                e.startover_window_seconds = Some(1)
-            }),
-            ("segment", |e| {
-                e.segment = Segment {
-                    segment_duration_seconds: Some(6),
-                    ..Segment::default()
-                }
-            }),
-            ("hls_manifests", |e| {
-                e.hls_manifests = vec![stored_hls_manifest(
-                    CreateHlsManifestConfiguration {
-                        manifest_name: "m".to_string(),
-                        ..CreateHlsManifestConfiguration::default()
-                    },
-                    ManifestLocation {
-                        egress_domain: "host.example",
-                        group: "group",
-                        channel: "channel",
-                        endpoint: "endpoint",
-                    },
-                )]
-            }),
-            ("low_latency_hls_manifests", |e| {
-                e.low_latency_hls_manifests = vec![GetLowLatencyHlsManifestConfiguration {
-                    manifest_name: "m".to_string(),
-                    ..GetLowLatencyHlsManifestConfiguration::default()
-                }]
-            }),
-            ("dash_manifests", |e| {
-                e.dash_manifests = vec![GetDashManifestConfiguration {
-                    manifest_name: "m".to_string(),
-                    ..GetDashManifestConfiguration::default()
-                }]
-            }),
-            ("mss_manifests", |e| {
-                e.mss_manifests = vec![GetMssManifestConfiguration {
-                    manifest_name: "m".to_string(),
-                    ..GetMssManifestConfiguration::default()
-                }]
-            }),
-            ("force_endpoint_error_configuration", |e| {
-                e.force_endpoint_error_configuration = Some(ForceEndpointErrorConfiguration {
-                    endpoint_error_conditions: Some(vec!["STALE_MANIFEST".to_string()]),
-                })
-            }),
-            ("uri_separator", |e| {
-                e.uri_separator = "HYPHEN".to_string()
-            }),
-            ("stream_name_output_mode", |e| {
-                e.stream_name_output_mode = Some("PASSTHROUGH_NAME".to_string())
-            }),
-            // An endpoint under a channel that may not carry the member has no mode at
-            // all, which is a different record from one that carries the default.
-            ("stream_name_output_mode absent", |e| {
-                e.stream_name_output_mode = None
-            }),
-        ];
-        for (member, mutate) in mutations {
-            let mut mutated = baseline.clone();
-            mutate(&mut mutated);
-            assert_ne!(
-                origin_endpoint_etag(&baseline),
-                origin_endpoint_etag(&mutated),
-                "case {member:?}: changing an endpoint's {member} must move its entity tag"
-            );
-        }
-        // The tag is a function of the CONTENT: the same content, built again, hashes
-        // the same, so a create and a later update of an unchanged record agree on it.
-        let twin = OriginEndpoint {
-            created_at: baseline.created_at,
-            modified_at: baseline.modified_at,
-            ..sample_endpoint()
-        };
-        assert_eq!(
-            origin_endpoint_etag(&baseline),
-            origin_endpoint_etag(&twin),
-            "a record rebuilt with the same content must keep its entity tag"
-        );
-    }
-
-    #[test]
-    fn a_token_match_tells_a_retry_from_a_changed_request() {
-        let stored = [("group-a", Some("token-1"), "fingerprint-a")];
-        assert_eq!(
-            match_client_token(Some("token-1"), "fingerprint-a", stored.into_iter()),
-            TokenMatch::Replay("group-a".to_string()),
-            "the same token with the same request must replay the stored resource"
-        );
-        assert_eq!(
-            match_client_token(Some("token-1"), "fingerprint-b", stored.into_iter()),
-            TokenMatch::Mismatch,
-            "the same token with a changed request must be a parameter mismatch"
-        );
-        assert_eq!(
-            match_client_token(Some("token-2"), "fingerprint-a", stored.into_iter()),
-            TokenMatch::Fresh,
-            "another token must not match a stored resource"
-        );
-        assert_eq!(
-            match_client_token(None, "fingerprint-a", stored.into_iter()),
-            TokenMatch::Fresh,
-            "a request with no token can never be a replay"
-        );
-    }
-
-    #[test]
-    fn a_container_serves_only_its_own_manifest_families() {
-        // Read off the model's `ValidationExceptionType`: TS serves the HLS families,
-        // CMAF adds DASH, ISM serves MSS alone.
-        for (container, family, refused) in [
-            ("TS", ManifestFamily::Hls, false),
-            ("TS", ManifestFamily::LowLatencyHls, false),
-            ("TS", ManifestFamily::Dash, true),
-            ("TS", ManifestFamily::Mss, true),
-            ("CMAF", ManifestFamily::Hls, false),
-            ("CMAF", ManifestFamily::LowLatencyHls, false),
-            ("CMAF", ManifestFamily::Dash, false),
-            ("CMAF", ManifestFamily::Mss, true),
-            ("ISM", ManifestFamily::Hls, true),
-            ("ISM", ManifestFamily::LowLatencyHls, true),
-            ("ISM", ManifestFamily::Dash, true),
-            ("ISM", ManifestFamily::Mss, false),
-        ] {
-            let conflict = container_manifest_conflict(container, family);
-            assert_eq!(
-                conflict.is_some(),
-                refused,
-                "case {container} + {family:?}: expected refused={refused}, got {conflict:?}"
-            );
-        }
-    }
-}

@@ -25,6 +25,12 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex encoding for those digests and for the opaque pagination token.
 hex = { workspace = true }
+# `ETag` is the base64 of a 32-byte digest, which is the form AWS hands entity tags out in.
+base64 = "0.22"
+# The object store `CreateHarvestJob` resolves a harvest destination against: the bucket is
+# read out of Amazon S3's OWN state in this same shared engine, in memory, so a submission's
+# destination is never a host anything dials.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 # `service-common` carries the ONE caller-supplied-ARN parse, which the CDN authorization
 # and key-provider ARN members are read against.
 service-common = { path = "../common" }
