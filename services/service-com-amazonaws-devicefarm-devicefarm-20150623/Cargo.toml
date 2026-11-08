@@ -21,6 +21,11 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# The workspace's shared service helpers: the one reader of a request URI's path.
+service-common = { path = "../common" }
+# Reads the content PUT for an upload as the archive its upload type names (an APK and an
+# IPA are both zip containers), so the upload's processing outcome is a real judgement.
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

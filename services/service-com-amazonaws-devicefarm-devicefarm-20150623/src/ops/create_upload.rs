@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateUpload
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateUpload`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateUpload::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Registers an upload inside an existing project: a fresh ARN, the file name and type the
+//! request named, the category the service classifies the upload as, and the locator the
+//! content is stored against — all written to the record in [`crate::state`] and read back
+//! out of it for the response, so every later `GetUpload` reports the identical values.
+//!
+//! The upload starts INITIALIZED: the name and type are registered before any content
+//! exists for them. A name that is not a usable file name for the type it is registered
+//! under is refused as a bad argument ([`crate::state::upload_name_refusal`]).
 //!
 //! ## Shape of an operation
 //!
@@ -161,18 +161,141 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateUpload` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateUploadErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateUpload"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateUploadErrorModeled::ServiceAccountException(
+                ServiceAccountException {
+                    message: Some("the Device Farm state store is unavailable".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The model constrains `projectArn` only to `^arn:aws:devicefarm:.+$`, so an ARN
+        // naming another Device Farm resource type reaches here. That is a bad argument,
+        // not a missing project.
+        if !crate::state::is_project_arn(&input.project_arn) {
+            return Err(CreateUploadErrorModeled::ArgumentException(ArgumentException {
+                message: Some(format!("{} is not a project ARN", input.project_arn)),
+            })
+            .into());
+        }
+
+        // The name is a file name, and which file names are usable depends on the type the
+        // upload is registered under.
+        if let Some(refusal) = crate::state::upload_name_refusal(&input.name, &input.r#type) {
+            return Err(CreateUploadErrorModeled::ArgumentException(ArgumentException {
+                message: Some(refusal),
+            })
+            .into());
+        }
+
+        let region = crate::state::request_region(ctx.parts());
+        let created = crate::state::now();        let mut store = state.lock();
+        // An upload lives inside a project, so one cannot be registered for a project the
+        // store does not hold.
+        if !store.projects.contains_key(&input.project_arn) {
+            return Err(CreateUploadErrorModeled::NotFoundException(NotFoundException {
+                message: Some(crate::state::arn_not_found_message(
+                    crate::state::PROJECT_ENTITY,
+                    &input.project_arn,
+                )),
+            })
+            .into());
+        }
+        // The store's own bound: refuse rather than let an unbounded number of calls grow
+        // the state without end. Checked before anything is minted, so a refused call
+        // leaves the store exactly as it was.
+        if store.uploads.len() >= crate::state::UPLOAD_QUOTA {
+            return Err(CreateUploadErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The account has reached its limit of {} uploads",
+                        crate::state::UPLOAD_QUOTA
+                    )),
+                },
+            )
+            .into());
+        }
+
+        // The ARN and the locator are minted ONCE here and stored on the record; nothing
+        // recomputes them per response.
+        let arn = store.mint_upload_arn(&region, &input.project_arn);
+        let record = crate::state::UploadRecord {
+            url: crate::state::upload_content_url(&content_host(ctx, &region), &arn),
+            arn: arn.clone(),
+            project_arn: input.project_arn,
+            name: input.name,
+            created,
+            r#type: input.r#type,
+            // The upload is registered before any content is stored against it.
+            status: crate::state::UPLOAD_STATUS_INITIALIZED.to_string(),
+            // Both are reported for content that HAS been stored: the parsed manifest of
+            // an app package, and the service's word on how its processing ended. Nothing
+            // has been stored yet, so the upload reports neither.
+            metadata: None,
+            message: None,
+            // Reported as the request named it, and absent when the request named none:
+            // an absent content type and one the caller chose are different answers.
+            content_type: input.content_type,
+            // `CURATED` describes the uploads Device Farm itself manages; what a caller
+            // creates in its own project is the caller's own.
+            category: crate::state::UPLOAD_CATEGORY_PRIVATE.to_string(),
+            // No content has been stored against the upload, so nothing is being read for
+            // it and no status transition is owed.
+            processing: None,
+        };
+
+        // The response is built from the record the store now HOLDS, through the entry the
+        // insert hands back, so it can never report a value the store does not have. A
+        // minted ARN the store already holds would mean the sequence repeated, which it
+        // cannot; that is an internal invariant breach, never someone else's upload
+        // returned under a 200.
+        let upload = match store.uploads.entry(arn) {
+            ::std::collections::btree_map::Entry::Vacant(slot) => slot.insert(record).to_upload(),
+            ::std::collections::btree_map::Entry::Occupied(_) => {
+                return Err(CreateUploadErrorModeled::ServiceAccountException(
+                    ServiceAccountException {
+                        message: Some(
+                            "the Device Farm state store minted an upload id it already holds"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into());
+            }
+        };
+        Ok(CreateUploadOutput {
+            upload: Some(upload),
+        })
     }
 }
+
+/// The endpoint host the locator this upload's content is stored against names: the one
+/// THIS REQUEST reached, read through the workspace's one reader of data-plane addressing
+/// (`service_common::data_plane_addressing::reached_endpoint_host`), which takes the
+/// addressed host only when it is shaped like a host and otherwise names this service's
+/// published endpoint in the request's own region.
+///
+/// A URL an operation announces has to resolve back to where the caller is already talking,
+/// and only a host-SHAPED value is taken, so no caller gets a string of its own into the
+/// `url` this service reports and stores.
+fn content_host(ctx: &smithy_server_runtime::OperationContext<'_>, region: &str) -> String {
+    let parts = ctx.parts();
+    let host = parts
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|value| value.to_str().ok());
+    ::service_common::data_plane_addressing::reached_endpoint_host(
+        &parts.uri.to_string(),
+        host,
+        DEVICEFARM_ENDPOINT_PREFIX,
+        region,
+    )
+}
+
+/// This service's endpoint prefix, which is the host a published URL names for a request
+/// that reached the emulator without naming a host of its own.
+///
+/// From the model's own wire identity (`smithy_query(query="service_info")`:
+/// `awsService.endpointPrefix`).
+const DEVICEFARM_ENDPOINT_PREFIX: &str = "devicefarm";

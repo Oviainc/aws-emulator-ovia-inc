@@ -56,6 +56,9 @@ impl Emulator {
         let mut builder = ::http::Request::builder()
             .method("POST")
             .uri("/")
+            // Every client addresses the emulator by host, and a handler that publishes a
+            // URL on the endpoint the request arrived at reads it from here.
+            .header("host", EMULATOR_HOST)
             .header("content-type", "application/x-amz-json-1.1")
             .header("x-amz-target", format!("DeviceFarm_20150623.{op}"));
         if let Some(region) = region {
@@ -88,7 +91,37 @@ impl Emulator {
         assert_eq!(status, 200, "CreateProject({body}) answered {status}: {response}");
         response["project"].clone()
     }
+
+    /// Dispatch one request to a URL this emulator PUBLISHED, the way a client follows it:
+    /// the method and body of its own choosing, no `X-Amz-Target`, and no credential —
+    /// which is how a presigned URL is followed. Used by the upload content plane's suite.
+    ///
+    /// `declared` overrides the `Content-Length` the request states, so a case can state a
+    /// length other than the one it sends; `None` states the body's own length.
+    pub(crate) async fn request_url(
+        &self,
+        method: &str,
+        url: &str,
+        body: Vec<u8>,
+        declared: Option<u64>,
+    ) -> (u16, Vec<u8>) {
+        let length = declared.unwrap_or(body.len() as u64);
+        let request = ::http::Request::builder()
+            .method(method)
+            .uri(url)
+            .header("host", EMULATOR_HOST)
+            .header("content-length", length.to_string())
+            .header("content-type", "application/octet-stream")
+            .body(Bytes::from(body))
+            .expect("the test request is well formed");
+        let response = self.router.dispatch(request).await;
+        (response.status().as_u16(), response.body().to_vec())
+    }
 }
+
+/// The endpoint every request in this crate's suites is addressed to, and therefore the
+/// host a URL this emulator publishes carries.
+pub(crate) const EMULATOR_HOST: &str = "devicefarm.us-west-2.emulator.test";
 
 /// The wire error code of an awsJson1_1 error body (`__type`).
 pub(crate) fn error_code(body: &Value) -> String {

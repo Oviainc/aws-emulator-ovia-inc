@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::ops::types::{EnvironmentVariable, NetworkProfile, Project, VpcConfig};
+use crate::ops::types::{EnvironmentVariable, NetworkProfile, Project, Upload, VpcConfig};
 
 /// The execution timeout a project gets when `CreateProject` is called without
 /// `defaultJobTimeoutMinutes`.
@@ -27,6 +27,48 @@ pub const PROJECT_RESOURCE_TYPE: &str = "project";
 /// The resource type a network-profile ARN carries:
 /// `arn:aws:devicefarm:<region>:<account>:networkprofile:<project-id>/<profile-id>`.
 pub const NETWORK_PROFILE_RESOURCE_TYPE: &str = "networkprofile";
+
+/// The resource type an upload ARN carries:
+/// `arn:aws:devicefarm:<region>:<account>:upload:<project-id>/<upload-id>`.
+pub const UPLOAD_RESOURCE_TYPE: &str = "upload";
+
+/// The status a freshly created upload has: the file name and type are registered, and the
+/// content has not been stored against them yet.
+///
+/// `UploadStatus` models INITIALIZED, PROCESSING, SUCCEEDED and FAILED; `CreateUpload`
+/// registers the upload before any content exists for it, so INITIALIZED is the status it
+/// starts in.
+pub const UPLOAD_STATUS_INITIALIZED: &str = "INITIALIZED";
+
+/// The status an upload has while the content stored against it is being read.
+pub const UPLOAD_STATUS_PROCESSING: &str = "PROCESSING";
+
+/// The terminal status of an upload whose content was read as the package its type names.
+pub const UPLOAD_STATUS_SUCCEEDED: &str = "SUCCEEDED";
+
+/// The terminal status of an upload whose content could not be read as the package its
+/// type names.
+pub const UPLOAD_STATUS_FAILED: &str = "FAILED";
+
+/// How long an upload stays PROCESSING before its terminal status is reported.
+///
+/// Neither the model nor AWS documents how long Device Farm takes to process an upload, so
+/// this span is the emulator's OWN: it only has to be non-zero, so a caller that reads the
+/// upload straight after storing its content still sees PROCESSING, exactly as a caller of
+/// the real service can.
+pub const UPLOAD_PROCESSING_SPAN: ::std::time::Duration = ::std::time::Duration::from_secs(3);
+
+/// The segment that names THIS data plane under the emulator's reserved data-plane path
+/// namespace (`service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE`): a content
+/// locator is `/_aws/<this>/<project-id>/<upload-id>`.
+pub const UPLOAD_CONTENT_PLANE: &str = "devicefarm-uploads";
+
+/// The category an upload created through the API has.
+///
+/// `UploadCategory` models two values, documented as "CURATED: An upload managed by AWS
+/// Device Farm" and "PRIVATE: An upload managed by the AWS Device Farm customer" — so an
+/// upload a caller creates in its own project is PRIVATE.
+pub const UPLOAD_CATEGORY_PRIVATE: &str = "PRIVATE";
 
 /// The only type a network profile created through the API can have.
 ///
@@ -74,6 +116,14 @@ pub const PROJECT_QUOTA: usize = 1_000;
 /// claim about any account's published quota, set far above any workflow an emulator
 /// serves: it is what stops repeated calls growing the state without end.
 pub const NETWORK_PROFILE_QUOTA: usize = 1_000;
+
+/// How many uploads the store holds before `CreateUpload` refuses with the modelled
+/// `LimitExceededException`.
+///
+/// Like [`PROJECT_QUOTA`], this is the emulator's OWN bound on the store rather than a
+/// claim about any account's published quota, set far above any workflow an emulator
+/// serves: it is what stops repeated calls growing the state without end.
+pub const UPLOAD_QUOTA: usize = 1_000;
 
 /// One stored project: the single source of truth every Project response is built from.
 ///
@@ -159,6 +209,113 @@ impl NetworkProfileRecord {
     }
 }
 
+/// One stored upload: the single source of truth every `Upload` response is built from.
+///
+/// The ARN, the `created` instant and the content locator are minted once, at create time,
+/// and never recomputed — so every later `GetUpload` reports byte-identical values.
+#[derive(Debug, Clone)]
+pub struct UploadRecord {
+    pub arn: String,
+    /// The project the upload belongs to. Kept so an upload can be selected by its owning
+    /// project without parsing the ARN back apart.
+    pub project_arn: String,
+    pub name: String,
+    pub created: ::aws_smithy_types::DateTime,
+    pub r#type: String,
+    pub status: String,
+    pub url: Option<String>,
+    pub metadata: Option<String>,
+    pub content_type: Option<String>,
+    pub message: Option<String>,
+    pub category: String,
+    /// The outcome the content stored against this upload was read to, and the instant it
+    /// becomes the upload's reported status. `None` for an upload no content has been
+    /// stored against, and cleared once the outcome has been applied.
+    ///
+    /// Crate-private: it is written by `CreateUpload` (as `None`) and by
+    /// [`UploadRecord::begin_processing`], and read only by [`UploadRecord::settle`], so no
+    /// response can report a status the clock has not made due.
+    pub(crate) processing: Option<PendingProcessing>,
+}
+
+/// The terminal status an upload's processing reached, waiting for the instant it is
+/// reported from.
+#[derive(Debug, Clone)]
+pub(crate) struct PendingProcessing {
+    /// When the outcome becomes the upload's reported status, per
+    /// [`UPLOAD_PROCESSING_SPAN`].
+    due: ::std::time::Instant,
+    outcome: ProcessingOutcome,
+}
+
+/// How the content stored against an upload was read: the terminal status it puts the
+/// upload in, and what the service has to say about it.
+#[derive(Debug, Clone)]
+pub struct ProcessingOutcome {
+    /// One of [`UPLOAD_STATUS_SUCCEEDED`] or [`UPLOAD_STATUS_FAILED`].
+    pub status: &'static str,
+    /// "A message about the upload's result" (`Upload$message`) — carried by an upload
+    /// whose processing has something to report, which is a failure.
+    pub message: Option<String>,
+    /// "The upload's metadata" (`Upload$metadata`), the document Device Farm reports about
+    /// the content it read: what the processing found, in JSON.
+    pub metadata: Option<String>,
+}
+
+impl UploadRecord {
+    /// The modelled `Upload` for this record. Every member is read off the record, so a
+    /// response can never carry a value the store does not hold.
+    pub fn to_upload(&self) -> Upload {
+        Upload {
+            arn: Some(self.arn.clone()),
+            name: Some(self.name.clone()),
+            created: Some(self.created),
+            r#type: Some(self.r#type.clone()),
+            status: Some(self.status.clone()),
+            url: self.url.clone(),
+            metadata: self.metadata.clone(),
+            content_type: self.content_type.clone(),
+            message: self.message.clone(),
+            category: Some(self.category.clone()),
+        }
+    }
+
+    /// Take the content stored against this upload into processing: the upload reports
+    /// PROCESSING, and `outcome` becomes its status once [`UPLOAD_PROCESSING_SPAN`] has
+    /// passed.
+    ///
+    /// Storing content again restarts the processing of the upload, because the outcome is
+    /// the outcome of the content it now holds.
+    pub fn begin_processing(&mut self, outcome: ProcessingOutcome, now: ::std::time::Instant) {
+        self.status = UPLOAD_STATUS_PROCESSING.to_string();
+        self.message = None;
+        self.metadata = None;
+        self.processing = Some(PendingProcessing {
+            due: now + UPLOAD_PROCESSING_SPAN,
+            outcome,
+        });
+    }
+
+    /// Apply the processing outcome the clock has already made due, if any.
+    ///
+    /// A reporting operation calls this before it reads the record: the transition was owed
+    /// at `now` whether or not anybody asked, so applying it is materialising a change the
+    /// clock made, never a change the read itself caused.
+    pub fn settle(&mut self, now: ::std::time::Instant) {
+        let Some(pending) = &self.processing else {
+            return;
+        };
+        if now < pending.due {
+            return;
+        }
+        let outcome = pending.outcome.clone();
+        self.status = outcome.status.to_string();
+        self.message = outcome.message;
+        self.metadata = outcome.metadata;
+        self.processing = None;
+    }
+}
+
 /// Per-service state for com-amazonaws-devicefarm-devicefarm-20150623. A handler reaches it through [`service_state`].
 ///
 /// `projects` is keyed by project ARN, so Get/Update/Delete are O(log n) and
@@ -168,6 +325,8 @@ impl NetworkProfileRecord {
 pub struct ComAmazonawsDevicefarmDevicefarm20150623State {
     pub projects: BTreeMap<String, ProjectRecord>,
     pub network_profiles: BTreeMap<String, NetworkProfileRecord>,
+    /// Keyed by upload ARN, for the same reasons as `projects`.
+    pub uploads: BTreeMap<String, UploadRecord>,
     /// The sequence the next minted project id comes from. Private, and only ever
     /// advanced by [`Self::mint_project_arn`], so no two projects can share an id and a
     /// released id is never handed out again.
@@ -175,6 +334,9 @@ pub struct ComAmazonawsDevicefarmDevicefarm20150623State {
     /// The sequence the next minted network-profile id comes from, with the same
     /// guarantee as `next_project_id`.
     next_network_profile_id: u64,
+    /// The sequence the next minted upload id comes from, with the same guarantee as
+    /// `next_project_id`.
+    next_upload_id: u64,
 }
 
 impl ComAmazonawsDevicefarmDevicefarm20150623State {
@@ -217,6 +379,44 @@ impl ComAmazonawsDevicefarmDevicefarm20150623State {
                 self.next_network_profile_id, RESOURCE_ID_SUFFIX
             ),
         )
+    }
+
+    /// Mint a fresh, unique upload ARN in `region` under `project_arn`, advancing the
+    /// store's sequence.
+    ///
+    /// An upload lives inside a project, so its ARN carries both ids
+    /// (`upload:<project-id>/<upload-id>`) exactly as a network profile's does. The ARN is
+    /// stored on the record and never recomputed.
+    pub fn mint_upload_arn(&mut self, region: &str, project_arn: &str) -> String {
+        self.next_upload_id = self.next_upload_id.wrapping_add(1);
+        let project_id = devicefarm_resource_id(project_arn, PROJECT_RESOURCE_TYPE).unwrap_or("");
+        ::emulator_server::emulator_arn(
+            "devicefarm",
+            region,
+            &format!(
+                "{UPLOAD_RESOURCE_TYPE}:{project_id}/{:016x}-{}",
+                self.next_upload_id, RESOURCE_ID_SUFFIX
+            ),
+        )
+    }
+
+    /// The upload whose published content locator carries `resource_id`
+    /// (`<project-id>/<upload-id>`), for writing.
+    ///
+    /// A resource id comes from the store's own never-reused sequence, so it names at most
+    /// one upload however many regions the store holds uploads in.
+    pub fn upload_of_resource_id_mut(&mut self, resource_id: &str) -> Option<&mut UploadRecord> {
+        self.uploads.values_mut().find(|record| {
+            devicefarm_resource_id(&record.arn, UPLOAD_RESOURCE_TYPE) == Some(resource_id)
+        })
+    }
+
+    /// Whether the store holds an upload whose published content locator carries
+    /// `resource_id`.
+    pub fn holds_upload_of_resource_id(&self, resource_id: &str) -> bool {
+        self.uploads.values().any(|record| {
+            devicefarm_resource_id(&record.arn, UPLOAD_RESOURCE_TYPE) == Some(resource_id)
+        })
     }
 }
 
@@ -300,6 +500,9 @@ pub const PROJECT_ENTITY: &str = "project";
 /// How a network profile is named in the prose of a message about one.
 pub const NETWORK_PROFILE_ENTITY: &str = "network profile";
 
+/// How an upload is named in the prose of a message about one.
+pub const UPLOAD_ENTITY: &str = "upload";
+
 /// The message a Device Farm `NotFoundException` carries when the ARN a request supplied
 /// resolves to no resource of the type that member names.
 ///
@@ -320,6 +523,153 @@ pub fn is_project_arn(arn: &str) -> bool {
 /// Whether `arn` names a network profile.
 pub fn is_network_profile_arn(arn: &str) -> bool {
     is_devicefarm_arn_of_type(arn, NETWORK_PROFILE_RESOURCE_TYPE)
+}
+
+/// Whether `arn` names an upload.
+pub fn is_upload_arn(arn: &str) -> bool {
+    is_devicefarm_arn_of_type(arn, UPLOAD_RESOURCE_TYPE)
+}
+
+/// Where the content of the upload `arn` names is stored against it, as the modelled `url`
+/// member reports it — on `host`, the endpoint the creating request reached
+/// (`service_common::data_plane_addressing::reached_endpoint_host`).
+///
+/// AWS answers a presigned Amazon S3 URL here. This emulator has no object data plane, so
+/// the locator names THIS upload on this emulator's own endpoint, under the workspace's
+/// reserved data-plane path namespace so it collides with no modelled route, and this
+/// service SERVES it (`crate::service`): the content a caller stores against the locator is
+/// what the upload's processing then reads, so the URL the response publishes can actually
+/// be used.
+pub fn upload_content_url(host: &str, arn: &str) -> Option<String> {
+    let resource_id = devicefarm_resource_id(arn, UPLOAD_RESOURCE_TYPE)?;
+    Some(format!(
+        "https://{host}/{namespace}/{UPLOAD_CONTENT_PLANE}/{resource_id}",
+        namespace = ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE,
+    ))
+}
+
+/// The upload resource id a request path names, when the path is a content locator this
+/// service publishes ([`upload_content_url`]).
+///
+/// The path is read back through the workspace's one reader of data-plane addressing, so
+/// the namespace and the plane segment are judged exactly as every other plane judges
+/// them. Reading it is a syntax check only: whether it names an upload the store holds is
+/// the store's own judgement.
+pub fn upload_content_resource_id(path: &str) -> Option<&str> {
+    use ::service_common::data_plane_addressing::{first_segment, EMULATOR_PATH_NAMESPACE};
+
+    let (namespace, under_namespace) = first_segment(path)?;
+    if namespace != EMULATOR_PATH_NAMESPACE {
+        return None;
+    }
+    let (plane, under_plane) = first_segment(under_namespace)?;
+    if plane != UPLOAD_CONTENT_PLANE {
+        return None;
+    }
+    let resource_id = under_plane.strip_prefix('/')?;
+    let mut segments = resource_id.split('/');
+    match (segments.next(), segments.next(), segments.next()) {
+        (Some(project_id), Some(upload_id), None)
+            if !project_id.is_empty() && !upload_id.is_empty() =>
+        {
+            Some(resource_id)
+        }
+        _ => None,
+    }
+}
+
+/// What the content stored against an upload of a given `UploadType` is read as.
+///
+/// `UploadType` (read with `smithy_query(query="shape",shape="UploadType")`) names three
+/// kinds of upload: the two platform APP packages, whose content is that platform's package
+/// format; the `*_TEST_PACKAGE` types, whose content is the test archive Device Farm
+/// unpacks; and the rest — `EXTERNAL_DATA` (data a test reads), `WEB_APP` and the
+/// `*_TEST_SPEC` types (a test spec document) — whose content Device Farm does not read as
+/// an archive at all.
+///
+/// One classification serves the judgement the content plane makes of the bytes; what file
+/// name a type may carry is its own rule ([`upload_name_rule`]), because a type whose
+/// content Device Farm does not unpack still has a documented file name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UploadContentFormat {
+    /// An Android application package: a zip container carrying an Android manifest.
+    AndroidApp,
+    /// An iOS application archive: a zip container carrying an app bundle under `Payload/`.
+    IosApp,
+    /// A zip container, whatever it carries — the form every Device Farm test package
+    /// takes.
+    ZipArchive,
+    /// Content the service does not read: it is accepted as whatever was uploaded.
+    Opaque,
+}
+
+/// The format an upload of `upload_type` is read as.
+pub fn upload_content_format(upload_type: &str) -> UploadContentFormat {
+    match upload_type {
+        "ANDROID_APP" => UploadContentFormat::AndroidApp,
+        "IOS_APP" => UploadContentFormat::IosApp,
+        _ if upload_type.ends_with("_TEST_PACKAGE") => UploadContentFormat::ZipArchive,
+        _ => UploadContentFormat::Opaque,
+    }
+}
+
+/// The file-name extensions an upload of `upload_type` may carry, and the sentence a name
+/// carrying none of them is refused with — or `None` for a type whose file name the service
+/// does not constrain.
+///
+/// Every rule and every sentence is the model's own documentation, PER TYPE.
+/// `CreateUpload$name` states two: "If you are uploading an iOS app, the file name must end
+/// with the .ipa extension. If you are uploading an Android app, the file name must end
+/// with the .apk extension." `UpdateUpload$name` states the third, for the file AWS's
+/// custom-test-environment workflow uploads: "The test spec file name must end with the
+/// .yaml or .yml file extension."
+///
+/// The same sentence continues "For all others, the file name must end with the .zip file
+/// extension", and that clause is deliberately NOT enforced: the behaviour recorded from
+/// AWS for this emulator has a `CreateUpload` of a non-app type SERVED under a file name
+/// that does not end `.zip`, so refusing it would refuse a call the service accepts. The
+/// documented clause is a convention of the console workflow rather than a constraint the
+/// API applies, and a recorded response outranks the prose where the two disagree.
+pub fn upload_name_rule(upload_type: &str) -> Option<(&'static [&'static str], &'static str)> {
+    match upload_type {
+        "ANDROID_APP" => Some((
+            &[".apk"],
+            "The file name must end with the .apk extension",
+        )),
+        "IOS_APP" => Some((
+            &[".ipa"],
+            "The file name must end with the .ipa extension",
+        )),
+        _ if upload_type.ends_with("_TEST_SPEC") => Some((
+            &[".yaml", ".yml"],
+            "The test spec file name must end with the .yaml or .yml file extension",
+        )),
+        _ => None,
+    }
+}
+
+/// The separator a file name may not contain, per `CreateUpload$name` ("The name should
+/// not contain any forward slashes (/)"): a name is one file's, not a path.
+pub const UPLOAD_NAME_FORBIDDEN_SEPARATOR: char = '/';
+
+/// Why `name` is not a usable file name for an upload of `upload_type`, or `None` when it
+/// is.
+///
+/// Every sentence is the model's own documentation (see [`upload_name_rule`]); the model
+/// fixes no message text for `ArgumentException`, so the documented sentence is what the
+/// refusal states. The check lives here so `CreateUpload` and `UpdateUpload` — the two
+/// operations that set a name — word it one way.
+pub fn upload_name_refusal(name: &str, upload_type: &str) -> Option<String> {
+    if name.contains(UPLOAD_NAME_FORBIDDEN_SEPARATOR) {
+        return Some(format!(
+            "The name should not contain any forward slashes ({UPLOAD_NAME_FORBIDDEN_SEPARATOR})"
+        ));
+    }
+    let (extensions, sentence) = upload_name_rule(upload_type)?;
+    if extensions.iter().any(|extension| name.ends_with(extension)) {
+        return None;
+    }
+    Some(sentence.to_string())
 }
 
 /// The current wall-clock instant as a modelled timestamp, for the `created`-style

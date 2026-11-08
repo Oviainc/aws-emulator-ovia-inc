@@ -19,3 +19,5 @@ mod not_found_wording;
 mod projects;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/uploads.rs"]
+mod uploads;

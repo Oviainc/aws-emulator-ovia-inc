@@ -39,6 +39,16 @@
 //! table, and the default error renderers — lives in the generated `ServiceDefinition`
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
+//!
+//! ## The upload content plane
+//!
+//! `CreateUpload` publishes a locator the caller stores the upload's content against
+//! (`Upload$url`). That store is a plain HTTP `PUT` naming no modelled operation, so it is
+//! served here, through [`Service::can_handle`] (which also claims a request whose path is
+//! a content locator of an upload this store holds) and
+//! [`Service::override_routing_error`] (which serves the `PUT`). See [`upload_plane`].
+
+mod upload_plane;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
@@ -52,6 +62,12 @@ use std::sync::Arc;
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The SAME shared engine the generated entry threads into every operation.
+    ///
+    /// Held here because the upload content plane is served from
+    /// [`Service::override_routing_error`], which is not an operation and so has no
+    /// `self.engine` of its own; it must read and write the one store the operations use.
+    engine: Arc<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -60,8 +76,24 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            engine,
         }
+    }
+
+    /// Whether this request's path is a content locator this service published for an
+    /// upload the store still HOLDS.
+    ///
+    /// Resolving it against the store is what keeps the CLAIM narrow: a path this service
+    /// never published, and one whose upload has been deleted, is not this service's
+    /// request unless something else about it names this service. Whether a claimed
+    /// locator still names an upload is judged again where it is served.
+    fn holds_content_locator(&self, path: &str) -> bool {
+        let Some(resource_id) = crate::state::upload_content_resource_id(path) else {
+            return false;
+        };
+        crate::state::service_state(&*self.engine)
+            .is_some_and(|state| state.lock().holds_upload_of_resource_id(resource_id))
     }
 }
 
@@ -77,10 +109,17 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // Claim a request whose resolved route key is this service's signing
         // name. Edit this for anything the model does not express — a signing
         // name shared by several services, or access-key-id-based routing.
-        match smithy_server_runtime::resolve_route_key(parts) {
+        if match smithy_server_runtime::resolve_route_key(parts) {
             Some(key) => key == self.entry.identity().signing_name(),
             None => false,
+        } {
+            return true;
         }
+        // And a request to a content locator this service published for an upload the
+        // store holds: such a request names no service in a credential scope and carries
+        // no `X-Amz-Target`, so without this the router answers `UnknownService` for a URL
+        // this service handed out. See the module docs.
+        self.holds_content_locator(parts.uri.path())
     }
 
     fn override_operation(
@@ -119,8 +158,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // default for this service's envelope (query -> 400 InvalidAction text/xml,
         // awsJson -> 404, rpcv2Cbor -> 404, rest -> 501). Return `Some(resp)` to
         // word that routing failure in your own envelope instead.
-        let _ = req;
-        None
+        // A request to a content locator this service published is exactly that case by
+        // construction — the path is not in the model — so this is where the documented
+        // store of an upload's content is received. Whether the locator still names an
+        // upload is the plane's own judgement, so a locator whose upload was deleted is
+        // refused by this service rather than reported as a routing failure. Every other
+        // request that named no operation keeps the framework's default.
+        // The workspace's one reader of a request URI's path (`service_common`) is what
+        // the locator is read from, so an absolute-form request line and an origin-form
+        // one resolve identically here.
+        let path = ::service_common::request_path(req.uri());
+        let resource_id = crate::state::upload_content_resource_id(path)?;
+        Some(upload_plane::serve(&*self.engine, req, resource_id))
     }
 
     fn override_framework_error(
