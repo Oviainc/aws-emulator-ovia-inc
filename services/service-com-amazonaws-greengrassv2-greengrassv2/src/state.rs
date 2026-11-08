@@ -346,6 +346,21 @@ pub struct TargetDeployments {
     pub revisions: u64,
 }
 
+/// The Greengrass service role association this account holds: the role's ARN and the
+/// instant it was associated at.
+///
+/// ONE record, not a collection: the service role is a single account-level
+/// association, so associating a role REPLACES whatever was associated before rather
+/// than adding to a list, and disassociating removes the one record. The instant is
+/// kept as a `SystemTime` and rendered where it is reported
+/// ([`to_timestamp_text`]), so the read reports the same `associatedAt` the write
+/// answered.
+#[derive(Debug, Clone)]
+pub struct ServiceRoleAssociation {
+    pub role_arn: String,
+    pub associated_at: SystemTime,
+}
+
 /// Per-service state for com-amazonaws-greengrassv2-greengrassv2. A handler reaches it through [`service_state`].
 ///
 /// Every collection here is bounded by an enforced COUNT: component versions by
@@ -380,6 +395,10 @@ pub struct ComAmazonawsGreengrassv2Greengrassv2State {
     /// The cached tokens in expiry order, so expiring them costs only the entries
     /// that actually expired.
     pub idempotency_expiry: VecDeque<(SystemTime, String)>,
+    /// The Greengrass service role associated with this account, or `None` while no
+    /// role is associated — which is the state an account starts in and the one a
+    /// disassociation returns it to. At most one record, so it needs no count bound.
+    pub service_role: Option<ServiceRoleAssociation>,
 }
 
 impl ComAmazonawsGreengrassv2Greengrassv2State {
@@ -952,6 +971,19 @@ pub fn to_datetime(instant: SystemTime) -> ::aws_smithy_types::DateTime {
         .unwrap_or_default()
         .as_millis();
     ::aws_smithy_types::DateTime::from_millis(i64::try_from(millis).unwrap_or(i64::MAX))
+}
+
+/// A `SystemTime` as the instant a STRING timestamp member reports.
+///
+/// The service role association's `associatedAt` and `disassociatedAt` are modelled as
+/// plain strings rather than as `timestamp`
+/// (`smithy_query(query="operation",operation="GetServiceRoleForAccount")`), so the
+/// framework renders nothing for them and the handler states the form: the RFC 3339
+/// instant in UTC that an AWS `restJson1` timestamp carries, to whole seconds.
+pub fn to_timestamp_text(instant: SystemTime) -> String {
+    ::aws_smithy_types::DateTime::from_secs(epoch_seconds(instant))
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .unwrap_or_default()
 }
 
 /// A `SystemTime` in epoch SECONDS, which is how the shared IoT stores timestamp a
