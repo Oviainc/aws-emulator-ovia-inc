@@ -27,9 +27,11 @@
 //!   (`ValidationError`, HTTP 400). An address outside the VPC from a private range IS
 //!   accepted once the request names the zone.
 //! * AN `instance` TARGET. The modelled `InvalidTarget` is documented "the specified
-//!   target does not exist, is not in the same VPC as the target group": an id EC2 holds no
-//!   instance for is refused, as is an instance EC2 holds in another VPC, while the
-//!   instance EC2 holds in the group's own VPC is accepted.
+//!   target does not exist, is not in the same VPC as the target group": an instance EC2
+//!   holds in another VPC EXISTS and cannot be registered, so it earns that refusal, while
+//!   the instance EC2 holds in the group's own VPC is accepted. A value that is not WRITTEN
+//!   as an instance id, and an id EC2 holds no instance for, each name no target of any
+//!   account and are refused as malformed input (`ValidationError`).
 //!
 //! Assembling the whole router costs stack (see `boot_serve.rs`), so it is built — and the
 //! requests driven — on a sized thread.
@@ -679,20 +681,34 @@ fn elbv2_resolves_the_account_network_against_ec2() {
             );
             let instance_group =
                 target_group(&router, &runtime, "inst-network-tg", "instance", &network.vpc);
-            // (case, the target id, whether it is accepted)
-            let instance_rows: Vec<(&str, &str, bool)> = vec![
-                ("an instance of the group's own VPC", instance.as_str(), true),
+            // (case, the target id, the awsQuery code the registration is refused under —
+            // empty for an id that is accepted)
+            //
+            // An instance EC2 holds in another VPC EXISTS and cannot be registered: the
+            // modelled `InvalidTarget`. An id that is not WRITTEN as an instance id, and one
+            // EC2 holds no instance for, each name no target of any account, so they are the
+            // request to fix: `ValidationError`.
+            let instance_rows: Vec<(&str, &str, &str)> = vec![
+                ("an instance of the group's own VPC", instance.as_str(), ""),
                 (
                     "an instance of another VPC",
                     elsewhere.as_str(),
-                    false,
+                    "InvalidTarget",
                 ),
-                ("an id no instance of the account carries", "i-0123456789abcdef0", false),
-                ("an id that is no instance id at all", "not-an-instance", false),
+                (
+                    "an id no instance of the account carries",
+                    "i-0123456789abcdef0",
+                    "ValidationError",
+                ),
+                (
+                    "an id that is no instance id at all",
+                    "not-an-instance",
+                    "ValidationError",
+                ),
             ];
-            for (case, id, accepted) in instance_rows {
+            for (case, id, code) in instance_rows {
                 let answer = register(&router, &runtime, &instance_group, id, None);
-                if accepted {
+                if code.is_empty() {
                     assert_eq!(
                         answer.status, 200,
                         "case {case:?}: expected the registration to be accepted, got \
@@ -701,8 +717,8 @@ fn elbv2_resolves_the_account_network_against_ec2() {
                 } else {
                     assert_eq!(
                         (answer.status, answer.code()),
-                        (400, "InvalidTarget".to_string()),
-                        "case {case:?}: expected 400 InvalidTarget, got {answer:?}"
+                        (400, code.to_string()),
+                        "case {case:?}: expected 400 {code}, got {answer:?}"
                     );
                 }
             }

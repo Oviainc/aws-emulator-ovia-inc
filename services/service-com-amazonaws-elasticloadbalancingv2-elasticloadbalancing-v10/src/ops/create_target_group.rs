@@ -431,38 +431,16 @@ fn validate_health_check_port(port: Option<&str>) -> Result<(), CreateTargetGrou
 /// `HealthCheckProtocol`'s own documentation states it: "The TCP protocol is not
 /// supported for health checks if the protocol of the target group is HTTP or HTTPS.
 /// The GENEVE, TLS, UDP, TCP_UDP, QUIC, and TCP_QUIC protocols are not supported for
-/// health checks." Both are configuration the model declares but cannot express, so
-/// they are the operation's own `InvalidConfigurationRequest`.
+/// health checks." Both rules bound the VALUE the member may carry — read once in
+/// `crate::state` and applied by `ModifyTargetGroup` too — so a value outside them is
+/// malformed input, refused with this service's `ValidationError` naming the value and the
+/// protocols this target group's health check may use.
 fn validate_health_check_protocol(
     health_check_protocol: Option<&str>,
     protocol: Option<&str>,
 ) -> Result<(), CreateTargetGroupError> {
-    let Some(health_check_protocol) = health_check_protocol else {
-        return Ok(());
-    };
-    let refuse = |detail: String| {
-        Err(
-            CreateTargetGroupErrorModeled::InvalidConfigurationRequestException(
-                InvalidConfigurationRequestException {
-                    message: Some(detail),
-                },
-            )
-            .into(),
-        )
-    };
-    if !crate::state::HEALTH_CHECK_PROTOCOLS.contains(&health_check_protocol) {
-        return refuse(format!(
-            "The {health_check_protocol} protocol is not supported for health checks"
-        ));
-    }
-    if health_check_protocol == "TCP" && crate::state::is_http_protocol(protocol) {
-        return refuse(format!(
-            "The TCP protocol is not supported for health checks of a target group whose \
-             protocol is {}",
-            protocol.unwrap_or_default()
-        ));
-    }
-    Ok(())
+    crate::state::check_health_check_protocol(health_check_protocol, protocol)
+        .map_err(crate::scaffolded::Scaffolded::validation_error)
 }
 
 /// Refuse a `HealthCheckPath` whose VALUE is no health-check path, as

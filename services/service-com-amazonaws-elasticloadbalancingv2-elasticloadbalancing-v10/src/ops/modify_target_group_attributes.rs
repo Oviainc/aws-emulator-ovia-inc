@@ -184,11 +184,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     group.target_type
                 )));
             }
-            if let Err(domain) = spec.domain.check(&value) {
-                return Err(invalid_configuration(format!(
-                    "The value '{value}' is not valid for the attribute '{key}': it must be \
-                     {domain}"
-                )));
+            if let Err(refusal) =
+                spec.domain
+                    .check(crate::state::AttributeOwner::TargetGroup, &key, &value)
+            {
+                // The VALUE is outside the domain the attribute's documentation states for
+                // it — a bound, or a type it is not written in — which is malformed input
+                // rather than a configuration this target group cannot hold, so it answers
+                // under the code this API answers an input it cannot accept with, in the
+                // words it refuses that class of value with.
+                return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
             }
             writes.push((key, value));
         }
@@ -218,10 +223,10 @@ fn refuse(refusal: crate::state::Refusal) -> ModifyTargetGroupAttributesError {
     }
 }
 
-/// The operation's own refusal for an attribute it cannot store: a key this target group
-/// does not carry, or a value outside the set the attribute's documentation states. The
-/// message names the key and the value from the request and the rule they broke, because
-/// that is what the caller has to fix.
+/// The operation's own refusal for an attribute this target group cannot carry: a key its
+/// protocol and target type do not have. A value outside an attribute's documented domain
+/// is NOT this refusal — that is an input the request has to fix, answered under
+/// `ValidationError`.
 fn invalid_configuration(detail: String) -> ModifyTargetGroupAttributesError {
     ModifyTargetGroupAttributesErrorModeled::InvalidConfigurationRequestException(
         InvalidConfigurationRequestException {

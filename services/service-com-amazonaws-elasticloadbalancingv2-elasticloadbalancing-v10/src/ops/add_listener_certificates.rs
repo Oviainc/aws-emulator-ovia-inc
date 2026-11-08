@@ -287,14 +287,13 @@ fn certificate_not_found(arn: &str) -> AddListenerCertificatesError {
 }
 
 /// The modelled refusal for a call that would take a listener's certificate list past
-/// the bound this store holds it to.
+/// the bound this store holds it to, in the words Elastic Load Balancing states it
+/// (`crate::state::TOO_MANY_CERTIFICATES_MESSAGE`): a fixed sentence with no variable
+/// part.
 fn too_many_certificates() -> AddListenerCertificatesError {
     AddListenerCertificatesErrorModeled::TooManyCertificatesException(
         TooManyCertificatesException {
-            message: Some(format!(
-                "This emulator holds at most {} certificates in a listener's certificate list",
-                crate::state::CERTIFICATES_PER_LISTENER
-            )),
+            message: Some(crate::state::TOO_MANY_CERTIFICATES_MESSAGE.to_string()),
         },
     )
     .into()

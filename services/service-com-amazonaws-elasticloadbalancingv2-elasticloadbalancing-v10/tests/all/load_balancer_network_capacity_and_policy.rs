@@ -380,7 +380,13 @@ async fn set_ip_address_type_stores_what_its_documented_rules_accept() {
                 "case {case:?}: expected a later read to report the stored type, got {after:?}"
             );
         } else {
-            assert_refused(case, &reply, code, asked);
+            // Which address types a load balancer may carry is decided by its TYPE, and
+            // that is what this refusal states — not the value the request asked for.
+            let lb_type = fields
+                .iter()
+                .find_map(|(key, value)| (*key == "Type").then_some(*value))
+                .unwrap_or("application");
+            assert_refused(case, &reply, code, lb_type);
             let after = described_member(&router, &arn, "IpAddressType").await;
             assert_eq!(
                 after, before,

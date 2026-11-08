@@ -197,11 +197,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the limit.
         if input.tag_keys.len() > crate::state::TAGS_PER_RESOURCE {
             return Err(RemoveTagsErrorModeled::TooManyTagsException(TooManyTagsException {
-                message: Some(format!(
-                    "You've reached the limit of {} tags for a resource; the request names {} tag keys",
-                    crate::state::TAGS_PER_RESOURCE,
-                    input.tag_keys.len()
-                )),
+                // The words Elastic Load Balancing states this refusal with, stated once
+                // for every operation that answers it
+                // (`crate::state::TOO_MANY_TAGS_MESSAGE`).
+                message: Some(crate::state::TOO_MANY_TAGS_MESSAGE.to_string()),
             })
             .into());
         }

@@ -6,9 +6,11 @@
 //! after checking each one against the catalog the model's `ListenerAttribute$Key`
 //! documentation states (`crate::state::LISTENER_ATTRIBUTES`): the key must be an
 //! attribute this service models, the listener's load balancer family must carry it, and
-//! the value must be in the domain that documentation states for it. Anything else is
-//! the modelled `InvalidConfigurationRequestException`, and an ARN this store holds no
-//! listener for is `ListenerNotFoundException`.
+//! the value must be in the domain that documentation states for it. An attribute the
+//! family does not carry is the modelled `InvalidConfigurationRequestException`; a key
+//! this service models no attribute under and a value outside an attribute's domain are
+//! both inputs the request has to fix, so each answers `ValidationError`, and an ARN this
+//! store holds no listener for is `ListenerNotFoundException`.
 //!
 //! The whole request is checked before the first write, so a refused call stores
 //! nothing. An accepted one answers with the listener's WHOLE attribute collection — the
@@ -193,17 +195,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             };
             if !spec.applies_to(family) {
-                return Err(invalid_configuration(format!(
-                    "The attribute '{key}' is not supported for a listener of a {} load \
-                     balancer",
-                    family_name(family)
-                )));
+                // An attribute the listener's load balancer family does not carry, in the
+                // words Elastic Load Balancing refuses the listener form with
+                // (`crate::state::LISTENER_ATTRIBUTE_UNSUPPORTED_MESSAGE`).
+                return Err(invalid_configuration(
+                    crate::state::LISTENER_ATTRIBUTE_UNSUPPORTED_MESSAGE.to_string(),
+                ));
             }
-            if let Err(domain) = spec.domain.check(&value) {
-                return Err(invalid_configuration(format!(
-                    "The value '{value}' is not valid for the attribute '{key}': it must be \
-                     {domain}"
-                )));
+            if let Err(refusal) =
+                spec.domain
+                    .check(crate::state::AttributeOwner::Listener, &key, &value)
+            {
+                // The VALUE is outside the domain the attribute's documentation states for
+                // it — a bound, or a type it is not written in — which is malformed input
+                // rather than a configuration this listener cannot hold, so it answers
+                // under the code this API answers an input it cannot accept with, in the
+                // words it refuses that class of value with.
+                return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
             }
             writes.push((key, value));
         }
@@ -237,10 +245,10 @@ fn refuse(refusal: crate::state::Refusal) -> ModifyListenerAttributesError {
     }
 }
 
-/// The operation's own refusal for an attribute it cannot store: a key this listener does
-/// not carry, or a value outside the domain the attribute's documentation states. The
-/// message names the key and the value from the request and the rule they broke, because
-/// that is what the caller has to fix.
+/// The operation's own refusal for an attribute this listener cannot carry: one its load
+/// balancer family does not have. A value outside an attribute's documented domain is NOT
+/// this refusal — that is an input the request has to fix, answered under
+/// `ValidationError`.
 fn invalid_configuration(detail: String) -> ModifyListenerAttributesError {
     ModifyListenerAttributesErrorModeled::InvalidConfigurationRequestException(
         InvalidConfigurationRequestException {
@@ -248,14 +256,4 @@ fn invalid_configuration(detail: String) -> ModifyListenerAttributesError {
         },
     )
     .into()
-}
-
-/// How a refusal names the load balancer family it judged the attribute against, in the
-/// words the model's `LoadBalancerTypeEnum` uses.
-fn family_name(family: crate::state::LoadBalancerFamily) -> &'static str {
-    match family {
-        crate::state::LoadBalancerFamily::Application => "application",
-        crate::state::LoadBalancerFamily::Network => "network",
-        crate::state::LoadBalancerFamily::Gateway => "gateway",
-    }
 }

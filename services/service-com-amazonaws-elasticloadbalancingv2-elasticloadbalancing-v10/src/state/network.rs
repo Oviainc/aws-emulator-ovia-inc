@@ -181,8 +181,8 @@ impl NetworkRefusal {
     }
 
     /// The refusal EC2 ANSWERED on the wire: its sentence and the status it came with,
-    /// which a caller relaying the failure states beside the code
-    /// ([`NetworkRefusal::relayed_message`]).
+    /// which a caller reporting the failure states beside the code
+    /// ([`NetworkRefusal::reported_message`]).
     pub fn answered(code: impl Into<String>, message: Option<String>, status: Option<u16>) -> Self {
         Self {
             code: code.into(),
@@ -205,39 +205,22 @@ impl NetworkRefusal {
             .unwrap_or_else(|| self.code.clone())
     }
 
-    /// [`NetworkRefusal::reported_message`] in the form AWS reports a failure of a call a
-    /// service made to ANOTHER service on the caller's behalf: the inner service's own
-    /// sentence, then the service it was, the status and error code it answered, the id of
-    /// the call that was made, and the proxy it went through — there is none, so that
-    /// field is `null`.
+    /// What the Elastic Load Balancing v2 API states as the MESSAGE of its OWN refusal for
+    /// an EC2-owned resource it could not resolve: the error CODE EC2 answered, and nothing
+    /// else.
     ///
-    /// The tail is what a caller (or its tooling) correlates this refusal with the call
-    /// behind it by, so it is part of the message rather than an addition to it. A request
-    /// id names one call for correlation and is never a credential, so it is drawn afresh
-    /// per refusal and derived from nothing in the request
-    /// ([`::service_common::query_error_envelope::new_request_id`]).
+    /// That is this API's own wording for the class — the refusal is its `SubnetNotFound`
+    /// or `AllocationIdNotFound` rather than EC2's, so neither EC2's sentence, nor the
+    /// service and status it answered, nor the id of the call that was made is part of it.
+    /// A caller reads the inner code, which says WHICH kind of resource was not resolved,
+    /// under this API's own error code.
     ///
-    /// Which of the two forms a service states is the service's own: this one is what the
-    /// Elastic Load Balancing v2 API answers for an EC2-owned resource it could not
-    /// resolve, while the Classic API states the inner sentence alone
-    /// ([`NetworkRefusal::reported_message`]).
-    pub fn relayed_message(&self) -> String {
-        let status = self
-            .status
-            .map_or_else(String::new, |status| format!("Status Code: {status}; "));
-        let request_id = ::service_common::query_error_envelope::new_request_id();
-        format!(
-            "{} (Service: {RELAYED_SERVICE}; {status}Error Code: {}; Request ID: {request_id}; \
-             Proxy: null)",
-            self.reported_message(),
-            self.code,
-        )
+    /// Which of the two forms a service states is the service's own: the Classic API states
+    /// the inner SENTENCE instead ([`NetworkRefusal::reported_message`]).
+    pub fn stated_message(&self) -> String {
+        self.code.clone()
     }
 }
-
-/// The service a refusal relayed from one of these reads names: the one this service made
-/// the call to.
-const RELAYED_SERVICE: &str = "AmazonEC2";
 
 /// What EC2 says about the subnets a request named.
 #[derive(Debug, Clone, PartialEq, Eq)]

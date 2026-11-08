@@ -147,6 +147,15 @@ pub const RULES_PER_LOAD_BALANCER: usize = 100;
 /// `DescribeAccountLimits` reports as `condition-values-per-alb-rule`.
 pub const CONDITION_VALUES_PER_RULE: usize = 5;
 
+/// How many CONDITIONS one rule carries — a bound of its own, beside the number of VALUES
+/// those conditions match on ([`CONDITION_VALUES_PER_RULE`]).
+///
+/// Elastic Load Balancing states this bound in the refusal itself ("You can specify up to
+/// 5 conditions"), which is the only place it is published: no `DescribeAccountLimits`
+/// name carries it, so a rule's condition COUNT is judged against this number and its
+/// condition VALUES against the quota beside it.
+pub const CONDITIONS_PER_RULE: usize = 5;
+
 /// How many targets one target group of an APPLICATION Load Balancer holds before
 /// `RegisterTargets` refuses with the modelled `TooManyTargetsException`: the per-Region
 /// default Elastic Load Balancing publishes for "targets per target group", which
@@ -192,6 +201,83 @@ pub fn targets_per_target_group(group: &TargetGroupRecord) -> usize {
     }
 }
 
+/// The prefix every EC2 instance id carries, which is what a target of an `instance`
+/// target group is written as.
+const INSTANCE_ID_PREFIX: &str = "i-";
+
+/// The lengths an EC2 instance id's hexadecimal part has: AWS writes an instance id as
+/// `i-` and either 8 or 17 hexadecimal characters, and a value of any other length is no
+/// instance id at all.
+const INSTANCE_ID_DIGITS: [usize; 2] = [8, 17];
+
+/// A Lambda function's ARN, which is what a target of a `lambda` target group is written
+/// as (`TargetDescription$Id`: "if the target type is lambda, specify the ARN of the
+/// Lambda function").
+const LAMBDA_FUNCTION: ::service_common::arn::Requirement = ::service_common::arn::Requirement {
+    vendor: "lambda",
+    resource_type: Some("function"),
+    label: "a Lambda function ARN",
+};
+
+/// An Application Load Balancer's ARN, which is what a target of an `alb` target group is
+/// written as (`TargetDescription$Id`: "if the target type is alb, specify the ARN of the
+/// Application Load Balancer target").
+const LOAD_BALANCER_TARGET: ::service_common::arn::Requirement =
+    ::service_common::arn::Requirement {
+        vendor: SERVICE_NAMESPACE,
+        resource_type: Some("loadbalancer"),
+        label: "an Application Load Balancer ARN",
+    };
+
+/// Whether `id` is written the way a target of a `target_type` target group is written,
+/// and — when it is not — the rule it broke.
+///
+/// What a target id NAMES depends on the group's target type, and `TargetDescription$Id`
+/// states the form for each: "if the target type of the target group is instance, specify
+/// an instance ID. If the target type is ip, specify an IP address. If the target type is
+/// lambda, specify the ARN of the Lambda function. If the target type is alb, specify the
+/// ARN of the Application Load Balancer target." A value of none of those forms names no
+/// target of ANY account — it is the request that has to be fixed rather than a target the
+/// service could not find — so the operation that carries it refuses with this service's
+/// `ValidationError`, before anything is resolved against the service that owns the
+/// target.
+///
+/// An `ip` target's form is read by [`network::parse_ip_target`], which answers the
+/// address itself, so it is not restated here; the model puts no form on an id this
+/// service does not resolve at all.
+pub fn check_target_id(target_type: &str, id: &str) -> Result<(), String> {
+    let refuse = |form: &str| Err(format!("'{id}' in Targets is not {form}"));
+    match target_type {
+        "instance" => {
+            let digits = id.strip_prefix(INSTANCE_ID_PREFIX).unwrap_or_default();
+            if !INSTANCE_ID_DIGITS.contains(&digits.len())
+                || !digits
+                    .chars()
+                    .all(|digit| digit.is_ascii_digit() || ('a'..='f').contains(&digit))
+            {
+                return refuse("an instance ID");
+            }
+            Ok(())
+        }
+        "lambda" if !LAMBDA_FUNCTION.admits(id) => refuse(LAMBDA_FUNCTION.label),
+        "alb" if !LOAD_BALANCER_TARGET.admits(id) => refuse(LOAD_BALANCER_TARGET.label),
+        _ => Ok(()),
+    }
+}
+
+/// The message a registration naming instance ids EC2 holds no instance for is refused
+/// with: the ids it could not resolve, each quoted, in the order the request named them.
+///
+/// Elastic Load Balancing words this refusal about the TARGETS of the request — the ids are
+/// what the caller corrects — and states nothing about the target group or the account.
+pub fn invalid_instance_targets_message<'a>(ids: impl IntoIterator<Item = &'a str>) -> String {
+    let quoted: Vec<String> = ids.into_iter().map(|id| format!("'{id}'")).collect();
+    format!(
+        "The following targets are not valid instances: {}",
+        quoted.join(", ")
+    )
+}
+
 /// How many tags one Elastic Load Balancing resource carries before a tag write refuses
 /// with the modelled `TooManyTagsException`: the maximum number of tags per resource
 /// Elastic Load Balancing publishes in its tag restrictions (50), which applies to every
@@ -200,6 +286,14 @@ pub fn targets_per_target_group(group: &TargetGroupRecord) -> usize {
 /// Tags live on the record of the resource they are on, so what the store holds for them
 /// is bounded by this times the resource quotas above.
 pub const TAGS_PER_RESOURCE: usize = 50;
+
+/// The message a tag write past [`TAGS_PER_RESOURCE`] is refused with, for every
+/// operation that answers the modelled `TooManyTagsException`.
+///
+/// Elastic Load Balancing words this refusal as a FIXED sentence about the resource: it
+/// states neither the quota nor the count the request carried, so nothing of the request
+/// is interpolated into it.
+pub const TOO_MANY_TAGS_MESSAGE: &str = "The specified resource contains too many tags";
 
 /// The message a tag write that names one key twice is refused with, stated once for every
 /// operation that takes a `Tags` list.
@@ -655,28 +749,39 @@ pub fn rule_not_found_message(arn: &str) -> String {
     format!("Rule '{arn}' not found")
 }
 
-/// The message Elastic Load Balancing answers the `RuleNotFound` of `SetRulePriorities`
-/// with: that operation addresses a LIST (`RulePriorities`, one `RulePriorityPair` per
-/// rule) rather than one rule, so the refusal is about the set of priorities the request
-/// asked for and names no value — the collection-level wording every list-addressing read
-/// of this service answers, worded for the member the list carries.
+/// The message `SetRulePriorities` refuses a request it cannot place the asked-for
+/// priorities with: that operation addresses a LIST (`RulePriorities`, one
+/// `RulePriorityPair` per rule) rather than one rule, so the refusal is about the SET of
+/// priorities the request asked for and names no value — the collection-level wording every
+/// list-addressing read of this service answers, worded for the member the list carries.
 ///
-/// Pinned by the recorded answer: the concurrent-reorder behaviour this service is checked
-/// against has the losing `SetRulePriorities` of the race refused with exactly this
-/// sentence, where the rule its pairs named was no longer there.
-pub fn rule_priorities_not_found_message() -> String {
+/// ONE sentence for the two reasons that set cannot be placed — a pair naming a rule this
+/// store does not hold, and a priority a rule outside the request already evaluates at —
+/// which the ERROR CODE tells apart (`RuleNotFound` and `PriorityInUse`), exactly as the
+/// recorded answers do.
+pub fn rule_priorities_refusal_message() -> String {
     "One or more priorities not found".to_string()
 }
 
 /// The message Elastic Load Balancing answers a `PriorityInUse` with: the priority the
 /// request asked for, and nothing else.
 ///
-/// One message for every operation that places a rule at a priority — `CreateRule` and
-/// `SetRulePriorities` — because "a listener can't have multiple rules with the same
-/// priority" is ONE rule of the service. The listener is NOT named: the only value the
-/// refusal states is the one the request chose and has to change.
+/// The message of `CreateRule`, which places ONE rule at ONE priority, so the value the
+/// caller has to change is the one the refusal states. `SetRulePriorities` places a SET of
+/// them and words its own refusal about that set
+/// ([`rule_priorities_refusal_message`]).
 pub fn priority_in_use_message(priority: i32) -> String {
     format!("Priority '{priority}' is currently in use")
+}
+
+/// The message a `SetRulePriorities` request that names one priority twice is refused
+/// with: the priority the list repeated, which is the value the caller has to change.
+///
+/// A list that asks for two rules at one priority does not say which of them evaluates
+/// there, so the refusal is about the REQUEST and states the repeated value and nothing
+/// else — neither the rules it named nor the listeners they belong to.
+pub fn repeated_priority_message(priority: i32) -> String {
+    format!("Priority '{priority}' was provided multiple times")
 }
 
 /// The message a request that asks to DELETE a listener's default rule is refused with,
@@ -901,6 +1006,22 @@ pub fn check_mutual_authentication(
 /// The emulator's own bound, as [`LOAD_BALANCER_QUOTA`]: the list lives on the listener
 /// record, so it is released with the listener.
 pub const CERTIFICATES_PER_LISTENER: usize = 25;
+
+/// The message a call that would take a listener's certificate list past
+/// [`CERTIFICATES_PER_LISTENER`] is refused with.
+///
+/// Elastic Load Balancing words the modelled `TooManyCertificatesException` as a FIXED
+/// sentence with no variable part: neither the bound nor the listener is in it, so a
+/// caller reads the same text whichever listener it filled.
+pub const TOO_MANY_CERTIFICATES_MESSAGE: &str =
+    "The maximum number of certificates has been reached";
+
+/// The message a request to remove a listener's DEFAULT certificate is refused with.
+///
+/// The default certificate lives outside the certificate list and is replaced through
+/// `ModifyListener`, and Elastic Load Balancing states that as a fixed sentence: neither
+/// the certificate nor the listener the request named is part of it.
+pub const DEFAULT_CERTIFICATE_REMOVAL_MESSAGE: &str = "Default certificate cannot be removed";
 
 /// How many certificate ARNs ONE request may carry, which the model fixes at one for
 /// every operation that takes a `Certificates` list: `CreateListenerInput$Certificates`
@@ -1232,6 +1353,75 @@ pub fn unrecognized_attribute_key(owner: AttributeOwner, key: &str) -> Refusal {
         owner.noun()
     ))
 }
+
+/// How a refusal names a load balancer of `family` in PROSE, with the article that fits
+/// the display name AWS writes it with — as opposed to the `LoadBalancerTypeEnum` value a
+/// refusal quotes ([`family_type_name`]).
+pub fn family_prose_name(family: LoadBalancerFamily) -> &'static str {
+    match family {
+        LoadBalancerFamily::Application => "an Application Load Balancer",
+        LoadBalancerFamily::Network => "a Network Load Balancer",
+        LoadBalancerFamily::Gateway => "a Gateway Load Balancer",
+    }
+}
+
+/// The message a write of a load balancer attribute whose value the documentation FIXES
+/// for this kind of load balancer is refused with: the key, the one value it has, and the
+/// kind of load balancer it has it on.
+pub fn fixed_attribute_message(key: &str, fixed: &str, family: LoadBalancerFamily) -> String {
+    format!(
+        "The value for '{key}' must always be '{fixed}' for {}",
+        family_prose_name(family)
+    )
+}
+
+/// The message a write of a load balancer attribute the addressed load balancer's TYPE
+/// does not carry is refused with: the key the request named, and the type of the load
+/// balancer it was asked of.
+///
+/// Which attributes a load balancer carries is decided by its type, so that is what the
+/// refusal states — the key tells the caller which of the attributes it sent was rejected,
+/// and the type tells it why.
+pub fn load_balancer_attribute_unsupported_message(key: &str, family: LoadBalancerFamily) -> String {
+    format!(
+        "Load balancer attribute key '{key}' is not supported on load balancers with type '{}'",
+        family_type_name(family)
+    )
+}
+
+/// How Elastic Load Balancing refuses a key the addressed load balancer's TYPE does not
+/// carry, which that type decides.
+///
+/// Which attributes exist AT ALL is per type, so a Network or Gateway Load Balancer does
+/// not recognise another type's key any more than it recognises a key no documentation
+/// lists at all: both earn [`unrecognized_attribute_key`]. An Application Load Balancer
+/// tells the two apart — it answers a key of another type as a configuration it cannot
+/// hold, naming the key and its own type ([`Refusal::Configuration`], the modelled
+/// `InvalidConfigurationRequest`).
+///
+/// Recorded behaviour: the answers this service is checked against refuse a Network-only
+/// key on an Application Load Balancer with the "not supported on load balancers with
+/// type" sentence, and an Application-only key on a Network Load Balancer with the "not
+/// recognized" one.
+pub fn load_balancer_attribute_unsupported(key: &str, family: LoadBalancerFamily) -> Refusal {
+    match family {
+        LoadBalancerFamily::Application => Refusal::Configuration(
+            load_balancer_attribute_unsupported_message(key, family),
+        ),
+        LoadBalancerFamily::Network | LoadBalancerFamily::Gateway => {
+            unrecognized_attribute_key(AttributeOwner::LoadBalancer, key)
+        }
+    }
+}
+
+/// The message a write of a listener attribute the listener's load balancer family does
+/// not carry is refused with.
+///
+/// Elastic Load Balancing words the listener form of that refusal as a fixed sentence
+/// about the attribute the request provided, naming neither the key nor the family — unlike
+/// the load balancer form beside it ([`load_balancer_attribute_unsupported_message`]).
+pub const LISTENER_ATTRIBUTE_UNSUPPORTED_MESSAGE: &str =
+    "The provided listener attribute is not supported";
 
 /// Which family of load balancer a `Type` names, which is what decides WHICH listener
 /// attributes its listeners carry. The pairing is the model's own `LoadBalancerTypeEnum`
@@ -1906,9 +2096,13 @@ pub fn check_ip_address_type(
 ) -> Result<(), Refusal> {
     if ip_address_type == APPLICATION_ONLY_ADDRESS_TYPE && family != LoadBalancerFamily::Application
     {
+        // Elastic Load Balancing words this refusal about the LOAD BALANCER's type: the
+        // fixed frame below, with the type of the load balancer the request addressed —
+        // the address type the caller asked for is not restated in it.
         return Err(Refusal::Configuration(format!(
-            "The IP address type '{ip_address_type}' is only valid for an application load \
-             balancer"
+            "The specified IP address type is not supported on load balancers with type \
+             '{}'.",
+            family_type_name(family)
         )));
     }
     Ok(())
@@ -2248,7 +2442,10 @@ pub fn check_security_groups(
 
 /// The `LoadBalancerTypeEnum` value a family is named by, for a refusal that states which
 /// kind of load balancer the request asked for.
-fn family_type_name(family: LoadBalancerFamily) -> &'static str {
+///
+/// Public because the refusals an attribute write answers name the type the same way
+/// ([`load_balancer_attribute_unsupported_message`]).
+pub fn family_type_name(family: LoadBalancerFamily) -> &'static str {
     match family {
         LoadBalancerFamily::Application => "application",
         LoadBalancerFamily::Network => "network",
@@ -2434,6 +2631,42 @@ pub fn is_http_protocol(protocol: Option<&str>) -> bool {
 /// supported for health checks" — leaving HTTP, HTTPS and TCP.
 pub const HEALTH_CHECK_PROTOCOLS: &[&str] = &["HTTP", "HTTPS", "TCP"];
 
+/// The protocols a health check of a target group whose own protocol is `protocol` may
+/// use, from `HealthCheckProtocol`'s own documentation: [`HEALTH_CHECK_PROTOCOLS`] are the
+/// ones health checks support at all, and "the TCP protocol is not supported for health
+/// checks if the protocol of the target group is HTTP or HTTPS" takes TCP out for an HTTP
+/// target group.
+pub fn health_check_protocols_for(protocol: Option<&str>) -> &'static [&'static str] {
+    if is_http_protocol(protocol) {
+        return &["HTTP", "HTTPS"];
+    }
+    HEALTH_CHECK_PROTOCOLS
+}
+
+/// Whether `health_check_protocol` is one a health check of a target group whose protocol
+/// is `protocol` may use, and — when it is not — the message the write is refused with.
+///
+/// ONE reading of the two rules `HealthCheckProtocol`'s documentation states, applied by
+/// the create that first stores a health check and by the modify that changes it: a value
+/// outside [`health_check_protocols_for`] is refused naming the value and the protocols
+/// that target group's health check may use, which is what the caller has to choose from.
+pub fn check_health_check_protocol(
+    health_check_protocol: Option<&str>,
+    protocol: Option<&str>,
+) -> Result<(), String> {
+    let Some(health_check_protocol) = health_check_protocol else {
+        return Ok(());
+    };
+    let admitted = health_check_protocols_for(protocol);
+    if admitted.contains(&health_check_protocol) {
+        return Ok(());
+    }
+    Err(format!(
+        "Health check protocol '{health_check_protocol}' must be one of '{}'",
+        admitted.join(", ")
+    ))
+}
+
 /// The one `HealthCheckPort` value that is not a port number: the model documents it as
 /// that member's default — "traffic-port, which is the port on which each target
 /// receives traffic from the load balancer".
@@ -2565,41 +2798,86 @@ pub enum AttributeDomain {
 const RESERVED_COOKIE_PREFIXES: &[&str] = &["AWSALB", "AWSALBAPP", "AWSALBTG"];
 
 impl AttributeDomain {
-    /// Whether `value` is in this domain, and — when it is not — the domain stated the
-    /// way the attribute's documentation states it, so a refusal can name it.
-    pub fn check(&self, value: &str) -> Result<(), String> {
-        let integer = |min: i64, max: i64| -> Result<(), String> {
-            match value.parse::<i64>() {
-                Ok(parsed) if parsed >= min && parsed <= max => Ok(()),
-                _ => Err(format!("an integer from {min} to {max}")),
+    /// Whether `value` is in this domain and — when it is not — the message the write of
+    /// `key` on an `owner`'s attributes is refused with, in the words Elastic Load
+    /// Balancing refuses that CLASS of value with.
+    ///
+    /// Which sentence it is depends on HOW the value misses the domain, because that is
+    /// what the caller has to act on:
+    ///
+    /// * a value that is no integer at all: "The value of '<key>' must be a valid integer",
+    ///   with the literal the domain also admits named where it has one;
+    /// * an integer outside the documented range: the bound it missed — "The value of
+    ///   '<key>' cannot be less than <min> characters" and the `greater than <max>` form
+    ///   beside it — except on a LISTENER's attributes, whose own validator states the
+    ///   whole range instead: "'<key>' value '<value>' must be between '<min>-<max>'
+    ///   inclusive";
+    /// * a value outside an enumerated set, of which a boolean is the two-value case: "The
+    ///   value of '<key>' must be 'true' or 'false', but was '<value>'".
+    ///
+    /// The one difference between the owners is the range sentence, and it is recorded
+    /// behaviour: the answers this service is checked against word a load balancer
+    /// attribute's bound and a listener attribute's range that way.
+    pub fn check(&self, owner: AttributeOwner, key: &str, value: &str) -> Result<(), String> {
+        // An integer domain misses in two ways, and each has its own sentence: the value
+        // is not an integer, or it is one the range does not admit. `alternative` names
+        // the literal the domain admits beside the range, for the domains that have one.
+        let integer = |min: i64, max: i64, alternative: Option<&str>| -> Result<(), String> {
+            let Ok(parsed) = value.parse::<i64>() else {
+                return Err(match alternative {
+                    Some(literal) => {
+                        format!("The value of '{key}' must be '{literal}' or a valid integer")
+                    }
+                    None => format!("The value of '{key}' must be a valid integer"),
+                });
+            };
+            if parsed >= min && parsed <= max {
+                return Ok(());
             }
+            Err(match (owner, parsed < min) {
+                (AttributeOwner::Listener, _) => {
+                    format!("'{key}' value '{value}' must be between '{min}-{max}' inclusive")
+                }
+                (_, true) => format!("The value of '{key}' cannot be less than {min} characters"),
+                (_, false) => {
+                    format!("The value of '{key}' cannot be greater than {max} characters")
+                }
+            })
+        };
+        // The sentence a value outside an enumerated set earns, listing what the set holds.
+        let one_of = |values: &[&str]| -> String {
+            let listed: Vec<String> = values.iter().map(|value| format!("'{value}'")).collect();
+            format!(
+                "The value of '{key}' must be {}, but was '{value}'",
+                listed.join(" or ")
+            )
         };
         match *self {
             Self::Boolean => match value {
                 "true" | "false" => Ok(()),
-                _ => Err("'true' or 'false'".to_string()),
+                _ => Err(one_of(&["true", "false"])),
             },
             // Nothing to check: the documentation states no domain for it, so refusing
             // a value here would be this emulator's own rule rather than the service's.
             Self::Text => Ok(()),
-            Self::Integer { min, max } => integer(min, max),
+            Self::Integer { min, max } => integer(min, max, None),
             Self::IntegerOrOff { min, max } => {
                 if value == "off" {
                     return Ok(());
                 }
-                integer(min, max).map_err(|domain| format!("'off' or {domain}"))
+                integer(min, max, Some("off"))
             }
             Self::ZeroOrInteger { min, max } => {
                 if value == "0" {
                     return Ok(());
                 }
-                integer(min, max).map_err(|domain| format!("0 or {domain}"))
+                integer(min, max, Some("0"))
             }
             Self::OneOf(values) => {
                 if values.contains(&value) {
                     return Ok(());
                 }
-                Err(format!("one of {}", values.join(", ")))
+                Err(one_of(values))
             }
             Self::CookieName => {
                 if RESERVED_COOKIE_PREFIXES
@@ -2607,7 +2885,8 @@ impl AttributeDomain {
                     .any(|prefix| value.starts_with(prefix))
                 {
                     return Err(format!(
-                        "a name not starting with {}",
+                        "The value of '{key}' must not start with {}, which are reserved for \
+                         use by the load balancer",
                         RESERVED_COOKIE_PREFIXES.join(", ")
                     ));
                 }
@@ -3339,6 +3618,12 @@ pub fn unsupported_condition_member_message(member: &str, field: &str) -> String
 /// create that first stores them and on the modification that replaces them — so one
 /// reading of those clauses serves both.
 pub fn check_rule_conditions(conditions: &[RuleCondition]) -> Result<(), String> {
+    // How many conditions the rule carries is judged before what any of them matches on:
+    // the COUNT is a bound of its own ([`CONDITIONS_PER_RULE`]), and Elastic Load
+    // Balancing states it as the number a caller may specify.
+    if conditions.len() > CONDITIONS_PER_RULE {
+        return Err(format!("You can specify up to {CONDITIONS_PER_RULE} conditions"));
+    }
     let mut values = 0usize;
     let mut single_use_seen: Vec<&str> = Vec::new();
     for condition in conditions {
@@ -3407,6 +3692,89 @@ fn condition_values(condition: &RuleCondition) -> usize {
             .as_ref()
             .map_or(0, |config| listed(config.values.as_ref()));
     direct + configured
+}
+
+/// The action types that ROUTE a request, of which a rule carries exactly one: "Each rule
+/// must include exactly one of the following routing actions: `forward`,
+/// `fixed-response`, or `redirect`, and it must be the last action to be performed"
+/// (`smithy_query(query="doc",shape="Action")`).
+pub const ROUTING_ACTION_TYPES: &[&str] = &["forward", "fixed-response", "redirect"];
+
+/// The action types that AUTHENTICATE a request, of which a rule carries at most one:
+/// "Optionally, a rule for an HTTPS listener can also include one of the following user
+/// authentication actions: `authenticate-oidc`, `authenticate-cognito`, or
+/// `jwt-validation`" (`smithy_query(query="doc",shape="Action")`).
+pub const AUTHENTICATION_ACTION_TYPES: &[&str] =
+    &["authenticate-oidc", "authenticate-cognito", "jwt-validation"];
+
+/// How many actions one rule carries: the ONE routing action it must include, and the one
+/// user-authentication action it may include before it — the two sentences
+/// [`ROUTING_ACTION_TYPES`] and [`AUTHENTICATION_ACTION_TYPES`] quote, which is where this
+/// count comes from (no `DescribeAccountLimits` name carries it).
+///
+/// It is the FIRST thing [`check_rule_actions`] judges, so the work that walk does is
+/// bounded by this number rather than by the length of the list a caller chose to send.
+pub const ACTIONS_PER_RULE: usize = 2;
+
+/// Enforce what the model states about a rule's ACTIONS and declares no error shape for: a
+/// rule carries at most [`ACTIONS_PER_RULE`] of them, no action TYPE is specified twice,
+/// exactly one routing action is present, that action is LAST, and at most one
+/// user-authentication action precedes it.
+///
+/// A rule's actions are judged by the same clauses wherever they are SET — on the create
+/// that first stores them and on the modification that replaces them — so one reading of
+/// those clauses serves both, exactly as a rule's conditions are read once
+/// ([`check_rule_conditions`]).
+pub fn check_rule_actions(actions: &[Action]) -> Result<(), String> {
+    // The COUNT is judged before what the actions ARE, as a rule's conditions are: past the
+    // bound no list can hold together, and nothing below walks more actions than this.
+    if actions.len() > ACTIONS_PER_RULE {
+        return Err(format!("You can specify up to {ACTIONS_PER_RULE} actions"));
+    }
+    let kinds: Vec<&str> = actions.iter().map(|action| action.r#type.as_str()).collect();
+    // An action list that names one TYPE twice does not say which of the two is performed —
+    // the repeated type is what the refusal states, because it is what the caller removes.
+    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for kind in &kinds {
+        if !seen.insert(kind) {
+            return Err(format!(
+                "You cannot specify multiple of the following action type: '{kind}'"
+            ));
+        }
+    }
+    let routing = kinds
+        .iter()
+        .filter(|kind| ROUTING_ACTION_TYPES.contains(kind))
+        .count();
+    if routing != 1 {
+        return Err(format!(
+            "A rule must include exactly one of the following actions: {}",
+            ROUTING_ACTION_TYPES.join(", ")
+        ));
+    }
+    // "...and it must be the last action to be performed": an action AFTER the routing one
+    // would never run, so a list that puts one there asks for something the rule cannot do.
+    if !kinds
+        .last()
+        .is_some_and(|kind| ROUTING_ACTION_TYPES.contains(kind))
+    {
+        return Err(format!(
+            "The last action of a rule must be one of the following actions: {}",
+            ROUTING_ACTION_TYPES.join(", ")
+        ));
+    }
+    if kinds
+        .iter()
+        .filter(|kind| AUTHENTICATION_ACTION_TYPES.contains(kind))
+        .count()
+        > 1
+    {
+        return Err(format!(
+            "A rule can only have one of the following actions: {}",
+            AUTHENTICATION_ACTION_TYPES.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 /// Enforce what the model states about a rule's TRANSFORMS and declares no error shape

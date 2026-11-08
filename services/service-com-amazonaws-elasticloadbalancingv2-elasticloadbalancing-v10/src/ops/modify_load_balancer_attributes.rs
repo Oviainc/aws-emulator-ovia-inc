@@ -11,9 +11,12 @@
 //! documentation says this load balancer carries it, and only with a value in the domain
 //! that documentation states (`crate::state::LOAD_BALANCER_ATTRIBUTES`): the key must be
 //! one it lists, the load balancer's family must be one the key is listed for, and an
-//! attribute whose value that documentation FIXES cannot be changed. Anything else is the
-//! modelled `InvalidConfigurationRequestException`; an ARN this store holds no load
-//! balancer for is the modelled `LoadBalancerNotFoundException`.
+//! attribute whose value that documentation FIXES cannot be changed. A key this service
+//! models no attribute under, a value outside an attribute's domain and a value its
+//! documentation fixes are each a value the request has to fix, so each answers
+//! `ValidationError`; a key the addressed load balancer's TYPE does not carry is classified
+//! by that type (`crate::state::load_balancer_attribute_unsupported`); and an ARN this
+//! store holds no load balancer for is the modelled `LoadBalancerNotFoundException`.
 //!
 //! ## Shape of an operation
 //!
@@ -189,27 +192,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             };
             if !spec.applies_to(load_balancer) {
-                return Err(invalid_configuration(format!(
-                    "The attribute '{key}' is not supported for a {} load balancer",
-                    family_name(load_balancer.family())
+                // Which attributes a load balancer carries is decided by its TYPE, which is
+                // what the refusal states beside the key the request named — and which
+                // CLASS of refusal it is is decided by that type too
+                // (`crate::state::load_balancer_attribute_unsupported`).
+                return Err(refuse(crate::state::load_balancer_attribute_unsupported(
+                    &key,
+                    load_balancer.family(),
                 )));
             }
-            if let Err(domain) = spec.domain.check(&value) {
-                return Err(invalid_configuration(format!(
-                    "The value '{value}' is not valid for the attribute '{key}': it must be \
-                     {domain}"
-                )));
+            if let Err(refusal) =
+                spec.domain
+                    .check(crate::state::AttributeOwner::LoadBalancer, &key, &value)
+            {
+                // The VALUE is outside the domain the attribute's documentation states for
+                // it — a bound, or a type it is not written in — which is malformed input
+                // rather than a configuration this load balancer cannot hold, so it answers
+                // under the code this API answers an input it cannot accept with, in the
+                // words it refuses that class of value with.
+                return Err(crate::scaffolded::Scaffolded::validation_error(refusal));
             }
             // An attribute the documentation fixes for this load balancer keeps that
-            // value: a write restating it changes nothing and is accepted, and a write of
-            // anything else is a configuration the service cannot apply.
+            // value: a write restating it changes nothing and is accepted, while a write of
+            // anything else asks for a value the attribute cannot take on a load balancer
+            // of this type — an input the request has to fix, like a value outside the
+            // attribute's domain above.
             if let Some(fixed) = spec.fixed_for(load_balancer) {
                 if value != fixed {
-                    return Err(invalid_configuration(format!(
-                        "The attribute '{key}' cannot be changed for a {} load balancer: it is \
-                         always '{fixed}'",
-                        family_name(load_balancer.family())
-                    )));
+                    return Err(crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::fixed_attribute_message(
+                            &key,
+                            &fixed,
+                            load_balancer.family(),
+                        ),
+                    ));
                 }
             }
             writes.push((key, value));
@@ -255,11 +271,11 @@ fn refuse(refusal: crate::state::Refusal) -> ModifyLoadBalancerAttributesError {
     }
 }
 
-/// The operation's own refusal for an attribute it cannot store: a key this load balancer
-/// does not carry, a value outside the domain the attribute's documentation states, or a
-/// change to an attribute that documentation fixes. The message names the key and the
-/// value from the request and the rule they broke, because that is what the caller has to
-/// fix.
+/// The operation's own refusal for a rule `crate::state` classifies as a configuration
+/// this load balancer cannot hold — a key an Application Load Balancer does not carry. A
+/// key the service models nothing under, a value outside an attribute's domain and a value
+/// its documentation fixes are inputs the request has to fix instead, answered under
+/// `ValidationError`.
 fn invalid_configuration(detail: String) -> ModifyLoadBalancerAttributesError {
     ModifyLoadBalancerAttributesErrorModeled::InvalidConfigurationRequestException(
         InvalidConfigurationRequestException {
@@ -267,14 +283,4 @@ fn invalid_configuration(detail: String) -> ModifyLoadBalancerAttributesError {
         },
     )
     .into()
-}
-
-/// How a refusal names the load balancer family it judged the attribute against, in the
-/// words the model's `LoadBalancerTypeEnum` uses.
-fn family_name(family: crate::state::LoadBalancerFamily) -> &'static str {
-    match family {
-        crate::state::LoadBalancerFamily::Application => "application",
-        crate::state::LoadBalancerFamily::Network => "network",
-        crate::state::LoadBalancerFamily::Gateway => "gateway",
-    }
 }

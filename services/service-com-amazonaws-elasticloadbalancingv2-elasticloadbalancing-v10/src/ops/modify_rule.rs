@@ -238,6 +238,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             TransformUpdate::Clear => updated.transforms.clear(),
         }
 
+        // The clauses the model states about a rule's ACTIONS, judged on the actions this
+        // call LEAVES the rule with — the ONE reading `CreateRule` applies to the actions a
+        // rule is created with ([`crate::state::check_rule_actions`]), under the same
+        // modelled refusal for an action list the rule cannot perform.
+        crate::state::check_rule_actions(&updated.actions).map_err(|message| {
+            ModifyRuleErrorModeled::InvalidLoadBalancerActionException(
+                InvalidLoadBalancerActionException {
+                    message: Some(message),
+                },
+            )
+        })?;
+
         // A redirect action is judged against the protocol of the LISTENER it is attached
         // to, so a rule of a listener that terminates TLS cannot be left redirecting to
         // cleartext; the same action on a listener that does not is admitted.

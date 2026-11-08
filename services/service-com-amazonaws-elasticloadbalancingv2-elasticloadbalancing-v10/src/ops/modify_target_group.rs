@@ -223,23 +223,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The protocol rules of `HealthCheckProtocol`: "The GENEVE, TLS, UDP, TCP_UDP,
         // QUIC, and TCP_QUIC protocols are not supported for health checks", and "the
         // TCP protocol is not supported for health checks if the protocol of the target
-        // group is HTTP or HTTPS".
-        if let Some(health_check_protocol) = input.health_check_protocol.as_deref() {
-            if !crate::state::HEALTH_CHECK_PROTOCOLS.contains(&health_check_protocol) {
-                return Err(invalid_configuration(format!(
-                    "The {health_check_protocol} protocol is not supported for health checks"
-                )));
-            }
-            if health_check_protocol == "TCP"
-                && crate::state::is_http_protocol(group.protocol.as_deref())
-            {
-                return Err(invalid_configuration(format!(
-                    "The TCP protocol is not supported for health checks of a target group \
-                     whose protocol is {}",
-                    group.protocol.as_deref().unwrap_or_default()
-                )));
-            }
-        }
+        // group is HTTP or HTTPS". Both bound the VALUE the member may carry, so a value
+        // outside them is malformed input — the ONE reading of them in `crate::state`,
+        // which `CreateTargetGroup` applies to the check a target group STARTS with.
+        crate::state::check_health_check_protocol(
+            input.health_check_protocol.as_deref(),
+            group.protocol.as_deref(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // `HealthCheckPath` and `Matcher` are both documented "[HTTP/HTTPS health
         // checks]", so naming either for a health check that will not be an HTTP one is
         // a configuration that cannot hold together.

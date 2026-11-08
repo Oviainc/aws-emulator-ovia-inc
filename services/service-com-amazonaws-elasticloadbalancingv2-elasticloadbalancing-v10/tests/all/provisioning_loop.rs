@@ -550,8 +550,8 @@ async fn the_provisioning_loop_is_persisted_and_read_back() {
 
     let mut form = action("RegisterTargets");
     form.push(p("TargetGroupArn", &tg_arn));
-    form.push(p("Targets.member.1.Id", "i-1111111111111111"));
-    form.push(p("Targets.member.2.Id", "i-2222222222222222"));
+    form.push(p("Targets.member.1.Id", "i-11111111111111111"));
+    form.push(p("Targets.member.2.Id", "i-22222222222222222"));
     form.push(p("Targets.member.2.Port", "8080"));
     let registered = call(&router, &form).await;
     assert_eq!(
@@ -591,12 +591,12 @@ async fn the_provisioning_loop_is_persisted_and_read_back() {
         .map(|d| (first_text(d, "Id"), first_text(d, "Port")))
         .collect();
     assert!(
-        registrations.contains(&(Some("i-1111111111111111".to_string()), Some("80".to_string()))),
+        registrations.contains(&(Some("i-11111111111111111".to_string()), Some("80".to_string()))),
         "case health: a target registered without a port takes the group's port, got {registrations:?}"
     );
     assert!(
         registrations.contains(&(
-            Some("i-2222222222222222".to_string()),
+            Some("i-22222222222222222".to_string()),
             Some("8080".to_string())
         )),
         "case health: a target registered with a port keeps it, got {registrations:?}"
@@ -660,7 +660,7 @@ async fn the_provisioning_loop_is_persisted_and_read_back() {
     // A target that was never registered is reported as such.
     let mut form = action("DescribeTargetHealth");
     form.push(p("TargetGroupArn", &tg_arn));
-    form.push(p("Targets.member.1.Id", "i-9999999999999999"));
+    form.push(p("Targets.member.1.Id", "i-99999999999999999"));
     let health = call(&router, &form).await;
     assert_eq!(
         health.text("Reason").as_deref(),
@@ -1662,7 +1662,7 @@ async fn a_store_bound_is_answered_with_the_modelled_quota_error() {
     for index in 1..=target_bound {
         form.push(p(
             &format!("Targets.member.{index}.Id"),
-            &format!("i-{index:016}"),
+            &format!("i-{index:017}"),
         ));
     }
     let registered = call(&router, &form).await;
@@ -1676,7 +1676,7 @@ async fn a_store_bound_is_answered_with_the_modelled_quota_error() {
     form.push(p("TargetGroupArn", &tg_arn));
     // One target the group already holds (a replacement, which does not count) and
     // one new one, which does not fit.
-    form.push(p("Targets.member.1.Id", "i-0000000000000001"));
+    form.push(p("Targets.member.1.Id", "i-00000000000000001"));
     form.push(p("Targets.member.2.Id", "i-does-not-fit"));
     let refused = call(&router, &form).await;
     assert_eq!(
@@ -1760,7 +1760,7 @@ async fn an_unknown_identifier_is_refused_with_the_modelled_error() {
                 p("Action", "RegisterTargets"),
                 p("Version", VERSION),
                 p("TargetGroupArn", &bogus_tg),
-                p("Targets.member.1.Id", "i-1111111111111111"),
+                p("Targets.member.1.Id", "i-11111111111111111"),
             ],
             400,
             "TargetGroupNotFound",

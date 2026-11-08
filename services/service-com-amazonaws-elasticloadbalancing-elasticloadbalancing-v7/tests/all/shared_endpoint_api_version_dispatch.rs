@@ -65,7 +65,7 @@ async fn targets_registered_through_the_shared_endpoint_are_reported_by_the_heal
             "an instance target with a port override",
             "shared-health-override",
             "instance",
-            "i-00fedcba9876543210",
+            "i-00fedcba987654321",
             Some("8081"),
         ),
         (

@@ -205,11 +205,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(
                     RemoveListenerCertificatesErrorModeled::OperationNotPermittedException(
                         OperationNotPermittedException {
-                            message: Some(format!(
-                                "Certificate '{arn}' is the default certificate of listener \
-                                 '{}' and cannot be removed; call ModifyListener to replace it",
-                                input.listener_arn
-                            )),
+                            // The words Elastic Load Balancing states this refusal with
+                            // (`crate::state::DEFAULT_CERTIFICATE_REMOVAL_MESSAGE`): a
+                            // fixed sentence naming neither the certificate nor the
+                            // listener the request carried.
+                            message: Some(
+                                crate::state::DEFAULT_CERTIFICATE_REMOVAL_MESSAGE.to_string(),
+                            ),
                         },
                     )
                     .into(),

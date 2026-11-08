@@ -1209,10 +1209,10 @@ async fn listener_attributes_default_and_accept_only_their_documented_domain() {
     // one ranged attribute and a value either side of them, a boolean inside and outside
     // its two values, header-name and header-value attributes the issue did not cite, an
     // attribute of another family, and a key no attribute carries. The last column is the
-    // awsQuery code the row is refused under, empty for a row that is stored: a value
-    // outside an attribute's domain, and an attribute this listener's family does not
-    // carry, are configurations this listener cannot hold, while a key the service defines
-    // no attribute under is an input value the request has to fix.
+    // awsQuery code the row is refused under, empty for a row that is stored: an attribute
+    // this listener's family does not carry is a configuration this listener cannot hold,
+    // while a value outside an attribute's documented domain and a key the service defines
+    // no attribute under are both inputs the request has to fix.
     let rows: Vec<(&str, &str, &str, &str)> = vec![
         ("network", "tcp.idle_timeout.seconds", "60", ""),
         ("network", "tcp.idle_timeout.seconds", "6000", ""),
@@ -1220,19 +1220,19 @@ async fn listener_attributes_default_and_accept_only_their_documented_domain() {
             "network",
             "tcp.idle_timeout.seconds",
             "59",
-            INVALID_CONFIGURATION,
+            VALIDATION_ERROR,
         ),
         (
             "network",
             "tcp.idle_timeout.seconds",
             "6001",
-            INVALID_CONFIGURATION,
+            VALIDATION_ERROR,
         ),
         (
             "network",
             "tcp.idle_timeout.seconds",
             "not-a-number",
-            INVALID_CONFIGURATION,
+            VALIDATION_ERROR,
         ),
         (
             "gateway",
@@ -1244,7 +1244,7 @@ async fn listener_attributes_default_and_accept_only_their_documented_domain() {
             "gateway",
             "send_tcp_reset.on_idle_timeout.enabled",
             "yes",
-            INVALID_CONFIGURATION,
+            VALIDATION_ERROR,
         ),
         (
             "application",

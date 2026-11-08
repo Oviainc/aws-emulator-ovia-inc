@@ -196,11 +196,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the call names, so it is the modelled quota refusal rather than a malformed
         // request — the same refusal the per-resource check below answers.
         if input.tags.len() > crate::state::TAGS_PER_RESOURCE {
-            return Err(too_many_tags(format!(
-                "You've reached the limit of {} tags for a resource; the request carries {} tags",
-                crate::state::TAGS_PER_RESOURCE,
-                input.tags.len()
-            )));
+            return Err(too_many_tags());
         }
 
         // What to store, in the order the request named it: a list that names one key
@@ -256,10 +252,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             };
             let after = merged_tag_count(stored, &additions);
             if after > crate::state::TAGS_PER_RESOURCE {
-                return Err(too_many_tags(format!(
-                    "You've reached the limit of {} tags for the resource '{arn}'",
-                    crate::state::TAGS_PER_RESOURCE
-                )));
+                return Err(too_many_tags());
             }
         }
 
@@ -294,10 +287,12 @@ fn merged_tag_count(stored: &HashMap<String, String>, additions: &[(String, Stri
 }
 
 /// The modelled quota refusal for a write that would take a resource past the tags it
-/// may carry.
-fn too_many_tags(message: String) -> AddTagsError {
+/// may carry, in the words Elastic Load Balancing states it
+/// (`crate::state::TOO_MANY_TAGS_MESSAGE`): a fixed sentence that states neither the
+/// quota nor what the request carried.
+fn too_many_tags() -> AddTagsError {
     AddTagsErrorModeled::TooManyTagsException(TooManyTagsException {
-        message: Some(message),
+        message: Some(crate::state::TOO_MANY_TAGS_MESSAGE.to_string()),
     })
     .into()
 }

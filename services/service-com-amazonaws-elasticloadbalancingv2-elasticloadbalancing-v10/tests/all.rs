@@ -59,6 +59,8 @@ mod management_event_recording;
 mod provisioning_loop;
 #[path = "all/query_error_envelope.rs"]
 mod query_error_envelope;
+#[path = "all/refusal_class_by_failure_mode.rs"]
+mod refusal_class_by_failure_mode;
 #[path = "all/reported_member_defaults.rs"]
 mod reported_member_defaults;
 #[path = "all/resource_tags.rs"]

@@ -10,14 +10,17 @@
 //! stored.
 //!
 //! Every target is RESOLVED before any of them is stored, so a refusal registers none of
-//! them: what an id names depends on the group's target type, and an `ip` group's address
-//! or an `instance` group's instance is matched against the account's network, which EC2
+//! them: what an id names depends on the group's target type, and an id that is not even
+//! WRITTEN the way a target of that type is written is refused `ValidationError` before
+//! anything is resolved ([`crate::state::check_target_id`]). An `ip` group's address or an
+//! `instance` group's instance is matched against the account's network, which EC2
 //! owns ([`crate::state::network`]). An address that is no address of the group's address
 //! type, one of no range an `ip` target may come from, one the group's VPC holds outside
-//! every subnet of it, and one outside the VPC that no zone was named for are refused
-//! `ValidationError` — which of those classes a registration earns is decided by where
-//! the address falls, never by what the request left out; an instance EC2 does not hold,
-//! or holds in another VPC, is the modelled `InvalidTargetException`. A registration in a
+//! every subnet of it, one outside the VPC that no zone was named for, and an instance id
+//! EC2 holds no instance for are refused `ValidationError` — which of those classes a
+//! registration earns is decided by where the address falls, never by what the request
+//! left out; an instance that EXISTS and cannot be registered — EC2 holds it in another
+//! VPC — is the modelled `InvalidTargetException`. A registration in a
 //! subnet of the group's VPC takes that subnet's Availability Zone, which is what
 //! `DescribeTargetHealth` then reports for it.
 //!
@@ -335,6 +338,16 @@ async fn resolve_targets(
     targets: &[TargetDescription],
 ) -> Result<Vec<Option<String>>, RegisterTargetsError> {
     let unresolved = || Ok(vec![None; targets.len()]);
+    // What a target id is WRITTEN as is decided by the group's target type, and a value of
+    // none of those forms names no target of any account: that is the request to fix rather
+    // than a target this group cannot carry, so it is refused with this service's
+    // `ValidationError` before anything is asked of the service that owns the target
+    // ([`crate::state::check_target_id`]). An `ip` target's form is read below, by the
+    // parse that answers the address itself.
+    for target in targets {
+        crate::state::check_target_id(target_type, &target.id)
+            .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+    }
     match target_type {
         "ip" => {
             // What the ids ARE is decided by this request alone, so it is answered before
@@ -390,10 +403,16 @@ async fn resolve_targets(
                 .into_iter()
                 .collect();
             match crate::state::network::resolve_instance_targets(ctx, region, &ids).await {
-                crate::state::network::InstanceTargets::Absent(id) => Err(invalid_target(format!(
-                    "The target '{id}' is not valid: this account holds no instance with \
-                     that id"
-                ))),
+                // An id EC2 holds no instance for names no target of this account at all,
+                // so it is the request that has to be fixed rather than a target this group
+                // cannot carry: the modelled `InvalidTarget` is for a target that EXISTS
+                // and cannot be registered, which is the VPC rule below. The refusal names
+                // the ids it could not resolve, which is what the caller corrects.
+                crate::state::network::InstanceTargets::Absent(id) => {
+                    Err(crate::scaffolded::Scaffolded::validation_error(
+                        crate::state::invalid_instance_targets_message([id.as_str()]),
+                    ))
+                }
                 crate::state::network::InstanceTargets::Resolved(instances) => {
                     // "... is not in the same VPC as the target group": compared only
                     // where both VPCs are known, because a value neither side reports

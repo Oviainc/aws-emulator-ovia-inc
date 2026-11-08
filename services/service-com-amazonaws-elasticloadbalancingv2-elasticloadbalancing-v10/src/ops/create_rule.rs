@@ -210,6 +210,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // once for every operation that SETS them ([`crate::state`]).
         crate::state::check_rule_conditions(&input.conditions)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // The clauses the model states about a rule's ACTIONS: how many it carries, the one
+        // routing action it must end with, and the one authentication action it may carry
+        // before that. An action list outside them asks for something the rule cannot do, so
+        // it answers the modelled "the requested action is not valid".
+        crate::state::check_rule_actions(&input.actions).map_err(|message| {
+            CreateRuleErrorModeled::InvalidLoadBalancerActionException(
+                InvalidLoadBalancerActionException {
+                    message: Some(message),
+                },
+            )
+        })?;
         crate::state::check_rule_transforms(input.transforms.as_deref().unwrap_or_default())
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // Each component of a redirect's target URI holds its documented form, and a

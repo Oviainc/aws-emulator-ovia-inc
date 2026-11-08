@@ -520,16 +520,18 @@ async fn repeated_writes_replace_only_the_keys_they_name_and_are_idempotent() {
 // ---------------------------------------------------------------------------
 
 /// An attribute this service cannot store is refused and the load balancer is left exactly
-/// as it was: a key the service defines no attribute under is an input value the request
-/// has to fix (`ValidationError`), while every other way a write can be wrong is a
-/// configuration this load balancer cannot hold (the operation's own
-/// `InvalidConfigurationRequest`).
+/// as it was. A key the service defines no attribute under, a value outside the
+/// attribute's documented domain and a change to a value that documentation fixes are each
+/// a value the request has to fix (`ValidationError`); a key the addressed load balancer's
+/// TYPE does not carry is classified by that type — an Application Load Balancer answers
+/// the operation's own `InvalidConfigurationRequest`, a Network or Gateway Load Balancer
+/// answers `ValidationError`.
 ///
-/// The rows span every way a write can be wrong: a key no documentation lists, a key
-/// another family's load balancers carry (in both directions), a value outside a
-/// documented domain — one past each published bound of an integer range and a word
-/// outside an enumerated set — and a change to the attribute whose documentation says it
-/// "can't be changed".
+/// The rows span every one of them: a key no documentation lists, a key another family's
+/// load balancers carry (in both directions, so both classes of that refusal are driven), a
+/// value outside a documented domain — one past each published bound of an integer range and
+/// a word outside an enumerated set — and a change to the attribute whose documentation says
+/// it "can't be changed".
 #[tokio::test]
 async fn an_attribute_this_service_cannot_store_is_refused_and_changes_nothing() {
     let cases: Vec<RefusalCase> = vec![
@@ -549,49 +551,49 @@ async fn an_attribute_this_service_cannot_store_is_refused_and_changes_nothing()
             "an application load balancer's attribute on a network load balancer",
             vec![("Type", "network")],
             ("routing.http2.enabled", "false"),
-            INVALID_CONFIGURATION,
+            VALIDATION_ERROR,
         ),
         (
             "an attribute of both other families on a gateway load balancer",
             vec![("Type", "gateway")],
             ("access_logs.s3.enabled", "true"),
-            INVALID_CONFIGURATION,
+            VALIDATION_ERROR,
         ),
         (
             "a boolean that is neither true nor false",
             vec![],
             ("deletion_protection.enabled", "yes"),
-            INVALID_CONFIGURATION,
+            VALIDATION_ERROR,
         ),
         (
             "one below the published lower bound of an integer range",
             vec![],
             ("idle_timeout.timeout_seconds", "0"),
-            INVALID_CONFIGURATION,
+            VALIDATION_ERROR,
         ),
         (
             "one above the published upper bound of an integer range",
             vec![],
             ("idle_timeout.timeout_seconds", "4001"),
-            INVALID_CONFIGURATION,
+            VALIDATION_ERROR,
         ),
         (
             "one above the published upper bound of the secondary address range",
             vec![("Type", "network")],
             ("secondary_ips.auto_assigned.per_subnet", "8"),
-            INVALID_CONFIGURATION,
+            VALIDATION_ERROR,
         ),
         (
             "a word outside an enumerated set",
             vec![],
             ("routing.http.xff_header_processing.mode", "rewrite"),
-            INVALID_CONFIGURATION,
+            VALIDATION_ERROR,
         ),
         (
             "changing the attribute whose documentation fixes it",
             vec![],
             ("load_balancing.cross_zone.enabled", "false"),
-            INVALID_CONFIGURATION,
+            VALIDATION_ERROR,
         ),
     ];
 
@@ -640,8 +642,8 @@ async fn a_request_carrying_one_bad_attribute_stores_none_of_them() {
     let reply = write_attributes(&router, &arn, &writes).await;
     assert_eq!(
         (reply.status, reply.error_code().as_str()),
-        (400, INVALID_CONFIGURATION),
-        "case a good attribute beside a bad one: expected 400 {INVALID_CONFIGURATION}, got {} \
+        (400, VALIDATION_ERROR),
+        "case a good attribute beside a bad one: expected 400 {VALIDATION_ERROR}, got {} \
          body {}",
         reply.status,
         reply.body

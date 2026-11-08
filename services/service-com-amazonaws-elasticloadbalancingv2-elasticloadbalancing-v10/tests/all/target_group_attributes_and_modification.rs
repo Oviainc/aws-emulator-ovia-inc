@@ -15,10 +15,10 @@
 //!   shape, carrying the documented default until a write changes it
 //!   (`smithy_query(query="doc",shape="TargetGroupAttribute",member="Key")` is the only
 //!   catalog of them, since the Smithy shape itself is an unconstrained key/value pair).
-//! * A value outside an attribute's documented domain and a key another load balancer
-//!   family's groups carry are each refused with the operation's own
-//!   `InvalidConfigurationRequest`, a key the model does not document with
-//!   `ValidationError`, and a refused write stores nothing.
+//! * A value outside an attribute's documented domain and a key the model does not
+//!   document are each refused with `ValidationError`, a key another load balancer
+//!   family's groups carry with the operation's own `InvalidConfigurationRequest`, and a
+//!   refused write stores nothing.
 //! * `ModifyTargetGroup` replaces the health-check members the request names and leaves
 //!   every other one as it was.
 //! * `CreateTargetGroup` refuses a `Name` outside the rule its own documentation states
@@ -49,15 +49,21 @@ const INVALID_CONFIGURATION: &str = "InvalidConfigurationRequest";
 /// rule its model documents in prose and declares no error shape for.
 const VALIDATION_ERROR: &str = "ValidationError";
 
-/// The code a refused attribute write answers under: a key the service defines no
-/// attribute for is an input value the request has to fix, while a value outside an
-/// attribute's documented domain and an attribute this target group does not carry are
-/// configurations it cannot hold.
+/// The keys the write table's refused rows name that this target group does not CARRY at
+/// all — an attribute of another load balancer family, and one of a Lambda target — as
+/// opposed to a key it carries written with a value outside that attribute's domain.
+const KEYS_THE_GROUP_DOES_NOT_CARRY: &[&str] =
+    &["proxy_protocol_v2.enabled", "lambda.multi_value_headers.enabled"];
+
+/// The code a refused attribute write answers under: an attribute this target group does
+/// not carry is a configuration it cannot hold, while a key the service defines no
+/// attribute for and a value outside an attribute's documented domain are both inputs the
+/// request has to fix.
 fn refusal_code(key: &str) -> &'static str {
-    if key == UNDOCUMENTED_ATTRIBUTE_KEY {
-        VALIDATION_ERROR
-    } else {
+    if KEYS_THE_GROUP_DOES_NOT_CARRY.contains(&key) {
         INVALID_CONFIGURATION
+    } else {
+        VALIDATION_ERROR
     }
 }
 
@@ -239,7 +245,7 @@ async fn every_operation_naming_an_absent_target_group_answers_the_modelled_refu
             "RegisterTargets",
             vec![
                 p("TargetGroupArn", &absent),
-                p("Targets.member.1.Id", "i-1111111111111111"),
+                p("Targets.member.1.Id", "i-11111111111111111"),
             ],
             named(&absent),
         ),
@@ -247,7 +253,7 @@ async fn every_operation_naming_an_absent_target_group_answers_the_modelled_refu
             "DeregisterTargets",
             vec![
                 p("TargetGroupArn", &absent),
-                p("Targets.member.1.Id", "i-1111111111111111"),
+                p("Targets.member.1.Id", "i-11111111111111111"),
             ],
             named(&absent),
         ),
@@ -470,9 +476,9 @@ async fn attribute_defaults_follow_the_documented_catalog_of_the_load_balancer_f
 // ---------------------------------------------------------------------------
 
 /// A write inside an attribute's documented domain is stored and read back verbatim; a
-/// write outside it and a key that belongs to another load balancer family are each
-/// refused with `InvalidConfigurationRequest`, a key the model does not document with
-/// `ValidationError`, and each of them stores nothing.
+/// write outside it and a key the model does not document are each refused with
+/// `ValidationError`, a key that belongs to another load balancer family with
+/// `InvalidConfigurationRequest`, and each of them stores nothing.
 ///
 /// The accepted rows sit ON each published bound; the refused ones one step past it, so
 /// the deregistration-delay value the issue recorded is one cell of the table.
@@ -652,7 +658,7 @@ async fn an_attribute_write_is_all_or_nothing_across_the_request() {
     let reply = call(&router, &form).await;
     assert_eq!(
         (reply.status, reply.error_code().as_str()),
-        (400, "InvalidConfigurationRequest"),
+        (400, VALIDATION_ERROR),
         "case one bad attribute beside a good one: expected the refusal, got {} body {}",
         reply.status,
         reply.body
@@ -735,8 +741,12 @@ async fn modify_target_group_replaces_only_the_health_check_members_it_names() {
     }
 }
 
-/// A health check that cannot hold together is refused with the operation's own
-/// `InvalidConfigurationRequest`, and the stored health check is left as it was.
+/// A health check that cannot hold together is refused, and the stored health check is
+/// left as it was: a `HealthCheckProtocol` value the member's documentation does not admit
+/// — on its own or against the target group's protocol — is an input the request has to fix
+/// (`ValidationError`), while a member that only an HTTP check carries, and health checks
+/// turned off on a target type that always has them, are configurations the target group
+/// cannot hold (the operation's own `InvalidConfigurationRequest`).
 ///
 /// Each row is a sentence of the model's own documentation: the protocols a health check
 /// may use, the one pairing of target group and health check protocol it rules out, the
@@ -767,13 +777,13 @@ async fn a_health_check_that_cannot_hold_together_is_refused() {
             "a health check over UDP",
             &tcp_tg,
             vec![("HealthCheckProtocol", "UDP")],
-            "InvalidConfigurationRequest",
+            VALIDATION_ERROR,
         ),
         (
             "a health check over GENEVE",
             &tcp_tg,
             vec![("HealthCheckProtocol", "GENEVE")],
-            "InvalidConfigurationRequest",
+            VALIDATION_ERROR,
         ),
         (
             // "The TCP protocol is not supported for health checks if the protocol of
@@ -781,7 +791,7 @@ async fn a_health_check_that_cannot_hold_together_is_refused() {
             "a TCP health check of an HTTP target group",
             &http_tg,
             vec![("HealthCheckProtocol", "TCP")],
-            "InvalidConfigurationRequest",
+            VALIDATION_ERROR,
         ),
         (
             // The same protocol IS supported for a TCP target group.
@@ -976,10 +986,10 @@ async fn deregistering_removes_the_named_registrations_and_is_idempotent() {
     // registrations of one id.
     let mut form = action("RegisterTargets");
     form.push(p("TargetGroupArn", &arn));
-    form.push(p("Targets.member.1.Id", "i-1111111111111111"));
-    form.push(p("Targets.member.2.Id", "i-1111111111111111"));
+    form.push(p("Targets.member.1.Id", "i-11111111111111111"));
+    form.push(p("Targets.member.2.Id", "i-11111111111111111"));
     form.push(p("Targets.member.2.Port", "8080"));
-    form.push(p("Targets.member.3.Id", "i-2222222222222222"));
+    form.push(p("Targets.member.3.Id", "i-22222222222222222"));
     form.push(p("Targets.member.3.Port", "9090"));
     let reply = call(&router, &form).await;
     assert_eq!(
@@ -990,9 +1000,9 @@ async fn deregistering_removes_the_named_registrations_and_is_idempotent() {
     assert_eq!(
         registered_ports(&router, &arn).await,
         vec![
-            ("i-1111111111111111".to_string(), "80".to_string()),
-            ("i-1111111111111111".to_string(), "8080".to_string()),
-            ("i-2222222222222222".to_string(), "9090".to_string()),
+            ("i-11111111111111111".to_string(), "80".to_string()),
+            ("i-11111111111111111".to_string(), "8080".to_string()),
+            ("i-22222222222222222".to_string(), "9090".to_string()),
         ],
         "case register three: expected all three registrations"
     );
@@ -1001,39 +1011,39 @@ async fn deregistering_removes_the_named_registrations_and_is_idempotent() {
     let cases: Vec<DeregisterCase> = vec![
         (
             "a target the group does not hold at all",
-            vec![p("Targets.member.1.Id", "i-9999999999999999")],
+            vec![p("Targets.member.1.Id", "i-99999999999999999")],
             vec![
-                ("i-1111111111111111".to_string(), "80".to_string()),
-                ("i-1111111111111111".to_string(), "8080".to_string()),
-                ("i-2222222222222222".to_string(), "9090".to_string()),
+                ("i-11111111111111111".to_string(), "80".to_string()),
+                ("i-11111111111111111".to_string(), "8080".to_string()),
+                ("i-22222222222222222".to_string(), "9090".to_string()),
             ],
         ),
         (
             "a registered id on a port it was never registered on",
             vec![
-                p("Targets.member.1.Id", "i-2222222222222222"),
+                p("Targets.member.1.Id", "i-22222222222222222"),
                 p("Targets.member.1.Port", "7070"),
             ],
             vec![
-                ("i-1111111111111111".to_string(), "80".to_string()),
-                ("i-1111111111111111".to_string(), "8080".to_string()),
-                ("i-2222222222222222".to_string(), "9090".to_string()),
+                ("i-11111111111111111".to_string(), "80".to_string()),
+                ("i-11111111111111111".to_string(), "8080".to_string()),
+                ("i-22222222222222222".to_string(), "9090".to_string()),
             ],
         ),
         (
             "the registration on the group's own port, named without a port",
-            vec![p("Targets.member.1.Id", "i-1111111111111111")],
+            vec![p("Targets.member.1.Id", "i-11111111111111111")],
             vec![
-                ("i-1111111111111111".to_string(), "8080".to_string()),
-                ("i-2222222222222222".to_string(), "9090".to_string()),
+                ("i-11111111111111111".to_string(), "8080".to_string()),
+                ("i-22222222222222222".to_string(), "9090".to_string()),
             ],
         ),
         (
             "two registrations at once, each named with its port",
             vec![
-                p("Targets.member.1.Id", "i-1111111111111111"),
+                p("Targets.member.1.Id", "i-11111111111111111"),
                 p("Targets.member.1.Port", "8080"),
-                p("Targets.member.2.Id", "i-2222222222222222"),
+                p("Targets.member.2.Id", "i-22222222222222222"),
                 p("Targets.member.2.Port", "9090"),
             ],
             Vec::new(),
@@ -1041,7 +1051,7 @@ async fn deregistering_removes_the_named_registrations_and_is_idempotent() {
         (
             "the same call again, with nothing left to remove",
             vec![
-                p("Targets.member.1.Id", "i-1111111111111111"),
+                p("Targets.member.1.Id", "i-11111111111111111"),
                 p("Targets.member.1.Port", "8080"),
             ],
             Vec::new(),

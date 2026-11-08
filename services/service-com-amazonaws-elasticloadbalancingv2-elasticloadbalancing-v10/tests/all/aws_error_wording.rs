@@ -9,10 +9,11 @@
 //! below asserts is one rule of the service, so each table spans what that rule
 //! generalizes over rather than the one call that showed it:
 //!
-//! 1. A priority another rule of the listener already evaluates at is refused naming the
-//!    PRIORITY the request asked for and nothing else — the listener is not part of it —
-//!    for both operations that place a rule at a priority
-//!    ([`a_priority_already_in_use_is_refused_naming_only_the_priority`]).
+//! 1. A priority another rule of the listener already evaluates at is refused under
+//!    `PriorityInUse` by both operations that place a rule at a priority — the listener is
+//!    not part of either refusal — with `CreateRule` naming the ONE priority it was asked
+//!    for and `SetRulePriorities` stating the collection-level sentence about the SET it
+//!    places ([`a_priority_already_in_use_is_refused_naming_only_the_priority`]).
 //! 2. A listener's default rule refuses the three operations that address a rule, each with
 //!    the sentence for what it would have changed
 //!    ([`the_default_rule_guards_state_what_cannot_be_changed`]).
@@ -60,6 +61,12 @@ const TOO_MANY_CERTIFICATES: &str = "TooManyCertificates";
 /// The code this API answers an input it cannot accept with — the one code for a rule it
 /// documents in prose and for a value the framework refused at the boundary alike.
 const VALIDATION_ERROR: &str = "ValidationError";
+
+/// The sentence `SetRulePriorities` refuses a set of priorities it cannot place with: that
+/// operation addresses a LIST of them, so its refusal is about the set rather than about
+/// one value — for a priority something else holds as for a pair naming no rule, which the
+/// error code tells apart.
+const SET_PRIORITIES_REFUSAL: &str = "One or more priorities not found";
 
 /// How many certificate ARNs one request may carry, from the documentation of the
 /// `Certificates` member every operation that takes one declares: "You must provide
@@ -111,13 +118,15 @@ fn rule_fields(target_group_arn: &str, path: &str) -> Form {
     fields
 }
 
-/// Rule 1: a priority a rule of the listener already evaluates at is refused naming only
-/// that priority.
+/// Rule 1: a priority a rule of the listener already evaluates at is refused under the
+/// code the operation models for it, with the sentence that operation words it in.
 ///
 /// "A listener can't have multiple rules with the same priority" is one rule of the
 /// service, so both operations that place a rule at a priority — `CreateRule` and
-/// `SetRulePriorities` — state it the same way, and neither names the listener: the
-/// priority is the only value the caller has to change.
+/// `SetRulePriorities` — refuse it under `PriorityInUse`, and neither names the listener:
+/// `CreateRule` places ONE rule at ONE priority, so it states that priority, while
+/// `SetRulePriorities` places a SET of them and states the collection-level sentence about
+/// that set.
 #[tokio::test]
 async fn a_priority_already_in_use_is_refused_naming_only_the_priority() {
     let (router, _engine) = emulator();
@@ -170,7 +179,7 @@ async fn a_priority_already_in_use_is_refused_naming_only_the_priority() {
             &format!("SetRulePriorities onto the taken priority {priority}"),
             &set,
             PRIORITY_IN_USE,
-            &expected,
+            SET_PRIORITIES_REFUSAL,
         );
 
         // The listener the priority lives in is NOT part of the refusal: the message is

@@ -12,8 +12,12 @@
 //! of every rule the request names, together with the current priority of every rule of
 //! that listener it does not. That is what lets two rules swap priorities in one call,
 //! and why the same number already in use on ANOTHER listener is no conflict at all.
-//! Two rules of one listener landing on one priority is the modelled
-//! `PriorityInUseException`.
+//! A priority a rule OUTSIDE the request holds is the modelled `PriorityInUseException`,
+//! while a request LIST that repeats one priority says nothing about which rule evaluates
+//! there and is refused as malformed input (`ValidationError`), before the store is
+//! reached. This operation places a SET of priorities, so the two refusals ABOUT THAT SET
+//! — a pair naming no rule and a priority something else holds — state the one
+//! collection-level sentence and are told apart by their error code.
 //!
 //! The rules are read and written on their listener's record, the one rule store
 //! `DescribeRules` walks, so a priority this operation persists is the priority that read
@@ -195,6 +199,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     "RulePriorities names rule '{rule_arn}' more than once"
                 )));
             }
+            // One call cannot ask for two rules at one priority: the list would not say
+            // which of them evaluates there. That is a rule of the REQUEST — judged before
+            // the store is reached and whatever the listeners the rules belong to — so it
+            // is malformed input rather than the modelled conflict with a priority
+            // something already holds.
+            if asked.iter().any(|(_, held)| *held == priority) {
+                return Err(crate::scaffolded::Scaffolded::validation_error(
+                    crate::state::repeated_priority_message(priority),
+                ));
+            }
             asked.push((rule_arn, priority));
         }
 
@@ -250,7 +264,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if taken.contains(&priority) {
                     return Err(SetRulePrioritiesErrorModeled::PriorityInUseException(
                         PriorityInUseException {
-                            message: Some(crate::state::priority_in_use_message(priority)),
+                            // This operation places a SET of priorities, so its refusal is
+                            // about that set rather than about one value
+                            // (`crate::state::rule_priorities_refusal_message`) — the same
+                            // sentence it answers a pair naming no rule with, which the
+                            // error CODE tells apart from this one.
+                            message: Some(crate::state::rule_priorities_refusal_message()),
                         },
                     )
                     .into());
@@ -312,11 +331,11 @@ fn distinct_listeners(moves: &[Move]) -> Vec<&str> {
 ///
 /// This operation addresses a LIST — one `RulePriorityPair` per rule — so the refusal is
 /// about the set of priorities the request asked for rather than one rule it addresses,
-/// and it names no value ([`crate::state::rule_priorities_not_found_message`]), exactly as
+/// and it names no value ([`crate::state::rule_priorities_refusal_message`]), exactly as
 /// every other list-addressing refusal of this service does.
 fn rule_not_found() -> SetRulePrioritiesError {
     SetRulePrioritiesErrorModeled::RuleNotFoundException(RuleNotFoundException {
-        message: Some(crate::state::rule_priorities_not_found_message()),
+        message: Some(crate::state::rule_priorities_refusal_message()),
     })
     .into()
 }

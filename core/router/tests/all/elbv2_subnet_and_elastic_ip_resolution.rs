@@ -7,9 +7,9 @@
 //! owns what those name: a subnet and an Elastic IP allocation are EC2's resources. So each
 //! resolves them against EC2 through the in-process callback and answers the modelled
 //! refusal — `SubnetNotFound` for an id the account holds no subnet for,
-//! `AllocationIdNotFound` for one it holds no Elastic IP for — stating the SENTENCE EC2
-//! answered in the form AWS reports an inner service's failure in, rather than placing a
-//! load balancer in a subnet that does not exist.
+//! `AllocationIdNotFound` for one it holds no Elastic IP for — stating as its MESSAGE the
+//! error CODE EC2 answered, which is this API's own wording for the class, rather than
+//! placing a load balancer in a subnet that does not exist.
 //!
 //! That needs both services on one engine, which is why this suite lives here beside
 //! `elbv2_network_resolution.rs`, whose request plumbing it reuses; the rules that need
@@ -41,49 +41,27 @@ const ABSENT_SUBNET: &str = "subnet-00000000000000000";
 /// An id of the right form that names no Elastic IP allocation of the account.
 const ABSENT_ALLOCATION: &str = "eipalloc-00000000000000000";
 
-/// Assert one refusal Elastic Load Balancing RELAYED from the EC2 call it made on the
-/// caller's behalf: the status, the modelled awsQuery code, and a message that states
-/// EC2's own sentence wrapped in the form AWS reports an inner service's failure in —
-/// `<sentence> (Service: AmazonEC2; Status Code: 400; Error Code: <code>; Request ID:
-/// <id>; Proxy: null)`.
-///
-/// The request id is a per-call value, so it is checked for its SHAPE rather than compared
-/// to a literal; everything around it is the requirement.
-fn assert_relayed_refusal(case: &str, answer: &Answer, code: &str, detail: &str, inner: &str) {
+/// Assert one refusal Elastic Load Balancing answered for an EC2-owned resource it could
+/// not resolve: the status, the modelled awsQuery code, and a message that is the error
+/// CODE EC2 answered and nothing else — neither EC2's own sentence, nor the service and
+/// status it came from, nor the id of the call that was made.
+fn assert_refusal_states_the_inner_code(case: &str, answer: &Answer, code: &str, inner: &str) {
     assert_eq!(
         (answer.status, answer.code()),
         (400, code.to_string()),
         "case {case:?}: expected 400 {code}, got {answer:?}"
     );
-    let message = answer.message();
-    let head =
-        format!("{detail} (Service: AmazonEC2; Status Code: 400; Error Code: {inner}; Request ID: ");
-    let tail = "; Proxy: null)";
-    assert!(
-        message.starts_with(&head) && message.ends_with(tail),
-        "case {case:?}: expected the relayed refusal {head:?}…{tail:?}, got {message:?}"
-    );
-    let request_id = &message[head.len()..message.len() - tail.len()];
-    assert!(
-        request_id.len() == 36
-            && request_id.matches('-').count() == 4
-            && request_id
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() || byte == b'-'),
-        "case {case:?}: the relayed refusal must name the inner call's request id, \
-         got {request_id:?} in {message:?}"
+    assert_eq!(
+        answer.message(),
+        inner,
+        "case {case:?}: expected the message {inner:?}, got {:?}",
+        answer.message()
     );
 }
 
-/// The sentence EC2 refuses a read naming an id it holds no subnet for with.
-fn absent_subnet_sentence(subnet_id: &str) -> String {
-    format!("The subnet ID '{subnet_id}' does not exist")
-}
-
-/// The refusal EC2 answered for an id it would not resolve: the sentence it worded and the
-/// error code it came under, which is what the relaying refusal states.
+/// The refusal EC2 answered for an id it would not resolve: the error code it came under,
+/// which is what the refusing operation states as its message.
 struct InnerRefusal {
-    sentence: String,
     code: &'static str,
 }
 
@@ -184,11 +162,10 @@ fn a_placement_naming_a_resource_ec2_does_not_hold_is_refused() {
                     ],
                 );
                 if let Some(unresolved) = unresolved {
-                    assert_relayed_refusal(
-                        case,
+                    assert_refusal_states_the_inner_code(
+                        &format!("{case}, EC2 refusing the read for {unresolved:?}"),
                         &answer,
                         "SubnetNotFound",
-                        &absent_subnet_sentence(unresolved),
                         SUBNET_NOT_FOUND_CODE,
                     );
                     // A refused create stores nothing: the name is still free.
@@ -239,11 +216,10 @@ fn a_placement_naming_a_resource_ec2_does_not_hold_is_refused() {
                     ("Subnets.member.2", ABSENT_SUBNET),
                 ],
             );
-            assert_relayed_refusal(
+            assert_refusal_states_the_inner_code(
                 "replacing a placement with an id EC2 holds no subnet for",
                 &reconfigured,
                 "SubnetNotFound",
-                &absent_subnet_sentence(ABSENT_SUBNET),
                 SUBNET_NOT_FOUND_CODE,
             );
             // And the load balancer is still in the subnets it was created in.
@@ -273,7 +249,6 @@ fn a_placement_naming_a_resource_ec2_does_not_hold_is_refused() {
                     case: "an id EC2 holds no allocation for",
                     pinned: ABSENT_ALLOCATION.to_string(),
                     refused: Some(InnerRefusal {
-                        sentence: format!("The allocation ID '{ABSENT_ALLOCATION}' does not exist"),
                         code: ALLOCATION_NOT_FOUND_CODE,
                     }),
                 },
@@ -281,10 +256,9 @@ fn a_placement_naming_a_resource_ec2_does_not_hold_is_refused() {
                     case: "a value that is not an allocation id",
                     pinned: "not-an-eip".to_string(),
                     // EC2 tells a value that is no allocation id apart from one that names
-                    // no allocation, and the refusal relays the sentence and the code it
-                    // answered.
+                    // no allocation, and the refusal states the code it answered — so the
+                    // two cases are distinguishable from the message alone.
                     refused: Some(InnerRefusal {
-                        sentence: "Invalid id: \"not-an-eip\"".to_string(),
                         code: ALLOCATION_MALFORMED_CODE,
                     }),
                 },
@@ -305,11 +279,10 @@ fn a_placement_naming_a_resource_ec2_does_not_hold_is_refused() {
                     ],
                 );
                 if let Some(refused) = &row.refused {
-                    assert_relayed_refusal(
+                    assert_refusal_states_the_inner_code(
                         case,
                         &answer,
                         "AllocationIdNotFound",
-                        &refused.sentence,
                         refused.code,
                     );
                     let read = elbv2(
