@@ -1013,10 +1013,6 @@ mod apigateway_repeated_stage_requests;
 // reason those entries record: the appended tail at the end of this file and the `e…` span
 #[path = "all/eks_control_plane_logs.rs"]
 mod eks_control_plane_logs;
-// Declared HERE, beside the sibling suites above in the same quiet `n`/`o` gap, for the
-// reason those entries record: the appended tail at the end of this file and the `e…` span
-#[path = "all/eks_control_plane_logs.rs"]
-mod eks_control_plane_logs;
 // Declared in this same head region, for the reason the note above records.
 #[path = "all/bedrock_agentcore_data_plane_parent_resources.rs"]
 mod bedrock_agentcore_data_plane_parent_resources;
@@ -1029,7 +1025,6 @@ mod cloudfront_edge_metrics_drive_the_alarm_chain;
 // `cloudformation_wafv2_protection_stack`, `lambda_sqs_event_source_batching_window` and
 // `cloudformation_asset_bucket_publishing_role` — are each ALREADY declared above (the first
 // four in the sorted head, the fifth at line 34, and the wafv2 one at line 1006). Two
-// concurrent changes appended the same entry, which is a redefinition and stops this target
 // from compiling; the duplicate lines are removed here and the first declaration of each
 // stands.
 // Declared here, in the appended tail: what a stack declaring the `AWS::Config::*` resources
@@ -1099,3 +1094,7 @@ mod sesv2_probe3;
 // `s…` span every SNS suite lands in is a region concurrently landing suites append to.
 #[path = "all/sns_lambda_invoke_permission_revocation.rs"]
 mod sns_lambda_invoke_permission_revocation;
+// Declared here, in the appended tail: the log group a stack DECLARES, read back by the name
+// the stack published, and the records the function pointed at it leaves in it.
+#[path = "all/cloudformation_declared_log_group_takes_its_function_logs.rs"]
+mod cloudformation_declared_log_group_takes_its_function_logs;
