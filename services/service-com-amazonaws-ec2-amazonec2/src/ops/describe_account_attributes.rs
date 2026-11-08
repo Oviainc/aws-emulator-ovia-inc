@@ -1,15 +1,29 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAccountAttributes
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAccountAttributes`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAccountAttributes::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the attributes of the Amazon Web Services ACCOUNT, in the Region the request was
+//! signed for.
+//!
+//! An account attribute is a fact of the account rather than a resource a caller creates —
+//! nothing in this API makes, renames or deletes one — so the values come from
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::account_attribute`], which derives each
+//! one from whatever already owns it, and this handler persists NOTHING of its own: two
+//! calls signed for the same Region report the same attributes.
+//!
+//! What the request chooses is which of them are reported:
+//!
+//! * `AttributeNames` names the attributes to report; the default is every attribute the
+//!   operation documents ([`crate::state::ACCOUNT_ATTRIBUTE_NAMES`]), and a name that is no
+//!   account attribute is refused with `InvalidParameter` rather than answered with an
+//!   empty list. The model bounds the list's length nowhere, so it is capped before the
+//!   catalog is consulted for each entry.
+//! * `DryRun` performs nothing and answers 412 `DryRunOperation`, the answer the real
+//!   service gives a caller that holds the action's permissions.
+//!
+//! The one value that comes from the STORE is `default-vpc`: the id of the default VPC the
+//! account holds in this Region, read through the same index `DescribeVpcs` reports that
+//! VPC from, so the attribute and the describe cannot disagree about it.
 //!
 //! ## Shape of an operation
 //!
@@ -144,18 +158,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAccountAttributes` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAccountAttributesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAccountAttributes"))
+        use crate::state;
+
+        // The Region this request was signed for: EC2 is reached through a regional
+        // endpoint, and "the ID of the default VPC for your account" is the id of the VPC
+        // the account holds in the Region it is asking in.
+        let region = state::request_region(ctx.parts());
+
+        // "The account attribute names" (`AttributeNames`), whose length the model bounds
+        // nowhere — so the one caller-sized list this request carries is capped before any
+        // work proportional to it runs, the same ceiling the sibling describes hold their
+        // name lists to.
+        let named = input.attribute_names.as_deref().unwrap_or_default();
+        if named.len() > state::MAX_RESOURCE_IDS {
+            return Err(state::invalid_parameter_value(format!(
+                "AttributeNames carries {} entries, above the maximum of {}",
+                named.len(),
+                state::MAX_RESOURCE_IDS
+            )));
+        }
+
+        // A name that is no account attribute is the caller's mistake, not an absent row:
+        // it is refused whether or not any other name would have been reported, so a
+        // misspelled attribute can never read as "that attribute has no value".
+        for name in named {
+            if !state::ACCOUNT_ATTRIBUTE_NAMES.contains(&name.as_str()) {
+                return Err(state::invalid_account_attribute_name(name));
+            }
+        }
+
+        // "Checks whether you have the required permissions for the action, without
+        // actually making the request... If you have the required permissions, the error
+        // response is DryRunOperation" (`DryRun`). Every caller that reaches this handler
+        // holds them, so the report below does not run at all — and the default network
+        // this Region owes is not materialised either.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let store = state::require_service_state(&*self.engine)?;
+        let mut store = store.lock();
+        // The ambient default VPC of the Region this request is signed for: "when you
+        // create an AWS account, we create a default VPC for you in each AWS Region"
+        // (Amazon VPC User Guide, "Default VPCs"), so it is already the account's whatever
+        // it has created. The call is idempotent per Region and materialises a VPC owed
+        // since the account existed rather than one this read created, so it changes
+        // nothing a later caller would not have seen anyway — exactly as `DescribeVpcs`
+        // does before reporting that same VPC.
+        store.ensure_default_network(&region);
+
+        // The default is to report every attribute the operation documents, which
+        // `AttributeNames` narrows to the ones it names. The catalog is walked in its own
+        // order, so an attribute asked for twice is reported once and the response order
+        // does not depend on the request's.
+        let reported: Vec<AccountAttribute> = state::ACCOUNT_ATTRIBUTE_NAMES
+            .iter()
+            .filter(|name| named.is_empty() || named.iter().any(|asked| asked == *name))
+            .filter_map(|name| store.account_attribute(name, &region))
+            .collect();
+
+        Ok(DescribeAccountAttributesOutput {
+            account_attributes: Some(reported),
+        })
     }
 }

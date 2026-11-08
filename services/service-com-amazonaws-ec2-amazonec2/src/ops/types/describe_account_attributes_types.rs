@@ -11,7 +11,18 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-ec2-amazonec2.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ec2#DescribeAccountAttributesRequest")]
+// `skip_validation = ["AttributeNames"]`: the member targets the modelled
+// `AccountAttributeName` enum, whose value set (`default-vpc | supported-platforms`) is
+// shorter than the list of attributes the operation's own doc documents, and EC2 refuses a
+// name it does not know with its OWN parameter error rather than with the generic
+// constraint report — see `crate::state::invalid_account_attribute_name`, which the handler
+// answers for every name outside `crate::state::ACCOUNT_ATTRIBUTE_NAMES`. `skip_validation`
+// drops only this member's constraint traits; every other member of the input is still
+// judged at the boundary.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.ec2#DescribeAccountAttributesRequest",
+    skip_validation = ["AttributeNames"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct DescribeAccountAttributesInput {
     pub dry_run: Option<bool>,

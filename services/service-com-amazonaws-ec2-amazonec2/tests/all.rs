@@ -15,6 +15,14 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// What `DescribeAccountAttributes` reports about the ACCOUNT: every attribute the operation
+// documents with the value the account holds for it, `default-vpc` asserted against the VPC
+// the same Region's `DescribeVpcs` reports, the narrowing `AttributeNames` does, and the
+// refusals for a name that is no account attribute and for a dry run. Declared beside
+// `prefix_lists` for the reason the note above gives: the sorted neighbourhood and the tail
+// of this file are where every new ec2 suite inserts its lines.
+#[path = "all/account_attributes.rs"]
+mod account_attributes;
 // The VPC Block Public Access OPTIONS of one Region: the mode
 // `ModifyVpcBlockPublicAccessOptions` puts it into, the default a Region no modify was made
 // for reports, the clock-owed `update-in-progress` -> `update-complete` move, and what each

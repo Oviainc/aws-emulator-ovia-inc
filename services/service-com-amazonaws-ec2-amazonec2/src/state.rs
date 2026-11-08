@@ -2264,6 +2264,12 @@ pub use client_vpn::*;
 /// handler reaches it as `crate::state::require_enclave_certificate_arn` like any helper of
 /// this module.
 pub mod enclave_certificate_iam_roles;
+/// The attributes of the ACCOUNT itself — the catalog `DescribeAccountAttributes` reports,
+/// each attribute's value derived from what already owns it, and the refusal for a name that
+/// is no account attribute — in a file of its own rather than as more lines here. Everything
+/// it declares is re-exported below, so a handler reaches it as
+/// `crate::state::ACCOUNT_ATTRIBUTE_NAMES` like any helper of this module.
+mod account_attributes;
 mod network_acl_store;
 mod fleets;
 mod network_insights;
@@ -2348,6 +2354,7 @@ pub use nat_gateways_and_vpn_connections::*;
 pub use network_insights::*;
 pub use fleets::*;
 pub use network_acl_store::*;
+pub use account_attributes::*;
 
 pub use enclave_certificate_iam_roles::*;
 
