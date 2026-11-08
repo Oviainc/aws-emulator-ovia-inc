@@ -100,6 +100,11 @@ service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
+# The REST-protocol service a `Task` state's AWS SDK integration calls in
+# `tests/all/backup_task_integration.rs`: mounted beside Step Functions on the one
+# engine the test router builds, so the backup job a task starts is stored by AWS
+# Backup's own handler and read back through its own API.
+service-com-amazonaws-backup-cryocontrollerusermanager = { workspace = true }
 # The service a `Task` state's integration call is made to in `tests/all/task_integrations.rs`:
 # mounted beside Step Functions on the one engine the test router builds, the same shape
 # `core/router/src/lib.rs` mounts them in, so the call a task makes is served for real.

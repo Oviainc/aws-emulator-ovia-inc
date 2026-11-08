@@ -17594,6 +17594,7 @@ dependencies = [
  "quick-xml",
  "serde_json",
  "serde_json_path",
+ "service-com-amazonaws-backup-cryocontrollerusermanager",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-dynamodb-dynamodb-20120810",

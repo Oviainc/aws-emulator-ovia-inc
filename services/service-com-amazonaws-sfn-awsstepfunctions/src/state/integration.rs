@@ -29,9 +29,11 @@
 //! input document, which is exactly what a payload template builds, so one entry
 //! covers every operation that service models: the operation name is derived from the
 //! action, and nothing is written per action. A `restJson1` service spreads an
-//! operation's input over the path, the query, the headers and one payload member, so
-//! its entry carries those bindings per operation ([`Rest`]) and a call is made only
-//! for an operation whose bindings are stated. An `awsQuery` service takes the whole
+//! operation's input over the path, the query, the headers and its body — one payload
+//! member where the operation binds one, else the document of every member the rest of
+//! the request does not carry ([`Body`]) — so its entry carries those bindings per
+//! operation ([`Rest`]) and a call is made only for an operation whose bindings are
+//! stated. An `awsQuery` service takes the whole
 //! request as a FORM — the action and the service's API version beside one field per
 //! member of the input ([`form_body`]) — and answers an XML document wrapping the
 //! operation's own result ([`query_result`]).
@@ -522,6 +524,27 @@ const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 /// The media type a `restJson1` request and the body of its answer carry.
 const REST_CONTENT_TYPE: &str = "application/json";
 
+/// What the BODY of one operation's request — and of its answer — carries, which is
+/// the operation's own `httpPayload` binding, or the absence of one.
+///
+/// A REST protocol spreads an operation's members over the path, the query, the
+/// headers and the body, and which of those the body is comes from the operation
+/// itself (`smithy_query(query="operation")`): a member it binds as its `httpPayload`
+/// IS the body, and a structure with no such member is carried as the DOCUMENT of
+/// every member no other binding takes — the default a REST-JSON protocol gives one.
+/// An operation whose every member is bound elsewhere carries no body at all, which is
+/// what a read addressed by its path and its query sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Body {
+    /// Every member no path, query or header binding carries, as one JSON document.
+    Document,
+    /// The one member the operation binds as its `httpPayload`: that member is the
+    /// whole body, and no other member is in it.
+    Member(&'static str),
+    /// Nothing: every member of this operation is bound somewhere else.
+    Empty,
+}
+
 /// How ONE operation of a REST service binds its input and output members to HTTP.
 ///
 /// Every field is read from that operation's own
@@ -538,16 +561,16 @@ pub struct Rest {
     /// Its request URI (`http.uri`), in which `{<member>}` is an `httpLabel` member
     /// standing for the value the request names it with.
     pub uri: &'static str,
-    /// The member the request carries as its BODY (`httpPayload`).
-    pub payload: &'static str,
+    /// What the request carries as its BODY ([`Body`]).
+    pub request_body: Body,
     /// The members the request carries as HEADERS (`httpHeader`), each with the field
     /// name it goes under.
     pub headers: &'static [(&'static str, &'static str)],
     /// The members the request carries in the QUERY string (`httpQuery`), each with
     /// the parameter name it goes under.
     pub query: &'static [(&'static str, &'static str)],
-    /// The output member the answer's BODY is (`httpPayload`).
-    pub response_payload: &'static str,
+    /// What the answer's BODY is read as ([`Body`]).
+    pub response_body: Body,
     /// The output member the answer's STATUS is (`httpResponseCode`).
     pub response_status: &'static str,
     /// The output members the answer carries as HEADERS, each with the field name it
@@ -569,14 +592,14 @@ const LAMBDA_REST: &[Rest] = &[Rest {
     operation: "Invoke",
     method: "POST",
     uri: "/2015-03-31/functions/{FunctionName}/invocations",
-    payload: "Payload",
+    request_body: Body::Member("Payload"),
     headers: &[
         ("InvocationType", "x-amz-invocation-type"),
         ("LogType", "x-amz-log-type"),
         ("ClientContext", "x-amz-client-context"),
     ],
     query: &[("Qualifier", "Qualifier")],
-    response_payload: "Payload",
+    response_body: Body::Member("Payload"),
     response_status: "StatusCode",
     response_headers: &[
         ("ExecutedVersion", "x-amz-executed-version"),
@@ -584,6 +607,147 @@ const LAMBDA_REST: &[Rest] = &[Rest {
         ("LogResult", "x-amz-log-result"),
     ],
 }];
+
+/// The REST bindings of the AWS Backup operations a `Task` state's integration calls.
+///
+/// Read from that service's own model with
+/// `smithy_query(query="operation",operation="StartBackupJob,DescribeBackupJob,
+/// ListBackupJobs,StartCopyJob,CreateBackupVault,DescribeBackupVault,
+/// DescribeRecoveryPoint,ListRecoveryPointsByBackupVault",model_path="services/
+/// service-com-amazonaws-backup-cryocontrollerusermanager/smithy-model/
+/// com-amazonaws-backup-cryocontrollerusermanager.json")`. None of them binds a
+/// member as its `httpPayload`, and none binds an output member to the status or to a
+/// header, so each request carries the members its path and its query do not
+/// ([`Body::Document`]) and each answer's body IS the operation's output document.
+const BACKUP_REST: &[Rest] = &[
+    // `http` PUT `/backup-jobs`, with every input member in the body.
+    Rest {
+        operation: "StartBackupJob",
+        method: "PUT",
+        uri: "/backup-jobs",
+        request_body: Body::Document,
+        headers: &[],
+        query: &[],
+        response_body: Body::Document,
+        response_status: "",
+        response_headers: &[],
+    },
+    // `http` GET `/backup-jobs/{BackupJobId}`, `BackupJobId` its one member and an
+    // `httpLabel`, so the request carries no body.
+    Rest {
+        operation: "DescribeBackupJob",
+        method: "GET",
+        uri: "/backup-jobs/{BackupJobId}",
+        request_body: Body::Empty,
+        headers: &[],
+        query: &[],
+        response_body: Body::Document,
+        response_status: "",
+        response_headers: &[],
+    },
+    // `http` GET `/backup-jobs`, whose every input member is an `httpQuery` — each
+    // under the parameter name that member's own binding states.
+    Rest {
+        operation: "ListBackupJobs",
+        method: "GET",
+        uri: "/backup-jobs",
+        request_body: Body::Empty,
+        headers: &[],
+        query: &[
+            ("NextToken", "nextToken"),
+            ("MaxResults", "maxResults"),
+            ("ByResourceArn", "resourceArn"),
+            ("ByState", "state"),
+            ("ByBackupVaultName", "backupVaultName"),
+            ("ByCreatedBefore", "createdBefore"),
+            ("ByCreatedAfter", "createdAfter"),
+            ("ByResourceType", "resourceType"),
+            ("ByAccountId", "accountId"),
+            ("ByCompleteAfter", "completeAfter"),
+            ("ByCompleteBefore", "completeBefore"),
+            ("ByParentJobId", "parentJobId"),
+            ("ByMessageCategory", "messageCategory"),
+        ],
+        response_body: Body::Document,
+        response_status: "",
+        response_headers: &[],
+    },
+    // `http` PUT `/copy-jobs`, with every input member in the body.
+    Rest {
+        operation: "StartCopyJob",
+        method: "PUT",
+        uri: "/copy-jobs",
+        request_body: Body::Document,
+        headers: &[],
+        query: &[],
+        response_body: Body::Document,
+        response_status: "",
+        response_headers: &[],
+    },
+    // `http` PUT `/backup-vaults/{BackupVaultName}`: the vault's name is the path, and
+    // the members beside it (`BackupVaultTags`, `EncryptionKeyArn`,
+    // `CreatorRequestId`) are the body.
+    Rest {
+        operation: "CreateBackupVault",
+        method: "PUT",
+        uri: "/backup-vaults/{BackupVaultName}",
+        request_body: Body::Document,
+        headers: &[],
+        query: &[],
+        response_body: Body::Document,
+        response_status: "",
+        response_headers: &[],
+    },
+    // `http` GET `/backup-vaults/{BackupVaultName}`, with `BackupVaultAccountId` an
+    // `httpQuery`.
+    Rest {
+        operation: "DescribeBackupVault",
+        method: "GET",
+        uri: "/backup-vaults/{BackupVaultName}",
+        request_body: Body::Empty,
+        headers: &[],
+        query: &[("BackupVaultAccountId", "backupVaultAccountId")],
+        response_body: Body::Document,
+        response_status: "",
+        response_headers: &[],
+    },
+    // `http` GET `/backup-vaults/{BackupVaultName}/recovery-points/{RecoveryPointArn}`:
+    // TWO `httpLabel` members, the second of them the recovery point's own ARN.
+    Rest {
+        operation: "DescribeRecoveryPoint",
+        method: "GET",
+        uri: "/backup-vaults/{BackupVaultName}/recovery-points/{RecoveryPointArn}",
+        request_body: Body::Empty,
+        headers: &[],
+        query: &[("BackupVaultAccountId", "backupVaultAccountId")],
+        response_body: Body::Document,
+        response_status: "",
+        response_headers: &[],
+    },
+    // `http` GET `/backup-vaults/{BackupVaultName}/recovery-points`, whose filters are
+    // `httpQuery` members beside the vault in its path.
+    Rest {
+        operation: "ListRecoveryPointsByBackupVault",
+        method: "GET",
+        uri: "/backup-vaults/{BackupVaultName}/recovery-points",
+        request_body: Body::Empty,
+        headers: &[],
+        query: &[
+            ("BackupVaultAccountId", "backupVaultAccountId"),
+            ("NextToken", "nextToken"),
+            ("MaxResults", "maxResults"),
+            ("ByResourceArn", "resourceArn"),
+            ("ByResourceType", "resourceType"),
+            ("ByBackupPlanId", "backupPlanId"),
+            ("ByCreatedBefore", "createdBefore"),
+            ("ByCreatedAfter", "createdAfter"),
+            ("ByParentRecoveryPointArn", "parentRecoveryPointArn"),
+        ],
+        response_body: Body::Document,
+        response_status: "",
+        response_headers: &[],
+    },
+];
 
 ///
 /// A `Task` state's integration parameters are written in PascalCase whatever the
@@ -646,6 +810,27 @@ pub const APIS: &[Api] = &[
         sdk_client: "AmazonAthena",
         sdk_exception: "AmazonAthenaException",
         // `StartQueryExecution`'s input: `QueryString`, `WorkGroup`.
+        member_case: MemberCase::Pascal,
+        query_compatible: false,
+    },
+    // `services/service-com-amazonaws-backup-cryocontrollerusermanager/smithy-model/
+    // com-amazonaws-backup-cryocontrollerusermanager.json`: restJson1, sigv4Name
+    // `backup`, endpointPrefix `backup`, arnNamespace `backup`, sdkId `Backup` — a
+    // REST protocol, so each operation's own bindings are what a request to it is
+    // built from ([`BACKUP_REST`]).
+    Api {
+        namespace: "backup",
+        signing_name: "backup",
+        endpoint_prefix: "backup",
+        wire: Wire::Rest(BACKUP_REST),
+        sdk_id: "Backup",
+        error_prefix: "Backup",
+        // The client class `AWSBackupClient`, whose base exception is
+        // `AWSBackupException`; the model's service shape is the service's internal
+        // name (`CryoControllerUserManager`), which the SDK's own names do not carry.
+        sdk_client: "AWSBackup",
+        sdk_exception: "AWSBackupException",
+        // `StartBackupJob`'s input: `BackupVaultName`, `ResourceArn`, `IamRoleArn`.
         member_case: MemberCase::Pascal,
         query_compatible: false,
     },
@@ -926,14 +1111,14 @@ const S3_REST: &[Rest] = &[
         operation: LIST_OBJECTS_OPERATION,
         method: "GET",
         uri: "/{Bucket}?list-type=2",
-        payload: "",
+        request_body: Body::Empty,
         headers: &[],
         query: &[
             ("Prefix", "prefix"),
             ("ContinuationToken", "continuation-token"),
             ("MaxKeys", "max-keys"),
         ],
-        response_payload: DATASET_BODY,
+        response_body: Body::Member(DATASET_BODY),
         response_status: "",
         response_headers: &[],
     },
@@ -941,10 +1126,10 @@ const S3_REST: &[Rest] = &[
         operation: GET_OBJECT_OPERATION,
         method: "GET",
         uri: "/{Bucket}/{Key+}?x-id=GetObject",
-        payload: "",
+        request_body: Body::Empty,
         headers: &[],
         query: &[],
-        response_payload: DATASET_BODY,
+        response_body: Body::Member(DATASET_BODY),
         response_status: "",
         response_headers: &[],
     },
@@ -2826,13 +3011,29 @@ impl Rest {
             .iter()
             .filter_map(|(member, field)| Some((*field, member_text(document, member)?)))
             .collect();
-        // The payload member IS the body: a value given as text is those bytes, and a
-        // document is its JSON text, which is what the member the integration
-        // documents as a document carries.
-        let body = match document.get(self.payload) {
-            None | Some(Value::Null) => Vec::new(),
-            Some(Value::String(text)) => text.clone().into_bytes(),
-            Some(value) => ::serde_json::to_vec(value).map_err(|error| error.to_string())?,
+        let body = match self.request_body {
+            // Every member is bound to the path, the query or a header, so there is no
+            // body to send.
+            Body::Empty => Vec::new(),
+            // The payload member IS the body: a value given as text is those bytes, and
+            // a document is its JSON text, which is what the member the integration
+            // documents as a document carries.
+            Body::Member(member) => match document.get(member) {
+                None | Some(Value::Null) => Vec::new(),
+                Some(Value::String(text)) => text.clone().into_bytes(),
+                Some(value) => ::serde_json::to_vec(value).map_err(|error| error.to_string())?,
+            },
+            // The document of every member no other binding carries: one already on
+            // the wire in the path, the query or a header is not in the body as well,
+            // and a request whose members are all bound elsewhere carries no body.
+            Body::Document => {
+                let carried = self.unbound(document);
+                match carried.is_empty() {
+                    true => Vec::new(),
+                    false => ::serde_json::to_vec(&Value::Object(carried))
+                        .map_err(|error| error.to_string())?,
+                }
+            }
         };
         Ok(Wired {
             method: self.method,
@@ -2868,9 +3069,69 @@ impl Rest {
             let payload = ::serde_json::from_slice::<Value>(&answered.payload).unwrap_or_else(
                 |_| Value::String(String::from_utf8_lossy(&answered.payload).to_string()),
             );
-            members.insert(self.response_payload.to_string(), payload);
+            match self.response_body {
+                Body::Member(member) => {
+                    members.insert(member.to_string(), payload);
+                }
+                // The body IS the operation's output document, so the members it
+                // holds are the answer's own: they are reported beside the ones the
+                // status and the headers carry rather than under a member of their
+                // own. A body that is not that document carries no member of this
+                // operation's, and nothing is invented for one.
+                Body::Document => {
+                    if let Value::Object(carried) = payload {
+                        members.extend(carried);
+                    }
+                }
+                // An operation that binds no body reports none, whatever bytes the
+                // answer happened to carry.
+                Body::Empty => {}
+            }
         }
         Value::Object(members)
+    }
+
+    /// The members of `document` this operation binds NOWHERE else — not to its path,
+    /// its query or a header — which are the ones its body carries
+    /// ([`Body::Document`]).
+    fn unbound(&self, document: &Value) -> Map<String, Value> {
+        let labels = self.labels();
+        document
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter(|(member, _)| {
+                !labels.iter().any(|label| label == member)
+                    && !self.query.iter().any(|(bound, _)| bound == member)
+                    && !self.headers.iter().any(|(bound, _)| bound == member)
+            })
+            .map(|(member, value)| (member.clone(), value.clone()))
+            .collect()
+    }
+
+    /// The members this operation binds to its PATH, as the `{<member>}` holes of its
+    /// `http.uri` name them, a GREEDY label's own `+` dropped.
+    fn labels(&self) -> Vec<&'static str> {
+        let mut labels = Vec::new();
+        let mut remaining = self.uri;
+        while let Some((_, after)) = remaining.split_once('{') {
+            let Some((label, tail)) = after.split_once('}') else {
+                break;
+            };
+            labels.push(label.strip_suffix('+').unwrap_or(label));
+            remaining = tail;
+        }
+        labels
+    }
+
+    /// The output member this operation binds the answer's BODY to, for an operation
+    /// that binds one ([`Body::Member`]); `None` where the body is the output document
+    /// itself or the answer carries none.
+    fn response_member(&self) -> Option<&'static str> {
+        match self.response_body {
+            Body::Member(member) => Some(member),
+            Body::Document | Body::Empty => None,
+        }
     }
 }
 
@@ -3064,7 +3325,10 @@ const SDK_HTTP_METADATA: &str = "SdkHttpMetadata";
 ///
 /// Pure, so the reading is pinned by this module's own tests.
 fn invocation_payload(call: &Call, document: &Value) -> Value {
-    let member = call.rest.map_or(PAYLOAD_MEMBER, |rest| rest.response_payload);
+    let member = call
+        .rest
+        .and_then(Rest::response_member)
+        .unwrap_or(PAYLOAD_MEMBER);
     document.get(member).cloned().unwrap_or(Value::Null)
 }
 
@@ -3094,7 +3358,11 @@ fn function_error(call: &Call, document: &Value) -> Option<Failed> {
         .get(FUNCTION_ERROR_MEMBER)
         .and_then(Value::as_str)
         .filter(|signal| !signal.is_empty())?;
-    let payload = document.get(call.rest.map_or(PAYLOAD_MEMBER, |rest| rest.response_payload));
+    let payload = document.get(
+        call.rest
+            .and_then(Rest::response_member)
+            .unwrap_or(PAYLOAD_MEMBER),
+    );
     let error = payload
         .and_then(|payload| payload.get(ERROR_TYPE_MEMBER))
         .and_then(Value::as_str)

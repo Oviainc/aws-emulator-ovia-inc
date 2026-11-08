@@ -31,6 +31,8 @@ mod activity_worker_hand_off;
 mod alias_order_and_redrive_context;
 #[path = "all/arn_validation.rs"]
 mod arn_validation;
+#[path = "all/backup_task_integration.rs"]
+mod backup_task_integration;
 #[path = "all/callback_service_integration.rs"]
 mod callback_service_integration;
 #[path = "all/choice_and_wait_evaluation.rs"]

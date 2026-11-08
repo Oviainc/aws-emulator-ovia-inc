@@ -62,7 +62,7 @@ type InstantRow = (&'static str, &'static [&'static str], Value, Value);
 #[test]
 fn a_resource_names_the_call_its_action_does() {
     // (case, the Resource, the signing name and operation it names, parks at a job)
-    let rows: [ResourceRow; 29] = [
+    let rows: [ResourceRow; 32] = [
         (
             "the optimized DynamoDB integration",
             "arn:aws:states:::dynamodb:putItem",
@@ -147,6 +147,27 @@ fn a_resource_names_the_call_its_action_does() {
             "the AWS SDK integration of that same operation",
             "arn:aws:states:::aws-sdk:lambda:invoke",
             Some(("lambda", "Invoke")),
+            false,
+        ),
+        // Another REST service, whose operations bind no payload member at all: the
+        // write, a read addressed by its path and a read filtered by its query are
+        // each a call, and an operation whose bindings are not carried is not.
+        (
+            "an AWS SDK integration with AWS Backup",
+            "arn:aws:states:::aws-sdk:backup:startBackupJob",
+            Some(("backup", "StartBackupJob")),
+            false,
+        ),
+        (
+            "a read of the same service, addressed by its own query",
+            "arn:aws:states:::aws-sdk:backup:listBackupJobs",
+            Some(("backup", "ListBackupJobs")),
+            false,
+        ),
+        (
+            "an operation of that service whose bindings are not carried",
+            "arn:aws:states:::aws-sdk:backup:listTags",
+            None,
             false,
         ),
         // The run-a-job pattern: the ACTION is what is called, and the task is
@@ -1188,6 +1209,147 @@ fn a_rest_answer_is_read_into_the_members_its_output_binds() {
         result,
         ::serde_json::json!({ "StatusCode": 202, "Payload": "not json" }),
         "case \"an answer carrying no document and no headers\": got {result}"
+    );
+}
+
+/// One row of the document-body table: the case, the `Resource`, the parameters the
+/// state built, and the request-target and request body expected of it — `None` for a
+/// request that carries no body.
+type DocumentRow = (&'static str, &'static str, Value, &'static str, Option<Value>);
+
+/// A REST operation that binds NO payload member carries the document of every member
+/// its path, query and headers do not, which is what that protocol gives a structure.
+///
+/// The rows span what the rule generalises over: a write whose every member is the
+/// body, a write whose name is a path label and whose remaining members are the body,
+/// a read whose only member is its path label, a read whose members are query
+/// parameters, and a read with two labels the second of which is an ARN.
+#[test]
+fn a_rest_operation_with_no_payload_member_carries_its_members_as_the_document() {
+    let vault = "nightly";
+    let point = "arn:aws:backup:us-west-2:000000000000:recovery-point:1";
+    let rows: [DocumentRow; 5] = [
+        (
+            "a write whose every member is the body",
+            "arn:aws:states:::aws-sdk:backup:startBackupJob",
+            ::serde_json::json!({
+                "BackupVaultName": vault,
+                "ResourceArn": "arn:aws:dynamodb:us-west-2:000000000000:table/orders",
+                "IamRoleArn": "arn:aws:iam::000000000000:role/Backup",
+            }),
+            "/backup-jobs",
+            Some(::serde_json::json!({
+                "BackupVaultName": vault,
+                "ResourceArn": "arn:aws:dynamodb:us-west-2:000000000000:table/orders",
+                "IamRoleArn": "arn:aws:iam::000000000000:role/Backup",
+            })),
+        ),
+        (
+            // The member the PATH carries is on the wire there, so it is not in the
+            // body as well.
+            "a write whose name is its path and whose tags are its body",
+            "arn:aws:states:::aws-sdk:backup:createBackupVault",
+            ::serde_json::json!({
+                "BackupVaultName": vault,
+                "BackupVaultTags": { "team": "platform" },
+            }),
+            "/backup-vaults/nightly",
+            Some(::serde_json::json!({ "BackupVaultTags": { "team": "platform" } })),
+        ),
+        (
+            "a read whose only member is its path label",
+            "arn:aws:states:::aws-sdk:backup:describeBackupJob",
+            ::serde_json::json!({ "BackupJobId": "job-1" }),
+            "/backup-jobs/job-1",
+            None,
+        ),
+        (
+            "a read whose members are its query parameters",
+            "arn:aws:states:::aws-sdk:backup:listBackupJobs",
+            ::serde_json::json!({
+                "MaxResults": 5,
+                "ByResourceArn": "arn:aws:dynamodb:us-west-2:000000000000:table/orders",
+            }),
+            "/backup-jobs?maxResults=5&resourceArn=arn:aws:dynamodb:us-west-2:000000000000\
+             :table/orders",
+            None,
+        ),
+        (
+            "a read with two path labels, the second an ARN",
+            "arn:aws:states:::aws-sdk:backup:describeRecoveryPoint",
+            ::serde_json::json!({ "BackupVaultName": vault, "RecoveryPointArn": point }),
+            "/backup-vaults/nightly/recovery-points/arn:aws:backup:us-west-2:000000000000\
+             :recovery-point:1",
+            None,
+        ),
+    ];
+
+    for (case, resource, parameters, uri, body) in rows {
+        let call = read(resource).unwrap_or_else(|why| {
+            panic!("case {case:?}: expected {resource:?} to name a call, got {why:?}")
+        });
+        let built = wired(&call, &parameters)
+            .unwrap_or_else(|why| panic!("case {case:?}: expected a request, got {why:?}"));
+        assert_eq!(
+            built.uri, uri,
+            "case {case:?}: expected the request-target {uri:?}, got {:?}",
+            built.uri
+        );
+        let sent: Option<Value> = match built.body.is_empty() {
+            true => None,
+            false => Some(::serde_json::from_slice(&built.body).unwrap_or_else(|error| {
+                panic!(
+                    "case {case:?}: expected a JSON body, got {error} for {:?}",
+                    String::from_utf8_lossy(&built.body)
+                )
+            })),
+        };
+        assert_eq!(
+            sent, body,
+            "case {case:?}: expected the body {body:?}, got {sent:?}"
+        );
+    }
+}
+
+/// A 2xx answer to a REST call whose output binds no payload member is read as the
+/// output DOCUMENT itself: the members the body holds are the result's own.
+#[test]
+fn a_rest_answer_with_no_payload_member_is_the_output_document() {
+    let rest = BACKUP_REST
+        .iter()
+        .find(|rest| rest.operation == "StartBackupJob")
+        .expect("starting a backup job is a call this emulator makes");
+    let answered = Answered {
+        status: 200,
+        error_type: None,
+        headers: vec![("x-amzn-requestid".to_string(), "r-1".to_string())],
+        payload: br#"{"BackupJobId":"job-1","IsParent":false,"CreationDate":1.5}"#.to_vec(),
+    };
+    let result = rest.result(&answered);
+    assert_eq!(
+        result,
+        ::serde_json::json!({
+            "BackupJobId": "job-1",
+            "IsParent": false,
+            "CreationDate": 1.5,
+        }),
+        "case \"a started backup job\": the members the answer carried are the result's, got \
+         {result}"
+    );
+
+    // An operation whose output carries no member answers an empty body, which is the
+    // empty document rather than a member invented for it.
+    let answered = Answered {
+        status: 200,
+        error_type: None,
+        headers: Vec::new(),
+        payload: Vec::new(),
+    };
+    let result = rest.result(&answered);
+    assert_eq!(
+        result,
+        ::serde_json::json!({}),
+        "case \"an answer carrying no body\": got {result}"
     );
 }
 
