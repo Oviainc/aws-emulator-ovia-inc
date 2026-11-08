@@ -242,13 +242,37 @@ pub async fn store_managed_api_key(
     provider_name: &str,
     api_key: &str,
 ) -> Result<String, ApiKeySecretProblem> {
-    let name = managed_api_key_secret_name(token_vault_id, provider_name);
-    let value = managed_api_key_secret_value(api_key);
+    store_managed_secret(
+        ctx,
+        region,
+        &managed_api_key_secret_name(token_vault_id, provider_name),
+        &managed_api_key_secret_value(api_key),
+    )
+    .await
+}
+
+/// Put `value` into the Secrets Manager secret named `name`, which is a secret
+/// this SERVICE manages for a credential provider, and report that secret's ARN.
+///
+/// A secret already standing under that name is the provider's own — the name is
+/// derived from the provider — so the value is put into it as a new version
+/// rather than refused. Shared by the credential-provider stores of this crate
+/// (the API key provider above and the payment provider beside it), so no two of
+/// them differ about how a managed secret is written or which ARN is reported
+/// for it.
+///
+/// Call it with NO state guard held — it awaits.
+pub(crate) async fn store_managed_secret(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    name: &str,
+    value: &str,
+) -> Result<String, ApiKeySecretProblem> {
     let client = secrets_manager_client(ctx, region);
     let created = client
         .create_secret()
-        .name(&name)
-        .secret_string(&value)
+        .name(name)
+        .secret_string(value)
         .send()
         .await;
     match created {
@@ -260,8 +284,8 @@ pub async fn store_managed_api_key(
         {
             let put = client
                 .put_secret_value()
-                .secret_id(&name)
-                .secret_string(&value)
+                .secret_id(name)
+                .secret_string(value)
                 .send()
                 .await
                 .map_err(|error| {
@@ -323,15 +347,15 @@ fn arn_of(arn: Option<String>, operation: &str) -> Result<String, ApiKeySecretPr
 
 /// A failed Secrets Manager call as [`ApiKeySecretProblem::Unavailable`], with
 /// what came back rendered for the trace.
-fn unavailable(detail: impl ::std::fmt::Display) -> ApiKeySecretProblem {
+pub(crate) fn unavailable(detail: impl ::std::fmt::Display) -> ApiKeySecretProblem {
     ApiKeySecretProblem::Unavailable(detail.to_string())
 }
 
-/// The Secrets Manager client this service stores and resolves an API key secret
-/// through: the in-process callback into this same emulator, at the endpoint of
-/// the REQUEST's own Region, so the secret lands where the provider's own ARN says
-/// the provider is.
-fn secrets_manager_client(
+/// The Secrets Manager client this crate's credential-provider stores store and
+/// resolve a secret through: the in-process callback into this same emulator, at
+/// the endpoint of the REQUEST's own Region, so the secret lands where the
+/// provider's own ARN says the provider is.
+pub(crate) fn secrets_manager_client(
     ctx: &::smithy_server_runtime::OperationContext<'_>,
     region: &str,
 ) -> ::aws_sdk_secretsmanager::Client {

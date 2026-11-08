@@ -42,6 +42,12 @@
 //! * the token vault ([`TokenVaults`]): the KMS configuration each vault of the
 //!   account is encrypted under, so `SetTokenVaultCMK` and `GetTokenVault`
 //!   answer from one store;
+//! * the payment credential provider
+//!   (`/identities/…PaymentCredentialProvider`): one
+//!   [`PaymentCredentialProviderRecord`] per `name`, holding the vendor
+//!   configuration the token vault was given and, for each secret the vendor
+//!   needs, who manages it and the ARN it is reported by, so a create and every
+//!   later read of the provider answer from one store;
 //! * the API key credential provider (`/identities/`): one
 //!   [`ApiKeyCredentialProviderRecord`] per provider `name`, holding the ARN of
 //!   the Secrets Manager secret the key lives in and the source that secret
@@ -1754,6 +1760,11 @@ impl MemoryRecord {
 /// carries. Re-exported, so a handler names `crate::state::…` for it exactly as
 /// it does for the memory that holds the strategy.
 pub mod memory_strategies;
+/// The account's payment credential providers: the vendor configuration the
+/// token vault holds for each one, and the secrets a payment connector
+/// authenticates with. Re-exported, so a handler names `crate::state::…` for it
+/// exactly as it does for the resources beside it.
+pub mod payment_credential_providers;
 /// Every lookup and mutation the handlers drive this service's state struct through:
 /// the inherent methods of
 /// [`ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState`], which a
@@ -1782,6 +1793,7 @@ pub mod gateway_target_synchronization;
 pub use api_key_credential_providers::*;
 pub use gateway_target_synchronization::*;
 pub use memory_strategies::*;
+pub use payment_credential_providers::*;
 pub use resource_policies::*;
 pub use runtime_logs::*;
 
@@ -3048,7 +3060,8 @@ impl ConfigurationBundleRecord {
 /// name index),
 /// [`MAX_CONFIGURATION_BUNDLES`] the configuration bundles (and with them their
 /// 1:1 name index), [`MAX_VERSIONS_PER_CONFIGURATION_BUNDLE`] the versions one
-/// bundle accumulates and
+/// bundle accumulates,
+/// [`MAX_PAYMENT_CREDENTIAL_PROVIDERS`] the payment credential providers and
 /// [`MAX_WORKLOAD_IDENTITIES`] the workload identities,
 /// [`MAX_API_KEY_CREDENTIAL_PROVIDERS`] the API key credential providers, the
 /// resource policies are capped by the resources they attach to (one per runtime
@@ -3243,6 +3256,11 @@ pub struct ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState
     /// were first recorded, so the oldest record is the one evicted at the
     /// ceiling.
     configuration_bundle_idempotency_order: VecDeque<String>,
+    /// Every payment credential provider of this account, keyed by `name` — the
+    /// identifier every payment-credential-provider operation addresses it by,
+    /// none of them carrying any other. The key order is the deterministic list
+    /// order a payment-credential-provider listing pages over.
+    pub payment_credential_providers: BTreeMap<String, PaymentCredentialProviderRecord>,
     /// Every API key credential provider of this account's default token vault,
     /// keyed by `name` — the identifier every API-key-credential-provider route
     /// addresses it by, and what the provider's own ARN ends in. The key order is

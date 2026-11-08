@@ -77,6 +77,10 @@ mod memory_namespace_key_reference_wording;
 mod memory_read_reflects_last_mutation;
 #[path = "all/memory_update_and_read_projection.rs"]
 mod memory_update_and_read_projection;
+#[path = "all/payment_credential_provider_external_secret.rs"]
+mod payment_credential_provider_external_secret;
+#[path = "all/payment_credential_provider_lifecycle.rs"]
+mod payment_credential_provider_lifecycle;
 #[path = "all/registry_lifecycle.rs"]
 mod registry_lifecycle;
 #[path = "all/resource_error_message_wording.rs"]

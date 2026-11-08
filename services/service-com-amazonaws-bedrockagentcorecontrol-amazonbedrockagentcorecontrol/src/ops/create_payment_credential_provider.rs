@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreatePaymentCredentialProvider
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreatePaymentCredentialProvider`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreatePaymentCredentialProvider::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Creates a payment credential provider in the account's token vault: the
+//! credentials a payment connector authenticates to an external payment
+//! provider with. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -144,6 +138,89 @@ impl From<CreatePaymentCredentialProviderErrorModeled> for CreatePaymentCredenti
     }
 }
 
+/// What the STORED state of this account refuses this create for, read under the
+/// store's guard: the name another provider of the account already holds, and
+/// the ceiling this emulator holds providers up to. `None` when the store admits
+/// the provider.
+///
+/// Shared by the two reads of the store the handler makes — one before the
+/// caller's secrets are resolved against Secrets Manager and one after, with the
+/// guard released in between — so a create that won that race is refused in the
+/// same words as one that arrived second to begin with.
+fn refusal_for_store(
+    store: &crate::state::ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState,
+    name: &str,
+) -> Option<CreatePaymentCredentialProviderError> {
+    if store.payment_credential_providers.contains_key(name) {
+        return Some(
+            CreatePaymentCredentialProviderErrorModeled::ConflictException(ConflictException {
+                message: Some(format!(
+                    "a {} named {name} already exists",
+                    crate::state::RESOURCE_PAYMENT_CREDENTIAL_PROVIDER
+                )),
+            })
+            .into(),
+        );
+    }
+    if store.payment_credential_providers.len() >= crate::state::MAX_PAYMENT_CREDENTIAL_PROVIDERS {
+        return Some(
+            CreatePaymentCredentialProviderErrorModeled::ResourceLimitExceededException(
+                ResourceLimitExceededException {
+                    message: Some(format!(
+                        "this account already holds the maximum of {} payment credential \
+                         providers",
+                        crate::state::MAX_PAYMENT_CREDENTIAL_PROVIDERS
+                    )),
+                },
+            )
+            .into(),
+        );
+    }
+    None
+}
+
+/// How a create answers when the secrets the provider authenticates with could
+/// not be reported: a reference naming no secret of this account is the modelled
+/// 404 for "a resource referenced by the operation does not exist"; a secret
+/// whose KMS key Secrets Manager will not decrypt under is the modelled
+/// `DecryptionFailure`, which tells the caller the secret's key rather than the
+/// request is at fault; anything else is this emulator failing to reach Secrets
+/// Manager, which is a server failure rather than a statement about the request.
+fn secret_problem(
+    problem: crate::state::PaymentSecretProblem,
+) -> CreatePaymentCredentialProviderError {
+    match problem {
+        crate::state::PaymentSecretProblem::Absent => {
+            CreatePaymentCredentialProviderErrorModeled::ResourceNotFoundException(
+                crate::state::resource_not_found(crate::state::RESOURCE_SECRET),
+            )
+            .into()
+        }
+        crate::state::PaymentSecretProblem::Undecryptable => {
+            CreatePaymentCredentialProviderErrorModeled::DecryptionFailure(DecryptionFailure {
+                message: crate::state::SECRET_UNDECRYPTABLE_MESSAGE.to_string(),
+            })
+            .into()
+        }
+        crate::state::PaymentSecretProblem::Unavailable(detail) => {
+            ::tracing::warn!(
+                %detail,
+                "the payment credential provider's secrets could not be stored in or resolved \
+                 against Secrets Manager, so no provider was created",
+            );
+            CreatePaymentCredentialProviderErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the payment credentials could not be stored in Secrets Manager"
+                            .to_string(),
+                    ),
+                },
+            )
+            .into()
+        }
+    }
+}
+
 /// The `CreatePaymentCredentialProvider` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -180,18 +257,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreatePaymentCredentialProvider` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreatePaymentCredentialProviderErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreatePaymentCredentialProviderErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some(
+                        "the payment credential provider store is unavailable".to_string(),
+                    ),
+                },
+            )
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        // The credentials go into the account's token vault, which is what the
+        // provider's own ARN is nested under; this request names no vault, so
+        // they go into the one every account holds.
+        let token_vault_id = crate::state::DEFAULT_TOKEN_VAULT_ID;
+        let requested = crate::state::RequestedPaymentProviderConfiguration::from_input(
+            &input.credential_provider_vendor,
+            &region,
+            &input.provider_configuration_input,
+        )
+        .map_err(CreatePaymentCredentialProviderErrorModeled::ValidationException)?;
+
+        // The name is the "unique name for the payment credential provider" and
+        // the only identifier any operation of the family carries, so a second
+        // create of one name is a conflict rather than a second provider a read
+        // by that name cannot tell apart. The store this request would grow is
+        // bounded too, so a caller looping on create meets the modelled limit
+        // instead of this process's memory limit.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreatePaymentCredentialProvider"))
+        // Both are decided before anything is written to Secrets Manager, under
+        // the store's guard, which is then RELEASED: the secrets this provider
+        // authenticates with belong to another service, and that service is
+        // asked below with no lock held.
+        if let Some(refusal) = refusal_for_store(&state.lock(), &input.name) {
+            return Err(refusal);
+        }
+
+        // The secrets the provider reports are secrets Secrets Manager really
+        // holds: the ones this create puts the caller's values into for a
+        // managed source, and the ones the request references for an external
+        // one. Each ARN is `@required` on this operation's own answer, so no
+        // provider is recorded — and no success reported — when there is no
+        // secret to name.
+        let configuration = requested
+            .resolve(ctx, &region, token_vault_id, &input.name)
+            .await
+            .map_err(secret_problem)?;
+
+        let record = crate::state::PaymentCredentialProviderRecord {
+            credential_provider_arn: crate::state::payment_credential_provider_arn(
+                &region,
+                token_vault_id,
+                &input.name,
+            ),
+            name: input.name,
+            configuration,
+            tags: crate::state::sorted_map(input.tags),
+            created_at: now,
+            // Nothing has updated a provider this call just minted, so it was
+            // last updated when it was created.
+            updated_at: now,
+        };
+        let output = record.create_output();
+
+        let mut store = state.lock();
+        // The guard was released while another service was asked, so the name is
+        // read once more: a create that won the race in the meantime holds it.
+        if let Some(refusal) = refusal_for_store(&store, &record.name) {
+            return Err(refusal);
+        }
+        store
+            .payment_credential_providers
+            .insert(record.name.clone(), record);
+
+        Ok(output)
     }
 }
