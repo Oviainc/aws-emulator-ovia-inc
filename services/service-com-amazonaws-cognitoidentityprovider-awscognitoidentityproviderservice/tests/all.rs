@@ -53,6 +53,8 @@ mod app_client_validity_defaults;
 mod auth_flow_not_enabled;
 #[path = "all/authentication_refusal_classes.rs"]
 mod authentication_refusal_classes;
+#[path = "all/authentication_refusal_wire.rs"]
+mod authentication_refusal_wire;
 #[path = "all/authentication_success_shape.rs"]
 mod authentication_success_shape;
 #[path = "all/change_password.rs"]

@@ -395,6 +395,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !resend {
                 return Err(username_exists());
             }
+            // A resend sends "the invitation message to a user that already exists, and
+            // [resets] the temporary-password duration with a new temporary password"
+            // (`AdminCreateUser.MessageAction`). The invitation is that temporary
+            // credential, and the user still owing its replacement is the one in
+            // `FORCE_CHANGE_PASSWORD` — "the user must change their password to complete
+            // sign-in" (`UserStatusType`). A user in any other status has no outstanding
+            // invitation for this call to send again or reset, so the request is refused
+            // for the state it found and nothing about that user changes.
+            if existing.status != RESENDABLE_STATUS {
+                return Err(resend_not_possible(&input.username));
+            }
             if let Some(temporary_password) = input.temporary_password.clone() {
                 existing.password = Some(temporary_password);
                 existing.password_permanent = false;
@@ -523,6 +534,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The one user status a `RESEND` of the invitation message is possible in.
+///
+/// `MessageAction` `RESEND` "resend[s] the invitation message to a user that already
+/// exists, and ... reset[s] the temporary-password duration with a new temporary password"
+/// (`AdminCreateUser.MessageAction`), and the user that still holds an unreplaced temporary
+/// password is the one this status names (`UserStatusType`).
+const RESENDABLE_STATUS: crate::state::UserStatus = crate::state::UserStatus::ForceChangePassword;
+
 /// This operation's `ResourceNotFoundException` for an absent user pool.
 fn user_pool_not_found(user_pool_id: &str) -> AdminCreateUserError {
     AdminCreateUserErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
@@ -549,6 +568,22 @@ fn user_not_found() -> AdminCreateUserError {
 fn username_exists() -> AdminCreateUserError {
     AdminCreateUserErrorModeled::UsernameExistsException(UsernameExistsException {
         message: Some("User account already exists".to_string()),
+    })
+    .into()
+}
+
+/// This operation's `UnsupportedUserStateException` for a `RESEND` addressed to a user
+/// whose status holds no outstanding invitation ([`RESENDABLE_STATUS`]).
+///
+/// The sentence's fixed text is Amazon Cognito's; its variable parts are the sign-in name
+/// the request submitted and the status a resend requires, which the status set names
+/// rather than any one run.
+fn resend_not_possible(username: &str) -> AdminCreateUserError {
+    AdminCreateUserErrorModeled::UnsupportedUserStateException(UnsupportedUserStateException {
+        message: Some(format!(
+            "Resend not possible. {username} status is not {}",
+            RESENDABLE_STATUS.as_str()
+        )),
     })
     .into()
 }
