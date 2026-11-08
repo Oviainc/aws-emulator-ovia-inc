@@ -35,8 +35,12 @@ mod delete_message_batch;
 mod fifo_group_rotation;
 #[path = "all/fifo_queue.rs"]
 mod fifo_queue;
+#[path = "all/fifo_queue_designation.rs"]
+mod fifo_queue_designation;
 #[path = "all/fifo_receive_idempotency.rs"]
 mod fifo_receive_idempotency;
+#[path = "all/generated_queue_policy_document.rs"]
+mod generated_queue_policy_document;
 #[path = "all/list_dead_letter_source_queues.rs"]
 mod list_dead_letter_source_queues;
 #[path = "all/list_message_move_tasks.rs"]
@@ -53,6 +57,8 @@ mod message_move_task_queue_type;
 mod message_plane;
 #[path = "all/message_visibility_changes.rs"]
 mod message_visibility_changes;
+#[path = "all/opaque_response_tokens.rs"]
+mod opaque_response_tokens;
 #[path = "all/pagination_token_refusal.rs"]
 mod pagination_token_refusal;
 #[path = "all/policy_statement_limit.rs"]

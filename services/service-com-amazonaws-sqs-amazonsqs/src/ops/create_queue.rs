@@ -29,7 +29,11 @@
 //!   presenting one is answered for a queue that no longer exists
 //!   ([`crate::state::Queue::mint_receipt_handle`]).
 //! - "If you don't specify the FifoQueue attribute, Amazon SQS creates a standard
-//!   queue", and "A FIFO queue name must end with the .fifo suffix."
+//!   queue", and "A FIFO queue name must end with the .fifo suffix." Designating a queue
+//!   as FIFO is the whole of that attribute, and no attribute designates a standard one,
+//!   so a value that designates nothing is not an attribute this call has and is refused
+//!   as an unknown attribute name before any state is written
+//!   ([`crate::state::AttributeKind::Designator`]).
 //! - The two server-side encryption options are mutually exclusive, and a queue whose
 //!   create names neither is on the Amazon SQS owned key: which option the created
 //!   queue carries is [`crate::state::encryption::apply_encryption_choice`], and what it
@@ -231,7 +235,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and the `.fifo` suffix part of the rule the name has to satisfy.
         let fifo = supplied
             .get(state::FIFO_QUEUE_ATTRIBUTE)
-            .is_some_and(|value| value == "true");
+            .is_some_and(|value| value == state::DESIGNATES_FIFO_QUEUE);
 
         // `QueueName` carries no modelled constraint, so the member's own rule is
         // enforced here. The fault is in the NAME the request supplied, whichever half
@@ -284,12 +288,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             });
         }
 
-        // The documented defaults, overlaid with what this request supplied: the
-        // attribute set the queue carries, and the one a re-create of the same name is
-        // compared against (see [`state::recreate_refusal`]).
+        // The documented defaults of every attribute that APPLIES to the queue being
+        // created, overlaid with what this request supplied: the attribute set the queue
+        // carries, and the one a re-create of the same name is compared against (see
+        // [`state::recreate_refusal`]). A FIFO-only attribute is defaulted for a FIFO queue
+        // and for no other, because a standard queue does not have it at all — which is
+        // what makes a FIFO queue report the default of one its create never named, rather
+        // than reporting nothing for it.
         let mut attributes: ::std::collections::BTreeMap<String, String> =
             state::SETTABLE_ATTRIBUTES
                 .iter()
+                .filter(|spec| fifo || !spec.fifo_only)
                 .filter_map(|spec| {
                     spec.default
                         .map(|value| (spec.name.to_string(), value.to_string()))

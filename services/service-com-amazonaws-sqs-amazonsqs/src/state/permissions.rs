@@ -20,8 +20,10 @@
 
 use super::*;
 
-/// The policy language version a generated queue policy declares.
-pub const POLICY_VERSION: &str = "2012-10-17";
+/// The policy language version a generated queue policy declares: Amazon SQS synthesises
+/// its default queue policy in its own long-standing policy language version, which is not
+/// the one a caller writing a policy today would use.
+pub const POLICY_VERSION: &str = "2008-10-17";
 
 /// The `Version` member of a policy document.
 pub const POLICY_VERSION_MEMBER: &str = "Version";

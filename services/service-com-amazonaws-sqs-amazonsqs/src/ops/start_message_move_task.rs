@@ -437,7 +437,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // consumer polling the destination the instant this answers sees none of the
         // messages yet and the status is `COMPLETED` only once the source queue is drained.
         let task = sqs::MessageMoveTask {
-            task_handle: sqs::new_identifier(),
+            task_handle: sqs::message_move_task_handle(&sqs::new_identifier(), &queue_arn),
             region: region.clone(),
             source_queue_name: source_name.clone(),
             destination_queue_name: destination_name.clone(),

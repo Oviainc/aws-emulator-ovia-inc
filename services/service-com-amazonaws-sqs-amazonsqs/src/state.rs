@@ -224,6 +224,13 @@ pub const FIFO_QUEUE_NAME_SUFFIX: &str = ".fifo";
 /// The attribute that designates a queue as FIFO.
 pub const FIFO_QUEUE_ATTRIBUTE: &str = "FifoQueue";
 
+/// The one value [`FIFO_QUEUE_ATTRIBUTE`] designates a queue with: "Designates a queue
+/// as FIFO" is all the attribute does, and this service publishes no attribute that
+/// designates a queue as a standard one — a create that names none makes one. A value
+/// that designates nothing is therefore not this attribute at all; see
+/// [`AttributeKind::Designator`].
+pub const DESIGNATES_FIFO_QUEUE: &str = "true";
+
 /// The attribute that makes a FIFO queue derive a message's deduplication token from
 /// its body: "Enables content-based deduplication."
 pub const CONTENT_BASED_DEDUPLICATION: &str = "ContentBasedDeduplication";
@@ -400,6 +407,13 @@ pub enum AttributeKind {
     Json,
     /// An opaque string the service does not constrain.
     Text,
+    /// An attribute that exists only to DESIGNATE what the queue is, carrying the one
+    /// value that designates it. The service publishes no attribute designating the
+    /// opposite, so a request supplying any other value asks for an attribute that does
+    /// not exist rather than for a value outside a published set — which is why such a
+    /// value is refused as an UNKNOWN NAME ([`unknown_attribute_name`]) and not as a bad
+    /// value.
+    Designator(&'static str),
 }
 
 /// One settable queue attribute: what it accepts, when it may be supplied, and the
@@ -416,7 +430,10 @@ pub struct AttributeSpec {
     /// True when it "applies only to FIFO (first-in-first-out) queues".
     pub fifo_only: bool,
     /// The documented default ("Default: 30."), applied by `CreateQueue` when the
-    /// request names no value. `None` for an attribute the docs give no default.
+    /// request names no value, and only where the attribute APPLIES to the queue being
+    /// created: a `fifo_only` default is materialised for a FIFO queue and for no other,
+    /// since a standard queue has no such attribute at all. `None` for an attribute the
+    /// docs give no default.
     pub default: Option<&'static str>,
 }
 
@@ -428,12 +445,15 @@ pub struct AttributeSpec {
 /// is always refused for the same one.
 pub const SETTABLE_ATTRIBUTES: &[AttributeSpec] = &[
     AttributeSpec {
-        // "Enables content-based deduplication. Valid values are true and false."
+        // "Enables content-based deduplication. Valid values are true and false." A FIFO
+        // queue always carries the attribute: one whose create enabled nothing reads back
+        // as deduplication that is not content-based, which is `false` — "absent" is not a
+        // value this attribute has.
         name: CONTENT_BASED_DEDUPLICATION,
         kind: AttributeKind::Boolean,
         create_only: false,
         fifo_only: true,
-        default: None,
+        default: Some("false"),
     },
     AttributeSpec {
         // "Specifies whether message deduplication occurs at the message group or
@@ -453,10 +473,11 @@ pub const SETTABLE_ATTRIBUTES: &[AttributeSpec] = &[
         default: Some("0"),
     },
     AttributeSpec {
-        // "Designates a queue as FIFO. Valid values are true and false. ... You can
-        // provide this attribute only during queue creation."
+        // "Designates a queue as FIFO. ... You can provide this attribute only during
+        // queue creation." Designating is all it does, so the only value it carries is
+        // the one that designates — see [`AttributeKind::Designator`].
         name: FIFO_QUEUE_ATTRIBUTE,
-        kind: AttributeKind::Boolean,
+        kind: AttributeKind::Designator(DESIGNATES_FIFO_QUEUE),
         create_only: true,
         fifo_only: false,
         default: None,
@@ -1663,20 +1684,26 @@ impl Queue {
         }
     }
 
-    /// Mint a receipt handle for a receive of one of this queue's messages: this queue's
-    /// incarnation and a fresh token identifying the receive, joined so the handle names
-    /// the queue that issued it.
+    /// Mint a receipt handle for a receive of one of this queue's messages: one opaque
+    /// token, encoding this queue's incarnation, a fresh token identifying the receive and
+    /// the queue's ARN, so the handle names the queue that issued it.
+    ///
+    /// A handle is "associated with a specific instance of receiving a message" and Amazon
+    /// SQS hands it over as a single long encoded token, so what this service puts in a
+    /// handle travels INSIDE the encoding ([`encoded_opaque_token`]) rather than in the
+    /// token's own text: a consumer reads the value as opaque, which is what it is.
     ///
     /// The handle a consumer holds therefore carries its own provenance: a later call that
     /// presents it to another queue, or to a queue created again under the same name, is
     /// answered for what the handle IS rather than for what some live table happens to
     /// hold ([`receipt_handle_incarnation`]).
     pub fn mint_receipt_handle(&self) -> String {
-        format!(
-            "{}{RECEIPT_HANDLE_SEPARATOR}{}",
+        encoded_opaque_token(&format!(
+            "{}{RECEIPT_HANDLE_FIELD_SEPARATOR}{}{RECEIPT_HANDLE_FIELD_SEPARATOR}{}",
             self.incarnation,
-            new_identifier()
-        )
+            new_identifier(),
+            self.arn,
+        ))
     }
 
     /// Record the receipt handle a receive just minted for `message_id`, remembering the
@@ -3009,6 +3036,23 @@ pub const MESSAGE_MOVE_CANCELLED: &str = "CANCELLED";
 /// itself is this emulator's choice, not a documented duration.
 pub const MESSAGE_MOVE_CANCELLATION_SPAN: Duration = Duration::from_millis(500);
 
+/// The `TaskHandle` a started message movement task is reported under: "An identifier
+/// associated with a message movement task", as the one opaque encoded token the service
+/// hands out ([`encoded_opaque_token`]), carrying the task's own identity — the token this
+/// service minted for it and the source queue it moves messages out of.
+///
+/// `CancelMessageMoveTask` takes that handle back verbatim, so the value a caller holds is
+/// what resolves the task; nothing is read out of its text.
+pub fn message_move_task_handle(task_id: &str, source_arn: &str) -> String {
+    encoded_opaque_token(
+        &::serde_json::json!({
+            "taskId": task_id,
+            "sourceArn": source_arn,
+        })
+        .to_string(),
+    )
+}
+
 /// One message movement task `StartMessageMoveTask` started.
 ///
 /// The record holds only what the start call RESOLVED — the queues it found, the rate and
@@ -3574,13 +3618,17 @@ pub fn is_receipt_handle(receipt_handle: &str) -> bool {
 /// The queue INCARNATION a receipt handle this service minted names, or `None` for a value
 /// this service did not mint.
 ///
-/// A minted handle is the incarnation that issued it and the token identifying the receive
-/// joined by [`RECEIPT_HANDLE_SEPARATOR`] — both [`new_identifier`] values — so the queue
-/// a consumer's handle belongs to is read out of the handle itself, and a value of any
-/// other form names no queue.
-pub fn receipt_handle_incarnation(receipt_handle: &str) -> Option<&str> {
-    let (incarnation, receive) = receipt_handle.split_once(RECEIPT_HANDLE_SEPARATOR)?;
-    (is_minted_identifier(incarnation) && is_minted_identifier(receive)).then_some(incarnation)
+/// A minted handle is the opaque encoding of the incarnation that issued it, the token
+/// identifying the receive and the queue's ARN ([`Queue::mint_receipt_handle`]) — the first
+/// two both [`new_identifier`] values — so the queue a consumer's handle belongs to is read
+/// out of the handle itself, and a value of any other form names no queue.
+pub fn receipt_handle_incarnation(receipt_handle: &str) -> Option<String> {
+    let decoded = decoded_opaque_token(receipt_handle)?;
+    let mut fields = decoded.split(RECEIPT_HANDLE_FIELD_SEPARATOR);
+    let incarnation = fields.next()?;
+    let receive = fields.next()?;
+    (is_minted_identifier(incarnation) && is_minted_identifier(receive))
+        .then(|| incarnation.to_string())
 }
 
 /// Whether `value` is one of the opaque identifiers this service mints — the form
@@ -3589,10 +3637,31 @@ fn is_minted_identifier(value: &str) -> bool {
     value.chars().count() == MINTED_IDENTIFIER_LENGTH && uuid::Uuid::parse_str(value).is_ok()
 }
 
-/// What joins the two parts of a receipt handle this service mints. It is inside the
-/// alphabet [`is_receipt_handle`] accepts, so a minted handle is a well-formed one, and it
-/// appears in neither part, so the split is unambiguous.
-const RECEIPT_HANDLE_SEPARATOR: char = '/';
+/// `payload` as one opaque token a caller is handed: the single encoded string Amazon SQS
+/// hands out where a token identifies something it minted (a receipt handle, a message
+/// movement task handle), rather than that payload in the clear.
+///
+/// The codec is the workspace's own base64 ([`aws_smithy_types::base64`]), whose alphabet
+/// is inside the one [`is_receipt_handle`] accepts.
+fn encoded_opaque_token(payload: &str) -> String {
+    ::aws_smithy_types::base64::encode(payload)
+}
+
+/// The payload [`encoded_opaque_token`] put in `token`, or `None` for a value it did not
+/// produce.
+///
+/// A request supplies the token, so the decode is bounded by the length a handle has
+/// ([`MAX_RECEIPT_HANDLE_LENGTH`]) before anything is allocated from it.
+fn decoded_opaque_token(token: &str) -> Option<String> {
+    if token.len() > MAX_RECEIPT_HANDLE_LENGTH {
+        return None;
+    }
+    String::from_utf8(::aws_smithy_types::base64::decode(token).ok()?).ok()
+}
+
+/// What separates the fields a minted receipt handle's payload carries. It appears in none
+/// of them, so the split is unambiguous.
+const RECEIPT_HANDLE_FIELD_SEPARATOR: char = ' ';
 
 /// The length of one opaque identifier this service mints: [`new_identifier`] produces the
 /// hyphenated 36-character form, and nothing shorter is a receipt handle.
@@ -3951,10 +4020,11 @@ pub enum AttributeRefusal {
 /// in order, so a map with two bad attributes is always refused for the same one.
 ///
 /// A name this call cannot accept is an UNKNOWN attribute whichever rule put it out of
-/// reach ([`unknown_attribute_name`]): the set of names a call accepts depends on the call
-/// and on the queue it addresses, so an attribute only `GetQueueAttributes` reports, one
-/// only a create may supply, and one that applies only to the other kind of queue are each
-/// simply not an attribute THIS call has.
+/// reach ([`unknown_attribute_name`]): the set of names a call accepts depends on the call,
+/// on the queue it addresses and on what the value asks for, so an attribute only
+/// `GetQueueAttributes` reports, one only a create may supply, one that applies only to the
+/// other kind of queue, and a designator ([`AttributeKind::Designator`]) given a value that
+/// designates nothing are each simply not an attribute THIS call has.
 pub fn validate_attributes(
     supplied: &HashMap<String, String>,
     on_create: bool,
@@ -4090,13 +4160,21 @@ fn check_attribute_value(spec: &AttributeSpec, value: &str) -> Result<(), Attrib
         AttributeKind::OneOf(allowed) => allowed.contains(&value),
         AttributeKind::Json => ::serde_json::from_str::<::serde_json::Value>(value).is_ok(),
         AttributeKind::Text => true,
+        AttributeKind::Designator(designating) => value == designating,
     };
     if accepted {
         return Ok(());
     }
     // The refusal names the attribute and nothing else: what that attribute accepts is
     // published with the attribute, not restated per call.
-    Err(AttributeRefusal::Value(invalid_attribute_value(spec.name)))
+    Err(match spec.kind {
+        // A designator carries the one value that designates and nothing else, so a value
+        // that designates nothing is not a value of this attribute to repair: the
+        // attribute the request named is one the service does not have for it, and that is
+        // what the refusal states.
+        AttributeKind::Designator(_) => AttributeRefusal::Name(unknown_attribute_name(spec.name)),
+        _ => AttributeRefusal::Value(invalid_attribute_value(spec.name)),
+    })
 }
 
 /// Why a `QueueName` was refused, as the text of the refusal a caller has to fix the

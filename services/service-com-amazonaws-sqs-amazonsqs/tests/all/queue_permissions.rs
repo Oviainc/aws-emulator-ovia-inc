@@ -35,8 +35,14 @@ use super::support::{
 // publishes them, rather than read back off the implementation's own constants: an
 // expectation taken from the code it checks would pass whatever that code said.
 
-/// The policy language version a generated queue policy declares.
-const EXPECTED_POLICY_VERSION: &str = "2012-10-17";
+/// The policy language version a GENERATED queue policy declares — the long-standing
+/// default policy language version Amazon SQS synthesises `SQSDefaultPolicy` in, not the
+/// one a caller writing a policy today would use.
+const EXPECTED_POLICY_VERSION: &str = "2008-10-17";
+
+/// The policy language version the rows that UPLOAD a document write, which the queue
+/// keeps as written: a policy a caller supplies is stored with its own version.
+const UPLOADED_POLICY_VERSION: &str = "2012-10-17";
 
 /// What the `Id` of a generated queue policy is: the queue's ARN followed by this.
 const EXPECTED_POLICY_ID_SUFFIX: &str = "/SQSDefaultPolicy";
@@ -373,7 +379,7 @@ async fn a_grant_adds_to_an_uploaded_policy_rather_than_replacing_it() {
     let arn = expected_arn("uploaded-policy");
 
     let uploaded = json!({
-        "Version": EXPECTED_POLICY_VERSION,
+        "Version": UPLOADED_POLICY_VERSION,
         "Id": format!("{arn}/uploaded"),
         "Statement": [{
             "Sid": "uploaded",

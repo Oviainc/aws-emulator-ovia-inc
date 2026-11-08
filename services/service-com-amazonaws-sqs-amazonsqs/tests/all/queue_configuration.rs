@@ -36,10 +36,13 @@ use super::support::{
 /// A minimal but well-formed queue policy, used wherever a row needs a JSON document.
 const QUEUE_POLICY: &str = r#"{"Version":"2012-10-17","Statement":[{"Sid":"allow-foreign","Effect":"Allow","Principal":{"AWS":"arn:aws:iam::210987654321:root"},"Action":"sqs:SendMessage","Resource":"*"}]}"#;
 
-/// The documented default of every attribute that has one.
-fn documented_defaults() -> BTreeMap<String, String> {
+/// The documented default of every attribute that has one and that APPLIES to the kind of
+/// queue under test: an attribute that "applies only to FIFO (first-in-first-out) queues"
+/// has no default on a standard queue, which does not carry it at all.
+fn documented_defaults(fifo: bool) -> BTreeMap<String, String> {
     SETTABLE_ATTRIBUTES
         .iter()
+        .filter(|spec| fifo || !spec.fifo_only)
         .filter_map(|spec| {
             spec.default
                 .map(|value| (spec.name.to_string(), value.to_string()))
@@ -158,7 +161,7 @@ async fn a_created_queue_reports_its_url_arn_supplied_attributes_and_documented_
 
         // Every attribute with a documented default that the request named no value
         // for carries that default.
-        for (name, default) in documented_defaults() {
+        for (name, default) in documented_defaults(row.name.ends_with(".fifo")) {
             if as_map(&row.attributes).contains_key(&name) {
                 continue;
             }
