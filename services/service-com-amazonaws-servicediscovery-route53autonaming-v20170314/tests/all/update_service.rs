@@ -343,8 +343,11 @@ async fn a_change_that_states_no_records_deletes_the_record_configurations() {
         update(&router, &service_id, change).await;
 
         let service = read(&router, &service_id).await;
-        assert!(
-            service["DnsConfig"].is_null(),
+        // The member itself stays on the shape — a service always reports a
+        // `DnsConfig` — so "deleted" is read off the records it no longer registers.
+        assert_eq!(
+            service["DnsConfig"]["DnsRecords"],
+            json!([]),
             "case {case:?}: the record configurations are deleted, got {service}"
         );
         assert_eq!(

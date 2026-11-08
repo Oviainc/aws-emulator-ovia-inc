@@ -279,18 +279,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // Exactly the attribute map that was registered, as `GetInstance` and
                 // `DiscoverInstances` report it.
                 attributes: Some(record.attributes.clone()),
-                // Set only for an instance another account registered into a shared
-                // namespace, which this emulator does not model: every resource it
-                // holds belongs to the one emulator account its ARNs carry.
-                created_by_account: None,
+                // The account that registered the instance, which is the one account
+                // this emulator serves — as `GetInstance` reports it.
+                created_by_account: Some(crate::state::owning_account()),
             })
             .collect();
 
         Ok(ListInstancesOutput {
             // `ResourceOwner` names the account that created the containing namespace,
-            // which only distinguishes a namespace shared from another account —
-            // omitted for the reason above, as this crate's other readers omit it.
-            resource_owner: None,
+            // which is the one account this emulator serves — the same account every
+            // other reader of this crate reports.
+            resource_owner: Some(crate::state::owning_account()),
             instances: Some(instances),
             next_token,
         })

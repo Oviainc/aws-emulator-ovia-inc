@@ -41,6 +41,8 @@ mod list_operations;
 mod namespace_listing;
 #[path = "all/public_dns_namespace.rs"]
 mod public_dns_namespace;
+#[path = "all/resource_ownership.rs"]
+mod resource_ownership;
 #[path = "all/service_attributes.rs"]
 mod service_attributes;
 #[path = "all/service_identity_and_error_bodies.rs"]

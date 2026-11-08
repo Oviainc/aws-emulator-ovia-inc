@@ -1024,6 +1024,21 @@ pub fn service_arn(region: &str, resource: &str) -> String {
     ::engine::emulator_arn(ARN_NAMESPACE, region, resource)
 }
 
+/// The account that created and owns every resource this emulator holds, as the
+/// 12-character `AWSAccountId` the ownership members carry.
+///
+/// Each of those members — `Namespace$ResourceOwner`, `Service$ResourceOwner` /
+/// `$CreatedByAccount`, `ServiceAttributes$ResourceOwner`, `Instance$CreatedByAccount`,
+/// `Operation$OwnerAccount` and their listing counterparts — is documented as "the ID
+/// of the Amazon Web Services account that created/owns" the resource, and names
+/// another account ONLY when the namespace was shared in from one. This emulator serves
+/// a single account, the one its ARNs carry, so every resource it holds was created by
+/// and is owned by that account and every read reports it: the member is a fact of the
+/// resource, not a cross-account marker, so it is never omitted.
+pub fn owning_account() -> String {
+    ::engine::emulator_account_id().to_string()
+}
+
 /// The ARN form of a service reference a request named, for an error that answers with
 /// the service the caller asked for rather than with a sentence about it.
 ///
@@ -1095,7 +1110,7 @@ pub fn namespace_view(record: &NamespaceRecord, service_count: i32) -> Namespace
     Namespace {
         id: Some(record.id.clone()),
         arn: Some(record.arn.clone()),
-        resource_owner: None,
+        resource_owner: Some(owning_account()),
         name: Some(record.name.clone()),
         r#type: Some(record.namespace_type.clone()),
         description: record.description.clone(),
@@ -1130,8 +1145,8 @@ pub fn namespace_summary_view(record: &NamespaceRecord, service_count: i32) -> N
     NamespaceSummary {
         id: namespace.id,
         arn: namespace.arn,
-        // Absent for the same reason as on `Namespace`: this emulator shares no
-        // namespace across accounts, so no listing reports a different owner.
+        // The same account `Namespace` reports, so a listing and `GetNamespace` can
+        // never disagree about who owns the namespace.
         resource_owner: namespace.resource_owner,
         name: namespace.name,
         r#type: namespace.r#type,
@@ -1188,18 +1203,25 @@ pub fn service_view(record: &ServiceRecord) -> Service {
     Service {
         id: Some(record.id.clone()),
         arn: Some(record.arn.clone()),
-        resource_owner: None,
+        resource_owner: Some(owning_account()),
         name: Some(record.name.clone()),
         namespace_id: Some(record.namespace_id.clone()),
         description: record.description.clone(),
         instance_count: Some(record.instance_count()),
-        dns_config: record.dns_config.clone(),
+        // `DnsConfig` describes "the Route 53 DNS records that you want Cloud Map to
+        // create when you register an instance", which every service has — one that
+        // registers no record simply has none of them — so the member is part of the
+        // service's shape rather than something a read leaves out: it carries the stored
+        // configuration, and an EMPTY one (no record, and so none of the members a
+        // stored configuration resolves for itself either) for a service that registers
+        // no record at all.
+        dns_config: Some(record.dns_config.clone().unwrap_or_default()),
         r#type: Some(record.service_type.clone()),
         health_check_config: record.health_check_config.clone(),
         health_check_custom_config: record.health_check_custom_config.clone(),
         create_date: Some(timestamp(record.create_date)),
         creator_request_id: record.creator_request_id.clone(),
-        created_by_account: None,
+        created_by_account: Some(owning_account()),
     }
 }
 
@@ -1212,8 +1234,8 @@ pub fn service_summary_view(record: &ServiceRecord) -> ServiceSummary {
     ServiceSummary {
         id: service.id,
         arn: service.arn,
-        // Absent for the same reason as on `Service`: this emulator shares no namespace
-        // across accounts, so no listing reports a different owner or creator.
+        // The same accounts `Service` reports, so a listing and `GetService` can never
+        // disagree about who owns the namespace or created the service.
         resource_owner: service.resource_owner,
         name: service.name,
         r#type: service.r#type,
@@ -1235,9 +1257,9 @@ pub fn service_summary_view(record: &ServiceRecord) -> ServiceSummary {
 pub fn service_attributes_view(record: &ServiceRecord) -> ServiceAttributes {
     ServiceAttributes {
         service_arn: Some(record.arn.clone()),
-        // Set only for a namespace shared from another account, which this emulator
-        // never produces — as for `Service$ResourceOwner`.
-        resource_owner: None,
+        // The account that created the namespace the service belongs to, as
+        // `Service$ResourceOwner` reports it.
+        resource_owner: Some(owning_account()),
         attributes: if record.attributes.is_empty() {
             None
         } else {
@@ -1295,7 +1317,7 @@ pub fn instance_view(record: &InstanceRecord) -> Instance {
         id: record.instance_id.clone(),
         creator_request_id: record.creator_request_id.clone(),
         attributes: Some(record.attributes.clone()),
-        created_by_account: None,
+        created_by_account: Some(owning_account()),
     }
 }
 
@@ -1303,7 +1325,7 @@ pub fn instance_view(record: &InstanceRecord) -> Instance {
 pub fn operation_view(record: &OperationRecord) -> Operation {
     Operation {
         id: Some(record.id.clone()),
-        owner_account: None,
+        owner_account: Some(owning_account()),
         r#type: Some(record.operation_type.clone()),
         status: Some(record.status.clone()),
         error_message: record.error_message.clone(),

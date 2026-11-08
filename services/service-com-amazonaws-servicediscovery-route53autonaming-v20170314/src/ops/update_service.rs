@@ -33,9 +33,9 @@
 //!   shared namespace and contains instances that were registered by Amazon Web Services
 //!   accounts other than the account making the UpdateService call" — cannot arise: this
 //!   emulator never produces a namespace shared from another account, and every stored
-//!   instance was registered by the one account (`Service$ResourceOwner` and
-//!   `Instance$CreatedByAccount` are always absent). No request can reach that state, so
-//!   nothing is refused for it.
+//!   instance was registered by the one account it serves (`Service$ResourceOwner` and
+//!   `Instance$CreatedByAccount` both report that account). No request can reach that
+//!   state, so nothing is refused for it.
 //! * `DuplicateRequest` (409, "The operation is already in progress") is never
 //!   constructed: `UpdateService` carries no idempotency token, so there is no identity
 //!   by which one call could be recognised as the retry of another, and this emulator

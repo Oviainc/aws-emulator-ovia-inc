@@ -153,9 +153,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         // `OwnerAccount` names the account that owns a SHARED namespace. This emulator
-        // holds one account's resources (every namespace reports no `ResourceOwner`),
-        // so there is no cross-account namespace to select and the member does not
-        // change which record is resolved.
+        // holds one account's resources (every namespace reports that one account as its
+        // `ResourceOwner`), so there is no cross-account namespace to select and the
+        // member does not change which record is resolved.
         let _ = (ctx, &input.owner_account);
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DiscoverInstancesRevisionErrorModeled::InvalidInput(InvalidInput {
