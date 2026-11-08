@@ -55,6 +55,8 @@ mod direct_put_source_gate;
 mod encryption_conflict_messages;
 #[path = "all/http_endpoint_delivery.rs"]
 mod http_endpoint_delivery;
+#[path = "all/kinesis_source_ingestion.rs"]
+mod kinesis_source_ingestion;
 #[path = "all/kms_key_resolution.rs"]
 mod kms_key_resolution;
 #[path = "all/legacy_s3_destination_mirror.rs"]

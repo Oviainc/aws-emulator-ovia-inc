@@ -42,6 +42,10 @@ service-common = { path = "../common" }
 # The destination of a Firehose stream is an Amazon S3 location, and the one object store
 # in this emulator is the Amazon S3 service's: a delivered object is written there.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# A `KinesisStreamAsSource` stream is fed by a Kinesis data stream, and the one register of
+# such streams, their shards and their records in this emulator is that service's: the
+# records a producer put there are read back from it and buffered for the destination.
+service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
 # An `Elasticsearch` / `Amazonopensearchservice` destination indexes each delivered record
 # into an index of an Amazon OpenSearch Service domain, and the one such domain store in
 # this emulator is that service's: a delivered document is written there.

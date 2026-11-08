@@ -92,6 +92,13 @@ impl Emulator {
                 Arc::clone(&engine),
             ),
         );
+        // A `KinesisStreamAsSource` stream is fed by a Kinesis data stream, so the suite
+        // that drives that source needs that service mounted on the same engine too.
+        router.register_service(
+            service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService::new(Arc::clone(
+                &engine,
+            )),
+        );
         Self { router, engine }
     }
 
@@ -102,13 +109,29 @@ impl Emulator {
 
     /// Call one Firehose operation; answer its HTTP status and JSON body.
     pub(crate) async fn firehose(&self, operation: &str, body: Value) -> (u16, Value) {
+        self.json_rpc("firehose", "Firehose_20150804", operation, body)
+            .await
+    }
+
+    /// Call one operation of an `awsJson1_1` service mounted here: `service` is the routing
+    /// key its requests are signed for and `target` the prefix of its `X-Amz-Target`.
+    ///
+    /// The one request path for every such service, so a suite driving the Kinesis data
+    /// stream a Firehose stream reads from sends its calls exactly as the Firehose ones go.
+    pub(crate) async fn json_rpc(
+        &self,
+        service: &str,
+        target: &str,
+        operation: &str,
+        body: Value,
+    ) -> (u16, Value) {
         let request = http::Request::builder()
             .method("POST")
             .uri("/")
             .header("host", HOST)
             .header("content-type", "application/x-amz-json-1.1")
-            .header("x-amz-target", format!("Firehose_20150804.{operation}"))
-            .header("authorization", authorization("firehose"))
+            .header("x-amz-target", format!("{target}.{operation}"))
+            .header("authorization", authorization(service))
             .body(bytes::Bytes::from(
                 serde_json::to_vec(&body).expect("the request body serializes"),
             ))
@@ -732,7 +755,10 @@ fn delivery_rows() -> Vec<DeliveryRow> {
 }
 
 /// Whether `key` carries a `YYYY/MM/DD/HH/` segment right after `prefix`.
-fn carries_time_prefix(key: &str, prefix: &str) -> bool {
+///
+/// `pub(crate)` so a sibling suite reading the same delivered keys — the source-fed streams
+/// of `kinesis_source_ingestion` — judges them by this one reading.
+pub(crate) fn carries_time_prefix(key: &str, prefix: &str) -> bool {
     let rest = match key.strip_prefix(prefix) {
         Some(rest) => rest,
         None => return false,
@@ -1166,6 +1192,23 @@ const HOSTILE_QUERIES: &[(&str, &str)] = &[
     (
         "a loop over the record",
         "{dept:(foreach .items[] as $i (0; .+0; $i))|tostring}",
+    ),
+    // The GENERATORS: an iteration hands the engine one output per element of its value and
+    // a pipe re-applies what follows once per output, so two of them multiply, and jq's
+    // recursive descent generates one output per sub-value at every depth of the record.
+    (
+        "two iterations multiplied by a pipe",
+        "[.a[] | .b[]]",
+    ),
+    (
+        "a recursive descent through the record",
+        "[.. ]",
+    ),
+    // jq's two-value generator, chained: each link doubles what the next one is applied to,
+    // so a handful of tokens makes the engine materialise many copies of the record.
+    (
+        "a value doubled by a chain of comma generators",
+        "[(.,.)|(.,.)|(.,.)|(.,.)]",
     ),
     ("a program that does not parse", "{dept:"),
     (

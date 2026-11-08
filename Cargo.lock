@@ -12093,6 +12093,7 @@ dependencies = [
  "rand 0.9.5",
  "ruzstd",
  "serde_json",
+ "service-com-amazonaws-kinesis-kinesis-20131202",
  "service-com-amazonaws-kms-trentservice",
  "service-com-amazonaws-opensearch-amazonopensearchservice",
  "service-com-amazonaws-s3-amazons3",

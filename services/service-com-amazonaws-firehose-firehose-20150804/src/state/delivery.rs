@@ -194,6 +194,17 @@ const MAX_PROGRAM_TOKENS: usize = 128;
 /// count, the largest value a run can build is bounded — see [`admissible_program`].
 const MAX_PROGRAM_CONSTRUCTIONS: usize = 1;
 
+/// How many ITERATIONS (`.a[]`, the empty-bracket form) a metadata-extraction program may
+/// carry.
+///
+/// An iteration is the one admitted form that is a GENERATOR: it yields one output per
+/// element of the value it is applied to, and everything after it in a pipe is re-applied
+/// once per output — so two of them in one program multiply, `n` elements by `m`, and a
+/// third cubes it, which is exactly the growth [`MAX_PROGRAM_CONSTRUCTIONS`] exists to
+/// bound. One is admitted, because reading a partition key out of a list needs one and its
+/// outputs together are no larger than the record they came out of; a second is refused.
+const MAX_PROGRAM_ITERATIONS: usize = 1;
+
 /// The largest record a metadata-extraction program is run over.
 ///
 /// An emulator resource budget, NOT an AWS limit: it is the other half of the memory bound
@@ -2224,6 +2235,19 @@ async fn partition_keys(query: String, records: &[StoredRecord]) -> Option<Vec<G
     }
 }
 
+/// What an open bracket of a metadata-extraction program is, which is what decides whether
+/// a `,` inside it separates ELEMENTS or generates VALUES.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Bracket {
+    /// A container construction — `{…}`, or a `[…]` that does not follow something
+    /// indexable. A `,` inside one separates the elements that container collects, so it
+    /// grows the value by the factor [`MAX_PROGRAM_CONSTRUCTIONS`] already bounds.
+    Construction,
+    /// A group (`(…)`) or an index / slice bracket. A `,` inside one is jq's generator: it
+    /// yields two values and a pipe re-applies everything after it once per value.
+    Generating,
+}
+
 /// Why a metadata-extraction program is not one this emulator runs at all.
 ///
 /// Every check is applied to the TEXT, so no descent over the program has begun when one
@@ -2261,6 +2285,13 @@ async fn partition_keys(query: String, records: &[StoredRecord]) -> Option<Vec<G
 ///   with every `{` and with every `[` that does not follow something INDEXABLE — a
 ///   keyword is not indexable, so the `[` of `if . then [., .] else . end` is counted as
 ///   the construction the engine reads it as rather than as an index;
+/// * it carries more than [`MAX_PROGRAM_ITERATIONS`] iterations — a `[]` where an index
+///   would go, which is jq's GENERATOR over a value's elements — or jq's recursive descent
+///   `..`, which generates one output per sub-value at every depth, or a `,` anywhere but
+///   inside a container construction, which is jq's own generator of two values (`(.a, .b)`)
+///   rather than the separator of the elements `{a:.x,b:.y}` collects. A generator is the
+///   one form whose outputs are MANY, and a pipe re-applies everything after it once per
+///   output, so generators MULTIPLY what the straight-line accounting below charges for;
 /// * it carries a string literal this scanner cannot read as the engine would — one that
 ///   never closes, or that carries a raw line break jq does not admit — because a scanner
 ///   that read the text differently from the engine would be shown one program while the
@@ -2268,11 +2299,14 @@ async fn partition_keys(query: String, records: &[StoredRecord]) -> Option<Vec<G
 ///   one, so nothing can be hidden behind one either.
 ///
 /// THE MEMORY BOUND those last three give. With no library function registered there is no
-/// generator and no recursion; with no definition, no loop form and no binding there is
-/// nothing that re-applies an expression, so a program is STRAIGHT-LINE: it either takes
-/// the input APART (a path, an index, a slice, a comparison, `if`, `//`, `|`) or CONSTRUCTS
-/// one container from it. A construction holding `n` copies of its input grows it `n`-fold
-/// and a chain of `k` constructions grows it `n^k`-fold — so with `k` capped at one and `n`
+/// recursion; with no definition, no loop form and no binding there is nothing that
+/// re-applies an expression over a value, and with at most one generator there is at most
+/// one expression whose outputs are many — so a program is STRAIGHT-LINE over at most the
+/// elements of ONE value: it either takes the input APART (a path, an index, a slice, one
+/// iteration, a comparison, `if`, `//`, `|`) or CONSTRUCTS one container from it. A
+/// construction holding `n` copies of its input grows it `n`-fold and a chain of `k`
+/// constructions grows it `n^k`-fold — so with `k` capped at one, the generators capped at
+/// one (whose outputs together are no larger than the input they came out of) and `n`
 /// bounded by the token count, the largest value one run can build is at most
 /// [`MAX_PROGRAM_TOKENS`] times [`MAX_EXTRACTED_RECORD_BYTES`], and at most
 /// [`MAX_RUNNING_METADATA_EXTRACTIONS`] runs hold one at a time. The steps it takes are
@@ -2282,10 +2316,23 @@ async fn partition_keys(query: String, records: &[StoredRecord]) -> Option<Vec<G
 /// A program this refuses is a program whose records go to the error output, which is what
 /// Firehose does with a query whose metadata extraction does not succeed.
 fn admissible_program(query: &str) -> Result<(), &'static str> {
-    let mut depth = 0usize;
-    let mut deepest = 0usize;
+    // The brackets open right now, innermost last — which is what tells a `,` that SEPARATES
+    // the elements of one container from one that GENERATES two values. Its length is the
+    // nesting depth, and the depth bound below is enforced as it grows, so it holds at most
+    // [`MAX_PROGRAM_DEPTH`] entries however long the text is.
+    let mut brackets: Vec<Bracket> = Vec::new();
     let mut tokens = 0usize;
     let mut constructions = 0usize;
+    // How many GENERATORS the program carries: an iteration (`[]` where an index would go)
+    // yields one output per element of its value, and a pipe re-applies what follows it once
+    // per output, so these multiply where a construction merely scales.
+    let mut iterations = 0usize;
+    // Whether the bracket now open was charged as an INDEX and nothing has been read inside
+    // it yet — so the `]` that closes it makes the pair jq's iteration rather than an index
+    // or a slice. Cleared by every token read inside the brackets, and carried across
+    // whitespace and across a `#` comment, because `.a[ ]` and `.a[ # c\n ]` iterate exactly
+    // as `.a[]` does.
+    let mut empty_index_bracket = false;
     let mut in_string = false;
     let mut escaped = false;
     let mut word = String::new();
@@ -2354,6 +2401,12 @@ fn admissible_program(query: &str) -> Result<(), &'static str> {
         }
         let preceding = previous;
         previous = character;
+        // Whether the bracket now open was still empty when this character was read: the
+        // flag is cleared here and re-set only by the `[` that opens an index bracket and by
+        // whitespace inside one, so every other token read inside the brackets ends the
+        // empty-bracket form.
+        let inside_empty_bracket = empty_index_bracket;
+        empty_index_bracket = false;
         if character.is_alphanumeric() || character == '_' {
             word.push(character);
             continue;
@@ -2379,6 +2432,12 @@ fn admissible_program(query: &str) -> Result<(), &'static str> {
         }
         if character == '#' {
             in_comment = true;
+            // A comment READS nothing, and jq runs one to the end of its line, so it is
+            // whitespace to the engine: an index bracket holding only a comment is still
+            // the empty-bracket form the engine reads as an iteration. Carried here, and
+            // left untouched by the comment's own characters and by the line break that
+            // ends it, so `.a[ # c\n ]` is charged as the iteration it is.
+            empty_index_bracket = inside_empty_bracket;
             continue;
         }
         if character == '"' {
@@ -2388,19 +2447,36 @@ fn admissible_program(query: &str) -> Result<(), &'static str> {
         }
         match character {
             '(' | '[' | '{' => {
-                depth += 1;
-                deepest = deepest.max(depth);
                 tokens += 1;
                 // `(` groups rather than constructs, and a `[` right after something
-                // indexable is an index or a slice.
-                if character == '{' || (character == '[' && !indexable) {
+                // indexable is an index, a slice or an ITERATION.
+                let bracket = if character == '{' || (character == '[' && !indexable) {
                     constructions += 1;
+                    // A `,` inside a construction separates the elements it collects.
+                    Bracket::Construction
+                } else {
+                    // A `,` inside a group or an index bracket yields TWO values, and a
+                    // pipe re-applies what follows once per value.
+                    Bracket::Generating
+                };
+                brackets.push(bracket);
+                if brackets.len() > MAX_PROGRAM_DEPTH {
+                    // The ONE place the depth bound lives, applied as the nesting grows:
+                    // nothing is read past it, and the stack above cannot hold more than it
+                    // admits.
+                    return Err("it nests deeper than this emulator reads");
                 }
+                // Which of the three that `[` is decided by what closes it: nothing inside
+                // it makes the pair jq's iteration.
+                empty_index_bracket = character == '[' && indexable;
                 indexable = false;
             }
             ')' | ']' | '}' => {
-                depth = depth.saturating_sub(1);
+                brackets.pop();
                 tokens += 1;
+                if character == ']' && inside_empty_bracket {
+                    iterations += 1;
+                }
                 indexable = true;
             }
             // `-` is here for the same reason as `+` and `*`, and a lone `/` for the same
@@ -2413,7 +2489,17 @@ fn admissible_program(query: &str) -> Result<(), &'static str> {
             '/' => {
                 pending_slash = true;
             }
-            character if character.is_whitespace() => {}
+            character if character.is_whitespace() => {
+                // Whitespace reads nothing, so an index bracket holding only whitespace is
+                // still the empty-bracket form the engine reads as an iteration.
+                empty_index_bracket = inside_empty_bracket;
+            }
+            // jq's recursive descent `..` generates one output per sub-value of the record,
+            // at every depth of it, so what follows it in a pipe is re-applied that many
+            // times — a generator whose output count is the record's own nesting rather than
+            // anything this accounting charges for. Nothing is needed of it to read a
+            // partition key out of a document.
+            '.' if preceding == '.' => return Err("it descends recursively through a value"),
             '.' | '?' => {
                 tokens += 1;
                 indexable = true;
@@ -2427,6 +2513,14 @@ fn admissible_program(query: &str) -> Result<(), &'static str> {
             }
             '=' => {
                 pending_equals = true;
+            }
+            // A `,` is jq's own generator wherever it is not separating the elements of a
+            // container: `(.a, .b) | f` applies `f` once per value, and a chain of such
+            // groups multiplies that per link — the growth the accounting below is written
+            // to exclude. Inside a construction it only separates the elements that
+            // construction collects, which is what `{dept:.dept,region:.region}` needs.
+            ',' if brackets.last() != Some(&Bracket::Construction) => {
+                return Err("it generates more than one value")
             }
             // The punctuation a program needs to take a JSON record apart: the pipe, the
             // comma, an object key separator, a binding's `$`, and the two halves of a
@@ -2460,14 +2554,14 @@ fn admissible_program(query: &str) -> Result<(), &'static str> {
     if !word.is_empty() {
         tokens += 1;
     }
-    if deepest > MAX_PROGRAM_DEPTH {
-        return Err("it nests deeper than this emulator reads");
-    }
     if tokens > MAX_PROGRAM_TOKENS {
         return Err("it carries more tokens than this emulator reads");
     }
     if constructions > MAX_PROGRAM_CONSTRUCTIONS {
         return Err("it constructs more containers than this emulator runs");
+    }
+    if iterations > MAX_PROGRAM_ITERATIONS {
+        return Err("it iterates over a value more than this emulator runs");
     }
     Ok(())
 }
@@ -3025,7 +3119,7 @@ pub fn drive_delivery_clock<Eng: Send + Sync + 'static>(
         let mut capped = true;
         for _ in 0..MAX_DELIVERY_WAKE_UPS {
             let now = SystemTime::now();
-            let Some(due) = next_due_or_release_pump(&mut state.lock(), generation) else {
+            let Some(due) = next_due_or_release_pump(&mut state.lock(), generation, now) else {
                 capped = false;
                 break;
             };
@@ -3037,11 +3131,27 @@ pub fn drive_delivery_clock<Eng: Send + Sync + 'static>(
                 .unwrap_or_default()
                 .clamp(MIN_DELIVERY_WAIT, MAX_DELIVERY_WAIT);
             ::tokio::time::sleep(wait).await;
+            // A stream whose data comes from a configured source is fed by that source and
+            // by no Firehose call at all, so the wake-up reads what the source has taken
+            // since before it delivers what that made due.
+            crate::state::kinesis_source::ingest_from_sources(&*engine, SystemTime::now());
             deliver_due(&*engine, SystemTime::now(), Extractions::Run, &transport).await;
         }
         if capped {
             // Only THIS pump's claim, so a pump started since is left holding its own.
-            release_pump(&mut state.lock(), generation);
+            let still_owed = {
+                let mut store = state.lock();
+                forget_pump(&mut store, generation);
+                next_due_or_poll(&store, SystemTime::now()).is_some()
+            };
+            // A source-fed stream is consumed for as long as it exists and no further
+            // Firehose call is coming to start a pump for it, so the cap HANDS OVER rather
+            // than standing down on work that is still owed: a fresh pump takes the claim
+            // this one released and stands down itself as soon as nothing is owed. The cap
+            // still bounds what one task does, which is what it is for.
+            if still_owed {
+                drive_delivery_clock(&engine, transport);
+            }
         }
     });
     // The handle is kept so the pump it replaces is aborted rather than merely forgotten.
@@ -3065,6 +3175,20 @@ fn release_pump(store: &mut ComAmazonawsFirehoseFirehose20150804State, generatio
     if store.delivery_pump_generation == generation {
         store.delivery_pump_running = false;
     }
+}
+
+/// Release the claim `generation` took AND drop the handle stored for it.
+///
+/// What a pump that is handing over to a fresh one calls: the stored handle is its OWN, and
+/// the pump it starts would otherwise abort it as the handle it replaces ([`set_pump`]).
+/// Dropping a `JoinHandle` detaches the task rather than cancelling it, so the pump that
+/// forgets its handle here still runs to the end of its own body.
+fn forget_pump(store: &mut ComAmazonawsFirehoseFirehose20150804State, generation: u64) {
+    if store.delivery_pump_generation != generation {
+        return;
+    }
+    release_pump(store, generation);
+    store.delivery_pump = None;
 }
 
 /// Keep the running pump's task handle, aborting the one it replaces.
@@ -3098,8 +3222,9 @@ fn set_pump(
 fn next_due_or_release_pump(
     store: &mut ComAmazonawsFirehoseFirehose20150804State,
     generation: u64,
+    now: SystemTime,
 ) -> Option<SystemTime> {
-    match next_due_at(store) {
+    match next_due_or_poll(store, now) {
         Some(due) => Some(due),
         None => {
             release_pump(store, generation);
@@ -3108,13 +3233,32 @@ fn next_due_or_release_pump(
     }
 }
 
+/// The earliest instant this store owes WORK at: a buffer whose delivery is due, or a poll
+/// of the source a stream's configuration names.
+///
+/// A source-fed stream owes a poll for as long as it exists ([`crate::state::kinesis_source`]),
+/// because its data arrives at the source and not through a Firehose call — so a pump keeps
+/// running for one even while nothing is buffered.
+fn next_due_or_poll(
+    store: &ComAmazonawsFirehoseFirehose20150804State,
+    now: SystemTime,
+) -> Option<SystemTime> {
+    [
+        next_due_at(store),
+        crate::state::kinesis_source::next_poll_at(store, now),
+    ]
+    .into_iter()
+    .flatten()
+    .min()
+}
+
 #[cfg(test)]
 mod tests {
     //! The text accounting a client-supplied `MetadataExtractionQuery` has to pass before
     //! any engine sees it: what [`admissible_program`] admits, and what it refuses so that
     //! the memory and step bound that function documents actually holds.
 
-    use super::{admissible_program, MAX_PROGRAM_CONSTRUCTIONS};
+    use super::{admissible_program, MAX_PROGRAM_CONSTRUCTIONS, MAX_PROGRAM_ITERATIONS};
 
     #[test]
     fn a_program_that_reads_a_partition_key_out_of_a_record_is_admitted() {
@@ -3248,6 +3392,93 @@ mod tests {
             ("def# a comment\nf: .; f", "it defines a function"),
             ("reduce\"x\" .items[] as $i (.; $i)", "it loops over a value"),
             ("foreach# a comment\n.items[] as $i (.; $i)", "it loops over a value"),
+        ] {
+            assert_eq!(
+                admissible_program(program),
+                Err(refusal),
+                "case {program:?}: expected the program to be refused as {refusal:?}"
+            );
+        }
+    }
+
+    /// RULE: a GENERATOR hands the engine many outputs and a pipe re-applies everything
+    /// after it once per output, so ONE is admitted and a second — or jq's recursive
+    /// descent, whose outputs are the record's own sub-values at every depth — is refused.
+    #[test]
+    fn more_than_one_generator_is_refused() {
+        assert_eq!(
+            MAX_PROGRAM_ITERATIONS, 1,
+            "these rows are written for a cap of one iteration"
+        );
+        // One iteration, in each position a query needs it, with the index and the slice
+        // beside it: only the EMPTY bracket pair is a generator.
+        for one in [
+            "{dept:.items[]}",
+            "[.items[]]",
+            ".items[] | {dept:.dept}",
+            "{dept:(.a[0] // .b[\"k\"] // .c[1:2])}",
+            // Whitespace inside the brackets reads nothing, so this is the same iteration
+            // and is admitted as the one this program is allowed.
+            "{dept:.items[ ]}",
+            // And so does a COMMENT, which jq runs to the end of its line: the brackets
+            // hold nothing either way.
+            "{dept:.items[ # which\n ]}",
+            // A `,` SEPARATING the elements of a construction is not a generator: it is
+            // what an object of several partition keys, and an array of several elements,
+            // are written with.
+            "{dept:.dept,region:.region,year:.year}",
+            "[.a,.b,.c]",
+        ] {
+            assert_eq!(
+                admissible_program(one),
+                Ok(()),
+                "case {one:?}: one generator is inside the cap"
+            );
+        }
+        // (the program, the refusal it must earn). Two iterations MULTIPLY: the engine
+        // evaluates what follows once per output of what precedes, so the value built is the
+        // product of the two lists' lengths whatever the token count says.
+        for (program, refusal) in [
+            (
+                ".a[] | .b[]",
+                "it iterates over a value more than this emulator runs",
+            ),
+            (
+                "[.a[] | .b[]]",
+                "it iterates over a value more than this emulator runs",
+            ),
+            (
+                "{dept:(.a[].b[])}",
+                "it iterates over a value more than this emulator runs",
+            ),
+            (
+                "{dept:(.a[ ] | .b[\t])}",
+                "it iterates over a value more than this emulator runs",
+            ),
+            // A COMMENT inside the brackets is whitespace to the engine too, so a program
+            // hiding its second iteration behind one is still two generators.
+            (
+                ".a[] | .b[ # c\n ]",
+                "it iterates over a value more than this emulator runs",
+            ),
+            (
+                "[.a[] | .b[ # c\n ]]",
+                "it iterates over a value more than this emulator runs",
+            ),
+            // jq's own two-value generator: a `,` outside a container construction. A chain
+            // of such groups multiplies per link, which is how a handful of tokens makes the
+            // engine materialise far more than the record it started from.
+            ("(.,.)|(.,.)|(.,.)", "it generates more than one value"),
+            ("[(.,.)|(.,.)]", "it generates more than one value"),
+            (".a,.b", "it generates more than one value"),
+            ("{dept:(.a,.b)}", "it generates more than one value"),
+            // Including one hidden in an INDEX bracket, where two keys yield two values.
+            ("{dept:.a[0,1]}", "it generates more than one value"),
+            ("[..]", "it descends recursively through a value"),
+            (
+                "{dept:(.. | .id)}",
+                "it descends recursively through a value",
+            ),
         ] {
             assert_eq!(
                 admissible_program(program),

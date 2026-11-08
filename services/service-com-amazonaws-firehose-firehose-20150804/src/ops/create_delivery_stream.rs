@@ -416,13 +416,44 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Firehose numbers destination ids from one.
             next_destination_id: 1,
             delivery_retry_at: None,
+            // Nothing has been consumed from this stream's source yet, so every shard of
+            // it is read from the instant retrieval starts at
+            // (`crate::state::kinesis_source`).
+            source_positions: ::std::collections::BTreeMap::new(),
         };
         let destination_id = stream.mint_destination_id();
         stream.destinations.push(crate::state::Destination {
             destination_id,
             config: destination,
         });
-        store.streams.insert(input.delivery_stream_name, stream);
+        store.streams.insert(input.delivery_stream_name.clone(), stream);
+        // Whether the created stream is fed by a source, read off the stored record before
+        // the lock is released: the delivery task takes the same lock to read what the
+        // store owes, so it is started with no lock of this store held.
+        let takes_a_source = store
+            .streams
+            .get(&input.delivery_stream_name)
+            .is_some_and(crate::state::kinesis_source::has_kinesis_source);
+        drop(store);
+
+        // A stream fed by a configured source gets its data from that source and from no
+        // Firehose call at all, so nothing later would start the task that consumes it:
+        // this create is the only call a client makes for such a stream. A stream that
+        // takes direct puts starts the task from its own put, so this create starts
+        // nothing for one.
+        //
+        // The transport the task is given is the emulator's OWN in-process transport —
+        // `smithy_server_runtime::EmbeddedEmulator::http_connector` hands out the router
+        // this request was dispatched by — so a delivery of this stream's buffer reaches
+        // only what this emulator serves itself: it opens no socket and leaves this
+        // process, this host and this network untouched. It is the same transport the
+        // ingestion operations hand the task (`crate::ops::put_record`).
+        if takes_a_source {
+            crate::state::delivery::drive_delivery_clock(
+                &self.engine,
+                ctx.callback().http_connector(),
+            );
+        }
 
         Ok(CreateDeliveryStreamOutput {
             delivery_stream_arn: Some(arn),

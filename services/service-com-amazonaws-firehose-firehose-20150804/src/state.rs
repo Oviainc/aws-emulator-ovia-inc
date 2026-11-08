@@ -23,6 +23,7 @@ use std::time::{Duration, SystemTime};
 
 pub mod cloudwatch_logs_pipeline;
 pub mod delivery;
+pub mod kinesis_source;
 pub mod producer;
 
 use crate::ops::types::{
@@ -554,6 +555,13 @@ pub struct DeliveryStream {
     /// or the object store refused the write) so the retry does not spin — see
     /// [`delivery::DELIVERY_RETRY_SPAN`]. `None` once a delivery succeeds.
     pub delivery_retry_at: Option<SystemTime>,
+    /// How far this stream has consumed the SOURCE its configuration names: the sequence
+    /// number of the last record buffered from each shard of it, by shard id.
+    ///
+    /// Empty for a stream whose data comes from direct puts, and for a source-fed stream
+    /// that has consumed nothing yet — which reads its source from the instant retrieval
+    /// starts at instead ([`kinesis_source`]).
+    pub source_positions: BTreeMap<String, String>,
 }
 
 impl DeliveryStream {
