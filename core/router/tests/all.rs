@@ -963,6 +963,10 @@ mod sns_lambda_cdk_subscription_delivery;
 // and the log group the invocation that path makes writes its run to.
 #[path = "all/apigateway_proxy_lambda_ddb_pipeline.rs"]
 mod apigateway_proxy_lambda_ddb_pipeline;
+// Declared here, in the appended tail: what REPEATED requests to one deployed stage are each
+// answered with, and the one stream record each new item they write carries.
+#[path = "all/apigateway_repeated_stage_requests.rs"]
+mod apigateway_repeated_stage_requests;
 // Declared here, in this same head region, for the reason the entry above records: what a
 // deployed `AWS_IAM` method makes of the credential its request presents, on a router that
 // verifies request signatures.
