@@ -117,6 +117,8 @@ mod ecs_elbv2_stack_outputs;
 mod error_envelope;
 #[path = "all/estimate_template_cost.rs"]
 mod estimate_template_cost;
+#[path = "all/executed_change_set_create_outcomes.rs"]
+mod executed_change_set_create_outcomes;
 #[path = "all/extension_registrations.rs"]
 mod extension_registrations;
 #[path = "all/extension_registry.rs"]
