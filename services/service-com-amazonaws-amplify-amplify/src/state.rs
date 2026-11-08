@@ -471,14 +471,27 @@ impl PendingDeployment {
     /// zipped deployment, or the empty string for a reservation that has none.
     ///
     /// `zipUploadUrl` is returned "when the fileMap argument is not provided in the
-    /// request", and the member is @required with a `length` minimum of 0
-    /// (`smithy_query(query="shape",shape="UploadUrl")`), so the empty value is how
-    /// "not returned" is expressed on the wire.
+    /// request", so a reservation that named its files has none — and the member is
+    /// then left OUT of the answer rather than sent empty (see
+    /// `crate::ops::types::CreateDeploymentResponse`).
     pub fn zip_upload_url(&self) -> String {
         self.zip
             .as_ref()
             .map(|zip| zip.url.clone())
             .unwrap_or_default()
+    }
+
+    /// Has anything been uploaded to this reservation's destinations yet?
+    ///
+    /// What `StartDeployment` deploys from a reservation is the content AT those
+    /// destinations, so this is the precondition of starting it: a reservation nothing
+    /// has been uploaded to has no deployment file to deploy.
+    pub fn holds_an_upload(&self) -> bool {
+        self.zip.as_ref().is_some_and(|zip| zip.content.is_some())
+            || self
+                .files
+                .values()
+                .any(|file| file.upload.content.is_some())
     }
 
     /// Whether `token` authorises one of this reservation's uploads.

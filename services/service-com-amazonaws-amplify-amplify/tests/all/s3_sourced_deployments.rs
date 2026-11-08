@@ -700,9 +700,8 @@ async fn a_reserved_deployment_is_started_from_its_uploads() {
     let deployments = Deployments::new();
     let app_id = deployments.app_with_branch("deploy-reservations", "main").await;
 
-    // Each row: the case, the `CreateDeployment` request, what is uploaded to the
-    // destinations it hands back (none at all for the last), the terminal status, and the
-    // assets the deployment publishes.
+    // Each row: the case, the `CreateDeployment` request, whether what it reserved is
+    // uploaded, the terminal status, and the assets the deployment publishes.
     type UploadRow<'a> = (&'a str, Value, bool, &'a str, Vec<&'a str>);
     let rows: Vec<UploadRow<'_>> = vec![
         (
@@ -723,9 +722,13 @@ async fn a_reserved_deployment_is_started_from_its_uploads() {
             vec!["assets/app.js", "index.html"],
         ),
         (
-            "a reservation naming its files, never uploaded",
-            json!({ "fileMap": { "index.html": "d41d8cd98f00b204e9800998ecf8427e" }}),
-            false,
+            // A reservation whose uploads do not make up a servable site: the files
+            // ARRIVED, so the deployment starts, and its job ends FAILED because the
+            // branch has no root document to serve. (A reservation nothing was uploaded
+            // to is refused instead of started — see `deployment_upload_plane.rs`.)
+            "a reservation naming one file that is not the root document",
+            json!({ "fileMap": { "assets/app.js": "d41d8cd98f00b204e9800998ecf8427e" }}),
+            true,
             FAILED,
             vec![],
         ),

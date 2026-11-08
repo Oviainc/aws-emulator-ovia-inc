@@ -394,6 +394,11 @@ impl Source {
 /// `sourceUrl` starts a deployment of what the URL points at. A request that names
 /// neither names nothing to deploy, and is refused with the modelled 400 ("A request
 /// contains unexpected data") rather than starting a job with no content.
+///
+/// A reservation is startable only once its content has ARRIVED at the destinations it
+/// handed out: a `jobId` whose reservation holds no upload is refused with the same
+/// modelled 400, carrying [`DEPLOYMENT_FILE_NOT_UPLOADED`], so the upload step cannot
+/// be skipped silently.
 fn source_of(
     input: &StartDeploymentInput,
     branch: &crate::state::AmplifyBranch,
@@ -412,12 +417,21 @@ fn source_of(
         .filter(|source_url| !source_url.is_empty());
 
     if let Some(job_id) = job_id {
-        return branch
+        let pending = branch
             .deployments
             .get(job_id)
             .cloned()
-            .map(Source::Reserved)
-            .ok_or_else(|| absent(crate::state::JOB_ENTITY, job_id));
+            .ok_or_else(|| absent(crate::state::JOB_ENTITY, job_id))?;
+        // A reserved deployment deploys the content uploaded to the destinations its
+        // reservation handed out, so the upload is what makes it startable: a
+        // reservation nothing has been uploaded to has no deployment file at all, and
+        // the start is refused with the modelled 400 ("A request contains unexpected
+        // data") BEFORE a job is started, telling the caller to upload first rather
+        // than leaving it waiting on a job that can never serve anything.
+        if !pending.holds_an_upload() {
+            return Err(bad_request(DEPLOYMENT_FILE_NOT_UPLOADED));
+        }
+        return Ok(Source::Reserved(pending));
     }
 
     let Some(source_url) = source_url else {
@@ -908,8 +922,11 @@ async fn archive_deployment(
 /// A reservation handed its caller one destination per file it named, or one for the
 /// zipped deployment, and the plane serving those destinations
 /// (`crate::state::deployment_upload_path`) wrote what arrived onto the reservation. So
-/// what this deploys is what is actually AT those destinations now: a reservation whose
-/// uploads never happened deploys nothing, and its job says so.
+/// what this deploys is what is actually AT those destinations now: a reservation only
+/// SOME of whose destinations were uploaded to deploys only those files, and whether
+/// they make up a servable site decides how its job ends. A reservation nothing at all
+/// was uploaded to never reaches here — that start is refused (see
+/// [`DEPLOYMENT_FILE_NOT_UPLOADED`]).
 ///
 /// How many files the reservation named is the CALLER'S choice, so the set of files is
 /// bounded exactly as the walk over a prefix's objects is: a reservation naming more
@@ -944,6 +961,9 @@ fn reserved_deployment(pending: &crate::state::PendingDeployment, label: &str) -
         .as_ref()
         .and_then(|zip| zip.content.as_deref())
     else {
+        // Not reached for a reservation this operation starts: one with no upload at
+        // all is refused before a job exists. What is left here is the only answer a
+        // reservation with nothing behind it could deploy.
         return Deployment::failed(format!(
             "The deployment source {label} has no upload to deploy."
         ));
@@ -1170,6 +1190,16 @@ pub const BUCKET_POLICY_WITHOUT_AMPLIFY_ACCESS: &str =
 /// request shape whose two optional members the caller has to pick between and carries
 /// nothing from the request or the store.
 pub const NO_SOURCE_MESSAGE: &str = "Must specify jobId or sourceUrl for StartDeploymentRequest.";
+
+/// Why starting a RESERVED deployment nothing has been uploaded to is refused.
+///
+/// The ONE sentence recorded behaviour words this modelled 400 with: entirely fixed
+/// text, carrying no value from the request or from the store, and telling the caller
+/// what has to happen before this call — the upload to the destination the reservation
+/// handed back.
+pub const DEPLOYMENT_FILE_NOT_UPLOADED: &str =
+    "Deployment file has not been uploaded, please make sure you uploaded the deployment \
+     file prior to invoke this api.";
 
 /// What a `BUCKET_PREFIX` deployment is refused with when the bucket holds no
 /// [`ROOT_DOCUMENT`] under the prefix the request named.

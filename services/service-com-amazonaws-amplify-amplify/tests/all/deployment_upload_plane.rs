@@ -17,8 +17,9 @@
 //! 2. What a reserved deployment deploys is what was UPLOADED to those destinations:
 //!    the job settles to `SUCCEED` and publishes the files the upload carries when
 //!    they make up a servable site, and to `FAILED` with the reason when they do not —
-//!    an upload that never happened, an archive these bytes are not, an upload carrying
-//!    no root document.
+//!    an archive these bytes are not, an upload carrying no root document. A
+//!    reservation nothing was uploaded to cannot be STARTED at all: that call is
+//!    refused with the modelled 400 and its job stays the created one.
 //! 3. A destination is written by ONE `PUT`: another method against it is refused, the
 //!    last write is what the deployment deploys, and a URL this emulator never handed
 //!    out resolves to nothing.
@@ -36,7 +37,7 @@ use std::time::Duration;
 use serde_json::{json, Value};
 
 use service_com_amazonaws_amplify_amplify::ops::start_deployment::{
-    MAX_ARCHIVE_BYTES, ROOT_DOCUMENT,
+    DEPLOYMENT_FILE_NOT_UPLOADED, MAX_ARCHIVE_BYTES, ROOT_DOCUMENT,
 };
 use service_com_amazonaws_amplify_amplify::state::{
     ComAmazonawsAmplifyAmplifyState, JOB_SETTLE_MILLIS, MAX_STORED_DEPLOYMENT_BYTES,
@@ -53,6 +54,10 @@ const SUCCEED: &str = "SUCCEED";
 
 /// The terminal status of a deployment whose files could not be published.
 const FAILED: &str = "FAILED";
+
+/// The status of the job of a deployment nothing has started, which is where a refused
+/// start leaves it.
+const CREATED: &str = "CREATED";
 
 /// A declared `MD5Hash` for a file a reservation names: the member is modelled
 /// `length 0..32` with no further constraint
@@ -282,7 +287,8 @@ struct UploadCase {
     zip: Option<Vec<u8>>,
     /// The file names whose own destinations the row uploads to.
     uploaded_files: &'static [&'static str],
-    /// The terminal status the deployment settles to.
+    /// The status the deployment's job is in once the clock has had its span: the
+    /// terminal one it settles to, or the created one a refused start leaves it in.
     status: &'static str,
     /// The asset paths it publishes.
     assets: &'static [&'static str],
@@ -335,9 +341,9 @@ fn upload_cases() -> Vec<UploadCase> {
             request: json!({}),
             zip: None,
             uploaded_files: &[],
-            status: FAILED,
+            status: CREATED,
             assets: &[],
-            reason_names: Some("no upload"),
+            reason_names: None,
         },
         UploadCase {
             case: "one named file, uploaded",
@@ -391,9 +397,9 @@ fn upload_cases() -> Vec<UploadCase> {
             request: json!({ "fileMap": { "index.html": DECLARED_HASH } }),
             zip: None,
             uploaded_files: &[],
-            status: FAILED,
+            status: CREATED,
             assets: &[],
-            reason_names: Some("no file"),
+            reason_names: None,
         },
     ]
 }
@@ -471,11 +477,39 @@ async fn an_upload_destination_accepts_the_upload_and_the_deployment_deploys_it(
         let started = deployments
             .start_deployment(&app_id, "main", &json!({ "jobId": job_id }))
             .await;
-        assert_eq!(
-            started.status, 200,
-            "case {:?}: expected HTTP 200 from StartDeployment, got {started:?}",
-            row.case
-        );
+        // A row that uploaded NOTHING has no deployment file behind its reservation, so
+        // the start is refused with the modelled 400 and AWS's fixed sentence (pinned
+        // literally in `manual_deployment_preconditions.rs`) rather than starting a job
+        // with no content; every other row starts.
+        let refused = row.zip.is_none() && row.uploaded_files.is_empty();
+        if refused {
+            assert_eq!(
+                started.status, 400,
+                "case {:?}: a reservation nothing was uploaded to cannot be started, \
+                 got {started:?}",
+                row.case
+            );
+            assert_eq!(
+                started.error_code.as_deref(),
+                Some("BadRequestException"),
+                "case {:?}: expected the modelled BadRequestException, got {:?}",
+                row.case,
+                started.error_code
+            );
+            assert_eq!(
+                started.message().as_deref(),
+                Some(DEPLOYMENT_FILE_NOT_UPLOADED),
+                "case {:?}: expected {DEPLOYMENT_FILE_NOT_UPLOADED:?}, got {:?}",
+                row.case,
+                started.message()
+            );
+        } else {
+            assert_eq!(
+                started.status, 200,
+                "case {:?}: expected HTTP 200 from StartDeployment, got {started:?}",
+                row.case
+            );
+        }
 
         sleep(past_the_settle_span());
         let read_back = deployments.get_job(&app_id, "main", &job_id).await;
@@ -489,7 +523,7 @@ async fn an_upload_destination_accepts_the_upload_and_the_deployment_deploys_it(
         assert_eq!(
             string_member(&settled, "status"),
             row.status,
-            "case {:?}: expected the job to settle to {}, got {settled:?}",
+            "case {:?}: expected the job to be {} after the span, got {settled:?}",
             row.case,
             row.status
         );
@@ -511,6 +545,26 @@ async fn an_upload_destination_accepts_the_upload_and_the_deployment_deploys_it(
                 "case {:?}: the failed job's reason must name {fragment:?}, got {reason:?}",
                 row.case
             );
+        }
+
+        // A refused start leaves the reservation's job unfinished, and a branch
+        // SERIALIZES its deployments, so it is stopped before the next row reserves one.
+        // Every other row's job reached a terminal status in the span above.
+        if refused {
+            let stopped = deployments
+                .emulator
+                .call(
+                    "DELETE",
+                    &format!("/apps/{app_id}/branches/main/jobs/{job_id}/stop"),
+                    None,
+                )
+                .await;
+            assert_eq!(
+                stopped.status, 200,
+                "case {:?}: expected HTTP 200 from StopJob, got {stopped:?}",
+                row.case
+            );
+            sleep(past_the_settle_span());
         }
     }
 }

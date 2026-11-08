@@ -592,8 +592,20 @@ async fn a_branch_serializes_its_deployments() {
     );
 
     // STARTING the outstanding deployment does not free the branch either: its job is
-    // now running, which is the other half of "was not finished".
+    // now running, which is the other half of "was not finished". The reservation's
+    // content is uploaded first, because a deployment nothing was uploaded to cannot be
+    // started at all (see `deployment_upload_plane.rs`).
     let second = string_member(&again.body, "jobId");
+    let upload = http::Request::builder()
+        .method("PUT")
+        .uri(zip_upload_url(&again))
+        .body(bytes::Bytes::from_static(b"the bytes of the deployment"))
+        .expect("an upload destination is a well-formed URL");
+    assert_eq!(
+        emulator.dispatch(upload).await.status().as_u16(),
+        200,
+        "case \"while the deployment runs\": the destination must accept the upload"
+    );
     let started = emulator
         .call(
             "POST",

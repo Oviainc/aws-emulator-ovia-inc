@@ -47,6 +47,13 @@
 //! incomplete while that provisioning runs and Amplify sends only the members it
 //! already has a value for. That projection therefore DROPS a member with no value
 //! instead of completing it.
+//!
+//! [`ValuedMembers`] is that dropping half on its own, for an ANSWER that leaves a
+//! member out: an operation whose output carries one member or another depending on
+//! the form of the request writes its result through it (see
+//! [`CreateDeploymentResponse`](super::CreateDeploymentResponse)), naming the members
+//! this answer does not carry and whether each is dropped only when it has no value
+//! ([`Unsent`]).
 
 use super::*;
 
@@ -264,6 +271,9 @@ impl SerializableStruct for DomainAssociationProjection {
         ValuedMembers {
             record: &self.record,
             unsent: self.unsent,
+            // A domain association reports a member wherever it HAS a value for it:
+            // which members it has values for changes as its provisioning runs.
+            when: Unsent::WithoutValue,
         }
         .serialize_members(serializer)
     }
@@ -299,12 +309,33 @@ const UNSENT_WHEN_WRITTEN: &[&str] = &["statusReason"];
 /// prefix is the apex, the associated domain itself.
 const UNSENT_WHEN_REPORTED: &[&str] = &["statusReason", "prefix"];
 
-/// `record`, written with every member of `unsent` it has no value for left out — at
-/// any depth, since the members concerned sit both on the record and inside the
-/// structures its `subDomains` list carries.
-struct ValuedMembers<'r> {
-    record: &'r dyn SerializableStruct,
-    unsent: &'static [&'static str],
+/// WHEN a member named in an answer's `unsent` list is left out of the body.
+///
+/// Both halves are the same rule — Amplify does not send a member this answer has
+/// nothing to report for — and they differ only in what "nothing to report" is: a
+/// record whose member holds no value, or an answer the member is not part of at all.
+#[derive(Debug, Clone, Copy)]
+pub enum Unsent {
+    /// Left out only where the member HAS no value: the empty string a `@required`
+    /// member whose `length` minimum is 0 holds for "nothing". The same member is sent
+    /// wherever it does have one, which is why the decision reads the value and not
+    /// only the member name.
+    WithoutValue,
+    /// Left out whatever it holds, because the answer being written does not carry the
+    /// member: the request's form decided that, not the value.
+    Always,
+}
+
+/// `record`, written with every member of `unsent` this answer does not carry left
+/// out — at any depth, since the members concerned sit both on the record and inside
+/// the structures its lists carry.
+pub struct ValuedMembers<'r> {
+    /// The record to write.
+    pub record: &'r dyn SerializableStruct,
+    /// The members this answer may leave out, by their modelled names.
+    pub unsent: &'static [&'static str],
+    /// When each of them is left out.
+    pub when: Unsent,
 }
 
 impl SerializableStruct for ValuedMembers<'_> {
@@ -315,34 +346,40 @@ impl SerializableStruct for ValuedMembers<'_> {
         self.record.serialize_members(&mut Valued {
             inner: serializer,
             unsent: self.unsent,
+            when: self.when,
         })
     }
 }
 
-/// A [`ShapeSerializer`] that DROPS the write of a member with no value and passes
-/// every other write through, re-wrapping the structures, lists and maps below it so
-/// one rule holds for the whole record.
+/// A [`ShapeSerializer`] that DROPS the write of a member this answer does not carry
+/// and passes every other write through, re-wrapping the structures, lists and maps
+/// below it so one rule holds for the whole record.
 struct Valued<'s> {
     inner: &'s mut dyn ShapeSerializer,
     unsent: &'static [&'static str],
+    when: Unsent,
 }
 
 impl Valued<'_> {
-    /// Is this write one the service has no value for, and so one Amplify does not
-    /// send? Decided from the VALUE as well as the member, because the same member —
-    /// a subdomain's `prefix` — is sent for one element of a list and not for
-    /// another.
-    fn unsent(&self, schema: &Schema, value: &str) -> bool {
-        value.is_empty()
-            && schema
-                .member_name()
-                .is_some_and(|name| self.unsent.contains(&name))
+    /// Is this write one Amplify does not send? `value` is the string being written,
+    /// for the one case decided from the VALUE as well as the member — because the
+    /// same member, a subdomain's `prefix`, is sent for one element of a list and not
+    /// for another — and `None` for a write of any other type.
+    fn unsent(&self, schema: &Schema, value: Option<&str>) -> bool {
+        let named = schema
+            .member_name()
+            .is_some_and(|name| self.unsent.contains(&name));
+        named
+            && match self.when {
+                Unsent::Always => true,
+                Unsent::WithoutValue => value.is_some_and(str::is_empty),
+            }
     }
 }
 
-/// Emit the [`ShapeSerializer`] methods that write a member this projection never
-/// drops: a member of one of these types either has a value or is not one of the
-/// members with no value, so the write goes straight to the inner serializer.
+/// Emit the [`ShapeSerializer`] methods that write a member of a type this projection
+/// drops only for an answer that does not carry it at all: the write is dropped when
+/// the member is one of those, and goes straight to the inner serializer otherwise.
 macro_rules! pass_through {
     ($( fn $method:ident($($arg:ident: $ty:ty),*); )*) => {
         $(
@@ -351,6 +388,9 @@ macro_rules! pass_through {
                 schema: &Schema,
                 $($arg: $ty),*
             ) -> ::std::result::Result<(), SerdeError> {
+                if self.unsent(schema, None) {
+                    return Ok(());
+                }
                 self.inner.$method(schema, $($arg),*)
             }
         )*
@@ -374,13 +414,13 @@ impl ShapeSerializer for Valued<'_> {
         fn write_null();
     }
 
-    /// The one write that can be dropped: the members with no value are strings.
+    /// The write of a string, which is the one a member with NO VALUE is dropped by.
     fn write_string(
         &mut self,
         schema: &Schema,
         value: &str,
     ) -> ::std::result::Result<(), SerdeError> {
-        if self.unsent(schema, value) {
+        if self.unsent(schema, Some(value)) {
             return Ok(());
         }
         self.inner.write_string(schema, value)
@@ -392,12 +432,17 @@ impl ShapeSerializer for Valued<'_> {
         schema: &Schema,
         value: &dyn SerializableStruct,
     ) -> ::std::result::Result<(), SerdeError> {
+        if self.unsent(schema, None) {
+            return Ok(());
+        }
         let unsent = self.unsent;
+        let when = self.when;
         self.inner.write_struct(
             schema,
             &ValuedMembers {
                 record: value,
                 unsent,
+                when,
             },
         )
     }
@@ -409,11 +454,16 @@ impl ShapeSerializer for Valued<'_> {
         schema: &Schema,
         write_elements: &dyn Fn(&mut dyn ShapeSerializer) -> ::std::result::Result<(), SerdeError>,
     ) -> ::std::result::Result<(), SerdeError> {
+        if self.unsent(schema, None) {
+            return Ok(());
+        }
         let unsent = self.unsent;
+        let when = self.when;
         self.inner.write_list(schema, &|elements| {
             write_elements(&mut Valued {
                 inner: elements,
                 unsent,
+                when,
             })
         })
     }
@@ -424,11 +474,16 @@ impl ShapeSerializer for Valued<'_> {
         schema: &Schema,
         write_entries: &dyn Fn(&mut dyn ShapeSerializer) -> ::std::result::Result<(), SerdeError>,
     ) -> ::std::result::Result<(), SerdeError> {
+        if self.unsent(schema, None) {
+            return Ok(());
+        }
         let unsent = self.unsent;
+        let when = self.when;
         self.inner.write_map(schema, &|entries| {
             write_entries(&mut Valued {
                 inner: entries,
                 unsent,
+                when,
             })
         })
     }

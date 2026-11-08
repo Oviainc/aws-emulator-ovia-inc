@@ -27,3 +27,72 @@ pub struct CreateDeploymentOutput {
     pub zip_upload_url: String,
 }
 
+/// A `CreateDeployment` answer as this operation puts it on the wire: the record, and
+/// which of its two upload members THIS answer does not carry.
+///
+/// `fileUploadUrls` is returned "when the fileMap argument is provided in the request"
+/// and `zipUploadUrl` "when the fileMap argument is not provided in the request"
+/// (`smithy_query(query="operation",operation="CreateDeployment")` — both are
+/// `@required`, the map with no minimum size and the URL with a `length` minimum of 0).
+/// The two request forms are mutually exclusive, so exactly ONE of the members is part
+/// of any one answer, and the other is left OUT of the body rather than sent as its
+/// type's zero value: a client decides which deployment mode it is in by which member
+/// is present, and a present-but-empty `fileUploadUrls` makes the per-file mode look
+/// selected with no file to upload.
+///
+/// The record itself is the generated [`CreateDeploymentOutput`], written by its own
+/// generated serializer; this wrapper only drops the member the request's form did not
+/// select (see [`ValuedMembers`]).
+#[derive(Debug, Clone)]
+pub struct CreateDeploymentResponse {
+    /// The result, as the operation computed it.
+    record: CreateDeploymentOutput,
+    /// The members this answer does not carry.
+    unsent: &'static [&'static str],
+}
+
+impl CreateDeploymentResponse {
+    /// The answer to a request that NAMED its files: one upload destination per file
+    /// name, and no single destination for a zipped deployment.
+    pub fn per_file(record: CreateDeploymentOutput) -> Self {
+        Self {
+            record,
+            unsent: UNSENT_FOR_A_NAMED_FILE_DEPLOYMENT,
+        }
+    }
+
+    /// The answer to a request that named NO file: the single destination for the
+    /// zipped deployment, and no per-file destinations.
+    pub fn zipped(record: CreateDeploymentOutput) -> Self {
+        Self {
+            record,
+            unsent: UNSENT_FOR_A_ZIPPED_DEPLOYMENT,
+        }
+    }
+}
+
+impl ::aws_smithy_schema::serde::SerializableStruct for CreateDeploymentResponse {
+    fn serialize_members(
+        &self,
+        serializer: &mut dyn ::aws_smithy_schema::serde::ShapeSerializer,
+    ) -> ::std::result::Result<(), ::aws_smithy_schema::serde::SerdeError> {
+        ValuedMembers {
+            record: &self.record,
+            unsent: self.unsent,
+            // Which member is left out is decided by the form of the REQUEST, not by
+            // the value: the member this answer does not carry is absent whatever the
+            // record holds for it.
+            when: Unsent::Always,
+        }
+        .serialize_members(serializer)
+    }
+}
+
+/// The member a reservation of a ZIPPED deployment does not report: there is no
+/// destination per file, because the request named none.
+const UNSENT_FOR_A_ZIPPED_DEPLOYMENT: &[&str] = &["fileUploadUrls"];
+
+/// The member a reservation of NAMED FILES does not report: there is no single
+/// destination for a zipped deployment, because the request named its files.
+const UNSENT_FOR_A_NAMED_FILE_DEPLOYMENT: &[&str] = &["zipUploadUrl"];
+

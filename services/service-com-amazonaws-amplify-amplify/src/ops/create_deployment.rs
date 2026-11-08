@@ -151,7 +151,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for CreateDeployment<Eng>
 {
     type Input = CreateDeploymentInput;
-    type Output = CreateDeploymentOutput;
+    type Output = CreateDeploymentResponse;
     type Error = CreateDeploymentError;
 
     const NAME: &'static str = "CreateDeployment";
@@ -285,7 +285,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ),
         );
 
-        Ok(CreateDeploymentOutput {
+        let answer = CreateDeploymentOutput {
             // The id of the job this deployment runs under once it is started, which
             // is what `StartDeployment` is called with.
             job_id: Some(pending.job_id.clone()),
@@ -298,6 +298,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map(|(file_name, file)| (file_name.clone(), file.upload.url.clone()))
                 .collect(),
             zip_upload_url: pending.zip_upload_url(),
+        };
+        // Which of the two upload members the answer CARRIES follows the form of the
+        // request: a request that named files is answered with the destination of each,
+        // and one that named none with the single destination of the zipped deployment.
+        // The other member is left out of the body rather than sent empty — see
+        // `CreateDeploymentResponse`.
+        Ok(if pending.files.is_empty() {
+            CreateDeploymentResponse::zipped(answer)
+        } else {
+            CreateDeploymentResponse::per_file(answer)
         })
     }
 }
