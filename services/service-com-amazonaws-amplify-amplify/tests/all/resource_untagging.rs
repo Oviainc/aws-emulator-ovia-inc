@@ -15,6 +15,9 @@
 //! naming no resource of a kind this service persists tags for is refused 404 and
 //! removes nothing.
 //!
+//! The STATUS a served removal answers with — `204 No Content`, because the response
+//! carries no document — is its own suite: `tests/all/empty_response_status.rs`.
+//!
 //! The tables span the class the rule generalises over — the two resource kinds the
 //! model gives a tag map (an app and a branch, the branch also under a name carrying
 //! the slash a Git branch name commonly has), how many keys one call names, whether
@@ -36,7 +39,11 @@ use crate::resource_tags::{
 /// (`smithy_query(query="operation",operation="UntagResource")` reports
 /// `DELETE /tags/{resourceArn}`), so every key travels as its own query pair, and the
 /// ARN travels as ONE path segment with its `:` and `/` percent-encoded.
-async fn untag_resource(emulator: &Emulator, resource_arn: &str, tag_keys: &[String]) -> Reply {
+pub(crate) async fn untag_resource(
+    emulator: &Emulator,
+    resource_arn: &str,
+    tag_keys: &[String],
+) -> Reply {
     let query = tag_keys
         .iter()
         .map(|key| format!("tagKeys={}", encode_label(key)))
@@ -244,8 +251,8 @@ async fn a_tag_removal_deletes_exactly_the_keys_it_names() {
             for removal in &case.removals {
                 let removed = untag_resource(&emulator, &seeded.arn, removal).await;
                 assert_eq!(
-                    removed.status, 200,
-                    "case {:?} ({kind:?}): UntagResource {removal:?} expected 200, got {removed:?}",
+                    removed.status, 204,
+                    "case {:?} ({kind:?}): UntagResource {removal:?} expected 204, got {removed:?}",
                     case.case
                 );
                 // `UntagResourceResponse` declares no members
@@ -293,8 +300,8 @@ async fn a_removed_key_can_be_tagged_again_with_a_new_value() {
 
         let removed = untag_resource(&emulator, &seeded.arn, &keys(&["env"])).await;
         assert_eq!(
-            removed.status, 200,
-            "case {kind:?}: UntagResource expected 200, got {removed:?}"
+            removed.status, 204,
+            "case {kind:?}: UntagResource expected 204, got {removed:?}"
         );
         assert_eq!(
             list_tags(&emulator, &seeded.arn).await.member("tags"),
@@ -345,8 +352,8 @@ async fn a_removal_reaches_only_the_resource_its_arn_names() {
 
     let removed = untag_resource(&emulator, &branch.arn, &keys(&["env"])).await;
     assert_eq!(
-        removed.status, 200,
-        "UntagResource on the branch expected 200, got {removed:?}"
+        removed.status, 204,
+        "UntagResource on the branch expected 204, got {removed:?}"
     );
 
     for (label, target, expected) in [
@@ -462,14 +469,14 @@ async fn a_tag_keys_list_outside_the_modelled_bound_is_not_served() {
         let mut past_the_bound = numbered_keys(50);
         past_the_bound.push("one.too.many".to_string());
         let refused = untag_resource(&emulator, &seeded.arn, &past_the_bound).await;
-        assert_ne!(
-            refused.status, 200,
+        assert!(
+            refused.status >= 400,
             "case {kind:?}: 51 tagKeys is past the modelled maximum, got {refused:?}"
         );
 
         let no_keys = untag_resource(&emulator, &seeded.arn, &[]).await;
-        assert_ne!(
-            no_keys.status, 200,
+        assert!(
+            no_keys.status >= 400,
             "case {kind:?}: a request binding no tagKeys is past the modelled minimum, got \
              {no_keys:?}"
         );
@@ -484,12 +491,12 @@ async fn a_tag_keys_list_outside_the_modelled_bound_is_not_served() {
         // The bound itself is served: exactly 50 keys, and exactly one.
         let at_the_minimum = untag_resource(&emulator, &seeded.arn, &keys(&["key.0"])).await;
         assert_eq!(
-            at_the_minimum.status, 200,
+            at_the_minimum.status, 204,
             "case {kind:?}: one tagKey is the modelled minimum, got {at_the_minimum:?}"
         );
         let at_the_maximum = untag_resource(&emulator, &seeded.arn, &numbered_keys(50)).await;
         assert_eq!(
-            at_the_maximum.status, 200,
+            at_the_maximum.status, 204,
             "case {kind:?}: 50 tagKeys is the modelled maximum, got {at_the_maximum:?}"
         );
         assert_eq!(

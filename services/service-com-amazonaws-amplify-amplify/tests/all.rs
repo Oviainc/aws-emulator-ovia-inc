@@ -41,6 +41,8 @@ mod deployment_upload_plane;
 mod domain_association_certificate_lifecycle;
 #[path = "all/domain_associations.rs"]
 mod domain_associations;
+#[path = "all/empty_response_status.rs"]
+mod empty_response_status;
 #[path = "all/hosted_branch_rewrites.rs"]
 mod hosted_branch_rewrites;
 #[path = "all/hosted_branch_site.rs"]

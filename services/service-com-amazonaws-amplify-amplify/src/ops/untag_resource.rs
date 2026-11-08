@@ -123,7 +123,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "UntagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::UNTAG_RESOURCE_OUTPUT_SCHEMA;
-    const SUCCESS_STATUS: u16 = 200u16;
+    // `UntagResourceResponse` declares no members and the operation is bound to
+    // `DELETE`, so a success has no document to carry: it is answered No Content, not
+    // the protocol default that promises a body (see
+    // [`crate::state::NO_CONTENT_SUCCESS_STATUS`]). How such an answer is FRAMED — no
+    // body bytes, and the length stated for them — is `crate::service`'s, at the one
+    // place every response of this service passes through.
+    const SUCCESS_STATUS: u16 = crate::state::NO_CONTENT_SUCCESS_STATUS;
 
     async fn handle(
         &self,

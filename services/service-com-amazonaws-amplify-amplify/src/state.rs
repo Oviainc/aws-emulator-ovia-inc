@@ -1562,6 +1562,29 @@ pub fn tag_limit_message(resource_arn: &str, merged: usize) -> String {
     ))
 }
 
+/// The status a successful Amplify response answers with when it reports NO document
+/// and the request that asked for it REMOVED something: `204 No Content`.
+///
+/// A response body is only ever omitted where the operation's modelled output declares
+/// no members, and of this service's operations exactly two do: `TagResource`, bound
+/// `POST /tags/{resourceArn}`, and `UntagResource`, bound `DELETE /tags/{resourceArn}`
+/// (`smithy_query(query="operation",operation="TagResource,UntagResource")`). The
+/// DELETE of the pair is the one that answers No Content: there is nothing to report
+/// and nothing left where the request pointed. The model pins no success code for
+/// either, which leaves the restJson1 default of 200 — and a 200 promises a document
+/// the response does not carry, so a client that parses a body only when there is one,
+/// or that asserts the status it was told, takes the wrong branch on it.
+///
+/// Every other `DELETE` this service binds (`DeleteApp`, `DeleteBranch`,
+/// `DeleteBackendEnvironment`, `DeleteDomainAssociation`, `DeleteJob`, `DeleteWebhook`,
+/// `StopJob`) reports the record it acted on, so each of those keeps the 200 it answers
+/// a document with, as does the `POST` half of the tagging pair.
+///
+/// The status itself is the cross-service one, and the FRAMING of an answer carrying it
+/// is `service_common`'s too (see `crate::service`): what belongs to this service is only
+/// which of its operations answers it.
+pub const NO_CONTENT_SUCCESS_STATUS: u16 = ::service_common::no_content_responses::NO_CONTENT_STATUS;
+
 /// The `code` an Amplify `ResourceNotFoundException` carries.
 ///
 /// `ResourceNotFoundException$code` is `@required` and modelled as plain text

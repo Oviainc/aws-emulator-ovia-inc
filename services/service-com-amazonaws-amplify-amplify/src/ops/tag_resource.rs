@@ -122,6 +122,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const NAME: &'static str = "TagResource";
     const INPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_INPUT_SCHEMA;
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::TAG_RESOURCE_OUTPUT_SCHEMA;
+    // `TagResourceResponse` declares no members either, but this half of the tagging
+    // pair is bound to `POST` and leaves the resource carrying what it wrote, so it
+    // keeps the 200 the protocol gives it; its sibling `UntagResource` is the DELETE
+    // that answers No Content (see [`crate::state::NO_CONTENT_SUCCESS_STATUS`]).
     const SUCCESS_STATUS: u16 = 200u16;
 
     async fn handle(

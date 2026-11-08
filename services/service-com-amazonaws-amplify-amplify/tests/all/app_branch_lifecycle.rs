@@ -119,7 +119,15 @@ impl Emulator {
         self.router.dispatch(request).await
     }
 
-    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
+    /// The WHOLE response to a request on this service's front door, for a suite that
+    /// asserts the framing (the status line, the body bytes, the headers) rather than
+    /// the parsed body. [`Self::call`] is this reduced to what a client branches on.
+    pub(crate) async fn call_http(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<&Value>,
+    ) -> http::Response<bytes::Bytes> {
         let payload = body.map_or_else(Vec::new, |value| {
             serde_json::to_vec(value).expect("a request body serializes")
         });
@@ -131,7 +139,11 @@ impl Emulator {
             .body(bytes::Bytes::from(payload))
             .expect("a well-formed request");
 
-        let response = self.router.dispatch(request).await;
+        self.router.dispatch(request).await
+    }
+
+    pub(crate) async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Reply {
+        let response = self.call_http(method, path, body).await;
         let status = response.status().as_u16();
         let error_code = response
             .headers()
