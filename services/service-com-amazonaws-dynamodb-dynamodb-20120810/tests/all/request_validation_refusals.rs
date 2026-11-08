@@ -933,7 +933,11 @@ async fn an_arn_addresses_this_endpoints_own_region() {
 async fn a_configuration_change_changes_something() {
     let router = emulator();
     table(&router, "Precision").await;
-    let stream = "arn:aws:kinesis:us-east-1:000000000000:stream/precision";
+    // The destination's stream has to EXIST for the registration to replicate: one whose
+    // `StreamArn` resolves to no stream settles `ENABLE_FAILED`, which no configuration
+    // change can then address.
+    let stream = crate::emulator::ensure_kinesis_stream(&router, "precision").await;
+    let stream = stream.as_str();
 
     // Each row: the precision in force before the command and the precision it asks
     // for. The two values are the ones the model declares for

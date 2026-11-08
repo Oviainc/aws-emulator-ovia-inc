@@ -38,6 +38,11 @@ hex = { workspace = true }
 # enabling a stream on CreateTable/UpdateTable registers it through that crate's
 # `state::register_stream` seam, which is what its own consumers then read.
 service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810 = { workspace = true }
+# The Kinesis service owns the data streams a table's streaming destination replicates
+# to: enabling one resolves its `StreamArn` against that crate's own stream registry
+# (`state::kinesis_stream_exists`), so a destination pointed at a stream that does not
+# exist settles ENABLE_FAILED instead of ACTIVE.
+service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
 # `ExportTableToPointInTime` writes the exported items into the destination bucket through
 # Amazon S3's OWN store on the same engine, so a caller lists and reads those objects
 # where S3 holds them (`state::export_objects`).

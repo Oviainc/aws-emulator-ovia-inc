@@ -9,6 +9,10 @@
 //! expired are deleted by the store's own sweep
 //! (`crate::state::Table::apply_due_expirations`).
 //!
+//! Changing the setting is RATE-LIMITED: a table's TTL setting takes one accepted change
+//! per `crate::state::TTL_MODIFICATION_INTERVAL`, and a further one inside that interval
+//! is refused whatever status the first one has already settled into.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -214,18 +218,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into())
             }
         }
-        // "It can take up to one hour for the change to fully process. Any additional
-        // UpdateTimeToLive calls for the same table during this one hour duration result
-        // in a ValidationException" (the doc above): while the change this table was
-        // last given is still processing, this one is refused and nothing is stored.
-        if !table.time_to_live.settled(now) {
-            return Err(crate::scaffolded::Scaffolded::validation(
-                crate::state::TIME_TO_LIVE_MODIFIED_TOO_OFTEN_MESSAGE,
-            ));
-        }
         // A table whose TTL is on expires its items by ONE attribute, and this API does
         // not move it: a specification naming another attribute is refused, and told
-        // which attribute is in force.
+        // which attribute is in force. Both this refusal and the repeated-state one below
+        // are permanent for the request as it stands, whatever the clock does, so they are
+        // answered ahead of the timing refusal that only tells a caller to come back
+        // later.
         if let Some(attribute) = table.time_to_live.attribute_in_force(now) {
             if attribute != specification.attribute_name {
                 return Err(crate::scaffolded::Scaffolded::validation(
@@ -244,6 +242,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !specification.enabled && in_force == crate::state::TIME_TO_LIVE_DISABLED {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::TIME_TO_LIVE_ALREADY_DISABLED_MESSAGE,
+            ));
+        }
+        // "It can take up to one hour for the change to fully process. Any additional
+        // UpdateTimeToLive calls for the same table during this one hour duration result
+        // in a ValidationException" (the doc above): a change this table was given inside
+        // that interval refuses this one, and nothing is stored. The interval is counted
+        // from the last accepted change rather than from the status it left behind — the
+        // status settles far sooner ([`crate::state::TTL_MODIFICATION_INTERVAL`]).
+        if !table.time_to_live.modifiable(now) {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::TIME_TO_LIVE_MODIFIED_TOO_OFTEN_MESSAGE,
             ));
         }
         table

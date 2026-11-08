@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The refusal a command against a table's Kinesis streaming destination earns when it
-//! asks for the configuration that destination already replicates under.
+//! The Kinesis seam: what a table's streaming destination resolves to in the KINESIS
+//! service's own state, and the refusal a command against that destination earns when it
+//! asks for the configuration the destination already replicates under.
 //!
-//! Beside the other destination refusals in [`super::table_settings`]: this one is
-//! about the COMMAND rather than about the record's lifecycle status, so it is stated
-//! here and re-exported through [`super`] like the rest.
+//! Beside the other destination refusals in [`super::table_settings`]: these are about the
+//! COMMAND, and about the stream it names, rather than about the record's lifecycle
+//! status, so they are stated here and re-exported through [`super`] like the rest.
 
 use super::*;
 
@@ -26,4 +27,37 @@ pub fn kinesis_precision_unchanged(
         "Invalid Request: Precision is already set to the desired value of {precision} for \
          tableId: {table_id}, kdsArn: {stream_arn}"
     ))
+}
+
+/// Whether the Kinesis data stream `stream_arn` names EXISTS in `region`.
+///
+/// A destination is a Kinesis data stream, and the streams are the KINESIS service's own
+/// resources, so whether one exists is answered from that service's store on the shared
+/// engine — the same place its `DescribeStream` answers from — rather than from a second
+/// copy of the registry kept here. A replication that cannot be completed because there is
+/// no such stream is what `DestinationStatus` has `ENABLE_FAILED` for
+/// ([`super::KinesisDestination::enable_failing`]).
+///
+/// `false` when the stream is not there, and when the Kinesis store cannot be reached at
+/// all (the engine is not the shared in-memory one): either way nothing resolves the ARN,
+/// so nothing can replicate to it.
+///
+/// LOCKING: this takes the KINESIS store's lock, and the caller must NOT hold this
+/// service's own while it does — the one lock order this seam uses, as
+/// [`super::register_table_stream`] describes for the streams registry. The work under
+/// that lock is one walk over the region's streams, bounded by the registry's own quota.
+pub fn kinesis_stream_exists<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    region: &str,
+    stream_arn: &str,
+    at: SystemTime,
+) -> bool {
+    use ::service_com_amazonaws_kinesis_kinesis_20131202 as kinesis;
+
+    kinesis::state::service_state(engine).is_some_and(|store| {
+        store
+            .lock()
+            .stream_by_arn(at, region, stream_arn)
+            .is_some()
+    })
 }

@@ -6,6 +6,12 @@
 //! the configuration the request carries, and reports the replication as `ENABLING`
 //! until the clock settles it — this is the ONLY file to touch for this operation.
 //!
+//! What it settles INTO is decided by the stream itself: the `StreamArn` is resolved
+//! against the Kinesis service's own stream registry
+//! (`crate::state::kinesis_stream_exists`), and a destination whose stream does not exist
+//! settles `ENABLE_FAILED` — nothing replicates to a stream that is not there, so it never
+//! reaches `ACTIVE`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -171,6 +177,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A destination IS a Kinesis data stream, so a value that names no stream names
         // no destination this command could register.
         let stream = crate::state::check_stream_arn(&input.stream_arn).map_err(lift)?;
+        // WHETHER that stream exists is the Kinesis service's to answer, and it is asked
+        // BEFORE this service's store is locked: an enable whose `StreamArn` resolves to no
+        // stream cannot be completed, so its destination settles `ENABLE_FAILED` rather
+        // than reporting replication to a stream nothing could reach.
+        let stream_resolved = crate::state::kinesis_stream_exists(
+            &*self.engine,
+            &region,
+            &input.stream_arn,
+            now,
+        );
         let precision = input
             .enable_kinesis_streaming_configuration
             .as_ref()
@@ -222,7 +238,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
-        let registered = table.register_kinesis_destination(&input.stream_arn, precision, now);
+        let registered = table.register_kinesis_destination(
+            &input.stream_arn,
+            precision,
+            stream_resolved,
+            now,
+        );
         let stream_arn = registered.stream_arn.clone();
         let status = registered.status(now).to_string();
         let in_force = registered.precision();
@@ -236,7 +257,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             table_name = %table_name,
             stream = %stream,
             destination_status = %status,
-            outcome = "enabled",
+            outcome = if stream_resolved { "enabled" } else { "enable_failed" },
             "kinesis streaming destination enabled"
         );
 

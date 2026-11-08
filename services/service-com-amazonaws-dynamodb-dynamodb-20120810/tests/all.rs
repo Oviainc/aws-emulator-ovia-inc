@@ -79,6 +79,8 @@ mod item_write_vocabularies;
 mod key_schema_element_refusals;
 #[path = "all/kinesis_destination_state_refusals.rs"]
 mod kinesis_destination_state_refusals;
+#[path = "all/kinesis_destination_stream_resolution.rs"]
+mod kinesis_destination_stream_resolution;
 #[path = "all/kinesis_streaming_destinations.rs"]
 mod kinesis_streaming_destinations;
 #[path = "all/list_exports.rs"]
@@ -245,3 +247,6 @@ mod vector_indexes;
 
 #[path = "all/vector_search.rs"]
 mod vector_search;
+
+#[path = "all/vector_write_validation.rs"]
+mod vector_write_validation;

@@ -123,6 +123,13 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             &engine,
         )),
     );
+    // Amazon Kinesis, for the data stream an `AWS::DynamoDB::Table`'s
+    // `KinesisStreamSpecification` names: DynamoDB resolves that ARN against this service's
+    // own stream registry when it starts replicating, so a suite that declares one creates
+    // the stream here first.
+    router.register_service(
+        service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService::new(Arc::clone(&engine)),
+    );
     (router, engine)
 }
 

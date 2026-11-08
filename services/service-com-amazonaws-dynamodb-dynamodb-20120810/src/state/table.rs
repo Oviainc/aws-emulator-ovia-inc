@@ -417,12 +417,14 @@ impl Table {
 
     /// Hold every SECONDARY-INDEX key attribute the item carries to the type the
     /// table declared for it, to the non-emptiness a key value must have, and to the
-    /// same key-value limits — the three rules below, in that order.
+    /// same key-value limits — the three rules below, in that order — and then every
+    /// VECTOR-INDEX vector attribute it carries to the vector that index holds
+    /// ([`Self::check_vector_attributes`]).
     ///
     /// Every write path that stores an item goes through here. The transactional
     /// write, whose answer depends on WHICH of the rules was broken, calls
-    /// [`Self::check_index_key_types`] and [`Self::check_index_key_values`]
-    /// separately instead.
+    /// [`Self::check_index_key_types`], [`Self::check_index_key_values`] and
+    /// [`Self::check_vector_attributes`] separately instead.
     pub fn check_index_keys(&self, item: &Item) -> Result<(), RequestError> {
         self.check_index_key_types(item)?;
         self.check_index_key_values(item)?;
@@ -439,6 +441,10 @@ impl Table {
     /// the write is refused rather than stored outside the index it was written for. An
     /// item that carries NO value for the attribute is simply not covered by the index
     /// ([`VectorIndex::covers`]) and is written as it stands.
+    ///
+    /// Every write path that stores an item reaches this, through
+    /// [`Self::check_index_keys`] or beside it, so one rule decides what a table with a
+    /// vector index accepts whichever operation the write arrived on.
     pub fn check_vector_attributes(&self, item: &Item) -> Result<(), RequestError> {
         for index in &self.vector_indexes {
             let name = index.vector_attribute.attribute_name.as_str();
@@ -463,6 +469,25 @@ impl Table {
                     "{INVALID_PARAMETER_CLAUSE}: The vector attribute {name} must hold only \
                      numbers, each a 32-bit IEEE-754 floating point value"
                 )));
+            }
+            // The search schema partitions and filters by the VALUE of each attribute it
+            // names, so its type is the one the table declared for that attribute:
+            // "Partition key and inline filter attributes defined in the search schema must
+            // have data types matching the index schema definition" (the `PutItem$Item`
+            // doc's own list of what a vector index requires of a write).
+            for element in &index.search_schema {
+                let attribute = element.attribute_name.as_str();
+                let Some(supplied) = item.get(attribute) else {
+                    continue;
+                };
+                if let Some(declared) = self.declared_type(attribute) {
+                    let actual = attribute_value_type(supplied);
+                    if declared != actual {
+                        return Err(index_key_type_mismatch(
+                            attribute, declared, actual, &index.name,
+                        ));
+                    }
+                }
             }
         }
         Ok(())
@@ -943,8 +968,13 @@ impl Table {
     }
 
     /// Register replication to `stream_arn`, as the command that starts it leaves the
-    /// record: `ENABLING` for the span and `ACTIVE` after it, under the precision the
-    /// command named and under none where it named none.
+    /// record: `ENABLING` for the span, and after it `ACTIVE` when the stream it names
+    /// resolves and `ENABLE_FAILED` when it does not, under the precision the command named
+    /// and under none where it named none.
+    ///
+    /// Whether the stream resolves is the KINESIS service's to answer
+    /// ([`kinesis_stream_exists`]), so the caller reads it there and passes it in — this
+    /// record only remembers which of the two ends the enable is headed for.
     ///
     /// A stream this table once replicated to is re-registered IN PLACE, so one stream
     /// has one record whatever number of times replication to it is started and stopped,
@@ -953,9 +983,14 @@ impl Table {
         &mut self,
         stream_arn: &str,
         precision: Option<&str>,
+        stream_resolved: bool,
         now: SystemTime,
     ) -> &KinesisDestination {
-        let registered = KinesisDestination::enabling(stream_arn, precision, now);
+        let registered = if stream_resolved {
+            KinesisDestination::enabling(stream_arn, precision, now)
+        } else {
+            KinesisDestination::enable_failing(stream_arn, precision, now)
+        };
         let index = match self
             .kinesis_destinations
             .iter()

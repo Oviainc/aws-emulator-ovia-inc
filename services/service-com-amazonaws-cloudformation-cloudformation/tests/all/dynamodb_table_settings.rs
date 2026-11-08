@@ -127,6 +127,38 @@ fn stream_arn(name: &str) -> String {
     format!("arn:aws:kinesis:{REGION}:{ACCOUNT_ID}:stream/{name}")
 }
 
+/// Create the Kinesis data stream `name` through the Kinesis service's own wire, so the
+/// destination a table's `KinesisStreamSpecification` declares RESOLVES to a stream.
+///
+/// A destination is a Kinesis data stream, and DynamoDB settles one whose `StreamArn` names
+/// no stream in `ENABLE_FAILED` rather than replicating to nothing — so the stream a row
+/// declares exists before the stack is deployed, exactly as it must in an account.
+async fn create_stream(router: &MultiServiceRouter, name: &str) {
+    let request = http::Request::builder()
+        .method("POST")
+        .uri(format!("https://kinesis.{REGION}.amazonaws.com/"))
+        .header("content-type", "application/x-amz-json-1.1")
+        .header("x-amz-target", "Kinesis_20131202.CreateStream")
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/kinesis/aws4_request, \
+                 SignedHeaders=host;x-amz-target, Signature=0123456789abcdef"
+            ),
+        )
+        .body(bytes::Bytes::from(
+            json!({"StreamName": name, "ShardCount": 1}).to_string(),
+        ))
+        .expect("a well-formed Kinesis request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = String::from_utf8(response.into_body().to_vec()).unwrap_or_default();
+    assert_eq!(
+        status, 200,
+        "creating the Kinesis stream {name:?}: expected HTTP 200, got {status} with {body}"
+    );
+}
+
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -294,6 +326,11 @@ fn rows() -> Vec<Row> {
 async fn a_declared_table_setting_is_in_force_when_the_stack_completes() {
     for row in rows() {
         let router = router();
+        // Every stream a row's declaration replicates to, created in Kinesis first: the
+        // destination resolves its `StreamArn` there.
+        for stream in ["table-changes", "all-changes"] {
+            create_stream(&router, stream).await;
+        }
         let case = row.case;
         let body = template(row.table, &row.settings);
         let (status, answer) = create_stack(&router, row.stack, &body, &[]).await;
@@ -391,12 +428,19 @@ async fn a_setting_the_owning_service_refuses_fails_the_resource() {
 }
 
 /// The setting is applied to the table a CHANGED declaration names too: a deployment that
-/// turns TTL on over a table the stack already has puts it into force through the same call,
-/// and one that drops the property turns it off again.
+/// turns a property on over a table the stack already has puts it into force through the same
+/// call, and one that drops the property turns it off again.
+///
+/// The property here is Contributor Insights rather than TTL: DynamoDB takes ONE change to a
+/// table's TTL setting per modification interval ("Any additional UpdateTimeToLive calls for
+/// the same table during this one hour duration result in a ValidationException" — its
+/// `UpdateTimeToLive` doc), so no deployment can turn TTL on and off again over one table. The
+/// rows above pin TTL as a declaration applied at CREATE time; what this case is about is the
+/// CHANGED declaration, which holds whichever of these properties carries it.
 #[tokio::test]
 async fn a_changed_declaration_applies_the_setting_to_the_table_the_stack_has() {
     let router = router();
-    let case = "TTL turned on, then dropped, over one table";
+    let case = "Contributor Insights turned on, then dropped, over one table";
     let stack = "ddb-settings-updated";
     let table = "updated-settings-table";
 
@@ -411,11 +455,11 @@ async fn a_changed_declaration_applies_the_setting_to_the_table_the_stack_has() 
         "case {case:?}: expected the stack to complete, got {reported:?} in {described}"
     );
 
-    // The deployment that turns TTL on: the property is applied to the table that already
-    // exists, which that service's own read then reports.
+    // The deployment that turns the setting on: the property is applied to the table that
+    // already exists, which that service's own read then reports.
     let enabling = template(
         table,
-        &json!({"TimeToLiveSpecification": {"AttributeName": "expiresAt", "Enabled": true}}),
+        &json!({"ContributorInsightsSpecification": {"Enabled": true}}),
     );
     let (status, answer) = call(
         &router,
@@ -437,15 +481,15 @@ async fn a_changed_declaration_applies_the_setting_to_the_table_the_stack_has() 
          {described}",
         failure_reasons(&router, stack).await
     );
-    let status = wait_for_time_to_live(&router, table, "ENABLED").await;
+    let status = wait_for_contributor_insights(&router, table, "ENABLED").await;
     assert_eq!(
         status, "ENABLED",
-        "case {case:?}: expected DynamoDB to report TTL ENABLED on {table:?} after the \
-         deployment that declared it, got {status:?}"
+        "case {case:?}: expected DynamoDB to report Contributor Insights ENABLED on {table:?} \
+         after the deployment that declared it, got {status:?}"
     );
 
-    // And the deployment that DROPS the property asks for TTL off, which the same call
-    // expresses over the attribute the setting is in force for.
+    // And the deployment that DROPS the property asks for the setting off, which the same
+    // call expresses.
     let (status, answer) = call(
         &router,
         "UpdateStack",
@@ -466,24 +510,28 @@ async fn a_changed_declaration_applies_the_setting_to_the_table_the_stack_has() 
          in {described}",
         failure_reasons(&router, stack).await
     );
-    let status = wait_for_time_to_live(&router, table, "DISABLED").await;
+    let status = wait_for_contributor_insights(&router, table, "DISABLED").await;
     assert_eq!(
         status, "DISABLED",
-        "case {case:?}: expected DynamoDB to report TTL DISABLED on {table:?} once the \
-         declaration dropped the property, got {status:?}"
+        "case {case:?}: expected DynamoDB to report Contributor Insights DISABLED on {table:?} \
+         once the declaration dropped the property, got {status:?}"
     );
 }
 
-/// The `TimeToLiveStatus` DynamoDB reports for `table`, waited for until it is `wanted`:
-/// turning the setting on or off is asynchronous in that service, so the status it settles on
-/// is owed from the instant its own span falls due and no fixed sleep names it.
-async fn wait_for_time_to_live(router: &MultiServiceRouter, table: &str, wanted: &str) -> String {
+/// The `ContributorInsightsStatus` DynamoDB reports for `table`, waited for until it is
+/// `wanted`: turning the setting on or off is asynchronous in that service, so the status it
+/// settles on is owed from the instant its own span falls due and no fixed sleep names it.
+async fn wait_for_contributor_insights(
+    router: &MultiServiceRouter,
+    table: &str,
+    wanted: &str,
+) -> String {
     let mut last = String::new();
     for _ in 0..POLLS {
         let asked = json!({"TableName": table});
-        let (_, answered) = dynamodb(router, "DescribeTimeToLive", &asked).await;
+        let (_, answered) = dynamodb(router, "DescribeContributorInsights", &asked).await;
         last = answered
-            .pointer("/TimeToLiveDescription/TimeToLiveStatus")
+            .pointer("/ContributorInsightsStatus")
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();

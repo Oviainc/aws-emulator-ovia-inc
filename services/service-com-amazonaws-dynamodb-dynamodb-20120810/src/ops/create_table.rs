@@ -373,8 +373,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         )
         .map_err(lift)?;
-        // The projection budget is summed across EVERY secondary index of the table,
-        // so it can only be checked once all of them are known.
+        // The projection budget is summed across EVERY index of the table, the VECTOR
+        // indexes included — "the total count of NonKeyAttributes summed across all of the
+        // secondary indexes, must not exceed 100" (`Projection$NonKeyAttributes`) — so it
+        // can only be checked once all of them are known.
         crate::state::check_projection_budget(
             global_secondary_indexes
                 .iter()
@@ -383,7 +385,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     local_secondary_indexes
                         .iter()
                         .map(|index| &index.projection),
-                ),
+                )
+                .chain(vector_indexes.iter().map(|index| &index.projection)),
         )
         .map_err(lift)?;
 
@@ -787,15 +790,32 @@ fn clamped_lists(input: &CreateTableInput) -> Result<(), crate::state::RequestEr
         )));
     }
     for index in input.vector_indexes.iter().flatten() {
-        let elements = index.search_schema.as_ref().map_or(0, Vec::len);
-        if elements > crate::state::MAX_VECTOR_SEARCH_SCHEMA_ELEMENTS {
-            return Err(crate::state::RequestError::Validation(format!(
-                "Invalid SearchSchema for index {}: a vector index's search schema may carry at \
-                 most {} elements, got {elements}",
-                index.index_name,
-                crate::state::MAX_VECTOR_SEARCH_SCHEMA_ELEMENTS
-            )));
-        }
+        clamped_search_schema(
+            &index.index_name,
+            index.search_schema.as_ref().map_or(0, Vec::len),
+        )?;
+    }
+    Ok(())
+}
+
+/// Hold ONE vector index's search schema to the elements it may carry.
+///
+/// The caller-chosen list is both WALKED (once per element, against the table's attribute
+/// definitions) and STORED, so it is clamped before either happens — and it is clamped
+/// wherever a vector index is declared, so `CreateTable` and `UpdateTable`'s `Create` state
+/// one rule with one sentence. Each caller applies it where its own request is still
+/// request-level, which is why this is a check of a COUNT rather than part of
+/// [`DeclaredVectorIndex::validated`]: that runs with the store already locked.
+pub(crate) fn clamped_search_schema(
+    index_name: &str,
+    elements: usize,
+) -> Result<(), crate::state::RequestError> {
+    if elements > crate::state::MAX_VECTOR_SEARCH_SCHEMA_ELEMENTS {
+        return Err(crate::state::RequestError::Validation(format!(
+            "Invalid SearchSchema for index {index_name}: a vector index's search schema may \
+             carry at most {} elements, got {elements}",
+            crate::state::MAX_VECTOR_SEARCH_SCHEMA_ELEMENTS
+        )));
     }
     Ok(())
 }
@@ -1178,9 +1198,59 @@ fn validated_vector_indexes(
                 index.index_name
             )));
         }
-        validated_projection(&index.index_name, &index.projection)?;
-        check_vector_dimensions(index.dimensions)?;
-        for element in index.search_schema.iter().flatten() {
+        indexes.push(
+            DeclaredVectorIndex {
+                index_name: &index.index_name,
+                vector_attribute: &index.vector_attribute,
+                search_schema: index.search_schema.as_deref(),
+                projection: &index.projection,
+                dimensions: index.dimensions,
+                distance_function: &index.distance_function,
+            }
+            .validated(&definitions, region, table, now)?,
+        );
+    }
+    Ok(indexes)
+}
+
+/// One vector index as a REQUEST declares it, whichever member it arrived in.
+///
+/// `CreateTable$VectorIndexes` and the `Create` action of `UpdateTable$VectorIndexUpdates`
+/// carry the same six members and describe the same resource, so the rules a declaration is
+/// held to — and the stored index built from it — are stated ONCE, here, and both operations
+/// borrow their own shape into this one before applying them.
+pub(crate) struct DeclaredVectorIndex<'d> {
+    pub(crate) index_name: &'d str,
+    pub(crate) vector_attribute: &'d VectorAttributeDefinition,
+    pub(crate) search_schema: Option<&'d [SearchSchemaElement]>,
+    pub(crate) projection: &'d Projection,
+    pub(crate) dimensions: i64,
+    pub(crate) distance_function: &'d str,
+}
+
+impl DeclaredVectorIndex<'_> {
+    /// The index this declaration STORES, or the refusal it earns.
+    ///
+    /// Two rules, both of the declaration alone: its `Projection` has to hold together
+    /// ([`validated_projection`]), and every attribute its `SearchSchema` names has to be
+    /// declared in `definitions` — the search schema partitions and filters by that
+    /// attribute's VALUE, so its type has to be declared, exactly as an index key's is. A
+    /// definition is not REQUIRED for the `VectorAttribute`: no schema is built over the
+    /// vector itself.
+    ///
+    /// The stored index starts `CREATING` and becomes `ACTIVE` when the clock makes the
+    /// transient span due, and it carries the ARN this service mints for an index of
+    /// `table` in `region`.
+    pub(crate) fn validated(
+        &self,
+        definitions: &[AttributeDefinition],
+        region: &str,
+        table: &str,
+        now: ::std::time::SystemTime,
+    ) -> Result<crate::state::VectorIndex, crate::state::RequestError> {
+        validated_projection(self.index_name, self.projection)?;
+        check_vector_dimensions(self.dimensions)?;
+        for element in self.search_schema.unwrap_or_default() {
             let name = element.attribute_name.as_str();
             if !definitions
                 .iter()
@@ -1189,24 +1259,23 @@ fn validated_vector_indexes(
                 return Err(crate::state::RequestError::Validation(format!(
                     "Invalid SearchSchema for index {}: no AttributeDefinition was provided for \
                      search schema attribute {name}",
-                    index.index_name
+                    self.index_name
                 )));
             }
         }
-        indexes.push(crate::state::VectorIndex {
-            arn: crate::state::index_arn(region, table, &index.index_name),
-            name: index.index_name.clone(),
-            vector_attribute: index.vector_attribute.clone(),
-            search_schema: index.search_schema.clone().unwrap_or_default(),
-            projection: index.projection.clone(),
-            dimensions: index.dimensions,
-            distance_function: index.distance_function.clone(),
+        Ok(crate::state::VectorIndex {
+            arn: crate::state::index_arn(region, table, self.index_name),
+            name: self.index_name.to_string(),
+            vector_attribute: self.vector_attribute.clone(),
+            search_schema: self.search_schema.unwrap_or_default().to_vec(),
+            projection: self.projection.clone(),
+            dimensions: self.dimensions,
+            distance_function: self.distance_function.to_string(),
             transient_status: crate::state::IndexStatus::Creating,
             active_at: now + crate::state::STATUS_TRANSITION,
             reported_counters: crate::state::MeteredCounters::new(now),
-        });
+        })
     }
-    Ok(indexes)
 }
 
 /// One index's key schema: at least one `HASH` element, within the documented key

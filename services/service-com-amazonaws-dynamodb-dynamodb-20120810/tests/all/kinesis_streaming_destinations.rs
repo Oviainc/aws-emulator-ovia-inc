@@ -47,7 +47,9 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_dynamodb_dynamodb_20120810::state::{self, STATUS_TRANSITION};
 
 use crate::contributor_insights::{create_table, settle};
-use crate::emulator::{call, emulator_and_engine, error_code, message, ok, REGION};
+use crate::emulator::{
+    call, emulator_and_engine, ensure_kinesis_stream, error_code, message, ok, REGION,
+};
 
 /// The ARN of a Kinesis data stream in the region the suite drives, built through the
 /// same ARN helper the emulator mints every other ARN with.
@@ -84,7 +86,10 @@ async fn set_up(
     destinations: &[Destination],
 ) {
     for (stream, precision, _) in destinations {
-        let mut request = json!({"TableName": table, "StreamArn": stream_arn(stream)});
+        // The stream has to EXIST for the registration to replicate: a destination whose
+        // `StreamArn` resolves to no stream settles `ENABLE_FAILED` rather than `ACTIVE`.
+        let arn = ensure_kinesis_stream(router, stream).await;
+        let mut request = json!({"TableName": table, "StreamArn": arn});
         if let Some(precision) = precision {
             request["EnableKinesisStreamingConfiguration"] =
                 json!({"ApproximateCreationDateTimePrecision": precision});
@@ -632,7 +637,7 @@ async fn a_stream_arn_that_names_no_stream_is_refused() {
 async fn the_destination_lifecycle_is_driven_over_the_wire() {
     let (router, _engine) = emulator_and_engine();
     create_table(&router, "Wired", &[]).await;
-    let arn = stream_arn("cdc");
+    let arn = ensure_kinesis_stream(&router, "cdc").await;
 
     // A table no command has named replicates to nothing at all.
     let empty = ok(

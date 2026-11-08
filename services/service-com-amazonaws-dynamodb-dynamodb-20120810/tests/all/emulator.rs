@@ -33,7 +33,57 @@ pub fn emulator_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>
     // client's would.
     router.set_request_authentication(false);
     router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    // KINESIS is mounted beside it, on the same engine, because a table's streaming
+    // destination IS a Kinesis data stream: enabling one resolves its `StreamArn` against
+    // that service's own registry, so a suite that enables a destination has to be able to
+    // create the stream it names ([`create_kinesis_stream`]).
+    router.register_service(
+        service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService::new(Arc::clone(&engine)),
+    );
     (router, engine)
+}
+
+/// Make sure the Kinesis data stream `name` exists in [`REGION`], creating it over the
+/// wire if it does not, and answer the ARN THAT SERVICE reports for it — the ARN a table's
+/// destination then names.
+///
+/// A single shard: the destination only has to RESOLVE the stream, and the shard count is
+/// the caller's choice everywhere else. Idempotent, so a suite may call it from the helper
+/// that enables a destination however many times that helper runs: a stream the region
+/// already holds answers `ResourceInUseException`, which is this call's success too. The ARN
+/// is read back off that service's own description rather than built here, so a suite does
+/// not depend on how the Kinesis crate mints one.
+pub async fn ensure_kinesis_stream(router: &MultiServiceRouter, name: &str) -> String {
+    let (status, body) = dispatch_as(
+        router,
+        REGION,
+        "kinesis",
+        "Kinesis_20131202.CreateStream",
+        json!({"StreamName": name, "ShardCount": 1}),
+    )
+    .await;
+    assert!(
+        status == 200 || error_code(&body) == "ResourceInUseException",
+        "case ensure the Kinesis stream {name:?}: expected it created or already there, got \
+         {status} with {body}"
+    );
+    let (status, described) = dispatch_as(
+        router,
+        REGION,
+        "kinesis",
+        "Kinesis_20131202.DescribeStreamSummary",
+        json!({"StreamName": name}),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case ensure the Kinesis stream {name:?}: expected its description, got {status} with \
+         {described}"
+    );
+    described["StreamDescriptionSummary"]["StreamARN"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string()
 }
 
 /// One emulator holding this service AND DynamoDB Streams, over ONE shared engine.
@@ -94,6 +144,18 @@ async fn dispatch(
     target: &str,
     body: Value,
 ) -> (u16, Value) {
+    dispatch_as(router, region, "dynamodb", target, body).await
+}
+
+/// The same, signed for the service `signing_name` — which is what the router claims a
+/// request by, so a call to another service mounted on the same engine names its own.
+async fn dispatch_as(
+    router: &MultiServiceRouter,
+    region: &str,
+    signing_name: &str,
+    target: &str,
+    body: Value,
+) -> (u16, Value) {
     let request = http::Request::builder()
         .method("POST")
         .uri("/")
@@ -102,7 +164,7 @@ async fn dispatch(
         .header(
             "authorization",
             format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{region}/dynamodb/aws4_request, \
+                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{region}/{signing_name}/aws4_request, \
                  SignedHeaders=host;x-amz-target, Signature=0000"
             ),
         )

@@ -40,8 +40,12 @@
 //! carries no vector index for is refused with `ResourceNotFoundException` — the modelled
 //! answer for "the operation tried to access a nonexistent table or index" — before
 //! anything is written, which leaves every stored index where it was; a name it does
-//! carry is removed, its siblings keep serving `SearchVectors`, and the removal is index
-//! lifecycle work, so the table is left `UPDATING` for the span below like any other.
+//! carry is removed, its siblings keep serving `SearchVectors`. A `Create` adds the index
+//! it describes, held to the same rules as one declared with the table, and it becomes
+//! searchable when it reaches `ACTIVE`. Either way the change is index lifecycle work, so
+//! the table is left `UPDATING` for the span below like any other — and a call asking for
+//! more than one create or one delete of a vector index exceeds what one `UpdateTable`
+//! carries, which is the control plane's `LimitExceededException`.
 //!
 //! A `ReplicaUpdates` entry addresses one REGION of the table's replication group. A
 //! `Create` makes the table a global table: the replica is a table of its own in the
@@ -62,9 +66,8 @@
 //! ([`crate::state::OnDemandCeilings`]).
 //!
 //! Members this slice does not store (witnesses, a PER-INDEX on-demand or warm
-//! throughput, multi-region consistency, the settings replication mode, disassociation
-//! protection and a `VectorIndexUpdates` CREATE) are refused with the scaffold's 501 and
-//! are their own gap issues.
+//! throughput, multi-region consistency, the settings replication mode and disassociation
+//! protection) are refused with the scaffold's 501 and are their own gap issues.
 //!
 //! ## Shape of an operation
 //!
@@ -339,6 +342,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The same limit over the table's VECTOR indexes: a call that asks for more
+        // vector-index lifecycle work than one `UpdateTable` carries is answered the
+        // control plane's limit error, counted per action the way the secondary-index
+        // limit above is.
+        if let Some(message) = vector_index_actions_over_limit(&vector_index_updates) {
+            return Err(UpdateTableErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
         // What the request's `StreamSpecification` asks for, resolved before the
         // store lock is taken: a specification that cannot hold together refuses the
         // whole update.
@@ -486,6 +501,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(lift)?;
         let declared = merged_definitions(table, &declared_definitions);
+        // The table's vector indexes after the update, resolved against the STORED ones:
+        // a `Delete` naming an index the table does not carry, and a `Create` the table
+        // cannot take, refuse the whole update here, before anything is written. The
+        // definitions it is given are the MERGED ones, so a create may name a search-schema
+        // attribute this same request declares.
+        let vector_indexes =
+            resolve_vector_indexes(table, &vector_index_updates, &declared, &region, now)
+                .map_err(lift)?;
         let indexes = resolve_indexes(
             table,
             &billing_mode,
@@ -495,20 +518,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             now,
         )
         .map_err(lift)?;
-        // The table's vector indexes after the update, resolved against the STORED ones:
-        // a `Delete` naming an index the table does not carry refuses the whole update
-        // here, before anything is written.
-        let vector_indexes = resolve_vector_indexes(table, &vector_index_updates).map_err(lift)?;
-        // The projection budget is summed across EVERY secondary index the table would
-        // carry after this update, the table's local indexes included: an index added
-        // here spends from the same budget as the ones created with the table.
+        // The projection budget is summed across EVERY index the table would carry after
+        // this update, the table's local and VECTOR indexes included: "the total count of
+        // NonKeyAttributes summed across all of the secondary indexes, must not exceed 100"
+        // (`Projection$NonKeyAttributes`), so an index added here spends from the same
+        // budget as the ones created with the table — which is also what bounds the
+        // projection list a `Create` stores.
         crate::state::check_projection_budget(
-            indexes.iter().map(|index| &index.projection).chain(
-                table
-                    .local_secondary_indexes
-                    .iter()
-                    .map(|index| &index.projection),
-            ),
+            indexes
+                .iter()
+                .map(|index| &index.projection)
+                .chain(
+                    table
+                        .local_secondary_indexes
+                        .iter()
+                        .map(|index| &index.projection),
+                )
+                .chain(vector_indexes.iter().map(|index| &index.projection)),
         )
         .map_err(lift)?;
         // Only the attribute definitions some key schema still uses are kept, so a
@@ -944,16 +970,6 @@ fn unsupported_member(input: &UpdateTableInput) -> Option<&'static str> {
     {
         return Some("GlobalTableWitnessUpdates");
     }
-    // A vector index DELETE is applied by this handler; a CREATE would have to store an
-    // index configuration this slice does not write yet, so only that action is refused.
-    if input
-        .vector_index_updates
-        .iter()
-        .flatten()
-        .any(|update| update.create.is_some())
-    {
-        return Some("VectorIndexUpdates carrying Create");
-    }
     if input.multi_region_consistency.is_some() {
         return Some("MultiRegionConsistency");
     }
@@ -1056,11 +1072,39 @@ fn index_lifecycle_actions_over_limit(updates: &[GlobalSecondaryIndexUpdate]) ->
     }
     // AWS's text for this limit is FIXED: it states the limit and nothing of which
     // index or how many the request named, so it reads the same whichever side of the
-    // lifecycle the request asked twice for.
-    Some(format!(
-        "Subscriber limit exceeded: Only {PER_CALL} online index can be created or deleted \
+    // lifecycle the request asked twice for — and the same sentence answers for a vector
+    // index ([`vector_index_actions_over_limit`]).
+    Some(online_index_limit_message(PER_CALL))
+}
+
+/// The sentence AWS states a per-call index lifecycle limit with: the limit, and nothing
+/// of which index or how many the request named.
+fn online_index_limit_message(per_call: usize) -> String {
+    format!(
+        "Subscriber limit exceeded: Only {per_call} online index can be created or deleted \
          simultaneously per table"
-    ))
+    )
+}
+
+/// Why one request asks for more VECTOR-index lifecycle work than a single `UpdateTable`
+/// may carry, or `None` when it stays inside the limit.
+///
+/// `UpdateTableInput$VectorIndexUpdates` is a list, but a create or a delete of a vector
+/// index is asynchronous work on the table itself — the table reports `UPDATING` until it
+/// settles — so one call carries ONE such action in all: a create and a delete in one call
+/// are two, and are refused like two creates. (The secondary-index limit beside it counts
+/// its create and its delete separately, which is the rule stated for that member.) AWS
+/// states both limits with the same sentence ([`online_index_limit_message`]), and it is
+/// answered with the control plane's modelled `LimitExceededException` — the code a client
+/// backs off on and retries one index at a time.
+fn vector_index_actions_over_limit(updates: &[VectorIndexUpdate]) -> Option<String> {
+    /// How many vector index actions one `UpdateTable` may carry.
+    const PER_CALL: usize = 1;
+    let actions = updates
+        .iter()
+        .filter(|update| update.create.is_some() || update.delete.is_some())
+        .count();
+    (actions > PER_CALL).then(|| online_index_limit_message(PER_CALL))
 }
 
 /// The vector-index actions one request asks for, each index named at most once.
@@ -1071,6 +1115,11 @@ fn index_lifecycle_actions_over_limit(updates: &[GlobalSecondaryIndexUpdate]) ->
 /// costs one hash per entry rather than a scan, and each entry has to ask for exactly
 /// one of the two actions the model gives it — an entry that asks for both, or for
 /// neither, names no single change the table could apply.
+///
+/// A `Create`'s own caller-chosen list is clamped here too: a vector index's search schema
+/// carries at most [`crate::state::MAX_VECTOR_SEARCH_SCHEMA_ELEMENTS`] elements, the bound
+/// `CreateTable` holds a vector index declared WITH the table to, so neither the walk below
+/// nor the stored index can be grown by one request.
 fn validated_vector_index_updates(
     input: &UpdateTableInput,
 ) -> Result<Vec<VectorIndexUpdate>, crate::state::RequestError> {
@@ -1104,6 +1153,16 @@ fn validated_vector_index_updates(
             return Err(crate::state::RequestError::Validation(format!(
                 "Invalid VectorIndexUpdates: index {index_name} is named more than once"
             )));
+        }
+        // The search schema a `Create` carries is request-sized, and it is both walked (once
+        // per element, against the table's attribute definitions) and STORED, so it is held
+        // to the per-index element bound before either happens — by the one statement of
+        // that rule, which `CreateTable` holds a declared index to as well.
+        if let Some(create) = &update.create {
+            crate::ops::create_table::clamped_search_schema(
+                &create.index_name,
+                create.search_schema.as_ref().map_or(0, Vec::len),
+            )?;
         }
     }
     Ok(updates)
@@ -1466,7 +1525,8 @@ fn resolve_indexes(
     Ok(indexes)
 }
 
-/// The table's vector indexes after the update: every one a `Delete` names is gone.
+/// The table's vector indexes after the update: every one a `Delete` names is gone, and
+/// every one a `Create` names is added, `CREATING` until the clock settles it `ACTIVE`.
 ///
 /// A `Delete` addresses the index AS THE RESOURCE it changes, so a name the table carries
 /// no vector index for is a lookup miss rather than a malformed request: it is refused
@@ -1479,11 +1539,20 @@ fn resolve_indexes(
 /// `DELETING` for a description to report it in, and nothing can be searched through it
 /// again.
 ///
-/// A `Create` is refused ahead of this with the scaffold's 501
-/// ([`unsupported_member`]), so only the removals reach here.
+/// A `Create` is held to what the table can carry, exactly as `CreateTable` holds a vector
+/// index declared WITH the table: a name no other index of the table already has, a
+/// `Projection` that holds together, a search-schema attribute the table has an
+/// `AttributeDefinition` for (its type is what the index partitions and filters by), and
+/// the per-table index count. One call carries ONE index action
+/// ([`vector_index_actions_over_limit`]), so the two loops below never both do work for the
+/// same request; the deletes are walked first all the same, which is the order the table
+/// would be left in if the limit ever let both through.
 fn resolve_vector_indexes(
     table: &crate::state::Table,
     updates: &[VectorIndexUpdate],
+    definitions: &[AttributeDefinition],
+    region: &str,
+    now: ::std::time::SystemTime,
 ) -> Result<Vec<crate::state::VectorIndex>, crate::state::RequestError> {
     let mut indexes = table.vector_indexes.clone();
     for delete in updates.iter().filter_map(|update| update.delete.as_ref()) {
@@ -1495,6 +1564,44 @@ fn resolve_vector_indexes(
                 &delete.index_name,
             ));
         }
+    }
+    for create in updates.iter().filter_map(|update| update.create.as_ref()) {
+        let taken = indexes.iter().any(|stored| stored.name == create.index_name)
+            || table
+                .global_secondary_indexes
+                .iter()
+                .any(|stored| stored.name == create.index_name)
+            || table
+                .local_secondary_indexes
+                .iter()
+                .any(|stored| stored.name == create.index_name);
+        if taken {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid VectorIndex: duplicate index name {}",
+                create.index_name
+            )));
+        }
+        if indexes.len() >= crate::state::MAX_VECTOR_INDEXES {
+            return Err(crate::state::RequestError::Validation(format!(
+                "Invalid VectorIndexUpdates: a table carries at most {} vector indexes",
+                crate::state::MAX_VECTOR_INDEXES
+            )));
+        }
+        // What the declaration has to satisfy, and the index it stores, are `CreateTable`'s
+        // to state: the two members describe the same resource, so a vector index added
+        // here is held to exactly the rules one declared with the table is
+        // ([`crate::ops::create_table::DeclaredVectorIndex`]).
+        indexes.push(
+            crate::ops::create_table::DeclaredVectorIndex {
+                index_name: &create.index_name,
+                vector_attribute: &create.vector_attribute,
+                search_schema: create.search_schema.as_deref(),
+                projection: &create.projection,
+                dimensions: create.dimensions,
+                distance_function: &create.distance_function,
+            }
+            .validated(definitions, region, &table.name, now)?,
+        );
     }
     Ok(indexes)
 }

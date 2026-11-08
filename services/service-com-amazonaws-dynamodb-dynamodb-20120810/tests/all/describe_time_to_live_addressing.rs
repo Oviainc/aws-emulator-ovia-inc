@@ -139,7 +139,8 @@ async fn every_spelling_of_a_table_s_name_reaches_the_same_ttl_setting() {
     }
     settle().await;
 
-    // A table no `UpdateTimeToLive` has named reports TTL off, through every spelling.
+    // A table no `UpdateTimeToLive` has named reports TTL off, through every spelling —
+    // and reports it again unchanged, because a read stores nothing.
     for (case, _, spellings) in &rows {
         for (spelling, value) in spellings {
             let fresh = described_ttl(&router, value).await;
@@ -148,36 +149,9 @@ async fn every_spelling_of_a_table_s_name_reaches_the_same_ttl_setting() {
                 json!({"TimeToLiveStatus": "DISABLED"}),
                 "case {case:?} by {spelling}: a table with no TTL reports it off, got {fresh}"
             );
-        }
-    }
-
-    // Turn TTL on addressing each table by its BARE name, and let the change settle.
-    for (case, name, _) in &rows {
-        let stored = set_ttl(&router, name, true).await;
-        assert_eq!(
-            stored["TimeToLiveSpecification"].clone(),
-            json!({"Enabled": true, "AttributeName": TTL_ATTRIBUTE}),
-            "case {case:?}: the update answers the specification it stored, got {stored}"
-        );
-    }
-    settle().await;
-
-    // Every spelling now reports the setting the bare name stored — and reports it again
-    // unchanged, because a read stores nothing.
-    for (case, _, spellings) in &rows {
-        let expected = json!({
-            "TimeToLiveStatus": "ENABLED",
-            "AttributeName": TTL_ATTRIBUTE,
-        });
-        for (spelling, value) in spellings {
-            let first = described_ttl(&router, value).await;
-            assert_eq!(
-                first, expected,
-                "case {case:?} by {spelling}: the stored setting is reported, got {first}"
-            );
             let again = described_ttl(&router, value).await;
             assert_eq!(
-                again, first,
+                again, fresh,
                 "case {case:?} by {spelling}: a second read reports the same description, got \
                  {again}"
             );
@@ -185,31 +159,38 @@ async fn every_spelling_of_a_table_s_name_reaches_the_same_ttl_setting() {
     }
 
     // Those reads left the setting as a later change finds it: the ARN spelling may make
-    // the change, and the bare name reads the result.
+    // the change, and the bare name reads the result. ONE change per table — DynamoDB takes
+    // one change to a table's TTL setting per modification interval, which
+    // `tests/all/time_to_live.rs` pins — so this is the change every spelling is then read
+    // against.
     for (case, name, spellings) in &rows {
         let by_arn = &spellings[1].1;
-        let stored = set_ttl(&router, by_arn, false).await;
+        let stored = set_ttl(&router, by_arn, true).await;
         assert_eq!(
             stored["TimeToLiveSpecification"].clone(),
-            json!({"Enabled": false, "AttributeName": TTL_ATTRIBUTE}),
+            json!({"Enabled": true, "AttributeName": TTL_ATTRIBUTE}),
             "case {case:?}: a change addressed by ARN is accepted, got {stored}"
         );
         let during = described_ttl(&router, name).await;
         assert_eq!(
             during,
-            json!({"TimeToLiveStatus": "DISABLING", "AttributeName": TTL_ATTRIBUTE}),
+            json!({"TimeToLiveStatus": "ENABLING", "AttributeName": TTL_ATTRIBUTE}),
             "case {case:?}: the change is still processing, got {during}"
         );
     }
     settle().await;
+
+    // Every spelling now reports the setting the ARN spelling stored.
     for (case, _, spellings) in &rows {
+        let expected = json!({
+            "TimeToLiveStatus": "ENABLED",
+            "AttributeName": TTL_ATTRIBUTE,
+        });
         for (spelling, value) in spellings {
-            let off = described_ttl(&router, value).await;
+            let settled = described_ttl(&router, value).await;
             assert_eq!(
-                off,
-                json!({"TimeToLiveStatus": "DISABLED"}),
-                "case {case:?} by {spelling}: a setting that has settled off reports no \
-                 attribute, got {off}"
+                settled, expected,
+                "case {case:?} by {spelling}: the stored setting is reported, got {settled}"
             );
         }
     }

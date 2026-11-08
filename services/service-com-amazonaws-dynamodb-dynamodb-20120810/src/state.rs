@@ -1123,6 +1123,22 @@ impl VectorIndex {
         }
     }
 
+    /// The entry this index REPORTS for one covered item: the entry it holds
+    /// ([`Self::index_entry`]) without the vector attribute itself.
+    ///
+    /// A read of an index answers "attributes that are copied (projected) from the table
+    /// into the vector index" (`VectorIndex$Projection`). The vector is what the index
+    /// FINDS an item by rather than an attribute it projects — the result carries the
+    /// similarity score computed from it instead — so it is not handed back as an item
+    /// attribute, whatever the index's `Projection` is. Everything else the index stores is
+    /// reported, which is why this is stated over [`Self::index_entry`] rather than beside
+    /// it.
+    pub fn reported_entry(&self, item: &Item, table_key_schema: &[KeySchemaElement]) -> Item {
+        let mut entry = self.index_entry(item, table_key_schema);
+        entry.remove(self.vector_attribute.attribute_name.as_str());
+        entry
+    }
+
     /// The bytes this index stores for one covered item: the size of the entry it holds
     /// for it, so what the index is sized by and what a search through it reports are the
     /// same projection.

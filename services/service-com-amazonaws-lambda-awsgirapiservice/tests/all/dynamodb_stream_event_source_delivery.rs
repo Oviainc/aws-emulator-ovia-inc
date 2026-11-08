@@ -829,12 +829,20 @@ def lambda_handler(event, context):
     )
 }
 
-/// Wait until `table` holds the item `key` names, answering it.
+/// Wait until `table` holds the item `key` names CARRYING the change `event` names,
+/// answering it.
+///
+/// The change under test is not always the only record a mapping delivers: a removal has an
+/// item to remove only once one is there, so its stream carries the insert that put it there
+/// too, and the handler writes the derived item once per record. What the case is about is
+/// therefore the item as the record under test leaves it, which is what this waits for
+/// rather than for the key to appear.
 async fn wait_for_item(
     router: &MultiServiceRouter,
     case: &str,
     table: &str,
     key: &str,
+    event: &str,
 ) -> Value {
     let deadline = Instant::now() + BUDGET;
     loop {
@@ -848,13 +856,17 @@ async fn wait_for_item(
             status, 200,
             "case {case:?}: GetItem answered {status} {read}"
         );
-        if read.get("Item").is_some_and(|item| !item.is_null()) {
+        if read
+            .pointer("/Item/event/S")
+            .and_then(Value::as_str)
+            .is_some_and(|written| written == event)
+        {
             return read["Item"].clone();
         }
         assert!(
             Instant::now() < deadline,
             "case {case:?}: {table} never came to hold the item {key:?} the handler had to \
-             write: {read}"
+             write for the {event} record: {read}"
         );
         tokio::time::sleep(LOOK_AGAIN).await;
     }
@@ -922,7 +934,7 @@ async fn a_delivered_change_reaches_a_handler_that_writes_it_downstream() {
         .await;
         write_item(&router, case, &source, key, write).await;
 
-        let item = wait_for_item(&router, case, &output, key).await;
+        let item = wait_for_item(&router, case, &output, key, expected_event).await;
         assert_eq!(
             item["event"]["S"],
             json!(expected_event),

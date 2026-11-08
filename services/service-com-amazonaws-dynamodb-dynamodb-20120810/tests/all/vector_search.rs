@@ -11,10 +11,10 @@
 //!    and reports the `TopK` of them most similar first: the `k` smallest scores for
 //!    `COSINE` and `EUCLIDEAN`, the `k` highest for `DOT_PRODUCT`;
 //! 2. a result carries the entry the index holds for its item — the attributes its
-//!    `Projection` stores — narrowed further by a `ProjectionExpression`, which may only
-//!    name attributes the index projects;
+//!    `Projection` stores, never the vector it finds them by — narrowed further by a
+//!    `ProjectionExpression`, which reports nothing for a name the index does not hold;
 //! 3. a `SearchConditionExpression` filters the scored items by the index's search schema
-//!    attributes, and may reference no others;
+//!    attributes, each PINNED by `=`, and may reference no others;
 //! 4. a request that addresses no searchable index is refused: a table that is not serving
 //!    items with `ResourceNotFoundException`, an `IndexName` the table declares no vector
 //!    index for and a `SearchVector` that is not the index's shape with
@@ -188,7 +188,8 @@ async fn the_index_distance_function_decides_which_items_are_most_similar() {
     // but twice as far, `c` points nearly that way, `b` is orthogonal to it. The last one
     // is NOT in any of the indexes — it carries no vector at all — so no search may ever
     // report it. A vector of the WRONG number of dimensions is not an item this table
-    // accepts at all (`a_write_whose_vector_is_not_the_indexed_shape_is_refused`).
+    // accepts at all (`a_write_whose_vector_is_not_the_indexed_shape_is_refused`, and
+    // `vector_write_validation` over every write operation).
     for (key, embedding_values) in [
         ("a", Some(vec![1.0, 0.0, 0.0])),
         ("b", Some(vec![0.0, 1.0, 0.0])),
@@ -308,19 +309,21 @@ async fn a_result_carries_the_attributes_the_index_projects() {
     // Rows differ along the index's `Projection` (the three `ProjectionType` values) and
     // along the `ProjectionExpression` the request narrows it with — absent, a written-out
     // name, several names, and a name reached through an `ExpressionAttributeNames` alias.
-    let cases: [(&str, Value, Value, &[&str]); 7] = [
+    // The vector attribute `emb` is in NO row: a search reports the attributes the index
+    // projects, and the vector it finds them by is not one of them.
+    let cases: [(&str, Value, Value, &[&str]); 8] = [
         (
             "all-index",
             Value::Null,
             Value::Null,
-            &["brand", "emb", "note", "pk", "tenant"],
+            &["brand", "note", "pk", "tenant"],
         ),
-        ("keys-index", Value::Null, Value::Null, &["emb", "pk", "tenant"]),
+        ("keys-index", Value::Null, Value::Null, &["pk", "tenant"]),
         (
             "include-index",
             Value::Null,
             Value::Null,
-            &["brand", "emb", "pk", "tenant"],
+            &["brand", "pk", "tenant"],
         ),
         ("all-index", json!("note"), Value::Null, &["note"]),
         ("all-index", json!("pk, note"), Value::Null, &["note", "pk"]),
@@ -331,8 +334,10 @@ async fn a_result_carries_the_attributes_the_index_projects() {
             &["brand"],
         ),
         // A projection that names an attribute the item does not hold reports nothing for
-        // it, the way a projection over a table's items does.
+        // it, the way a projection over a table's items does — and so does one naming an
+        // attribute the index does not project, or the vector attribute itself.
         ("all-index", json!("absent"), Value::Null, &[]),
+        ("keys-index", json!("note, emb"), Value::Null, &[]),
     ];
     for (index, projection_expression, names, expected) in cases {
         let case = format!("{index} projecting {projection_expression}");
@@ -399,11 +404,12 @@ async fn a_search_condition_filters_by_the_index_search_schema() {
         put(&router, "vector-search-conditions", item).await;
     }
 
-    // Rows differ along the operator the condition uses and the schema element it reads:
-    // the `HASH` element pinned by `=` (written both ways round), and a comparison, a
-    // range and a function over the `INLINE_FILTER` one beside it. Every row pins the
-    // `HASH` element, because the index partitions by it.
-    let cases: [(Value, Value, &[&str]); 8] = [
+    // Rows differ along the schema element the condition pins and the way it spells the
+    // equality (both ways round), and along how many of the schema's elements it reads:
+    // the `HASH` element alone, and the `HASH` element with the `INLINE_FILTER` one beside
+    // it. Every row pins the `HASH` element, because the index partitions by it, and every
+    // row reads its elements by equality — the only way a search condition may read them.
+    let cases: [(Value, Value, &[&str]); 6] = [
         (
             json!("tenant = :t"),
             json!({":t": {"S": "t1"}}),
@@ -420,28 +426,18 @@ async fn a_search_condition_filters_by_the_index_search_schema() {
             &["t2-cheap"],
         ),
         (
-            json!("tenant = :t AND price < :p"),
-            json!({":t": {"S": "t1"}, ":p": {"N": "10"}}),
+            json!("tenant = :t AND price = :p"),
+            json!({":t": {"S": "t1"}, ":p": {"N": "5"}}),
             &["t1-cheap"],
         ),
         (
-            json!("tenant = :t AND price BETWEEN :low AND :high"),
-            json!({":t": {"S": "t1"}, ":low": {"N": "0"}, ":high": {"N": "10"}}),
-            &["t1-cheap"],
-        ),
-        (
-            json!("tenant = :t AND price >= :p"),
+            json!("tenant = :t AND :p = price"),
             json!({":t": {"S": "t1"}, ":p": {"N": "50"}}),
             &["t1-dear"],
         ),
-        (
-            json!("tenant = :t AND attribute_exists(price)"),
-            json!({":t": {"S": "t1"}}),
-            &["t1-cheap", "t1-dear"],
-        ),
         // A condition nothing satisfies answers an empty result set, not an error.
         (
-            json!("tenant = :t AND price > :p"),
+            json!("tenant = :t AND price = :p"),
             json!({":t": {"S": "t1"}, ":p": {"N": "100"}}),
             &[],
         ),
@@ -466,43 +462,57 @@ async fn a_search_condition_filters_by_the_index_search_schema() {
 
     // The other half of the rule: a condition that reads the schema the wrong way is
     // refused rather than filtered. Rows differ along HOW it is wrong — a `HASH` element
-    // left unpinned (no condition at all, and a condition that only filters), and a `HASH`
-    // element read by a comparison, a range, a function, a negation and a path into it.
-    let refusals: [(Value, Value, &str); 8] = [
+    // left unpinned (no condition at all, and a condition that only filters), a schema
+    // element read by a comparison, a range, a function, a negation or a path into it, in
+    // each ROLE the schema can give it (which decides the sentence), and an attribute the
+    // schema does not name at all.
+    let refusals: [(Value, Value, &str); 10] = [
         (
             Value::Null,
             Value::Null,
-            "must be provided in the SearchConditionExpression",
+            "SearchConditionExpression must be provided when SearchSchema has a HASH key",
         ),
         (
-            json!("price < :p"),
+            json!("price = :p"),
             json!({":p": {"N": "10"}}),
             "must be provided in the SearchConditionExpression",
         ),
         (
             json!("tenant < :t"),
             json!({":t": {"S": "t2"}}),
-            "Only the equality operator",
+            "Only the equality operator (=) is supported for HASH attributes",
         ),
         (
             json!("tenant BETWEEN :low AND :high"),
             json!({":low": {"S": "t0"}, ":high": {"S": "t9"}}),
-            "Only the equality operator",
+            "Only the equality operator (=) is supported for HASH attributes",
         ),
         (
             json!("attribute_exists(tenant)"),
             Value::Null,
-            "Only the equality operator",
+            "Only the equality operator (=) is supported for HASH attributes",
         ),
         (
             json!("begins_with(tenant, :t)"),
             json!({":t": {"S": "t"}}),
-            "Only the equality operator",
+            "Only the equality operator (=) is supported for HASH attributes",
         ),
         (
             json!("NOT tenant <> :t"),
             json!({":t": {"S": "t1"}}),
-            "Only the equality operator",
+            "Only the equality operator (=) is supported for HASH attributes",
+        ),
+        // The INLINE_FILTER element is held to the same one operator, and refused with the
+        // sentence the service states for that role.
+        (
+            json!("tenant = :t AND price > :p"),
+            json!({":t": {"S": "t1"}, ":p": {"N": "15"}}),
+            "Invalid comparator used in SearchConditionExpression",
+        ),
+        (
+            json!("tenant = :t AND price BETWEEN :low AND :high"),
+            json!({":t": {"S": "t1"}, ":low": {"N": "0"}, ":high": {"N": "10"}}),
+            "Invalid comparator used in SearchConditionExpression",
         ),
         (
             json!("tenant = :t AND note = :n"),
@@ -566,7 +576,7 @@ async fn a_request_that_addresses_no_searchable_index_is_refused() {
     // Rows differ along WHICH part of the request addresses nothing searchable: the table,
     // the index, the vector's element type, and the vector's length — one element short,
     // one long, and far off.
-    let cases: [(&str, Value, &str, &str); 8] = [
+    let cases: [(&str, Value, &str, &str); 7] = [
         (
             "a table that does not exist",
             search_body("vector-search-absent", "refusal-index", &[1.0, 0.0, 0.0], 3),
@@ -589,7 +599,7 @@ async fn a_request_that_addresses_no_searchable_index_is_refused() {
             "a vector one dimension short",
             search_body("vector-search-refusals", "refusal-index", &[1.0, 0.0], 3),
             "ValidationException",
-            "number of dimensions",
+            "Input search vector dimension 2 does not match vector index dimension 3",
         ),
         (
             "a vector one dimension long",
@@ -600,13 +610,13 @@ async fn a_request_that_addresses_no_searchable_index_is_refused() {
                 3,
             ),
             "ValidationException",
-            "number of dimensions",
+            "Input search vector dimension 4 does not match vector index dimension 3",
         ),
         (
             "a vector of one dimension",
             search_body("vector-search-refusals", "refusal-index", &[1.0], 3),
             "ValidationException",
-            "number of dimensions",
+            "Input search vector dimension 1 does not match vector index dimension 3",
         ),
         (
             "a vector element that is not a number",
@@ -618,18 +628,6 @@ async fn a_request_that_addresses_no_searchable_index_is_refused() {
             }),
             "ValidationException",
             "32-bit IEEE-754",
-        ),
-        (
-            "a projection naming an attribute the index does not project",
-            json!({
-                "TableName": "vector-search-refusals",
-                "IndexName": "refusal-index",
-                "SearchVector": embedding(&[1.0, 0.0, 0.0]),
-                "TopK": 3,
-                "ProjectionExpression": "note",
-            }),
-            "ValidationException",
-            "Only attributes projected into the vector index can be retrieved",
         ),
     ];
     for (case, body, expected_code, expected_message) in cases {

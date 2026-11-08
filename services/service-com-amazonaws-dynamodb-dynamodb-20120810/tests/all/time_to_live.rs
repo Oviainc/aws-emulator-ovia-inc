@@ -10,14 +10,15 @@
 //!    operations ("A successful UpdateTimeToLive call returns the current
 //!    TimeToLiveSpecification" — the `UpdateTimeToLive` doc), through the transient
 //!    status the asynchronous change is reported in ("It can take up to one hour for the
-//!    change to fully process") and into the settled one; a table whose TTL has settled
-//!    off reports no attribute, which is also what a table that never had TTL reports;
+//!    change to fully process") and into the settled one; a table that has never been
+//!    given a specification reports TTL off with no attribute;
 //! 2. this API ENABLES OR DISABLES TTL, so a specification asking for the state the
 //!    table is already in is refused, and so is one naming an attribute other than the
 //!    one TTL is in force for — which is told which attribute that is;
-//! 3. a second change that arrives while the first is still processing is refused ("Any
-//!    additional UpdateTimeToLive calls for the same table during this one hour duration
-//!    result in a ValidationException"), and stores nothing;
+//! 3. a table's TTL setting takes ONE change per modification interval ("Any additional
+//!    UpdateTimeToLive calls for the same table during this one hour duration result in a
+//!    ValidationException"): a second change is refused while the first is still
+//!    processing AND once it has settled, and stores nothing;
 //! 4. while TTL is on, an item whose TTL attribute holds an epoch-SECONDS number already
 //!    in the past is deleted once the clock makes that deletion due ("If the epoch time
 //!    value stored in the attribute is less than the current time, the item is marked as
@@ -227,29 +228,10 @@ async fn the_specification_a_table_is_given_is_the_one_both_operations_report() 
             "case {case}: a second read reports the same description, got {again:?}"
         );
 
-        // DISABLE: the same round trip the other way.
-        let disabled = set_ttl_ok(&router, &name, false, attribute).await;
-        assert_eq!(
-            disabled["TimeToLiveSpecification"].clone(),
-            json!({"Enabled": false, "AttributeName": attribute}),
-            "case {case}: the disable returns the specification it stored, got {disabled}"
-        );
-        let disabling = described_ttl(&router, &name).await;
-        assert_eq!(
-            (
-                disabling["TimeToLiveStatus"].clone(),
-                disabling["AttributeName"].clone()
-            ),
-            (json!("DISABLING"), json!(attribute)),
-            "case {case}: the disable is still processing, got {disabling:?}"
-        );
-        settle().await;
-        let off = described_ttl(&router, &name).await;
-        assert_eq!(
-            (off["TimeToLiveStatus"].clone(), off["AttributeName"].clone()),
-            (json!("DISABLED"), Value::Null),
-            "case {case}: a table whose TTL has settled off reports no attribute, got {off:?}"
-        );
+        // The other direction of the round trip — the disable and the `DISABLING` status it
+        // leaves — cannot follow on this table: the setting takes one change per
+        // modification interval, which `a_second_change_inside_the_modification_interval_is_refused`
+        // pins.
     }
 }
 
@@ -260,14 +242,11 @@ async fn every_status_a_description_reports_is_one_the_model_declares() {
 
     // The status member is an enum, so what a description reports must be a value from
     // the model's own table rather than a spelling this emulator invented. Rows span the
-    // states a setting can be read in: never set, becoming on, on, becoming off, off.
+    // states one table's setting can be read in within the modification interval: never
+    // set, becoming on, and on.
     let mut seen: Vec<String> = Vec::new();
     seen.push(status_of(&described_ttl(&router, "Declared").await));
     set_ttl_ok(&router, "Declared", true, "ttl").await;
-    seen.push(status_of(&described_ttl(&router, "Declared").await));
-    settle().await;
-    seen.push(status_of(&described_ttl(&router, "Declared").await));
-    set_ttl_ok(&router, "Declared", false, "ttl").await;
     seen.push(status_of(&described_ttl(&router, "Declared").await));
     settle().await;
     seen.push(status_of(&described_ttl(&router, "Declared").await));
@@ -284,8 +263,6 @@ async fn every_status_a_description_reports_is_one_the_model_declares() {
             "DISABLED".to_string(),
             "ENABLING".to_string(),
             "ENABLED".to_string(),
-            "DISABLING".to_string(),
-            "DISABLED".to_string(),
         ],
         "case the whole walk: each state is reported in turn, got {seen:?}"
     );
@@ -304,20 +281,15 @@ async fn a_specification_asking_for_the_state_already_in_force_is_refused() {
     let router = emulator();
 
     // Rows differ in how the table reached the state asked for again: TTL off because it
-    // has never been set, off because it was turned off, and on because it was turned on.
-    // Each repeat is refused with the FIXED sentence for that state, and the refusal
-    // stores nothing.
-    let cases: [RepeatCase; 3] = [
+    // has never been set, and on because it was just turned on. Each repeat is refused
+    // with the FIXED sentence for that state — the state the table is in is permanent for
+    // the request as it stands, so it is answered ahead of the modification interval — and
+    // the refusal stores nothing. (A table whose TTL was turned OFF again cannot be reached
+    // inside the interval, so it has no row here.)
+    let cases: [RepeatCase; 2] = [
         (
             "off because it was never set",
             &[],
-            false,
-            TIME_TO_LIVE_ALREADY_DISABLED_MESSAGE,
-            "DISABLED",
-        ),
-        (
-            "off because it was turned off",
-            &[(true, "ttl"), (false, "ttl")],
             false,
             TIME_TO_LIVE_ALREADY_DISABLED_MESSAGE,
             "DISABLED",
@@ -406,56 +378,48 @@ async fn a_specification_naming_another_attribute_while_ttl_is_on_is_refused() {
             "case {case}: the refusal left the stored setting alone, got {described:?}"
         );
     }
-
-    // The attribute IS moved by turning TTL off and on again, so the refusals above are
-    // about the attribute named and not about the operation.
-    set_ttl_ok(&router, "Renamed", false, "expires_at").await;
-    settle().await;
-    set_ttl_ok(&router, "Renamed", true, "ttl").await;
-    settle().await;
-    let moved = described_ttl(&router, "Renamed").await;
-    assert_eq!(
-        (
-            moved["TimeToLiveStatus"].clone(),
-            moved["AttributeName"].clone()
-        ),
-        (json!("ENABLED"), json!("ttl")),
-        "case after turning TTL off and on: the new attribute is in force, got {moved:?}"
-    );
 }
 
+/// Rule 3: a table's TTL setting takes ONE change per modification interval. "It can take
+/// up to one hour for the change to fully process. Any additional UpdateTimeToLive calls
+/// for the same table during this one hour duration result in a ValidationException" (the
+/// `UpdateTimeToLive` doc), so the second change is refused both while the first is still
+/// processing and once its status has settled — the interval runs from the accepted change,
+/// not from the status it left behind
+/// (`service_com_amazonaws_dynamodb_dynamodb_20120810::state::TTL_MODIFICATION_INTERVAL`).
 #[tokio::test]
-async fn a_change_that_arrives_while_the_last_one_is_processing_is_refused() {
+async fn a_second_change_inside_the_modification_interval_is_refused() {
     let router = emulator();
 
-    // Rows differ in the change that arrives too early: the opposite toggle, in both
-    // directions, and one naming another attribute. While the last change is still
-    // processing every one of them is refused for THAT reason; the last column is what the
-    // same call gets once the clock has settled the first change — served, or refused on
-    // its own merits rather than on the timing.
-    let cases: [(&str, bool, bool, &str, Option<String>); 3] = [
-        ("a disable right after an enable", true, false, "ttl", None),
-        ("an enable right after a disable", false, true, "ttl", None),
+    // Rows differ in the change that arrives inside the interval: the opposite toggle, one
+    // that re-states what the first asked for, and one naming another attribute. The
+    // interval refuses a change the setting's own state would otherwise take; the rows
+    // whose second call is refused on its own merits instead (asking for the state in
+    // force, or naming another attribute while TTL is on) carry that sentence, because
+    // those refusals are permanent for the request as it stands.
+    let cases: [(&str, bool, &str, Option<String>); 3] = [
+        ("a disable right after an enable", false, "ttl", None),
+        (
+            "an enable right after an enable",
+            true,
+            "ttl",
+            Some(TIME_TO_LIVE_ALREADY_ENABLED_MESSAGE.to_string()),
+        ),
         (
             "a rename right after an enable",
-            true,
             true,
             "other",
             Some(time_to_live_attribute_mismatch("ttl")),
         ),
     ];
 
-    for (case, first, second, attribute, settled) in cases {
-        let name = format!("Processing{}", case.replace(' ', ""));
+    for (case, second, attribute, settled_merits) in cases {
+        let name = format!("Interval{}", case.replace(' ', ""));
         create_active_table(&router, &name).await;
-        // The table starts with TTL off, so a row whose first change is a disable turns
-        // it on and lets that settle before the row's own first change.
-        if !first {
-            set_ttl_ok(&router, &name, true, "ttl").await;
-            settle().await;
-        }
-        set_ttl_ok(&router, &name, first, "ttl").await;
+        set_ttl_ok(&router, &name, true, "ttl").await;
 
+        // While the first change is still processing, every one of them is refused on the
+        // interval: the setting is in no state the second call could be refused for yet.
         let (status, body) = set_ttl(&router, &name, second, attribute).await;
         assert_eq!(
             (status, error_code(&body), message(&body)),
@@ -464,33 +428,42 @@ async fn a_change_that_arrives_while_the_last_one_is_processing_is_refused() {
                 "ValidationException".to_string(),
                 TIME_TO_LIVE_MODIFIED_TOO_OFTEN_MESSAGE.to_string()
             ),
-            "case {case}: a change during the last one is refused, got {status} with {body}"
+            "case {case}: a change inside the interval is refused, got {status} with {body}"
         );
         let during = described_ttl(&router, &name).await;
         assert_eq!(
             during["TimeToLiveStatus"].clone(),
-            json!(if first { "ENABLING" } else { "DISABLING" }),
+            json!("ENABLING"),
             "case {case}: the refusal stored nothing, got {during:?}"
         );
 
-        // Once the clock has settled the first change, the timing no longer refuses the
-        // second one.
+        // The status settles long before the interval is out, and the second change is
+        // STILL refused: a change the status no longer refuses is refused on the interval.
         settle().await;
+        let settled = described_ttl(&router, &name).await;
+        assert_eq!(
+            settled["TimeToLiveStatus"].clone(),
+            json!("ENABLED"),
+            "case {case}: the first change settles on its own clock, got {settled:?}"
+        );
         let (status, body) = set_ttl(&router, &name, second, attribute).await;
-        match settled {
-            None => assert_eq!(
-                (status, body["TimeToLiveSpecification"]["Enabled"].clone()),
-                (200, json!(second)),
-                "case {case}: the change is served once the last one settled, got {status} \
-                 with {body}"
+        let expected = settled_merits
+            .unwrap_or_else(|| TIME_TO_LIVE_MODIFIED_TOO_OFTEN_MESSAGE.to_string());
+        assert_eq!(
+            (status, error_code(&body), message(&body)),
+            (400, "ValidationException".to_string(), expected.clone()),
+            "case {case}: once the status settled the change is still refused with \
+             {expected:?}, got {status} with {body}"
+        );
+        let after = described_ttl(&router, &name).await;
+        assert_eq!(
+            (
+                after["TimeToLiveStatus"].clone(),
+                after["AttributeName"].clone()
             ),
-            Some(expected) => assert_eq!(
-                (status, error_code(&body), message(&body)),
-                (400, "ValidationException".to_string(), expected),
-                "case {case}: once settled it is refused on its own merits, got {status} \
-                 with {body}"
-            ),
-        }
+            (json!("ENABLED"), json!("ttl")),
+            "case {case}: the second refusal stored nothing either, got {after:?}"
+        );
     }
 }
 
@@ -559,14 +532,13 @@ async fn an_item_is_deleted_only_once_its_own_epoch_second_has_made_it_due() {
 async fn items_of_a_table_whose_ttl_is_off_never_expire() {
     let router = emulator();
 
-    // Rows differ in why the table expires nothing: TTL never set, TTL turned off again,
-    // and TTL enabled over ANOTHER attribute than the one the item carries. The item's own
-    // value is the same long-past epoch second in each, so what differs is the table's
-    // setting and not the item.
+    // Rows differ in why the table expires nothing: TTL never set, and TTL enabled over
+    // ANOTHER attribute than the one the item carries. The item's own value is the same
+    // long-past epoch second in each, so what differs is the table's setting and not the
+    // item.
     let now = epoch_seconds_now();
-    let cases: [(&str, &[(bool, &str)]); 3] = [
+    let cases: [(&str, &[(bool, &str)]); 2] = [
         ("TTL was never set", &[]),
-        ("TTL was turned off again", &[(true, "ttl"), (false, "ttl")]),
         ("TTL is on for another attribute", &[(true, "other")]),
     ];
 
@@ -600,17 +572,10 @@ async fn a_backup_records_the_ttl_setting_its_table_had_when_it_was_taken() {
 
     // `SourceTableFeatureDetails$TimeToLiveDescription` is "the description of the Time
     // to Live (TTL) status on the specified table" as the backup recorded it, so rows
-    // differ in the setting in force when the backup was taken: none ever set, on, and
-    // off again after being on.
-    let cases: [BackupCase; 3] = [
+    // differ in the setting in force when the backup was taken: none ever set, and on.
+    let cases: [BackupCase; 2] = [
         ("TTL was never set", &[], "DISABLED", Value::Null),
         ("TTL is on", &[(true, "expires_at")], "ENABLED", json!("expires_at")),
-        (
-            "TTL was turned off again",
-            &[(true, "expires_at"), (false, "expires_at")],
-            "DISABLED",
-            Value::Null,
-        ),
     ];
 
     for (case, toggles, status, attribute) in cases {

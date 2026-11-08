@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::contributor_insights::{create_table, settle};
-use crate::emulator::{call, emulator, error_code, message, ok, REGION};
+use crate::emulator::{call, emulator, ensure_kinesis_stream, error_code, message, ok, REGION};
 
 /// The ARN of a Kinesis data stream in the region the suite drives, built through the
 /// same ARN helper the emulator mints every other ARN with.
@@ -84,6 +84,9 @@ async fn arrange(router: &MultiServiceRouter, table: &str, arn: &str, reached: R
     if matches!(reached, Reached::Absent) {
         return;
     }
+    // The destination's stream has to EXIST for the registration to replicate at all: one
+    // whose `StreamArn` resolves to no stream settles `ENABLE_FAILED`.
+    ensure_kinesis_stream(router, "cdc").await;
     ok(
         router,
         "EnableKinesisStreamingDestination",

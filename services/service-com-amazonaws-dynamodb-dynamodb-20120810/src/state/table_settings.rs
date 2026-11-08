@@ -333,13 +333,21 @@ pub fn time_to_live_attribute_mismatch(attribute_in_force: &str) -> String {
     )
 }
 
-/// How a call that arrives while the last TTL change is still processing is refused:
+/// How a call that arrives while the last TTL change is still rate-limited is refused:
 /// "Any additional UpdateTimeToLive calls for the same table during this one hour
-/// duration result in a ValidationException" (the `UpdateTimeToLive` doc). The span this
-/// emulator processes a change over is [`STATUS_TRANSITION`], the one every other
-/// transient status here is reported for.
+/// duration result in a ValidationException" (the `UpdateTimeToLive` doc).
 pub const TIME_TO_LIVE_MODIFIED_TOO_OFTEN_MESSAGE: &str =
     "Time to live has been modified multiple times within a fixed interval";
+
+/// How long after one accepted `UpdateTimeToLive` the NEXT one is refused.
+///
+/// A documented duration, kept as documented: "It can take up to one hour for the change
+/// to fully process. Any additional UpdateTimeToLive calls for the same table during this
+/// one hour duration result in a ValidationException" (the `UpdateTimeToLive` doc). It is
+/// NOT the span the setting's transient status is reported for ([`STATUS_TRANSITION`]):
+/// the status settles on its own clock — a table reports `ENABLED` well before the hour is
+/// out — while a second change stays refused for the whole interval.
+pub const TTL_MODIFICATION_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// One table's Time to Live setting: what the last accepted `UpdateTimeToLive` asked
 /// for, when it was accepted, and when this table's items were last swept.
@@ -360,6 +368,10 @@ pub struct TimeToLive {
     pub(super) attribute_name: Option<String>,
     /// When the clock owes the move out of the transient status.
     pub(super) settles_at: Option<SystemTime>,
+    /// When the last accepted change was made, or `None` while no request has named this
+    /// table — the instant the [`TTL_MODIFICATION_INTERVAL`] a further change is refused
+    /// inside is counted from.
+    pub(super) changed_at: Option<SystemTime>,
     /// When this table's items were last swept for expiries, or `None` while they never
     /// have been.
     pub(super) swept_at: Option<SystemTime>,
@@ -372,6 +384,15 @@ impl TimeToLive {
         self.enabled = enabled;
         self.attribute_name = Some(attribute_name.to_string());
         self.settles_at = Some(now + STATUS_TRANSITION);
+        self.changed_at = Some(now);
+    }
+
+    /// Whether this table's TTL setting may be changed at `now`: a change is accepted only
+    /// once the [`TTL_MODIFICATION_INTERVAL`] since the last accepted one has passed, and a
+    /// table no change has ever been made to is always modifiable.
+    pub fn modifiable(&self, now: SystemTime) -> bool {
+        self.changed_at
+            .is_none_or(|changed| now >= changed + TTL_MODIFICATION_INTERVAL)
     }
 
     /// Whether the clock has already settled the last change this setting was given.
@@ -494,6 +515,10 @@ pub const DESTINATION_STATUS_ACTIVE: &str = "ACTIVE";
 pub const DESTINATION_STATUS_UPDATING: &str = "UPDATING";
 pub const DESTINATION_STATUS_DISABLING: &str = "DISABLING";
 pub const DESTINATION_STATUS_DISABLED: &str = "DISABLED";
+/// The status an enable that cannot be completed settles in — "ENABLE_FAILED" exists for
+/// a replication the service could not start, which is what a `StreamArn` naming a stream
+/// that does not exist asks for ([`kinesis_stream_exists`]).
+pub const DESTINATION_STATUS_ENABLE_FAILED: &str = "ENABLE_FAILED";
 
 /// How DynamoDB opens its refusal of a command against a table's Kinesis streaming
 /// destination that the table's state cannot serve; the reason follows the colon.
@@ -549,8 +574,9 @@ pub fn kinesis_destination_not_active_to_update(table: &str, stream_arn: &str) -
 /// stop command's refusal is stated over the status it requires
 /// ([`kinesis_destination_not_active_to_disable`]): it names neither the table nor the
 /// stream. `ENABLE_FAILED` is named beside `DISABLED` because AWS states both as the
-/// statuses an enable may start from; this store reaches `DISABLED` and never that one,
-/// so no record of it is kept here.
+/// statuses an enable may start from, and this store reaches both: a destination whose
+/// stream could not be resolved settles `ENABLE_FAILED`, and an enable may be retried
+/// from there.
 pub fn kinesis_destination_not_enableable() -> RequestError {
     RequestError::Validation(format!(
         "{KINESIS_DESTINATION_INVALID_STATE}: EnableKinesisStreamingDestination must be \
@@ -637,6 +663,20 @@ impl KinesisDestination {
         }
     }
 
+    /// The same registration for an enable that CANNOT be completed: the record is
+    /// `ENABLING` for the span, like any other, and settles in `ENABLE_FAILED` instead of
+    /// `ACTIVE`.
+    ///
+    /// Nothing replicates to a stream that does not exist, so the destination never
+    /// reaches `ACTIVE`; the status that says so is the one the model declares for it, and
+    /// a later enable may start again from it ([`kinesis_destination_not_enableable`]).
+    pub fn enable_failing(stream_arn: &str, precision: Option<&str>, now: SystemTime) -> Self {
+        Self {
+            settled_status: DESTINATION_STATUS_ENABLE_FAILED,
+            ..Self::enabling(stream_arn, precision, now)
+        }
+    }
+
     /// The status at `now`: the transient one until the clock has made the move due,
     /// then the settled one.
     pub fn status(&self, now: SystemTime) -> &'static str {
@@ -650,10 +690,13 @@ impl KinesisDestination {
     /// Whether this record still REPLICATES — the destination a command that addresses
     /// a table's live replication to this stream acts on. A record whose replication has
     /// stopped, or is stopping, is history: it is still reported, and no longer
-    /// addressable.
+    /// addressable. A record whose enable FAILED never replicated at all, so it is not
+    /// live either, and an enable may start again from it.
     pub fn replicating(&self, now: SystemTime) -> bool {
         let status = self.status(now);
-        status != DESTINATION_STATUS_DISABLED && status != DESTINATION_STATUS_DISABLING
+        status != DESTINATION_STATUS_DISABLED
+            && status != DESTINATION_STATUS_DISABLING
+            && status != DESTINATION_STATUS_ENABLE_FAILED
     }
 
     /// Whether this record is `ACTIVE` at `now` — replication running, with no
@@ -709,5 +752,110 @@ impl KinesisDestination {
             destination_status_description: None,
             approximate_creation_date_time_precision: self.precision(),
         }
+    }
+}
+
+/// The settings' own clock-driven transitions, asserted over instants a WIRE test cannot
+/// reach: the TTL modification interval is an hour, so the state a second change is served
+/// from — and the statuses a change that is served leaves behind — are stated here, where
+/// the instant one was accepted at can be put in the past.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// One instant the cases below are stated about, so no case depends on the clock
+    /// advancing while it runs.
+    fn at(seconds_ago: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000 - seconds_ago)
+    }
+
+    #[test]
+    fn a_change_is_served_only_once_the_modification_interval_has_passed() {
+        let now = at(0);
+        let mut setting = TimeToLive::default();
+        // A table no change has ever been made to takes one.
+        assert!(
+            setting.modifiable(now),
+            "a setting no change has been made to must be modifiable, got {setting:?}"
+        );
+
+        setting.apply(true, "expires_at", now);
+        // Rows: the instant of the change, every instant inside the interval, the instant
+        // the interval falls due, and one past it.
+        for (case, asked, modifiable) in [
+            ("at the change itself", now, false),
+            ("one second in", now + Duration::from_secs(1), false),
+            (
+                "one second before the interval is out",
+                now + TTL_MODIFICATION_INTERVAL - Duration::from_secs(1),
+                false,
+            ),
+            ("as the interval falls due", now + TTL_MODIFICATION_INTERVAL, true),
+            (
+                "past the interval",
+                now + TTL_MODIFICATION_INTERVAL + Duration::from_secs(1),
+                true,
+            ),
+        ] {
+            assert_eq!(
+                setting.modifiable(asked),
+                modifiable,
+                "case {case:?}: expected modifiable={modifiable}, got {setting:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_disable_settles_the_setting_off_on_the_status_clock() {
+        // TTL turned on an interval ago, so the disable below is a change the setting takes.
+        let enabled_at = at(TTL_MODIFICATION_INTERVAL.as_secs());
+        let now = at(0);
+        let mut setting = TimeToLive::default();
+        setting.apply(true, "expires_at", enabled_at);
+        assert_eq!(
+            (setting.status(now), setting.attribute_in_force(now)),
+            (TIME_TO_LIVE_ENABLED, Some("expires_at")),
+            "case \"the settled enable\": expected ENABLED on its attribute, got {setting:?}"
+        );
+
+        setting.apply(false, "expires_at", now);
+        // The status clock is the transient span, not the modification interval: the
+        // setting is DISABLING for that span and DISABLED after it, and a setting that has
+        // settled off expires nothing and reports no attribute.
+        for (case, asked, status, in_force, attribute) in [
+            (
+                "while the disable is processing",
+                now,
+                TIME_TO_LIVE_DISABLING,
+                None,
+                Some("expires_at"),
+            ),
+            (
+                "as the transient span falls due",
+                now + STATUS_TRANSITION,
+                TIME_TO_LIVE_DISABLED,
+                None,
+                None,
+            ),
+        ] {
+            let described = setting.describe(asked);
+            assert_eq!(
+                (
+                    setting.status(asked),
+                    setting.attribute_in_force(asked),
+                    described.attribute_name.as_deref(),
+                ),
+                (status, in_force, attribute),
+                "case {case:?}: expected {status} on {attribute:?}, got {described:?}"
+            );
+        }
+
+        // And the disable itself starts the interval again: the setting takes no further
+        // change until it is out.
+        assert!(
+            !setting.modifiable(now + STATUS_TRANSITION),
+            "case \"after the disable settled\": the interval runs from the change, got \
+             {setting:?}"
+        );
     }
 }

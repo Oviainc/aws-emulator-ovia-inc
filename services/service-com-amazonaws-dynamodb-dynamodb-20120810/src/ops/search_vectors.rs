@@ -8,10 +8,10 @@
 //!
 //! Everything reported is computed from stored state: the index comes from the table
 //! `CreateTable`/`UpdateTable` wrote, the candidates are the table's own items (those the
-//! index covers, carrying a vector of the index's dimensions), and each result item is
-//! the ENTRY the index holds for it ([`crate::state::VectorIndex::index_entry`]) — the
-//! same projection the index is sized by, so a search can report only what the index
-//! stores.
+//! index covers, carrying a vector of the index's dimensions), and each result item is the
+//! entry the index REPORTS for it ([`crate::state::VectorIndex::reported_entry`]) — the
+//! attributes the index projects, without the vector it finds them by, so a search can
+//! report only what the index stores and never the embedding itself.
 //!
 //! The refusals, each grounded in the operation's own contract:
 //!
@@ -22,10 +22,9 @@
 //!   `ValidationException` this service words for an index a request names and the table
 //!   does not have, over the name the request sent
 //!   ([`crate::state::unknown_index_named`]);
-//! * a `SearchVector` whose length differs from the index's `Dimensions`, a
-//!   `ProjectionExpression` naming an attribute the index does not project, and a
+//! * a `SearchVector` whose length differs from the index's `Dimensions`, and a
 //!   `SearchConditionExpression` that reads an attribute outside the index's search
-//!   schema, reads a `HASH` element any way other than by pinning it with `=`, or leaves
+//!   schema, reads a schema element any way other than by pinning it with `=`, or leaves
 //!   a `HASH` element unpinned, are refused as `ValidationException`s;
 //! * a table whose resource-based policy denies the caller `dynamodb:SearchVectors` is
 //!   answered `AccessDeniedException` instead of its items.
@@ -314,34 +313,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         // "Only attributes projected into the vector index can be retrieved"
-        // (`SearchVectors$ProjectionExpression`). An index that projects `ALL` stores every
-        // attribute of an item, so there is no name it could refuse.
-        let stored_attributes = index.stored_attributes(&table.key_schema);
-        if let (Some(requested), Some(stored)) =
-            (requested_attributes.as_ref(), stored_attributes.as_ref())
-        {
-            if requested
-                .iter()
-                .map(|path| path.attribute())
-                .any(|name| !stored.contains(name))
-            {
-                return Err(lift(crate::state::RequestError::Validation(
-                    UNPROJECTED_ATTRIBUTE_MESSAGE.to_string(),
-                )));
-            }
-        }
+        // (`SearchVectors$ProjectionExpression`): a path the index does not hold the
+        // attribute for reports nothing for it, the way a projection over a table's items
+        // reports nothing for an attribute the item does not carry. The projection is
+        // applied to the entry below, so there is no name to refuse here.
+        //
         // How the condition may read the index's search schema, from
         // `SearchVectors$SearchConditionExpression` and
         // `SearchSchemaElement$SearchSchemaElementType`:
         //
         // * "Only top-level attributes from the search schema can be referenced";
-        // * "Only the equality operator (=) is supported for HASH attributes. Comparison
-        //   and range operators are supported for INLINE_FILTER attributes";
+        // * a schema element is read by PINNING it with `=` and no other way. The model
+        //   states that for the `HASH` elements ("Only the equality operator (=) is
+        //   supported for HASH attributes"); the service applies it to the `INLINE_FILTER`
+        //   elements too, which is the behaviour recorded for a range comparator over one
+        //   of them, and each role is refused with its own sentence;
         // * a `HASH` element partitions the index, and "when specified, you must provide
         //   this attribute's value in the SearchConditionExpression" — so a search of an
         //   index that declares one must pin it, whether or not it carries a condition at
         //   all. An `INLINE_FILTER` element is "optional in the
-        //   SearchConditionExpression".
+        //   SearchConditionExpression", so a condition may leave it out.
         let reads = condition
             .as_ref()
             .map(crate::state::ParsedCondition::attribute_reads)
@@ -356,13 +347,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     SEARCH_SCHEMA_ATTRIBUTE_MESSAGE.to_string(),
                 )));
             };
-            if element.search_schema_element_type == crate::state::SEARCH_SCHEMA_PARTITION_KEY
-                && kinds
-                    .iter()
-                    .any(|kind| *kind != crate::state::AttributeRead::Equality)
+            if kinds
+                .iter()
+                .any(|kind| *kind != crate::state::AttributeRead::Equality)
             {
+                // The element's ROLE decides how the refusal is worded: the model states a
+                // sentence of its own for a `HASH` attribute read by anything but `=`, and
+                // the recorded refusal of a comparator over an `INLINE_FILTER` attribute is
+                // what the service states for that one.
+                let message = if element.search_schema_element_type
+                    == crate::state::SEARCH_SCHEMA_PARTITION_KEY
+                {
+                    PARTITION_KEY_EQUALITY_MESSAGE
+                } else {
+                    INLINE_FILTER_COMPARATOR_MESSAGE
+                };
                 return Err(lift(crate::state::RequestError::Validation(
-                    PARTITION_KEY_EQUALITY_MESSAGE.to_string(),
+                    message.to_string(),
                 )));
             }
         }
@@ -379,8 +380,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .any(|element| !partition_pinned(element))
         {
+            // A request that carries NO condition at all over an index that partitions is
+            // missing the member itself, which is what AWS states; one that carries a
+            // condition leaving an element unpinned is told which value the condition owes.
+            let message = if input.search_condition_expression.is_none() {
+                SEARCH_CONDITION_REQUIRED_MESSAGE
+            } else {
+                PARTITION_KEY_REQUIRED_MESSAGE
+            };
             return Err(lift(crate::state::RequestError::Validation(
-                PARTITION_KEY_REQUIRED_MESSAGE.to_string(),
+                message.to_string(),
             )));
         }
         let Some(distance) = DistanceFunction::resolve(&index.distance_function) else {
@@ -430,7 +439,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !search_results.is_empty() && reported_bytes >= MAX_PAGE_BYTES {
                 break;
             }
-            let entry = index.index_entry(item, &table.key_schema);
+            let entry = index.reported_entry(item, &table.key_schema);
             let projected = match requested_attributes.as_ref() {
                 Some(requested) => crate::state::project_paths(&entry, requested),
                 None => entry,
@@ -466,16 +475,10 @@ const PROJECTION_EXPRESSION: &str = "ProjectionExpression";
 /// which of the two to change.
 fn dimension_mismatch(provided: usize, configured: i64) -> crate::state::RequestError {
     crate::state::RequestError::Validation(format!(
-        "The number of dimensions in the search vector must match the number of dimensions \
-         configured for the vector index: provided {provided}, configured {configured}"
+        "Input search vector dimension {provided} does not match vector index dimension \
+         {configured}"
     ))
 }
-
-/// How a `ProjectionExpression` naming an attribute the index does not hold is refused:
-/// the rule the model states for that member ("Only attributes projected into the vector
-/// index can be retrieved" — `SearchVectors$ProjectionExpression`).
-const UNPROJECTED_ATTRIBUTE_MESSAGE: &str =
-    "Only attributes projected into the vector index can be retrieved";
 
 /// How a `SearchConditionExpression` that reads an attribute outside the index's search
 /// schema is refused: the rule the model states for that member ("Only top-level
@@ -485,12 +488,22 @@ const SEARCH_SCHEMA_ATTRIBUTE_MESSAGE: &str =
     "Only top-level attributes from the vector index search schema can be referenced in a \
      SearchConditionExpression";
 
-/// How a condition that reads a `HASH` search-schema element any other way than by
-/// pinning it is refused: the rule the model states ("Only the equality operator (=) is
-/// supported for HASH attributes" — `SearchVectors$SearchConditionExpression`).
+/// How a condition that reads a `HASH` search-schema element any other way than by pinning
+/// it with `=` is refused: the rule the model states for that element, in its own terms
+/// ("Only the equality operator (=) is supported for HASH attributes" —
+/// `SearchVectors$SearchConditionExpression`).
 const PARTITION_KEY_EQUALITY_MESSAGE: &str =
     "Only the equality operator (=) is supported for HASH attributes in a \
      SearchConditionExpression";
+
+/// How the same read of an `INLINE_FILTER` element is refused.
+///
+/// The model says comparison and range operators are supported for those attributes, and
+/// the recorded service refuses them: a range comparator over an inline filter is answered
+/// this sentence, recorded verbatim, so it is what the emulator states for an element the
+/// schema gave that role.
+const INLINE_FILTER_COMPARATOR_MESSAGE: &str =
+    "Invalid SearchConditionExpression: Invalid comparator used in SearchConditionExpression";
 
 /// How a search of an index that partitions by a `HASH` search-schema element is refused
 /// when the condition does not pin it: "When specified, you must provide this attribute's
@@ -499,6 +512,12 @@ const PARTITION_KEY_EQUALITY_MESSAGE: &str =
 const PARTITION_KEY_REQUIRED_MESSAGE: &str =
     "The value of each HASH attribute of the vector index search schema must be provided in \
      the SearchConditionExpression";
+
+/// The same requirement where the request carries no `SearchConditionExpression` at all:
+/// the member itself is what is missing, which is the fixed sentence AWS states for an
+/// index whose search schema partitions.
+const SEARCH_CONDITION_REQUIRED_MESSAGE: &str =
+    "SearchConditionExpression must be provided when SearchSchema has a HASH key";
 
 /// The modelled server error for a request that cannot reach this service's store.
 fn store_unavailable() -> SearchVectorsError {

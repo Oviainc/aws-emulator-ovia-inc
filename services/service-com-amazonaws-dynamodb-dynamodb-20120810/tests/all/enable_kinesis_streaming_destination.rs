@@ -46,7 +46,7 @@ use smithy_server_runtime::MultiServiceRouter;
 use service_com_amazonaws_dynamodb_dynamodb_20120810::state;
 
 use crate::contributor_insights::{create_table, settle};
-use crate::emulator::{call, emulator, error_code, message, ok, REGION};
+use crate::emulator::{call, emulator, ensure_kinesis_stream, error_code, message, ok, REGION};
 
 /// The ARN of a Kinesis data stream in the region the suite drives, built through the
 /// same ARN helper the emulator mints every other ARN with.
@@ -59,6 +59,15 @@ fn stream_arn(name: &str) -> String {
 /// (`smithy_query(query="shape",shape="ApproximateCreationDateTimePrecision")`:
 /// `MILLISECOND | MICROSECOND`).
 const PRECISIONS: [&str; 2] = ["MILLISECOND", "MICROSECOND"];
+
+/// Every Kinesis data stream the destinations below name, created on the emulator's
+/// Kinesis service so an enable can RESOLVE them: a destination whose `StreamArn` names no
+/// stream never replicates, so a suite about registration creates its streams first.
+async fn declared_streams(router: &MultiServiceRouter) {
+    for name in ["cdc", "audit", "history", "replacement"] {
+        ensure_kinesis_stream(router, name).await;
+    }
+}
 
 /// Start replication of `table` to `stream` over the wire, leaving the registration span
 /// owed: a caller that needs it replicating waits that span out with [`settle`].
@@ -184,6 +193,7 @@ async fn an_enable_registers_the_destination_it_names() {
 
     for (index, (case, named, by_arn)) in cases.into_iter().enumerate() {
         let router = emulator();
+        declared_streams(&router).await;
         let table = format!("Registered{index}");
         create_table(&router, &table, &[]).await;
         let arn = stream_arn("cdc");
@@ -275,6 +285,7 @@ async fn an_enable_of_a_stream_already_replicating_is_refused() {
 
     for (index, (case, settled, updating)) in cases.into_iter().enumerate() {
         let router = emulator();
+        declared_streams(&router).await;
         let table = format!("Running{index}");
         create_table(&router, &table, &[]).await;
         let arn = stream_arn("cdc");
@@ -350,6 +361,7 @@ async fn an_enable_of_a_stream_already_replicating_is_refused() {
 #[tokio::test]
 async fn an_enable_re_registers_a_stopped_stream_in_place() {
     let router = emulator();
+    declared_streams(&router).await;
     create_table(&router, "Replaced", &[]).await;
     create_table(&router, "Untouched", &[]).await;
     for (stream, precision) in [
@@ -455,6 +467,7 @@ async fn an_enable_re_registers_a_stopped_stream_in_place() {
 #[tokio::test]
 async fn an_enable_resolves_the_table_and_the_stream_it_names() {
     let router = emulator();
+    declared_streams(&router).await;
     create_table(&router, "Resolved", &[]).await;
     let arn = stream_arn("cdc");
 

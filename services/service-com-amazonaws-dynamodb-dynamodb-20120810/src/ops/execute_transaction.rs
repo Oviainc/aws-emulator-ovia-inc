@@ -642,6 +642,7 @@ fn write_transaction(
                 let table = store.active_table(region, &name, now).map_err(lift)?;
                 table.check_index_key_types(&item).map_err(keying)?;
                 table.check_index_key_values(&item).map_err(lift)?;
+                table.check_vector_attributes(&item).map_err(lift)?;
                 let key = table.key_of_item(&item).map_err(keying)?;
                 let before = table.items.get(&key).cloned();
                 // An `INSERT` is a put that must not replace, so a primary key that
@@ -730,6 +731,7 @@ fn write_transaction(
                         let table = store.active_table(region, &name, now).map_err(lift)?;
                         table.check_index_key_types(&item).map_err(keying)?;
                         table.check_index_key_values(&item).map_err(lift)?;
+                        table.check_vector_attributes(&item).map_err(lift)?;
                     }
                     let reported = crate::state::projected_return_values(
                         update

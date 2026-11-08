@@ -137,6 +137,11 @@ service-com-amazonaws-iot-awsiotservice = { workspace = true }
 # invoke a function behind it — must have its owning service mounted beside CloudFormation,
 # or the create is refused and the stack fails.
 service-com-amazonaws-apigatewayv2-apigatewayv2 = { workspace = true }
+# Amazon Kinesis, for the data stream an `AWS::DynamoDB::Table`'s
+# `KinesisStreamSpecification` replicates its changes to: DynamoDB resolves that ARN against
+# the Kinesis service's own stream registry, so a suite that declares one must create the
+# stream there first or the destination never replicates.
+service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
 
 [lints]
 workspace = true

@@ -417,6 +417,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     deny(&caller, table, action, now)?;
                     table.check_index_key_types(&item).map_err(keying)?;
                     table.check_index_key_values(&item).map_err(lift)?;
+                    table.check_vector_attributes(&item).map_err(lift)?;
                     Prepared {
                         key: table.key_of_item(&item).map_err(keying)?,
                         addressed: item.clone(),
@@ -492,6 +493,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     let table = store.active_table(&region, &name, now).map_err(lift)?;
                     table.check_index_key_types(&item).map_err(keying)?;
                     table.check_index_key_values(&item).map_err(lift)?;
+                    table.check_vector_attributes(&item).map_err(lift)?;
                     Prepared {
                         key,
                         addressed: item.clone(),
