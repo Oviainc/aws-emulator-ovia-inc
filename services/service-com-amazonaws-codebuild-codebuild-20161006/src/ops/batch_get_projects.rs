@@ -138,6 +138,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
+        // `names` takes "the names or ARNs of the build projects", and a value that is
+        // neither is no project identifier at all: it is refused here, ahead of the
+        // lookup, with the sentence CodeBuild states for a name it cannot be written
+        // with — rather than absorbed into `projectsNotFound`, which a caller could not
+        // tell from "this account holds no such project". `names` targets
+        // `NonEmptyString`, so the model constrains nothing here and the rule is the
+        // service's: `crate::state::project_identifier_violation`.
+        if let Some(message) = input
+            .names
+            .iter()
+            .find_map(|identifier| crate::state::project_identifier_violation(identifier))
+        {
+            return Err(BatchGetProjectsErrorModeled::InvalidInputException(
+                InvalidInputException {
+                    message: Some(message.to_string()),
+                },
+            )
+            .into());
+        }
+
         // A read: it reports what CreateProject stored, in the order the request
         // named the projects, and splits the identifiers it does not hold into
         // `projectsNotFound`. `names` is documented as "The names or ARNs of the build        // projects", so each identifier is resolved through

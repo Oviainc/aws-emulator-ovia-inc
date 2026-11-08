@@ -22,9 +22,34 @@ use service_com_amazonaws_codebuild_codebuild_20161006::state;
 use super::project_build_lifecycle::{call, create_project, emulator, error_type, REGION};
 
 /// The `message` an error body carries.
-fn message(body: &Value) -> String {
+///
+/// `pub(crate)`: the suites that assert on a refusal's wording share this reader rather
+/// than each growing a copy of it.
+pub(crate) fn message(body: &Value) -> String {
     body["message"].as_str().unwrap_or_default().to_string()
 }
+
+/// Every class of character the name patterns of this service exclude, each in a name of
+/// its own: a path separator, a space, punctuation, an ARN separator, a dot, a plus sign,
+/// a non-ASCII letter, whitespace alone, and a name that is one illegal character.
+///
+/// None of these is a character `FleetName` (`^[A-Za-z0-9][A-Za-z0-9\-_]{1,127}$`) or
+/// `ProjectName` (`^[A-Za-z0-9][A-Za-z0-9\-_]{1,149}$`) allows — the two patterns admit
+/// the same set — so ONE table serves every suite that drives an unwritable name, and the
+/// rows cannot drift apart between them. `pub(crate)` for that reason;
+/// `name_character_refusals` drives the same rows through the operations that CREATE a
+/// resource.
+pub(crate) const UNSUPPORTED_NAMES: [(&str, &str); 9] = [
+    ("a slash", "slash/name"),
+    ("a space", "not a name"),
+    ("an exclamation mark", "name!!"),
+    ("a colon", "name:one"),
+    ("a dot", "name.one"),
+    ("a plus sign", "name+one"),
+    ("a non-ASCII letter", "náme"),
+    ("whitespace alone", "\t"),
+    ("a star", "*"),
+];
 
 /// RULE: a compute-fleet identifier is either an ARN or a fleet NAME, and a fleet name is
 /// written with the characters the model's `FleetName` pattern allows
@@ -37,21 +62,10 @@ async fn batch_get_fleets_refuses_a_name_that_is_not_a_fleet_name() {
     let router = emulator();
 
     // Every class of character the fleet-name pattern excludes, each tried in a name of
-    // its own: a space, punctuation, a path separator, a colon, a dot, a non-ASCII
-    // letter, and a name that is nothing but whitespace. None of these is a character
-    // CreateFleet would have accepted in a name.
-    let refused = [
-        ("a space", "not a fleet"),
-        ("an exclamation mark", "fleet!!"),
-        ("a slash", "fleet/one"),
-        ("a colon", "fleet:one"),
-        ("a dot", "fleet.one"),
-        ("a non-ASCII letter", "flée t"),
-        ("a plus sign", "fleet+one"),
-        ("whitespace alone", "\t"),
-        ("a star", "*"),
-    ];
-    for (case, name) in refused {
+    // its own — the table every suite of this crate drives an unwritable name from. None
+    // of these is a character CreateFleet would have accepted in a name either, which is
+    // what `name_character_refusals` asserts over the same rows.
+    for (case, name) in UNSUPPORTED_NAMES {
         let (status, body) = call(&router, "BatchGetFleets", json!({"names": [name]})).await;
         assert_eq!(status, 400, "case {case:?}: expected 400, got {status} with {body}");
         assert_eq!(

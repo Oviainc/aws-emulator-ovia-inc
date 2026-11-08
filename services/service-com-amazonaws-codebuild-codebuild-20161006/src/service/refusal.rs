@@ -16,7 +16,7 @@
 //! model puts on it — never to one operation or one recorded request.
 
 use aws_smithy_schema::{Schema, ShapeType};
-use aws_smithy_schema_server::constraints::RangeTrait;
+use aws_smithy_schema_server::constraints::{LengthTrait, PatternTrait, RangeTrait};
 use aws_smithy_schema_server::{Violation, ViolationKind};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
@@ -67,9 +67,155 @@ fn codebuild_sentence(violation: &Violation) -> Option<String> {
         ViolationKind::MinValue(_) | ViolationKind::MaxValue(_) => {
             build_timeout_windows().get(&path).map(stated_window)
         }
+        // A resource NAME carrying a character the model's `@pattern` for that kind of
+        // name does not allow: CodeBuild states the character set itself. Keyed to the
+        // PATTERN rather than to a member name, so a project's name is refused the same
+        // way wherever the model constrains it with it — `CreateProject$name`, and the
+        // `projectName` the webhook operations carry.
+        ViolationKind::Pattern(pattern) => {
+            unsupported_name_character_sentence(pattern, violation.value.as_deref())
+        }
         _ => None,
     }
 }
+
+/// The sentence CodeBuild states for a NAME the constraint walk refused against
+/// `pattern`, when the value broke that pattern's CHARACTER clause.
+///
+/// `None` when the pattern is not one of the names CodeBuild words itself
+/// ([`name_character_sentences`]), and `None` when the value broke another clause of the
+/// same pattern — one the sentence below would not describe, so it keeps the shared
+/// constraint envelope:
+///
+/// * every character it carries IS one the name's character set allows (so what it broke
+///   is the LENGTH or the leading-character clause);
+/// * it is LONGER than the maximum the model gives that name. Its characters are then not
+///   even readable here: the walk hands a refusal the value already elided for rendering
+///   (`Violation::value` is "ALREADY elided"), and an elision introduces characters of
+///   its own — so a name written entirely with supported characters would otherwise be
+///   refused for carrying unsupported ones. Within the modelled maximum (150 characters
+///   for a project, 128 for a fleet) the value reaches this unabridged.
+///
+/// That is the same split the store's own identifier rules make
+/// (`crate::state::project_identifier_violation`), so one name is refused with one
+/// sentence however it reaches the service.
+///
+/// The MEMBER the value came in on is not part of the question: a member the model
+/// constrains with a resource's name pattern carries a name of that resource whatever it
+/// is called, which is what gives `CreateProject$name` and the webhook operations'
+/// `projectName` the same sentence.
+fn unsupported_name_character_sentence(pattern: &str, value: Option<&str>) -> Option<String> {
+    let value = value?;
+    let (longest, stated) = name_character_sentences().get(pattern)?;
+    if value.chars().count() > *longest {
+        return None;
+    }
+    if value
+        .chars()
+        .all(crate::state::is_supported_name_character)
+    {
+        return None;
+    }
+    Some((*stated).to_string())
+}
+
+/// What CodeBuild states for a name carrying a character its kind's `@pattern` does not
+/// allow, with the longest that name may be, keyed by that PATTERN.
+///
+/// Built once from the schema of the member that NAMES each resource, so nothing here
+/// spells a pattern or a bound: a key is whatever the MODEL puts on `CreateProject$name`
+/// or `CreateFleet$name`, which covers every member the model constrains with the same
+/// pattern — the name an update carries, and any input that grows one — without another
+/// edit here, and the length beside it is that member's own `@length` maximum. These are
+/// the two resources this service addresses by name, and the two whose sentence is
+/// recorded (`crate::state::INVALID_PROJECT_NAME_MESSAGE`,
+/// `crate::state::INVALID_FLEET_NAME_MESSAGE`); a pattern that is not a key — one that
+/// does not state [`SUPPORTED_NAME_CHARACTER_CLASS`], or whose member the model gives no
+/// maximum length — keeps the shared constraint envelope.
+fn name_character_sentences() -> &'static BTreeMap<&'static str, (usize, &'static str)> {
+    static SENTENCES: LazyLock<BTreeMap<&'static str, (usize, &'static str)>> =
+        LazyLock::new(|| {
+            /// The resources whose name has a sentence of CodeBuild's own, as the input
+            /// that CREATES each one — the schema the pattern and the bound are read from.
+            const STATED: [(&::aws_smithy_schema::Schema, &str); 2] = [
+                (
+                    crate::ops::types::CREATE_PROJECT_INPUT_SCHEMA,
+                    crate::state::INVALID_PROJECT_NAME_MESSAGE,
+                ),
+                (
+                    crate::ops::types::CREATE_FLEET_INPUT_SCHEMA,
+                    crate::state::INVALID_FLEET_NAME_MESSAGE,
+                ),
+            ];
+            let sentences: BTreeMap<&'static str, (usize, &'static str)> = STATED
+                .into_iter()
+                .filter_map(|(input, stated)| {
+                    let member = name_member(input)?;
+                    let pattern = pattern_of(member)?;
+                    // Only a pattern that states the character class the shared predicate
+                    // implements: the sentence is chosen by the pattern but the clause
+                    // that was broken is decided by that predicate, so a name kind whose
+                    // pattern admits some OTHER set is left to the shared constraint
+                    // envelope rather than classified against the wrong set.
+                    if !pattern.contains(SUPPORTED_NAME_CHARACTER_CLASS) {
+                        return None;
+                    }
+                    // The longest that name may be, which is what bounds the value this
+                    // sentence may be chosen from — see
+                    // [`unsupported_name_character_sentence`].
+                    let longest = usize::try_from(max_length_of(member)?).ok()?;
+                    Some((pattern, (longest, stated)))
+                })
+                .collect();
+            // Two resources, two patterns: a model in which they collided would silently
+            // word one kind's refusal with the other kind's resource name.
+            debug_assert_eq!(
+                sentences.len(),
+                STATED.len(),
+                "each name kind CodeBuild words itself needs its own @pattern stating the \
+                 supported character class, and a maximum length"
+            );
+            sentences
+        });
+    &SENTENCES
+}
+
+/// How the model's name patterns write the characters a name may carry — the class
+/// `crate::state::is_supported_name_character` implements, as `ProjectName` and
+/// `FleetName` spell it inside their own `@pattern`.
+const SUPPORTED_NAME_CHARACTER_CLASS: &str = r"[A-Za-z0-9\-_]";
+
+/// The member of `input` that carries the resource's own name, if it has one.
+fn name_member(input: &'static Schema) -> Option<&'static Schema> {
+    input
+        .members()
+        .iter()
+        .find(|member| member.member_name() == Some(NAME_MEMBER))
+        .copied()
+}
+
+/// The `@pattern` the model attaches to `member`, if it puts one on it.
+fn pattern_of(member: &Schema) -> Option<&'static str> {
+    let carried = member.traits()?.get(&PatternTrait::TRAIT_ID)?;
+    carried
+        .as_any()
+        .downcast_ref::<PatternTrait>()
+        .map(|pattern| pattern.regex)
+}
+
+/// The maximum the model's `@length` allows `member` to be, if it bounds it above.
+fn max_length_of(member: &Schema) -> Option<i64> {
+    let carried = member.traits()?.get(&LengthTrait::TRAIT_ID)?;
+    carried
+        .as_any()
+        .downcast_ref::<LengthTrait>()
+        .and_then(|length| length.max)
+}
+
+/// The name the model gives the member that carries a resource's own name on the
+/// operation that CREATES it — the member the pattern and the length bound above are read
+/// from.
+const NAME_MEMBER: &str = "name";
 
 /// What CodeBuild states as the reason a list request asked for a sort order it does
 /// not define, carried by the modelled `InvalidInputException`.
