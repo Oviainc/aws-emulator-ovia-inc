@@ -487,7 +487,12 @@ async fn an_address_nothing_holds_is_a_miss() {
         ("a prefix of a stored id", "hel"),
         ("a stored id in another case", "HELD"),
     ] {
-        for operation in ["RunStatement", "GetStatement"] {
+        for (operation, expected) in [
+            ("RunStatement", messages::session_not_found(id)),
+            // The statement surface words its own session miss, naming the member it
+            // could not resolve.
+            ("GetStatement", messages::session_id_not_found(id)),
+        ] {
             let (status, body) = call(
                 &router,
                 operation,
@@ -506,9 +511,9 @@ async fn an_address_nothing_holds_is_a_miss() {
             );
             assert_eq!(
                 error_message(&body),
-                messages::session_not_found(id),
-                "case {case}: the refusal must name the session the request addressed, got \
-                 {body}"
+                expected,
+                "case {case}: {operation} must answer its own session miss {expected:?}, \
+                 got {body}"
             );
         }
     }

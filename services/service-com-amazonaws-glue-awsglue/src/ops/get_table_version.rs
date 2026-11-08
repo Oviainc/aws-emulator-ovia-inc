@@ -251,13 +251,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The table holds its own versions: the live definition is the version its
             // `VersionId` names, and every earlier one is the definition the write that
             // replaced it archived. An id outside that history names no version of this
-            // table.
+            // table, and which of the two version-miss sentences it earns is the table's
+            // own (`crate::state::TableEntry::version_miss_message`).
             let Some(table_version) = entry.table_version(requested, &database.database_id) else {
                 return Err(GetTableVersionErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {
-                        message: Some(
-                            crate::state::messages::TABLE_VERSION_NOT_FOUND.to_string(),
-                        ),
+                        message: Some(entry.version_miss_message(requested).to_string()),
                         from_federation_source: None,
                     },
                 )

@@ -452,8 +452,8 @@ async fn the_listing_reports_only_the_statements_of_the_session_it_names() {
         );
         assert_eq!(
             error_message(&body),
-            messages::session_not_found("left"),
-            "case {region:?}: expected the miss to name the session, got {body}"
+            messages::session_id_not_found("left"),
+            "case {region:?}: expected the statement surface's session miss, got {body}"
         );
     }
 }
@@ -503,8 +503,8 @@ async fn a_session_the_store_does_not_hold_is_not_found() {
         );
         assert_eq!(
             error_message(&body),
-            messages::session_not_found(session),
-            "case {case:?}: the refusal must name the session the request addressed, got {body}"
+            messages::session_id_not_found(session),
+            "case {case:?}: the refusal must name the SessionId the request addressed, got {body}"
         );
     }
 

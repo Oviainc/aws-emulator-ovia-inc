@@ -252,11 +252,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every other version of the table is one an earlier write archived, so the
         // delete removes it from that history and leaves the live definition alone. A
-        // counter the history does not hold names no version of this table.
+        // counter the history does not hold names no version of this table, worded as the
+        // table words that miss (`crate::state::TableEntry::version_miss_message`).
         if entry.archived_versions.remove(&requested).is_none() {
             return Err(DeleteTableVersionErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::TABLE_VERSION_NOT_FOUND.to_string()),
+                    message: Some(entry.version_miss_message(Some(requested)).to_string()),
                     from_federation_source: None,
                 },
             )

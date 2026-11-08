@@ -272,7 +272,7 @@ async fn deleting_a_settled_session_removes_the_record_stored_under_its_id() {
             );
             assert_eq!(
                 error_message(&body),
-                messages::session_not_found(id),
+                messages::session_id_not_found(id),
                 "case {case}: the statement read misses on the session itself, got {body}"
             );
         }

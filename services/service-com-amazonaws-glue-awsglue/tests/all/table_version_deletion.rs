@@ -33,9 +33,10 @@ use crate::wire::{call, emulator, error_code, error_message, ok};
 /// ([`crate::batch_table_version_deletion`]), so both suites read one spelling of it.
 pub(crate) const LATEST_REFUSAL: &str = "VersionId cannot be equal to the latest.";
 
-/// The refusal a read or a delete of a version the table's history does not hold earns —
-/// which is what a version becomes once it has been deleted. `pub(crate)` for the same
-/// reason as [`LATEST_REFUSAL`].
+/// The refusal a read or a delete of a version the table's history no longer holds earns —
+/// which is what a version the table MINTED becomes once it has been deleted. An id the
+/// table never minted earns the other version-miss sentence, which `not_found_wording.rs`
+/// pins beside this one. `pub(crate)` for the same reason as [`LATEST_REFUSAL`].
 pub(crate) const MISSING_VERSION_REFUSAL: &str = "Table version not found.";
 
 /// One `DeleteTableVersion` call: its HTTP status and body.

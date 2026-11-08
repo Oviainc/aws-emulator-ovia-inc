@@ -780,9 +780,11 @@ async fn reading_an_unknown_workflow_run_is_refused() {
             error_code(&body).contains("EntityNotFoundException"),
             "case {case}: expected EntityNotFoundException for {run_id:?}, got {body}"
         );
-        assert!(
-            error_message(&body).contains(&run_id),
-            "case {case}: the refusal names the run that resolved to nothing, got {body}"
+        assert_eq!(
+            error_message(&body),
+            WORKFLOW_NOT_FOUND,
+            "case {case}: a run that resolved to nothing earns the same fixed entity miss, \
+             got {body}"
         );
     }
 

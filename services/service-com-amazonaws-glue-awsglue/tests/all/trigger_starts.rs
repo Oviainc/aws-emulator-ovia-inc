@@ -537,8 +537,9 @@ async fn a_firing_past_the_workflow_concurrency_ceiling_is_refused() {
 }
 
 /// A start for a name the request's Region holds no trigger under is refused with the
-/// modelled `EntityNotFoundException` naming what was asked for: a trigger is served only
-/// through the endpoint that created it, so a trigger of another Region is such a name.
+/// modelled `EntityNotFoundException` and the service's fixed trigger miss: a trigger is
+/// served only through the endpoint that created it, so a trigger of another Region is such
+/// a name.
 #[tokio::test]
 async fn a_start_for_a_trigger_this_region_does_not_hold_is_refused() {
     let (router, _engine) = emulator_with_engine();

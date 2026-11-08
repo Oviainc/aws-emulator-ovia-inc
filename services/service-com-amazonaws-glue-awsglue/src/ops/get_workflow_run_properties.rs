@@ -165,10 +165,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let Some(run) = workflow.run(&input.run_id) else {
-            return Err(not_found(crate::state::messages::workflow_run_not_found(
-                &input.name,
-                &input.run_id,
-            )));
+            return Err(not_found(
+                crate::state::messages::WORKFLOW_NOT_FOUND.to_string(),
+            ));
         };
 
         // "The workflow run properties which were set during the specified run": the map

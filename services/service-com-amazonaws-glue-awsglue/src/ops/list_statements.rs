@@ -205,9 +205,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(session) = store.session_mut(&region, &input.session_id) else {
             return Err(ListStatementsErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    // The refusal names the id that resolved to nothing, which is the whole
-                    // address of a session.
-                    message: Some(crate::state::messages::session_not_found(
+                    // The refusal names the member that resolved to nothing, which is the
+                    // whole address of the session whose statements were asked for.
+                    message: Some(crate::state::messages::session_id_not_found(
                         &input.session_id,
                     )),
                     from_federation_source: None,

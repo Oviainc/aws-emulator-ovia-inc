@@ -177,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(session) = store.session_mut(&region, &input.session_id) else {
             return Err(GetStatementErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::session_not_found(
+                    message: Some(crate::state::messages::session_id_not_found(
                         &input.session_id,
                     )),
                     from_federation_source: None,

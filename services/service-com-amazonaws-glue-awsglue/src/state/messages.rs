@@ -170,8 +170,9 @@ pub fn classifier_not_found(name: &str) -> String {
 /// The DELETE of a classifier this account holds none of (`DeleteClassifier`).
 ///
 /// Recorded template, and a DIFFERENT sentence from the read's above — which is why
-/// the two are not one shared string, exactly as the connection read and write keep
-/// their own ([`connection_not_found`], [`connection_not_found_for_write`]): the
+/// the two are not one shared string, exactly as the connection read, update and delete
+/// each keep their own ([`connection_not_found`], [`connection_not_found_for_update`],
+/// [`CONNECTION_NOT_FOUND_FOR_DELETE`]): the
 /// delete states the miss ONCE, over the whole address it resolved — the account whose
 /// namespace was searched and the requested name, joined by a colon, because a
 /// classifier name is unique per account. The name is read off the request, exactly as
@@ -400,12 +401,31 @@ pub fn dashboard_url_not_supported(resource_type: &str) -> String {
     format!("GetDashboardUrl operation is not supported for {resource_type}")
 }
 
-/// Any operation whose `ResourceId`/`Id` names no session of this account
-/// (`GetDashboardUrl` for a `ResourceType` of `SESSION`). NOT recorded: the sentence
-/// follows the per-resource template of [`database_not_found`], built from the id the
-/// request addressed, which is the whole address of a session.
+/// A session lookup addressed by `Id` for an id this account holds no session under —
+/// `GetSession`'s miss, and the miss of every operation that resolves a session the same
+/// way and words it the same.
+///
+/// RECORDED template: fixed text around its one variable part, the id the request
+/// addressed, taken from the request exactly as sent, with a trailing period.
+///
+/// It is NOT the wording of the STATEMENT surface's own session miss
+/// ([`session_id_not_found`]): an operation that resolves a `SessionId` in order to reach
+/// the statements of that session states the member it could not resolve, which is why the
+/// two are two strings and not one.
 pub fn session_not_found(id: &str) -> String {
     format!("Session {id} not found.")
+}
+
+/// The session miss of an operation that addresses a session's STATEMENTS through its
+/// `SessionId` (`GetStatement`, `ListStatements`) for an id this account holds no session
+/// under.
+///
+/// RECORDED template: fixed text around its one variable part, the `SessionId` the request
+/// sent, taken exactly as sent — the sentence names the MEMBER that resolved to nothing
+/// ("Session ID"), and carries no trailing period, where the session read's own miss
+/// ([`session_not_found`]) names the resource and ends in one.
+pub fn session_id_not_found(session_id: &str) -> String {
+    format!("Session ID {session_id} not found")
 }
 
 /// A read of the Glue Identity Center configuration of an account that has none
@@ -752,14 +772,23 @@ pub fn connection_not_found(name: &str, catalog_id: &str) -> String {
     format!("Connection with name {name} in account {catalog_id} is not found")
 }
 
-/// A WRITE that addresses ONE connection definition by name (`UpdateConnection`, and
-/// the `DeleteConnection` that addresses one the same way) for a name the addressed
-/// Data Catalog holds none under. Recorded template of the update, and a DIFFERENT
-/// sentence from the read's above — which is why the two are not one shared string:
-/// it names the connection alone, built from the request, and no account.
-pub fn connection_not_found_for_write(name: &str) -> String {
+/// The `UpdateConnection` that addresses ONE connection definition by name for a name the
+/// addressed Data Catalog holds none under. Recorded template of the update, and a
+/// DIFFERENT sentence from the read's above — which is why the two are not one shared
+/// string: it names the connection alone, built from the request, and no account.
+pub fn connection_not_found_for_update(name: &str) -> String {
     format!("Connection not found: {name}")
 }
+
+/// The DELETE of a connection the addressed Data Catalog holds none of
+/// (`DeleteConnection`).
+///
+/// Recorded CONSTANT, and the whole message: the delete states the resource kind it could
+/// not resolve, with no trailing period, and echoes back neither the requested
+/// `ConnectionName` nor the catalog it was addressed in — a THIRD wording for this one
+/// miss, which is why the read's, the update's and the delete's are three strings and not
+/// one.
+pub const CONNECTION_NOT_FOUND_FOR_DELETE: &str = "Connection not found";
 
 /// `CreateConnection` for a `ConnectionInput$Name` the addressed Data Catalog already
 /// holds a connection under. Recorded constant, and the whole message: the service
@@ -784,19 +813,35 @@ pub fn table_not_found(name: &str) -> String {
 /// [`CRAWLER_ALREADY_EXISTS`].
 pub const TABLE_ALREADY_EXISTS: &str = "Table already exists.";
 
-/// A version read (`GetTableVersion`) for a version the addressed table's history
-/// does not hold, and the version DELETE (`DeleteTableVersion`) for the same miss.
-/// Recorded constant: the refusal names neither the version the request addressed nor
-/// the table it was addressed in.
+/// A version read (`GetTableVersion`) or the single-version delete (`DeleteTableVersion`)
+/// for a version id this table ONCE MINTED whose definition its history no longer holds.
+///
+/// Recorded CONSTANT, and the whole message: the refusal names the resource kind that
+/// resolved to nothing and echoes back neither the `VersionId` the request addressed nor
+/// the table it was addressed in. Which of this and [`VERSION_NOT_FOUND`] a miss earns is
+/// decided by [`super::TableEntry::version_miss_message`], so no operation picks the
+/// wording itself.
 pub const TABLE_VERSION_NOT_FOUND: &str = "Table version not found.";
 
+/// The same two operations for an id that is NO version of the addressed table at all —
+/// one past the counter its live definition carries, which the catalog has never minted
+/// for it (a table whose history restarted under the same name is read this way).
+///
+/// Recorded CONSTANT, and the whole message: it states that the VERSION resolved to
+/// nothing, and like [`TABLE_VERSION_NOT_FOUND`] carries no part of the request.
+pub const VERSION_NOT_FOUND: &str = "Version not found.";
+
 /// The per-item failure of the BATCH version delete (`BatchDeleteTableVersion`) for a
-/// version the addressed table's history does not hold. Recorded constant, and a
-/// SHORTER sentence than the single-version delete's [`TABLE_VERSION_NOT_FOUND`] above
-/// — which is why the two are not one shared string: an entry of `Errors` already names
-/// the table and the version it is about in its own members, so the message says only
-/// what went wrong with that item.
-pub const BATCH_TABLE_VERSION_NOT_FOUND: &str = "Version not found.";
+/// version the addressed table's history does not hold.
+///
+/// Recorded TEMPLATE, and a different sentence from the single-version read's and
+/// delete's constants above — which is why they are not one shared string: the batch
+/// answers 200 and reports this failure inside `Errors`, so its per-item message carries
+/// the `VersionId` the item sent, in parentheses and exactly as sent, and ends without a
+/// period. That id is what tells a caller WHICH of its items failed.
+pub fn batch_table_version_not_found(version_id: &str) -> String {
+    format!("Table version ({version_id}) not found")
+}
 
 /// Any table-version operation whose `VersionId` spells no version counter
 /// ([`super::parse_version_counter`]) — the version read's and the version delete's
@@ -1010,19 +1055,22 @@ pub fn blueprint_run_workflow_exists(workflow_name: &str) -> String {
 
 /// A blueprint run lookup (`GetBlueprintRun`) for a `RunId` the named blueprint holds no
 /// run under. NOT recorded: the sentence follows the per-resource template of
-/// [`workflow_run_not_found`], built from the ADDRESS the request sent — the blueprint
-/// and the run id, which together name a blueprint run.
+/// [`column_statistics_task_run_not_found`], built from the ADDRESS the request sent — the
+/// blueprint and the run id, which together name a blueprint run.
 pub fn blueprint_run_not_found(blueprint_name: &str, run_id: &str) -> String {
     format!("Blueprint run {run_id} not found for blueprint {blueprint_name}.")
 }
 
-/// Any workflow operation whose `Name` names no workflow this account holds
-/// (`GetWorkflow`, and the same miss on every sibling that addresses one by name).
+/// The miss of the WORKFLOW surface: a `Name` that names no workflow this account holds
+/// (`GetWorkflow`, and every sibling that addresses a workflow the same way), and a `RunId`
+/// that names no run of a workflow that WAS found (`GetWorkflowRunProperties`,
+/// `GetWorkflowRun`, `PutWorkflowRunProperties`), as well as the workflow a trigger's
+/// definition names but nothing holds.
 ///
 /// RECORDED constant, and the whole message: the sentence is the fixed, generic one this
-/// surface answers a workflow miss with, with no trailing period and naming no workflow,
-/// as recorded — so a miss discloses nothing about the account's namespace and every
-/// operation that addresses a workflow by name reports the miss the same way.
+/// surface answers a miss with, with no trailing period and naming neither the workflow nor
+/// the run — so neither half of a run's address is disclosed, and the same text answers the
+/// workflow miss and the run miss alike.
 pub const WORKFLOW_NOT_FOUND: &str = "Entity not found";
 
 /// A run-history read (`GetWorkflowRuns`) of a workflow this account DOES hold whose
@@ -1054,14 +1102,6 @@ pub fn no_starting_trigger(name: &str) -> String {
 /// `ConcurrentRunsExceededException`.
 pub fn concurrent_workflow_runs_exceeded(name: &str) -> String {
     format!("Concurrent runs exceeded for workflow: {name}.")
-}
-
-/// A workflow run lookup (`GetWorkflowRun`) for a `RunId` the named workflow holds no
-/// run under. NOT recorded: the sentence follows the per-resource template of
-/// [`column_statistics_task_run_not_found`], built from the ADDRESS the request sent —
-/// the workflow and the run id, which together name a workflow run.
-pub fn workflow_run_not_found(workflow_name: &str, run_id: &str) -> String {
-    format!("Workflow run {run_id} not found for workflow {workflow_name}.")
 }
 
 /// A data quality rule recommendation run lookup

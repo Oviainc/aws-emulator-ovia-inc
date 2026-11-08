@@ -410,15 +410,13 @@ async fn a_refused_delete_removes_nothing() {
             row.code,
             error_code(&body)
         );
-        // A miss names the connection the delete addressed and nothing else — a different
-        // sentence from the read's, which names the account too.
+        // A miss states the resource kind the delete could not resolve and nothing else —
+        // a different sentence from the read's, which names the connection and the account,
+        // and from the update's, which names the connection.
         if row.code == "EntityNotFoundException" {
-            let addressed = row.request["ConnectionName"]
-                .as_str()
-                .expect("every row addresses a ConnectionName");
             assert_eq!(
                 error_message(&body),
-                format!("Connection not found: {addressed}"),
+                "Connection not found",
                 "case {:?}: unexpected wording for the delete's miss",
                 row.case
             );
@@ -468,7 +466,7 @@ async fn deleting_the_same_connection_twice_reports_the_second_as_a_miss() {
     );
     assert_eq!(
         error_message(&body),
-        "Connection not found: transient",
-        "the second delete's refusal names the connection it addressed"
+        "Connection not found",
+        "the second delete's refusal is the delete's own fixed sentence"
     );
 }

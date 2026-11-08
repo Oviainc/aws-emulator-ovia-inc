@@ -266,7 +266,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     } else {
                         Some((
                             "EntityNotFoundException",
-                            crate::state::messages::BATCH_TABLE_VERSION_NOT_FOUND.to_string(),
+                            crate::state::messages::batch_table_version_not_found(requested),
                         ))
                     }
                 }

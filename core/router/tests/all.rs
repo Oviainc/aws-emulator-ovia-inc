@@ -37,12 +37,8 @@ mod cloudformation_asset_bucket_publishing_role;
 // regions concurrently landing suites add their line to.
 #[path = "all/cloudformation_sfn_reference_starts_execution.rs"]
 mod cloudformation_sfn_reference_starts_execution;
-// Declared here, in this same head region, for the reason the entry above records: the
-// appended tail and the sorted `c…` span (where every cloudformation suite lands) are both
-// regions concurrently landing suites add their line to.
 #[path = "all/cloudformation_rest_api_serves_its_stage.rs"]
 mod cloudformation_rest_api_serves_its_stage;
-// Declared here, in this same head region, for the reason the entry above records: the
 // appended tail and the sorted `r…` span are both regions concurrently landing suites add
 // their line to.
 #[path = "all/rds_s3_snapshot_export_flow.rs"]
@@ -1056,3 +1052,8 @@ mod cloudformation_wafv2_protection_stack;
 // stops this target from compiling; the duplicate lines are removed here and the first
 // declaration of each stands. `bedrock_agentcore_data_plane_parent_resources`, which stood
 // just below, was appended the same way and is declared in that head too.
+// The suites that stood here — `apigateway_iam_authenticated_invoke`,
+// `cloudformation_wafv2_protection_stack`, `lambda_sqs_event_source_batching_window`,
+// `cloudformation_asset_bucket_publishing_role` and
+// `bedrock_agentcore_data_plane_parent_resources` — are each ALREADY declared above, in the
+// declaration of each stands.

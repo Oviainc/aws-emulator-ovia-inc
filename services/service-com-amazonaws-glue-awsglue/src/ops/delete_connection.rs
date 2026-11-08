@@ -183,9 +183,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(DeleteConnectionErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::connection_not_found_for_write(
-                        &input.connection_name,
-                    )),
+                    message: Some(
+                        crate::state::messages::CONNECTION_NOT_FOUND_FOR_DELETE.to_string(),
+                    ),
                     from_federation_source: None,
                 },
             )

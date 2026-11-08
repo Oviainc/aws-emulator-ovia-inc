@@ -43,10 +43,13 @@ const MAX_VERSIONS_PER_BATCH: usize = 100;
 const MISS_CODE: &str = "EntityNotFoundException";
 
 /// The per-item wording a batch reports for a version the table's history does not hold.
-/// A SHORTER sentence than the one a READ of that version answers
-/// ([`MISSING_VERSION_REFUSAL`]): an `Errors` entry names the table and the version in its
-/// own members, so its message says only what went wrong with that item.
-const MISSING_ITEM_REFUSAL: &str = "Version not found.";
+/// A DIFFERENT sentence from the one a READ or a single-version delete of that version
+/// answers ([`MISSING_VERSION_REFUSAL`]): the batch answers 200 and reports this failure
+/// inside `Errors`, so the message carries the `VersionId` the item sent, in parentheses,
+/// which is what tells a caller which of its items failed.
+fn missing_item_refusal(version_id: &str) -> String {
+    format!("Table version ({version_id}) not found")
+}
 
 /// The error code a per-item failure carries for an id that addresses no deletable
 /// version: one that spells no integer, and the table's own current version.
@@ -272,7 +275,7 @@ async fn an_item_the_history_cannot_give_up_fails_only_itself() {
         FailureCase {
             case: "a counter past the newest version",
             sent: ids(&["7"]),
-            expected: vec![("7", MISS_CODE, MISSING_ITEM_REFUSAL.to_string())],
+            expected: vec![("7", MISS_CODE, missing_item_refusal("7"))],
             survivors: vec![0, 1, 2, 3],
         },
         FailureCase {
@@ -308,14 +311,14 @@ async fn an_item_the_history_cannot_give_up_fails_only_itself() {
         FailureCase {
             case: "the same archived version addressed twice in one batch",
             sent: ids(&["0", "0"]),
-            expected: vec![("0", MISS_CODE, MISSING_ITEM_REFUSAL.to_string())],
+            expected: vec![("0", MISS_CODE, missing_item_refusal("0"))],
             survivors: vec![1, 2, 3],
         },
         FailureCase {
             case: "two deletes beside three kinds of failing item",
             sent: ids(&["0", "7", "1", "nope", "3"]),
             expected: vec![
-                ("7", MISS_CODE, MISSING_ITEM_REFUSAL.to_string()),
+                ("7", MISS_CODE, missing_item_refusal("7")),
                 ("nope", INVALID_CODE, malformed_refusal("nope")),
                 ("3", INVALID_CODE, LATEST_REFUSAL.to_string()),
             ],

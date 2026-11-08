@@ -8,10 +8,10 @@
 //! connection and scopes the miss to the ACCOUNT — "Connection with name <Name> in
 //! account <accountId> is not found" — with `<Name>` taken verbatim from the request and
 //! `<accountId>` the account the caller's credentials speak for, never the `CatalogId`
-//! the request happened to carry. A WRITE that addresses one connection by name words
-//! the same miss as the service words a write's miss — "Connection not found: <Name>" —
-//! so a client can tell the two apart, exactly as the table read and the table writes
-//! are told apart.
+//! the request happened to carry. The `UpdateConnection` that addresses one connection by
+//! name words the same miss its own way — "Connection not found: <Name>" — so a client can
+//! tell the two apart, exactly as the table read and the table writes are told apart. The
+//! DELETE words it a third way, with no name at all, which `not_found_wording.rs` pins.
 //!
 //! Each suite is a table whose rows differ along what the rule generalises over: the
 //! requested name's value, length, casing and character set, whether the request names
@@ -51,9 +51,9 @@ fn expected_read_message(name: &str) -> String {
     format!("Connection with name {name} in account {ACCOUNT_ID} is not found")
 }
 
-/// The wording a WRITE's connection miss must answer: the service's own write sentence,
-/// carrying the requested name alone.
-fn expected_write_message(name: &str) -> String {
+/// The wording the UPDATE's connection miss must answer: the service's own update
+/// sentence, carrying the requested name alone.
+fn expected_update_message(name: &str) -> String {
     format!("Connection not found: {name}")
 }
 
@@ -157,12 +157,12 @@ async fn a_connection_miss_is_worded_per_operation() {
                 &label,
                 "UpdateConnection",
                 &update,
-                &expected_write_message(name),
+                &expected_update_message(name),
             )
             .await;
             assert_ne!(
                 expected_read_message(name),
-                expected_write_message(name),
+                expected_update_message(name),
                 "case {label}: the read and the write must be distinguishable by message"
             );
         }

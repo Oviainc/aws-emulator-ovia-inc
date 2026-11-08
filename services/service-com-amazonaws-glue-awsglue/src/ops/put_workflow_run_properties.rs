@@ -176,10 +176,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
         let Some(run) = workflow.run_mut(&input.run_id) else {
-            return Err(not_found(crate::state::messages::workflow_run_not_found(
-                &input.name,
-                &input.run_id,
-            )));
+            return Err(not_found(
+                crate::state::messages::WORKFLOW_NOT_FOUND.to_string(),
+            ));
         };
 
         // "If a property already exists for the specified run, then it overrides the value

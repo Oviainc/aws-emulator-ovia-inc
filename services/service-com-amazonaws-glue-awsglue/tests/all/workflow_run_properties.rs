@@ -19,9 +19,7 @@
 //! the form of the keys and values (empty, non-ASCII, many).
 
 use serde_json::{json, Map, Value};
-use service_com_amazonaws_glue_awsglue::state::messages::{
-    workflow_run_not_found, WORKFLOW_NOT_FOUND,
-};
+use service_com_amazonaws_glue_awsglue::state::messages::WORKFLOW_NOT_FOUND;
 use service_com_amazonaws_glue_awsglue::state::MAX_RUN_PROPERTIES_PER_RUN;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -408,9 +406,9 @@ async fn addressing_a_run_the_store_does_not_hold_is_refused() {
             );
             assert_eq!(
                 error_message(&body),
-                workflow_run_not_found(named_workflow, missing),
-                "case {case} / {operation}: the refusal names the run that resolved to nothing, \
-                 got {body}"
+                WORKFLOW_NOT_FOUND,
+                "case {case} / {operation}: a run that resolved to nothing earns the same \
+                 fixed entity miss, got {body}"
             );
         }
     }

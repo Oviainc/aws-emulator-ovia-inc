@@ -1448,6 +1448,37 @@ impl TableEntry {
         }
     }
 
+    /// How this table words the miss of ONE of its versions: which of the service's two
+    /// version-miss sentences the `version` a request named earns.
+    ///
+    /// The two are told apart by whether the id is a version this table ever MINTED. "Each
+    /// version is incremented by 1" (`GetTableVersionRequest$VersionId`), so the counter the
+    /// live definition carries is the newest id the catalog has minted for this table: an id
+    /// at or below it stood for a definition of this table, which the history no longer
+    /// holds, and an id above it was never a version of this table at all. The second is
+    /// what a read of a table whose history restarted (a `DeleteTable` and a create under
+    /// the same name) addresses with an id of the old history.
+    ///
+    /// Shared by every operation that resolves one version by id, so the read and the
+    /// single-version delete cannot word one miss two ways.
+    ///
+    /// Both sentences are RECORDED, on two reads of the SAME table in one wire fixture
+    /// (`glue-table-versioning-and-column-statistics`, its two version reads): the one that
+    /// addresses an id past the table's newest earns the first sentence, and the one that
+    /// addresses a version the table had and the history no longer holds earns the second.
+    /// A later recording that showed the split anywhere else is the first thing to re-check
+    /// here.
+    pub fn version_miss_message(&self, version: Option<u64>) -> &'static str {
+        let minted = version.is_some_and(|wanted| {
+            parse_version_counter(&self.version_id).is_some_and(|current| wanted <= current)
+        });
+        if minted {
+            messages::TABLE_VERSION_NOT_FOUND
+        } else {
+            messages::VERSION_NOT_FOUND
+        }
+    }
+
     /// The key material the write that stored the definition of ONE of this table's
     /// versions was encrypted under — the live record's for the current version, and the
     /// archived record's own for an earlier one.
