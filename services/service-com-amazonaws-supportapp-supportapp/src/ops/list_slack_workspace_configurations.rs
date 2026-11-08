@@ -158,7 +158,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // AWS decides a signed call at the IAM layer, in FRONT of the service, so the
+        // caller's identity-based policies are evaluated before this request's own values
+        // and before any store is reached: a principal no policy allows this action for is
+        // refused, and nothing is reported to it.
+        if let Some(denied) = crate::state::authorization_refusal(&*self.engine, ctx, Self::NAME) {
+            return Err(
+                ListSlackWorkspaceConfigurationsErrorModeled::AccessDeniedException(denied).into(),
+            );
+        }
+
         // This listing is reported whole, so it mints no `nextToken` and a request that
         // carries one names no position in anything this operation answered. See
         // [`crate::state::pagination_token_refusal`] for the rule and the refusal.

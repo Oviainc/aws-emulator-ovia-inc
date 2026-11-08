@@ -28,7 +28,10 @@
 //! severity rule, every severity level and flag combination on each side of it, both
 //! operations that look a configuration up, id pairs at both published `@length`
 //! bounds and in several forms, and a `@pattern` row for every patterned member this
-//! service declares — not only the `accountAlias` the issue cited. Each row's
+//! service declares whose form the BOUNDARY judges — not only the `accountAlias` the issue
+//! cited. `channelRoleArn` is the one patterned member outside that class, because the role
+//! it names is one the service is asked to use: its own row asserts the 403 the pass-role
+//! step answers instead. Each row's
 //! expected message is written out in full AND checked against the invariants of its
 //! rule, so a message that drifts back to an internal paraphrase fails twice.
 //!
@@ -37,7 +40,9 @@
 //! model_path="services/service-com-amazonaws-supportapp-supportapp/smithy-model/com-amazonaws-supportapp-supportapp.json")`.
 
 use serde_json::{json, Value};
-use service_com_amazonaws_supportapp_supportapp::state::MAX_SLACK_WORKSPACE_CONFIGURATIONS;
+use service_com_amazonaws_supportapp_supportapp::state::{
+    CROSS_ACCOUNT_PASS_ROLE_MESSAGE, MAX_SLACK_WORKSPACE_CONFIGURATIONS,
+};
 
 use crate::slack_channel_configurations::{role_arn, Emulator, Reply};
 use crate::slack_workspace_configurations::list_workspaces;
@@ -68,8 +73,10 @@ const SLACK_ID_PATTERN: &str = r"\S+";
 /// `channelName`'s `@pattern`, unanchored. Model value: `^.+$`.
 const CHANNEL_NAME_PATTERN: &str = r".+";
 
-/// `roleArn`'s `@pattern`, unanchored. Model value:
-/// `^arn:aws:iam::[0-9]{12}:role/(.+)$`.
+/// `roleArn`'s `@pattern`. Model value: `^arn:aws:iam::[0-9]{12}:role/(.+)$`. A value outside
+/// it is NOT a boundary refusal on this service — `channelRoleArn` names a role the service
+/// is asked to use, so the pass-role step judges it — which is what
+/// [`a_value_outside_the_role_arn_pattern_is_the_pass_role_refusal`] pins.
 const ROLE_ARN_PATTERN: &str = r"arn:aws:iam::[0-9]{12}:role/(.+)";
 
 /// `teamId` / `channelId` are `@length min 1 max 256`, so a 256-character id is the
@@ -471,10 +478,8 @@ async fn a_pattern_violation_states_the_model_pattern_without_its_anchors() {
     channel_space["channelId"] = json!("C0123 45");
     let mut newline_name = valid_create();
     newline_name["channelName"] = json!("first\nsecond");
-    let mut bad_role = valid_create();
-    bad_role["channelRoleArn"] = json!("arn:aws:iam::ABCDEFGHIJKL:role/SupportAppRole");
 
-    let rows: [(&str, &str, Value, &str, &str, &str); 6] = [
+    let rows: [(&str, &str, Value, &str, &str, &str); 5] = [
         (
             "accountAlias outside its charset",
             "put-account-alias",
@@ -508,14 +513,6 @@ async fn a_pattern_violation_states_the_model_pattern_without_its_anchors() {
             CHANNEL_NAME_PATTERN,
         ),
         (
-            "channelRoleArn without a twelve-digit account",
-            "create-slack-channel-configuration",
-            bad_role,
-            "arn:aws:iam::ABCDEFGHIJKL:role/SupportAppRole",
-            "channelRoleArn",
-            ROLE_ARN_PATTERN,
-        ),
-        (
             "channelId with a space on a delete",
             "delete-slack-channel-configuration",
             json!({ "teamId": "T012ABCDEFG", "channelId": "C0123 45" }),
@@ -534,6 +531,54 @@ async fn a_pattern_violation_states_the_model_pattern_without_its_anchors() {
             "case {label:?}: expected {expected:?}, got {message:?}"
         );
         assert_validation_envelope(label, &message);
+    }
+}
+
+/// The row the table above no longer carries: a `channelRoleArn` outside `roleArn`'s
+/// `@pattern` is NOT a request-validation refusal on this service.
+///
+/// The member names a role the service is asked to USE, so its value goes into the
+/// pass-role/authorization step, which refuses anything that is not a role of the calling
+/// account with the modelled `AccessDeniedException` (HTTP 403) and AWS's own wording for
+/// that refusal — never the 400 `ValidationException` envelope the table above pins for a
+/// caller-input mistake. The rows differ in HOW the value leaves the member's form.
+#[tokio::test]
+async fn a_value_outside_the_role_arn_pattern_is_the_pass_role_refusal() {
+    let emulator = Emulator::new();
+    for (label, submitted) in [
+        (
+            "an account segment that is not twelve digits",
+            "arn:aws:iam::ABCDEFGHIJKL:role/SupportAppRole".to_string(),
+        ),
+        (
+            "no ARN at all",
+            "not-an-iam-role-arn-000000000000".to_string(),
+        ),
+        (
+            "an IAM entity that is not a role",
+            format!(
+                "arn:aws:iam::{}:user/SupportAppUser",
+                engine::EMULATOR_ACCOUNT_ID
+            ),
+        ),
+    ] {
+        let mut body = valid_create();
+        body["channelRoleArn"] = json!(submitted);
+        let reply = emulator
+            .call("create-slack-channel-configuration", body)
+            .await;
+        let message = refusal(label, &reply, 403, "AccessDeniedException");
+        assert_eq!(
+            message, CROSS_ACCOUNT_PASS_ROLE_MESSAGE,
+            "case {label:?} ({submitted:?}): expected {CROSS_ACCOUNT_PASS_ROLE_MESSAGE:?}, got \
+             {message:?}"
+        );
+        // And the pattern clause the table above states for a caller-input mistake is NOT
+        // what such a value is answered with.
+        assert!(
+            !message.contains(ROLE_ARN_PATTERN),
+            "case {label:?}: expected no request-validation clause, got {message:?}"
+        );
     }
 }
 

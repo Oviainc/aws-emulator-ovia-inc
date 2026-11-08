@@ -136,7 +136,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // AWS decides a signed call at the IAM layer, in FRONT of the service, so the
+        // caller's identity-based policies are evaluated before any store is reached: a
+        // principal no policy allows this action for is refused, and nothing is written for
+        // it.
+        if let Some(denied) = crate::state::authorization_refusal(&*self.engine, ctx, Self::NAME) {
+            return Err(PutAccountAliasErrorModeled::AccessDeniedException(denied).into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             PutAccountAliasErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Support App store is unavailable".to_string()),

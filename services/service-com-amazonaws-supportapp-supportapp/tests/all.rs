@@ -19,6 +19,8 @@ mod channel_configuration_pair_lookup;
 mod channel_configuration_workspace_precondition;
 #[path = "all/channel_role_account.rs"]
 mod channel_role_account;
+#[path = "all/channel_role_pass_role_form.rs"]
+mod channel_role_pass_role_form;
 #[path = "all/console_authorized_workspace.rs"]
 mod console_authorized_workspace;
 #[path = "all/delete_slack_workspace_configuration.rs"]
@@ -27,6 +29,8 @@ mod delete_slack_workspace_configuration;
 mod error_message_templates;
 #[path = "all/handler_validation_refusal_shape.rs"]
 mod handler_validation_refusal_shape;
+#[path = "all/identity_authorization.rs"]
+mod identity_authorization;
 #[path = "all/listing_pagination.rs"]
 mod listing_pagination;
 #[path = "all/notification_flag_default.rs"]

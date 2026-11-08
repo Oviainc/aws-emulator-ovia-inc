@@ -1007,6 +1007,11 @@ mod medical_imaging_dicom_import;
 // answered with, and the one stream record each new item they write carries.
 #[path = "all/apigateway_repeated_stage_requests.rs"]
 mod apigateway_repeated_stage_requests;
+// Declared here, in the appended tail: WAFv2 protection a stack provisions. It stood twice in
+// this tail and once in the sorted head across concurrent changes; one declaration of each
+// suite is what this target compiles, so the entry lives here, once.
+#[path = "all/cloudformation_wafv2_protection_stack.rs"]
+mod cloudformation_wafv2_protection_stack;
 // Several suites that stood here are each ALREADY declared above, in the sorted head: two
 // concurrent changes appended the same entry, which is a redefinition and stops this target
 // from compiling, so the duplicate lines are removed and the first declaration of each

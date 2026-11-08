@@ -153,7 +153,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // AWS decides a signed call at the IAM layer, in FRONT of the service, so the
+        // caller's identity-based policies are evaluated before this request's own values
+        // and before any store is reached: a principal no policy allows this action for is
+        // refused, and nothing is read or deleted for it.
+        if let Some(denied) = crate::state::authorization_refusal(&*self.engine, ctx, Self::NAME) {
+            return Err(
+                DeleteSlackWorkspaceConfigurationErrorModeled::AccessDeniedException(denied).into(),
+            );
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteSlackWorkspaceConfigurationErrorModeled::InternalServerException(
                 InternalServerException {

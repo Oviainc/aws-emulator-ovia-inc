@@ -138,7 +138,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // `DeleteAccountAliasRequest` has no members, so there is nothing to read off
         // the request: the resource is the account's single alias.
-        let _ = (&input, ctx);
+        let _ = &input;
+        // AWS decides a signed call at the IAM layer, in FRONT of the service, so the
+        // caller's identity-based policies are evaluated before any store is reached: a
+        // principal no policy allows this action for is refused, and nothing is deleted for
+        // it.
+        if let Some(denied) = crate::state::authorization_refusal(&*self.engine, ctx, Self::NAME) {
+            return Err(DeleteAccountAliasErrorModeled::AccessDeniedException(denied).into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             DeleteAccountAliasErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Support App store is unavailable".to_string()),

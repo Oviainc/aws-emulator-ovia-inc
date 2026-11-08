@@ -11,7 +11,18 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-supportapp-supportapp.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.supportapp#CreateSlackChannelConfigurationRequest")]
+// `skip_validation = ["channelRoleArn"]`: AWS does not enforce `roleArn`'s `@pattern` on this
+// member at the request boundary. The value is a role the caller asks this service to USE, so
+// it is taken into the pass-role/authorization step, which refuses a value that does not name
+// a role of the calling account with `AccessDeniedException` (HTTP 403) — recorded behaviour
+// for a value outside the member's own form, deliberately distinct from the 400
+// `ValidationException` a caller-input mistake gets. The member's form is therefore judged in
+// the handler, which is the only place that answer can be given; the member stays `@required`,
+// which the deserializer enforces whatever this list says.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.supportapp#CreateSlackChannelConfigurationRequest",
+    skip_validation = ["channelRoleArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct CreateSlackChannelConfigurationInput {
     pub team_id: String,

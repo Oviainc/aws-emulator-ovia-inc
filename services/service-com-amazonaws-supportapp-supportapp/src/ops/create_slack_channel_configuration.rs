@@ -7,6 +7,12 @@
 //! the persisted record is the operation's only effect — and the only thing
 //! `ListSlackChannelConfigurations` and `UpdateSlackChannelConfiguration` read.
 //!
+//! The `channelRoleArn` this request carries is a role the service is asked to USE, so the
+//! value is taken into the pass-role step rather than refused for its form at the request
+//! boundary (`skip_validation` on the input in `src/ops/types/`): a value that does not name
+//! a role of the calling account is the modelled `AccessDeniedException` (403), whatever
+//! form it has — see [`crate::state::channel_role_account_refusal`].
+//!
 //! A channel configuration lives inside a Slack workspace that is registered to the
 //! account, so the request's `teamId` must be in the account's workspace registry
 //! (`state::slack_workspace_configurations`, written by
@@ -186,10 +192,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-        // Whose account the role ARN names is a fact about the REQUEST, so it is
-        // settled before the store is reached: a role in another account cannot be
-        // passed to this service, and no configuration is recorded for it.
+        // AWS decides a signed call at the IAM layer, in FRONT of the service, so the
+        // caller's identity-based policies are evaluated before this request's own values
+        // and before any store is reached: a principal no policy allows this action for is
+        // refused, and nothing is read or written for it.
+        if let Some(denied) = crate::state::authorization_refusal(&*self.engine, ctx, Self::NAME) {
+            return Err(
+                CreateSlackChannelConfigurationErrorModeled::AccessDeniedException(denied).into(),
+            );
+        }
+
+        // `channelRoleArn` came off the request boundary with the whole member (see
+        // [`crate::state::channel_role_account_refusal`]), so the one rule of it that is a
+        // caller-input rule — the declared length bound on what this API can carry — is
+        // applied here, in the envelope the boundary states that class in, and before the
+        // pass-role attempt below for that reason.
+        if let Some(message) =
+            crate::state::channel_role_arn_length_refusal(&input.channel_role_arn)
+        {
+            return Err(CreateSlackChannelConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // Which role this request asks the service to use is settled next, before the store
+        // is reached: the value has to name a role this account can pass, and no
+        // configuration is recorded for one it cannot.
         if let Some(message) =
             crate::state::channel_role_account_refusal(&input.channel_role_arn)
         {

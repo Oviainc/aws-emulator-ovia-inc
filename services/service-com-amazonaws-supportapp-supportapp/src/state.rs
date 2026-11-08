@@ -16,6 +16,12 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::ops::types::{SlackChannelConfiguration, SlackWorkspaceConfiguration};
 
+/// Whether IAM lets a request perform the action it asks for — the decision every operation
+/// of this service takes before it reads or writes anything. Re-exported here, so a handler
+/// reaches it the way it reaches every other rule of this module.
+mod authorization;
+pub use authorization::*;
+
 /// The most Slack channel configurations this account can hold.
 ///
 /// The service documents the quota on `CreateSlackChannelConfiguration`: "You can add
@@ -476,34 +482,83 @@ pub fn workspace_quota_exceeded_message(operation: &str) -> String {
 /// Why the `channelRoleArn` a write carried cannot be used, as the message the
 /// refusal carries, or `None` when the value names a role this account can pass.
 ///
-/// The member's `@pattern` (`^arn:aws:iam::[0-9]{12}:role/(.+)$`,
-/// `smithy_query(query="operation",operation="CreateSlackChannelConfiguration")`)
-/// settles the FORM of the value before a handler runs, and it admits ANY twelve-digit
-/// account id — so what is left for the handler is whose account the ARN names. The
-/// member documents the role as one "that you want to use to perform operations on
-/// Amazon Web Services" for the calling account, and a service acting for one account
-/// cannot be handed a role another account owns: a value naming any account other than
-/// the one this emulator presents ([`::engine::emulator_account_id`]) is refused with
-/// the modelled `AccessDeniedException` by EVERY operation that takes the member,
-/// rather than persisted. It is a fact about the REQUEST, so it is answered before the
-/// account's store is consulted, and nothing is written when it holds.
+/// The member documents the role as one "that you want to use to perform operations on
+/// Amazon Web Services"
+/// (`smithy_query(query="operation",operation="CreateSlackChannelConfiguration")`) for
+/// the calling account, so the value is not request INPUT the service merely stores: it
+/// names a role the service is asked to assume, which is a pass-role attempt. That
+/// attempt is what judges the value — its FORM included — so the member's `@pattern` is
+/// off the request boundary (`skip_validation` on both inputs that carry it, in
+/// `src/ops/types/`) and every value reaches this rule, as the recorded refusal of a
+/// value outside that pattern shows: AWS answers the modelled `AccessDeniedException`
+/// (HTTP 403) for it, not a request-validation `ValidationException`.
 ///
-/// The test is the one the member's own form states: the value has to be an IAM role
-/// ARN of the caller's account, which is that form with the account field filled in
-/// from [`::engine::emulator_account_id`] — so it needs no ARN reading of its own, and
-/// it fails CLOSED, refusing anything else the member could carry rather than letting
-/// an unreadable value through. The message is built from the request — the value
-/// submitted, against the account the caller is in — and names the parameter the way
-/// this service's prose names one, in the API's PascalCase spelling.
+/// A service acting for one account cannot be handed a role another account owns, so the
+/// test is the one the member's own form states: the value has to be an IAM role ARN of
+/// the caller's account NAMING a role, which is that form with the account field filled
+/// in from [`::engine::emulator_account_id`] and a non-empty role name — exactly what the
+/// member's `(.+)` admits after `role/`. It therefore needs no ARN reading of its own and
+/// it fails CLOSED — anything that is not a role ARN of this account, whatever else it
+/// is, is a role this service cannot pass. EVERY operation that takes the member answers
+/// this refusal rather than persisting the value, before the account's store is
+/// consulted, so nothing is written when it holds.
 pub fn channel_role_account_refusal(role_arn: &str) -> Option<String> {
-    let caller = ::engine::emulator_account_id();
-    let own_account_role = format!("arn:aws:iam::{caller}:role/");
-    (!role_arn.starts_with(&own_account_role)).then(|| {
-        format!(
-            "ChannelRoleArn {role_arn} must name an IAM role in account {caller}, which is the \
-             only account the Amazon Web Services Support App can use a role in."
-        )
-    })
+    let own_account_role = format!("arn:aws:iam::{}:role/", ::engine::emulator_account_id());
+    let names_a_role_of_this_account = role_arn
+        .strip_prefix(&own_account_role)
+        .is_some_and(|role_name| !role_name.is_empty());
+    (!names_a_role_of_this_account).then(|| CROSS_ACCOUNT_PASS_ROLE_MESSAGE.to_string())
+}
+
+/// The `AccessDeniedException` message a refused pass-role attempt carries, as AWS words
+/// that refusal: fixed text, naming the rule the attempt broke and quoting no value of the
+/// request back.
+pub const CROSS_ACCOUNT_PASS_ROLE_MESSAGE: &str = "Cross-account pass role is not allowed.";
+
+/// The longest `channelRoleArn` this service accepts: the member's own declared maximum
+/// (`roleArn`, `@length min 31 max 2048`,
+/// `smithy_query(query="operation",operation="CreateSlackChannelConfiguration")`).
+pub const MAX_CHANNEL_ROLE_ARN_LEN: usize = 2048;
+
+/// The member path a clause about `channelRoleArn` names, in the lowerCamel spelling the
+/// validation envelope states a member with.
+const CHANNEL_ROLE_ARN_PATH: &str = "channelRoleArn";
+
+/// Why the `channelRoleArn` a write carried is too long to hold, or `None` when it fits.
+///
+/// The member's declared `@length` maximum is a bound on what the API can carry — the
+/// same member reports the stored value back on `UpdateSlackChannelConfiguration` and
+/// `ListSlackChannelConfigurations` — and it is the one rule of this member the request
+/// boundary no longer applies, because taking the value into the pass-role step took the
+/// whole member off that boundary (see [`channel_role_account_refusal`]). So the bound is
+/// applied HERE instead, by the operations that write the member, and a value past it is
+/// the modelled `ValidationException` (HTTP 400) rather than something stored: it is a
+/// caller-input mistake, not a role this service may not pass, and it is settled before
+/// the pass-role attempt for that reason.
+///
+/// A declared `@length` maximum is a constraint the MODEL states, so the refusal is the one
+/// AWS words for that class — the standard validation envelope over one clause naming the
+/// rejected value, the member path and the bound, built by the framework's own renderer
+/// ([`::aws_smithy_schema_server::constraints::envelope`]) from the same violation the
+/// request boundary would have raised. That is what keeps this clause worded exactly as the
+/// clause every other member of this service is refused with (`accountAlias`'s length clause
+/// among them) instead of in the prose envelope this service reserves for a rule the model
+/// cannot express. The value is echoed through the tree's shared
+/// [`::service_common::validation::quoted_echo`], so a handler-worded clause quotes a value
+/// under the same ceiling as one the walk restored and no message is sized by the request.
+pub fn channel_role_arn_length_refusal(role_arn: &str) -> Option<String> {
+    if role_arn.chars().count() <= MAX_CHANNEL_ROLE_ARN_LEN {
+        return None;
+    }
+    let violation = ::aws_smithy_schema_server::constraints::Violation {
+        path: CHANNEL_ROLE_ARN_PATH.to_string(),
+        kind: ::aws_smithy_schema_server::constraints::ViolationKind::MaxLength(
+            i64::try_from(MAX_CHANNEL_ROLE_ARN_LEN).unwrap_or(i64::MAX),
+        ),
+        value: Some(::service_common::validation::quoted_echo(role_arn).into_owned()),
+        sensitive: false,
+    };
+    ::aws_smithy_schema_server::constraints::envelope(::std::slice::from_ref(&violation))
 }
 
 /// The three notification flags as ONE clause of the documented

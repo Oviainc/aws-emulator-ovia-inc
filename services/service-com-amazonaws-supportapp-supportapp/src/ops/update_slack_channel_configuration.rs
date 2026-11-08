@@ -210,11 +210,38 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
-        // Whose account the role ARN names is a fact about the REQUEST, not about the
-        // stored configuration, so it is settled before the store is reached: a role in
-        // another account cannot be passed to this service, and the record this update
-        // would rewrite is left exactly as it stands.
+        // AWS decides a signed call at the IAM layer, in FRONT of the service, so the
+        // caller's identity-based policies are evaluated before this request's own values
+        // and before any store is reached: a principal no policy allows this action for is
+        // refused, and nothing is read or written for it.
+        if let Some(denied) = crate::state::authorization_refusal(&*self.engine, ctx, Self::NAME) {
+            return Err(
+                UpdateSlackChannelConfigurationErrorModeled::AccessDeniedException(denied).into(),
+            );
+        }
+
+        // `channelRoleArn` came off the request boundary with the whole member (see
+        // [`crate::state::channel_role_account_refusal`]), so the one rule of it that is a
+        // caller-input rule — the declared length bound on what this API can carry — is
+        // applied here, in the envelope the boundary states that class in, and before the
+        // pass-role attempt below for that reason.
+        if let Some(message) = input
+            .channel_role_arn
+            .as_deref()
+            .and_then(crate::state::channel_role_arn_length_refusal)
+        {
+            return Err(UpdateSlackChannelConfigurationErrorModeled::ValidationException(
+                ValidationException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
+        // Which role this request asks the service to use is settled next — a fact about the
+        // REQUEST, not about the stored configuration: the value has to name a role this
+        // account can pass, and the record this update would rewrite is left exactly as it
+        // stands when it does not.
         if let Some(message) = input
             .channel_role_arn
             .as_deref()

@@ -22,8 +22,12 @@
 //! create request — the severity level, which notification flags it carries, whether it
 //! names a channel — because none of that bears on which account a passed role may be
 //! in.
+//!
+//! A value OUTSIDE the member's own `@pattern` is the same refusal, for the same reason: see
+//! [`crate::channel_role_pass_role_form`], which spans those forms.
 
 use serde_json::{json, Value};
+use service_com_amazonaws_supportapp_supportapp::state::CROSS_ACCOUNT_PASS_ROLE_MESSAGE;
 
 use crate::slack_channel_configurations::{role_arn, Emulator, Reply};
 
@@ -198,32 +202,33 @@ fn create_bodies_across_severities(role_arn_value: &str) -> Vec<(&'static str, V
     ]
 }
 
-/// Require `reply` to be the modelled pass-role refusal, and that its message states
-/// the rule: which parameter was refused, which value was submitted, and which account
-/// a passed role may name.
+/// Require `reply` to be the modelled pass-role refusal, worded as AWS words that refusal.
+///
+/// The sentence is fixed text — it quotes no value of the request back — so the row's
+/// submitted value is named in the assertion's own case label instead, and the whole message
+/// is pinned rather than searched for fragments.
 fn assert_pass_role_refusal(case: &str, reply: &Reply, submitted: &str) {
     assert_eq!(
         reply.status, 403,
-        "case {case:?}: expected HTTP 403, got {} / {}",
+        "case {case:?} ({submitted:?}): expected HTTP 403, got {} / {}",
         reply.status, reply.body
     );
     assert_eq!(
         reply.error_type, "AccessDeniedException",
-        "case {case:?}: expected AccessDeniedException, got {:?}",
+        "case {case:?} ({submitted:?}): expected AccessDeniedException, got {:?}",
         reply.error_type
     );
     let message = reply.string("message").unwrap_or_else(|| {
         panic!(
-            "case {case:?}: the refusal carries no message: {}",
+            "case {case:?} ({submitted:?}): the refusal carries no message: {}",
             reply.body
         )
     });
-    for expected in ["ChannelRoleArn", submitted, caller_account()] {
-        assert!(
-            message.contains(expected),
-            "case {case:?}: expected the message to state {expected:?}, got {message:?}"
-        );
-    }
+    assert_eq!(
+        message, CROSS_ACCOUNT_PASS_ROLE_MESSAGE,
+        "case {case:?} ({submitted:?}): expected {CROSS_ACCOUNT_PASS_ROLE_MESSAGE:?}, got \
+         {message:?}"
+    );
 }
 
 #[tokio::test]

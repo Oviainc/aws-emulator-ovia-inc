@@ -7,6 +7,15 @@
 //! no alias to report, and the operation models no not-found error, so the answer is a
 //! 200 with `accountAlias` absent.
 //!
+//! Reporting it is still a signed call IAM decides, in front of the service, so the
+//! caller's identity-based policies are evaluated before the store is read
+//! ([`crate::state::authorization_refusal`]) and a principal no policy allows
+//! `supportapp:GetAccountAlias` for is told it is not authorized rather than told what the
+//! account holds. This operation's own `errors` list names only the service-common
+//! `InternalServerException`, so the refusal shape — which this SERVICE models and nine of
+//! its ten operations declare — is widened onto the error enum below through
+//! `extra_errors`.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -56,6 +65,12 @@
 //!
 //! ## Errors
 //!
+//! * `AccessDeniedException` (HTTP 403) — widened in through `extra_errors` (see below): the
+//!   refusal IAM gives a principal whose identity-based policies do not allow this action,
+//!   carrying IAM's own sentence — "User: <principal> is not authorized to perform:
+//!   supportapp:GetAccountAlias on resource: <resource> <reason>"
+//!   ([`crate::state::authorization_refusal`]). The shape's own documentation reads "You don't
+//!   have sufficient permission to perform this action".
 //! * `InternalServerException` (HTTP 500) — We can’t process your request right now because
 //!   of a server issue. Try again later.
 
@@ -73,9 +88,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-supportapp-supportapp.j
 // here — hence the `GetAccountAliasError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.supportapp#GetAccountAlias")]
+// `AccessDeniedException` is widened in through `extra_errors`: this SERVICE models the
+// shape (`@error client`, `@httpError 403`) and nine of its ten operations declare it, but
+// this operation's own `errors` list does not — and IAM refuses a call to it exactly as it
+// refuses a call to its neighbours, which is the answer the handler below gives.
+#[smithy_macros::operation_error(
+    "com.amazonaws.supportapp#GetAccountAlias",
+    extra_errors = ["AccessDeniedException"]
+)]
 #[derive(Debug)]
 pub enum GetAccountAliasErrorModeled {
+    AccessDeniedException(AccessDeniedException),
     InternalServerException(InternalServerException),
 }
 
@@ -130,7 +153,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = (&input, ctx);
+        // `GetAccountAliasRequest` has no members, so there is nothing to read off the
+        // request: the resource is the account's single alias.
+        let _ = &input;
+        // AWS decides a signed call at the IAM layer, in FRONT of the service, so the
+        // caller's identity-based policies are evaluated before the store is read: a
+        // principal no policy allows this action for is told it is not authorized rather
+        // than told what the account holds.
+        if let Some(denied) = crate::state::authorization_refusal(&*self.engine, ctx, Self::NAME) {
+            return Err(GetAccountAliasErrorModeled::AccessDeniedException(denied).into());
+        }
+
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             GetAccountAliasErrorModeled::InternalServerException(InternalServerException {
                 message: Some("the Support App store is unavailable".to_string()),

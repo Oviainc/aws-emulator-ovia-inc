@@ -1414,8 +1414,10 @@ async fn a_create_outside_the_modelled_constraints_is_refused() {
     );
 
     // Rows: each `@required` member absent, a value outside each published length
-    // bound, a value outside `^\S+$`, a severity outside the modelled value set, and a
-    // role ARN outside `^arn:aws:iam::[0-9]{12}:role/(.+)$`.
+    // bound, a value outside `^\S+$`, and a severity outside the modelled value set.
+    // `channelRoleArn`'s own form is NOT in this table: the member names a role the service
+    // is asked to USE, so the pass-role step judges it and answers 403 rather than 400 —
+    // asserted on its own below.
     let mut rejected: Vec<(&str, Value)> = Vec::new();
     for required in ["teamId", "channelId", "notifyOnCaseSeverity", "channelRoleArn"] {
         let mut body = valid.clone();
@@ -1438,16 +1440,6 @@ async fn a_create_outside_the_modelled_constraints_is_refused() {
             "notifyOnCaseSeverity",
             json!("critical"),
         ),
-        (
-            "a role ARN that is not an IAM role ARN",
-            "channelRoleArn",
-            json!("arn:aws:iam::123456789012:user/NotARole"),
-        ),
-        (
-            "a role ARN below its length bound",
-            "channelRoleArn",
-            json!("arn:aws:iam::1:role/r"),
-        ),
     ] {
         let mut body = valid.clone();
         body[member] = value;
@@ -1462,6 +1454,40 @@ async fn a_create_outside_the_modelled_constraints_is_refused() {
             reply.status, reply.body
         );
         // Nothing was stored for a refused create.
+        let listed = emulator.list(None).await;
+        assert_eq!(
+            listed.configurations(),
+            Vec::<Value>::new(),
+            "case {label:?}: a refused create must store nothing, got {}",
+            listed.body
+        );
+    }
+
+    // The two rows the table above does not carry: a `channelRoleArn` that is no role ARN of
+    // this account is refused by the pass-role step, with the modelled
+    // `AccessDeniedException` (403) instead of the boundary's 400, and stores nothing just
+    // the same. The forms differ: an IAM entity that is not a role, and a value below the
+    // member's published length bound.
+    for (label, submitted) in [
+        (
+            "a role ARN that is not an IAM role ARN",
+            "arn:aws:iam::123456789012:user/NotARole",
+        ),
+        ("a role ARN below its length bound", "arn:aws:iam::1:role/r"),
+    ] {
+        let mut body = valid.clone();
+        body["channelRoleArn"] = json!(submitted);
+        let reply = emulator.create(body).await;
+        assert_eq!(
+            reply.status, 403,
+            "case {label:?} ({submitted:?}): expected HTTP 403, got {} / {}",
+            reply.status, reply.body
+        );
+        assert_eq!(
+            reply.error_type, "AccessDeniedException",
+            "case {label:?} ({submitted:?}): expected AccessDeniedException, got {:?}",
+            reply.error_type
+        );
         let listed = emulator.list(None).await;
         assert_eq!(
             listed.configurations(),

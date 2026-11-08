@@ -11,7 +11,13 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-supportapp-supportapp.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.supportapp#UpdateSlackChannelConfigurationRequest")]
+// `skip_validation = ["channelRoleArn"]`: the same member, the same reason as
+// `CreateSlackChannelConfigurationRequest` — a role the service is asked to USE is judged by
+// the pass-role step, not by the request boundary, so its form reaches the handler.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.supportapp#UpdateSlackChannelConfigurationRequest",
+    skip_validation = ["channelRoleArn"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct UpdateSlackChannelConfigurationInput {
     pub team_id: String,
