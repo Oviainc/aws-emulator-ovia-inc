@@ -240,6 +240,28 @@ pub fn missing_member_refusal(member: &str) -> String {
     )])
 }
 
+/// What the request-validation stage answers for a member whose value is outside the shape
+/// this service publishes for it: the member's wire name and the expression the value must
+/// match, under the count envelope above.
+///
+/// A member whose shape the PINNED model does not declare — the certificate body of
+/// `ImportCertificateAuthorityCertificate`, which the model constrains only by length while
+/// the front door publishes an expression for it
+/// ([`crate::state::CERTIFICATE_PEM_PATTERN`]) — is not one the validating walk can judge,
+/// so the clause is worded here, beside the clauses the walk produces, and answered with
+/// the same status and error code. A recorded refusal of such a member closes the quoted
+/// expression with a full stop, which the walk's own clauses do not carry, so the stop is
+/// written here rather than in [`stated_refusal`].
+///
+/// `member` is the member's WIRE name and `pattern` the expression as it is published,
+/// unanchored, exactly as [`clause`] quotes a declared one.
+pub fn pattern_refusal(member: &str, pattern: &str) -> String {
+    stated_refusal(&[format!(
+        "Value at '{member}'{CONSTRAINT_PREAMBLE}Member must satisfy regular expression \
+         pattern: {pattern}."
+    )])
+}
+
 /// The values this service's front door does NOT offer, though the model declares them.
 ///
 /// The model is this service's whole surface across every partition it is deployed in, while

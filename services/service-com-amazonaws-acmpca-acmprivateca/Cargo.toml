@@ -30,6 +30,13 @@ hex = { workspace = true }
 # service accepts (ImportCertificateAuthorityCertificate, IssueCertificate) and hands
 # out (GetCertificateAuthorityCsr, GetCertificate).
 x509-cert = "0.2"
+# Mints the key pair a private CA signs with (CreateCertificateAuthority) and makes the
+# signatures its certification request, its issued certificates and its CRLs carry. Already
+# linked into this emulator by `emulator-server`, which uses it for its own TLS provider.
+aws-lc-rs = "1.19"
+# Enforces the PEM shape the certificate members of this service's requests are published
+# with, as the regular expression the refusal quotes.
+regex = "1.13"
 # Amazon S3 client the bucket an enabled `CrlConfiguration` names is resolved through
 # before a CA is created or updated with it: Amazon Web Services Private CA writes its
 # CRLs to that bucket, and S3 is called over the in-process callback into this same

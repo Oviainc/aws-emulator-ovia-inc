@@ -13,6 +13,12 @@
 // points it into `tests/all/`.
 #[path = "all/ca_arn_resolution_stages.rs"]
 mod ca_arn_resolution_stages;
+#[path = "all/ca_certificate_import.rs"]
+mod ca_certificate_import;
+#[path = "all/certificate_authority_audit_reports.rs"]
+mod certificate_authority_audit_reports;
+#[path = "all/certificate_authority_key_material.rs"]
+mod certificate_authority_key_material;
 #[path = "all/certificate_authority_listing.rs"]
 mod certificate_authority_listing;
 #[path = "all/certificate_authority_tags.rs"]
@@ -31,6 +37,8 @@ mod crl_publication;
 mod delete_certificate_authority;
 #[path = "all/enum_value_set_order.rs"]
 mod enum_value_set_order;
+#[path = "all/issued_certificate_reads.rs"]
+mod issued_certificate_reads;
 #[path = "all/permission_action_set.rs"]
 mod permission_action_set;
 #[path = "all/permissions.rs"]

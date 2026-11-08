@@ -22,8 +22,8 @@ use service_com_amazonaws_acmpca_acmprivateca::state::{
 };
 
 use crate::private_ca_lifecycle::{
-    active_ca, blob, certificate_pem, root_ca_request, string, wait_for_the_clock, Emulator,
-    ACCOUNT,
+    active_ca, blob, own_ca_certificate, root_ca_request, string, wait_for_the_clock,
+    Emulator, ACCOUNT,
 };
 
 /// The three operations that read or write a CA's resource-based policy.
@@ -692,12 +692,13 @@ async fn a_ca_without_its_certificate_resolves_for_the_policy_operations() {
     // Importing the CA certificate changes none of it: the delete still succeeds and the
     // read still reports the policy as the absent resource.
     let case = "CA with its certificate imported";
+    let own = own_ca_certificate(&emulator, case, &arn).await;
     emulator
         .ok(
             case,
             "ImportCertificateAuthorityCertificate",
             &json!({"CertificateAuthorityArn": arn,
-                    "Certificate": blob(&certificate_pem("policy-pending"))}),
+                    "Certificate": blob(&own)}),
         )
         .await;
     emulator

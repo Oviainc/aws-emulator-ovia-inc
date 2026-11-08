@@ -35,8 +35,8 @@ use x509_cert::Certificate;
 
 use crate::delete_certificate_authority::force_status;
 use crate::private_ca_lifecycle::{
-    active_ca, blob, certificate_pem, root_ca_request, string, wait_for_the_clock, Emulator,
-    ACCOUNT, REGION,
+    active_ca, blob, own_ca_certificate, root_ca_request, string, wait_for_the_clock,
+    Emulator, ACCOUNT, REGION,
 };
 use crate::resource_policy::error_message;
 
@@ -774,7 +774,8 @@ async fn a_root_cas_own_self_signed_certificate_is_never_revoked() {
         .await;
     let subordinate = string(&created, "CertificateAuthorityArn", case);
     wait_for_the_clock();
-    let subordinate_certificate = certificate_pem("subordinate-authority");
+    let subordinate_certificate =
+        own_ca_certificate(&emulator, case, &subordinate).await;
     emulator
         .ok(
             case,

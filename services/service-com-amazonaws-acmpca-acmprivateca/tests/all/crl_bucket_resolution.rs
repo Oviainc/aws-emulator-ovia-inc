@@ -24,7 +24,7 @@ use service_com_amazonaws_acmpca_acmprivateca::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::private_ca_lifecycle::{
-    blob, certificate_pem, root_ca_request, string, AUTHORIZATION, REGION,
+    blob, ca_certificate_for, root_ca_request, string, AUTHORIZATION, REGION,
 };
 use crate::resource_policy::error_message;
 
@@ -85,6 +85,33 @@ impl Emulator {
         assert_eq!(
             status, 200,
             "case {case:?}: expected {operation} to answer 200, got {status} {parsed:?}"
+        );
+        parsed
+    }
+
+    /// Call one private-CA operation requiring the modelled error `code` with HTTP 400, and
+    /// answer the body it carries.
+    pub(crate) async fn refused(
+        &self,
+        case: &str,
+        operation: &str,
+        body: &Value,
+        code: &str,
+    ) -> Value {
+        let (status, parsed) = self.call(operation, body).await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: expected {operation} to refuse with 400 {code}, got {status} \
+             {parsed:?}"
+        );
+        let wire_code = parsed
+            .get("__type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            wire_code.contains(code),
+            "case {case:?}: expected {operation} to answer {code}, got {wire_code:?} ({parsed:?})"
         );
         parsed
     }
@@ -343,13 +370,25 @@ async fn an_update_writes_a_crl_configuration_only_for_a_bucket_that_resolves() 
     // An update is allowed only from ACTIVE or DISABLED, so the CA is given its
     // certificate first; the clock-owed settle out of CREATING comes due before that.
     std::thread::sleep(SETTLE_AFTER + std::time::Duration::from_millis(250));
+    // The certificate a CA takes is the one its own certification request asks for.
+    let csr = string(
+        &emulator
+            .ok(
+                case,
+                "GetCertificateAuthorityCsr",
+                &json!({"CertificateAuthorityArn": arn}),
+            )
+            .await,
+        "Csr",
+        case,
+    );
     emulator
         .ok(
             case,
             "ImportCertificateAuthorityCertificate",
             &json!({
                 "CertificateAuthorityArn": arn,
-                "Certificate": blob(&certificate_pem("update-root")),
+                "Certificate": blob(&ca_certificate_for(&csr)),
             }),
         )
         .await;

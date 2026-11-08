@@ -220,10 +220,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The certificate member is published with a PEM shape, and a body outside that
+        // shape is refused by the request-validation stage quoting the expression it must
+        // match — ahead of any attempt to read a certificate out of it, which is what the
+        // modelled malformed-certificate failure below answers.
+        if !crate::state::is_published_certificate_pem(&input.certificate) {
+            return Err(ImportCertificateAuthorityCertificateError::validation(
+                crate::service::pattern_refusal(
+                    crate::state::CERTIFICATE_MEMBER,
+                    crate::state::CERTIFICATE_PEM_PATTERN,
+                ),
+            ));
+        }
+
         // The certificate (and the chain, when one is supplied) has to be a PEM-framed
         // DER X.509 certificate before anything is persisted: a body that is not one is
         // malformed, whatever the CA's state.
-        let certificate = pem_certificate(&input.certificate)?;
+        let presented = pem_certificate(&input.certificate)?;
+        let certificate =
+            crate::state::encode_certificate_pem(&presented).ok_or_else(malformed_certificate)?;
         let chain = match input.certificate_chain.as_deref() {
             // An empty chain blob is modelled (`CertificateChainBlob` has min length 0)
             // and carries no certificate, so it is the same as supplying none.
@@ -290,6 +305,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
 
+            // The certificate a CA takes has to be the one that was issued for the
+            // certification request the CA published: a private CA signs with the key pair
+            // IT holds, so a certificate for another subject, or over another public key,
+            // is not this CA's certificate and taking it would leave the CA holding one
+            // whose private key this service does not have. Which field diverges is what
+            // the refusal's sentence says ([`crate::state::CertificateMismatch`]).
+            if let Some(mismatch) = record.certificate_mismatch(&presented) {
+                return Err(
+                    ImportCertificateAuthorityCertificateErrorModeled::CertificateMismatchException(
+                        CertificateMismatchException {
+                            message: Some(mismatch.message().to_string()),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
             record.ca_certificate_pem = Some(certificate);
             record.ca_certificate_chain_pem = chain;
             record.status = crate::state::STATUS_ACTIVE.to_string();
@@ -312,20 +344,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The one X.509 certificate `bytes` carries, re-encoded canonically, or
-/// `MalformedCertificateException`.
+/// The one X.509 certificate `bytes` carries, decoded, or `MalformedCertificateException`.
 fn pem_certificate(
     bytes: &[u8],
-) -> Result<String, ImportCertificateAuthorityCertificateError> {
-    let der = ::std::str::from_utf8(bytes)
+) -> Result<::x509_cert::Certificate, ImportCertificateAuthorityCertificateError> {
+    ::std::str::from_utf8(bytes)
         .ok()
         .and_then(|text| crate::state::parse_pem_block(text, crate::state::PEM_LABEL_CERTIFICATE))
-        .filter(|der| crate::state::is_x509_certificate(der))
-        .ok_or_else(malformed_certificate)?;
-    Ok(crate::state::encode_pem(
-        crate::state::PEM_LABEL_CERTIFICATE,
-        &der,
-    ))
+        .and_then(|der| crate::state::parse_x509_certificate(&der))
+        .ok_or_else(malformed_certificate)
 }
 
 /// Every X.509 certificate `bytes` carries, re-encoded canonically, or

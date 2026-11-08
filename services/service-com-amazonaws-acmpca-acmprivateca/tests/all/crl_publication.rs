@@ -37,7 +37,7 @@ use x509_cert::{Certificate, Version};
 
 use crate::crl_bucket_resolution::Emulator;
 use crate::private_ca_lifecycle::{
-    blob, certificate_pem, csr_pem, root_ca_request, string, subject_common_name,
+    blob, ca_certificate_for, csr_pem, root_ca_request, string, subject_common_name,
     wait_for_the_clock,
 };
 
@@ -81,7 +81,10 @@ fn crl_configuration(
 
 /// Create a CA — with `revocation` as its revocation configuration, when a row supplies
 /// one — and activate it, answering its ARN and the certificate it was activated with.
-async fn active_ca(
+///
+/// `pub(crate)` so a sibling suite that drives the same two-service emulator activates a CA
+/// through one helper rather than growing a second copy of it.
+pub(crate) async fn active_ca(
     emulator: &Emulator,
     case: &str,
     common_name: &str,
@@ -97,7 +100,19 @@ async fn active_ca(
     let arn = string(&created, "CertificateAuthorityArn", case);
     // A test may wait for a due instant; a handler may not.
     wait_for_the_clock();
-    let certificate = certificate_pem(common_name);
+    // The certificate a CA takes is the one its own certification request asks for.
+    let csr = string(
+        &emulator
+            .ok(
+                case,
+                "GetCertificateAuthorityCsr",
+                &json!({"CertificateAuthorityArn": arn}),
+            )
+            .await,
+        "Csr",
+        case,
+    );
+    let certificate = ca_certificate_for(&csr);
     emulator
         .ok(
             case,

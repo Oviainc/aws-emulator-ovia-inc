@@ -6,6 +6,20 @@
 //! operation handlers share: ARN parsing, the clock-owed status transitions, validity
 //! resolution and the PEM bodies the service hands back. Handlers hold no state of
 //! their own — they reach this store through [`service_state`].
+//!
+//! Three concerns of the store live in files of their own beside this one, and are
+//! re-exported from here so every handler still reaches them as `crate::state::*`: the key
+//! pair a CA signs with ([`key_material`]), what makes a presented certificate the CA's own
+//! ([`imported_certificate`]) and the audit reports a CA produces over the certificates it
+//! has issued ([`audit_reports`]).
+
+mod audit_reports;
+mod imported_certificate;
+mod key_material;
+
+pub use audit_reports::*;
+pub use imported_certificate::*;
+pub use key_material::*;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1028,6 +1042,10 @@ pub struct CertificateAuthorityRecord {
     pub key_storage_security_standard: String,
     /// The CSR this CA hands out, derived once at create time and never re-derived.
     pub csr_pem: String,
+    /// The key pair this CA signs with, minted once at create time, for the
+    /// `KeyAlgorithm` its configuration names ([`generate_key_pair`]); `None` for a
+    /// `KeyAlgorithm` the in-process cryptography provider cannot mint.
+    pub key_pair: Option<CaKeyPair>,
     /// The CA certificate imported through `ImportCertificateAuthorityCertificate`.
     pub ca_certificate_pem: Option<String>,
     /// The chain imported alongside that certificate.
@@ -1058,6 +1076,9 @@ pub struct CertificateAuthorityRecord {
     pub crl_published_at: Option<SystemTime>,
     /// Certificates issued by this CA, keyed by certificate ARN.
     pub certificates: HashMap<String, IssuedCertificate>,
+    /// The audit reports this CA has produced over those certificates, oldest first
+    /// ([`AuditReportRecord`]).
+    pub audit_reports: Vec<AuditReportRecord>,
     /// Permissions granted on this CA, one per (principal, source account) pair.
     pub permissions: Vec<PermissionRecord>,
     /// `IssueCertificate` idempotency tokens -> the certificate ARN they minted.
@@ -1426,10 +1447,16 @@ pub enum RevocationConfigurationFault {
     Unserviceable(String),
 }
 
-/// What Amazon Web Services Private CA answers a revocation configuration whose CRLs are
-/// to be written to an S3 bucket that is not there: one sentence about the bucket, naming
-/// no bucket of its own.
-pub const CRL_BUCKET_ABSENT_MESSAGE: &str = "The S3 bucket you provided does not exist.";
+/// What Amazon Web Services Private CA answers when an S3 bucket a request names is not
+/// there: one sentence about the bucket, naming no bucket of its own.
+///
+/// Shared by every call of this service that is given a bucket to write to — the CRL
+/// configuration of a create or an update, and the bucket an audit report is deposited in —
+/// so one service does not word the same fault two ways.
+pub const BUCKET_ABSENT_MESSAGE: &str = "The S3 bucket you provided does not exist.";
+
+/// The sentence above, under the name the CRL configuration's refusal has always used.
+pub const CRL_BUCKET_ABSENT_MESSAGE: &str = BUCKET_ABSENT_MESSAGE;
 
 /// Whether an enabled CRL configuration names an S3 bucket that cannot be resolved, which
 /// is what the call carrying it is refused for.
@@ -1466,13 +1493,28 @@ pub async fn unresolvable_crl_bucket(
     let Some(bucket) = crl.s3_bucket_name.as_ref() else {
         return false;
     };
+    bucket_absent(ctx, region, bucket).await
+}
+
+/// Whether S3 reports that this account holds no bucket named `bucket`.
+///
+/// The ONE place this service asks object storage that question, for every call that is
+/// given a bucket to write to. `false` means the call may proceed: that includes every
+/// answer that is not S3 reporting the bucket absent — a router with no S3 mounted, or any
+/// other failure to ask — since nothing is then known about the bucket and a refusal has to
+/// be grounded in what S3 answered rather than assumed.
+pub async fn bucket_absent(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+) -> bool {
     let answer = s3_client(ctx, region)
         .head_bucket()
         .bucket(bucket)
         .send()
         .await;
     match answer {
-        // S3 holds the bucket, so the CA can write its CRLs to it.
+        // S3 holds the bucket, so the call may write to it.
         Ok(_) => false,
         // S3 says this account holds no such bucket: the refusal is grounded.
         Err(error) if bucket_reported_absent(&error) => true,
@@ -1480,7 +1522,7 @@ pub async fn unresolvable_crl_bucket(
             ::tracing::warn!(
                 bucket = %bucket,
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "the CRL configuration's bucket could not be resolved against S3"
+                "the bucket could not be resolved against S3"
             );
             false
         }
@@ -1754,8 +1796,8 @@ pub async fn publish_crl(
 /// certificates each with its serial, its revocation date and its reason code, and the
 /// CRL's own number.
 ///
-/// As with the certificates this service writes there is no key to sign with, so the
-/// signature is the stand-in of the right ASN.1 shape ([`stand_in_signature`]).
+/// As with the certificates this service writes, the signature is made with the CA's own
+/// private key ([`object_signature`]).
 fn encode_crl(
     ca: &CertificateAuthorityRecord,
     crl: &CrlConfiguration,
@@ -1776,7 +1818,11 @@ fn encode_crl(
         revoked_certificates: (!revoked.is_empty()).then_some(revoked),
         crl_extensions: Some(crl_extensions(ca, number)?),
     };
-    let signature = stand_in_signature(&tbs_cert_list.to_der().ok()?)?;
+    let signature = object_signature(
+        ca.key_pair.as_ref(),
+        &ca.configuration.signing_algorithm,
+        &tbs_cert_list.to_der().ok()?,
+    )?;
     CertificateList {
         tbs_cert_list,
         signature_algorithm: algorithm,
@@ -2585,7 +2631,22 @@ mod oid {
 /// one is what `MalformedCertificateException` answers. Nothing here verifies the
 /// signature — the emulator holds no issuer key to verify it against.
 pub fn is_x509_certificate(der: &[u8]) -> bool {
-    Certificate::from_der(der).is_ok()
+    parse_x509_certificate(der).is_some()
+}
+
+/// The X.509 certificate `der` carries (RFC 5280 section 4.1), or `None` when it is not one
+/// — what `MalformedCertificateException` answers.
+pub fn parse_x509_certificate(der: &[u8]) -> Option<Certificate> {
+    Certificate::from_der(der).ok()
+}
+
+/// `certificate` as the PEM block this service hands a certificate out in, which is the
+/// canonical framing of the DER it decoded from ([`encode_pem`]).
+pub fn encode_certificate_pem(certificate: &Certificate) -> Option<String> {
+    Some(encode_pem(
+        PEM_LABEL_CERTIFICATE,
+        &certificate.to_der().ok()?,
+    ))
 }
 
 /// The PKCS#10 certification request `der` carries (RFC 2986 section 4), or `None` when
@@ -2596,30 +2657,39 @@ pub fn parse_certification_request(der: &[u8]) -> Option<CertificationRequest> {
 
 /// The certification request this CA hands out, derived once at create time.
 ///
-/// A real PKCS#10 `CertificationRequest` whose subject is the CA's own configured
-/// subject and whose `SubjectPublicKeyInfo` names the algorithm the CA was created with,
-/// so the body the CA hands out is the structure a signing authority expects — and the
-/// certificate this service issues for it (below) can be imported back into a CA.
+/// A real PKCS#10 `CertificationRequest` (RFC 2986 section 4) over the key pair the CA was
+/// minted with: its subject is the CA's own configured subject, its `SubjectPublicKeyInfo`
+/// is that key pair's public key, and its signature is made with the key pair's private
+/// half under the `SigningAlgorithm` the CA was created with — so a signing authority can
+/// read the key out of it, verify it, and sign a certificate for it, and the certificate
+/// this service issues for it (below) carries the same key.
 ///
-/// The emulator holds no HSM, so there is no key pair and no signature to make: the
-/// public key and the signature are stand-ins of the right ASN.1 shape, each the SHA-256
-/// digest of the content it belongs to (the CA's ARN, and the request body the signature
-/// covers), so the same CA always answers with the same CSR. Nothing in the emulator
-/// verifies either.
+/// For a `KeyAlgorithm` the in-process provider cannot mint a key pair for
+/// ([`generate_key_pair`]) the CA holds none, and the request falls back to the stand-in
+/// public key and signature of the right ASN.1 shape, each the SHA-256 digest of the
+/// content it belongs to, so the same CA still always answers with the same request.
 ///
 /// `None` when the configured subject cannot be encoded as an X.500 name.
 pub fn derive_csr_pem(
     arn: &str,
     configuration: &CertificateAuthorityConfiguration,
+    key_pair: Option<&CaKeyPair>,
 ) -> Option<String> {
     let info = CertReqInfo {
         version: x509_cert::request::Version::V1,
         subject: subject_name(&configuration.subject)?,
-        public_key: public_key_info(&configuration.key_algorithm, arn)?,
+        public_key: match key_pair {
+            Some(key_pair) => key_pair.public_key_info()?,
+            None => stand_in_public_key_info(&configuration.key_algorithm, arn)?,
+        },
         attributes: SetOfVec::new(),
     };
     let algorithm = signature_algorithm_identifier(&configuration.signing_algorithm)?;
-    let signature = stand_in_signature(&info.to_der().ok()?)?;
+    let signature = object_signature(
+        key_pair,
+        &configuration.signing_algorithm,
+        &info.to_der().ok()?,
+    )?;
     let request = CertReq {
         info,
         algorithm,
@@ -2635,9 +2705,9 @@ pub fn derive_csr_pem(
 /// issuer the CA's own subject, the resolved validity window, and — as a CA does — the
 /// subject and the public key copied out of the certification request being signed.
 ///
-/// As with the CSR above there is no key to sign with, so the signature is a stand-in of
-/// the right ASN.1 shape: the SHA-256 digest of the TBS certificate the signature would
-/// cover. Nothing in the emulator verifies it.
+/// The signature is made with the CA's own private key ([`CaKeyPair::signature`]) under the
+/// algorithm the request asked for, so the certificate verifies against the public key the
+/// CA publishes; for a CA holding no key pair it is the stand-in of the right ASN.1 shape.
 ///
 /// `None` when the CA's subject, the allocated serial or the validity window cannot be
 /// encoded as the certificate's DER demands.
@@ -2665,7 +2735,11 @@ pub fn derive_certificate_pem(
         subject_unique_id: None,
         extensions: None,
     };
-    let signature = stand_in_signature(&tbs_certificate.to_der().ok()?)?;
+    let signature = object_signature(
+        ca.key_pair.as_ref(),
+        signing_algorithm,
+        &tbs_certificate.to_der().ok()?,
+    )?;
     let certificate = Certificate {
         tbs_certificate,
         signature_algorithm: algorithm,
@@ -2724,12 +2798,16 @@ fn signature_algorithm_identifier(signing_algorithm: &str) -> Option<AlgorithmId
     })
 }
 
-/// The `SubjectPublicKeyInfo` of a CA created with `key_algorithm`.
+/// The `SubjectPublicKeyInfo` of a CA whose `key_algorithm` the in-process provider cannot
+/// mint a key pair for.
 ///
 /// The algorithm identifier is the real one for that member of `KeyAlgorithm`; the key
-/// bits are a stand-in derived from `seed` (see [`derive_csr_pem`]), since the emulator
-/// holds no key material. `None` for a value `KeyAlgorithm` does not declare.
-fn public_key_info(key_algorithm: &str, seed: &str) -> Option<SubjectPublicKeyInfoOwned> {
+/// bits are a stand-in derived from `seed` (see [`derive_csr_pem`]), because there is no
+/// key. `None` for a value `KeyAlgorithm` does not declare.
+fn stand_in_public_key_info(
+    key_algorithm: &str,
+    seed: &str,
+) -> Option<SubjectPublicKeyInfoOwned> {
     let (algorithm, parameters) = match key_algorithm {
         "RSA_2048" | "RSA_3072" | "RSA_4096" => (oid::RSA_ENCRYPTION, Some(null_parameters()?)),
         "EC_prime256v1" => (oid::EC_PUBLIC_KEY, Some(curve_parameters(oid::PRIME256V1)?)),
@@ -2760,8 +2838,24 @@ fn null_parameters() -> Option<Any> {
     Any::new(DerTag::Null, Vec::new()).ok()
 }
 
-/// The signature bits of an object this service writes: the SHA-256 digest of the DER the
-/// signature covers, standing in for a signature the emulator has no key to make.
+/// The signature bits of an object this service writes: the one `key_pair` makes over
+/// `signed` under `signing_algorithm`, or the stand-in below when the CA holds no key pair
+/// that algorithm can be made with.
+fn object_signature(
+    key_pair: Option<&CaKeyPair>,
+    signing_algorithm: &str,
+    signed: &[u8],
+) -> Option<BitString> {
+    match key_pair.and_then(|key_pair| key_pair.signature(signing_algorithm, signed)) {
+        Some(signature) => BitString::from_bytes(&signature).ok(),
+        None => stand_in_signature(signed),
+    }
+}
+
+/// The stand-in signature bits of an object a CA holding no key pair writes: the SHA-256
+/// digest of the DER the signature covers, which is of the right ASN.1 shape and is what a
+/// CA whose `KeyAlgorithm` the in-process provider cannot mint signs with. Nothing in the
+/// emulator verifies it.
 fn stand_in_signature(signed: &[u8]) -> Option<BitString> {
     BitString::from_bytes(&Sha256::digest(signed)).ok()
 }

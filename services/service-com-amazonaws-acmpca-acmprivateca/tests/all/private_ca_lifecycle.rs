@@ -163,12 +163,12 @@ pub(crate) fn root_ca_request(common_name: &str) -> Value {
 ///
 /// The framing is well formed and the body is base64 — and the body is NOT DER, which is
 /// exactly what makes it a malformed certificate or certification request.
-fn pem(label: &str, content: &str) -> String {
+pub(crate) fn pem(label: &str, content: &str) -> String {
     pem_of_bytes(label, content.as_bytes())
 }
 
 /// A PEM block of `label` around raw `body` bytes.
-fn pem_of_bytes(label: &str, body: &[u8]) -> String {
+pub(crate) fn pem_of_bytes(label: &str, body: &[u8]) -> String {
     let encoded = aws_smithy_types::base64::encode(body);
     let mut out = format!("-----BEGIN {label}-----\n");
     for line in encoded.as_bytes().chunks(64) {
@@ -216,22 +216,110 @@ pub(crate) fn csr_pem(common_name: &str) -> String {
         .expect("the request is PEM-encodable")
 }
 
+/// The CA certificate the certification request `csr` asks for: a certificate over the
+/// subject and the public key that request published, which is what makes it the
+/// certificate of the CA that published it.
+///
+/// Assembled here, out of `x509-cert`, rather than taken from the service: the bytes a
+/// suite feeds `ImportCertificateAuthorityCertificate` are written by something other than
+/// the code under test, exactly as [`certificate_pem`]'s are — what this adds is the
+/// identity the import checks, the subject and the `SubjectPublicKeyInfo` of the CA's own
+/// request. The signature is bits of the right shape: nothing verifies a CA certificate's
+/// signature, which is signed by a key no caller of this API holds.
+pub(crate) fn ca_certificate_for(csr: &str) -> String {
+    let request = request_of(csr, "a CA certification request");
+    certificate_over(
+        &request.info.subject,
+        &request.info.public_key,
+        &request.algorithm,
+    )
+}
+
+/// A certificate over `subject` and `key`, signed under `algorithm`, PEM-encoded.
+///
+/// The three members `ImportCertificateAuthorityCertificate` judges a CA certificate by are
+/// the caller's to choose here, so a suite can present a certificate that diverges from the
+/// CA's own request in exactly one of them.
+pub(crate) fn certificate_over(
+    subject: &Name,
+    key: &x509_cert::spki::SubjectPublicKeyInfoOwned,
+    algorithm: &x509_cert::spki::AlgorithmIdentifierOwned,
+) -> String {
+    let not_before = SystemTime::now() - Duration::from_secs(3600);
+    let not_after = not_before + Duration::from_secs(365 * 24 * 3600);
+    let tbs_certificate = x509_cert::TbsCertificate {
+        version: x509_cert::Version::V3,
+        serial_number: x509_cert::serial_number::SerialNumber::new(&next_test_serial())
+            .expect("a serial number"),
+        signature: algorithm.clone(),
+        // A CA certificate for a root CA is self-signed, so the issuer is the subject.
+        issuer: subject.clone(),
+        validity: x509_cert::time::Validity {
+            not_before: Time::try_from(not_before).expect("a representable date"),
+            not_after: Time::try_from(not_after).expect("a representable date"),
+        },
+        subject: subject.clone(),
+        subject_public_key_info: key.clone(),
+        issuer_unique_id: None,
+        subject_unique_id: None,
+        extensions: None,
+    };
+    let certificate = Certificate {
+        signature_algorithm: tbs_certificate.signature.clone(),
+        signature: x509_cert::der::asn1::BitString::from_bytes(&next_test_serial())
+            .expect("signature bits"),
+        tbs_certificate,
+    };
+    pem_of_bytes(
+        "CERTIFICATE",
+        &certificate.to_der().expect("the certificate encodes"),
+    )
+}
+
+/// A distinct eight-byte serial for every certificate a suite builds, so two of them are
+/// never the same certificate.
+fn next_test_serial() -> [u8; 8] {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        .to_be_bytes()
+}
+
+/// The CA certificate the CA `arn` published its certification request for, read through
+/// the service: `GetCertificateAuthorityCsr` and then [`ca_certificate_for`].
+///
+/// This is what a caller of this API does — take the CA's request to a signer and bring
+/// back the certificate it asks for — so it is how every suite here activates a CA.
+pub(crate) async fn own_ca_certificate(
+    emulator: &Emulator,
+    case: &str,
+    arn: &str,
+) -> String {
+    let reported = emulator
+        .ok(
+            case,
+            "GetCertificateAuthorityCsr",
+            &json!({"CertificateAuthorityArn": arn}),
+        )
+        .await;
+    ca_certificate_for(&string(&reported, "Csr", case))
+}
+
 /// The X.509 certificate a PEM body carries, or a panic naming the case.
-fn certificate_of(text: &str, case: &str) -> Certificate {
+pub(crate) fn certificate_of(text: &str, case: &str) -> Certificate {
     Certificate::from_pem(text)
         .unwrap_or_else(|error| panic!("case {case:?}: expected an X.509 certificate: {error}"))
 }
 
 /// The DER of the certificate a PEM body carries — the identity of the certificate,
 /// whatever framing it arrived in.
-fn certificate_der(text: &str, case: &str) -> Vec<u8> {
+pub(crate) fn certificate_der(text: &str, case: &str) -> Vec<u8> {
     certificate_of(text, case)
         .to_der()
         .expect("a decoded certificate re-encodes")
 }
 
 /// The certification request a PEM body carries, or a panic naming the case.
-fn request_of(text: &str, case: &str) -> CertReq {
+pub(crate) fn request_of(text: &str, case: &str) -> CertReq {
     CertReq::from_pem(text).unwrap_or_else(|error| {
         panic!("case {case:?}: expected a PKCS#10 certification request: {error}")
     })
@@ -288,13 +376,17 @@ pub(crate) fn string(value: &Value, member: &str, case: &str) -> String {
 
 /// Create a CA and drive it all the way to ACTIVE, returning its ARN and the CA
 /// certificate imported into it.
+///
+/// The certificate is the one the CA's own certification request asks for
+/// ([`own_ca_certificate`]): a private CA signs with the key pair it holds, so that is the
+/// only certificate it takes.
 pub(crate) async fn active_ca(emulator: &Emulator, common_name: &str) -> (String, String) {
     let created = emulator
         .ok(common_name, "CreateCertificateAuthority", &root_ca_request(common_name))
         .await;
     let arn = string(&created, "CertificateAuthorityArn", common_name);
     wait_for_the_clock();
-    let certificate = certificate_pem(common_name);
+    let certificate = own_ca_certificate(emulator, common_name, &arn).await;
     emulator
         .ok(
             common_name,
@@ -437,8 +529,8 @@ async fn the_private_ca_lifecycle_runs_end_to_end() {
         "case {case:?}: the CSR carries the CA's own subject, got {csr:?}"
     );
 
-    // 3. Importing the signed CA certificate activates the CA.
-    let ca_certificate = certificate_pem("the-root-ca");
+    // 3. Importing the certificate the CA's own request asks for activates the CA.
+    let ca_certificate = ca_certificate_for(&csr);
     let ca_chain = certificate_pem("an-intermediate");
     let imported = emulator
         .ok(
@@ -843,6 +935,27 @@ async fn revocation_configurations_are_accepted_only_where_documented() {
     }
 }
 
+/// The line endings a row presents a well-formed certificate in: the framing the service
+/// writes, that framing with the line endings RFC 7468 also allows, and that framing with
+/// its final break left off.
+#[derive(Debug, Clone, Copy)]
+enum Framing {
+    Canonical,
+    Crlf,
+    NoTrailingNewline,
+}
+
+impl Framing {
+    /// `body` as this framing presents it.
+    fn apply(self, body: &str) -> String {
+        match self {
+            Self::Canonical => body.to_string(),
+            Self::Crlf => body.replace('\n', "\r\n"),
+            Self::NoTrailingNewline => body.trim_end().to_string(),
+        }
+    }
+}
+
 /// A certificate body or certification request the service cannot read is malformed; one
 /// it can read is accepted whatever its line endings and block count.
 ///
@@ -850,45 +963,30 @@ async fn revocation_configurations_are_accepted_only_where_documented() {
 /// certificate, and one it reads as a certification request a PEM-framed DER PKCS#10
 /// request — well-formed PEM framing around a body that is not that structure is
 /// malformed, which is what the modelled malformed-certificate and malformed-CSR errors
-/// answer.
+/// answer. A body that is not even of the PEM SHAPE the certificate member is published
+/// with is refused one stage earlier, by request validation
+/// (`crate::ca_certificate_import`).
 #[tokio::test]
 async fn pem_bodies_are_accepted_only_where_they_are_well_formed() {
     let emulator = Emulator::new();
 
-    let certificate = certificate_pem("a-good-ca");
-    let certificate_body = certificate_der(&certificate, "a good certificate");
     let request = csr_pem("a-request");
+    let foreign = certificate_pem("a-good-ca");
+    let foreign_body = certificate_der(&foreign, "a good certificate");
+    // Every row here is of the published PEM shape — base64 in 64-character lines inside
+    // the certificate armour — and carries something no X.509 parser can read, which is
+    // what the modelled malformed-certificate failure is for.
     let malformed: &[(&str, String)] = &[
-        ("not pem at all", "a certificate".to_string()),
-        ("the wrong label", request.clone()),
-        (
-            "a body that is not base64",
-            "-----BEGIN CERTIFICATE-----\nnot base64 at all!!\n-----END CERTIFICATE-----\n"
-                .to_string(),
-        ),
-        (
-            "an empty block",
-            "-----BEGIN CERTIFICATE-----\n-----END CERTIFICATE-----\n".to_string(),
-        ),
-        (
-            "a block with no end",
-            "-----BEGIN CERTIFICATE-----\nYSBjZXJ0aWZpY2F0ZQ==\n".to_string(),
-        ),
-        // Well-formed framing, base64 body, and nothing an X.509 parser can read: the
-        // shape of a malformed certificate a client actually sends.
         ("base64 that is not der", pem("CERTIFICATE", "a certificate")),
         (
             "a truncated certificate",
-            pem_of_bytes(
-                "CERTIFICATE",
-                &certificate_body[..certificate_body.len() / 2],
-            ),
+            pem_of_bytes("CERTIFICATE", &foreign_body[..foreign_body.len() / 2]),
         ),
         (
             "a certificate with trailing bytes",
             pem_of_bytes(
                 "CERTIFICATE",
-                &[certificate_body.clone(), vec![0x00, 0x01]].concat(),
+                &[foreign_body.clone(), vec![0x00, 0x01]].concat(),
             ),
         ),
         (
@@ -902,12 +1000,10 @@ async fn pem_bodies_are_accepted_only_where_they_are_well_formed() {
         ),
     ];
     for (case, body) in malformed {
-        let (arn, _) = {
-            let created = emulator
-                .ok(case, "CreateCertificateAuthority", &root_ca_request("pem-root"))
-                .await;
-            (string(&created, "CertificateAuthorityArn", case), ())
-        };
+        let created = emulator
+            .ok(case, "CreateCertificateAuthority", &root_ca_request("pem-root"))
+            .await;
+        let arn = string(&created, "CertificateAuthorityArn", case);
         wait_for_the_clock();
         emulator
             .refused(
@@ -917,12 +1013,13 @@ async fn pem_bodies_are_accepted_only_where_they_are_well_formed() {
                 "MalformedCertificateException",
             )
             .await;
-        // The CA is untouched by a refused import, so it still takes a good one.
+        // The CA is untouched by a refused import, so it still takes its own certificate.
+        let own = own_ca_certificate(&emulator, case, &arn).await;
         emulator
             .ok(
                 case,
                 "ImportCertificateAuthorityCertificate",
-                &json!({"CertificateAuthorityArn": arn, "Certificate": blob(&certificate)}),
+                &json!({"CertificateAuthorityArn": arn, "Certificate": blob(&own)}),
             )
             .await;
     }
@@ -958,13 +1055,14 @@ async fn pem_bodies_are_accepted_only_where_they_are_well_formed() {
             .await;
         let arn = string(&created, "CertificateAuthorityArn", case);
         wait_for_the_clock();
+        let own = own_ca_certificate(&emulator, case, &arn).await;
         emulator
             .refused(
                 case,
                 "ImportCertificateAuthorityCertificate",
                 &json!({
                     "CertificateAuthorityArn": arn,
-                    "Certificate": blob(&certificate),
+                    "Certificate": blob(&own),
                     "CertificateChain": blob(chain),
                 }),
                 "MalformedCertificateException",
@@ -982,32 +1080,32 @@ async fn pem_bodies_are_accepted_only_where_they_are_well_formed() {
     }
 
     // Accepted bodies: CRLF line endings, no trailing newline, and a chain of several
-    // blocks.
-    let accepted: &[(&str, String, Option<String>)] = &[
-        ("crlf", certificate.replace('\n', "\r\n"), None),
-        (
-            "no trailing newline",
-            certificate.trim_end().to_string(),
-            None,
-        ),
+    // blocks. The certificate is the CA's own either way; what each row varies is the
+    // framing it arrives in and the chain beside it.
+    let accepted: &[(&str, Framing, Option<String>)] = &[
+        ("crlf", Framing::Crlf, None),
+        ("no trailing newline", Framing::NoTrailingNewline, None),
         (
             "a two-certificate chain",
-            certificate.clone(),
+            Framing::Canonical,
             Some(format!(
                 "{}{}",
                 certificate_pem("an-intermediate"),
                 certificate_pem("a-root")
             )),
         ),
-        ("an empty chain", certificate.clone(), Some(String::new())),
+        ("an empty chain", Framing::Canonical, Some(String::new())),
     ];
-    for (case, body, chain) in accepted {
+    for (case, framing, chain) in accepted {
         let created = emulator
             .ok(case, "CreateCertificateAuthority", &root_ca_request("pem-root"))
             .await;
         let arn = string(&created, "CertificateAuthorityArn", case);
         wait_for_the_clock();
-        let mut import = json!({"CertificateAuthorityArn": arn, "Certificate": blob(body)});
+        let own = own_ca_certificate(&emulator, case, &arn).await;
+        let own_body = certificate_der(&own, case);
+        let body = framing.apply(&own);
+        let mut import = json!({"CertificateAuthorityArn": arn, "Certificate": blob(&body)});
         if let Some(chain) = chain {
             import["CertificateChain"] = blob(chain);
         }
@@ -1023,14 +1121,14 @@ async fn pem_bodies_are_accepted_only_where_they_are_well_formed() {
             .await;
         assert_eq!(
             certificate_der(&string(&read_back, "Certificate", case), case),
-            certificate_body,
+            own_body,
             "case {case:?}: a well-formed body reads back as the certificate it carried"
         );
         // And in the service's canonical framing, whatever framing it arrived in: base64
         // in 64-character LF lines with a trailing newline (RFC 7468 section 2).
         assert_eq!(
             string(&read_back, "Certificate", case),
-            pem_of_bytes("CERTIFICATE", &certificate_body),
+            pem_of_bytes("CERTIFICATE", &own_body),
             "case {case:?}: a well-formed body reads back in canonical PEM framing"
         );
         let expected_chain: Vec<Vec<u8>> = chain
@@ -1065,11 +1163,11 @@ async fn pem_bodies_are_accepted_only_where_they_are_well_formed() {
     let (arn, _) = active_ca(&emulator, "csr-root").await;
     for (case, body) in [
         ("not pem at all", "a request".to_string()),
-        ("the wrong label", certificate.clone()),
+        ("the wrong label", foreign.clone()),
         ("base64 that is not der", pem("CERTIFICATE REQUEST", "a request")),
         (
             "a certificate under the request label",
-            pem_of_bytes("CERTIFICATE REQUEST", &certificate_body),
+            pem_of_bytes("CERTIFICATE REQUEST", &foreign_body),
         ),
     ] {
         emulator
@@ -1383,7 +1481,7 @@ async fn a_ca_without_its_certificate_can_neither_issue_nor_serve_one() {
         .await;
 
     // And once it is ACTIVE it cannot take a second certificate.
-    let certificate = blob(&certificate_pem("a-pending-ca"));
+    let certificate = blob(&own_ca_certificate(&emulator, case, &arn).await);
     emulator
         .ok(
             case,
@@ -1415,13 +1513,14 @@ async fn a_short_lived_ca_refuses_a_validity_beyond_seven_days() {
         case,
     );
     wait_for_the_clock();
+    let certificate = own_ca_certificate(&emulator, case, &arn).await;
     emulator
         .ok(
             case,
             "ImportCertificateAuthorityCertificate",
             &json!({
                 "CertificateAuthorityArn": arn,
-                "Certificate": blob(&certificate_pem("a-short-lived-ca")),
+                "Certificate": blob(&certificate),
             }),
         )
         .await;
@@ -1530,14 +1629,15 @@ async fn a_ca_signs_only_with_its_own_key_family() {
     }
     wait_for_the_clock();
 
-    for ((case, key_algorithm, signing_algorithm, accepted), arn) in rows.iter().zip(&authorities) {
+    for ((case, _key_algorithm, signing_algorithm, accepted), arn) in rows.iter().zip(&authorities) {
+        let own = own_ca_certificate(&emulator, case, arn).await;
         emulator
             .ok(
                 case,
                 "ImportCertificateAuthorityCertificate",
                 &json!({
                     "CertificateAuthorityArn": arn,
-                    "Certificate": blob(&certificate_pem(&format!("ca-for-{key_algorithm}"))),
+                    "Certificate": blob(&own),
                 }),
             )
             .await;

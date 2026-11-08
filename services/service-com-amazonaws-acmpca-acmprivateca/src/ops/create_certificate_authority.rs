@@ -227,6 +227,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
 
+        // The CA's key pair is minted ONCE, here — before the store is locked, and on the
+        // blocking pool rather than on the async worker. Minting is CPU work whose cost the
+        // CALLER chooses with `KeyAlgorithm` (searching for RSA primes takes orders of
+        // magnitude longer than generating an EC key), so it runs where a long one cannot
+        // block the runtime, and it holds no lock while it runs: no other request of this
+        // service waits on the store for it, and the request's own timeout and the
+        // emulator's shutdown keep their yield point.
+        //
+        // The pair is what the CA's published certification request is over and what every
+        // certificate and revocation list it later puts out is signed with, so it is never
+        // re-minted. A `KeyAlgorithm` the in-process cryptography provider cannot mint
+        // leaves the CA without one, and what it publishes carries the stand-in public key
+        // and signature instead.
+        let key_algorithm = input
+            .certificate_authority_configuration
+            .key_algorithm
+            .clone();
+        let key_pair = ::tokio::task::spawn_blocking(move || {
+            crate::state::generate_key_pair(&key_algorithm)
+        })
+        .await
+        .map_err(|_| {
+            CreateCertificateAuthorityError::from(
+                CreateCertificateAuthorityErrorModeled::RequestFailedException(
+                    RequestFailedException {
+                        message: Some(
+                            "the certificate authority's key pair could not be minted"
+                                .to_string(),
+                        ),
+                    },
+                ),
+            )
+        })?;
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(CreateCertificateAuthorityErrorModeled::RequestFailedException(
                 RequestFailedException {
@@ -280,12 +314,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         );
         let configuration = input.certificate_authority_configuration;
         let record = crate::state::CertificateAuthorityRecord {
-            csr_pem: crate::state::derive_csr_pem(&arn, &configuration).ok_or_else(|| {
-                invalid_args(
-                    "CertificateAuthorityConfiguration.Subject cannot be encoded as an X.500 \
-                     distinguished name",
-                )
-            })?,
+            csr_pem: crate::state::derive_csr_pem(&arn, &configuration, key_pair.as_ref())
+                .ok_or_else(|| {
+                    invalid_args(
+                        "CertificateAuthorityConfiguration.Subject cannot be encoded as an \
+                         X.500 distinguished name",
+                    )
+                })?,
+            key_pair,
             owner_account: ::emulator_server::emulator_account_id().to_string(),
             ca_type: input.certificate_authority_type,
             // A new CA is returned in CREATING and settles into PENDING_CERTIFICATE on
@@ -322,6 +358,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crl_number: 0,
             crl_published_at: None,
             certificates: ::std::collections::HashMap::new(),
+            // A new CA has produced no audit report yet.
+            audit_reports: ::std::vec::Vec::new(),
             permissions: ::std::vec::Vec::new(),
             issue_idempotency: crate::state::IdempotencyRecords::new(),
             arn: arn.clone(),

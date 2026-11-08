@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeCertificateAuthorityAuditReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeCertificateAuthorityAuditReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeCertificateAuthorityAuditReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -157,18 +148,58 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeCertificateAuthorityAuditReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeCertificateAuthorityAuditReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeCertificateAuthorityAuditReport"))
+        let _ = ctx;
+        let arn = input.certificate_authority_arn;
+        if crate::state::parse_certificate_authority_arn(&arn).is_none() {
+            return Err(
+                DescribeCertificateAuthorityAuditReportErrorModeled::InvalidArnException(
+                    InvalidArnException {
+                        message: Some(crate::state::INVALID_ARN_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(not_found("the private CA store is unavailable".to_string()));
+        };
+        let mut state = state.lock();
+        let now = ::std::time::SystemTime::now();
+
+        // Reporting only: the lookup materialises the CREATING -> PENDING_CERTIFICATE
+        // change the clock already owed.
+        let Some(record) = state.certificate_authority_mut(&arn, now) else {
+            return Err(not_found(crate::state::CA_NOT_FOUND_MESSAGE.to_string()));
+        };
+        // A report is held under the CA that produced it, so an id that CA has no report
+        // for is the absence of the report rather than of the authority — which is the one
+        // code this operation models for either.
+        let Some(report) = record.audit_report(&input.audit_report_id) else {
+            return Err(not_found(
+                crate::state::AUDIT_REPORT_NOT_FOUND_MESSAGE.to_string(),
+            ));
+        };
+
+        Ok(DescribeCertificateAuthorityAuditReportOutput {
+            // Producing a report takes the service a moment, so its status is read off the
+            // clock: the instant it was due to be finished is the instant it is finished,
+            // whether or not anybody asked.
+            audit_report_status: Some(report.status(now).to_string()),
+            s3_bucket_name: Some(report.s3_bucket_name.clone()),
+            s3_key: Some(report.s3_key.clone()),
+            created_at: Some(crate::state::to_date_time(report.created_at)),
+        })
     }
+}
+
+/// "A resource such as a private CA, S3 bucket, certificate, audit report, or policy cannot
+/// be found." — the only absence this operation models, whichever of the two is missing.
+fn not_found(message: String) -> DescribeCertificateAuthorityAuditReportError {
+    DescribeCertificateAuthorityAuditReportErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(message),
+        },
+    )
+    .into()
 }

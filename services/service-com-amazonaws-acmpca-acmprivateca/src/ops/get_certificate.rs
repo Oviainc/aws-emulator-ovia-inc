@@ -191,16 +191,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(record) = state.certificate_authority_mut(&ca_arn, now) else {
             return Err(not_found(crate::state::CA_NOT_FOUND_MESSAGE.to_string()));
         };
-        if record.status == crate::state::STATUS_CREATING {
-            return Err(GetCertificateErrorModeled::RequestInProgressException(
-                RequestInProgressException {
-                    message: Some(crate::state::CREATE_IN_PROGRESS_MESSAGE.to_string()),
-                },
-            )
-            .into());
-        }
 
+        // A CA signs a certificate with the certificate of its OWN that vouches for its
+        // key, so one that does not hold a certificate yet can have issued certificates
+        // only in the one case this service's `IssueCertificate` admits: the root CA
+        // certificate it signs for ITSELF, which this read is the documented next step
+        // after. So the certificate the request names is resolved first, and a CA with
+        // nothing to show for the ARN is then judged: before it holds a certificate of its
+        // own it is not in a state to have issued any, which is the state refusal about the
+        // authority; once it does, the absence reported is that of the certificate the
+        // request asked about.
+        //
+        // `RequestInProgressException` is kept for the one thing it says — a certificate
+        // this CA really is minting, which a caller may retry for (below) — rather than for
+        // a CA that will never have one, which a caller would retry forever.
         let Some(certificate) = record.certificates.get(&certificate_arn) else {
+            if record.ca_certificate_pem.is_none() {
+                return Err(GetCertificateErrorModeled::InvalidStateException(
+                    InvalidStateException {
+                        message: Some(crate::state::not_in_state_to_have_issued_message(
+                            &ca_arn,
+                        )),
+                    },
+                )
+                .into());
+            }
             return Err(not_found(
                 crate::state::CERTIFICATE_NOT_FOUND_MESSAGE.to_string(),
             ));

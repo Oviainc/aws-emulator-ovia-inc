@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateCertificateAuthorityAuditReport
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateCertificateAuthorityAuditReport`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateCertificateAuthorityAuditReport::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -137,6 +128,15 @@ impl From<CreateCertificateAuthorityAuditReportErrorModeled> for CreateCertifica
 /// [`smithy_server_runtime::Operation`]. Generic over the engine type `Eng`, so this
 /// crate names no concrete engine type: a migrated service that needs state picks a
 /// concrete engine where it mounts the service, not here.
+///
+/// One rule this operation's documentation states is deliberately NOT enforced here: "You
+/// can generate a maximum of one report every 30 minutes." A rate limit is only as good as
+/// the refusal it answers with, and nothing records which code or sentence Amazon Web
+/// Services Private CA refuses the second report in a window with — the operation models
+/// `RequestInProgressException` and `RequestFailedException`, and picking one would be this
+/// emulator inventing a refusal a caller would then branch on. So every request for a
+/// report this service can produce is answered with one, and a caller that depends on the
+/// published limit gets a report where production would refuse it.
 pub struct CreateCertificateAuthorityAuditReport<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
@@ -167,18 +167,159 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateCertificateAuthorityAuditReport` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateCertificateAuthorityAuditReportErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateCertificateAuthorityAuditReport"))
+        let region = crate::state::request_region(&ctx.parts().headers);
+        let arn = input.certificate_authority_arn.clone();
+        let Some(parsed) = crate::state::parse_certificate_authority_arn(&arn) else {
+            return Err(
+                CreateCertificateAuthorityAuditReportErrorModeled::InvalidArnException(
+                    InvalidArnException {
+                        message: Some(crate::state::INVALID_ARN_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::SystemTime::now();
+        // The report is built while the store is held and deposited once the guard has been
+        // released, as every other write this service makes to object storage is.
+        let (report_id, deposit) = self.build_report(&arn, &parsed.id, &input, now)?;
+
+        // The bucket is resolved against object storage BEFORE the report is written to it,
+        // the way a CRL configuration's bucket is resolved before a CA is created with it
+        // ([`crate::state::bucket_absent`]), so a bucket this account does not hold is
+        // answered as the absent resource it is — the one sentence this service words that
+        // fault with — rather than by a write that fails.
+        if crate::state::bucket_absent(ctx, &region, &deposit.bucket).await {
+            return Err(
+                CreateCertificateAuthorityAuditReportErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::BUCKET_ABSENT_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The report's `S3Key` is the key of an object that is THERE: the deposit is made
+        // before the report is recorded, so a bucket that will not take it is answered as
+        // the failed request it is rather than with a key nothing is at. The bucket was
+        // resolved just above, so what is left here is object storage refusing the write
+        // for a reason this service knows nothing more about than the model's own sentence
+        // for it.
+        if !crate::state::deposit_audit_report(ctx, &region, &deposit).await {
+            return Err(
+                CreateCertificateAuthorityAuditReportErrorModeled::RequestFailedException(
+                    RequestFailedException {
+                        message: Some("The request has failed for an unspecified reason."
+                            .to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // The store is taken a second time to record the report, because the deposit above
+        // holds no lock while it calls another service. A CA deleted inside that window is
+        // reported as the absent resource it now is, and the object already deposited for
+        // it is left where it is: there is no call that takes an object back out, and a
+        // report nothing records is a report no describe answers.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+        let mut state = state.lock();
+        let Some(record) = state.certificate_authority_mut(&arn, now) else {
+            return Err(ca_not_found());
+        };
+        record.record_audit_report(crate::state::AuditReportRecord {
+            id: report_id.clone(),
+            s3_bucket_name: deposit.bucket,
+            s3_key: deposit.key.clone(),
+            created_at: now,
+            // Producing the report completes on the clock, so a caller that describes it
+            // straight away still sees it being created.
+            completes_at: now + crate::state::SETTLE_AFTER,
+        });
+
+        Ok(CreateCertificateAuthorityAuditReportOutput {
+            audit_report_id: Some(report_id),
+            s3_key: Some(deposit.key),
+        })
     }
+}
+
+impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>
+    CreateCertificateAuthorityAuditReport<Eng>
+{
+    /// The report this request asks for: its minted id, and the object-storage write that
+    /// carries it.
+    ///
+    /// Everything that reads the store happens here, so this service's lock is taken and
+    /// released inside one synchronous call and no handler holds it while calling another
+    /// service.
+    fn build_report(
+        &self,
+        arn: &str,
+        certificate_authority_id: &str,
+        input: &CreateCertificateAuthorityAuditReportInput,
+        now: ::std::time::SystemTime,
+    ) -> Result<(String, crate::state::AuditReportDeposit), CreateCertificateAuthorityAuditReportError>
+    {
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(store_unavailable());
+        };
+        let mut state = state.lock();
+        let Some(record) = state.certificate_authority_mut(arn, now) else {
+            return Err(ca_not_found());
+        };
+
+        // "Creates an audit report that lists every time that your CA private key is used
+        // to issue a certificate." (this operation's docs.) A CA that has not been given a
+        // certificate of its own has signed nothing with that key and has no audit
+        // information to report, which is the same state refusal `GetCertificate` answers
+        // for a CA that cannot have issued certificates.
+        if record.ca_certificate_pem.is_none() {
+            return Err(
+                CreateCertificateAuthorityAuditReportErrorModeled::InvalidStateException(
+                    InvalidStateException {
+                        message: Some(crate::state::not_in_state_to_have_issued_message(arn)),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let format = input.audit_report_response_format.as_str();
+        let report_id = crate::state::mint_resource_id();
+        let deposit = crate::state::AuditReportDeposit {
+            bucket: input.s3_bucket_name.clone(),
+            key: crate::state::audit_report_key(certificate_authority_id, &report_id, format),
+            content_type: crate::state::audit_report_content_type(format),
+            body: crate::state::audit_report_body(record, format, now),
+        };
+        Ok((report_id, deposit))
+    }
+}
+
+/// "A resource such as a private CA, S3 bucket, certificate, audit report, or policy cannot
+/// be found."
+fn ca_not_found() -> CreateCertificateAuthorityAuditReportError {
+    CreateCertificateAuthorityAuditReportErrorModeled::ResourceNotFoundException(
+        ResourceNotFoundException {
+            message: Some(crate::state::CA_NOT_FOUND_MESSAGE.to_string()),
+        },
+    )
+    .into()
+}
+
+/// "The request has failed for an unspecified reason." — the modelled error this emulator
+/// answers for not reaching its own state store, with the sentence that says which failure
+/// it was.
+fn store_unavailable() -> CreateCertificateAuthorityAuditReportError {
+    CreateCertificateAuthorityAuditReportErrorModeled::RequestFailedException(
+        RequestFailedException {
+            message: Some("the private CA store is unavailable".to_string()),
+        },
+    )
+    .into()
 }
