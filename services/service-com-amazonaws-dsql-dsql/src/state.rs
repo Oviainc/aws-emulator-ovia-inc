@@ -2482,15 +2482,24 @@ fn parse_policy(document: &str) -> Option<::serde_json::Map<String, ::serde_json
 /// Read the way an IAM resource policy is read: an explicit `Deny` beats every
 /// `Allow`, so a `Deny` statement that covers all principals, covers
 /// [`POLICY_MANAGEMENT_ACTION`], covers the cluster being protected and carries no
-/// `Condition` narrowing it leaves nobody able to call that action again.
+/// `Condition` narrowing it leaves nobody able to call that action again. Each of
+/// the three sets is read in whichever of its two forms the statement spells it,
+/// the positive element or its negated complement — `Principal`/`NotPrincipal`,
+/// `Action`/`NotAction`, `Resource`/`NotResource` — because the negated form states
+/// the same set by naming what it leaves out.
 fn locks_out_every_principal(
     document: &::serde_json::Map<String, ::serde_json::Value>,
     resource_arn: &str,
 ) -> bool {
+    // The account the policy protects is the account segment of the ARN it is
+    // attached to: a principal of that account is who the check asks about.
+    let account = parse_resource_arn(resource_arn)
+        .map(|arn| arn.account)
+        .unwrap_or_default();
     statements(document).iter().any(|statement| {
         effect_is(statement, "Deny")
             && !statement.contains_key("Condition")
-            && covers_every_principal(statement)
+            && covers_every_principal(statement, &account)
             && covers_management_action(statement)
             && covers_this_resource(statement, resource_arn)
     })
@@ -2520,17 +2529,57 @@ fn effect_is(statement: &::serde_json::Map<String, ::serde_json::Value>, effect:
         .is_some_and(|stated| stated.eq_ignore_ascii_case(effect))
 }
 
-/// Whether the statement applies to every principal: `"Principal": "*"`, or a
-/// `Principal` block whose `AWS` entry is `*`.
-fn covers_every_principal(statement: &::serde_json::Map<String, ::serde_json::Value>) -> bool {
-    match statement.get("Principal") {
-        Some(::serde_json::Value::String(principal)) => principal == "*",
-        Some(::serde_json::Value::Object(block)) => block
-            .values()
-            .flat_map(string_values)
-            .any(|principal| principal == "*"),
-        _ => false,
+/// Whether the statement applies to every principal that could still replace the
+/// policy: `"Principal": "*"`, or a `Principal` block whose entries include `*`.
+///
+/// `NotPrincipal` is the complement, so the statement applies to every principal it
+/// does NOT name — which still leaves the policy replaceable when one of the
+/// principals it exempts could call [`POLICY_MANAGEMENT_ACTION`] on a resource of
+/// `account_id` ([`can_manage_policy`]), and locks everybody out otherwise.
+fn covers_every_principal(
+    statement: &::serde_json::Map<String, ::serde_json::Value>,
+    account_id: &str,
+) -> bool {
+    if let Some(principals) = statement.get("Principal") {
+        return principal_entries(principals)
+            .iter()
+            .any(|principal| principal == "*");
     }
+    if let Some(not_principals) = statement.get("NotPrincipal") {
+        return !principal_entries(not_principals)
+            .iter()
+            .any(|principal| can_manage_policy(principal, account_id));
+    }
+    false
+}
+
+/// Every principal a statement's `Principal` or `NotPrincipal` element names: IAM
+/// writes the element as the bare string `*`, or as a block keyed by principal type
+/// (`AWS`, `Service`, …) whose entries are a string or a list of them.
+fn principal_entries(element: &::serde_json::Value) -> Vec<String> {
+    match element {
+        ::serde_json::Value::Object(block) => block.values().flat_map(string_values).collect(),
+        other => string_values(other),
+    }
+}
+
+/// Whether `principal` is one that could still call [`POLICY_MANAGEMENT_ACTION`] on
+/// a resource of `account_id`: every principal (`*`), or a principal of that
+/// account — an account id written on its own, or the account segment of a
+/// principal ARN. A principal of any OTHER account, and a service or federated
+/// principal (which carries no account segment at all), could not, so exempting one
+/// of those from a `Deny` leaves nobody who can.
+///
+/// No wildcard matching beyond the whole-element `*`: IAM reads a `Principal` entry
+/// as an exact value, not as a pattern.
+fn can_manage_policy(principal: &str, account_id: &str) -> bool {
+    if principal == "*" {
+        return true;
+    }
+    if account_id.is_empty() {
+        return false;
+    }
+    principal == account_id || principal.split(':').nth(4) == Some(account_id)
 }
 
 /// Whether the statement's `Action` set covers [`POLICY_MANAGEMENT_ACTION`].

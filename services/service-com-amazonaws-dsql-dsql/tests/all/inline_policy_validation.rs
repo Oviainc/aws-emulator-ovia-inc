@@ -17,11 +17,13 @@
 //! null, truncated text), its STATEMENT COUNT and form (absent, empty list, a bare
 //! statement object, a list), the statement's effect spelling, the shape of its
 //! action set (`Action`, a wildcard family, `NotAction`), of its principal set (a
-//! string wildcard, an `AWS` block, one named role) and of its resource set
-//! (absent, `*`, a wildcard over the account's clusters, another cluster's ARN) —
-//! `tests/all/policy_version_conflict_and_lockout.rs` spans the `Resource` forms
-//! that name the cluster's own ARN, which a create cannot name because the ARN is
-//! minted by the call itself.
+//! string wildcard, an `AWS` block, one named role, `NotPrincipal`) and of its
+//! resource set (absent, `*`, a wildcard over the account's clusters, another
+//! cluster's ARN) — `tests/all/policy_version_conflict_and_lockout.rs` spans the
+//! `Resource` forms that name the cluster's own ARN, which a create cannot name
+//! because the ARN is minted by the call itself, and
+//! `tests/all/policy_principal_set.rs` spans the principal set's two polarities in
+//! full.
 //!
 //! Every case drives the real request path through the `Dsql` harness in
 //! `tests/all/harness.rs`, this crate's one test client.
@@ -159,6 +161,16 @@ fn policy_cases(region: &str) -> Vec<PolicyCase> {
             verdict: Verdict::Attached,
         },
         PolicyCase {
+            name: "a NotPrincipal that exempts a principal of this account",
+            document: document(json!([{
+                "Effect": "Deny",
+                "NotPrincipal": named_principal(),
+                "Action": "dsql:*",
+                "Resource": "*",
+            }])),
+            verdict: Verdict::Attached,
+        },
+        PolicyCase {
             name: "an allow beside a deny of another action, two statements",
             document: document(json!([
                 {
@@ -232,6 +244,16 @@ fn policy_cases(region: &str) -> Vec<PolicyCase> {
                 "Effect": "Deny",
                 "Principal": "*",
                 "NotAction": "dsql:DbConnect",
+                "Resource": "*",
+            }])),
+            verdict: Verdict::LocksEveryoneOut,
+        },
+        PolicyCase {
+            name: "deny everyone but a principal of another account, which is everyone here",
+            document: document(json!([{
+                "Effect": "Deny",
+                "NotPrincipal": {"AWS": "arn:aws:iam::111122223333:role/nobody"},
+                "Action": "dsql:*",
                 "Resource": "*",
             }])),
             verdict: Verdict::LocksEveryoneOut,

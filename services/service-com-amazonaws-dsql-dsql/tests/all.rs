@@ -73,6 +73,8 @@ mod peering_unwound_by_deletion;
 mod peering_unwound_by_update;
 #[path = "all/policy_document_class.rs"]
 mod policy_document_class;
+#[path = "all/policy_principal_set.rs"]
+mod policy_principal_set;
 #[path = "all/policy_token_optional_claim_distinctness.rs"]
 mod policy_token_optional_claim_distinctness;
 #[path = "all/policy_version_conflict_and_lockout.rs"]
