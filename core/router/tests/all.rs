@@ -35,6 +35,11 @@ mod cloudformation_rollback_triggers_revert_the_operation;
 // service's span of the sorted list.
 #[path = "all/workspace_lockfile_covers_every_manifest.rs"]
 mod workspace_lockfile_covers_every_manifest;
+// Declared here, in this same head region, for the reason the entries above record: what a
+// bucket's Lambda notification configuration DOES, which spans S3, Lambda, IAM and
+// CloudFormation at once.
+#[path = "all/s3_notification_invokes_its_lambda_target.rs"]
+mod s3_notification_invokes_its_lambda_target;
 #[path = "all/cloudformation_asset_bucket_publishing_role.rs"]
 mod cloudformation_asset_bucket_publishing_role;
 // Declared here, in this same head region, for the reason the entry above records: the

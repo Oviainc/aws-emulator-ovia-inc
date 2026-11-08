@@ -38,9 +38,11 @@ import sys
 
 # Everything this runtime itself needs, imported once, before the handler's own work
 # begins and before the bounds that measure that work are in place.
+import datetime
 import importlib
 import importlib.util
 import json
+import logging
 import time
 import traceback
 
@@ -51,8 +53,9 @@ class _LogStream:
     """One of the handler's output streams, writing into the invocation's log.
 
     The interpreter is built without the host's own standard streams, so this is the
-    only `sys.stdout`/`sys.stderr` a handler has: `print()` and `logging` reach the
-    invocation's log through it, and nothing reaches this process's stdio.
+    only `sys.stdout`/`sys.stderr` a handler has: `print()` and the logging handler this
+    runtime installs (`_install_logging`) reach the invocation's log through it, and
+    nothing reaches this process's stdio.
     """
 
     encoding = "utf-8"
@@ -96,6 +99,78 @@ class _LogStream:
 sys.stdout = _LogStream()
 sys.stderr = _LogStream()
 sys.stdin = None
+
+
+class _LambdaLogFormatter(logging.Formatter):
+    """How this runtime renders ONE logging record into the invocation's log.
+
+    The managed runtime's own text rendering of a record: the level in brackets, the
+    instant the record was created in UTC to the millisecond, the invocation's request id
+    and the message, tab separated. So a handler that logs through `logging` leaves lines
+    a client can read the level and the invocation off, exactly as `print()` leaves the
+    text it was given.
+    """
+
+    def __init__(self, request_id):
+        logging.Formatter.__init__(self)
+        self._request_id = request_id
+
+    def formatTime(self, record, datefmt=None):
+        whole = int(record.created)
+        millis = min(999, int((record.created - whole) * 1000.0))
+        at = datetime.datetime.utcfromtimestamp(whole)
+        return "%04d-%02d-%02dT%02d:%02d:%02d.%03dZ" % (
+            at.year,
+            at.month,
+            at.day,
+            at.hour,
+            at.minute,
+            at.second,
+            millis,
+        )
+
+    def format(self, record):
+        message = record.getMessage()
+        if record.exc_info:
+            rendered = traceback.format_exception(
+                record.exc_info[0], record.exc_info[1], record.exc_info[2]
+            )
+            message = "%s\n%s" % (message, "".join(rendered).rstrip("\n"))
+        return "[%s]\t%s\t%s\t%s" % (
+            record.levelname,
+            self.formatTime(record),
+            self._request_id,
+            message,
+        )
+
+
+def _install_logging(request_id):
+    """Give the root logger the handler the managed runtime gives it.
+
+    A record emitted through `logging` reaches no output on its own: with no handler on
+    the root logger the library falls back to one that takes nothing below a warning and
+    renders the bare message, so a handler logging at the level it set its logger to
+    would leave nothing in the function's log group. The managed runtime installs a
+    handler instead, which is what makes `logging.getLogger().setLevel(logging.INFO)`
+    followed by `logger.info(...)` appear in the log — so this runtime installs one too,
+    writing into the invocation's own output.
+
+    The LEVEL is left exactly as the library's own default (a warning), because that is
+    the level the managed runtime leaves the root logger at: what a record has to clear is
+    the level the handler's own code set, and nothing here lowers or raises it.
+
+    Installed before the handler's module is imported, so a record a module emits while it
+    is being imported is carried too, and installed as the ONLY handler, so a handler
+    module calling `logging.basicConfig()` adds none beside it and no record is written
+    twice.
+    """
+
+    handler = logging.StreamHandler(sys.stdout)
+    handler.setFormatter(_LambdaLogFormatter(request_id))
+    root = logging.getLogger()
+    for installed in list(root.handlers):
+        root.removeHandler(installed)
+    root.addHandler(handler)
 
 
 class _PackageLoader:
@@ -279,6 +354,9 @@ def _run(request, library):
             _PackageFinder(runtime_sources, importlib.util.spec_from_loader)
         )
     time.sleep = _bounded_sleep
+    # Before the handler's module is imported, which is where a module-level record is
+    # emitted from.
+    _install_logging(request["requestId"])
 
     handler = request["handler"]
     module_name, separator, attribute = handler.rpartition(".")

@@ -201,6 +201,10 @@ mod function_versions_by_capacity_provider;
 mod functions_by_code_signing_config;
 #[path = "all/handler_aws_sdk.rs"]
 mod handler_aws_sdk;
+#[path = "all/handler_db_auth_token.rs"]
+mod handler_db_auth_token;
+#[path = "all/handler_logging_facility.rs"]
+mod handler_logging_facility;
 #[path = "all/handler_object_store_sdk.rs"]
 mod handler_object_store_sdk;
 #[path = "all/handler_dynamodb_binary_attributes.rs"]
@@ -209,9 +213,6 @@ mod handler_dynamodb_binary_attributes;
 mod handler_dynamodb_resource;
 #[path = "all/handler_email_sdk.rs"]
 mod handler_email_sdk;
-#[path = "all/handler_eventbridge_publication.rs"]
-mod handler_eventbridge_publication;
-
 #[path = "all/handler_object_storage_sdk.rs"]
 mod handler_object_storage_sdk;
 #[path = "all/handler_rest_api_sdk.rs"]
@@ -232,6 +233,8 @@ mod invocation_log_delivery;
 mod invocation_log_group_search;
 #[path = "all/invocation_refusal_diagnostics.rs"]
 mod invocation_refusal_diagnostics;
+#[path = "all/invocation_run_capacity.rs"]
+mod invocation_run_capacity;
 #[path = "all/invoke_addressed_function.rs"]
 mod invoke_addressed_function;
 #[path = "all/invoke_function_error_document.rs"]
@@ -258,6 +261,8 @@ mod layer_archive_unzipped_size;
 mod layer_listing;
 #[path = "all/layer_listing_entry_members.rs"]
 mod layer_listing_entry_members;
+#[path = "all/layer_region_scope.rs"]
+mod layer_region_scope;
 #[path = "all/layer_version_by_arn.rs"]
 mod layer_version_by_arn;
 #[path = "all/layer_version_listing.rs"]
@@ -318,8 +323,6 @@ mod s3_package_source;
 mod signing_name_routing;
 #[path = "all/sqs_event_source_handler_run.rs"]
 mod sqs_event_source_handler_run;
-#[path = "all/sqs_event_source_record_attributes.rs"]
-mod sqs_event_source_record_attributes;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stream_mapping_iterator_age_series.rs"]
@@ -332,6 +335,8 @@ mod tag_resource_arn_constraint;
 mod untrusted_name_parsing;
 #[path = "all/update_function_configuration.rs"]
 mod update_function_configuration;
+#[path = "all/update_window_outlasts_its_call.rs"]
+mod update_window_outlasts_its_call;
 #[path = "all/version_delete_alias_reference.rs"]
 mod version_delete_alias_reference;
 #[path = "all/version_publishing.rs"]
@@ -352,13 +357,9 @@ mod invoke_caller_authorization;
 mod invoke_log_delivery;
 #[path = "all/invocation_logs.rs"]
 mod invocation_logs;
-#[path = "all/invocation_run_capacity.rs"]
-mod invocation_run_capacity;
-#[path = "all/handler_db_auth_token.rs"]
-mod handler_db_auth_token;
-#[path = "all/layer_region_scope.rs"]
-mod layer_region_scope;
-#[path = "all/update_window_outlasts_its_call.rs"]
-mod update_window_outlasts_its_call;
+#[path = "all/handler_eventbridge_publication.rs"]
+mod handler_eventbridge_publication;
+#[path = "all/sqs_event_source_record_attributes.rs"]
+mod sqs_event_source_record_attributes;
 #[path = "all/xray_daemon_datagram.rs"]
 mod xray_daemon_datagram;
