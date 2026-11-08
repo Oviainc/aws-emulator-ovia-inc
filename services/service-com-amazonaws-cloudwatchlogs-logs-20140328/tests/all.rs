@@ -179,6 +179,8 @@ mod missing_destination_refusal;
 mod parameter_pair_refusals;
 #[path = "all/put_log_events_batch_constraints.rs"]
 mod put_log_events_batch_constraints;
+#[path = "all/probe_scratch.rs"]
+mod probe_scratch;
 #[path = "all/query_and_stream_refusal_text.rs"]
 mod query_and_stream_refusal_text;
 #[path = "all/query_cancellation.rs"]
@@ -187,6 +189,8 @@ mod query_cancellation;
 mod query_compilation;
 #[path = "all/query_definitions.rs"]
 mod query_definitions;
+#[path = "all/query_language_admission.rs"]
+mod query_language_admission;
 #[path = "all/query_results.rs"]
 mod query_results;
 #[path = "all/query_window_refusal.rs"]

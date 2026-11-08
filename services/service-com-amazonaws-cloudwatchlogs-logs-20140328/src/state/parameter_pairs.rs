@@ -19,7 +19,10 @@
 //!   `DescribeMetricFilters` refusal for a half-named metric is worded, naming the request
 //!   by the operation's words;
 //! * [`either_required`] — one of the two has to be named, as the recorded refusals for the
-//!   log-group selector pair and for the lookup-table source pair are worded.
+//!   log-group selector pair and for the lookup-table source pair are worded;
+//! * [`cannot_be_combined`] — the two cannot be combined, as the recorded `StartQuery`
+//!   refusal for two of its three log-group members is worded, which states the pair as a
+//!   pair rather than as a rule over a list.
 //!
 //! Each form takes the parameters as the service NAMES them, which is a property of the
 //! pair: the selector pair is stated in the service's display words (`LogGroup name`), the
@@ -46,9 +49,17 @@ pub fn either_required(first: &str, second: &str) -> String {
     format!("Either {first} or {second} must be provided.")
 }
 
+/// The second sentence for two parameters that cannot be combined: `Both <first> and <second>
+/// cannot be specified at the same time`, with NO trailing period — the wording the recorded
+/// `StartQuery` refusal for two log-group members carries, which names the pair the request
+/// combined rather than the whole list the operation chooses from.
+pub fn cannot_be_combined(first: &str, second: &str) -> String {
+    format!("Both {first} and {second} cannot be specified at the same time")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{either_required, must_contain_both, mutually_exclusive};
+    use super::{cannot_be_combined, either_required, must_contain_both, mutually_exclusive};
 
     /// Each form states the two parameters it is given, in the order it is given them, and
     /// nothing else: the fixed words, the punctuation and the spacing are the form's own.
@@ -124,6 +135,27 @@ mod tests {
         ];
         for (first, second, expected) in required {
             let actual = either_required(first, second);
+            assert_eq!(
+                actual, expected,
+                "case {first}/{second}: expected {expected:?}, got {actual:?}"
+            );
+        }
+
+        let combined = [
+            // The recorded `StartQuery` refusal for two of its three log-group members.
+            (
+                "logGroupName",
+                "logGroupNames",
+                "Both logGroupName and logGroupNames cannot be specified at the same time",
+            ),
+            (
+                "logGroupNames",
+                "logGroupIdentifiers",
+                "Both logGroupNames and logGroupIdentifiers cannot be specified at the same time",
+            ),
+        ];
+        for (first, second, expected) in combined {
+            let actual = cannot_be_combined(first, second);
             assert_eq!(
                 actual, expected,
                 "case {first}/{second}: expected {expected:?}, got {actual:?}"

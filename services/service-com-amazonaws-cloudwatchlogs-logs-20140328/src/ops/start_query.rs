@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartQuery
-//! Implemented: compiles the query string, resolves the log groups it reads and starts the
-//! query `DescribeQueries` then reports. This is the ONLY file to touch for this
-//! operation.
+//! Implemented: compiles the query string in the language the request names, resolves the log
+//! groups it reads from the ONE place that language names them in, and stores the query
+//! `DescribeQueries` then reports. This is the ONLY file to touch for this operation.
 //!
 //! A 501 from this operation means "nobody has written it yet", never "the emulator is
 //! broken". Replace the `Err(..)` in [`StartQuery::handle`] with real behaviour and
@@ -212,7 +212,12 @@ fn malformed_query(
 ) -> StartQueryError {
     StartQueryErrorModeled::MalformedQueryException(MalformedQueryException {
         message: Some(crate::state::with_sdk_error_envelope(
-            &unexpected_symbol_message(query, failure),
+            // A fault the compiler states a rule for states that rule; one it stopped at a
+            // symbol for names that symbol and where it sits.
+            &failure
+                .refusal
+                .clone()
+                .unwrap_or_else(|| unexpected_symbol_message(query, failure)),
             ENVELOPE_MALFORMED_QUERY,
         )),
         query_compile_error: Some(QueryCompileError {
@@ -290,6 +295,86 @@ const ENVELOPE_MALFORMED_QUERY: crate::state::SdkEnvelopeFacts =
 /// parameters: logGroupName, logGroupNames, or logGroupIdentifiers").
 const LOG_GROUP_MEMBERS: [&str; 3] = ["logGroupName", "logGroupNames", "logGroupIdentifiers"];
 
+/// The two of [`LOG_GROUP_MEMBERS`] that name log groups by NAME, which the SQL query
+/// language takes none of: such a query names its log groups in the statement instead
+/// ("you specify the log group names inside the querystring instead of here",
+/// `StartQuery$logGroupName`), and `logGroupIdentifiers` is the member the statement's own
+/// clause overrides rather than one it conflicts with.
+const LEGACY_LOG_GROUP_MEMBERS: [&str; 2] = ["logGroupName", "logGroupNames"];
+
+/// Refuse the request with the error this operation models for a log group that is not there,
+/// naming the group that is missing.
+fn log_group_not_found(log_group_name: &str) -> StartQueryError {
+    StartQueryErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
+        message: Some(crate::state::query_admission::log_group_not_found_refusal(
+            log_group_name,
+        )),
+    })
+    .into()
+}
+
+/// Refuse a query string that IS a statement of the query language the request named and does
+/// not compile: the compiler's own account of what it stopped on, stated the way this service
+/// states a compile failure (recorded: a refusal for a query the compiler could not build
+/// opens `Compile Error - `), with the submitted statement as the text at fault — which is the
+/// structure the model declares for the detail (`QueryCompileError`).
+fn malformed_statement(query: &str, detail: &str) -> StartQueryError {
+    let rule = format!("{COMPILE_ERROR_PREFIX}{detail}");
+    StartQueryErrorModeled::MalformedQueryException(MalformedQueryException {
+        message: Some(crate::state::with_sdk_error_envelope(
+            &rule,
+            ENVELOPE_MALFORMED_QUERY,
+        )),
+        query_compile_error: Some(QueryCompileError {
+            message: Some(detail.to_string()),
+            location: Some(QueryCompileErrorLocation {
+                start_char_offset: Some(0),
+                end_char_offset: Some(
+                    i32::try_from(query.chars().count()).unwrap_or(i32::MAX),
+                ),
+            }),
+        }),
+    })
+    .into()
+}
+
+/// The fixed text a refusal for a query the compiler could not build opens with.
+const COMPILE_ERROR_PREFIX: &str = "Compile Error - ";
+
+/// Refuse a SQL statement that filters its groups on an aggregate function expression: the
+/// rule, then the predicate as the pipeline the statement translates to states it, and the
+/// character span its condition occupies in the submitted query string — which is the
+/// structure the model declares for the detail
+/// (`QueryCompileError`/`QueryCompileErrorLocation`).
+fn malformed_filter_on_aggregate(
+    fault: &crate::state::insights::sql::HavingFault,
+) -> StartQueryError {
+    let rule = format!(
+        "{}{}",
+        crate::state::insights::sql::NO_AGGREGATE_IN_FILTER_PREFIX,
+        fault.predicate
+    );
+    StartQueryErrorModeled::MalformedQueryException(MalformedQueryException {
+        message: Some(crate::state::with_sdk_error_envelope(
+            &format!(
+                "{rule} ([{}, {}])",
+                fault.start_char_offset, fault.end_char_offset
+            ),
+            ENVELOPE_MALFORMED_QUERY,
+        )),
+        query_compile_error: Some(QueryCompileError {
+            message: Some(rule),
+            location: Some(QueryCompileErrorLocation {
+                start_char_offset: Some(
+                    i32::try_from(fault.start_char_offset).unwrap_or(i32::MAX),
+                ),
+                end_char_offset: Some(i32::try_from(fault.end_char_offset).unwrap_or(i32::MAX)),
+            }),
+        }),
+    })
+    .into()
+}
+
 impl<Eng> StartQuery<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -342,8 +427,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "Specify the query language to use for this query": a request that names none uses
-        // Logs Insights QL, which is also the only language whose syntax this service
-        // compiles.
+        // Logs Insights QL, whose own grammar this service compiles.
         let query_language = input
             .query_language
             .clone()
@@ -354,11 +438,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .map_err(|failure| malformed_query(&input.query_string, &failure))?,
             )
         } else {
-            // The OpenSearch languages are compiled by the engine that runs them, which this
-            // service does not host: a query string in one of them is taken as given rather
-            // than judged against Logs Insights QL's grammar.
+            // The OpenSearch languages have grammars of their own, so a query string in one of
+            // them is not judged against Logs Insights QL's.
             None
         };
+        let sql = query_language == crate::state::insights::QUERY_LANGUAGE_SQL;
+
+        // A SQL statement filtering its groups on an aggregate function expression is one the
+        // language does not compile: it filters on the columns the projection names, so the
+        // aggregate has a name there to be filtered on. The fault is in the query string, so
+        // it is refused as the malformed query it is before anything else about the request.
+        if sql {
+            if let Some(fault) = crate::state::insights::sql::aggregate_expression_in_having(
+                &input.query_string,
+            ) {
+                return Err(malformed_filter_on_aggregate(&fault));
+            }
+        }
 
         // "To specify the log groups to query, a StartQuery operation must include one of the
         // following: Either exactly one of the following parameters: logGroupName,
@@ -374,58 +470,120 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|(_, named)| *named)
             .map(|(member, _)| *member)
             .collect();
-        let query_selects_sources = compiled
-            .as_ref()
-            .is_some_and(crate::state::query_compile::CompiledQuery::selects_its_own_sources)
-            // A query in one of the OpenSearch languages names its log groups inside the
-            // query string ("The exception is queries using the OpenSearch Service SQL query
-            // language, where you specify the log group names inside the querystring"), so
-            // such a request need name none of the three members.
-            || compiled.is_none();
-        if named_members.len() > 1 {
-            return Err(invalid_parameter(format!(
-                "Exactly one of {} must be specified.",
-                LOG_GROUP_MEMBERS.join(", ")
-            )));
-        }
-        if named_members.is_empty() && !query_selects_sources {
-            return Err(invalid_parameter(format!(
-                "Exactly one of {}, or a SOURCE command in the query string, must specify the \
-                 log groups to query.",
-                LOG_GROUP_MEMBERS.join(", ")
-            )));
+        // Two of the three members name the log groups twice over, whichever two they are:
+        // CloudWatch Logs states that as the pair it is, in the sentence it words every such
+        // pair with.
+        if let [first, second, ..] = named_members.as_slice() {
+            return Err(invalid_parameter(
+                crate::state::parameter_pairs::cannot_be_combined(first, second),
+            ));
         }
 
-        // Whichever member named them, the log groups are resolved to the names the store
-        // keys them by: an identifier may be a name or either ARN form of one group.
-        let identifiers: Vec<String> = input
-            .log_group_name
-            .clone()
-            .map(|name| vec![name])
-            .or_else(|| input.log_group_names.clone())
-            .or_else(|| input.log_group_identifiers.clone())
-            .unwrap_or_default();
-        // "You can include up to 50 log groups" (`logGroupNames`, `logGroupIdentifiers`).
-        if identifiers.len() > crate::state::MAX_QUERY_LOG_GROUPS {
-            return Err(invalid_parameter(format!(
-                "A query can include up to {} log groups.",
-                crate::state::MAX_QUERY_LOG_GROUPS
-            )));
-        }
-        let mut log_group_names: Vec<String> = Vec::with_capacity(identifiers.len());
-        for identifier in &identifiers {
-            let name = crate::state::log_group_name_from_identifier(identifier).to_string();
-            if !store.log_groups.contains_key(&name) {
-                return Err(StartQueryErrorModeled::ResourceNotFoundException(
-                    ResourceNotFoundException {
-                        message: Some(crate::state::resource_not_found_message("log group")),
-                    },
-                )
-                .into());
+        // Whichever place names them, the log groups are resolved to the names the store keys
+        // them by: an identifier may be a name or either ARN form of one group.
+        let log_group_names: Vec<String> = if sql {
+            // "The exception is queries using the OpenSearch Service SQL query language,
+            // where you specify the log group names inside the querystring instead of here":
+            // for this language the statement's own source clause is the ONE place the log
+            // groups are named, so one of the two LEGACY members — which name one group and a
+            // list of groups by name — names them a second time over. `logGroupIdentifiers`
+            // is the member that clause OVERRIDES rather than conflicts with, so a request
+            // may carry it.
+            if named_members
+                .iter()
+                .any(|member| LEGACY_LOG_GROUP_MEMBERS.contains(member))
+            {
+                return Err(invalid_parameter(
+                    crate::state::query_admission::log_group_source_conflict_refusal(),
+                ));
             }
-            if !log_group_names.contains(&name) {
-                log_group_names.push(name);
+            let sources =
+                crate::state::insights::sql::statement_sources(&input.query_string);
+            // A statement of this language that does not compile is a malformed query, which
+            // is what this operation models `MalformedQueryException` for; a query string that
+            // is no statement of the language names no log groups, and so does a statement
+            // with no source clause — for either, the request names them nowhere, because
+            // `logGroupIdentifiers` does not stand in for the clause: it is overridden by it.
+            let selectors = match sources {
+                crate::state::insights::sql::StatementSources::Named(selectors) => selectors,
+                crate::state::insights::sql::StatementSources::Malformed(detail) => {
+                    return Err(malformed_statement(&input.query_string, &detail))
+                }
+                crate::state::insights::sql::StatementSources::Unnamed => {
+                    return Err(invalid_parameter(
+                        crate::state::query_admission::sql_sources_unresolved_refusal(),
+                    ))
+                }
+            };
+            // A clause naming one log group by name or ARN names a resource, so one this
+            // account does not hold is the missing resource it is; a clause selecting groups
+            // by prefix selects whatever the account holds under it, including nothing.
+            for selector in &selectors {
+                if let crate::state::insights::GroupSelector::Name(identifier) = selector {
+                    let name = crate::state::log_group_name_from_identifier(identifier);
+                    if !store.log_groups.contains_key(name) {
+                        return Err(log_group_not_found(name));
+                    }
+                }
             }
+            crate::state::insights::selected_groups(&store, &selectors)
+                .into_iter()
+                .filter(|name| store.log_groups.contains_key(name))
+                .collect()
+        } else {
+            let query_selects_sources = compiled
+                .as_ref()
+                .is_some_and(crate::state::query_compile::CompiledQuery::selects_its_own_sources)
+                // PPL opens its pipeline with the command that names them, which is the same
+                // second form: the log groups are named in the query string.
+                || (compiled.is_none()
+                    && crate::state::query_admission::pipeline_selects_its_own_sources(
+                        &input.query_string,
+                    ));
+            if named_members.is_empty() && !query_selects_sources {
+                return Err(invalid_parameter(format!(
+                    "Exactly one of {}, or a SOURCE command in the query string, must specify the \
+                     log groups to query.",
+                    LOG_GROUP_MEMBERS.join(", ")
+                )));
+            }
+            let identifiers: Vec<String> = input
+                .log_group_name
+                .clone()
+                .map(|name| vec![name])
+                .or_else(|| input.log_group_names.clone())
+                .or_else(|| input.log_group_identifiers.clone())
+                .unwrap_or_default();
+            // "You can include up to 50 log groups" (`logGroupNames`, `logGroupIdentifiers`).
+            if identifiers.len() > crate::state::MAX_QUERY_LOG_GROUPS {
+                return Err(invalid_parameter(format!(
+                    "A query can include up to {} log groups.",
+                    crate::state::MAX_QUERY_LOG_GROUPS
+                )));
+            }
+            let mut names: Vec<String> = Vec::with_capacity(identifiers.len());
+            for identifier in &identifiers {
+                let name = crate::state::log_group_name_from_identifier(identifier).to_string();
+                if !store.log_groups.contains_key(&name) {
+                    return Err(log_group_not_found(&name));
+                }
+                if !names.contains(&name) {
+                    names.push(name);
+                }
+            }
+            names
+        };
+
+        // A query in one of the OpenSearch languages reads log groups of ONE log class, so a
+        // set of groups that mixes two classes is not a set one query may read — the class is
+        // the log group's own property (`CreateLogGroup$logGroupClass`), so the rule is applied
+        // where the named groups are resolved against state.
+        if query_language != crate::state::DEFAULT_QUERY_LANGUAGE
+            && crate::state::query_admission::spans_two_log_classes(&store, &log_group_names)
+        {
+            return Err(invalid_parameter(
+                crate::state::query_admission::mixed_log_class_refusal(),
+            ));
         }
 
         // A `lookup` command in the query reads a lookup table of this account, which the

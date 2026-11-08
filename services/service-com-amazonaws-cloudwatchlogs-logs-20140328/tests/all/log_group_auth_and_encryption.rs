@@ -505,15 +505,22 @@ async fn a_key_association_with_a_bad_target_or_key_is_refused() {
     // "you must specify either the resourceIdentifier parameter or the logGroup
     // parameter, but you can't specify both", and a resourceIdentifier that names
     // neither a log group nor the query-result resource names no target.
+    //
+    // The two forms differ in WHAT is wrong: a request naming both target members, or
+    // neither, breaks the rule relating the two members and is refused as a request
+    // validation; a resourceIdentifier that resolves to no resource is a bad value, which
+    // is the operation's own modelled parameter error.
     let bad_targets = [
-        ("neither parameter", json!({})),
+        ("neither parameter", json!({}), "ValidationException"),
         (
             "both parameters",
             json!({"logGroupName": group, "resourceIdentifier": log_group_arn}),
+            "ValidationException",
         ),
         (
             "a resourceIdentifier naming another service's resource",
             json!({"resourceIdentifier": engine::emulator_arn("s3", "", "a-bucket")}),
+            "InvalidParameterException",
         ),
         (
             "a resourceIdentifier naming a log stream",
@@ -522,13 +529,15 @@ async fn a_key_association_with_a_bad_target_or_key_is_refused() {
                 REGION,
                 &format!("log-group:{group}:log-stream:a-stream"),
             )}),
+            "InvalidParameterException",
         ),
         (
             "a resourceIdentifier that is no ARN at all",
             json!({"resourceIdentifier": group}),
+            "InvalidParameterException",
         ),
     ];
-    for (case, target) in bad_targets {
+    for (case, target, expected) in bad_targets {
         let mut associate = target.clone();
         associate
             .as_object_mut()
@@ -540,7 +549,7 @@ async fn a_key_association_with_a_bad_target_or_key_is_refused() {
         ] {
             let code = logs.err(operation, &body).await;
             assert_eq!(
-                code, "InvalidParameterException",
+                code, expected,
                 "case {operation} with {case}: a target naming nothing is refused, got {code}"
             );
         }

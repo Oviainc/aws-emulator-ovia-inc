@@ -848,11 +848,6 @@ async fn a_query_string_the_service_cannot_run_reports_the_failed_status() {
             format!("filter {}", "(".repeat(9_000)),
         ),
         (
-            "an aggregate the query language does not define",
-            "CWLI",
-            "stats bogus(@message) as x".to_string(),
-        ),
-        (
             "a stats command naming no aggregate",
             "CWLI",
             "stats by level".to_string(),
@@ -879,29 +874,6 @@ async fn a_query_string_the_service_cannot_run_reports_the_failed_status() {
             "a PPL pipeline truncated at a where command",
             "PPL",
             format!("{source} | where"),
-        ),
-        (
-            "a statement that is not SQL at all",
-            "SQL",
-            "SELECT FROM WHERE".to_string(),
-        ),
-        (
-            "a SQL statement truncated at its condition",
-            "SQL",
-            format!("SELECT * FROM `{GROUP}` WHERE"),
-        ),
-        (
-            "a SQL statement naming no table to read",
-            "SQL",
-            "SELECT 1".to_string(),
-        ),
-        (
-            "a SQL statement carrying a HAVING clause",
-            "SQL",
-            format!(
-                "SELECT `level`, count(*) AS hits FROM `{GROUP}` GROUP BY `level` \
-                 HAVING count(*) > 1"
-            ),
         ),
         (
             "a SQL statement calling a function this service does not run",
@@ -936,17 +908,20 @@ async fn a_query_string_the_service_cannot_run_reports_the_failed_status() {
         ),
     ];
     for (case, language, query_string) in cases {
-        let id = start(
-            &logs,
-            &json!({
-                "logGroupName": GROUP,
-                "queryLanguage": language,
-                "startTime": start_time,
-                "endTime": end_time,
-                "queryString": query_string,
-            }),
-        )
-        .await;
+        let mut body = json!({
+            "queryLanguage": language,
+            "startTime": start_time,
+            "endTime": end_time,
+            "queryString": query_string,
+        });
+        // The SQL language names the log groups to read inside the statement ("you specify
+        // the log group names inside the querystring instead of here",
+        // `StartQuery$logGroupName`), so a SQL case names none in the request; every other
+        // language names them there.
+        if language != "SQL" {
+            body["logGroupName"] = json!(GROUP);
+        }
+        let id = start(&logs, &body).await;
         tokio::time::sleep(past_completion()).await;
         let answer = logs.ok(RESULTS, &json!({"queryId": id})).await;
         assert_eq!(

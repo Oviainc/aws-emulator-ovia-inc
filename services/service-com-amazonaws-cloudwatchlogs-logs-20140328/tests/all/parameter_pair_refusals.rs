@@ -56,6 +56,11 @@ fn either_required(first: &str, second: &str) -> String {
     format!("Either {first} or {second} must be provided.")
 }
 
+/// The sentence a KMS-key association naming BOTH of its target members is refused with:
+/// this pair is worded about the member that identifies a target on its own.
+const RESOURCE_IDENTIFIER_EXCLUSIVE: &str =
+    "resourceIdentifier should not be specified with any other log group attributes";
+
 /// One refused request: the operation, the body, the error shape and the whole sentence.
 struct Case {
     name: &'static str,
@@ -71,7 +76,7 @@ struct Case {
 fn cases() -> Vec<Case> {
     let selectors_exclusive = mutually_exclusive("LogGroup name", "LogGroup ARN");
     let selector_required = either_required("LogGroupName", "LogGroupArn");
-    let kms_exclusive = mutually_exclusive("logGroupName", "resourceIdentifier");
+    let kms_exclusive = RESOURCE_IDENTIFIER_EXCLUSIVE.to_string();
     let metric_pair = must_contain_both("Describe Metric Filters", "MetricName", "MetricNamespace");
     vec![
         // The two name filters of a log-group listing: the pair this operation's own
@@ -148,7 +153,8 @@ fn cases() -> Vec<Case> {
             sent: vec!["ERROR".to_string()],
         },
         // The KMS-key target pair, both halves and neither, on both operations that
-        // resolve it — refused with those operations' own `InvalidParameterException`.
+        // resolve it — refused as the request-validation faults they are, like every other
+        // mutually-exclusive selector pair of this service.
         Case {
             name: "AssociateKmsKey naming both targets",
             operation: "AssociateKmsKey",
@@ -157,7 +163,7 @@ fn cases() -> Vec<Case> {
                 "logGroupName": "pairs",
                 "resourceIdentifier": GROUP_ARN,
             }),
-            code: INVALID_PARAMETER,
+            code: VALIDATION,
             message: kms_exclusive.clone(),
             sent: vec![KMS_KEY_ARN.to_string(), GROUP_ARN.to_string()],
         },
@@ -165,7 +171,7 @@ fn cases() -> Vec<Case> {
             name: "AssociateKmsKey naming neither target",
             operation: "AssociateKmsKey",
             body: json!({"kmsKeyId": KMS_KEY_ARN}),
-            code: INVALID_PARAMETER,
+            code: VALIDATION,
             message: either_required("logGroupName", "resourceIdentifier"),
             sent: vec![KMS_KEY_ARN.to_string()],
         },
@@ -173,7 +179,7 @@ fn cases() -> Vec<Case> {
             name: "DisassociateKmsKey naming both targets",
             operation: "DisassociateKmsKey",
             body: json!({"logGroupName": "pairs", "resourceIdentifier": GROUP_ARN}),
-            code: INVALID_PARAMETER,
+            code: VALIDATION,
             message: kms_exclusive,
             sent: vec!["pairs".to_string(), GROUP_ARN.to_string()],
         },

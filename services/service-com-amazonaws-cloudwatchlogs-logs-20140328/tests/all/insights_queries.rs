@@ -128,8 +128,8 @@ async fn a_query_string_that_does_not_compile_is_refused_as_malformed() {
             "already defined",
         ),
         (
-            "a later fields command naming an already-parsed field",
-            r"parse @message /(?<duration>\d+)/ | fields @timestamp, duration",
+            "a stats command defining an already-parsed field a second time",
+            r"parse @message /(?<duration>\d+)/ | stats count(*) as duration",
             "already defined",
         ),
         (

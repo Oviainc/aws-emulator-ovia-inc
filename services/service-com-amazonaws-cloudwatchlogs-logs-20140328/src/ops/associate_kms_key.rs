@@ -233,7 +233,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // "you specify either the logGroupName parameter or the resourceIdentifier
-        // parameter. You can't specify both of those parameters in the same operation."
+        // parameter. You can't specify both of those parameters in the same operation." The
+        // rule relates the two members, so breaking it is a refusal of the REQUEST rather than
+        // of a value in it.
+        if let Some(message) = crate::state::kms_key_target_pair_refusal(
+            input.log_group_name.as_deref(),
+            input.resource_identifier.as_deref(),
+        ) {
+            return Err(AssociateKmsKeyError::validation(message));
+        }
         let target = crate::state::resolve_kms_key_target(
             input.log_group_name.as_deref(),
             input.resource_identifier.as_deref(),

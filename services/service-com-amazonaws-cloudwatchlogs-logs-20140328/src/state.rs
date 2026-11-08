@@ -151,6 +151,10 @@ use std::collections::BTreeMap;
 /// `StartQuery` accepts one.
 pub mod query_compile;
 
+/// Which log groups a started query reads, and whether the request naming them may be
+/// admitted at all.
+pub mod query_admission;
+
 /// RUNNING a started query over the stored log events, which is what `GetQueryResults`
 /// reports.
 pub mod insights;
@@ -2835,6 +2839,39 @@ pub enum KmsKeyTarget {
     LogGroup(String),
     /// The account's stored query-insights results.
     QueryResults,
+}
+
+/// The sentence an `AssociateKmsKey` / `DisassociateKmsKey` request naming BOTH of its two
+/// target members is refused with: `resourceIdentifier` is the member that identifies the
+/// target on its own, so it is the member the sentence names. Fixed text for the class,
+/// carrying nothing of the request.
+pub const RESOURCE_IDENTIFIER_EXCLUSIVE_MESSAGE: &str =
+    "resourceIdentifier should not be specified with any other log group attributes";
+
+/// The refusal an `AssociateKmsKey` / `DisassociateKmsKey` request whose two target members
+/// cannot hold together is refused with, or `None` when exactly one of them names a target.
+///
+/// A request naming both, or neither, breaks the rule that RELATES the two members ("you
+/// specify either the logGroupName parameter or the resourceIdentifier parameter. You can't
+/// specify both of those parameters in the same operation") rather than any constraint on a
+/// value, so it is answered as the request-validation refusal it is — a `ValidationException`,
+/// like every other mutually-exclusive pair of a log-group selector this service checks — and
+/// not as one of the operation's own modelled parameter errors. A `resourceIdentifier` that
+/// names no resource IS a bad value, and stays one ([`resolve_kms_key_target`]).
+pub fn kms_key_target_pair_refusal(
+    log_group_name: Option<&str>,
+    resource_identifier: Option<&str>,
+) -> Option<String> {
+    match (log_group_name, resource_identifier) {
+        (Some(_), None) | (None, Some(_)) => None,
+        // The two members this rule relates, named as the service names them: the one that
+        // identifies a target on its own is the one the sentence is about.
+        (Some(_), Some(_)) => Some(RESOURCE_IDENTIFIER_EXCLUSIVE_MESSAGE.to_string()),
+        (None, None) => Some(parameter_pairs::either_required(
+            "logGroupName",
+            "resourceIdentifier",
+        )),
+    }
 }
 
 /// Resolve the target of an `AssociateKmsKey` / `DisassociateKmsKey` request. The two

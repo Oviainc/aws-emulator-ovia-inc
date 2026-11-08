@@ -22,8 +22,11 @@
 //!   group, a dangling quantifier — is refused where it stands;
 //! * the ephemeral fields the pipeline defines: a command may not DEFINE a field name an
 //!   earlier command of the same pipeline already defined — whether it defines it with an
-//!   `as` clause, with a named capture group of a `parse` expression, or by listing it in a
-//!   `fields` command — because the two definitions would name one field;
+//!   `as` clause or with a named capture group of a `parse` expression — because the two
+//!   definitions would name one field. LISTING a field a stage already produced (`fields
+//!   @timestamp, lat`) defines nothing: it selects it, which is what those commands are for;
+//! * the functions each stage CALLS, which have to be functions the language defines
+//!   ([`functions`]);
 //! * a `limit` command's count, which is a positive integer;
 //! * the lookup table each `lookup` command reads, which that command's first argument names
 //!   and which the caller resolves against the account's lookup tables
@@ -48,6 +51,9 @@
 
 use std::collections::BTreeSet;
 
+/// The functions a query may call, and finding a call to one the language does not define.
+mod functions;
+
 /// Why a query string does not compile, and where in the string the compiler stopped.
 ///
 /// The offsets are CHARACTER offsets into the query string, which is what
@@ -56,6 +62,12 @@ use std::collections::BTreeSet;
 pub struct QueryCompileFailure {
     /// What is wrong, as the compile error reports it.
     pub message: String,
+    /// The sentence the REFUSAL states, for a fault that is not a symbol the compiler stopped
+    /// on: a semantic fault — a call to a function the language does not define — parses
+    /// fine, so naming an unexpected symbol would misreport which rule the query broke.
+    /// `None` for a syntax fault, which the caller states as the symbol it stopped at and
+    /// where that symbol sits.
+    pub refusal: Option<String>,
     /// The first character of the text at fault.
     pub start_char_offset: usize,
     /// One past its last character.
@@ -159,6 +171,7 @@ pub fn compile(query: &str) -> Result<CompiledQuery, QueryCompileFailure> {
     if stages.is_empty() {
         return Err(QueryCompileFailure {
             message: "The query string is empty.".to_string(),
+            refusal: None,
             start_char_offset: 0,
             end_char_offset: query.chars().count(),
         });
@@ -175,6 +188,7 @@ pub fn compile(query: &str) -> Result<CompiledQuery, QueryCompileFailure> {
             let at = stage.start_char_offset + stage.text.chars().count();
             return Err(QueryCompileFailure {
                 message: "The query has an empty command.".to_string(),
+                refusal: None,
                 start_char_offset: at,
                 end_char_offset: at,
             });
@@ -188,6 +202,7 @@ pub fn compile(query: &str) -> Result<CompiledQuery, QueryCompileFailure> {
         if !COMMANDS.contains(&lowercased.as_str()) {
             return Err(QueryCompileFailure {
                 message: format!("The command {command} is not a valid query command."),
+                refusal: None,
                 start_char_offset: command_offset,
                 end_char_offset: command_offset + command.chars().count(),
             });
@@ -225,30 +240,28 @@ pub fn compile(query: &str) -> Result<CompiledQuery, QueryCompileFailure> {
                 compiled.lookup_tables.push(table);
             }
         }
-        // A `fields` command DEFINES the fields it lists — "use the fields command to get
-        // specific fields, or to create a new ephemeral field" — so a field an earlier
-        // command of the same pipeline already defined cannot be listed by it: the two
-        // definitions would name one field. Only `fields` defines what it names this way; a
-        // command that merely READS a field (`display`, `stats`, `sort`, `filter`) names it
-        // without defining anything.
-        if lowercased == FIELDS {
-            for token in tokens(arguments) {
-                let name = token.text.trim_matches(',');
-                if is_field_name(name) && compiled.defined_fields.contains(name) {
-                    return Err(QueryCompileFailure {
-                        message: format!("The field {name} is already defined."),
-                        start_char_offset: arguments_offset + token.offset,
-                        end_char_offset: arguments_offset
-                            + token.offset
-                            + token.text.chars().count(),
-                    });
-                }
+        // Every function a stage calls has to be one the language defines: a call to a name
+        // it defines none for computes nothing, so the query cannot be compiled. The `SOURCE`
+        // command is not read for calls — the `logGroups(…)` inside it SELECTS log groups and
+        // is no function of the query language.
+        if lowercased != SOURCE {
+            if let Some(failure) =
+                functions::unknown_function_call(&lowercased, arguments, arguments_offset)
+            {
+                return Err(failure);
             }
         }
+        // A command DEFINES an ephemeral field by naming it in an `as` clause, or with a named
+        // capture group of a `parse` expression — and a field an earlier command of the same
+        // pipeline already defined cannot be defined again, because the two definitions would
+        // name one field. A command that LISTS a field (`fields @timestamp, lat`, `display`,
+        // `stats`, `sort`, `filter`) selects or reads the one the pipeline already carries and
+        // defines nothing.
         for (field, offset) in defined_fields(&lowercased, arguments, arguments_offset) {
             if !compiled.defined_fields.insert(field.clone()) {
                 return Err(QueryCompileFailure {
                     message: format!("The field {field} is already defined."),
+                    refusal: None,
                     start_char_offset: offset,
                     end_char_offset: offset + field.chars().count(),
                 });
@@ -316,12 +329,14 @@ fn missing_operand_failure(query: &str, command: &str, at: usize) -> QueryCompil
     if symbol.is_empty() {
         return QueryCompileFailure {
             message,
+            refusal: None,
             start_char_offset: characters.len(),
             end_char_offset: characters.len(),
         };
     }
     QueryCompileFailure {
         message,
+        refusal: None,
         start_char_offset: index,
         end_char_offset: index + symbol.chars().count(),
     }
@@ -468,6 +483,12 @@ fn unseparated_command(arguments: &str, arguments_offset: usize) -> Option<Query
             }
         }
         if character == '|' {
+            // `||` is the OR operator of the query language's expressions, not a stage
+            // separator, so a pair of them is read past rather than blamed as a command.
+            if characters.get(index + 1) == Some(&'|') {
+                index += 2;
+                continue;
+            }
             let mut after = index + 1;
             while characters
                 .get(after)
@@ -493,6 +514,7 @@ fn unseparated_command(arguments: &str, arguments_offset: usize) -> Option<Query
                 } else {
                     format!("The command {word} is not a valid query command.")
                 },
+                refusal: None,
                 start_char_offset: arguments_offset + start,
                 end_char_offset: arguments_offset + end,
             });
@@ -558,12 +580,17 @@ fn check_regex_pattern(
     arguments: &str,
     arguments_offset: usize,
 ) -> Result<(), QueryCompileFailure> {
-    let Some(literal) = regex_literal(arguments, arguments_offset) else {
-        return Ok(());
-    };
-    if !literal.closed && command != PARSE {
-        return Ok(());
+    for literal in command_regex_literals(command, arguments, arguments_offset) {
+        if !literal.closed && command != PARSE {
+            continue;
+        }
+        check_one_regex_literal(&literal)?;
     }
+    Ok(())
+}
+
+/// Check one regular-expression literal.
+fn check_one_regex_literal(literal: &RegexLiteral) -> Result<(), QueryCompileFailure> {
     // The expression comes from the request, so what compiling it may allocate is bounded
     // here rather than left at the engine's default: the expression is only COMPILED — to
     // decide whether it is an expression at all — and never run over any data.
@@ -582,6 +609,7 @@ fn check_regex_pattern(
                     "The regular expression /{}/ is not valid.",
                     literal.pattern
                 ),
+                refusal: None,
                 start_char_offset: literal.offset,
                 end_char_offset: literal.offset + literal.pattern.chars().count() + slashes,
             });
@@ -604,6 +632,98 @@ struct RegexLiteral {
     /// Whether a `/` closed it.
     closed: bool,
 }
+
+/// The regular-expression literals `command`'s arguments carry, read WHERE that command
+/// writes one — so a `/` the command means as division is never read as the start of a
+/// pattern.
+///
+/// Each command that carries a pattern writes it in one place:
+///
+/// * `parse <field> <pattern>` — the pattern is the command's second operand, so a literal
+///   opens at the first character after the field when that character is the delimiter;
+/// * `filter <expression>` — an expression matches against a pattern with one of the match
+///   operators the query language defines (`like`, `not like`, `=~`), so a literal opens
+///   immediately after one of those operators. Everywhere else in an expression a `/` is the
+///   division operator (`filter (duration/1000) > (other/1000)`), which is arithmetic rather
+///   than a pattern.
+fn command_regex_literals(
+    command: &str,
+    arguments: &str,
+    arguments_offset: usize,
+) -> Vec<RegexLiteral> {
+    let characters: Vec<char> = arguments.chars().collect();
+    let operand_starts: Vec<usize> = if command == PARSE {
+        // Past the blanks, past the field, past the blanks after it.
+        let mut at = skip_blanks(&characters, 0);
+        while characters
+            .get(at)
+            .is_some_and(|character| !character.is_whitespace())
+        {
+            at += 1;
+        }
+        vec![skip_blanks(&characters, at)]
+    } else {
+        match_operator_ends(&characters)
+            .into_iter()
+            .map(|at| skip_blanks(&characters, at))
+            .collect()
+    };
+    operand_starts
+        .into_iter()
+        .filter(|at| characters.get(*at) == Some(&REGEX_DELIMITER))
+        .filter_map(|at| {
+            let operand: String = characters[at..].iter().collect();
+            regex_literal(&operand, arguments_offset + at)
+        })
+        .collect()
+}
+
+/// The character a regular-expression literal opens and closes with.
+const REGEX_DELIMITER: char = '/';
+
+/// The first character at or after `from` in `characters` that is not blank.
+fn skip_blanks(characters: &[char], from: usize) -> usize {
+    let mut at = from.min(characters.len());
+    while characters
+        .get(at)
+        .is_some_and(|character| character.is_whitespace())
+    {
+        at += 1;
+    }
+    at
+}
+
+/// One past the last character of each MATCH operator in `characters` — the places a pattern
+/// can open at in an expression.
+fn match_operator_ends(characters: &[char]) -> Vec<usize> {
+    let mut ends: Vec<usize> = Vec::new();
+    let mut index = 0usize;
+    while index < characters.len() {
+        // `=~`, written as two characters.
+        if characters[index] == '=' && characters.get(index + 1) == Some(&'~') {
+            ends.push(index + 2);
+            index += 2;
+            continue;
+        }
+        if !is_word_character(characters[index]) {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < characters.len() && is_word_character(characters[index]) {
+            index += 1;
+        }
+        let word: String = characters[start..index].iter().collect();
+        // `like` and `not like` both match against the pattern that FOLLOWS the word `like`.
+        if word.eq_ignore_ascii_case(LIKE) {
+            ends.push(index);
+        }
+    }
+    ends
+}
+
+/// The match operator written as a word, which `not` may precede.
+const LIKE: &str = "like";
 
 /// The regular-expression literal inside `arguments`, or `None` when the command carries
 /// none — a glob pattern in quotes, or no pattern at all.
@@ -649,6 +769,7 @@ fn lookup_table_name(
 ) -> Result<String, QueryCompileFailure> {
     let missing = || QueryCompileFailure {
         message: "The lookup command must name a lookup table.".to_string(),
+        refusal: None,
         start_char_offset: arguments_offset,
         end_char_offset: arguments_offset + arguments.chars().count(),
     };
@@ -690,6 +811,7 @@ fn check_limit_count(
     }
     Err(QueryCompileFailure {
         message: format!("The limit {trimmed} is not a positive number of log events."),
+        refusal: None,
         start_char_offset: offset,
         end_char_offset: offset + trimmed.chars().count(),
     })
@@ -700,6 +822,13 @@ fn check_limit_count(
 /// A field is defined by an `as <name>` clause — which `fields`, `parse`, `stats` and
 /// `pattern` all take — and by a named capture group of a `parse` command's regular
 /// expression, which is how that command names the fields it extracts.
+///
+/// How many names ONE `as` clause defines depends on the command. A glob `parse` extracts
+/// several fields with one pattern and names them in a comma-separated list (`parse @message
+/// "* *" as a, b`), so every name of that list is defined. Every other command takes a LIST
+/// OF ITEMS, each item an expression with an `as` clause of its own (`fields duration / 1000
+/// as seconds, svc`), so a comma there ends the clause and starts the next item — the names
+/// after the first are the items they belong to, which the stage reads rather than defines.
 fn defined_fields(
     command: &str,
     arguments: &str,
@@ -707,7 +836,7 @@ fn defined_fields(
 ) -> Vec<(String, usize)> {
     let mut defined: Vec<(String, usize)> = Vec::new();
     if command == PARSE {
-        if let Some(literal) = regex_literal(arguments, arguments_offset) {
+        for literal in command_regex_literals(PARSE, arguments, arguments_offset) {
             defined.extend(capture_group_names(&literal.pattern, literal.offset + 1));
         }
     }
@@ -718,11 +847,16 @@ fn defined_fields(
     // a pipeline that already names one of them is not defining it twice.
     if command == LOOKUP {
         if let Some((output, offset)) = output_clause(arguments, arguments_offset) {
-            defined.extend(alias_names(&output, offset));
+            defined.extend(item_alias_names(&output, offset));
         }
         return defined;
     }
-    defined.extend(alias_names(arguments, arguments_offset));
+    if command == PARSE {
+        // The glob form's one clause names every field the pattern extracts.
+        defined.extend(alias_names(arguments, arguments_offset));
+        return defined;
+    }
+    defined.extend(item_alias_names(arguments, arguments_offset));
     defined
 }
 
@@ -798,6 +932,36 @@ fn alias_names(arguments: &str, arguments_offset: usize) -> Vec<(String, usize)>
         // A token that does not end in a comma ends the list it belongs to.
         if !token.text.ends_with(',') {
             after_as = false;
+        }
+    }
+    names
+}
+
+/// The name each `as` clause of a LIST OF ITEMS assigns to, with the character offset of the
+/// name.
+///
+/// One `as` clause of such a list names ONE field — the item it belongs to is one expression
+/// under one name — so the clause ends at its name and whatever follows the comma after it
+/// belongs to the next item (`fields duration / 1000 as seconds, svc` defines `seconds` and
+/// reads `svc`). This is the form `fields`, `display`, `stats`, `pattern` and a `lookup`
+/// command's `OUTPUT` list are written in; a glob `parse`, whose single clause names several
+/// fields, is read by [`alias_names`].
+fn item_alias_names(arguments: &str, arguments_offset: usize) -> Vec<(String, usize)> {
+    let mut names: Vec<(String, usize)> = Vec::new();
+    let mut after_as = false;
+    for token in tokens(arguments) {
+        let token_offset = arguments_offset + token.offset;
+        if token.text.to_lowercase() == AS {
+            after_as = true;
+            continue;
+        }
+        if !after_as {
+            continue;
+        }
+        after_as = false;
+        let name = token.text.trim_matches(',');
+        if is_field_name(name) {
+            names.push((name.to_string(), token_offset));
         }
     }
     names

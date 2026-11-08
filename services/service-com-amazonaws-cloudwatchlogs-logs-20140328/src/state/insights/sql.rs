@@ -72,9 +72,23 @@ fn check_statement(parsed: &Query) -> Result<(), ExecutionFailure> {
         return Ok(());
     };
     if select.having.is_some() {
-        return Err(ExecutionFailure::new(
-            "a HAVING clause has no execution in this service",
-        ));
+        // "HAVING condition" filters the groups the statement built, over the columns its
+        // projection names — which is where an aggregate's value stands once the groups are
+        // folded. A condition carrying an aggregate function expression of its OWN is not a
+        // condition the language admits ([`aggregate_expression_in_having`]), and a statement
+        // carrying one is refused where it is compiled.
+        if let Some(predicate) = select
+            .having
+            .as_ref()
+            .and_then(aggregate_expression_in_condition)
+        {
+            return Err(ExecutionFailure::new(format!(
+                "{NO_AGGREGATE_IN_FILTER_PREFIX}{predicate}"
+            )));
+        }
+    }
+    if let Some(condition) = select.having.as_ref() {
+        check_expression(condition, 0)?;
     }
     if select.distinct.is_some() {
         return Err(ExecutionFailure::new(
@@ -217,6 +231,266 @@ pub(super) fn from_clause_groups(parsed: &Query) -> Result<Vec<GroupSelector>, E
     from_clause_selectors(select)
 }
 
+/// What the SQL statement `query_string` says about the log groups it reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StatementSources {
+    /// The statement's own source clause, as the selectors it names.
+    Named(Vec<GroupSelector>),
+    /// The query string names no log groups this service can resolve — a `SELECT` with no
+    /// `FROM` clause, and a query string that is no statement of this language at all.
+    Unnamed,
+    /// The query string IS a statement of this language — it opens with one of the keywords a
+    /// statement of it opens with — and does NOT compile, with the compiler's own account of
+    /// what it stopped on.
+    Malformed(String),
+}
+
+/// The log groups the SQL statement `query_string` names, read from the statement itself.
+///
+/// This is what the SQL language names INSTEAD of the request's members ("you specify the log
+/// group names inside the querystring instead of here", `StartQuery$logGroupIdentifiers`), so
+/// the caller that ADMITS a request reads them here — through the same parser that runs the
+/// statement, so the groups a request is admitted over are the groups its run will read.
+///
+/// The two ways a query string can name none are kept apart, because they are different
+/// faults: a string that is no statement of this language names no log groups and nothing
+/// else can be said about it, while a statement OF this language that does not compile is a
+/// malformed query, which is what this operation models `MalformedQueryException` for.
+pub fn statement_sources(query_string: &str) -> StatementSources {
+    let parsed = match Parser::parse_sql(&GenericDialect {}, query_string) {
+        Ok(statements) => statements,
+        Err(error) => {
+            return if opens_a_statement(query_string) {
+                StatementSources::Malformed(compiler_detail(&error.to_string()))
+            } else {
+                StatementSources::Unnamed
+            }
+        }
+    };
+    let [Statement::Query(parsed)] = parsed.as_slice() else {
+        return if opens_a_statement(query_string) {
+            StatementSources::Malformed(
+                "a SQL query of log events is one SELECT statement".to_string(),
+            )
+        } else {
+            StatementSources::Unnamed
+        };
+    };
+    match from_clause_groups(parsed) {
+        Ok(selectors) => StatementSources::Named(selectors),
+        // A statement that compiles and names no source clause names no log groups.
+        Err(_) => StatementSources::Unnamed,
+    }
+}
+
+/// Whether `query_string` opens a statement of this query language: its first word is one of
+/// the keywords such a statement opens with, whatever case it is written in.
+fn opens_a_statement(query_string: &str) -> bool {
+    query_string
+        .split_whitespace()
+        .next()
+        .is_some_and(|word| {
+            STATEMENT_KEYWORDS
+                .iter()
+                .any(|keyword| word.eq_ignore_ascii_case(keyword))
+        })
+}
+
+/// The keywords a statement of this query language opens with.
+const STATEMENT_KEYWORDS: [&str; 2] = ["select", "with"];
+
+/// The compiler's account of a statement that does not compile, as this service states one:
+/// the parser's own diagnostic, without the crate-level prefix it writes in front of it.
+fn compiler_detail(error: &str) -> String {
+    error
+        .strip_prefix(PARSER_ERROR_PREFIX)
+        .unwrap_or(error)
+        .to_string()
+}
+
+/// The prefix `sqlparser` writes in front of its diagnostics, which names the parser rather
+/// than the fault.
+const PARSER_ERROR_PREFIX: &str = "sql parser error: ";
+
+/// Where a statement's `HAVING` clause filters on something the language does not admit: the
+/// predicate to state the fault with, and where in the submitted query string that condition
+/// stands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HavingFault {
+    /// The condition as the pipeline the statement TRANSLATES to states it.
+    pub predicate: String,
+    /// The first character of the condition in the query string.
+    pub start_char_offset: usize,
+    /// One past its last character.
+    pub end_char_offset: usize,
+}
+
+/// The aggregate function expression the SQL statement `query_string` filters its groups on,
+/// if it filters them on one — the fault that makes such a statement one the language cannot
+/// compile.
+///
+/// The predicate is answered as the pipeline the statement TRANSLATES to states it: the
+/// `filter` stage the `HAVING` clause becomes, written as the command and the condition with
+/// no space between them, and with the name of every function call lowercased
+/// ([`translated_predicate`]). A query string that is no `SELECT`, or one whose `HAVING`
+/// filters on the columns the projection names, carries no such fault.
+pub fn aggregate_expression_in_having(query_string: &str) -> Option<HavingFault> {
+    let statements = Parser::parse_sql(&GenericDialect {}, query_string).ok()?;
+    let [Statement::Query(parsed)] = statements.as_slice() else {
+        return None;
+    };
+    let SetExpr::Select(select) = parsed.body.as_ref() else {
+        return None;
+    };
+    let condition = select.having.as_ref()?;
+    let predicate = aggregate_expression_in_condition(condition)?;
+    let (start_char_offset, end_char_offset) =
+        having_condition_span(query_string).unwrap_or((0, query_string.chars().count()));
+    Some(HavingFault {
+        predicate,
+        start_char_offset,
+        end_char_offset,
+    })
+}
+
+/// Where the condition of `query_string`'s `HAVING` clause stands in it, as CHARACTER offsets
+/// — what `QueryCompileErrorLocation` carries, so a client can point at the text at fault.
+///
+/// The clause is found by its keyword and runs to the clause that follows it, which in a
+/// `SELECT` of log events is an ordering or a bound; `None` when the query string carries no
+/// such keyword, which a statement whose parser found a `HAVING` clause does not happen to be.
+fn having_condition_span(query_string: &str) -> Option<(usize, usize)> {
+    let characters: Vec<char> = query_string.chars().collect();
+    let mut words: Vec<(String, usize, usize)> = Vec::new();
+    let mut index = 0usize;
+    while index < characters.len() {
+        if !characters[index].is_alphanumeric() && characters[index] != '_' {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < characters.len()
+            && (characters[index].is_alphanumeric() || characters[index] == '_')
+        {
+            index += 1;
+        }
+        words.push((
+            characters[start..index].iter().collect::<String>().to_lowercase(),
+            start,
+            index,
+        ));
+    }
+    let at = words.iter().position(|(word, ..)| word == HAVING_KEYWORD)?;
+    let start = words.get(at + 1).map_or(words[at].2, |(_, from, _)| *from);
+    let end = words
+        .iter()
+        .skip(at + 1)
+        .find(|(word, ..)| CLAUSES_AFTER_HAVING.contains(&word.as_str()))
+        .map_or(characters.len(), |(_, from, _)| *from);
+    Some((start, end.max(start)))
+}
+
+/// The keyword that opens the clause filtering a statement's groups.
+const HAVING_KEYWORD: &str = "having";
+
+/// The keywords that can open the clause AFTER it, which is where its condition ends.
+const CLAUSES_AFTER_HAVING: [&str; 2] = ["order", "limit"];
+
+/// The fixed text a statement filtering its groups on an aggregate function expression is
+/// refused with, the translated predicate following it.
+pub const NO_AGGREGATE_IN_FILTER_PREFIX: &str = "No aggregation function expression allowed: ";
+
+/// Whether `condition` calls an aggregate anywhere in it, and the translated predicate to
+/// state it with.
+fn aggregate_expression_in_condition(condition: &Expr) -> Option<String> {
+    if !calls_an_aggregate(condition, 0) {
+        return None;
+    }
+    Some(translated_predicate(condition))
+}
+
+/// Whether `expression` calls an aggregate function anywhere inside it.
+///
+/// Bounded by the same depth every other walk of a caller-written expression is bounded by
+/// ([`super::MAX_EXPRESSION_DEPTH`]): an expression nesting deeper than that is not read, and
+/// the compile check that follows refuses it for exactly that.
+fn calls_an_aggregate(expression: &Expr, depth: usize) -> bool {
+    if depth > super::MAX_EXPRESSION_DEPTH {
+        return false;
+    }
+    let depth = depth + 1;
+    if matches!(read_aggregate(expression), Ok(Some(_))) {
+        return true;
+    }
+    match expression {
+        Expr::Nested(inner)
+        | Expr::IsNull(inner)
+        | Expr::IsNotNull(inner)
+        | Expr::IsTrue(inner)
+        | Expr::IsFalse(inner)
+        | Expr::UnaryOp { expr: inner, .. } => calls_an_aggregate(inner, depth),
+        Expr::BinaryOp { left, right, .. } => {
+            calls_an_aggregate(left, depth) || calls_an_aggregate(right, depth)
+        }
+        Expr::Between {
+            expr, low, high, ..
+        } => [expr.as_ref(), low.as_ref(), high.as_ref()]
+            .into_iter()
+            .any(|inner| calls_an_aggregate(inner, depth)),
+        Expr::InList { expr, list, .. } => {
+            calls_an_aggregate(expr, depth)
+                || list.iter().any(|inner| calls_an_aggregate(inner, depth))
+        }
+        Expr::Like { expr, pattern, .. } | Expr::ILike { expr, pattern, .. } => {
+            calls_an_aggregate(expr, depth) || calls_an_aggregate(pattern, depth)
+        }
+        Expr::Function(function) => match &function.args {
+            FunctionArguments::List(arguments) => arguments.args.iter().any(|argument| {
+                matches!(argument, FunctionArg::Unnamed(FunctionArgExpr::Expr(inner))
+                    if calls_an_aggregate(inner, depth))
+            }),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// `condition` as the `filter` stage of the pipeline a SQL statement translates to: the
+/// command word, then the condition with its spacing removed and the name of every function
+/// call lowercased, which is how that pipeline writes one.
+fn translated_predicate(condition: &Expr) -> String {
+    let written = condition.to_string();
+    let characters: Vec<char> = written.chars().filter(|c| !c.is_whitespace()).collect();
+    let mut predicate = String::with_capacity(characters.len() + TRANSLATED_FILTER.len());
+    predicate.push_str(TRANSLATED_FILTER);
+    let mut index = 0usize;
+    while index < characters.len() {
+        let start = index;
+        while index < characters.len()
+            && (characters[index].is_alphanumeric() || characters[index] == '_')
+        {
+            index += 1;
+        }
+        if index > start {
+            let word: String = characters[start..index].iter().collect();
+            // A word the arguments open right after is a call, and a call's name is written
+            // lowercased; every other word is the caller's own text.
+            if characters.get(index) == Some(&'(') {
+                predicate.push_str(&word.to_lowercase());
+            } else {
+                predicate.push_str(&word);
+            }
+            continue;
+        }
+        predicate.push(characters[index]);
+        index += 1;
+    }
+    predicate
+}
+
+/// The command the translated pipeline filters with.
+const TRANSLATED_FILTER: &str = "filter";
+
 /// Run a planned SQL statement over the records the scan read.
 ///
 /// Reached with this service's state released ([`super::Prepared`]), so every clause is
@@ -278,20 +552,42 @@ struct Evaluation<'a> {
 impl Evaluation<'_> {
     /// Whether `subject` matches the SQL `LIKE` pattern `pattern`, compiling that pattern
     /// once however many records are matched against it.
+    ///
+    /// A pattern operand need not be a literal: `a LIKE b` reads `b` out of each RECORD, so
+    /// the patterns one statement matches against are the caller's DATA and there can be one
+    /// per scanned event. What is RETAINED is therefore bounded two ways — at most
+    /// [`MAX_CACHED_PATTERNS`] expressions are kept, each compiled under
+    /// [`MAX_COMPILED_PATTERN_BYTES`], so the whole cache is bounded by a constant rather than
+    /// by the data; and the pattern text each entry keeps is charged to the run
+    /// ([`Budget::store`]) like every other value a run holds on to. Past either bound a
+    /// pattern is compiled for the one match it is needed for and dropped.
     fn like_matches(&self, subject: &str, pattern: &str, insensitive: bool) -> bool {
         let key = (pattern.to_string(), insensitive);
         let mut patterns = self
             .patterns
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let compiled = patterns
-            .entry(key)
-            .or_insert_with(|| compile_like(pattern, insensitive));
-        compiled
+        if let Some(compiled) = patterns.get(&key) {
+            return compiled
+                .as_ref()
+                .is_some_and(|compiled| compiled.is_match(subject));
+        }
+        let compiled = compile_like(pattern, insensitive);
+        let matched = compiled
             .as_ref()
-            .is_some_and(|compiled| compiled.is_match(subject))
+            .is_some_and(|compiled| compiled.is_match(subject));
+        if patterns.len() < MAX_CACHED_PATTERNS && self.budget.store(pattern.len()) {
+            patterns.insert(key, compiled);
+        }
+        matched
     }
 }
+
+/// THE EMULATOR'S OWN CEILING on how many compiled `LIKE` patterns one run keeps: a statement
+/// matching against literals carries a handful of them, and a statement matching against a
+/// FIELD has as many patterns as the scan has distinct values — which is data rather than
+/// statement, so it is not what a cache may grow with.
+const MAX_CACHED_PATTERNS: usize = 16;
 
 /// Evaluate one planned statement over the scanned records.
 async fn evaluate_statement(
@@ -391,6 +687,14 @@ async fn evaluate_statement(
     }
 
     ::tokio::task::yield_now().await;
+    // "HAVING condition": the groups the condition selects, read over each group's own row —
+    // which carries the projection's columns, so an aggregate's value is there under the name
+    // the projection gave it.
+    if let Some(condition) = select.having.as_ref() {
+        rows.retain(|row| evaluate(evaluation, condition, row, 0).truthy());
+    }
+
+    ::tokio::task::yield_now().await;
     order_rows(evaluation, parsed, &mut rows)?;
 
     // "LIMIT count" bounds the rows the statement answers; the query's own limit and the
@@ -470,7 +774,10 @@ fn from_clause_selectors(select: &Select) -> Result<Vec<GroupSelector>, Executio
             .collect::<Vec<String>>()
             .join(".");
         if !named.is_empty() {
-            selectors.push(GroupSelector::Name(named));
+            // A table may name the log groups to read through the `logGroups(…)` selector the
+            // source command of the pipelined languages takes, which selects by name prefix or
+            // by identifier; a table that is a plain name names that one log group.
+            selectors.extend(super::read_group_selectors(&named));
         }
     }
     if selectors.is_empty() {

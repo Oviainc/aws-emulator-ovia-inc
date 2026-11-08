@@ -491,9 +491,9 @@ async fn a_query_that_does_not_compile_is_refused_with_the_parsers_diagnostic() 
             "/+/",
         ),
         (
-            "a field redefined by a later command",
-            r"parse @message /(?<duration>\d+)/ | fields duration",
-            "duration",
+            "a field defined twice over by two parse commands",
+            r#"fields @message | parse @message "lat=*" as lat | parse @message "lon=*" as lat"#,
+            "lat",
         ),
         (
             // A query string carries newlines as readily as a console does, and the place
