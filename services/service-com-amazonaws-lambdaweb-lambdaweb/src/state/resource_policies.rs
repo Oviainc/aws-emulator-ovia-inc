@@ -51,15 +51,19 @@ pub const POLICY_SYNTAX_ERROR_MESSAGE: &str = "Policy has syntax errors.";
 /// The `message` both mutating resource-policy operations report when the
 /// `revisionId` they were given is not the stored policy's.
 ///
-/// ONE sentence for ONE conflict class — the policy moved on under the caller,
-/// which is the conflict the model describes ("the resource is being modified by
-/// another request ... or the policy revision ID that you specified doesn't match
-/// the current policy", source: `smithy_query(query="shape",
-/// shape="ConflictException")`) — and it carries no revision id: the id the request
-/// sent is the caller's own, and the current one is what `GetResourcePolicy`
-/// reports.
+/// ONE fixed sentence pair for ONE conflict class — the policy moved on under the
+/// caller, which is the conflict the model describes ("the resource is being
+/// modified by another request ... or the policy revision ID that you specified
+/// doesn't match the current policy", source: `smithy_query(query="shape",
+/// shape="ConflictException")`) — naming both ways it can have moved on (written
+/// again, or removed) and the one way out of it: re-read the policy and present the
+/// revision id that read reports. It carries NO revision id, ARN or function name:
+/// the id the request sent is the caller's own, and the current one is what
+/// `GetResourcePolicy` reports, so there is nothing in the sentence to template per
+/// request.
 pub const STALE_POLICY_REVISION_MESSAGE: &str =
-    "The policy was updated by another request. Try again.";
+    "The policy was updated or deleted by another request. Try again with the latest policy \
+     revisionId.";
 
 /// Whether `policy` is a document the resource-policy put can accept.
 ///

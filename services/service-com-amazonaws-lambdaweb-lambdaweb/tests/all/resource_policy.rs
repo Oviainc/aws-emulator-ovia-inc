@@ -27,10 +27,12 @@ const REGION: &str = "us-east-1";
 const POLICY_MAX_CHARS: usize = 20480;
 
 /// The sentence both mutating resource-policy operations refuse a stale
-/// `revisionId` with: ONE fixed sentence for ONE conflict class, carrying no
-/// revision id — the id the request sent is the caller's own and the current one is
-/// what `GetResourcePolicy` reports.
-const STALE_REVISION_MESSAGE: &str = "The policy was updated by another request. Try again.";
+/// `revisionId` with: ONE fixed sentence pair for ONE conflict class, carrying no
+/// revision id, ARN or function name — the id the request sent is the caller's own
+/// and the current one is what `GetResourcePolicy` reports.
+const STALE_REVISION_MESSAGE: &str =
+    "The policy was updated or deleted by another request. Try again with the latest policy \
+     revisionId.";
 
 /// The sentence the readers report for a function that carries no policy.
 const POLICY_NOT_FOUND_MESSAGE: &str = "The function does not have a policy.";
@@ -406,6 +408,114 @@ async fn a_stale_revision_id_is_a_conflict_that_changes_nothing() {
                 );
             }
         }
+    }
+}
+
+#[tokio::test]
+async fn every_stale_revision_conflict_reports_the_same_fixed_sentence() {
+    // RULE: the refusal of a `revisionId` that is not the stored policy's current
+    // generation is ONE conflict class, so both mutating resource-policy operations
+    // report the same fixed sentence for it, however the id came to be stale and
+    // whatever the request carries — the sentence templates nothing, so neither the
+    // supplied id, nor the current one, nor the ARN or function name appears in it.
+    // The rows span how stale the id is: one generation back, two, three, an id this
+    // service never minted, and the id of a policy that is gone altogether (the
+    // "deleted" half of the class).
+    let emulator = Emulator::new();
+    let name = "policy-stale-sentence";
+    let arn = create_function(&emulator, name).await;
+
+    // Four successive generations of the same policy: each put mints a fresh id, so
+    // the ids of the earlier ones are stale by one, two and three generations once
+    // the chain is complete.
+    let mut chain: Vec<String> = Vec::new();
+    for (generation, DocumentCase { case, document }) in
+        accepted_documents(&arn).into_iter().take(4).enumerate()
+    {
+        let put = put_policy(&emulator, &arn, &document, None).await;
+        assert_eq!(
+            put.status, 200,
+            "case generation {generation} ({case}): PutResourcePolicy expected 200, got {} \
+             with {:?}",
+            put.status, put.body
+        );
+        let (_, revision_id) = reported(case, &put);
+        chain.push(revision_id);
+    }
+    let current = chain
+        .pop()
+        .expect("the chain holds every generation that was put");
+
+    // 36 characters of the modelled alphabet, so the boundary validator passes it
+    // and the handler is what refuses it.
+    let never_minted = "ffffffff-ffff-ffff-ffff-ffffffffffff".to_string();
+    let mut stale: Vec<(String, String)> = Vec::new();
+    for (back, id) in chain.iter().rev().enumerate() {
+        stale.push((format!("{} generation(s) stale", back + 1), id.clone()));
+    }
+    stale.push((
+        "an id this service never minted".to_string(),
+        never_minted.clone(),
+    ));
+
+    for (case, id) in &stale {
+        for (operation, refused) in [
+            (
+                "PutResourcePolicy",
+                put_policy(&emulator, &arn, "{}", Some(id)).await,
+            ),
+            (
+                "DeleteResourcePolicy",
+                delete_policy(&emulator, &arn, Some(id)).await,
+            ),
+        ] {
+            assert_conflict(case, operation, &refused, &[id, &current, &arn, name]);
+        }
+    }
+
+    // The other half of the class: the policy is GONE, so the id the caller holds
+    // identifies no generation at all and a put naming it is the same conflict.
+    let removed = delete_policy(&emulator, &arn, Some(&current)).await;
+    assert_eq!(
+        removed.status, 204,
+        "case the policy is deleted: DeleteResourcePolicy expected 204, got {} with {:?}",
+        removed.status, removed.body
+    );
+    for (case, id) in [
+        ("the id of a policy that was deleted", &current),
+        ("an id this service never minted", &never_minted),
+    ] {
+        let refused = put_policy(&emulator, &arn, "{}", Some(id)).await;
+        assert_conflict(case, "PutResourcePolicy", &refused, &[id, &arn, name]);
+    }
+}
+
+/// Assert `refused` is the modelled stale-revision conflict: HTTP 409,
+/// `ConflictException`, and exactly the fixed sentence, with none of `values`
+/// (the supplied id, the current id, the ARN, the function name) templated into it.
+fn assert_conflict(case: &str, operation: &str, refused: &Reply, values: &[&str]) {
+    assert_eq!(
+        refused.status, 409,
+        "case {case:?} ({operation}): expected HTTP 409, got {} with {:?}",
+        refused.status, refused.body
+    );
+    assert_eq!(
+        refused.error(),
+        "ConflictException",
+        "case {case:?} ({operation}): expected ConflictException, got {:?}",
+        refused.body
+    );
+    let message = refused.string("message").unwrap_or_default();
+    assert_eq!(
+        message, STALE_REVISION_MESSAGE,
+        "case {case:?} ({operation}): expected the stale-revision sentence, got {message:?}"
+    );
+    for value in values {
+        assert!(
+            !message.contains(*value),
+            "case {case:?} ({operation}): the sentence templates nothing, yet it carries \
+             {value:?}: {message:?}"
+        );
     }
 }
 
