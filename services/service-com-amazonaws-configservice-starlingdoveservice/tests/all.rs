@@ -189,3 +189,5 @@ mod config_refusal_class_and_wording;
 mod config_snapshot_delivery;
 #[path = "all/delivery_channel_bucket_policy.rs"]
 mod delivery_channel_bucket_policy;
+#[path = "all/delivery_channel_recorder_role.rs"]
+mod delivery_channel_recorder_role;

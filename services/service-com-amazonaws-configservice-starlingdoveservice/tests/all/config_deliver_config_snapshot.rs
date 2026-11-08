@@ -349,12 +349,16 @@ async fn a_snapshot_delivery_is_refused_when_a_precondition_does_not_hold() {
     // One row per precondition the operation models, plus the channel names no channel
     // of this account carries (an absent name, a differently cased one and one with
     // trailing space): a channel is identified by its exact stored name.
-    let cases: [(&str, Setup, &str, &str); 7] = [
+    //
+    // The account's RECORDER is judged before the channel the request names (RECORDED
+    // behaviour), so the row that holds no channel at all — whose recorder cannot have
+    // been started, a start needing a channel — reports the recorder.
+    let cases: [(&str, Setup, &str, &str); 9] = [
         (
             "no delivery channel at all",
             Setup::NoChannel,
             DEFAULT_NAME,
-            "NoSuchDeliveryChannelException",
+            "NoRunningConfigurationRecorderException",
         ),
         (
             "a name no channel carries",
@@ -391,6 +395,21 @@ async fn a_snapshot_delivery_is_refused_when_a_precondition_does_not_hold() {
             Setup::RecorderStopped,
             DEFAULT_NAME,
             "NoRunningConfigurationRecorderException",
+        ),
+        // Both halves wrong at once: the recorder is what the refusal reports, which is
+        // what makes the rows above about precedence and not about the channel lookup
+        // having gone away.
+        (
+            "a name no channel carries, with the recorder stopped",
+            Setup::RecorderStopped,
+            "absent",
+            "NoRunningConfigurationRecorderException",
+        ),
+        (
+            "a name no channel carries, with the recorder deleted",
+            Setup::NoRecorder,
+            "absent",
+            "NoAvailableConfigurationRecorderException",
         ),
     ];
 

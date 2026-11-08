@@ -76,6 +76,10 @@ service-com-amazonaws-s3-amazons3 = { workspace = true }
 service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
 service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
+# IAM is mounted beside Config where the suite is about the configuration recorder's own
+# role: Config assumes that role to deliver, and the question is put to IAM itself, so
+# without IAM mounted there is nothing to answer it.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 
 [lints]
 workspace = true

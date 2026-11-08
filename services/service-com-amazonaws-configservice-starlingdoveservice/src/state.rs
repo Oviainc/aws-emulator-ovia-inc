@@ -2268,6 +2268,16 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
             .map(|recorder| recorder.arn.clone())
     }
 
+    /// The IAM role the customer managed configuration recorder a delivery is made for
+    /// RUNS AS — the role Config assumes to make the delivery at all
+    /// ([`delivery_authorization`]) — or `None` while this account holds no such recorder,
+    /// or holds one that names no role.
+    pub fn customer_managed_recorder_role_arn(&self) -> Option<String> {
+        self.customer_managed_recorders()
+            .next()
+            .and_then(|recorder| recorder.role_arn.clone())
+    }
+
     /// Record `entry` as a remediation execution of the rule `config_rule_name`.
     ///
     /// This is the ONE place [`Self::remediation_executions`] GROWS, so the store

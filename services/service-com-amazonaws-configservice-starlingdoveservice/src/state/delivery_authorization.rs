@@ -11,6 +11,14 @@
 //! service makes on it before it will take the channel ([`DELIVERY_CHECKS`]), and the
 //! refusal names the one that was denied, the way the service words it.
 //!
+//! Config makes those S3 calls UNDER THE CONFIGURATION RECORDER'S OWN IAM ROLE, which it
+//! assumes as that same service principal — so a role it cannot assume withholds the whole
+//! delivery before anything of the bucket is read, and is the check a refusal then names
+//! ([`DeliveryCheck::AssumeRole`]). Whether a role can be assumed is the workspace's ONE
+//! reading of that question (`service_common::iam_role`), put to IAM itself over the same
+//! in-process callback: a role nothing can be shown about withholds nothing, so an emulator
+//! with no IAM to ask refuses no channel.
+//!
 //! What the bucket holds is read from S3 ITSELF, over the same in-process callback the
 //! recorder observes resources through ([`super::s3_client`]), so this crate names no
 //! other service crate; and the decision the policy gives is the workspace's ONE
@@ -36,11 +44,17 @@ use super::{recorded_resource_arn, s3_client, S3_BUCKET_RESOURCE_TYPE};
 /// policy has to name.
 pub const CONFIG_SERVICE_PRINCIPAL: &str = "config.amazonaws.com";
 
-/// The S3 calls Config makes on a delivery channel's bucket before it will take the
-/// channel, in the order it makes them: it reads the bucket's ACL, then writes a delivered
-/// object. Each is one entry of [`DELIVERY_CHECKS`].
+/// The calls Config makes before it will take a delivery channel, in the order it makes
+/// them: it assumes the configuration recorder's role, then reads the bucket's ACL under
+/// it, then writes a delivered object. The two S3 calls are the entries of
+/// [`DELIVERY_CHECKS`], which a bucket's own policy decides; the assume precedes them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeliveryCheck {
+    /// `sts:AssumeRole` of the configuration recorder's IAM role, which Config performs as
+    /// its own service principal and makes the two S3 calls below under: a role this
+    /// account's IAM holds nothing under, or whose trust policy does not admit Config,
+    /// cannot be assumed, so no delivery can be made with it.
+    AssumeRole,
     /// `s3:GetBucketAcl` on the bucket itself (`arn:aws:s3:::<bucket>`), which the bucket
     /// policy AWS documents for a delivery channel grants in its
     /// `AWSConfigBucketPermissionsCheck` statement.
@@ -52,9 +66,10 @@ pub enum DeliveryCheck {
     ObjectWrite,
 }
 
-/// The checks a delivery channel's bucket has to pass, in the order the service makes them
-/// — which is the order a refusal names them in, since the first one denied is the one
-/// reported.
+/// The checks a delivery channel's BUCKET POLICY has to pass, in the order the service
+/// makes them — which is the order a refusal names them in, since the first one denied is
+/// the one reported. The assume of the recorder's role is not among them: it is decided by
+/// IAM rather than by the bucket, and is made before any of these.
 ///
 /// The two are the calls the service's own refusals NAME ("unable to get s3 bucket acl",
 /// "unable to write to bucket"); the documented policy's third statement, the
@@ -67,6 +82,7 @@ impl DeliveryCheck {
     /// The IAM action this check needs.
     pub fn action(self) -> &'static str {
         match self {
+            Self::AssumeRole => "sts:AssumeRole",
             Self::BucketAcl => "s3:GetBucketAcl",
             Self::ObjectWrite => "s3:PutObject",
         }
@@ -76,8 +92,11 @@ impl DeliveryCheck {
     /// "unable to" in [`insufficient_delivery_policy_message`]. The object write names the
     /// key prefix the channel asked for with it, since that prefix is what decides which
     /// key the write would have gone to.
-    fn denied_clause(self, key_prefix: Option<&str>) -> String {
+    fn denied_clause(self, key_prefix: Option<&str>, role_arn: Option<&str>) -> String {
         match self {
+            // The role the delivery would have been made under, named as the request's own
+            // configuration recorder carries it.
+            Self::AssumeRole => format!("assume role: {}", role_arn.unwrap_or_default()),
             Self::BucketAcl => "get s3 bucket acl".to_string(),
             Self::ObjectWrite => {
                 let prefix = key_prefix
@@ -119,9 +138,10 @@ pub enum DeliveryAuthorization {
     /// The policy in force on the bucket allows Config every check a delivery channel's
     /// bucket has to pass.
     Permitted,
-    /// The bucket's policy does not allow Config the named check — a bucket carrying no
-    /// policy at all allows it the first of them — which is
-    /// `InsufficientDeliveryPolicyException`, worded after that check.
+    /// The named check is withheld — the bucket's policy does not allow Config that S3 call
+    /// (a bucket carrying no policy at all allows it neither), or IAM does not let Config
+    /// assume the recorder's role — which is `InsufficientDeliveryPolicyException`, worded
+    /// after that check.
     Denied(DeliveryCheck),
     /// S3 established no policy for the bucket: it answered neither a policy nor that the
     /// bucket carries none, so there is nothing for this decision to read.
@@ -129,16 +149,20 @@ pub enum DeliveryAuthorization {
 }
 
 /// How Config words `InsufficientDeliveryPolicyException`: the bucket it could not deliver
-/// into, and the call on it the bucket's policy denied — which is what tells a client WHICH
-/// grant is missing.
+/// into, and the call the delivery was denied — which is what tells a client WHICH grant is
+/// missing.
+///
+/// `role_arn` is the configuration recorder's role, which the sentence names when the
+/// assume of that role is the call that was denied.
 pub fn insufficient_delivery_policy_message(
     bucket: &str,
     denied: DeliveryCheck,
     key_prefix: Option<&str>,
+    role_arn: Option<&str>,
 ) -> String {
     format!(
         "Insufficient delivery policy to s3 bucket: {bucket}, unable to {}.",
-        denied.denied_clause(key_prefix)
+        denied.denied_clause(key_prefix, role_arn)
     )
 }
 
@@ -147,14 +171,36 @@ pub fn insufficient_delivery_policy_message(
 ///
 /// `source_arn` is the resource of Config's the delivery is made for — the account's
 /// customer managed configuration recorder — for a policy that conditions its grant on
-/// it; a channel put before any recorder names one carries none.
+/// it; a channel put before any recorder names one carries none. `role_arn` is the IAM role
+/// that recorder runs as, the one Config assumes to make the delivery at all.
 pub async fn delivery_authorization(
     callback: &smithy_server_runtime::EmbeddedEmulator,
     region: &str,
     bucket: &str,
     key_prefix: Option<&str>,
     source_arn: Option<&str>,
+    role_arn: Option<&str>,
 ) -> DeliveryAuthorization {
+    // The delivery is made UNDER the recorder's role, so a role IAM answers Config cannot
+    // assume withholds it before the bucket is read at all — which is why this is decided
+    // first and is the check such a refusal names.
+    let unassumable = match role_arn.map(str::trim).filter(|role| !role.is_empty()) {
+        Some(role) => {
+            ::service_common::iam_role::role_is_unassumable_through(
+                callback,
+                region,
+                role,
+                CONFIG_SERVICE_PRINCIPAL,
+            )
+            .await
+        }
+        // A channel put for a recorder that names no role has no assume to make, so the
+        // decision is the bucket policy's alone.
+        None => false,
+    };
+    if unassumable {
+        return DeliveryAuthorization::Denied(DeliveryCheck::AssumeRole);
+    }
     let answered = s3_client(callback, region)
         .get_bucket_policy()
         .bucket(bucket)
@@ -213,6 +259,9 @@ pub fn denied_delivery_check(
         let resource = match check {
             DeliveryCheck::BucketAcl => &bucket_arn,
             DeliveryCheck::ObjectWrite => &object_arn,
+            // Not one of [`DELIVERY_CHECKS`]: the assume of the recorder's role is decided
+            // by IAM, not by this document, so no resource of the bucket stands for it.
+            DeliveryCheck::AssumeRole => return false,
         };
         let request = Request::new(check.action(), resource, &principals).with_context(&context);
         resource_decision(document, &request) != Decision::Allowed
@@ -436,39 +485,50 @@ mod tests {
         }
     }
 
-    /// The sentence the refusal carries names the bucket and the CALL the policy denied:
-    /// the ACL read as itself, and the object write with the key prefix the channel asked
-    /// for, which is what decides the key that write would have gone to.
+    /// The role every case below names as the configuration recorder's.
+    const ROLE_ARN: &str = "arn:aws:iam::000000000000:role/the-config-role";
+
+    /// The sentence the refusal carries names the bucket and the CALL that was denied: the
+    /// assume of the recorder's role as that role, the ACL read as itself, and the object
+    /// write with the key prefix the channel asked for, which is what decides the key that
+    /// write would have gone to.
     #[test]
     fn the_refusal_names_the_bucket_and_the_denied_call() {
-        let cases: [(&str, DeliveryCheck, Option<&str>, &str); 4] = [
+        let cases: [(&str, DeliveryCheck, Option<&str>, String); 5] = [
+            (
+                "the assume of the recorder's role",
+                DeliveryCheck::AssumeRole,
+                None,
+                format!("assume role: {ROLE_ARN}"),
+            ),
             (
                 "the ACL read",
                 DeliveryCheck::BucketAcl,
                 None,
-                "get s3 bucket acl",
+                "get s3 bucket acl".to_string(),
             ),
             (
                 "the ACL read, with a prefix configured",
                 DeliveryCheck::BucketAcl,
                 Some("audit"),
-                "get s3 bucket acl",
+                "get s3 bucket acl".to_string(),
             ),
             (
                 "the object write, no prefix",
                 DeliveryCheck::ObjectWrite,
                 None,
-                "write to bucket, provided s3 key prefix is 'null'",
+                "write to bucket, provided s3 key prefix is 'null'".to_string(),
             ),
             (
                 "the object write, a prefix",
                 DeliveryCheck::ObjectWrite,
                 Some("audit"),
-                "write to bucket, provided s3 key prefix is 'audit'",
+                "write to bucket, provided s3 key prefix is 'audit'".to_string(),
             ),
         ];
         for (case, denied, prefix, clause) in cases {
-            let message = insufficient_delivery_policy_message(BUCKET, denied, prefix);
+            let message =
+                insufficient_delivery_policy_message(BUCKET, denied, prefix, Some(ROLE_ARN));
             let expected =
                 format!("Insufficient delivery policy to s3 bucket: {BUCKET}, unable to {clause}.");
             assert_eq!(

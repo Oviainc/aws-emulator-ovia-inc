@@ -179,6 +179,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let recorder_is_recording = store.recording_customer_managed_recorder().is_some();
         let seq = store.next_config_snapshot_seq;
 
+        // A snapshot captures what a CUSTOMER MANAGED configuration recorder records
+        // for this account, so one has to exist...
+        if !has_customer_managed_recorder {
+            return Err(
+                DeliverConfigSnapshotErrorModeled::NoAvailableConfigurationRecorderException(
+                    NoAvailableConfigurationRecorderException {
+                        message: Some(
+                            crate::state::NO_AVAILABLE_CONFIGURATION_RECORDER_MESSAGE.to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+        // ...and it has to be recording: a recorder that is turned off is capturing
+        // nothing to snapshot.
+        //
+        // RECORDED behaviour: the account's RECORDER is judged before the channel the
+        // request names, so a call made while the recorder is turned off reports the
+        // recorder whether or not this account holds the channel it named.
+        if !recorder_is_recording {
+            return Err(
+                DeliverConfigSnapshotErrorModeled::NoRunningConfigurationRecorderException(
+                    NoRunningConfigurationRecorderException {
+                        message: Some(NO_RUNNING_RECORDER_TO_DELIVER.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
         // The snapshot is delivered THROUGH the channel the request names, so an
         // account that holds no such channel has nothing to deliver through. This is
         // the one lookup of that channel: the binding that resolves it is the binding
@@ -199,33 +230,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         };
-
-        // A snapshot captures what a CUSTOMER MANAGED configuration recorder records
-        // for this account, so one has to exist...
-        if !has_customer_managed_recorder {
-            return Err(
-                DeliverConfigSnapshotErrorModeled::NoAvailableConfigurationRecorderException(
-                    NoAvailableConfigurationRecorderException {
-                        message: Some(
-                            crate::state::NO_AVAILABLE_CONFIGURATION_RECORDER_MESSAGE.to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
-        // ...and it has to be recording: a recorder that is turned off is capturing
-        // nothing to snapshot.
-        if !recorder_is_recording {
-            return Err(
-                DeliverConfigSnapshotErrorModeled::NoRunningConfigurationRecorderException(
-                    NoRunningConfigurationRecorderException {
-                        message: Some(NO_RUNNING_RECORDER_TO_DELIVER.to_string()),
-                    },
-                )
-                .into(),
-            );
-        }
 
         // The id of the snapshot being created: distinct per delivery, taken from the
         // store's own sequence rather than from anything in the request.

@@ -2,7 +2,9 @@
 
 //! @op PutDeliveryChannel
 //! Creates or updates THE delivery channel of this account and Region, persisting it
-//! in [`crate::state`] so `DescribeDeliveryChannels` reads the same record back.
+//! in [`crate::state`] so `DescribeDeliveryChannels` reads the same record back — once the
+//! delivery it configures is one Config could make: under the configuration recorder's own
+//! IAM role, into the bucket the channel names.
 //!
 //! ## Shape of an operation
 //!
@@ -197,9 +199,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // What the request says about the bucket, and the recorder the delivery would be
-        // made for, read while the guard is held; the guard is then RELEASED, because the
-        // bucket's own policy is read from S3 and no lock is held across that await.
-        let source_arn = {
+        // made for — its ARN and the role it runs as — read while the guard is held; the
+        // guard is then RELEASED, because the role is resolved against IAM and the bucket's
+        // own policy is read from S3, and no lock is held across those awaits.
+        let (source_arn, role_arn) = {
             let store = state.lock();
 
             // A delivery channel needs a CUSTOMER MANAGED configuration recorder to
@@ -235,12 +238,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into(),
                 );
             }
-            store.customer_managed_recorder_arn()
+            (
+                store.customer_managed_recorder_arn(),
+                store.customer_managed_recorder_role_arn(),
+            )
         };
 
-        // Config delivers as its own service principal, so a channel is only usable if
-        // the policy in force on the bucket it names admits Config: the refusal this
-        // operation models for a bucket whose policy withholds the delivery.
+        // Config delivers as its own service principal, UNDER the configuration recorder's
+        // IAM role: a channel is only usable if Config can assume that role and if the
+        // policy in force on the bucket it names admits Config — the refusal this operation
+        // models for a delivery the role or the policy withholds.
         if let Some(bucket) = requested.s3_bucket_name.as_deref() {
             let prefix = requested.s3_key_prefix.as_deref();
             let authorization = crate::state::delivery_authorization(
@@ -249,6 +256,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 bucket,
                 prefix,
                 source_arn.as_deref(),
+                role_arn.as_deref(),
             )
             .await;
             match authorization {
@@ -258,7 +266,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             InsufficientDeliveryPolicyException {
                                 message: Some(
                                     crate::state::insufficient_delivery_policy_message(
-                                        bucket, denied, prefix,
+                                        bucket,
+                                        denied,
+                                        prefix,
+                                        role_arn.as_deref(),
                                     ),
                                 ),
                             },
@@ -266,8 +277,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         .into(),
                     );
                 }
-                // The policy admits Config, or S3 established no policy at all — on which
-                // no refusal of this call can be grounded.
+                // The role is assumable and the policy admits Config, or S3 established no
+                // policy at all — on which no refusal of this call can be grounded.
                 crate::state::DeliveryAuthorization::Permitted
                 | crate::state::DeliveryAuthorization::Unanswered => {}
             }
