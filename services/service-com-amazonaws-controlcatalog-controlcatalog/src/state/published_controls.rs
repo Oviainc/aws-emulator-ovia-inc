@@ -30,13 +30,15 @@
 //!   `^[a-zA-Z0-9_\.-]+$` (`smithy_query(query="shape", shape="ImplementationType")`).
 //! * `control_tower_identifier` is the `AWS-GR_…` identifier Amazon Web Services Control
 //!   Tower publishes for the control, where it publishes one.
-//! * `parameters` are the CONTROL parameters the control supports: the values a caller
-//!   supplies when it ENABLES the control, named as the modeled `ControlParameter`
-//!   documents them and never otherwise (see [`ALLOWED_REGIONS`] and the names beside
-//!   it). A setting of the AWS Config rule, Security Hub control, policy or hook that
-//!   implements the control is configuration of that surface, not a control parameter,
-//!   so a control whose implementing surface is the only thing configurable supports
-//!   none. The modeled `ParameterRequirementSummary` is DERIVED from the list (see
+//! * `parameters` are the control parameters a caller supplies when it ENABLES the
+//!   control, and they are the parameters of the SURFACE that implements it, so they are
+//!   read through [`parameters`] rather than off the row alone: a control an AWS Config
+//!   managed rule implements supports that rule's own input parameters
+//!   ([`CONFIG_RULE_PARAMETERS`], which is why two controls sharing one rule publish one
+//!   parameter set), while a control deployed as a policy or a hook supports the
+//!   exemption parameters the modeled `ControlParameter` documents (see
+//!   [`ALLOWED_REGIONS`] and the names beside it), which the row carries itself. The
+//!   modeled `ParameterRequirementSummary` is DERIVED from that list (see
 //!   [`parameter_requirement_summary`]) rather than written per row, because it is
 //!   defined as a summary of exactly that list.
 //! * `aliases` are DERIVED for the two designators that are functions of an identifier
@@ -48,27 +50,31 @@
 //!   own check (see [`framework_mappings`]).
 //!
 //! The opaque 25-character identifier inside a catalog ARN is assigned by Amazon Web
-//! Services and is derivable from nothing in the request, so — exactly as for the
-//! ontology in [`super::published_ontology`] — this emulator mints its own
-//! deterministically from each row's `slug` (see `super::catalog_id`). The slug never
-//! appears on the wire.
+//! Services and is derivable from nothing in the request, yet it is part of the
+//! control's published identity: the catalog is account-independent, so one ARN names
+//! the control for every caller, in every partition and on every run. A control whose
+//! published identifier is recorded in [`PUBLISHED_CATALOG_IDENTIFIERS`] is therefore
+//! served under it; for a control it does not name — and for the ontology in
+//! [`super::published_ontology`] — this emulator mints an identifier deterministically
+//! from the row's `slug` (see `super::catalog_id`). The slug never appears on the wire.
 
 /// `ControlParameterRequirement`: a parameter the caller must supply.
 pub(super) const REQUIRED: &str = "REQUIRED";
 /// `ControlParameterRequirement`: a parameter the caller may supply.
 pub(super) const OPTIONAL: &str = "OPTIONAL";
 
-// The control parameters a published control can support, spelled as the modeled
-// `ControlParameter` spells them. That shape's documentation is the whole vocabulary —
-// "Five types of control parameters are supported": `AllowedRegions`,
-// `ExemptedActions`, `ExemptedPrincipalArns`, `ExemptedResourceArns` and
-// `ExemptAssumeRoot`, each a value supplied when the control is enabled
+// The EXEMPTION parameters a control deployed as a policy or a hook can support,
+// spelled as the modeled `ControlParameter` spells them: "Five types of control
+// parameters are supported" — `AllowedRegions`, `ExemptedActions`,
+// `ExemptedPrincipalArns`, `ExemptedResourceArns` and `ExemptAssumeRoot`, each a value
+// supplied when the control is enabled
 // (`smithy_query(query="doc", shape="ControlParameter",
-// model_path="services/service-com-amazonaws-controlcatalog-controlcatalog/smithy-model/com-amazonaws-controlcatalog-controlcatalog.json")`)
-// — so a row names one of those five or supports no parameter at all. Only the names
-// the controls in this table support are declared here; the other two apply to
-// controls this catalog does not publish (`ExemptAssumeRoot` "applies only to the
-// `AWS-GR_RESTRICT_ROOT_USER` control").
+// model_path="services/service-com-amazonaws-controlcatalog-controlcatalog/smithy-model/com-amazonaws-controlcatalog-controlcatalog.json")`).
+// They are the vocabulary of the exemptions a deployed control takes, not the whole
+// parameter space: a control an implementing surface parameterises publishes that
+// surface's own input parameters as well (see [`CONFIG_RULE_PARAMETERS`]). Only the
+// names the controls in this table support are declared here; of the rest,
+// `ExemptAssumeRoot` "applies only to the `AWS-GR_RESTRICT_ROOT_USER` control".
 
 /// Regions exempted from the control.
 const ALLOWED_REGIONS: &str = "AllowedRegions";
@@ -212,10 +218,12 @@ pub(super) struct ControlSeed {
     pub(super) scope: &'static str,
     /// Empty for a GLOBAL control: `DeployableRegions` does not apply to it.
     pub(super) deployable_regions: &'static [&'static str],
-    /// `(name, ControlParameterRequirement)` for each CONTROL parameter the control
-    /// supports: a value supplied when the control is enabled, named from the modeled
-    /// vocabulary ([`ALLOWED_REGIONS`] and the names beside it) and never after a
-    /// setting of the surface that implements the control.
+    /// `(name, ControlParameterRequirement)` for each EXEMPTION parameter the control
+    /// supports, named from the modeled vocabulary ([`ALLOWED_REGIONS`] and the names
+    /// beside it). The parameters of the surface that implements the control are not
+    /// written here: they belong to that surface, so a control an AWS Config managed rule
+    /// implements takes its parameters from [`CONFIG_RULE_PARAMETERS`]. Read a control's
+    /// whole parameter list through [`parameters`].
     pub(super) parameters: &'static [(&'static str, &'static str)],
     pub(super) governed_resources: &'static [&'static str],
     pub(super) governed_providers: &'static [&'static str],
@@ -312,8 +320,9 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     ControlSeed {
         slug: "multi-region-cloud-trail-enabled",
         name: "Checks that there is at least one multi-region AWS CloudTrail",
-        description: "Reports an account whose CloudTrail trails all record events in a \
-                      single Region.",
+        description: "Checks that there is at least one multi-region AWS CloudTrail. The \
+                      rule is NON_COMPLIANT if the trails do not match the input \
+                      parameters.",
         behavior: DETECTIVE,
         severity: HIGH,
         implementation_type: CONFIG_RULE,
@@ -322,8 +331,7 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         designators: &["CONFIG.CLOUDTRAIL.DT.10"],
         scope: REGIONAL,
         deployable_regions: BROAD_REGIONS,
-        // The trail settings this control checks are the Config rule's own
-        // configuration, not values a caller supplies when enabling the control.
+        // Parameterised by the implementing rule; see `CONFIG_RULE_PARAMETERS`.
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::CloudTrail::Trail"],
         governed_providers: AWS,
@@ -361,15 +369,19 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "s3-bucket-server-side-encryption-enabled",
-        name: "Require server-side encryption on Amazon S3 buckets",
-        description: "Checks whether an Amazon S3 bucket has a default server-side \
-                      encryption configuration.",
+        name: "Checks that your Amazon S3 bucket either has Amazon S3 default encryption \
+               enabled or that its bucket policy explicitly denies put-object requests \
+               without server-side encryption",
+        description: "Checks that your Amazon S3 bucket either has Amazon S3 default \
+                      encryption enabled or that its bucket policy explicitly denies \
+                      put-object requests without server-side encryption. The rule is \
+                      NON_COMPLIANT if the bucket has neither.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("S3_BUCKET_SERVER_SIDE_ENCRYPTION_ENABLED"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.S3.DT.8"],
         scope: REGIONAL,
         deployable_regions: CORE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -389,9 +401,36 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "s3-bucket-public-read-prohibited",
-        name: "Checks whether an Amazon S3 bucket allows public read access",
-        description: "Reports an Amazon S3 bucket whose policy or access control list \
+        name: "Disallow public read access to S3 buckets",
+        description: "Detects whether an Amazon S3 bucket policy or access control list \
                       grants read access to everyone.",
+        behavior: DETECTIVE,
+        severity: CRITICAL,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("S3_BUCKET_PUBLIC_READ_PROHIBITED"),
+        control_tower_identifier: Some("AWS-GR_S3_BUCKET_PUBLIC_READ_PROHIBITED"),
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: BROAD_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::S3::Bucket"],
+        governed_providers: AWS,
+        implements: "restrict-public-access",
+        frameworks: &[
+            // "Access enforcement".
+            (NIST_SP_800_53_R5, "AC-3"),
+            // "Ensure that S3 buckets are configured with 'Block public access'".
+            (CIS_AWS_BENCHMARK_V3_0, "2.1.4"),
+        ],
+    },
+    // The log-archive control over the SAME Config rule as the account-wide one above:
+    // the catalog publishes the two separately, because one governs every bucket in the
+    // account and this one the bucket the organization archives its audit logs in.
+    ControlSeed {
+        slug: "audit-bucket-public-read-prohibited",
+        name: "Disallow public read access to log archive",
+        description: "Detects whether the Amazon S3 bucket the organization archives its \
+                      audit logs in grants read access to everyone.",
         behavior: DETECTIVE,
         severity: CRITICAL,
         implementation_type: CONFIG_RULE,
@@ -407,15 +446,40 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         frameworks: &[
             // "Access enforcement".
             (NIST_SP_800_53_R5, "AC-3"),
-            // "Ensure that S3 buckets are configured with 'Block public access'".
-            (CIS_AWS_BENCHMARK_V3_0, "2.1.4"),
+            // "Protection of audit information".
+            (NIST_SP_800_53_R5, "AU-9"),
         ],
     },
     ControlSeed {
         slug: "s3-bucket-public-write-prohibited",
-        name: "Checks whether an Amazon S3 bucket allows public write access",
-        description: "Reports an Amazon S3 bucket whose policy or access control list \
+        name: "Disallow public write access to S3 buckets",
+        description: "Detects whether an Amazon S3 bucket policy or access control list \
                       grants write access to everyone.",
+        behavior: DETECTIVE,
+        severity: CRITICAL,
+        implementation_type: CONFIG_RULE,
+        implementation_identifier: Some("S3_BUCKET_PUBLIC_WRITE_PROHIBITED"),
+        control_tower_identifier: Some("AWS-GR_S3_BUCKET_PUBLIC_WRITE_PROHIBITED"),
+        designators: NO_DESIGNATORS,
+        scope: REGIONAL,
+        deployable_regions: BROAD_REGIONS,
+        parameters: NO_PARAMETERS,
+        governed_resources: &["AWS::S3::Bucket"],
+        governed_providers: AWS,
+        implements: "restrict-public-access",
+        frameworks: &[
+            // "Protections against data leaks are implemented".
+            (NIST_CSF_V1_1, "PR.DS-5"),
+            // "Access enforcement".
+            (NIST_SP_800_53_R5, "AC-3"),
+        ],
+    },
+    // The log-archive control over the same Config rule as the account-wide one above.
+    ControlSeed {
+        slug: "audit-bucket-public-write-prohibited",
+        name: "Disallow public write access to log archive",
+        description: "Detects whether the Amazon S3 bucket the organization archives its \
+                      audit logs in grants write access to everyone.",
         behavior: DETECTIVE,
         severity: CRITICAL,
         implementation_type: CONFIG_RULE,
@@ -431,21 +495,23 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         frameworks: &[
             // "Protections against data leaks are implemented".
             (NIST_CSF_V1_1, "PR.DS-5"),
-            // "Access enforcement".
-            (NIST_SP_800_53_R5, "AC-3"),
+            // "Protection of audit information".
+            (NIST_SP_800_53_R5, "AU-9"),
         ],
     },
     ControlSeed {
         slug: "s3-bucket-ssl-requests-only",
-        name: "Checks whether an Amazon S3 bucket requests are made over a secure transport",
-        description: "Reports an Amazon S3 bucket whose policy does not deny requests made \
-                      over unencrypted HTTP.",
+        name: "Checks whether Amazon S3 buckets have policies that require requests to use \
+               Secure Socket Layer (SSL)",
+        description: "Checks whether Amazon S3 buckets have policies that require requests \
+                      to use Secure Socket Layer (SSL). The rule is NON_COMPLIANT if a \
+                      bucket policy does not deny requests made over unencrypted HTTP.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("S3_BUCKET_SSL_REQUESTS_ONLY"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.S3.DT.15"],
         scope: REGIONAL,
         deployable_regions: CORE_REGIONS,
         parameters: NO_PARAMETERS,
@@ -518,8 +584,9 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         designators: NO_DESIGNATORS,
         scope: GLOBAL,
         deployable_regions: NO_REGIONS,
-        // The key age this control checks against is the Config rule's own parameter,
-        // not a control parameter a caller supplies when enabling the control.
+        // The key age this control checks against is the implementing rule's input
+        // parameter, which it publishes as a control parameter; see
+        // `CONFIG_RULE_PARAMETERS`.
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::IAM::AccessKey"],
         governed_providers: AWS,
@@ -544,7 +611,8 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         designators: NO_DESIGNATORS,
         scope: GLOBAL,
         deployable_regions: NO_REGIONS,
-        // The strength thresholds are the Config rule's own parameters.
+        // The strength thresholds are the implementing rule's input parameters; see
+        // `CONFIG_RULE_PARAMETERS`.
         parameters: NO_PARAMETERS,
         // The account's password policy has no resource type of its own.
         governed_resources: NO_GOVERNED_RESOURCES,
@@ -570,8 +638,8 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
         deployable_regions: BROAD_REGIONS,
-        // The KMS key the rule checks volumes against is the Config rule's own
-        // parameter.
+        // The KMS key the rule checks volumes against is its input parameter; see
+        // `CONFIG_RULE_PARAMETERS`.
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::EC2::Volume"],
         governed_providers: AWS,
@@ -585,19 +653,21 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "vpc-flow-logs-enabled",
-        name: "Checks whether flow logs are enabled for every Amazon VPC",
-        description: "Reports an Amazon VPC that publishes no flow logs, so network traffic \
-                      cannot be reviewed.",
+        name: "Checks whether Amazon Virtual Private Cloud flow logs are found and enabled \
+               for Amazon VPC",
+        description: "Checks whether Amazon Virtual Private Cloud flow logs are found and \
+                      enabled for Amazon VPC. The rule is NON_COMPLIANT if a VPC \
+                      publishes no flow log of the traffic type the input parameter \
+                      names.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("VPC_FLOW_LOGS_ENABLED"),
         control_tower_identifier: None,
-        designators: NO_DESIGNATORS,
+        designators: &["CONFIG.EC2.DT.48"],
         scope: REGIONAL,
         deployable_regions: CORE_REGIONS,
-        // The traffic type the rule requires flow logs to capture is the Config rule's
-        // own parameter.
+        // Parameterised by the implementing rule; see `CONFIG_RULE_PARAMETERS`.
         parameters: NO_PARAMETERS,
         governed_resources: &["AWS::EC2::VPC"],
         governed_providers: AWS,
@@ -635,19 +705,21 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "rds-snapshots-public-prohibited",
-        name: "Checks whether an Amazon RDS snapshot is public",
-        description: "Reports an Amazon RDS database snapshot that is shared with every \
-                      account.",
+        name: "Disallow public access to RDS database snapshots",
+        description: "Detects whether an Amazon Relational Database Service database \
+                      snapshot is shared with every Amazon Web Services account.",
         behavior: DETECTIVE,
-        severity: HIGH,
+        severity: CRITICAL,
         implementation_type: CONFIG_RULE,
         implementation_identifier: Some("RDS_SNAPSHOTS_PUBLIC_PROHIBITED"),
-        control_tower_identifier: Some("AWS-GR_RDS_SNAPSHOT_PUBLIC_PROHIBITED"),
+        control_tower_identifier: Some("AWS-GR_RDS_SNAPSHOTS_PUBLIC_PROHIBITED"),
         designators: NO_DESIGNATORS,
         scope: REGIONAL,
         deployable_regions: CORE_REGIONS,
         parameters: NO_PARAMETERS,
-        governed_resources: &["AWS::RDS::DBSnapshot"],
+        // The catalog publishes no available resource type for the snapshot sharing this
+        // control governs.
+        governed_resources: NO_GOVERNED_RESOURCES,
         governed_providers: AWS,
         implements: "restrict-public-access",
         frameworks: &[
@@ -659,9 +731,9 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
     ControlSeed {
         slug: "rds-storage-encrypted",
-        name: "Checks whether storage encryption is enabled for an Amazon RDS instance",
-        description: "Reports an Amazon RDS database instance whose storage is not \
-                      encrypted.",
+        name: "Disallow RDS database instances without storage encryption",
+        description: "Detects whether an Amazon Relational Database Service database \
+                      instance is running without storage encryption.",
         behavior: DETECTIVE,
         severity: MEDIUM,
         implementation_type: CONFIG_RULE,
@@ -1010,6 +1082,145 @@ pub(super) const PUBLISHED_CONTROLS: &[ControlSeed] = &[
     },
 ];
 
+/// The opaque identifier the catalog publishes in a control's ARN, keyed by the `slug`
+/// of the [`PUBLISHED_CONTROLS`] row that describes the control: `(slug, identifier)`.
+///
+/// Source: the Control Catalog's own published control list, which names every control
+/// by the ARN `arn:{PARTITION}:controlcatalog:::control/{identifier}`. The identifier is
+/// assigned by Amazon Web Services and derivable from nothing in the request, yet it is
+/// part of the control's published identity rather than a per-run value: the catalog is
+/// account-independent and read-only, so one identifier names the control for every
+/// caller and across runs, and a client holds it to read the control back with
+/// `GetControl` and to enable it elsewhere. A row this table does not name is served
+/// under an identifier minted from its slug (see `super::catalog_id`), which is all a
+/// control whose published identifier is not recorded here can be served under.
+pub(super) const PUBLISHED_CATALOG_IDENTIFIERS: &[(&str, &str)] = &[
+    (
+        "multi-region-cloud-trail-enabled",
+        "d5kdbugbadk3r481vtwnvoynv",
+    ),
+    (
+        "s3-bucket-server-side-encryption-enabled",
+        "d4wgeffz6izrb627c2yb8nq8d",
+    ),
+    (
+        "s3-bucket-public-read-prohibited",
+        "8sw3pbid15t9cbww8d2w2qwgf",
+    ),
+    (
+        "audit-bucket-public-read-prohibited",
+        "9jzlkwys54gzgsx3pmkqnx8l1",
+    ),
+    (
+        "s3-bucket-public-write-prohibited",
+        "9j9nwxj789d82sypnukhyyowy",
+    ),
+    (
+        "audit-bucket-public-write-prohibited",
+        "ci9ov6vzjoi6vzkajgademvvo",
+    ),
+    ("s3-bucket-ssl-requests-only", "e5efjudq0b347dgxn86o8fg2o"),
+    ("vpc-flow-logs-enabled", "22484xhzccf9twis5gmdt7uic"),
+    (
+        "rds-snapshots-public-prohibited",
+        "1h4eyqyyonp19dlrreqf1i3w0",
+    ),
+    ("rds-storage-encrypted", "e34kieahgkm0lggs5g0s412jt"),
+];
+
+/// The opaque catalog identifier published for the control `slug` names, or `None` when
+/// this table does not record one for it.
+pub(super) fn published_catalog_identifier(slug: &str) -> Option<&'static str> {
+    PUBLISHED_CATALOG_IDENTIFIERS
+        .iter()
+        .find(|(candidate, _)| *candidate == slug)
+        .map(|(_, identifier)| *identifier)
+}
+
+/// The input parameters an AWS Config managed rule takes: `(rule identifier, [(parameter
+/// name, ControlParameterRequirement)])`.
+///
+/// A published control's `Parameters` are the parameters of the surface that implements
+/// it — the catalog publishes, for a control an AWS Config managed rule implements, that
+/// rule's own input parameters under the rule's own names, which is why such a control
+/// summarises its parameter requirement as `OPTIONAL` while a control over a rule that
+/// takes no input summarises it as `NONE`. Source: the implementing rule's documented
+/// input parameters; a parameter the rule gives a default is `OPTIONAL` and one it has no
+/// default for is `REQUIRED`. A rule this table does not name takes no input parameter,
+/// so a control it implements supports none.
+const CONFIG_RULE_PARAMETERS: &[(&str, &[(&str, &str)])] = &[
+    ("ACCOUNT_PART_OF_ORGANIZATIONS", &[("MasterAccountId", OPTIONAL)]),
+    (
+        "CLOUD_TRAIL_ENABLED",
+        &[
+            ("s3BucketName", OPTIONAL),
+            ("s3KeyPrefix", OPTIONAL),
+            ("snsTopicArn", OPTIONAL),
+        ],
+    ),
+    (
+        "MULTI_REGION_CLOUD_TRAIL_ENABLED",
+        &[
+            ("s3BucketName", OPTIONAL),
+            ("s3KeyPrefix", OPTIONAL),
+            ("snsTopicArn", OPTIONAL),
+            ("cloudWatchLogsLogGroupArn", OPTIONAL),
+            ("includeManagementEvents", OPTIONAL),
+            ("readWriteType", OPTIONAL),
+        ],
+    ),
+    ("ACCESS_KEYS_ROTATED", &[("maxAccessKeyAge", OPTIONAL)]),
+    (
+        "IAM_PASSWORD_POLICY",
+        &[
+            ("RequireUppercaseCharacters", OPTIONAL),
+            ("RequireLowercaseCharacters", OPTIONAL),
+            ("RequireSymbols", OPTIONAL),
+            ("RequireNumbers", OPTIONAL),
+            ("MinimumPasswordLength", OPTIONAL),
+            ("PasswordReusePrevention", OPTIONAL),
+            ("MaxPasswordAge", OPTIONAL),
+        ],
+    ),
+    ("ENCRYPTED_VOLUMES", &[("kmsId", OPTIONAL)]),
+    ("VPC_FLOW_LOGS_ENABLED", &[("trafficType", OPTIONAL)]),
+    ("RDS_STORAGE_ENCRYPTED", &[("kmsKeyId", OPTIONAL)]),
+    (
+        "GUARDDUTY_ENABLED_CENTRALIZED",
+        &[("centralMonitoringAccount", OPTIONAL)],
+    ),
+    ("CLOUDWATCH_LOG_GROUP_ENCRYPTED", &[("KmsKeyId", OPTIONAL)]),
+];
+
+/// The control parameters a published control supports.
+///
+/// A parameter is a value the caller supplies when it ENABLES the control, and which
+/// values those are is a property of the surface that implements the control, not of the
+/// catalog row: a control an AWS Config managed rule implements publishes that rule's
+/// input parameters ([`CONFIG_RULE_PARAMETERS`]), so two controls sharing one rule
+/// publish one parameter set and cannot drift apart, while a control deployed as a
+/// policy or a hook publishes the exemption parameters its row carries.
+pub(super) fn parameters(seed: &ControlSeed) -> &'static [(&'static str, &'static str)] {
+    if seed.implementation_type == CONFIG_RULE {
+        // A Config-rule row leaves the field empty, because the implementing rule's
+        // parameters are what such a control publishes; a row that declared both would
+        // otherwise lose the ones written on it.
+        debug_assert!(
+            seed.parameters.is_empty(),
+            "{}: a control an AWS Config managed rule implements takes its parameters \
+             from CONFIG_RULE_PARAMETERS, so its row declares none",
+            seed.slug
+        );
+        if let Some(identifier) = seed.implementation_identifier {
+            return CONFIG_RULE_PARAMETERS
+                .iter()
+                .find(|(rule, _)| *rule == identifier)
+                .map_or(NO_PARAMETERS, |(_, parameters)| *parameters);
+        }
+    }
+    seed.parameters
+}
+
 /// How two published controls relate: `(control slug, related control slug,
 /// ControlRelationType)`.
 ///
@@ -1088,6 +1299,19 @@ pub(super) const RELATED_CONTROLS: &[(&str, &str, &str)] = &[
         "s3-bucket-public-read-prohibited",
         "s3-bucket-public-write-prohibited",
         "COMPLEMENTARY",
+    ),
+    // Each of these pairs is one Config rule behind two published controls — the
+    // account-wide control and the log-archive one — so either satisfies the common
+    // control they both implement.
+    (
+        "s3-bucket-public-read-prohibited",
+        "audit-bucket-public-read-prohibited",
+        "ALTERNATIVE",
+    ),
+    (
+        "s3-bucket-public-write-prohibited",
+        "audit-bucket-public-write-prohibited",
+        "ALTERNATIVE",
     ),
 ];
 

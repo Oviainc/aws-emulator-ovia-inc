@@ -449,6 +449,20 @@ fn catalog_id(slug: &str) -> String {
     hex::encode(digest)[..CATALOG_ID_LEN].to_string()
 }
 
+/// The opaque identifier the catalog's control ARN carries for the published control
+/// `slug` names.
+///
+/// The catalog's own published identifier for the control
+/// (`published_controls::published_catalog_identifier`), where the control table records
+/// it: the catalog is account-independent and read-only, so that identifier names the
+/// control for every caller and a client holds it across sessions. For a control the
+/// table records none for, the identifier is minted from the slug exactly as the
+/// ontology's are ([`catalog_id`]).
+fn control_identifier(slug: &str) -> String {
+    published_controls::published_catalog_identifier(slug)
+        .map_or_else(|| catalog_id(slug), str::to_string)
+}
+
 // ---------------------------------------------------------------------------
 // List filters
 // ---------------------------------------------------------------------------
@@ -969,19 +983,34 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
         }
     }
     let common_control_arn = |slug: &str| catalog_arn("common-control", &catalog_id(slug));
+    let control_arn = |slug: &str| catalog_arn("control", &control_identifier(slug));
 
     // --- controls ----------------------------------------------------------
     //
     // ONE pass over the published control table, which carries one row per published
     // control: its identity, the surface that implements it, the control parameters a
     // caller supplies when enabling it, and the common control and framework items it
-    // is published against. The ARN is minted from the row's slug, exactly as the
-    // ontology's are.
+    // is published against. The ARN carries the catalog's own published identifier for
+    // the control, where the table records it, and otherwise one minted from the row's
+    // slug, exactly as the ontology's are (see `control_arn`).
     //
     // Timestamps are positional and fixed (see CATALOG_EPOCH), so the catalog a client
     // reads is identical in every process and on every run.
+    // Every recorded published identifier names a row of the table below: a stale entry
+    // would otherwise leave its control served under a minted identifier with no signal.
+    debug_assert!(
+        published_controls::PUBLISHED_CATALOG_IDENTIFIERS
+            .iter()
+            .all(|(slug, _)| published_controls::PUBLISHED_CONTROLS
+                .iter()
+                .any(|seed| seed.slug == *slug)),
+        "a published catalog identifier must name a published control"
+    );
     for (position, seed) in published_controls::PUBLISHED_CONTROLS.iter().enumerate() {
-        let arn = catalog_arn("control", &catalog_id(seed.slug));
+        let arn = control_arn(seed.slug);
+        // The parameters of the surface that implements the control, so two controls
+        // over one implementation report one parameter set.
+        let parameters = published_controls::parameters(seed);
         controls.insert(
             arn.clone(),
             Control {
@@ -1006,13 +1035,12 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
                     implementation_type: seed.implementation_type.to_string(),
                     identifier: seed.implementation_identifier.map(str::to_string),
                 }),
-                // A summary OF the parameters below, never an independent fact about
-                // the control.
+                // A summary OF the parameter list below, never an independent fact
+                // about the control.
                 parameter_requirement_summary: Some(
-                    published_controls::parameter_requirement_summary(seed.parameters).to_string(),
+                    published_controls::parameter_requirement_summary(parameters).to_string(),
                 ),
-                parameters: seed
-                    .parameters
+                parameters: parameters
                     .iter()
                     .map(|(name, requirement)| ControlParam {
                         name: (*name).to_string(),
@@ -1033,7 +1061,6 @@ fn seed_catalog() -> ComAmazonawsControlcatalogControlcatalogState {
             },
         );
     }
-    let control_arn = |slug: &str| catalog_arn("control", &catalog_id(slug));
 
     // --- control mappings --------------------------------------------------
     // The catalog records, for every control it publishes, that control's WHOLE

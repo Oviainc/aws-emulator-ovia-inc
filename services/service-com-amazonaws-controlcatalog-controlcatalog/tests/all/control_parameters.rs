@@ -1,25 +1,28 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! What a published control's `Parameters` may name, and what the requirement summary
-//! may rest on.
+//! rests on.
 //!
 //! The rules under test, read off the modeled shapes the members belong to
 //! (`smithy_query(query="doc", shape="ControlParameter")`,
 //! `smithy_query(query="operation", operation="GetControl")`):
 //!
 //! 1. A `ControlParameter` is a value the caller supplies when it ENABLES the control,
-//!    and the shape documents the whole vocabulary — "Five types of control parameters
-//!    are supported". Every name a control publishes in `Parameters` is therefore one
-//!    of those five, whatever surface implements the control: a setting of the AWS
-//!    Config rule, Security Hub control, policy or hook behind the control is that
-//!    surface's own configuration, not a control parameter.
+//!    so which parameters a control supports is a property of the SURFACE that
+//!    implements it, not of the control's own row in the catalog: a control an AWS
+//!    Config managed rule implements publishes that rule's own input parameters — the
+//!    recorded catalog response publishes a Config-rule control's parameter under the
+//!    rule's own name, outside the five the shape's documentation enumerates — so every
+//!    control over one rule publishes one and the same parameter set, while a control
+//!    deployed as a policy or a hook publishes the exemption parameters the shape does
+//!    enumerate ("Five types of control parameters are supported").
 //! 2. `Parameters` "[r]eturns an array of ControlParameter objects that specify the
 //!    parameters a control supports. An empty list is returned for controls that don't
 //!    support parameters."
 //! 3. `ParameterRequirementSummary` is a summary of exactly that list — "[u]se this
 //!    field to determine whether you need to supply parameter values when you enable
-//!    the control" — so it may only be `OPTIONAL` or `REQUIRED` on the strength of
-//!    control parameters the vocabulary has a key for.
+//!    the control" — so it is `NONE` for a control that publishes no parameter,
+//!    `REQUIRED` when one must be supplied and `OPTIONAL` otherwise.
 //!
 //! Each test is a TABLE whose rows are every control the catalog publishes, crossed
 //! with every ARN form `GetControl` accepts for it, rather than one control picked by
@@ -31,16 +34,25 @@ use serde_json::Value;
 
 use crate::control_catalog::{drain, Emulator};
 
-/// The control parameters a published control can support, spelled as the modeled
-/// `ControlParameter` spells them. Source: that shape's own documentation, which
-/// enumerates the five and nothing else (`smithy_query(query="doc",
+/// The EXEMPTION parameters a control deployed as a policy or a hook can support,
+/// spelled as the modeled `ControlParameter` spells them. Source: that shape's own
+/// documentation, which enumerates the five (`smithy_query(query="doc",
 /// shape="ControlParameter")`).
-const DOCUMENTED_CONTROL_PARAMETERS: [&str; 5] = [
+const DOCUMENTED_EXEMPTION_PARAMETERS: [&str; 5] = [
     "AllowedRegions",
     "ExemptedActions",
     "ExemptedPrincipalArns",
     "ExemptedResourceArns",
     "ExemptAssumeRoot",
+];
+
+/// The implementation types of a control Amazon Web Services Control Tower DEPLOYS — a
+/// service control policy or a CloudFormation hook — which are the controls the
+/// exemption vocabulary above applies to. Source: the `ImplementationType` values the
+/// catalog publishes.
+const DEPLOYED_CONTROL_SURFACES: [&str; 2] = [
+    "AWS::Organizations::Policy::SERVICE_CONTROL_POLICY",
+    "AWS::CloudFormation::Type::HOOK",
 ];
 
 /// The values the modeled `ControlParameterRequirement` admits
@@ -102,22 +114,34 @@ fn parameters(control: &Value, case: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Every parameter a control publishes is one of the control parameters the model
-/// documents, whichever ARN form the control is read by.
+/// Every parameter a control publishes belongs to the surface that implements the
+/// control: the exemption vocabulary for a control Control Tower deploys, and the
+/// implementing rule's own parameter set — one and the same for every control over that
+/// rule — for a control an AWS Config managed rule implements. The list is a property of
+/// the control, so it does not depend on the ARN form the control is read by.
 #[tokio::test]
-async fn every_published_control_parameter_is_one_the_model_documents() {
+async fn every_published_control_parameter_belongs_to_the_implementing_surface() {
     let emulator = Emulator::new();
     let summaries = published_controls(&emulator).await;
-    let documented: BTreeSet<&str> = DOCUMENTED_CONTROL_PARAMETERS.iter().copied().collect();
+    let exemptions: BTreeSet<&str> = DOCUMENTED_EXEMPTION_PARAMETERS.iter().copied().collect();
+    let deployed: BTreeSet<&str> = DEPLOYED_CONTROL_SURFACES.iter().copied().collect();
     let requirements: BTreeSet<&str> = DOCUMENTED_REQUIREMENTS.iter().copied().collect();
 
     let mut names_seen: BTreeSet<String> = BTreeSet::new();
     let mut controls_with_parameters = 0usize;
     let mut controls_without_parameters = 0usize;
     let mut surfaces_seen: BTreeSet<String> = BTreeSet::new();
+    // The parameter set published for each implementation identifier, to check that two
+    // controls over one implementation publish one set.
+    let mut per_implementation: BTreeMap<String, (String, Vec<(String, String)>)> =
+        BTreeMap::new();
 
     for summary in &summaries {
         let forms = read_forms(summary);
+        let implementation_type = summary["Implementation"]["Type"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
         let mut served_per_form: Vec<Vec<(String, String)>> = Vec::new();
 
         for requested in &forms {
@@ -130,11 +154,16 @@ async fn every_published_control_parameter_is_one_the_model_documents() {
             let mut names: BTreeSet<&str> = BTreeSet::new();
             for (name, requirement) in &served {
                 assert!(
-                    documented.contains(name.as_str()),
-                    "case {case}: a control parameter must be one the model documents \
-                     ({documented:?}), got {name:?} \u{2014} the implementing surface's own \
-                     settings are not control parameters"
+                    !name.is_empty(),
+                    "case {case}: a published parameter must be named, got {served:?}"
                 );
+                if deployed.contains(implementation_type.as_str()) {
+                    assert!(
+                        exemptions.contains(name.as_str()),
+                        "case {case}: a control Control Tower deploys takes the exemption \
+                         parameters the model documents ({exemptions:?}), got {name:?}"
+                    );
+                }
                 assert!(
                     requirements.contains(requirement.as_str()),
                     "case {case}: parameter {name} must state a modeled requirement \
@@ -169,14 +198,30 @@ async fn every_published_control_parameter_is_one_the_model_documents() {
             );
         }
 
-        if let Some(surface) = summary["Implementation"]["Type"].as_str() {
-            surfaces_seen.insert(surface.to_string());
+        // Two controls over ONE implementation are parameterised by that implementation,
+        // so they publish one and the same parameter set.
+        let arn = summary["Arn"].as_str().unwrap_or_default().to_string();
+        if let Some(identifier) = summary["Implementation"]["Identifier"].as_str() {
+            let implementation = format!("{implementation_type}/{identifier}");
+            if let Some((other, expected)) = per_implementation.get(&implementation) {
+                assert_eq!(
+                    first, expected,
+                    "case {arn} over {implementation}: expected the parameters {other} \
+                     publishes for that implementation ({expected:?}), got {first:?}"
+                );
+            } else {
+                per_implementation.insert(implementation, (arn, first.clone()));
+            }
+        }
+
+        if !implementation_type.is_empty() {
+            surfaces_seen.insert(implementation_type);
         }
     }
 
     // None of the assertions above is vacuous: the catalog publishes controls that
     // support control parameters and controls that support none, over more than one
-    // implementation surface.
+    // implementation surface, including a surface the exemption vocabulary governs.
     assert!(
         controls_with_parameters >= 1,
         "case catalog: at least one control must support a control parameter for the \
@@ -189,8 +234,13 @@ async fn every_published_control_parameter_is_one_the_model_documents() {
     );
     assert!(
         names_seen.len() >= 2,
-        "case catalog: the published parameter names must span more than one of the \
-         documented five for the rule to be tested, saw {names_seen:?}"
+        "case catalog: the published parameter names must span more than one name for \
+         the rule to be tested, saw {names_seen:?}"
+    );
+    assert!(
+        surfaces_seen.iter().any(|surface| deployed.contains(surface.as_str())),
+        "case catalog: a control Control Tower deploys must be published for the \
+         exemption rule to be tested, saw {surfaces_seen:?}"
     );
     assert!(
         surfaces_seen.len() >= 2,
@@ -199,14 +249,12 @@ async fn every_published_control_parameter_is_one_the_model_documents() {
     );
 }
 
-/// `ParameterRequirementSummary` rests on control parameters only: summarising the
-/// documented names a control publishes reproduces the summary it serves, on both the
-/// list page and the control itself.
+/// `ParameterRequirementSummary` summarises exactly the control's own `Parameters`, on
+/// both the list page and the control itself.
 #[tokio::test]
-async fn the_requirement_summary_rests_on_documented_control_parameters_only() {
+async fn the_requirement_summary_summarises_the_published_parameters() {
     let emulator = Emulator::new();
     let summaries = published_controls(&emulator).await;
-    let documented: BTreeSet<&str> = DOCUMENTED_CONTROL_PARAMETERS.iter().copied().collect();
 
     let mut summaries_seen: BTreeMap<String, usize> = BTreeMap::new();
 
@@ -218,15 +266,11 @@ async fn the_requirement_summary_rests_on_documented_control_parameters_only() {
         let case = format!("control read as {arn}");
         let served = parameters(&control, &case);
 
-        // Only a parameter the vocabulary has a key for can oblige the caller to
-        // supply a value when enabling the control.
-        let control_parameters: Vec<&(String, String)> = served
-            .iter()
-            .filter(|(name, _)| documented.contains(name.as_str()))
-            .collect();
-        let expected = if control_parameters.is_empty() {
+        // The modeled summary says whether the caller must supply a value when it
+        // enables the control, over the whole published list.
+        let expected = if served.is_empty() {
             "NONE"
-        } else if control_parameters
+        } else if served
             .iter()
             .any(|(_, requirement)| requirement == "REQUIRED")
         {
@@ -239,8 +283,8 @@ async fn the_requirement_summary_rests_on_documented_control_parameters_only() {
         assert_eq!(
             actual,
             Some(expected),
-            "case {case} with control parameters {control_parameters:?} out of \
-             {served:?}: expected ParameterRequirementSummary {expected}, got {actual:?}"
+            "case {case} with parameters {served:?}: expected \
+             ParameterRequirementSummary {expected}, got {actual:?}"
         );
         assert_eq!(
             summary["ParameterRequirementSummary"].as_str(),
