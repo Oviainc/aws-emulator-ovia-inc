@@ -197,6 +197,8 @@ mod policy_arn_absence_wording;
 mod policy_default_version;
 #[path = "all/policy_deletion.rs"]
 mod policy_deletion;
+#[path = "all/policy_input_list_refusal_wording.rs"]
+mod policy_input_list_refusal_wording;
 #[path = "all/policy_language_values.rs"]
 mod policy_language_values;
 #[path = "all/policy_listing.rs"]
@@ -327,12 +329,16 @@ mod service_specific_credential_status;
 mod service_specific_credentials;
 #[path = "all/signing_certificates.rs"]
 mod signing_certificates;
+#[path = "all/simulated_address_conditions.rs"]
+mod simulated_address_conditions;
 #[path = "all/simulated_decision_attribution.rs"]
 mod simulated_decision_attribution;
 #[path = "all/simulated_policy_composition.rs"]
 mod simulated_policy_composition;
 #[path = "all/simulated_principal_sources.rs"]
 mod simulated_principal_sources;
+#[path = "all/simulated_resource_names.rs"]
+mod simulated_resource_names;
 #[path = "all/simulated_resource_policy.rs"]
 mod simulated_resource_policy;
 #[path = "all/state_roundtrip.rs"]

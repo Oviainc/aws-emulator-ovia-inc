@@ -18607,6 +18607,7 @@ dependencies = [
  "aws-smithy-types",
  "bumpalo",
  "http",
+ "ipnet",
  "iso8601-duration",
  "jsonata-rs",
  "ring",

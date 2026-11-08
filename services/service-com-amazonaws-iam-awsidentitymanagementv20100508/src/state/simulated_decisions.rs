@@ -47,6 +47,17 @@ const MAX_SIMULATED_RESOURCES: usize = 1_000;
 /// pair the page decides.
 const MAX_SIMULATED_DOCUMENTS: usize = 10;
 
+/// How many LEVELS of an Organizations hierarchy one request may supply, which is the
+/// bound the member's own target states: `OrganizationPolicyListType` is length 0..7
+/// (`smithy_query(query="shape",shape="OrganizationPolicyListType")`).
+///
+/// It is counted beside [`MAX_SIMULATED_DOCUMENTS`], not covered by it: that cap measures
+/// the DOCUMENTS the levels carry, and a level carrying none contributes nothing to it,
+/// while every level is walked for every pair the page decides
+/// ([`organization_outcome`]) — so without this the work would be the page's pairs times a
+/// factor the request alone chooses.
+const MAX_SIMULATED_ORGANIZATION_LEVELS: usize = 7;
+
 /// How many (action, resource) pairs one PAGE may decide. The page's action count is
 /// narrowed so this holds, which bounds both the work the request does and the size of
 /// the response it gets back; the actions that do not fit are reported on the next
@@ -184,14 +195,22 @@ pub struct SimulationInput<'a> {
 /// error channel.
 pub fn request_defect(request: &SimulationInput<'_>) -> Option<String> {
     // Every supplied document has to be a policy document before anything is decided
-    // from it: the rule, and the fixed sentence each way of breaking it is refused with,
-    // are the shared ones every operation taking a policy document applies
-    // (`crate::state::policy_document_defect`), so the refusal carries neither the member
-    // that supplied the document nor anything read out of it.
+    // from it: the rule is the shared one every operation taking a policy document applies
+    // (`crate::state::policy_document_defect`). An entry of `PolicyInputList` is refused by
+    // its POSITION in that list, counted from one
+    // (`crate::state::policy_input_list_item_invalid`), because the member carries several
+    // documents and the caller has to be told which of them was rejected.
+    for (position, document) in (1..).zip(request.documents) {
+        if super::policy_document_defect(document).is_some() {
+            return Some(super::policy_input_list_item_invalid(position));
+        }
+    }
+    // Every other document the request supplies is refused with the fixed sentence the
+    // shared validator words, which carries neither the member that supplied the document
+    // nor anything read out of it.
     let documents = request
-        .documents
+        .boundary
         .iter()
-        .chain(request.boundary.iter())
         .chain(request.organization_levels.iter().flatten())
         .map(String::as_str)
         .chain(request.resource_policy);
@@ -231,6 +250,11 @@ pub fn request_defect(request: &SimulationInput<'_>) -> Option<String> {
         ),
         (
             "OrderedOrganizationPolicyInputList",
+            request.organization_levels.len(),
+            MAX_SIMULATED_ORGANIZATION_LEVELS,
+        ),
+        (
+            "OrderedOrganizationPolicyInputList",
             request.organization_levels.iter().map(Vec::len).sum(),
             MAX_SIMULATED_DOCUMENTS,
         ),
@@ -254,6 +278,28 @@ pub fn request_defect(request: &SimulationInput<'_>) -> Option<String> {
         return Some(format!(
             "Invalid Action name: {action} must name a service and an action, as in \
              iam:CreateUser"
+        ));
+    }
+
+    // "A list of ARNs of Amazon Web Services resources to include in the simulation …
+    // Each API in the ActionNames parameter is evaluated for each resource in this list":
+    // an entry that is neither an ARN nor the wildcard the member defaults to names no
+    // resource the simulation could decide a statement's `Resource` element against, so
+    // nothing can be reported about it. The refusal names every such entry, in the order
+    // the request carries them, because the member is a list and the caller has to be told
+    // which of its values are not resource names.
+    let malformed: Vec<&str> = request
+        .resource_arns
+        .iter()
+        .filter(|named| {
+            named.as_str() != ANY_RESOURCE && ::service_common::arn::parse(named).is_none()
+        })
+        .map(String::as_str)
+        .collect();
+    if !malformed.is_empty() {
+        return Some(format!(
+            "ResourceNames are not in a valid ARN format: {}.",
+            malformed.join(", ")
         ));
     }
 

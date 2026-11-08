@@ -63,8 +63,8 @@
 //!
 //! A statement's `Condition` is evaluated only for the keys the caller puts in the
 //! [`Request::context`] it passes (`rum:alias`, say, which CloudWatch RUM documents for
-//! `PutRumEvents`) and only for the string, ARN, boolean, numeric, date and existence
-//! operators below, each
+//! `PutRumEvents`) and only for the string, ARN, boolean, numeric, date, IP-address and
+//! existence operators below, each
 //! of which may carry IAM's `IfExists` suffix ([`IF_EXISTS_SUFFIX`]), under which a key the
 //! request models and carries no value for holds instead of refusing. A clause this CAN decide is
 //! part of whether its statement applies at all, whichever effect the statement states: a
@@ -130,8 +130,8 @@
 //! element as a plain non-match: a refusal is never weakened on a value this evaluation
 //! could not establish.
 
-/// The string condition operators this evaluator decides. Everything else — the IP
-/// operators — leaves the statement undecided (see the module
+/// The string condition operators this evaluator decides. Everything else leaves the
+/// statement undecided (see the module
 /// docs). Each of them may be written under a set qualifier; see [`split_set_qualifier`].
 const STRING_OPERATORS: &[&str] = &[
     "StringEquals",
@@ -241,6 +241,43 @@ fn number(text: &str) -> Option<f64> {
         .parse::<f64>()
         .ok()
         .filter(|parsed| parsed.is_finite())
+}
+
+/// The IP-address condition operators this evaluator decides: "IP address condition
+/// operators let you construct `Condition` elements that restrict access based on comparing
+/// a key to an IPv4 or IPv6 address or range of IP addresses", used with a key whose value
+/// is an address (`aws:SourceIp`, `aws:VpcSourceIp`). Like the string operators, each may be
+/// written under a set qualifier and with the `IfExists` suffix.
+///
+/// Both sides are read as ADDRESSES rather than as text ([`in_network`]): "IpAddress — the
+/// specified IP address or range" holds when the address the request carries lies in the
+/// network the clause states, so a clause stating a CIDR block holds for every address of
+/// that block and not only for the one spelling of it, and `NotIpAddress` holds exactly
+/// where its sibling does not.
+const IP_ADDRESS_OPERATORS: &[&str] = &["IpAddress", "NotIpAddress"];
+
+/// Whether the address `actual` names lies in the network `stated` names.
+///
+/// Both sides are read by the tree's IP-network parser rather than by comparing text, so the
+/// comparison is the one the network describes: a clause stating `198.51.100.0/24` holds for
+/// every address of that block, and one stating a bare address holds for that address alone
+/// — "you can use a /32 prefix size to specify a single IP address", which is the network a
+/// bare address is. A side that names no address, and an address of the other IP version
+/// than the network's, lies in nothing, so the positive comparison does not hold on it (and
+/// the negated one, which holds exactly where its sibling does not, does).
+fn in_network(stated: &str, actual: &str) -> bool {
+    let Ok(address) = actual.trim().parse::<::std::net::IpAddr>() else {
+        return false;
+    };
+    let stated = stated.trim();
+    match stated.parse::<::ipnet::IpNet>() {
+        Ok(network) => network.contains(&address),
+        // A clause may state a single address rather than a block, which is that address's
+        // own host network.
+        Err(_) => stated
+            .parse::<::std::net::IpAddr>()
+            .is_ok_and(|single| single == address),
+    }
 }
 
 /// The suffix that makes a comparison hold where the request carries no value for the key:
@@ -1156,6 +1193,7 @@ fn conditions_hold(
                 || ARN_OPERATORS.contains(&operator)
                 || NUMERIC_OPERATORS.contains(&operator)
                 || DATE_OPERATORS.contains(&operator)
+                || IP_ADDRESS_OPERATORS.contains(&operator)
         };
         for (key, expected) in keys {
             let actual: Vec<&str> = request
@@ -1350,6 +1388,14 @@ fn clause_holds(operator: &str, expected: &[Expanded], actual: &str) -> bool {
             .any(|value| value.equals(actual, case_sensitive))
     };
     let any_like = || expected.iter().any(|pattern| pattern.matches(actual, true));
+    // Both sides as ADDRESSES: an IP clause asks whether the address the request carries
+    // lies in the network the clause states, which is decided by the network rather than by
+    // the text of either side.
+    let any_in_network = || {
+        expected
+            .iter()
+            .any(|value| in_network(&value.text(), actual))
+    };
     // Both sides as INSTANTS: a date clause compares the moment each side names, so the
     // epoch and ISO 8601 spellings of one moment compare equal. A side that names no
     // instant at all is compared against nothing, so the positive spelling does not hold
@@ -1395,6 +1441,10 @@ fn clause_holds(operator: &str, expected: &[Expanded], actual: &str) -> bool {
         "DateLessThanEquals" => any_instant(|reached, stated| reached <= stated),
         "DateGreaterThan" => any_instant(|reached, stated| reached > stated),
         "DateGreaterThanEquals" => any_instant(|reached, stated| reached >= stated),
+        // An address key is compared against the network the clause states, not against its
+        // spelling ([`in_network`]).
+        "IpAddress" => any_in_network(),
+        "NotIpAddress" => !any_in_network(),
         // A boolean key carries one of the two literals, compared as such.
         BOOL_OPERATOR => any_equals(false),
         // Unreachable: the caller checks the operator against the two operator tables

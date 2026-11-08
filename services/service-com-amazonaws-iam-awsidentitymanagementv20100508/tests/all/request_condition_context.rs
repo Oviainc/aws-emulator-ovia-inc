@@ -679,9 +679,10 @@ struct SimulatedCase {
 
 /// Rows spanning the readings an absent key gets under a `Deny`'s clause and the two ways
 /// the request can settle it: a negated operator the absence itself satisfies (so the deny
-/// applies and nothing was needed), the same clause with the value supplied, and the
-/// positive operator the absence makes false (so the deny does not apply, and the value the
-/// policy needed is reported).
+/// applies and nothing was needed), the same clause with the value supplied, the positive
+/// operator the absence makes false (so the deny does not apply, and the value the policy
+/// needed is reported) — in its text and its ADDRESS spellings — and an operator this
+/// evaluation does not implement, which no value settles, so the deny stands.
 const SIMULATED_CASES: &[SimulatedCase] = &[
     SimulatedCase {
         case: "a negated operator over a key the request leaves out",
@@ -716,12 +717,20 @@ const SIMULATED_CASES: &[SimulatedCase] = &[
         missing: &["aws:SourceVpce"],
     },
     SimulatedCase {
-        case: "an operator this evaluation cannot decide at all",
+        case: "an address operator over a key the request leaves out",
         condition: r#"{"IpAddress":{"aws:SourceIp":"10.0.0.0/8"}}"#,
+        supplied: None,
+        decision: ALLOWED,
+        real_call_refused: true,
+        missing: &["aws:SourceIp"],
+    },
+    SimulatedCase {
+        case: "an operator this evaluation cannot decide at all",
+        condition: r#"{"BinaryEquals":{"aws:SourceVpce":"dnBjZS0wYWJj"}}"#,
         supplied: None,
         decision: EXPLICIT_DENY,
         real_call_refused: true,
-        missing: &["aws:SourceIp"],
+        missing: &["aws:SourceVpce"],
     },
 ];
 

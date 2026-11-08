@@ -195,18 +195,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "An optional list of additional policies for which you want the list of
         // context keys that are referenced" — each entry has to BE an IAM JSON policy
         // document, which `policyDocumentType`'s own pattern does not ask for, so one
-        // that is not is an "invalid … value … supplied for an input parameter". The
-        // rule, and the fixed sentence each defect is refused with, are the shared ones
-        // every operation taking a policy document applies.
+        // that is not is an "invalid … value … supplied for an input parameter". The rule
+        // is the shared one every operation taking a policy document applies, and the
+        // refusal names the entry by its POSITION in the list, counted from one
+        // (`crate::state::policy_input_list_item_invalid`).
         let supplied = input.policy_input_list.unwrap_or_default();
-        if let Some(defect) = supplied
-            .iter()
-            .find_map(|document| crate::state::policy_document_defect(document))
+        if let Some(position) = (1..)
+            .zip(&supplied)
+            .find(|(_, document)| crate::state::policy_document_defect(document).is_some())
+            .map(|(position, _)| position)
         {
             return Err(
                 GetContextKeysForPrincipalPolicyErrorModeled::InvalidInputException(
                     InvalidInputException {
-                        message: Some(defect.message().to_string()),
+                        message: Some(crate::state::policy_input_list_item_invalid(position)),
                     },
                 )
                 .into(),

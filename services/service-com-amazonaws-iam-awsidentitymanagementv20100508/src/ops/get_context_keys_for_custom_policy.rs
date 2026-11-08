@@ -173,21 +173,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Each entry has to BE an IAM JSON policy document — "each document is
         // specified as a string containing the complete, valid JSON text of an IAM
         // policy" — which `policyDocumentType`'s own pattern does not ask for, so one
-        // that is not is an "invalid … value … supplied for an input parameter". The
-        // rule, and the fixed sentence each way of breaking it is refused with, are the
-        // shared ones every operation taking a policy document applies
-        // (`crate::state::policy_document_defect`), so the refusal carries neither the
-        // member that supplied the document nor anything read out of it — the same text
-        // `GetContextKeysForPrincipalPolicy` answers for the same list.
-        if let Some(defect) = input
-            .policy_input_list
-            .iter()
-            .find_map(|document| crate::state::policy_document_defect(document))
+        // that is not is an "invalid … value … supplied for an input parameter". The rule
+        // is the shared one every operation taking a policy document applies
+        // (`crate::state::policy_document_defect`), and the refusal names the entry by its
+        // POSITION in the list, counted from one
+        // (`crate::state::policy_input_list_item_invalid`) — the same text
+        // `GetContextKeysForPrincipalPolicy` and the two simulations answer for the same
+        // member.
+        if let Some(position) = (1..)
+            .zip(&input.policy_input_list)
+            .find(|(_, document)| crate::state::policy_document_defect(document).is_some())
+            .map(|(position, _)| position)
         {
             return Err(
                 GetContextKeysForCustomPolicyErrorModeled::InvalidInputException(
                     InvalidInputException {
-                        message: Some(defect.message().to_string()),
+                        message: Some(crate::state::policy_input_list_item_invalid(position)),
                     },
                 )
                 .into(),

@@ -257,6 +257,30 @@ fn cases(policy_arn: &str) -> Vec<Case> {
             reason: no_allow("iam:ListUserTags"),
             details: true,
         },
+        // The same two reads of a ROLE: a request that addresses one entity of another
+        // type, so neither the entity type nor the resource form selects the wording —
+        // each of these actions is one AWS words with the pointer, as the user's tag
+        // listing above is.
+        Case {
+            case: "implicit deny listing one role's tags",
+            policies: Vec::new(),
+            action: "ListRoleTags",
+            params: vec![("RoleName".to_string(), TARGET.to_string())],
+            iam_action: "iam:ListRoleTags",
+            named_as: format!("role {TARGET}"),
+            reason: no_allow("iam:ListRoleTags"),
+            details: true,
+        },
+        Case {
+            case: "implicit deny listing one role's embedded policies",
+            policies: Vec::new(),
+            action: "ListRolePolicies",
+            params: vec![("RoleName".to_string(), TARGET.to_string())],
+            iam_action: "iam:ListRolePolicies",
+            named_as: format!("role {TARGET}"),
+            reason: no_allow("iam:ListRolePolicies"),
+            details: true,
+        },
         Case {
             case: "implicit deny writing an account property",
             policies: Vec::new(),

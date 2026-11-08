@@ -4266,6 +4266,24 @@ pub enum PolicyDocumentDefect {
 /// [`POLICY_HAS_NO_STATEMENTS`]).
 pub const SYNTAX_ERRORS_IN_POLICY: &str = "Syntax errors in policy.";
 
+/// How IAM refuses an entry of a `PolicyInputList` it cannot read as a policy document:
+/// the fixed text, carrying the POSITION of the offending entry in the list it arrived in,
+/// counted from one.
+///
+/// The operations that take that member — the two simulations and the two context-key
+/// readers — take a LIST of documents, so a caller submitting several in one call needs to
+/// be told WHICH one was rejected; that is the only variable part, and it comes from the
+/// request. It is why these operations do not answer the sentence an operation taking a
+/// SINGLE policy document answers ([`SYNTAX_ERRORS_IN_POLICY`]), which identifies no entry.
+///
+/// Every defect [`policy_document_defect`] reports is worded this way here, because what the
+/// refusal says is that the entry is not content these operations can read as a policy —
+/// a text that is no JSON object and an object describing no statement are alike unreadable
+/// as the "complete, valid JSON text of an IAM policy" the member documents.
+pub fn policy_input_list_item_invalid(position: usize) -> String {
+    format!("Policy input list item {position} has invalid content")
+}
+
 /// The fixed sentence IAM refuses a TRUST policy document that does not parse as a JSON
 /// object with.
 ///

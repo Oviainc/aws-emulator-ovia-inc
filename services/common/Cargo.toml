@@ -61,6 +61,10 @@ serde_json = { workspace = true }
 # `management_events`: the `eventID` / `requestID` a recorded event carries are version-4
 # UUIDs, minted by the same maintained crate rather than by laying the form out here.
 uuid = { version = "1", features = ["v4"] }
+# `iam_authorization`: the reading of an IP address or a range in CIDR notation that the
+# IAM `IpAddress`/`NotIpAddress` condition operators compare an address against, taken from
+# the maintained crate rather than by splitting the notation by hand.
+ipnet = "2"
 # `iso8601_span`: the ISO 8601 duration grammar, parsed by the maintained crate rather
 # than by hand, for every service handed a span as a caller-supplied string.
 iso8601-duration = "0.2"
