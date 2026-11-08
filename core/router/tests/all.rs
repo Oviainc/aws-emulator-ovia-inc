@@ -37,7 +37,6 @@ mod cloudformation_asset_bucket_publishing_role;
 // regions concurrently landing suites add their line to.
 #[path = "all/cloudformation_sfn_reference_starts_execution.rs"]
 mod cloudformation_sfn_reference_starts_execution;
-// Declared here, in this same head region, for the reason the entry above records: the
 // appended tail and the sorted `r…` span are both regions concurrently landing suites add
 // their line to.
 #[path = "all/rds_s3_snapshot_export_flow.rs"]
@@ -53,11 +52,6 @@ mod directory_realm_follows_its_create;
 // Declared here, in this same head region, for the reason the entries above record.
 #[path = "all/directory_data_access_cycle.rs"]
 mod directory_data_access_cycle;
-// Declared here, in this same head region, for the reason the entries above record: the
-// appended tail and the sorted `c…` span (where every cloudformation suite lands) are both
-// regions concurrently landing suites add their line to.
-#[path = "all/cloudformation_lambda_ssm_sourced_update.rs"]
-mod cloudformation_lambda_ssm_sourced_update;
 // appended tail and the sorted `k…` span are both regions concurrently landing suites add
 #[path = "all/kinesisvideo_discovered_data_plane.rs"]
 mod kinesisvideo_discovered_data_plane;
@@ -71,8 +65,6 @@ mod codebuild_artifacts_override_bucket;
 mod cloudformation_ec2_cdk_vpc_estate;
 #[path = "all/greengrass_deployment_iot_job.rs"]
 mod greengrass_deployment_iot_job;
-// appended tail and the sorted `c…` span (where every cloudformation suite lands) are both
-// regions concurrently landing suites add their line to.
 #[path = "all/cloudformation_sam_function_writes_its_table.rs"]
 mod cloudformation_sam_function_writes_its_table;
 // What S3's two address forms — path-style and virtual-hosted — mean to the router, which is
@@ -324,8 +316,6 @@ mod cognito_vended_session_is_an_assumed_role_caller;
 mod cognito_post_confirmation_lambda_trigger;
 #[path = "all/cognito_group_role_mapping.rs"]
 mod cognito_group_role_mapping;
-// Declared beside its sibling cognito suites, at the head, for the same reason they are
-// here: the appended tail and the sorted `c…` span are both regions concurrent suites land in.
 #[path = "all/cognito_sms_caller_role_trust.rs"]
 mod cognito_sms_caller_role_trust;
 #[path = "all/pi_resource_metadata_reflects_rds_configuration.rs"]
@@ -429,11 +419,10 @@ mod cloudformation_provisions_scheduler_schedules;
 mod cloudformation_provisions_stack_resources;
 #[path = "all/cloudfront_api_call_events.rs"]
 mod cloudfront_api_call_events;
-// Declared HERE, in the sorted list beside the other CloudFront suites, rather than
-// appended at the end of this file: the tail is where every suite landing in the same
-// window appends, so a line added there conflicts with all of them.
-#[path = "all/cloudfront_edge_cache_refresh.rs"]
-mod cloudfront_edge_cache_refresh;
+// Declared HERE, in sorted position beside the other CloudFront suites, rather than appended
+// at the end of this file: the tail is where every suite landing in the same window appends.
+#[path = "all/cloudfront_edge_metrics_drive_the_alarm_chain.rs"]
+mod cloudfront_edge_metrics_drive_the_alarm_chain;
 #[path = "all/cloudfront_key_value_store_handshake.rs"]
 mod cloudfront_key_value_store_handshake;
 // Declared HERE, in the sorted list beside the other CloudFront suite, rather than appended
@@ -979,11 +968,6 @@ mod apigateway_account_cloudwatch_role;
 // Service control plane and its data plane over one engine.
 #[path = "all/ds_data_plane_access_and_realm.rs"]
 mod ds_data_plane_access_and_realm;
-// Declared here, in this quiet span rather than in the contended tail: a log group's
-// subscription filter, the Firehose stream it forwards to and the object that stream
-// delivers.
-#[path = "all/logs_subscription_filter_to_firehose_s3.rs"]
-mod logs_subscription_filter_to_firehose_s3;
 #[path = "all/zz_probe_whole_emulator.rs"]
 mod zz_probe_whole_emulator;
 #[path = "all/cloudformation_provisions_cognito_identity_pools.rs"]
@@ -1015,3 +999,15 @@ mod eks_control_plane_logs;
 // Declared in this same head region, for the reason the note above records.
 #[path = "all/bedrock_agentcore_data_plane_parent_resources.rs"]
 mod bedrock_agentcore_data_plane_parent_resources;
+// Declared here, in this same head region, for the reason the entries above record: the
+#[path = "all/cloudformation_lambda_ssm_sourced_update.rs"]
+mod cloudformation_lambda_ssm_sourced_update;
+// Declared HERE, in the sorted list beside the other CloudFront suites, rather than
+// window appends, so a line added there conflicts with all of them.
+#[path = "all/cloudfront_edge_cache_refresh.rs"]
+mod cloudfront_edge_cache_refresh;
+// Declared here, in this quiet span rather than in the contended tail: a log group's
+// subscription filter, the Firehose stream it forwards to and the object that stream
+// delivers.
+#[path = "all/logs_subscription_filter_to_firehose_s3.rs"]
+mod logs_subscription_filter_to_firehose_s3;

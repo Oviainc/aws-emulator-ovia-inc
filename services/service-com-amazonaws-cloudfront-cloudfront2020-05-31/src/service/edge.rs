@@ -114,6 +114,7 @@ use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{http, OperationContext};
 use std::time::{Duration, SystemTime};
 
+use super::edge_metrics;
 use super::origin_access::{self, OriginAccess};
 use crate::ops::types::{AllowedMethods, CacheBehavior, DefaultCacheBehavior, Origin};
 use crate::state::{
@@ -802,6 +803,7 @@ pub async fn serve<Eng: Send + Sync + 'static>(
 ) -> RtResponse {
     let now = SystemTime::now();
     let cf_id;
+    let served_for;
     let plan;
     {
         let Some(state) = crate::state::service_state(engine) else {
@@ -812,31 +814,69 @@ pub async fn serve<Eng: Send + Sync + 'static>(
         // which owes a just-created configuration its deployment.
         store.settle(now);
         cf_id = store.mint_edge_request_id();
-        plan = plan_request(&store, req, &cf_id, now);
+        (served_for, plan) = plan_request(&store, req, &cf_id, now);
     }
-    match plan {
+    let method = req.method().to_ascii_uppercase();
+    let request_bytes = req.body().bytes().map_or(0, <[u8]>::len);
+    let response = match plan {
         Plan::Generated { status, detail } => generated(status, detail, &cf_id),
         Plan::Hit { status, body } => served(status, body, CACHE_HIT, &cf_id),
         Plan::Fetch(fetch) => fetch_origin(engine, ctx, *fetch, &cf_id, req).await,
+    };
+    // What the edge DID with this request is reported as the distribution's own CloudWatch
+    // series, whoever produced the answer: the counters and error rates a client watches a
+    // distribution with are the viewer requests it served ([`edge_metrics`]).
+    if let Some(distribution_id) = served_for {
+        edge_metrics::count_viewer_request(
+            engine,
+            &distribution_id,
+            now,
+            &edge_metrics::ServedRequest {
+                method: &method,
+                status: response.status().as_u16(),
+                response_bytes: response.body().bytes().map_or(0, <[u8]>::len),
+                request_bytes,
+            },
+        );
     }
+    response
 }
 
-/// Decide what the edge does with one viewer request, under the store's lock.
+/// Decide what the edge does with one viewer request, under the store's lock, and name the
+/// distribution the request resolved to — the one whose series it is counted into.
 fn plan_request(
     store: &ComAmazonawsCloudfrontCloudfront20200531State,
     req: &RtRequest,
     cf_id: &str,
     now: SystemTime,
-) -> Plan {
+) -> (Option<String>, Plan) {
     let addressed = Addressed::of_request(req);
     let Some(resolved) = resolve(store, &addressed) else {
         // The distribution was deleted between the claim and now: an endpoint that serves
-        // no distribution of this account is refused.
-        return Plan::Generated {
-            status: FORBIDDEN,
-            detail: BAD_REQUEST_DETAIL,
-        };
+        // no distribution of this account is refused, and counted into no distribution's
+        // series, there being none to count it into.
+        return (
+            None,
+            Plan::Generated {
+                status: FORBIDDEN,
+                detail: BAD_REQUEST_DETAIL,
+            },
+        );
     };
+    let distribution_id = resolved.distribution.id.clone();
+    let plan = plan_resolved(store, &addressed, &resolved, req, cf_id, now);
+    (Some(distribution_id), plan)
+}
+
+/// Decide what the edge does with one viewer request it has resolved to a distribution.
+fn plan_resolved(
+    store: &ComAmazonawsCloudfrontCloudfront20200531State,
+    addressed: &Addressed<'_>,
+    resolved: &Resolved<'_, '_>,
+    req: &RtRequest,
+    cf_id: &str,
+    now: SystemTime,
+) -> Plan {
     let distribution_id = resolved.distribution.id.clone();
     let viewer_path = resolved.viewer_path.to_string();
     if !resolved.distribution.config.enabled {

@@ -28,6 +28,12 @@ tracing = { workspace = true }
 # `service_principal_calls`: the directory of the calls this service makes AS the CloudFront
 # service principal, which the service serving one reads.
 service-common = { path = "../common" }
+# The CloudWatch store the EDGE publishes the per-distribution metrics of the viewer
+# requests it serves to (the `AWS/CloudFront` namespace, `service::edge_metrics`).
+# CloudWatch refuses a `PutMetricData` into a reserved `AWS/` namespace, so a service's own
+# metrics never travel over that API; this writes the very store `ListMetrics`,
+# `GetMetricStatistics` and the alarm evaluation read.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -88,6 +88,9 @@
 //! account, so it is no management event.
 
 pub mod edge;
+/// What the edge REPORTS about the viewer traffic it served: the per-distribution CloudWatch
+/// series every answer it serves is counted into.
+pub mod edge_metrics;
 pub mod envelope;
 /// This front door's AUDIT leg: every call it serves is recorded in the account's
 /// management-event history, and fanned out onto the default event bus while a trail is
