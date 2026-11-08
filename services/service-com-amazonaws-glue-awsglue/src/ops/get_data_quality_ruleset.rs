@@ -4,8 +4,14 @@
 //!
 //! Reports the data quality ruleset this account holds under the requested name
 //! ([`crate::state::ComAmazonawsGlueAwsglueState::data_quality_rulesets`]), which is what
-//! `CreateDataQualityRuleset` stored. READ-ONLY: every member is projected out of the
-//! stored record and nothing is written, so two reads of one ruleset agree.
+//! `CreateDataQualityRuleset` stored and what the last `UpdateDataQualityRuleset` left
+//! there. READ-ONLY: every member is projected out of the stored record and nothing is
+//! written, so two reads of one ruleset agree.
+//!
+//! The answer carries the ruleset's `Identifier` beside the published members, the same
+//! fact an update of the ruleset answers with (see `UpdateDataQualityRulesetOutput`): the
+//! identifier is the identity the create assigned the record, so the read of a ruleset
+//! reports it as well. `GetDataQualityRulesetOutput` is hand-declared for that one member.
 //!
 //! That projection is one member wider than the modelled response below binds: the read also
 //! reports the identifier the create assigned the ruleset, which is why the response shape is

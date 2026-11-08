@@ -61,7 +61,10 @@ pub struct WorkflowEntry {
 /// The ONE place this namespace's key form lives, so a write that reaches the map through a
 /// split borrow of the store ([`ComAmazonawsGlueAwsglueState::start_blueprint_run`]) keys it
 /// exactly as [`ComAmazonawsGlueAwsglueState::insert_workflow`] does.
-pub(super) fn insert_workflow_into(workflows: &mut BTreeMap<String, WorkflowEntry>, entry: WorkflowEntry) {
+pub(super) fn insert_workflow_into(
+    workflows: &mut BTreeMap<String, WorkflowEntry>,
+    entry: WorkflowEntry,
+) {
     workflows.insert(entry.name.clone(), entry);
 }
 

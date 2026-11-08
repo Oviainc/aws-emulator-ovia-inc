@@ -22,7 +22,8 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
-    NODE_TYPE_TRIGGER, TRIGGER_STATE_ACTIVATED, TRIGGER_STATE_CREATED, TRIGGER_STATE_DEACTIVATED,
+    messages, NODE_TYPE_TRIGGER, TRIGGER_STATE_ACTIVATED, TRIGGER_STATE_CREATED,
+    TRIGGER_STATE_DEACTIVATED,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -263,15 +264,15 @@ async fn a_delete_removes_the_named_trigger_and_answers_with_its_name() {
             "case {case:?}: the delete must answer with the name it deleted, got {deleted}"
         );
 
-        // The trigger is gone: the read of it is the modelled not-found refusal naming
-        // what was asked for.
+        // The trigger is gone: the read of it is the modelled not-found refusal, the one
+        // recorded sentence this surface words a trigger miss with.
         assert_refusal(
             &router,
             case,
             "GetTrigger",
             &json!({ "Name": row.name }),
             "EntityNotFoundException",
-            &format!("Trigger {} not found.", row.name),
+            messages::TRIGGER_NOT_FOUND,
         )
         .await;
 

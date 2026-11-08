@@ -158,9 +158,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(entry) = store.blueprint_mut(&input.blueprint_name) else {
             return Err(GetBlueprintRunErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::blueprint_not_found(
-                        &input.blueprint_name,
-                    )),
+                    message: Some(crate::state::messages::BLUEPRINT_NOT_FOUND.to_string()),
                     from_federation_source: None,
                 },
             )

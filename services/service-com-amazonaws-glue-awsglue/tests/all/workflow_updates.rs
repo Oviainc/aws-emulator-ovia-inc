@@ -24,7 +24,7 @@
 //! refusals — the form of the name, including each published length bound and one past it.
 
 use serde_json::{json, Map, Value};
-use service_com_amazonaws_glue_awsglue::state::messages::workflow_not_found;
+use service_com_amazonaws_glue_awsglue::state::messages::WORKFLOW_NOT_FOUND;
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::wire::{assert_echoed, call, emulator, error_code, error_message, ok};
@@ -444,11 +444,11 @@ async fn a_name_this_account_holds_no_workflow_under_is_refused() {
             error_code(&body)
         );
         // This crate's one sentence for a workflow a request named and the store does not
-        // hold, whose one variable part is the name the request itself sent.
+        // hold, which names no workflow at all.
         assert_eq!(
             error_message(&body),
-            workflow_not_found(&name),
-            "case {case:?}: expected the refusal to name the workflow that resolved to \
+            WORKFLOW_NOT_FOUND,
+            "case {case:?}: expected the recorded refusal for a workflow that resolved to \
              nothing, got {body}"
         );
 

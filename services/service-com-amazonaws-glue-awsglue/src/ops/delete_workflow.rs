@@ -1,15 +1,26 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteWorkflow
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteWorkflow`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteWorkflow::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Removes one workflow from this account's workflow namespace
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::workflows`]), addressed by `Name` alone,
+//! and answers with the name the request named. The WHOLE record goes — the default run
+//! properties it carries, the blueprint that laid it out and the runs started of it are
+//! held on the entry — so after it `GetWorkflow` reports the name as one this account
+//! holds no workflow under, `ListWorkflows` no longer lists it, and a `CreateWorkflow`
+//! under the same name is free to succeed again. The triggers whose `WorkflowName` named
+//! it are their own resources, addressed and deleted by their own names, and are left
+//! where they are.
+//!
+//! The model declares no entity-miss error for this operation (its errors are
+//! `ConcurrentModificationException`, `InvalidInputException`, `InternalServiceException`
+//! and `OperationTimeoutException`, where `GetWorkflow` and `UpdateWorkflow` each also
+//! model `EntityNotFoundException`), so a delete of a name that holds no workflow is not
+//! refused: it leaves the namespace as it found it and answers the same way — the
+//! tolerance `DeleteJob` states in prose ("If the job definition is not found, no
+//! exception is thrown"). Nor is a run in flight a reason to refuse: `DeleteWorkflow`
+//! models no state error, so a workflow with a `RUNNING` run deletes exactly as an idle
+//! one does.
 //!
 //! ## Shape of an operation
 //!
@@ -145,18 +156,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteWorkflow` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteWorkflowErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteWorkflow"))
+        // Workflows live in one per-account namespace, so nothing here depends on the
+        // request's Region.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This operation models a server fault, so an unreachable store is reported
+            // as that rather than as a client error the caller could act on.
+            return Err(DeleteWorkflowErrorModeled::InternalServiceException(
+                InternalServiceException {
+                    message: Some("the Glue workflow store is unavailable".into()),
+                },
+            )
+            .into());
+        };
+
+        // `Name` is `@required` with `length 1..255` and a pattern, every one of them
+        // refused at the boundary, so there is nothing left for this handler to validate.
+        // A workflow is addressed by that name alone, so removing the record stored under
+        // it is the whole delete; a name this account holds no workflow under leaves the
+        // namespace unchanged, which the module docs give the reason for.
+        let removed = state.lock().remove_workflow(&input.name);
+        ::tracing::info!(
+            operation = "DeleteWorkflow",
+            workflow = %input.name,
+            removed = removed.is_some(),
+            // How much went with the record: the runs the removed workflow held, and none
+            // for a name that held no workflow at all.
+            runs_removed = removed.map_or(0, |entry| entry.runs.len()),
+            "served a Glue workflow delete"
+        );
+
+        // "Name of the workflow specified in input" — the name the request named, which a
+        // name that held nothing is answered with too, since this delete is not refused
+        // for a miss.
+        Ok(DeleteWorkflowOutput {
+            name: Some(input.name),
+        })
     }
 }

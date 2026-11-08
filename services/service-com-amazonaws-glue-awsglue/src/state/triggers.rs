@@ -452,7 +452,10 @@ impl TriggerReference<'_> {
             // and discloses no name.
             Self::Job(_) => messages::JOB_NOT_FOUND.to_string(),
             Self::Crawler(name) => messages::crawler_not_found(name),
-            Self::Workflow(name) => messages::workflow_not_found(name),
+            // The workflow miss is the same fixed sentence wherever a workflow is looked
+            // up, so a trigger that would belong to a workflow nothing holds is refused
+            // with it too, and discloses no name.
+            Self::Workflow(_) => messages::WORKFLOW_NOT_FOUND.to_string(),
         }
     }
 }

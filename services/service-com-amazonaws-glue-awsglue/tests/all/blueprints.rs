@@ -23,7 +23,8 @@ use std::time::{Duration, SystemTime};
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::ops::types::CreateBlueprintInput;
 use service_com_amazonaws_glue_awsglue::state::{
-    BlueprintEntry, ComAmazonawsGlueAwsglueState, BLUEPRINT_SETTLES_AFTER, MAX_BLUEPRINTS,
+    messages, BlueprintEntry, ComAmazonawsGlueAwsglueState, BLUEPRINT_SETTLES_AFTER,
+    MAX_BLUEPRINTS,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -541,8 +542,8 @@ async fn reading_an_unknown_blueprint_is_refused() {
         );
         assert_eq!(
             error_message(&body),
-            format!("Blueprint {name} not found."),
-            "case {case}: the refusal must name the blueprint asked for, got {body}"
+            messages::BLUEPRINT_NOT_FOUND,
+            "case {case}: the refusal is the recorded blueprint miss, got {body}"
         );
     }
 

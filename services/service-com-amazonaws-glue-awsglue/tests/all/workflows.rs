@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::ops::types::CreateWorkflowInput;
+use service_com_amazonaws_glue_awsglue::state::messages::WORKFLOW_NOT_FOUND;
 use service_com_amazonaws_glue_awsglue::state::{
     ComAmazonawsGlueAwsglueState, WorkflowEntry, MAX_WORKFLOWS,
 };
@@ -369,9 +370,11 @@ async fn reading_an_unknown_workflow_is_refused() {
             error_code(&body).contains("EntityNotFoundException"),
             "case {case}: expected EntityNotFoundException for {name:?}, got {body}"
         );
-        assert!(
-            error_message(&body).contains(name),
-            "case {case}: the refusal names the workflow that resolved to nothing, got {body}"
+        assert_eq!(
+            error_message(&body),
+            WORKFLOW_NOT_FOUND,
+            "case {case}: expected the recorded refusal for a workflow that resolved to \
+             nothing, got {body}"
         );
     }
 

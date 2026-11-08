@@ -2,6 +2,23 @@
 
 //! @op DeleteTrigger
 //!
+//! Removes one trigger from the Region's trigger namespace
+//! ([`crate::state::ComAmazonawsGlueAwsglueState::triggers`]), addressed by `Name` alone,
+//! and answers with the name it was addressed by. The WHOLE record goes — the definition
+//! it fires on, the state it was left in and the tags it was registered with are held on
+//! the entry — so after it `GetTrigger` reports the name as one this Region holds no
+//! trigger under, `GetTriggers`/`ListTriggers` no longer list it, and a `CreateTrigger`
+//! under the same name is free to succeed again. The jobs and crawlers its actions named,
+//! and the workflow it was attached to, are their own resources and are left where they
+//! are.
+//!
+//! The model declares no entity-miss error for this operation, and the service documents
+//! the tolerance in prose — "Deletes a specified trigger. If the trigger is not found, no
+//! exception is thrown" — so a delete of a name that holds no trigger is not refused: it
+//! leaves the namespace as it found it and answers the same way. Nor is the state the
+//! trigger is in a reason to refuse: `DeleteTrigger` models no state error, so an
+//! `ACTIVATED` trigger deletes exactly as a `CREATED` or `DEACTIVATED` one does.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -158,17 +175,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // it — so the name it frees carries nothing into the next create under it, and
         // every projection built from the stored triggers (the listings, the batch read,
         // the graph of the workflow it belonged to) stops reporting it.
-        let mut store = state.lock();
-        let removed = store
-            .triggers
-            .get_mut(&region)
-            .and_then(|triggers| triggers.remove(&input.name))
-            .is_some();
+        let removed = state.lock().remove_trigger(&region, &input.name);
         ::tracing::info!(
             operation = "DeleteTrigger",
             trigger = %input.name,
             region = %region,
-            removed,
+            removed = removed.is_some(),
             "served a Glue trigger delete"
         );
 

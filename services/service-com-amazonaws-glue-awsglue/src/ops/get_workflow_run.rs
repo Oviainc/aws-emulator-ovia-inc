@@ -169,9 +169,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // over-long one is refused at the boundary: reaching here, the only question is
         // whether this account holds that workflow and that workflow holds that run.
         let Some(workflow) = store.workflow_mut(&input.name) else {
-            return Err(not_found(crate::state::messages::workflow_not_found(
-                &input.name,
-            )));
+            return Err(not_found(
+                crate::state::messages::WORKFLOW_NOT_FOUND.to_string(),
+            ));
         };
         // The only write a read makes: the status changes the clock had already made due.
         workflow.settle_due_runs(now);

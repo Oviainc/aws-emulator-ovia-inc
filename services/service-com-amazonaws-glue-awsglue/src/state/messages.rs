@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
+//! The wording of every refusal this service answers with, so one miss reads the same
+//! wherever it is reported.
+
 /// A crawler lookup (`GetCrawler`, and the `UpdateCrawler` that addresses one the
 /// same way) for a name no crawler in this account has. Built from the request's
 /// `Name`, which is stored and matched exactly as sent.
@@ -263,12 +266,12 @@ pub fn not_authorized_on_catalog(action: &str, catalog_arn: &str) -> String {
 }
 
 /// A trigger lookup (`GetTrigger`, and every other operation that addresses a trigger
-/// by name) for a name no trigger of the request's Region has. NOT recorded: the
-/// sentence follows the per-resource template of [`database_not_found`], built from
-/// the requested name, which is the whole address of a trigger.
-pub fn trigger_not_found(name: &str) -> String {
-    format!("Trigger {name} not found.")
-}
+/// by name) for a name no trigger of the request's Region has.
+///
+/// RECORDED constant, and the whole message: the sentence is fixed and names no trigger,
+/// so a miss discloses nothing about the Region's namespace, and every operation that
+/// addresses a trigger by name reports the miss with this one sentence.
+pub const TRIGGER_NOT_FOUND: &str = "Trigger not found.";
 
 /// `CreateTrigger` for a name the request's Region already holds a trigger under, where
 /// the definition submitted is the stored one. NOT
@@ -973,12 +976,12 @@ pub const BLUEPRINT_ALREADY_EXISTS: &str = "Blueprint with given name already ex
 
 /// Any blueprint operation whose `Name` names no blueprint this account holds
 /// (`GetBlueprint`, and the same miss on every sibling that addresses one by name).
-/// NOT recorded: what is pinned is the behaviour — 400 with the operation's modelled
-/// `EntityNotFoundException` — and the sentence follows [`database_not_found`]'s
-/// per-resource template, built from the requested name alone.
-pub fn blueprint_not_found(name: &str) -> String {
-    format!("Blueprint {name} not found.")
-}
+///
+/// RECORDED constant, and the whole message: like [`BLUEPRINT_ALREADY_EXISTS`] it names
+/// the member the request addressed the blueprint by and withholds the value, so one name
+/// cannot be disclosed by a miss on another, and every operation that addresses a
+/// blueprint by name reports the miss with this one sentence.
+pub const BLUEPRINT_NOT_FOUND: &str = "Blueprint with given name not found.";
 
 /// A blueprint operation whose blueprint has no ACTIVE definition to work from — a run
 /// started of a registration that has not finished, or of one that finished without a
@@ -1014,13 +1017,13 @@ pub fn blueprint_run_not_found(blueprint_name: &str, run_id: &str) -> String {
 }
 
 /// Any workflow operation whose `Name` names no workflow this account holds
-/// (`GetWorkflow`, and the same miss on every sibling that addresses one by name). NOT
-/// recorded: what is pinned is the behaviour — 400 with the operation's modelled
-/// `EntityNotFoundException` — and the sentence follows [`database_not_found`]'s
-/// per-resource template, built from the requested name alone.
-pub fn workflow_not_found(name: &str) -> String {
-    format!("Workflow {name} not found.")
-}
+/// (`GetWorkflow`, and the same miss on every sibling that addresses one by name).
+///
+/// RECORDED constant, and the whole message: the sentence is the fixed, generic one this
+/// surface answers a workflow miss with, with no trailing period and naming no workflow,
+/// as recorded — so a miss discloses nothing about the account's namespace and every
+/// operation that addresses a workflow by name reports the miss the same way.
+pub const WORKFLOW_NOT_FOUND: &str = "Entity not found";
 
 /// A run-history read (`GetWorkflowRuns`) of a workflow this account DOES hold whose
 /// history has no run to report. `GetWorkflowRunsResponse$Runs` is `length 1..1000`, so

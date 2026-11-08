@@ -202,9 +202,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Err(crate::state::BlueprintRunNotStarted::NoSuchBlueprint) => {
                 return Err(StartBlueprintRunErrorModeled::EntityNotFoundException(
                     EntityNotFoundException {
-                        message: Some(crate::state::messages::blueprint_not_found(
-                            &input.blueprint_name,
-                        )),
+                        message: Some(crate::state::messages::BLUEPRINT_NOT_FOUND.to_string()),
                         from_federation_source: None,
                     },
                 )

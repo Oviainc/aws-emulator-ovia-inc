@@ -2046,6 +2046,21 @@ impl ComAmazonawsGlueAwsglueState {
         self.workflows.get_mut(name)
     }
 
+    /// Remove the workflow `name`, answering the record that was removed, or `None` when
+    /// this account holds no workflow under that name.
+    ///
+    /// The whole record goes: a workflow's tags, its default run properties, its blueprint
+    /// attribution and the runs started of it are held ON the entry ([`WorkflowEntry`]), so
+    /// the name a delete frees carries none of them into the next create under it. The
+    /// triggers whose `WorkflowName` named it are their own records of this store and are
+    /// left where they are, because a trigger is created, read and deleted by name alone and
+    /// outlives the workflow it was attached to. Matched by name exactly as the read path
+    /// matches it ([`Self::workflow`]), and the removed entry is handed back rather than
+    /// dropped for symmetry with [`Self::remove_job`].
+    pub fn remove_workflow(&mut self, name: &str) -> Option<WorkflowEntry> {
+        self.workflows.remove(name)
+    }
+
     /// The trigger of the Region `region` that can BEGIN a run of the workflow
     /// `workflow_name`, or `None` when that workflow has no entry point.
     ///
@@ -2441,6 +2456,22 @@ impl ComAmazonawsGlueAwsglueState {
             .entry(region.to_string())
             .or_default()
             .insert(entry.name.clone(), entry);
+    }
+
+    /// Remove the trigger `name` from the Region `region`, answering the record that was
+    /// removed, or `None` when that Region holds no trigger under that name.
+    ///
+    /// The whole record goes: a trigger's tags, its state and the definition it fires on
+    /// are held ON the entry ([`TriggerEntry`]), so the name a delete frees carries none of
+    /// them into the next create under it. The jobs and crawlers its actions named, and the
+    /// workflow it was attached to, are their own records of this store and are left where
+    /// they are. Matched by name and Region exactly as the read path matches them
+    /// ([`Self::trigger`]), and the removed entry is handed back rather than dropped for
+    /// symmetry with [`Self::remove_job`].
+    pub fn remove_trigger(&mut self, region: &str, name: &str) -> Option<TriggerEntry> {
+        self.triggers
+            .get_mut(region)
+            .and_then(|triggers| triggers.remove(name))
     }
 
     /// Initiate `actions` — the actions of the trigger `trigger_name`, which has just FIRED

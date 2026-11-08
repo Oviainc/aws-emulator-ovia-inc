@@ -1812,7 +1812,7 @@ fn notify_workflow(
         | WorkflowEventDelivery::Deactivated => crate::state::InvocationOutcome::Invoked,
         WorkflowEventDelivery::NoWorkflow => crate::state::InvocationOutcome::Failed {
             code: GLUE_ENTITY_NOT_FOUND_CODE.to_string(),
-            message: messages::workflow_not_found(name),
+            message: messages::WORKFLOW_NOT_FOUND.to_string(),
         },
         WorkflowEventDelivery::NoEventTrigger => crate::state::InvocationOutcome::Failed {
             code: GLUE_ENTITY_NOT_FOUND_CODE.to_string(),

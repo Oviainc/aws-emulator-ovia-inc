@@ -32,7 +32,7 @@ use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
 
 use service_com_amazonaws_glue_awsglue::state::{
-    TRIGGER_STATE_ACTIVATED, TRIGGER_STATE_CREATED,
+    messages, TRIGGER_STATE_ACTIVATED, TRIGGER_STATE_CREATED,
 };
 
 use crate::error_messages::assert_refusal;
@@ -374,7 +374,7 @@ async fn a_batching_condition_outside_the_modelled_range_is_refused() {
             "GetTrigger",
             &json!({ "Name": name }),
             "EntityNotFoundException",
-            &format!("Trigger {name} not found."),
+            messages::TRIGGER_NOT_FOUND,
         )
         .await;
     }

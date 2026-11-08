@@ -297,8 +297,8 @@ async fn the_listing_reports_what_the_store_holds_now() {
         "case listed twice: the store must hold exactly what was listed, got {held:?}"
     );
 
-    // `DeleteWorkflow` is still a scaffold, so the record is dropped from the store the
-    // listing reads rather than through that operation.
+    // The record is dropped from the store the listing reads directly, so this case is
+    // about the listing alone and not about `DeleteWorkflow`'s own slice.
     {
         let state = engine.state::<ComAmazonawsGlueAwsglueState>();
         state.lock().workflows.remove("zeta");

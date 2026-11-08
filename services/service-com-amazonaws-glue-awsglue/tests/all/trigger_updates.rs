@@ -744,8 +744,8 @@ async fn an_update_of_an_absent_trigger_is_the_modelled_miss() {
         );
         assert_eq!(
             error_message(&body),
-            messages::trigger_not_found(name),
-            "case {case}: expected the trigger miss for {name}, got {body}"
+            messages::TRIGGER_NOT_FOUND,
+            "case {case}: expected the recorded trigger miss for {name}, got {body}"
         );
 
         // The refused update created nothing under that name in that Region.

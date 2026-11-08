@@ -176,7 +176,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(trigger) = store.trigger_mut(&region, &input.name) else {
             return Err(StopTriggerErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::trigger_not_found(&input.name)),
+                    message: Some(crate::state::messages::TRIGGER_NOT_FOUND.to_string()),
                     from_federation_source: None,
                 },
             )

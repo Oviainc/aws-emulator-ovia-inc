@@ -25,7 +25,7 @@
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
-    TRIGGER_STATE_ACTIVATED, TRIGGER_STATE_CREATED, TRIGGER_STATE_DEACTIVATED,
+    messages, TRIGGER_STATE_ACTIVATED, TRIGGER_STATE_CREATED, TRIGGER_STATE_DEACTIVATED,
     WORKFLOW_RUN_STATUS_RUNNING,
 };
 use smithy_server_runtime::MultiServiceRouter;
@@ -417,7 +417,7 @@ async fn a_stop_for_a_trigger_this_region_does_not_hold_is_refused() {
             "StopTrigger",
             &json!({ "Name": name }),
             "EntityNotFoundException",
-            &format!("Trigger {name} not found."),
+            messages::TRIGGER_NOT_FOUND,
         )
         .await;
     }

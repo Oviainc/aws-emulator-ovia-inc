@@ -235,6 +235,8 @@ mod ml_transform_reads;
 mod ml_transform_updates;
 #[path = "all/ml_transforms.rs"]
 mod ml_transforms;
+#[path = "all/mutations_are_applied.rs"]
+mod mutations_are_applied;
 #[path = "all/owed_status_materialisation.rs"]
 mod owed_status_materialisation;
 #[path = "all/partition_indexes.rs"]

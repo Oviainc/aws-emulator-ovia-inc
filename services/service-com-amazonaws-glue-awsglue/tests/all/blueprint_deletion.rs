@@ -91,8 +91,8 @@ async fn assert_missing(router: &MultiServiceRouter, case: &str, name: &str) {
     );
     assert_eq!(
         error_message(&body),
-        messages::blueprint_not_found(name),
-        "case {case}: the refusal must name the blueprint asked for, got {body}"
+        messages::BLUEPRINT_NOT_FOUND,
+        "case {case}: the refusal is the recorded sentence for a blueprint miss, got {body}"
     );
 }
 
@@ -258,7 +258,7 @@ async fn deleting_a_blueprint_removes_the_record_stored_under_its_name() {
             );
             assert_eq!(
                 error_message(&body),
-                messages::blueprint_not_found(name),
+                messages::BLUEPRINT_NOT_FOUND,
                 "case {case}: the run read misses on the blueprint itself, got {body}"
             );
         }

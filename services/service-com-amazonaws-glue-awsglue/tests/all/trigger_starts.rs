@@ -31,7 +31,7 @@ use std::time::SystemTime;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_glue_awsglue::state::{
-    ComAmazonawsGlueAwsglueState, TRIGGER_STATE_ACTIVATED, TRIGGER_STATE_CREATED,
+    messages, ComAmazonawsGlueAwsglueState, TRIGGER_STATE_ACTIVATED, TRIGGER_STATE_CREATED,
     WORKFLOW_RUN_ID_PREFIX, WORKFLOW_RUN_NOT_EXECUTED_MESSAGE, WORKFLOW_RUN_STATUS_ERROR,
     WORKFLOW_RUN_STATUS_RUNNING,
 };
@@ -570,7 +570,7 @@ async fn a_start_for_a_trigger_this_region_does_not_hold_is_refused() {
             "StartTrigger",
             &json!({ "Name": name }),
             "EntityNotFoundException",
-            &format!("Trigger {name} not found."),
+            messages::TRIGGER_NOT_FOUND,
         )
         .await;
     }

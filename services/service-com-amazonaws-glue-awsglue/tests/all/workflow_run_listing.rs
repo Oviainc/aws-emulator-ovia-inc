@@ -30,7 +30,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use serde_json::{json, Value};
-use service_com_amazonaws_glue_awsglue::state::messages::workflow_not_found;
+use service_com_amazonaws_glue_awsglue::state::messages::WORKFLOW_NOT_FOUND;
 use service_com_amazonaws_glue_awsglue::state::{
     ComAmazonawsGlueAwsglueState, WORKFLOW_RUN_NOT_EXECUTED_MESSAGE, WORKFLOW_RUN_STATUS_ERROR,
     WORKFLOW_RUN_STATUS_RUNNING,
@@ -463,7 +463,7 @@ async fn a_workflow_the_store_does_not_hold_is_not_found() {
         );
         assert_eq!(
             error_message(&body),
-            workflow_not_found(workflow),
+            WORKFLOW_NOT_FOUND,
             "case {case:?}: expected the wording a workflow miss carries, got {body}"
         );
     }

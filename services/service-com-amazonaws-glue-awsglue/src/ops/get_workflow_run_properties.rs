@@ -160,9 +160,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // whether this account holds that workflow and that workflow holds that run.
         let store = state.lock();
         let Some(workflow) = store.workflow(&input.name) else {
-            return Err(not_found(crate::state::messages::workflow_not_found(
-                &input.name,
-            )));
+            return Err(not_found(
+                crate::state::messages::WORKFLOW_NOT_FOUND.to_string(),
+            ));
         };
         let Some(run) = workflow.run(&input.run_id) else {
             return Err(not_found(crate::state::messages::workflow_run_not_found(

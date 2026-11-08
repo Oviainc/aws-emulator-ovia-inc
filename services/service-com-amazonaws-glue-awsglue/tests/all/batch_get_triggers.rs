@@ -372,7 +372,8 @@ async fn a_batched_trigger_is_the_trigger_get_trigger_reports() {
 ///
 /// This is the recorded reference flow — a create, an update, then a batch read — with the
 /// rows differing along which mutation preceded the batch. The trigger leaves the store
-/// directly rather than through `DeleteTrigger`, which is still a scaffold in this crate.
+/// directly rather than through `DeleteTrigger`, so this case is about the batch read
+/// alone.
 #[tokio::test]
 async fn the_batch_follows_the_store() {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());

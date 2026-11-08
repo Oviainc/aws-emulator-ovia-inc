@@ -197,7 +197,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(workflow) = store.workflow_mut(&input.name) else {
             return Err(GetWorkflowRunsErrorModeled::EntityNotFoundException(
                 EntityNotFoundException {
-                    message: Some(crate::state::messages::workflow_not_found(&input.name)),
+                    message: Some(crate::state::messages::WORKFLOW_NOT_FOUND.to_string()),
                     from_federation_source: None,
                 },
             )
