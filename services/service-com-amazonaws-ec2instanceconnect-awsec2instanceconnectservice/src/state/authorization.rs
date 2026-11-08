@@ -43,7 +43,7 @@
 //! evaluation ([`Conditions`]): the OS user a key is pushed for, and the tags of the instance
 //! the push names, under both spellings AWS publishes a resource tag as.
 //!
-//! ## The refusal
+//! ## The two refusals, and which answer each gets
 //!
 //! A call no policy allows, or one an explicit `Deny` refuses, is answered with the error code
 //! `AccessDeniedException` and HTTP 403 — the answer AWS's authorization layer gives, which is
@@ -51,7 +51,18 @@
 //! [`crate::scaffolded::Scaffolded::access_denied`] rather than by a modelled shape. The
 //! message is built from the three things the decision was made about — the principal, the
 //! action and the resource — closed by which document withheld the grant
-//! ([`not_authorized`]), and the withheld push leaves a structured audit record ([`refusal`]).
+//! ([`not_authorized`]).
+//!
+//! A request whose credential the identity store does not hold as VALID is a different
+//! failure, and gets a different answer: it speaks for no principal, so there is nothing to
+//! read policies for and no policy is consulted, and the model declares an error for exactly
+//! that case — `AuthException`, "Either your AWS credentials are not valid or you do not have
+//! access to the EC2 instance" (`smithy_query(query="shape",shape="AuthException")`). It is
+//! answered with that modelled shape, carrying the sentence the model documents for it, and
+//! never with the policy refusal, whose message would blame a document that was never read.
+//! Which of the two a decision came to is what [`Refusal`] carries out to the handler.
+//!
+//! Either withheld push leaves a structured audit record ([`refusal`]).
 //!
 //! ## The two callers the decision cannot refuse
 //!
@@ -67,8 +78,9 @@
 //!   policy the account does not hold grants nothing, because the account is the authority on
 //!   its own policies.
 //!
-//! An expired session credential speaks for nobody: it carries no document and no principal
-//! spelling, so every action it asks for is refused.
+//! A session credential the store reports as expired speaks for nobody: it is not a valid
+//! credential, so it is refused as one ([`Refusal::InvalidCredential`]) before any policy is
+//! looked at.
 //!
 //! Resolving the caller goes through STS's own `resolve_caller`, which materialises the
 //! session expiries the clock has already made due before it answers: that write is owed at
@@ -206,8 +218,67 @@ fn not_authorized(principal: &str, action: &str, resource: &str, reason: &str) -
     )
 }
 
-/// `Some(message)` when IAM does not allow `ec2-instance-connect:<operation>` on `resource`
-/// for the calling principal — the message the refusal carries — and `None` when it does.
+/// What AWS states for a credential that is not valid: the sentence this service's model
+/// documents for `AuthException`
+/// (`smithy_query(query="doc",shape="AuthException")` — "Either your AWS credentials are not
+/// valid or you do not have access to the EC2 instance.").
+///
+/// Fixed text: the request's credential is not quoted back, and no principal, action or
+/// resource appears in it, because nothing about the request was resolved.
+pub const INVALID_CREDENTIAL_MESSAGE: &str =
+    "Either your AWS credentials are not valid or you do not have access to the EC2 instance.";
+
+/// What the audit record names as the principal of a request whose credential is not valid:
+/// such a credential speaks for nobody, and the key id it presented is already recorded in the
+/// record's own `caller_akid` field.
+const NO_PRINCIPAL: &str = "none (the credential presented is not valid)";
+
+/// Why a push was withheld — the two failures AWS answers differently.
+///
+/// The gate decides which one happened; each operation's error channel carries it to the wire
+/// (see the module docs).
+#[derive(Debug, Clone)]
+pub enum Refusal {
+    /// The credential the request presented is not one the identity store holds as valid, so
+    /// it speaks for no principal and no policy was consulted. The modelled `AuthException`,
+    /// carrying [`INVALID_CREDENTIAL_MESSAGE`].
+    InvalidCredential(String),
+    /// The principal's identity-based policies do not allow the call. AWS's own authorization
+    /// answer, `AccessDeniedException`, carrying [`not_authorized`]'s sentence.
+    NotAuthorized(String),
+}
+
+impl Refusal {
+    /// The refusal's message, as it goes on the wire.
+    #[must_use]
+    pub fn message(&self) -> &str {
+        match self {
+            Self::InvalidCredential(message) | Self::NotAuthorized(message) => message,
+        }
+    }
+
+    /// The outcome the audit record carries, which tells the two refusals apart in a log.
+    fn outcome(&self) -> &'static str {
+        match self {
+            Self::InvalidCredential(_) => "refused_invalid_credential",
+            Self::NotAuthorized(_) => "refused_not_authorized",
+        }
+    }
+}
+
+/// The credential a request presented is not one the identity store holds as valid, so it
+/// speaks for no principal at all.
+#[derive(Debug, Clone, Copy)]
+pub struct InvalidCredential;
+
+/// `Some(refusal)` when this request may not push the key it asks to push — the refusal to
+/// answer it with — and `None` when it may.
+///
+/// Two things can withhold a push, and they are told apart: a credential the identity store
+/// does not hold as valid speaks for no principal, so it is refused as an invalid credential
+/// before any policy is read ([`Refusal::InvalidCredential`]); otherwise the principal's
+/// identity-based policies decide, and a call they do not allow is refused as not authorized
+/// ([`Refusal::NotAuthorized`]).
 ///
 /// A refusal leaves a structured audit record: the operation asked for, the access key id the
 /// request presented, the principal it resolved to, the action and the resource decided about,
@@ -223,17 +294,30 @@ pub fn refusal<Eng: Send + Sync + 'static>(
     operation: &str,
     resource: &str,
     conditions: &Conditions,
-) -> Option<String> {
+) -> Option<Refusal> {
     let action = action_for(operation);
-    let caller = caller(engine, ctx);
-    let withheld = withheld_grant(&caller, &action, resource, conditions);
-    if withheld.is_some() {
+    let (withheld, principal) = match caller(engine, ctx) {
+        Ok(caller) => {
+            let withheld = withheld_grant(&caller, &action, resource, conditions)
+                .map(Refusal::NotAuthorized);
+            (withheld, caller.arn)
+        }
+        // The credential speaks for nobody, so there is no principal to blame and no policy to
+        // consult: the failure is the credential itself.
+        Err(InvalidCredential) => (
+            Some(Refusal::InvalidCredential(
+                INVALID_CREDENTIAL_MESSAGE.to_string(),
+            )),
+            NO_PRINCIPAL.to_string(),
+        ),
+    };
+    if let Some(refusal) = &withheld {
         ::tracing::info!(
             audit = true,
             operation = %operation,
-            outcome = "refused_not_authorized",
+            outcome = refusal.outcome(),
             caller_akid = %::emulator_server::extract_akid(&ctx.parts().headers),
-            principal = %caller.arn,
+            principal = %principal,
             action = %action,
             resource = %resource,
             "no key was pushed"
@@ -331,11 +415,13 @@ impl Caller {
     }
 }
 
-/// The principal this request speaks for, with the identity-based policies in force on it.
+/// The principal this request speaks for, with the identity-based policies in force on it, or
+/// [`InvalidCredential`] when the credential it presented is not one the identity store holds
+/// as valid — which speaks for no principal at all.
 pub fn caller<Eng: Send + Sync + 'static>(
     engine: &Eng,
     ctx: &::smithy_server_runtime::OperationContext<'_>,
-) -> Caller {
+) -> Result<Caller, InvalidCredential> {
     let access_key_id = ::emulator_server::extract_akid(&ctx.parts().headers);
     let identity = match sts_store::service_state(engine) {
         Some(sts) => sts_store::resolve_caller(
@@ -348,19 +434,9 @@ pub fn caller<Eng: Send + Sync + 'static>(
         // account's own published credential.
         None => Ok(sts_store::ambient_identity()),
     };
-    let identity = match identity {
-        Ok(identity) => identity,
-        // The session credential has expired, so it speaks for nobody.
-        Err(expired) => {
-            return Caller {
-                arn: format!("an expired session credential ({})", expired.access_key_id),
-                documents: Vec::new(),
-                boundary: None,
-                account_credential: false,
-                unreadable_attachment: false,
-            }
-        }
-    };
+    // The session credential has expired, so it is not a valid credential and speaks for
+    // nobody: there is no principal to read policies for.
+    let identity = identity.map_err(|_expired| InvalidCredential)?;
 
     let mut caller = Caller {
         account_credential: identity.arn == sts_store::ambient_identity().arn,
@@ -370,7 +446,7 @@ pub fn caller<Eng: Send + Sync + 'static>(
         unreadable_attachment: false,
     };
     let Some(iam) = iam_store::service_state(engine) else {
-        return caller;
+        return Ok(caller);
     };
     let store = iam.lock();
     // A LONG-TERM access key: STS's store holds SESSIONS, so its answer for a key it never
@@ -409,7 +485,7 @@ pub fn caller<Eng: Send + Sync + 'static>(
         let user_arn = caller.arn.clone();
         caller.read_policies_of(&store, &user_arn);
     }
-    caller
+    Ok(caller)
 }
 
 #[cfg(test)]
@@ -596,6 +672,67 @@ mod tests {
                      {resource} {reason}"
                 ),
                 "case {case:?}: expected AWS's refusal sentence, got {message:?}"
+            );
+        }
+    }
+
+    /// The two refusals this gate can come to carry two different answers: a credential that
+    /// is not valid is stated as AWS states one, naming nothing of a decision that was never
+    /// taken, while a policy refusal names who was refused, what, on which resource, and which
+    /// rule withheld the grant.
+    #[test]
+    fn a_credential_refusal_states_the_credential_and_a_policy_refusal_states_the_decision() {
+        let action = action_for("SendSSHPublicKey");
+        let resource = instance_resource("us-east-1", "i-0a1b2c3d4e5f60718");
+        let principal = "arn:aws:iam::000000000000:user/probe";
+        let decided = [
+            action.as_str(),
+            resource.as_str(),
+            principal,
+            "is not authorized to perform",
+        ];
+
+        let credential = Refusal::InvalidCredential(INVALID_CREDENTIAL_MESSAGE.to_string());
+        assert_eq!(
+            credential.outcome(),
+            "refused_invalid_credential",
+            "case 'a credential that is not valid': expected the credential outcome, got {:?}",
+            credential.outcome()
+        );
+        assert_eq!(
+            credential.message(),
+            INVALID_CREDENTIAL_MESSAGE,
+            "case 'a credential that is not valid': expected the sentence the model documents \
+             for AuthException, got {:?}",
+            credential.message()
+        );
+        for named in decided {
+            assert!(
+                !credential.message().contains(named),
+                "case {named:?}: no principal was resolved and no policy was read, so the \
+                 refusal must not name it, got {:?}",
+                credential.message()
+            );
+        }
+
+        let policy = Refusal::NotAuthorized(not_authorized(
+            principal,
+            &action,
+            &resource,
+            "with an explicit deny in an identity-based policy",
+        ));
+        assert_eq!(
+            policy.outcome(),
+            "refused_not_authorized",
+            "case 'a policy that withholds the grant': expected the policy outcome, got {:?}",
+            policy.outcome()
+        );
+        for named in decided {
+            assert!(
+                policy.message().contains(named),
+                "case {named:?}: a policy refusal names what the decision was made about, got \
+                 {:?}",
+                policy.message()
             );
         }
     }

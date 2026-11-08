@@ -14,19 +14,22 @@
 //!
 //! 1. `InstanceOSUser` satisfies the `@pattern` the model declares for it — the one
 //!    constraint the framework cannot evaluate — else `InvalidArgsException`;
-//! 2. the caller's IAM identity-based policies allow
+//! 2. the request's credential is one the identity store holds as valid, else the modelled
+//!    `AuthException` — a credential that is not valid speaks for no principal, so no policy
+//!    is consulted at all;
+//! 3. the caller's IAM identity-based policies allow
 //!    `ec2-instance-connect:SendSSHPublicKey` on the instance's ARN, else
-//!    `AccessDeniedException` (HTTP 403) — the decision is taken BEFORE the instance is
+//!    `AccessDeniedException` (HTTP 403) — both decisions are taken BEFORE the instance is
 //!    resolved, so a caller holding no grant learns nothing about what the account holds
 //!    ([`crate::state::authorization`]);
-//! 3. EC2 holds the instance ([`crate::state::ec2`], this service's own registry only when
+//! 4. EC2 holds the instance ([`crate::state::ec2`], this service's own registry only when
 //!    no EC2 can be asked), else `EC2InstanceNotFoundException`;
-//! 4. its lifecycle state admits a connection, else `EC2InstanceUnavailableException` (503,
+//! 5. its lifecycle state admits a connection, else `EC2InstanceUnavailableException` (503,
 //!    still launching) or `EC2InstanceStateInvalidException` (going down, stopped or
 //!    terminated);
-//! 5. the `AvailabilityZone` the caller named, when it names one, is the instance's, else
+//! 6. the `AvailabilityZone` the caller named, when it names one, is the instance's, else
 //!    `InvalidArgsException`;
-//! 6. the key is stored against (instance id, OS user), replacing whatever was there and
+//! 7. the key is stored against (instance id, OS user), replacing whatever was there and
 //!    restarting the 60-second lifetime, and `Success: true` comes back with a fresh
 //!    `RequestId`.
 //!
@@ -36,9 +39,9 @@
 //!
 //! Every client error above is served with HTTP 400 whatever `@httpError` the shape
 //! carries — see [`crate::scaffolded::client_error_status`], which owns that mapping for
-//! the whole service. The authorization refusal is not one of them: it is AWS's own
-//! authorization answer rather than a modelled failure of this service, and it keeps the 403
-//! that layer gives it.
+//! the whole service, and which `AuthException` goes through like every other modelled
+//! client error. The policy refusal is not one of them: it is AWS's own authorization answer
+//! rather than a modelled failure of this service, and it keeps the 403 that layer gives it.
 //!
 //! ## Shape of an operation
 //!
@@ -257,7 +260,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &resource,
             &conditions,
         ) {
-            return Err(crate::scaffolded::Scaffolded::access_denied(refusal));
+            return Err(match refusal {
+                // The credential the request presented is not one the identity store holds as
+                // valid, so it speaks for no principal and no policy was consulted: the
+                // modelled error this service declares for a credential that is not valid.
+                crate::state::authorization::Refusal::InvalidCredential(message) => {
+                    SendSSHPublicKeyErrorModeled::AuthException(AuthException {
+                        message: Some(message),
+                    })
+                    .into()
+                }
+                // A principal whose policies do not allow the call: AWS's own authorization
+                // answer, which this service's model declares no shape for.
+                crate::state::authorization::Refusal::NotAuthorized(message) => {
+                    crate::scaffolded::Scaffolded::access_denied(message)
+                }
+            });
         }
 
         let mut state = store.lock();
