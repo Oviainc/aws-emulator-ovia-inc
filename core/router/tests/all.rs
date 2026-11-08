@@ -429,6 +429,11 @@ mod cloudformation_provisions_scheduler_schedules;
 mod cloudformation_provisions_stack_resources;
 #[path = "all/cloudfront_api_call_events.rs"]
 mod cloudfront_api_call_events;
+// Declared HERE, in the sorted list beside the other CloudFront suites, rather than
+// appended at the end of this file: the tail is where every suite landing in the same
+// window appends, so a line added there conflicts with all of them.
+#[path = "all/cloudfront_edge_cache_refresh.rs"]
+mod cloudfront_edge_cache_refresh;
 #[path = "all/cloudfront_key_value_store_handshake.rs"]
 mod cloudfront_key_value_store_handshake;
 // Declared HERE, in the sorted list beside the other CloudFront suite, rather than appended

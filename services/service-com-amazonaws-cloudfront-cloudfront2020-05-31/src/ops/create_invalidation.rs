@@ -257,14 +257,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let id = store.allocate_invalidation_id(&input.distribution_id);
-        // The paths this batch names, kept before the batch is stored whole below, so the
-        // edge cache can be emptied of what they name.
-        let paths: Vec<String> = input
-            .invalidation_batch
-            .paths
-            .items
-            .clone()
-            .unwrap_or_default();
         let invalidation = StoredInvalidation {
             id: id.clone(),
             // An invalidation batch CloudFront has just accepted has not finished yet,
@@ -285,10 +277,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         owner.invalidations.insert(id.clone(), invalidation);
-        // "You can invalidate files ... to remove them from CloudFront edge caches": the
-        // objects this batch names leave the cache now, with the call that creates it, so
-        // the next viewer request for one of them is fetched from the origin again.
-        owner.invalidate_edge_cache(&paths);
+        // "You can invalidate files ... to remove them from CloudFront edge caches" — which
+        // this batch has not done yet: the objects it names leave the edge cache when the
+        // clock FINISHES it ([`crate::state::StoredDistribution::settle`]), so a viewer
+        // asking for one of them before this invalidation reports `Completed` is still
+        // served what the cache holds.
 
         Ok(CreateInvalidationOutput {
             // "The fully qualified URI of the distribution and invalidation batch

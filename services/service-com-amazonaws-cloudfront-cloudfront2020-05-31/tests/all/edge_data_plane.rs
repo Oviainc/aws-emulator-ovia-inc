@@ -22,7 +22,10 @@
 //!   hit;
 //! * an origin nothing in this emulator serves answers nothing, and that is reported as
 //!   CloudFront reports an origin it could not reach: `502` with `X-Cache: Error from
-//!   cloudfront` — never as a response invented for an origin that did not run.
+//!   cloudfront` — never as a response invented for an origin that did not run;
+//! * an INVALIDATION is asynchronous: it is accepted with a status that is not
+//!   `Completed`, the cached object is still served while it has not finished, and the
+//!   objects its paths name leave the cache when it reports `Completed`.
 //!
 //! ## The origin these suites point at
 //!
@@ -354,10 +357,12 @@ async fn the_edge_cache_answers_only_what_the_behavior_caches() {
     }
 }
 
-/// An invalidation removes the objects its paths name from the edge cache, so the next
-/// request for one of them goes to the origin again.
+/// An invalidation removes the objects its paths name from the edge cache when it
+/// FINISHES, not when it is accepted: the batch is created `InProgress`, the cached object
+/// is still served while it is, and only once the invalidation reports `Completed` does the
+/// next request for one of them go to the origin again.
 #[tokio::test]
-async fn an_invalidation_takes_a_cached_object_out_of_the_edge_cache() {
+async fn an_invalidation_takes_a_cached_object_out_of_the_edge_cache_when_it_completes() {
     let router = emulator();
     let (id, domain) = deployed(&router, "edge-invalidation", SERVED_ORIGIN, CACHING_OPTIMIZED).await;
 
@@ -389,12 +394,51 @@ async fn an_invalidation_takes_a_cached_object_out_of_the_edge_cache() {
         "creating the invalidation answered {}: {}",
         invalidated.status, invalidated.raw
     );
+    let created_status = invalidated
+        .root()
+        .find_text("Status")
+        .expect("the created invalidation reports a status")
+        .to_string();
+    assert_ne!(
+        created_status, "Completed",
+        "an invalidation is asynchronous, so the create cannot report it finished: {}",
+        invalidated.raw
+    );
+    let invalidation_id = invalidated
+        .root()
+        .find_text("Id")
+        .expect("the created invalidation reports an id")
+        .to_string();
+
+    let during = view(&router, "GET", &domain, SERVED_PATH).await;
+    assert_eq!(
+        during.x_cache, HIT,
+        "case {created_status:?}: expected the cached object to still be served while the \
+         invalidation has not finished, got X-Cache {:?}",
+        during.x_cache
+    );
+
+    ::tokio::time::sleep(past_propagation()).await;
+    let read = call(
+        &router,
+        "GET",
+        &format!("/{API_VERSION}/distribution/{id}/invalidation/{invalidation_id}"),
+        None,
+        None,
+    )
+    .await;
+    assert_eq!(
+        read.root().find_text("Status"),
+        Some("Completed"),
+        "the invalidation did not reach Completed: {}",
+        read.raw
+    );
 
     let after = view(&router, "GET", &domain, SERVED_PATH).await;
     assert_eq!(
         after.x_cache, MISS,
-        "expected the invalidated object to be fetched from the origin again, got X-Cache \
-         {:?}",
+        "expected the invalidated object to be fetched from the origin again once the \
+         invalidation completed, got X-Cache {:?}",
         after.x_cache
     );
 }

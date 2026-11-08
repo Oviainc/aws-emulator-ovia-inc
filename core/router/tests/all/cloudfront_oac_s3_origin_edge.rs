@@ -46,11 +46,11 @@ use service_com_amazonaws_cloudfront_cloudfront2020_05_31::state::PROPAGATION_DE
 use smithy_server_runtime::MultiServiceRouter;
 
 /// The Region every setup call is signed for, and so the Region the origin host names.
-const REGION: &str = "us-east-1";
+pub(crate) const REGION: &str = "us-east-1";
 
 /// CloudFront's control-plane host, and the API version every route is under.
-const CLOUDFRONT_HOST: &str = "cloudfront.amazonaws.com";
-const API_VERSION: &str = "2020-05-31";
+pub(crate) const CLOUDFRONT_HOST: &str = "cloudfront.amazonaws.com";
+pub(crate) const API_VERSION: &str = "2020-05-31";
 
 /// The account every emulated ARN carries.
 const ACCOUNT_ID: &str = "000000000000";
@@ -60,21 +60,21 @@ const ACCOUNT_ID: &str = "000000000000";
 const CACHING_DISABLED: &str = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad";
 
 /// The service principal an origin access control makes CloudFront's origin request as.
-const CLOUDFRONT_PRINCIPAL: &str = "cloudfront.amazonaws.com";
+pub(crate) const CLOUDFRONT_PRINCIPAL: &str = "cloudfront.amazonaws.com";
 
 /// The code and message S3 refuses a read nothing granted with (Amazon S3 "Error responses").
 const ACCESS_DENIED: &str = "AccessDenied";
 
 /// What one call answered.
-struct Answer {
-    status: u16,
-    headers: ::http::HeaderMap,
-    body: Bytes,
+pub(crate) struct Answer {
+    pub(crate) status: u16,
+    pub(crate) headers: ::http::HeaderMap,
+    pub(crate) body: Bytes,
 }
 
 impl Answer {
     /// A response header's value.
-    fn header(&self, name: &str) -> String {
+    pub(crate) fn header(&self, name: &str) -> String {
         self.headers
             .get(name)
             .and_then(|value| value.to_str().ok())
@@ -83,12 +83,12 @@ impl Answer {
     }
 
     /// The body as text — the object's bytes, or an `<Error>` document.
-    fn text(&self) -> String {
+    pub(crate) fn text(&self) -> String {
         String::from_utf8_lossy(&self.body).to_string()
     }
 
     /// The text of `<name>…</name>` in the body, or the empty string.
-    fn element(&self, name: &str) -> String {
+    pub(crate) fn element(&self, name: &str) -> String {
         let body = self.text();
         body.split_once(&format!("<{name}>"))
             .and_then(|(_before, rest)| rest.split_once(&format!("</{name}>")))
@@ -98,7 +98,10 @@ impl Answer {
 
 /// The two services this suite exercises, mounted on `engine` exactly as the router mounts
 /// them, with request authentication as `authenticated` says.
-fn emulator(engine: &Arc<engine::InMemoryEngine>, authenticated: bool) -> MultiServiceRouter {
+pub(crate) fn emulator(
+    engine: &Arc<engine::InMemoryEngine>,
+    authenticated: bool,
+) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     router.set_request_authentication(authenticated);
     router.register_service(
@@ -115,7 +118,7 @@ fn emulator(engine: &Arc<engine::InMemoryEngine>, authenticated: bool) -> MultiS
 /// One setup call, addressed to `host` and carrying a credential scope naming `signing_name`
 /// — which is what routes it and what names the Region. The signature is not computed: the
 /// setup router runs with authentication off.
-async fn call(
+pub(crate) async fn call(
     router: &MultiServiceRouter,
     signing_name: &str,
     host: &str,
@@ -151,7 +154,7 @@ async fn call(
 
 /// One VIEWER request: addressed to the distribution's own domain name, with no credential of
 /// any kind, exactly as a browser reaches a distribution.
-async fn view(router: &MultiServiceRouter, domain: &str, path: &str) -> Answer {
+pub(crate) async fn view(router: &MultiServiceRouter, domain: &str, path: &str) -> Answer {
     let request = ::http::Request::builder()
         .method("GET")
         .uri(path)
@@ -169,19 +172,19 @@ async fn view(router: &MultiServiceRouter, domain: &str, path: &str) -> Answer {
 
 /// The host a bucket of this Region is addressed at VIRTUAL-HOSTED style, which is what an S3
 /// origin's `DomainName` carries and what the edge's own origin fetch is addressed to.
-fn origin_domain(bucket: &str) -> String {
+pub(crate) fn origin_domain(bucket: &str) -> String {
     format!("{bucket}.s3.{REGION}.amazonaws.com")
 }
 
 /// The PATH-STYLE endpoint of this Region, which carries no bucket in its host: the address
 /// a call that names its bucket in the PATH has to use, since a virtual-hosted host names the
 /// bucket itself and leaves the path to be the key (the core's `VirtualHostAddressing`).
-fn regional_endpoint() -> String {
+pub(crate) fn regional_endpoint() -> String {
     format!("s3.{REGION}.amazonaws.com")
 }
 
 /// `s3:CreateBucket`.
-async fn create_bucket(router: &MultiServiceRouter, case: &str, bucket: &str) {
+pub(crate) async fn create_bucket(router: &MultiServiceRouter, case: &str, bucket: &str) {
     let created = call(
         router,
         "s3",
@@ -202,7 +205,7 @@ async fn create_bucket(router: &MultiServiceRouter, case: &str, bucket: &str) {
 }
 
 /// `s3:PutObject` with the encryption headers `encryption` names.
-async fn put_object(
+pub(crate) async fn put_object(
     router: &MultiServiceRouter,
     case: &str,
     bucket: &str,
@@ -230,7 +233,12 @@ async fn put_object(
 }
 
 /// `s3:PutBucketPolicy`.
-async fn put_bucket_policy(router: &MultiServiceRouter, case: &str, bucket: &str, policy: &str) {
+pub(crate) async fn put_bucket_policy(
+    router: &MultiServiceRouter,
+    case: &str,
+    bucket: &str,
+    policy: &str,
+) {
     let stored = call(
         router,
         "s3",
@@ -251,7 +259,7 @@ async fn put_bucket_policy(router: &MultiServiceRouter, case: &str, bucket: &str
 
 /// `cloudfront:CreateOriginAccessControl` for an `s3` origin signed under `signing_behavior`,
 /// answering the control's id.
-async fn create_origin_access_control(
+pub(crate) async fn create_origin_access_control(
     router: &MultiServiceRouter,
     case: &str,
     name: &str,
@@ -293,13 +301,15 @@ async fn create_origin_access_control(
 }
 
 /// `cloudfront:CreateDistribution` over the S3 origin `bucket` with the origin access control
-/// `control` attached, answering the distribution's `(id, DomainName, ARN)`.
-async fn create_distribution(
+/// `control` attached and the cache policy `cache_policy` on its default behaviour, answering
+/// the distribution's `(id, DomainName, ARN)`.
+pub(crate) async fn create_distribution(
     router: &MultiServiceRouter,
     case: &str,
     caller_reference: &str,
     bucket: &str,
     control: &str,
+    cache_policy: &str,
 ) -> (String, String, String) {
     let body = format!(
         "<DistributionConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
@@ -311,7 +321,7 @@ async fn create_distribution(
          </Origin></Items></Origins>\
          <DefaultCacheBehavior><TargetOriginId>origin-bucket</TargetOriginId>\
          <ViewerProtocolPolicy>allow-all</ViewerProtocolPolicy>\
-         <CachePolicyId>{CACHING_DISABLED}</CachePolicyId>\
+         <CachePolicyId>{cache_policy}</CachePolicyId>\
          </DefaultCacheBehavior>\
          <Comment>oac over a private s3 origin</Comment>\
          <Enabled>true</Enabled>\
@@ -351,7 +361,7 @@ async fn create_distribution(
 }
 
 /// Assert through `GetDistribution` that the clock has deployed `id`.
-async fn assert_deployed(router: &MultiServiceRouter, case: &str, id: &str) {
+pub(crate) async fn assert_deployed(router: &MultiServiceRouter, case: &str, id: &str) {
     let read = call(
         router,
         "cloudfront",
@@ -373,7 +383,12 @@ async fn assert_deployed(router: &MultiServiceRouter, case: &str, id: &str) {
 /// A bucket policy granting `principal` the action `action` on `resource`, with the condition
 /// clause `condition` when the row names one — the document an origin bucket carries for an
 /// origin access control.
-fn policy(principal: &str, action: &str, resource: &str, condition: Option<&str>) -> String {
+pub(crate) fn policy(
+    principal: &str,
+    action: &str,
+    resource: &str,
+    condition: Option<&str>,
+) -> String {
     let condition = condition
         .map(|clause| format!(",\"Condition\":{clause}"))
         .unwrap_or_default();
@@ -640,6 +655,7 @@ async fn an_origin_access_control_serves_a_private_s3_origin_through_the_edge() 
             &format!("oac-edge-reference-{index}"),
             row.bucket,
             &control,
+            CACHING_DISABLED,
         )
         .await;
         // The policy is written AFTER the distribution exists, because it is scoped to that
