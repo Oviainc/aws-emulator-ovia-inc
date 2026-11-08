@@ -194,6 +194,14 @@ pub const MAX_JOBS_IN_FLIGHT: usize = 100;
 /// COUNT exactly as [`MAX_QUANTUM_TASKS`] bounds the quantum-task store.
 pub const MAX_JOBS: usize = 1_000;
 
+/// The most tags one resource may carry.
+///
+/// AWS's resource tagging limits allow at most 50 tags on a resource, so `TagResource`
+/// refuses a call that would take a resource past that figure. It is also what bounds
+/// the tag state one caller can accumulate on a stored record, the way the constants
+/// above bound how many records the stores hold.
+pub const MAX_TAGS_PER_RESOURCE: usize = 50;
+
 // ---------------------------------------------------------------------------
 // Records
 // ---------------------------------------------------------------------------
@@ -614,6 +622,43 @@ impl ComAmazonawsBraketBraketState {
             }
         }
         (queued, total)
+    }
+
+    /// The tag set stored on the resource `resource_arn` names, or `None` when no
+    /// resource this service holds carries that ARN.
+    ///
+    /// Every store whose records carry tags is reached from here — the quantum tasks
+    /// `CreateQuantumTask` writes, the hybrid jobs `CreateJob` writes and the spending
+    /// limits `CreateSpendingLimit` writes — and the ARN itself says which one holds the
+    /// resource, because each of those stores is keyed by it. ONE lookup for the tagging
+    /// doors and the reads that report tags, so what `TagResource` and `UntagResource`
+    /// write is what `ListTagsForResource` and the resource's own read report.
+    ///
+    /// A device resolves to `None`: devices are published by AWS rather than created
+    /// through this API and hold no tag set at all.
+    pub fn tags_of(&self, resource_arn: &str) -> Option<&BTreeMap<String, String>> {
+        self.quantum_tasks
+            .get(resource_arn)
+            .map(|task| &task.tags)
+            .or_else(|| self.jobs.get(resource_arn).map(|job| &job.tags))
+            .or_else(|| {
+                self.spending_limits
+                    .get(resource_arn)
+                    .map(|limit| &limit.tags)
+            })
+    }
+
+    /// The tag set [`tags_of`](Self::tags_of) resolves, to WRITE: the same lookup over
+    /// the same stores, so a door that changes a resource's tags and a door that reports
+    /// them cannot disagree about which resource an ARN names.
+    pub fn tags_of_mut(&mut self, resource_arn: &str) -> Option<&mut BTreeMap<String, String>> {
+        if let Some(task) = self.quantum_tasks.get_mut(resource_arn) {
+            return Some(&mut task.tags);
+        }
+        if let Some(job) = self.jobs.get_mut(resource_arn) {
+            return Some(&mut job.tags);
+        }
+        Some(&mut self.spending_limits.get_mut(resource_arn)?.tags)
     }
 }
 
@@ -1501,6 +1546,21 @@ pub fn is_braket_arn(value: &str, resource_type: &str) -> bool {
     braket_arn_resource_id(value, resource_type).is_some()
 }
 
+/// Whether `value` is syntactically an Amazon Braket ARN naming a resource of SOME type:
+/// the field grammar [`braket_arn_resource`] reads, plus a resource field that carries a
+/// type and a non-empty id (`<resource-type>/<id>`).
+///
+/// What an operation keyed to one kind of resource holds its ARN member to is
+/// [`is_braket_arn`]; this is the check an operation takes that is addressed to ANY
+/// taggable Braket resource, where the ARN's own type segment is what says which store
+/// the resource would be in. Whether the named resource exists is a different question,
+/// answered by the store.
+pub fn is_braket_resource_arn(value: &str) -> bool {
+    braket_arn_resource(value)
+        .and_then(|resource| resource.split_once('/'))
+        .is_some_and(|(resource_type, id)| !resource_type.is_empty() && !id.is_empty())
+}
+
 /// The resource id a Braket ARN of `resource_type` carries — everything after
 /// `<resource_type>/` — or `None` when `value` is not such an ARN.
 ///
@@ -1508,6 +1568,15 @@ pub fn is_braket_arn(value: &str, resource_type: &str) -> bool {
 /// the readings of what a resource id holds ([`device_type_from_arn`]) cannot disagree
 /// about where the resource field starts.
 fn braket_arn_resource_id<'v>(value: &'v str, resource_type: &str) -> Option<&'v str> {
+    braket_arn_resource(value)?
+        .strip_prefix(resource_type)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .filter(|id| !id.is_empty())
+}
+
+/// The RESOURCE field of a Braket ARN — everything after the fifth `:` — or `None` when
+/// `value`'s five leading fields are not those of an Amazon Braket ARN.
+fn braket_arn_resource(value: &str) -> Option<&str> {
     let mut fields = value.splitn(6, ':');
     let (Some("arn"), Some(partition), Some(service), Some(region), Some(account), Some(resource)) = (
         fields.next(),
@@ -1527,13 +1596,8 @@ fn braket_arn_resource_id<'v>(value: &'v str, resource_type: &str) -> Option<&'v
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
     let account_is_well_formed =
         account.is_empty() || (account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit()));
-    let resource_id = resource
-        .strip_prefix(resource_type)
-        .and_then(|rest| rest.strip_prefix('/'));
     (partition_is_aws && service == ARN_SERVICE && region_is_well_formed && account_is_well_formed)
-        .then_some(resource_id)
-        .flatten()
-        .filter(|id| !id.is_empty())
+        .then_some(resource)
 }
 
 /// The `DeviceType` a published device ARN itself names, read from the category segment

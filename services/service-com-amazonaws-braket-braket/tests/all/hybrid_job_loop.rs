@@ -126,7 +126,7 @@ const ECHOED_MEMBERS: &[&str] = &[
 ];
 
 /// A `CreateJob` body with only the required members filled in.
-fn job_body(client_token: &str, job_name: &str, device_arn: &str) -> Value {
+pub(crate) fn job_body(client_token: &str, job_name: &str, device_arn: &str) -> Value {
     json!({
         "clientToken": client_token,
         "jobName": job_name,
@@ -148,11 +148,11 @@ fn job_arn(job_name: &str) -> String {
 }
 
 impl Braket {
-    async fn create_job(&self, body: Value) -> Reply {
+    pub(crate) async fn create_job(&self, body: Value) -> Reply {
         self.call("POST", "/job", Some(body)).await
     }
 
-    async fn get_job(&self, arn: &str) -> Reply {
+    pub(crate) async fn get_job(&self, arn: &str) -> Reply {
         self.call("GET", &format!("/job/{}", encode(arn)), None).await
     }
 

@@ -25,6 +25,8 @@ mod hybrid_job_loop;
 mod quantum_task_loop;
 #[path = "all/request_body_rejection.rs"]
 mod request_body_rejection;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
 #[path = "all/spending_limit_deletes.rs"]
 mod spending_limit_deletes;
 #[path = "all/spending_limit_updates.rs"]
