@@ -92,6 +92,11 @@
 //! `DescribeRoleAlias` after `CreateRoleAlias` reports the created alias
 //! member-for-member (see [`role_aliases`]).
 //!
+//! It also holds the account's V2 LOGGING OPTIONS — one record and not a map, because
+//! neither `SetV2LoggingOptions` nor `GetV2LoggingOptions` names a resource, kept as an
+//! `Option` because an account nobody has set them for holds none and the reader refuses
+//! that account rather than reporting options it never configured (see [`v2_logging`]).
+//!
 //! It also holds the account's DEVICE DEFENDER AUDIT CONFIGURATION — one record, not a
 //! map, because `DescribeAccountAuditConfiguration` and
 //! `UpdateAccountAuditConfiguration` name no resource: there is one audit configuration
@@ -862,6 +867,16 @@ pub struct ComAmazonawsIotAwsiotserviceState {
     /// A caller grows this store, so it is bounded: [`MAX_ROLE_ALIASES`] is the
     /// ceiling `CreateRoleAlias` refuses past.
     pub role_aliases: BTreeMap<String, RegisteredRoleAlias>,
+    /// The account's V2 LOGGING OPTIONS — one record, not a map, because neither
+    /// `SetV2LoggingOptions` nor `GetV2LoggingOptions` names a resource: there is one
+    /// set of logging options per account.
+    ///
+    /// It is an `Option` and not a plain field, unlike
+    /// [`ComAmazonawsIotAwsiotserviceState::indexing_configuration`], because an
+    /// account nobody has set logging options for HAS none — which is the state the
+    /// reader refuses with the modelled `NotConfiguredException` instead of reporting
+    /// options the account never configured.
+    pub v2_logging_options: Option<V2LoggingOptions>,
     /// The account's DEVICE DEFENDER AUDIT CONFIGURATION — one record, not a map,
     /// because `DescribeAccountAuditConfiguration` /
     /// `UpdateAccountAuditConfiguration` name no resource: there is one audit
@@ -2744,6 +2759,16 @@ pub mod role_aliases;
 pub use role_aliases::{
     missing_role_alias_message, role_alias_arn, RegisteredRoleAlias,
     DEFAULT_CREDENTIAL_DURATION_SECONDS, MAX_ROLE_ALIASES, MAX_ROLE_ALIAS_TAGS,
+};
+
+// What the account's V2 LOGGING OPTIONS are — the one record `SetV2LoggingOptions`
+// writes and `GetV2LoggingOptions` reports — lives in `state/v2_logging.rs`, beside the
+// store accessor for the same reason the rules engine does. Its names are re-exported
+// here so a handler reaches them as `crate::state::<name>`.
+pub mod v2_logging;
+pub use v2_logging::{
+    missing_v2_logging_options_message, LoggedEventConfiguration, V2LoggingOptions,
+    MAX_LOG_EVENT_CONFIGURATIONS,
 };
 
 // What the account's DEVICE DEFENDER AUDIT CONFIGURATION is — the checks it holds a

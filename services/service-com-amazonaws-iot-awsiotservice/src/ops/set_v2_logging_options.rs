@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SetV2LoggingOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SetV2LoggingOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SetV2LoggingOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Records the account's V2 logging options in this service's state
+//! ([`crate::state::V2LoggingOptions`]), which is what `GetV2LoggingOptions` reports
+//! afterwards — and, until a set has been made, what that reader refuses an account
+//! for with its modelled `NotConfiguredException`.
+//!
+//! Every member of the response `GetV2LoggingOptions` hands back has a request member
+//! of the same name and shape here, so one request carries the WHOLE options document
+//! and recording it replaces the account's options in full.
 //!
 //! ## Shape of an operation
 //!
@@ -165,18 +165,53 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SetV2LoggingOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SetV2LoggingOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The options are account-wide, so no request metadata selects what is
+        // written.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SetV2LoggingOptionsErrorModeled::InternalException(InternalException {
+                message: Some("the IoT emulator has no state store attached".to_string()),
+            })
+        })?;
+
+        // Two entries for ONE event type are the same configuration named twice:
+        // `LogEventConfiguration$eventType` is `@required` and says which event type a
+        // configuration is for, so the last one given for an event type is the one the
+        // account holds (the store is keyed by it). Nothing in the model makes the list
+        // unique, so a duplicate is not refused.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SetV2LoggingOptions"))
+        // The list IS one a caller grows and `LogEventConfigurations` carries no
+        // modelled length, so the emulator's own ceiling bounds what one record may
+        // cost, and a request past it is refused before anything is recorded.
+        if let Some(configurations) = input.event_configurations.as_ref() {
+            if configurations.len() > crate::state::MAX_LOG_EVENT_CONFIGURATIONS {
+                return Err(SetV2LoggingOptionsErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(format!(
+                            "eventConfigurations carries {} configurations, more than the {} \
+                             this emulator records for one account",
+                            configurations.len(),
+                            crate::state::MAX_LOG_EVENT_CONFIGURATIONS
+                        )),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // A set replaces the account's options in full: the request carries every
+        // member the reader reports, so one a caller omits is one the configured
+        // options do not have.
+        state.lock().v2_logging_options = Some(crate::state::V2LoggingOptions::configured(
+            input.role_arn,
+            input.default_log_level,
+            input.disable_all_logs,
+            input.event_configurations,
+        ));
+
+        // `SetV2LoggingOptions` targets `smithy.api#Unit`, so a successful set is an
+        // empty 200 and what it persisted is read back through `GetV2LoggingOptions`.
+        Ok(SetV2LoggingOptionsOutput)
     }
 }
