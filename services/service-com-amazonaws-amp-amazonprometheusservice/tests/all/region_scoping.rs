@@ -23,9 +23,11 @@
 use crate::logging_configuration::log_group_arn;
 use crate::rule_groups_namespace_lifecycle::create_body;
 use crate::scraper_listing::{dataset_destination, eks_source, listed, scraper, seed};
-use crate::workspace_lifecycle::{tags_of, text, wait_for_due_transition, Amp, Reply};
+use crate::workspace_lifecycle::{
+    announced_prometheus_endpoint, tags_of, text, wait_for_due_transition, Amp, Reply,
+};
 use service_com_amazonaws_amp_amazonprometheusservice::state::{
-    prometheus_endpoint, region_ceiling_message, workspace_arn, Workspace, WorkspaceConfiguration,
+    region_ceiling_message, workspace_arn, IngestedMetrics, Workspace, WorkspaceConfiguration,
     DESCRIBE_WORKSPACE_NOT_FOUND_MESSAGE, MAX_REGIONS, RESOURCE_NOT_FOUND_CODE,
     RESOURCE_NOT_FOUND_MESSAGE, STATUS_ACTIVE, WORKSPACE_NOT_FOUND_MESSAGE, WORKSPACE_QUOTA,
 };
@@ -54,7 +56,6 @@ fn workspace_record(region: &str, workspace_id: &str, alias: &str) -> Workspace 
         alias: Some(alias.to_string()),
         pending_alias: None,
         status_code: STATUS_ACTIVE.to_string(),
-        prometheus_endpoint: prometheus_endpoint(region, workspace_id),
         created_at: SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000),
         tags: BTreeMap::new(),
         kms_key_arn: None,
@@ -68,6 +69,7 @@ fn workspace_record(region: &str, workspace_id: &str, alias: &str) -> Workspace 
         logging_configuration: None,
         policy: None,
         rule_groups_namespaces: BTreeMap::new(),
+        metrics: IngestedMetrics::default(),
     }
 }
 
@@ -148,8 +150,8 @@ async fn a_workspace_is_reported_only_by_the_region_that_created_it() {
         );
         assert_eq!(
             text(&described.body["workspace"]["prometheusEndpoint"]),
-            prometheus_endpoint(region, workspace_id),
-            "case {region:?}: the endpoint must name the Region serving it, got {described:?}"
+            announced_prometheus_endpoint(region, workspace_id),
+            "case {region:?}: the endpoint must name the host serving it, got {described:?}"
         );
 
         for (other, _) in &held {

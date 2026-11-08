@@ -34,6 +34,27 @@ hex = { workspace = true }
 # this service serves with it too, so the blob is asserted to be a YAML document with the
 # structure a Prometheus scraper reads rather than compared byte for byte.
 yaml-rust2 = { version = "0.10", default-features = false }
+# Decodes a Prometheus remote-write request the workspace's data plane receives: the
+# body is a snappy-compressed protobuf `WriteRequest`, so `snap` is the snappy block
+# codec that frames it and `prost` decodes the protobuf messages. Both are pure-Rust
+# libraries that compute over data in this process: neither opens a socket, reads a file
+# nor evaluates anything. `prost`'s derive is a proc macro, so it generates the message
+# code at build time; `snap` has no build step.
+snap = "1"
+prost = "0.13"
+# Parses the PromQL expression an instant query carries, so the data plane evaluates
+# the caller's own query from its syntax tree instead of reading its text. A PARSER, not
+# an engine: it answers a syntax tree and evaluates nothing, so no caller-supplied text
+# becomes instructions. It generates its grammar's parser at build time (its build script
+# runs `lrlex`/`lrpar` on the PromQL grammar on the builder's machine), and at run time it
+# compiles the regular expression of a label matcher through the `regex` crate, whose
+# matching is linear in the input; the expression it is given is bounded before parsing
+# (see `MAX_QUERY_BYTES` in `src/service/prometheus_plane.rs`).
+promql-parser = "0.11"
+# Reads the RFC 3339 form of an instant query's `time` parameter, which the Prometheus
+# HTTP API accepts beside a Unix timestamp. Calendar arithmetic is what this crate is
+# for, so neither form is parsed by hand.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -41,6 +62,11 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Builds a remote-write body the way a sender does — the protobuf `WriteRequest` of the
+# tests' own series, compressed with snappy's block format — so the data-plane suite
+# exercises the wire format rather than an internal shortcut.
+prost = "0.13"
+snap = "1"
 
 [lints]
 workspace = true

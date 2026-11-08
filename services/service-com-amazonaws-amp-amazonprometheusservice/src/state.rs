@@ -212,6 +212,22 @@ pub const WORKSPACE_RESOURCE_TYPE: &str = "AWS::APS::Workspace";
 pub mod alert_manager;
 pub use alert_manager::*;
 
+/// The time series a workspace holds: what its Prometheus data plane writes and what an
+/// instant query reads back. Re-exported for the same reason the alert manager definition
+/// is.
+pub mod metrics;
+pub use metrics::*;
+
+/// Reading a Prometheus remote-write request — the wire format the data plane receives.
+/// Named rather than re-exported: a caller says `crate::state::remote_write::…`, so the
+/// wire format's own message names stay beside it.
+pub mod remote_write;
+
+/// The PromQL an instant query carries, parsed and evaluated against the samples a
+/// workspace holds. Named rather than re-exported for the same reason
+/// [`remote_write`] is.
+pub mod promql;
+
 /// The `resourceType` those same exceptions report for a rule groups namespace. The
 /// name is the one the model itself gives the resource: `RuleGroupsNamespaceArn`
 /// carries `@arnReference(type: "AWS::APS::RuleGroupsNamespace")`.
@@ -707,7 +723,6 @@ pub struct Workspace {
     /// One of [`STATUS_CREATING`], [`STATUS_ACTIVE`], [`STATUS_UPDATING`],
     /// [`STATUS_DELETING`].
     pub status_code: String,
-    pub prometheus_endpoint: String,
     pub created_at: SystemTime,
     /// Sorted so a listing and a describe report the tags in one stable order.
     pub tags: BTreeMap<String, String>,
@@ -760,6 +775,11 @@ pub struct Workspace {
     /// child of the workspace: dropping the workspace releases every one of them.
     /// Sorted, so a listing reports one stable order.
     pub rule_groups_namespaces: BTreeMap<String, RuleGroupsNamespace>,
+    /// The time series written to this workspace's Prometheus data plane, which is what
+    /// an instant query against it reads back. They are the workspace's OWN data, so they
+    /// live on its record: deleting the workspace releases them with everything else it
+    /// holds. See [`metrics`].
+    pub metrics: IngestedMetrics,
 }
 
 /// One stored rule groups namespace: every member `RuleGroupsNamespaceDescription` /
@@ -1633,11 +1653,55 @@ pub fn names_this_account(arn: &str) -> bool {
     arn.split(':').nth(4) == Some(::engine::emulator_account_id())
 }
 
-/// The workspace's Prometheus endpoint, in the form
+/// The URL a workspace's Prometheus API is served at, in the form
 /// `WorkspaceDescription$prometheusEndpoint` documents: "For example,
 /// `https://aps-workspaces.<region>.amazonaws.com/workspaces/ws-.../api/v1/`".
-pub fn prometheus_endpoint(region: &str, workspace_id: &str) -> String {
-    format!("https://aps-workspaces.{region}.amazonaws.com/workspaces/{workspace_id}/api/v1/")
+///
+/// The HOST is the endpoint the REQUEST reached this service on, never a host composed
+/// from a literal: the member is "The Prometheus endpoint available for this workspace",
+/// so it has to be an address the caller that read it can reach — a Prometheus agent's
+/// remote_write target, a Grafana datasource and an SDK caller all follow it. The path is
+/// the documented one ([`workspace_prometheus_path`]), which is also the path space this
+/// service serves that API under, so following the announced URL lands on the served
+/// route.
+pub fn prometheus_endpoint(parts: &::http::request::Parts, workspace_id: &str) -> String {
+    format!(
+        "{}://{}{}",
+        request_scheme(parts),
+        request_authority(parts),
+        workspace_prometheus_path(workspace_id)
+    )
+}
+
+/// The scheme the request reached this service on: the one its URI names when it carries
+/// an absolute URI, and otherwise `https`, which is the only scheme the emulator's
+/// listener serves.
+fn request_scheme(parts: &::http::request::Parts) -> &str {
+    parts.uri.scheme_str().unwrap_or("https")
+}
+
+/// The authority the request was addressed to: its `Host` header, or the authority of an
+/// absolute request URI.
+///
+/// A request that names neither (neither HTTP/1.1 nor HTTP/2 permits one, but the type
+/// allows it) is answered for the address the emulator's own listener serves on, so the
+/// announced endpoint is still one a caller can reach.
+fn request_authority(parts: &::http::request::Parts) -> String {
+    parts
+        .headers
+        .get(::http::header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .map(str::trim)
+        .filter(|host| !host.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| parts.uri.authority().map(::http::uri::Authority::to_string))
+        .unwrap_or_else(|| {
+            format!(
+                "{}:{}",
+                ::emulator_server::DEFAULT_BIND_ADDRESS,
+                ::emulator_server::data_port_from_env()
+            )
+        })
 }
 
 /// A fresh workspace id of the shape the service mints: `ws-` followed by a UUID,

@@ -187,7 +187,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 status: WorkspaceStatus {
                     status_code: workspace.status_code.clone(),
                 },
-                prometheus_endpoint: Some(workspace.prometheus_endpoint.clone()),
+                // "The Prometheus endpoint available for this workspace": the URL this
+                // workspace's Prometheus API is served at, composed from the endpoint
+                // THIS request reached the service on, so a client that follows it
+                // reaches the data plane rather than another address.
+                prometheus_endpoint: Some(crate::state::prometheus_endpoint(
+                    ctx.parts(),
+                    &workspace.workspace_id,
+                )),
                 created_at: ::aws_smithy_types::DateTime::from(workspace.created_at),
                 tags: crate::state::tag_map(&workspace.tags),
                 kms_key_arn: workspace.kms_key_arn.clone(),

@@ -45,6 +45,8 @@ mod logging_configuration_deletion;
 mod map_key_constraints;
 #[path = "all/namespace_tag_removal.rs"]
 mod namespace_tag_removal;
+#[path = "all/prometheus_data_plane.rs"]
+mod prometheus_data_plane;
 #[path = "all/query_logging_configuration.rs"]
 mod query_logging_configuration;
 #[path = "all/refusal_messages.rs"]

@@ -67,6 +67,24 @@ pub(crate) struct Amp {
     engine: Arc<engine::InMemoryEngine>,
 }
 
+/// The host every request this harness sends is addressed to: this service's regional
+/// endpoint, which is also the endpoint the emulator is reached on as far as the request
+/// is concerned — so it is the host a response that announces an endpoint for a resource
+/// must name.
+pub(crate) fn endpoint_host(region: &str) -> String {
+    format!("aps.{region}.amazonaws.com")
+}
+
+/// The URL a workspace's Prometheus API is announced at for a request this harness sent
+/// to `region`: the endpoint the request was addressed to, carrying the documented
+/// `/workspaces/<workspaceId>/api/v1/` path.
+pub(crate) fn announced_prometheus_endpoint(region: &str, workspace_id: &str) -> String {
+    format!(
+        "https://{}/workspaces/{workspace_id}/api/v1/",
+        endpoint_host(region)
+    )
+}
+
 impl Amp {
     pub(crate) fn new() -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -93,7 +111,7 @@ impl Amp {
         let request = http::Request::builder()
             .method(method)
             .uri(uri)
-            .header("host", format!("aps.{region}.amazonaws.com"))
+            .header("host", endpoint_host(region))
             .header("content-type", "application/json")
             .header(
                 "authorization",
@@ -215,6 +233,22 @@ impl Amp {
         let workspace_id = text(&created.body["workspaceId"]);
         wait_for_due_transition();
         workspace_id
+    }
+
+    /// Dispatch one request exactly as it was built, and answer with the status, the
+    /// headers and the body BYTES.
+    ///
+    /// What a suite needs when the request or the response is not the control plane's
+    /// JSON: a body that is a compressed protobuf document, or a response whose media
+    /// type is another API's.
+    pub(crate) async fn send(
+        &self,
+        request: http::Request<Bytes>,
+    ) -> (u16, http::HeaderMap, Vec<u8>) {
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let headers = response.headers().clone();
+        (status, headers, response.into_body().to_vec())
     }
 }
 
@@ -508,11 +542,9 @@ async fn create_persists_every_member_and_describe_reads_it_back() {
         );
         assert_eq!(
             text(&workspace["prometheusEndpoint"]),
-            format!(
-                "https://aps-workspaces.{}.amazonaws.com/workspaces/{workspace_id}/api/v1/",
-                case.region
-            ),
-            "case {:?}: describe must report this region's Prometheus endpoint, got {described:?}",
+            announced_prometheus_endpoint(case.region, &workspace_id),
+            "case {:?}: describe must announce the endpoint this request reached the \
+             service on, got {described:?}",
             case.name
         );
         assert_eq!(

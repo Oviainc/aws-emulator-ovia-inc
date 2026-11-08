@@ -88,6 +88,15 @@
 //! reaching the handler. That gate binds the input the model's way and drives the same
 //! deserialize-equivalent -> validate -> handle -> serialize sequence by hand; the
 //! operation's behaviour still lives in its own file.
+//!
+//! ## The data plane the workspace announces
+//!
+//! A request addressed beneath a workspace's `prometheusEndpoint` names no modelled
+//! operation at all — it is Prometheus's own HTTP API, not this service's Smithy surface —
+//! so [`Service::override_operation`] resolves it to [`prometheus_plane::PrometheusDataPlane`].
+//! See that module for what is served and why this is the seam for it.
+
+mod prometheus_plane;
 
 use std::collections::HashMap;
 use std::marker::PhantomData;
@@ -119,6 +128,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// The [`ApsResponse`] gate for each modelled operation, keyed by the routing key the
     /// protocol resolves for it (the operation's own `NAME`). Built once, in `new`.
     response_envelope: HashMap<&'static str, Box<dyn ErasedOperation>>,
+    /// The workspace Prometheus API every workspace announces in its
+    /// `prometheusEndpoint`, served off the SAME shared engine the modelled operations
+    /// read and write. Built once, in `new`, because it is reached through
+    /// [`Service::override_operation`], which hands back a borrow.
+    data_plane: prometheus_plane::PrometheusDataPlane<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -128,6 +142,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
+            data_plane: prometheus_plane::PrometheusDataPlane::new(Arc::clone(&engine)),
             response_envelope: response_envelopes::<Eng>(engine),
         }
     }
@@ -502,6 +517,13 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
+        // A request addressed beneath a workspace's announced `prometheusEndpoint` is
+        // Prometheus's own HTTP API rather than a modelled operation, so no routing key
+        // can name it: it is resolved from the URI, before the model's routing key is
+        // read, and served by this service's data plane.
+        if prometheus_plane::api_request_of(req.uri()).is_some() {
+            return Some(&self.data_plane);
+        }
         // Put this service's response envelope in front of the modelled operation the
         // request names — the media type every aps response announces, and the modelled
         // `ValidationException` a request outside the model's constraints is refused

@@ -334,7 +334,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let workspace_id = crate::state::mint_workspace_id(next_id);
         let workspace = crate::state::Workspace {
             arn: crate::state::workspace_arn(&region, &workspace_id),
-            prometheus_endpoint: crate::state::prometheus_endpoint(&region, &workspace_id),
             alias: crate::state::normalize_alias(input.alias.as_deref()),
             // A workspace is created with the alias the request carried; only an
             // accepted-but-unsettled `UpdateWorkspaceAlias` holds a pending one.
@@ -370,6 +369,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A fresh workspace holds no rule groups namespaces;
             // `CreateRuleGroupsNamespace` is what puts one here.
             rule_groups_namespaces: ::std::collections::BTreeMap::new(),
+            // Nothing has been written to the workspace's Prometheus data plane yet; a
+            // `remote_write` to the endpoint `DescribeWorkspace` announces is what puts
+            // the first series here.
+            metrics: crate::state::IngestedMetrics::default(),
             workspace_id: workspace_id.clone(),
         };
 
