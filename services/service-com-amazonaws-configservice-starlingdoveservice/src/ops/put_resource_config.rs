@@ -249,7 +249,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
         })?;
@@ -280,98 +280,122 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
+        // The whole store-touching half of the operation: the configuration item is
+        // recorded under the store's guard, and the guard is released before the
+        // notification that item owes is streamed.
+        let recorded = {
+            let mut store = state.lock();
 
-        // Config records a configuration item only while a recorder is recording.
-        if store.recording_recorder().is_none() {
-            return Err(
-                PutResourceConfigErrorModeled::NoRunningConfigurationRecorderException(
-                    NoRunningConfigurationRecorderException {
-                        message: Some(
-                            crate::state::no_running_configuration_recorder_message(Self::NAME),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        // This API records the configuration state of a resource type the CloudFormation
-        // registry holds a registration for, so a `ResourceType` it holds none for names
-        // nothing Config can record. The lookup that establishes this is one Config makes
-        // against the CloudFormation registry with the configuration recorder's own role,
-        // so the refusal belongs to that lookup — the modelled permission class, client
-        // 400 — and not to the validation of the members this request carried. Judged
-        // AFTER the recorder, because a recorder that is not recording is the precondition
-        // Config reports for a request that fails both.
-        if !is_registered_resource_type(&input.resource_type) {
-            return Err(
-                PutResourceConfigErrorModeled::InsufficientPermissionsException(
-                    InsufficientPermissionsException {
-                        message: Some(unregistered_resource_type_message(&input.resource_type)),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        let key = (input.resource_type.clone(), input.resource_id.clone());
-        // Recording a resource Config already holds an ACTIVE configuration item for is
-        // not a new resource, so it meets no limit. Everything else is: a resource the
-        // inventory does not hold, and one whose deletion it recorded — which occupies
-        // no active quota, so recording its configuration again makes it an active
-        // resource that has to fit under the account's limit.
-        let already_active = store
-            .discovered_resources
-            .get(&key)
-            .is_some_and(|entry| entry.deleted_at.is_none());
-        if !already_active {
-            let active = store
-                .discovered_resources
-                .values()
-                .filter(|entry| entry.deleted_at.is_none())
-                .count();
-            if active >= ACTIVE_CUSTOM_RESOURCES_QUOTA {
+            // Config records a configuration item only while a recorder is recording.
+            if store.recording_recorder().is_none() {
                 return Err(
-                    PutResourceConfigErrorModeled::MaxActiveResourcesExceededException(
-                        MaxActiveResourcesExceededException {
-                            message: Some(format!(
-                                "this account already holds the maximum of \
-                                 {ACTIVE_CUSTOM_RESOURCES_QUOTA} active custom resources; \
-                                 delete unused resources with DeleteResourceConfig"
+                    PutResourceConfigErrorModeled::NoRunningConfigurationRecorderException(
+                        NoRunningConfigurationRecorderException {
+                            message: Some(
+                                crate::state::no_running_configuration_recorder_message(
+                                    Self::NAME,
+                                ),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // This API records the configuration state of a resource type the
+            // CloudFormation registry holds a registration for, so a `ResourceType` it
+            // holds none for names nothing Config can record. The lookup that establishes
+            // this is one Config makes against the CloudFormation registry with the
+            // configuration recorder's own role, so the refusal belongs to that lookup —
+            // the modelled permission class, client 400 — and not to the validation of the
+            // members this request carried. Judged AFTER the recorder, because a recorder
+            // that is not recording is the precondition Config reports for a request that
+            // fails both.
+            if !is_registered_resource_type(&input.resource_type) {
+                return Err(
+                    PutResourceConfigErrorModeled::InsufficientPermissionsException(
+                        InsufficientPermissionsException {
+                            message: Some(unregistered_resource_type_message(
+                                &input.resource_type,
                             )),
                         },
                     )
                     .into(),
                 );
             }
-        }
 
-        // Every call records a configuration item, and the inventory is written through
-        // the store's one accessor for it: that is what keeps the instant Config FIRST
-        // recorded the resource, moves the state the resource is leaving into the states
-        // it has left — so re-recording a resource with another configuration records a
-        // NEW item rather than overwriting the one before it — and keeps the inventory
-        // bounded (`DISCOVERED_RESOURCES_KEPT`) whatever a caller records. Recording the
-        // configuration of a resource Config had recorded the deletion of discovers it
-        // again, which is why this item carries no deletion instant.
-        store.record_discovered_resource(crate::state::DiscoveredResourceEntry {
-            resource_type: input.resource_type.clone(),
-            resource_id: input.resource_id.clone(),
-            resource_name: input.resource_name.clone(),
-            deleted_at: None,
-            schema_version_id: Some(input.schema_version_id.clone()),
-            configuration: Some(input.configuration.clone()),
-            tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
-            first_recorded_at: Some(now),
-            last_recorded_at: Some(now),
-            // A caller's own configuration item carries no supplementary blocks: this
-            // operation records the document it was handed and nothing beside it. The
-            // states this resource has already left are carried over by the store's own
-            // write path.
-            supplementary_configuration: ::std::collections::BTreeMap::new(),
-            history: Vec::new(),
-        });
+            let key = (input.resource_type.clone(), input.resource_id.clone());
+            // Recording a resource Config already holds an ACTIVE configuration item for
+            // is not a new resource, so it meets no limit. Everything else is: a resource
+            // the inventory does not hold, and one whose deletion it recorded — which
+            // occupies no active quota, so recording its configuration again makes it an
+            // active resource that has to fit under the account's limit.
+            let already_active = store
+                .discovered_resources
+                .get(&key)
+                .is_some_and(|entry| entry.deleted_at.is_none());
+            if !already_active {
+                let active = store
+                    .discovered_resources
+                    .values()
+                    .filter(|entry| entry.deleted_at.is_none())
+                    .count();
+                if active >= ACTIVE_CUSTOM_RESOURCES_QUOTA {
+                    return Err(
+                        PutResourceConfigErrorModeled::MaxActiveResourcesExceededException(
+                            MaxActiveResourcesExceededException {
+                                message: Some(format!(
+                                    "this account already holds the maximum of \
+                                     {ACTIVE_CUSTOM_RESOURCES_QUOTA} active custom \
+                                     resources; delete unused resources with \
+                                     DeleteResourceConfig"
+                                )),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+            }
+
+            // Every call records a configuration item, and the inventory is written
+            // through the store's one accessor for it: that is what keeps the instant
+            // Config FIRST recorded the resource, moves the state the resource is leaving
+            // into the states it has left — so re-recording a resource with another
+            // configuration records a NEW item rather than overwriting the one before it —
+            // and keeps the inventory bounded (`DISCOVERED_RESOURCES_KEPT`) whatever a
+            // caller records. Recording the configuration of a resource Config had
+            // recorded the deletion of discovers it again, which is why this item carries
+            // no deletion instant.
+            store.record_discovered_resource(crate::state::DiscoveredResourceEntry {
+                resource_type: input.resource_type.clone(),
+                resource_id: input.resource_id.clone(),
+                resource_name: input.resource_name.clone(),
+                deleted_at: None,
+                schema_version_id: Some(input.schema_version_id.clone()),
+                configuration: Some(input.configuration.clone()),
+                tags: input.tags.clone().unwrap_or_default().into_iter().collect(),
+                first_recorded_at: Some(now),
+                last_recorded_at: Some(now),
+                // A caller's own configuration item carries no supplementary blocks: this
+                // operation records the document it was handed and nothing beside it. The
+                // states this resource has already left are carried over by the store's
+                // own write path.
+                supplementary_configuration: ::std::collections::BTreeMap::new(),
+                history: Vec::new(),
+            })
+        };
+
+        // The configuration item this call recorded is streamed to the delivery channel's
+        // Amazon SNS topic, with the store's lock released: the notification is owed by the
+        // write that recorded the item, whichever operation made it.
+        crate::state::stream_recorded_item_changes(
+            ctx.callback(),
+            &*self.engine,
+            &region,
+            recorded.as_slice(),
+            now,
+        )
+        .await;
 
         Ok(PutResourceConfigOutput)
     }

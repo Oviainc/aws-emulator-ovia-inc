@@ -48,10 +48,12 @@ const DYNAMODB_TABLE: &str = "AWS::DynamoDB::Table";
 /// See [`EC2_VOLUME`].
 const KMS_KEY: &str = "AWS::KMS::Key";
 
-/// The `ConfigurationItemStatus` of an item that records a resource's configuration, and
-/// of the one that records its deletion
-/// (`com.amazonaws.configservice#ConfigurationItemStatus`).
+/// The `ConfigurationItemStatus` of an item that records a configuration the resource
+/// UPDATED, of the one that records its first discovery, and of the one that records its
+/// deletion (`com.amazonaws.configservice#ConfigurationItemStatus`).
 const STATUS_OK: &str = "OK";
+/// See [`STATUS_OK`].
+const STATUS_RESOURCE_DISCOVERED: &str = "ResourceDiscovered";
 /// See [`STATUS_OK`].
 const STATUS_RESOURCE_DELETED: &str = "ResourceDeleted";
 
@@ -214,7 +216,16 @@ async fn every_state_recorded_through_the_api_is_one_item_of_the_history() {
         let body = emulator
             .ok(HISTORY, &request(resource_type, &resource_id, json!({})))
             .await;
-        for item in items(case, &body) {
+        let reported = items(case, &body);
+        for (position, item) in reported.iter().enumerate() {
+            // The OLDEST item of the resource is the one that discovered it; every later
+            // one records a configuration that has been updated since
+            // (`ConfigurationItem$configurationItemStatus`).
+            let expected_status = if position + 1 == reported.len() {
+                STATUS_RESOURCE_DISCOVERED
+            } else {
+                STATUS_OK
+            };
             assert_eq!(
                 (
                     item["resourceType"].as_str(),
@@ -230,7 +241,7 @@ async fn every_state_recorded_through_the_api_is_one_item_of_the_history() {
                     Some(resource_id.as_str()),
                     Some(emulator.region.as_str()),
                     Some(emulator_server::emulator_account_id()),
-                    Some(STATUS_OK),
+                    Some(expected_status),
                 ),
                 "case {case:?}: every item must name the recorded resource, got {item}"
             );
@@ -447,7 +458,7 @@ async fn a_key_nothing_was_recorded_for_is_refused_and_a_deleted_resource_keeps_
         .collect();
     assert_eq!(
         reported,
-        vec![STATUS_RESOURCE_DELETED, STATUS_OK, STATUS_OK],
+        vec![STATUS_RESOURCE_DELETED, STATUS_OK, STATUS_RESOURCE_DISCOVERED],
         "case {case:?}: the deletion is the newest of the three states, got {body}"
     );
 }

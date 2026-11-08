@@ -221,15 +221,25 @@ impl DiscoveredResourceEntry {
     }
 
     /// The `ConfigurationItemStatus` of the resource's current configuration item: the
-    /// resource has been deleted, its configuration has been recorded, or it has been
-    /// discovered without its configuration being recorded.
+    /// resource has been deleted, it was newly discovered, or its configuration has been
+    /// updated.
+    ///
+    /// The member's own documentation states the three: "OK – The resource configuration
+    /// has been updated", "ResourceDiscovered – The resource was newly discovered" and
+    /// "ResourceDeleted – The resource was deleted". So the status follows from WHICH item
+    /// of the resource this is: the FIRST one Config recorded — the one that has no state
+    /// before it in [`Self::history`] — is the discovery of the resource, and every later
+    /// one records a configuration that has been updated since. A past item read back out
+    /// of the history is projected with the states before IT
+    /// ([`Self::configuration_items`]), so each item keeps the status it was recorded
+    /// with.
     pub fn configuration_item_status(&self) -> &'static str {
         if self.deleted_at.is_some() {
             CONFIGURATION_ITEM_STATUS_RESOURCE_DELETED
-        } else if self.configuration.is_some() {
-            CONFIGURATION_ITEM_STATUS_OK
-        } else {
+        } else if self.history.is_empty() {
             CONFIGURATION_ITEM_STATUS_RESOURCE_DISCOVERED
+        } else {
+            CONFIGURATION_ITEM_STATUS_OK
         }
     }
 
@@ -261,14 +271,17 @@ impl DiscoveredResourceEntry {
     /// A past item differs from the current one only in what a later item CHANGED — the
     /// configuration document, its supplementary blocks, the tags and the instant it was
     /// captured — so each is projected off this entry with those members replaced, which
-    /// keeps one statement of how a configuration item is rendered.
+    /// keeps one statement of how a configuration item is rendered. Each past item carries
+    /// the states recorded BEFORE it, so the status it reports is the one it was recorded
+    /// with ([`Self::configuration_item_status`]): the oldest item of the resource is its
+    /// discovery.
     pub fn configuration_items(
         &self,
         aws_region: &str,
         recording_frequency: &str,
     ) -> Vec<ConfigurationItem> {
         let mut items = vec![self.to_configuration_item(aws_region, recording_frequency)];
-        for state in self.history.iter().rev() {
+        for (index, state) in self.history.iter().enumerate().rev() {
             let past = Self {
                 configuration: state.configuration.clone(),
                 supplementary_configuration: state.supplementary_configuration.clone(),
@@ -277,7 +290,7 @@ impl DiscoveredResourceEntry {
                 // An earlier item is one the resource was still there for: the deletion
                 // belongs to the item that recorded it, which is the current one.
                 deleted_at: None,
-                history: Vec::new(),
+                history: self.history[..index].to_vec(),
                 ..self.clone()
             };
             items.push(past.to_configuration_item(aws_region, recording_frequency));

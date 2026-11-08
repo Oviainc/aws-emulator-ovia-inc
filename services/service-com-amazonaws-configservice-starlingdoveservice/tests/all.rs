@@ -28,6 +28,8 @@ mod config_discovered_resource_counts;
 // landing in the same window, while this span is untouched by those appends.
 #[path = "all/config_external_evaluation_compliance.rs"]
 mod config_external_evaluation_compliance;
+#[path = "all/config_item_change_notification.rs"]
+mod config_item_change_notification;
 #[path = "all/config_read_shape_and_compliance.rs"]
 mod config_read_shape_and_compliance;
 #[path = "all/config_recorded_resource_compliance.rs"]

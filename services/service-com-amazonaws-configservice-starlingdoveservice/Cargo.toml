@@ -33,6 +33,15 @@ aws-sdk-eventbridge = { version = "1", default-features = false }
 # from S3 itself rather than from another crate's state. Only the generated client is
 # needed — the emulator supplies the transport.
 aws-sdk-s3 = { version = "1", default-features = false }
+# The AWS SDK for Amazon SQS, driven over the same callback: a running configuration
+# recorder observes this account's queues and their configuration through Amazon SQS's own
+# API (`state::recording`), the way it observes every other resource type it records.
+aws-sdk-sqs = { version = "1", default-features = false }
+# The AWS SDK for Amazon SNS: a delivery channel "sends notifications and updated
+# configuration states" to the topic its `snsTopicARN` names, so each configuration item
+# Config records is published to that topic with `Publish`
+# (`state::change_notification`).
+aws-sdk-sns = { version = "1", default-features = false }
 # `sqlparser`: the SQL `SELECT` command `SelectResourceConfig` takes is PARSED with it,
 # so a malformed expression is refused because the parser cannot read it rather than
 # because this emulator searched its text.
@@ -53,13 +62,16 @@ sha2 = { workspace = true }
 hex = { workspace = true }
 # `time` lets a test await the clock-owed recorder status transition.
 tokio = { workspace = true, features = ["time"] }
-# S3, EventBridge and SQS are mounted beside Config on one engine in the integration
-# tests: the recorder READS the resources it records from S3, and a rule's compliance
-# change is published onto the default EventBridge bus, whose rule delivers it to an SQS
-# queue — without them mounted there is nothing to record and nowhere to publish.
+# S3, EventBridge, SNS and SQS are mounted beside Config on one engine in the integration
+# tests: the recorder READS the resources it records from S3 and Amazon SQS, a rule's
+# compliance change is published onto the default EventBridge bus, whose rule delivers it
+# to an SQS queue, and a recorded configuration item is streamed to the delivery channel's
+# SNS topic, whose subscriber is an SQS queue — without them mounted there is nothing to
+# record and nowhere to publish.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
 service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
 
 [lints]
 workspace = true

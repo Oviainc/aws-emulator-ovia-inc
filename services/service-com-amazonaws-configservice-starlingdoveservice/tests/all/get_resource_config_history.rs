@@ -277,7 +277,15 @@ async fn the_history_reports_the_states_inside_the_window_in_the_order_asked_for
         newest_first.len(),
         "the whole history is what the members below are checked over, got {body}"
     );
-    for item in &items {
+    for (position, item) in items.iter().enumerate() {
+        // The OLDEST item of the resource is the one that discovered it; every later one
+        // records a configuration that has been updated since
+        // (`ConfigurationItem$configurationItemStatus`).
+        let expected_status = if position + 1 == items.len() {
+            "ResourceDiscovered"
+        } else {
+            "OK"
+        };
         assert_eq!(
             (
                 item["resourceType"].as_str(),
@@ -293,7 +301,7 @@ async fn the_history_reports_the_states_inside_the_window_in_the_order_asked_for
                 Some(RESOURCE_ID),
                 Some(emulator.region.as_str()),
                 Some(emulator_server::emulator_account_id()),
-                Some("OK"),
+                Some(expected_status),
             ),
             "every item must name the recorded resource, got {item}"
         );

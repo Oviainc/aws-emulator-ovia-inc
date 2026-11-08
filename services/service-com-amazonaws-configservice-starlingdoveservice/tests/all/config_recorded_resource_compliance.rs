@@ -44,6 +44,25 @@ const COMPLIANCE_CHANGE_MESSAGE_TYPE: &str = "ComplianceChangeNotification";
 /// The resource type Config records an S3 bucket under.
 const BUCKET_RESOURCE_TYPE: &str = "AWS::S3::Bucket";
 
+/// The API version every Amazon SNS awsQuery call carries, from that service's model.
+const SNS_API_VERSION: &str = "2010-03-31";
+
+/// `value` as one form-encoded parameter value of an awsQuery call: every byte that is
+/// not unreserved is percent-encoded, which is what lets a JSON document travel as a
+/// parameter.
+fn urlencode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(*byte as char);
+            }
+            byte => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
 /// `ComplianceType` values.
 const COMPLIANT: &str = "COMPLIANT";
 /// See [`COMPLIANT`].
@@ -87,6 +106,11 @@ impl Emulator {
         router.register_service(service_com_amazonaws_sqs_amazonsqs::EmulatedService::new(
             Arc::clone(&engine),
         ));
+        router.register_service(
+            service_com_amazonaws_sns_amazonsimplenotificationservice::EmulatedService::new(
+                Arc::clone(&engine),
+            ),
+        );
         let callback = EmbeddedEmulator::from_router(router.clone());
         Self { router, callback }
     }
@@ -150,8 +174,39 @@ impl Emulator {
         parsed
     }
 
+    /// An Amazon SNS call, which the service serves over the AWS query protocol: the
+    /// operation and the API version travel in the form-encoded body rather than in a
+    /// target header.
+    pub(crate) async fn sns(&self, operation: &str, form: &[(&str, &str)]) -> String {
+        let mut body = format!("Action={operation}&Version={SNS_API_VERSION}");
+        for (name, value) in form {
+            body.push('&');
+            body.push_str(&format!("{name}={}", urlencode(value)));
+        }
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260101/{REGION}/sns/\
+             aws4_request, SignedHeaders=host;x-amz-date, Signature=deadbeef"
+        );
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", format!("sns.{REGION}.amazonaws.com"))
+            .header("authorization", authorization)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(bytes::Bytes::from(body))
+            .expect("the test request is well formed");
+        let response = self.router.dispatch(request).await;
+        let status = response.status().as_u16();
+        let answer = String::from_utf8_lossy(response.body()).to_string();
+        assert_eq!(
+            status, 200,
+            "{operation}: expected HTTP 200, got {status} with {answer}"
+        );
+        answer
+    }
+
     /// An SQS call (`awsJson1_0`), required to answer 200.
-    async fn sqs(&self, operation: &str, body: &Value) -> Value {
+    pub(crate) async fn sqs(&self, operation: &str, body: &Value) -> Value {
         let (status, parsed) = self.call("sqs", "AmazonSQS", "1.0", operation, body).await;
         assert_eq!(
             status, 200,
@@ -330,7 +385,7 @@ impl Emulator {
 
     /// Every message on the queue right now, as the event each carries, deleting each
     /// so a later drain reports only what arrived after it.
-    async fn drain(&self, queue_url: &str) -> Vec<Value> {
+    pub(crate) async fn drain(&self, queue_url: &str) -> Vec<Value> {
         let mut drained = Vec::new();
         loop {
             let received = self
@@ -968,15 +1023,20 @@ async fn the_configuration_history_reports_each_state_the_recorder_captured() {
         "the next page must carry the remaining item and no further token, got {rest}"
     );
 
-    // Each item names the resource it is about, this account and this Region.
+    // Each item names the resource it is about, this account and this Region, and reports
+    // the status it was recorded with: the OLDEST item of the resource is the one that
+    // discovered it, and every later one records a configuration that has been updated.
     let items = emulator.configuration_history(bucket, json!({})).await;
-    for (position, item) in items["configurationItems"]
+    let reported = items["configurationItems"]
         .as_array()
         .cloned()
-        .unwrap_or_default()
-        .iter()
-        .enumerate()
-    {
+        .unwrap_or_default();
+    for (position, item) in reported.iter().enumerate() {
+        let expected_status = if position + 1 == reported.len() {
+            "ResourceDiscovered"
+        } else {
+            "OK"
+        };
         assert_eq!(
             (
                 item["resourceType"].as_str(),
@@ -990,7 +1050,7 @@ async fn the_configuration_history_reports_each_state_the_recorder_captured() {
                 Some(bucket),
                 Some(REGION),
                 Some(ACCOUNT_ID),
-                Some("OK"),
+                Some(expected_status),
             ),
             "item {position} must name the recorded resource, got {item}"
         );

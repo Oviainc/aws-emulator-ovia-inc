@@ -45,10 +45,13 @@ const RECORDER: &str = "default";
 /// The `ConfigurationItemStatus` of the item that records a resource's deletion
 /// (`com.amazonaws.configservice#ConfigurationItemStatus`, whose values are `OK`,
 /// `ResourceDiscovered`, `ResourceNotRecorded`, `ResourceDeleted` and
-/// `ResourceDeletedNotRecorded`), and the one of the item it replaces.
+/// `ResourceDeletedNotRecorded`), the one of an item that records a configuration the
+/// resource updated, and the one of the item that first discovered it.
 const RESOURCE_DELETED: &str = "ResourceDeleted";
 /// See [`RESOURCE_DELETED`].
 const OK: &str = "OK";
+/// See [`RESOURCE_DELETED`].
+const RESOURCE_DISCOVERED: &str = "ResourceDiscovered";
 
 /// One row of the deletion table: the case name, the resource type, the
 /// resource id and the configuration document recorded for it.
@@ -401,8 +404,9 @@ async fn deleting_a_resource_config_holds_nothing_for_changes_nothing() {
             .unwrap_or_else(|| panic!("case {case:?}: the recorded resource keeps its entry"));
         assert_eq!(
             entry.configuration_item_status(),
-            OK,
-            "case {case:?}: the recorded resource is still recorded, got {:?}",
+            RESOURCE_DISCOVERED,
+            "case {case:?}: the recorded resource is still recorded, as the one item that \
+             discovered it, got {:?}",
             entry.configuration_item_status()
         );
     }

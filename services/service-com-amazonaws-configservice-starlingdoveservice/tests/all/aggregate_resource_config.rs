@@ -739,11 +739,11 @@ async fn a_reported_configuration_item_is_the_recorded_configuration_state() {
             .duration_since(SystemTime::UNIX_EPOCH)
             .expect("the seeded capture time is after the epoch")
             .as_secs_f64();
-        let expected_status = if configuration.is_some() {
-            "OK"
-        } else {
-            "ResourceDiscovered"
-        };
+        // Each seeded entry holds ONE configuration item, so each is the item that
+        // DISCOVERED its resource — whether or not a configuration document was recorded
+        // with it ("ResourceDiscovered – The resource was newly discovered",
+        // `ConfigurationItem$configurationItemStatus`).
+        let expected_status = "ResourceDiscovered";
         assert_eq!(
             item["configurationItemStatus"].as_str(),
             Some(expected_status),

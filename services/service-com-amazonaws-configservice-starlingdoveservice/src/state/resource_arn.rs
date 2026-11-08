@@ -25,6 +25,11 @@
 //! a CloudFormation registry type a caller records through `PutResourceConfig` — names
 //! a resource that has no such ARN, and no call carries one, so nothing is derived for
 //! it rather than an ARN being invented.
+//!
+//! Two recorded ids are not the resource's own name: Config records some resource types by
+//! the resource's own ARN, and some by the URL its own service addresses the resource at
+//! (an Amazon SQS queue url). Neither is an ARN resource field, so the first IS the answer
+//! and the second is read down to the resource it names ([`arn_resource_id`]).
 
 use super::is_amazon_resource_name;
 
@@ -315,7 +320,7 @@ pub fn recorded_resource_arn(
         ),
     };
 
-    let resource_field = format!("{qualifier}{resource_id}");
+    let resource_field = format!("{qualifier}{}", arn_resource_id(resource_id));
     Some(match scope {
         // `::emulator_server::emulator_arn` is what every ARN this emulator mints is
         // built through: it carries the partition and the one account id this emulator
@@ -332,6 +337,26 @@ pub fn recorded_resource_arn(
         }
         ArnScope::Neither => format!("arn:{ARN_PARTITION}:{namespace}:::{resource_field}"),
     })
+}
+
+/// The recorded resource id as an ARN's resource field carries it.
+///
+/// A resource type Config records by the URL its own service addresses the resource at —
+/// an Amazon SQS queue, whose configuration item carries the queue url as its
+/// `resourceId` — is named in its ARN by the resource that url addresses, which is its
+/// LAST path segment (`https://sqs.<region>.amazonaws.com/<account>/<name>`). Every other
+/// recorded id stands in the resource field as it is.
+fn arn_resource_id(resource_id: &str) -> &str {
+    let Some(path) = resource_id
+        .strip_prefix("https://")
+        .or_else(|| resource_id.strip_prefix("http://"))
+    else {
+        return resource_id;
+    };
+    path.rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty())
+        .unwrap_or(resource_id)
 }
 
 /// `name` in the lowercase, hyphen-separated spelling an ARN qualifier uses for a

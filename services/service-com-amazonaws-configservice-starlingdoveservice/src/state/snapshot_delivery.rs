@@ -450,7 +450,9 @@ pub fn snapshot_document(snapshot_id: &str, items: &[ConfigurationItem]) -> ::se
     })
 }
 
-/// One configuration item as a DELIVERED snapshot spells it.
+/// One configuration item as a DELIVERED snapshot spells it, which is also how the
+/// configuration-item change notification a delivery channel streams spells it
+/// ([`super::change_notification`]).
 ///
 /// The item is the one the API reports ([`super::configuration_item_document`], which
 /// spells every member as the model does), with the four members a delivered file spells
@@ -458,7 +460,7 @@ pub fn snapshot_document(snapshot_id: &str, items: &[ConfigurationItem]) -> ::se
 /// `configurationStateMd5Hash` (AWS Config Developer Guide, *Example configuration
 /// snapshot*). Rendering the file from the API projection is what keeps the two from
 /// drifting: a member the item does not carry is absent from both.
-fn delivered_configuration_item(item: &ConfigurationItem) -> ::serde_json::Value {
+pub fn delivered_configuration_item(item: &ConfigurationItem) -> ::serde_json::Value {
     let mut rendered = super::configuration_item_document(item);
     for (api_member, file_member) in [
         ("arn", "ARN"),

@@ -29,9 +29,10 @@ use std::time::{Duration, SystemTime};
 
 use super::{
     compliance_change_detail, publish_service_event_via, run_remediation_actions, service_state,
-    ComAmazonawsConfigserviceStarlingdoveserviceState, DiscoveredResourceEntry,
-    EvaluationResultEntry, COMPLIANCE_CHANGE_DETAIL_TYPE, COMPLIANCE_TYPE_COMPLIANT,
-    COMPLIANCE_TYPE_NON_COMPLIANT, CONFIG_RULE_STATE_ACTIVE, EVALUATION_MODE_DETECTIVE, OWNER_AWS,
+    stream_recorded_item_changes, ComAmazonawsConfigserviceStarlingdoveserviceState,
+    DiscoveredResourceEntry, EvaluationResultEntry, RecordedItemChange,
+    COMPLIANCE_CHANGE_DETAIL_TYPE, COMPLIANCE_TYPE_COMPLIANT, COMPLIANCE_TYPE_NON_COMPLIANT,
+    CONFIG_RULE_STATE_ACTIVE, EVALUATION_MODE_DETECTIVE, OWNER_AWS,
 };
 use crate::ops::types::{Scope, Source};
 
@@ -39,11 +40,45 @@ use crate::ops::types::{Scope, Source};
 /// `com.amazonaws.configservice#ResourceType` value.
 pub const S3_BUCKET_RESOURCE_TYPE: &str = "AWS::S3::Bucket";
 
+/// The resource type Config records an Amazon SQS queue under, a
+/// `com.amazonaws.configservice#ResourceType` value.
+pub const SQS_QUEUE_RESOURCE_TYPE: &str = "AWS::SQS::Queue";
+
 /// The resource types this emulator's configuration recorder can OBSERVE: the ones
 /// whose service it serves and whose configuration that service's own API reports.
 /// A recorder records the intersection of these and the resource types its recording
 /// group names, so a recording group of `allSupported` records exactly these.
-pub const OBSERVABLE_RESOURCE_TYPES: [&str; 1] = [S3_BUCKET_RESOURCE_TYPE];
+pub const OBSERVABLE_RESOURCE_TYPES: [&str; 2] =
+    [S3_BUCKET_RESOURCE_TYPE, SQS_QUEUE_RESOURCE_TYPE];
+
+/// The queue attributes a configuration item records as an Amazon SQS queue's
+/// CONFIGURATION, in the spelling Amazon SQS names them by.
+///
+/// Source: the attributes `GetQueueAttributes` reports
+/// (`com.amazonaws.sqs#QueueAttributeName`), less the ones that are not how the queue is
+/// configured: the three `ApproximateNumberOfMessages*` values count the messages the
+/// queue HOLDS, and `CreatedTimestamp` and `LastModifiedTimestamp` say when it was created
+/// and last changed — none of which a later observation of an unchanged queue would report
+/// the same way, so recording them would record a changed configuration item for a queue
+/// nothing changed.
+const RECORDED_QUEUE_ATTRIBUTES: [&str; 16] = [
+    "ContentBasedDeduplication",
+    "DeduplicationScope",
+    "DelaySeconds",
+    "FifoQueue",
+    "FifoThroughputLimit",
+    "KmsDataKeyReusePeriodSeconds",
+    "KmsMasterKeyId",
+    "MaximumMessageSize",
+    "MessageRetentionPeriod",
+    "Policy",
+    "QueueArn",
+    "ReceiveMessageWaitTimeSeconds",
+    "RedriveAllowPolicy",
+    "RedrivePolicy",
+    "SqsManagedSseEnabled",
+    "VisibilityTimeout",
+];
 
 /// How long after the call that makes one due Config runs the next
 /// recording-and-evaluation pass.
@@ -348,16 +383,21 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// keeps the instant Config FIRST recorded it and the states it has already left,
     /// and a deleted resource keeps its entry carrying the instant it went away — a
     /// discovered-resource read can be asked to include deleted resources.
+    ///
+    /// Answers the configuration items the pass RECORDED, which are the ones the delivery
+    /// channel owes a change notification for; an observation of a resource that is still
+    /// in the state its held item records contributes none.
     pub fn record_observed(
         &mut self,
         resource_type: &str,
         observed: Vec<DiscoveredResourceEntry>,
         now: SystemTime,
-    ) {
+    ) -> Vec<RecordedItemChange> {
+        let mut recorded = Vec::new();
         let mut seen: BTreeSet<(String, String)> = BTreeSet::new();
         for entry in observed {
             seen.insert((entry.resource_type.clone(), entry.resource_id.clone()));
-            self.record_discovered_resource(entry);
+            recorded.extend(self.record_discovered_resource(entry));
         }
         let gone: Vec<DiscoveredResourceEntry> = self
             .discovered_resources
@@ -372,8 +412,9 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
             })
             .collect();
         for entry in gone {
-            self.record_discovered_resource(entry);
+            recorded.extend(self.record_discovered_resource(entry));
         }
+        recorded
     }
 
     /// Evaluate the account's rules over the recorded resources in their scope as of
@@ -505,15 +546,25 @@ pub async fn run_due_recording_pass<Eng: Send + Sync + 'static>(
                 observed.push((resource_type, buckets));
             }
         }
+        if resource_type == SQS_QUEUE_RESOURCE_TYPE {
+            if let Some(queues) = observed_sqs_queues(callback, region, now).await {
+                observed.push((resource_type, queues));
+            }
+        }
     }
 
-    let changes = {
+    let (recorded, changes) = {
         let mut store = state.lock();
+        let mut recorded = Vec::new();
         for (resource_type, entries) in observed {
-            store.record_observed(resource_type, entries, now);
+            recorded.extend(store.record_observed(resource_type, entries, now));
         }
-        store.evaluate_recorded_resources(now)
+        (recorded, store.evaluate_recorded_resources(now))
     };
+
+    // Each configuration item the pass recorded is streamed to the delivery channel's
+    // Amazon SNS topic, which is what a consumer subscribed to that topic receives.
+    stream_recorded_item_changes(callback, engine, region, &recorded, now).await;
 
     // What the account has standing instructions to remediate: the resources a verdict
     // just placed at NON_COMPLIANT under a rule whose remediation configuration is
@@ -732,6 +783,129 @@ async fn observed_s3_buckets(
         });
     }
     Some(observed)
+}
+
+/// The configuration items the recorder observes for this Region's Amazon SQS queues, or
+/// `None` when Amazon SQS could not be read at all — which is not the same as an account
+/// with no queues.
+///
+/// Every member of the recorded configuration document comes from an Amazon SQS read named
+/// on it; nothing else is recorded, because nothing else is observed. A queue whose
+/// attributes could not be read contributes no item rather than one recording an empty
+/// configuration.
+async fn observed_sqs_queues(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+    now: SystemTime,
+) -> Option<Vec<DiscoveredResourceEntry>> {
+    let client = sqs_client(callback, region);
+    // "Returns a list of your queues in the current region" (`ListQueues`): a
+    // configuration recorder records the resources of ONE Region, the one its own account
+    // and Region stand for, which is the Region this client is built for.
+    let listed = match client.list_queues().send().await {
+        Ok(listed) => listed,
+        Err(error) => {
+            ::tracing::warn!(
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                "the configuration recorder could not read this account's Amazon SQS queues"
+            );
+            return None;
+        }
+    };
+
+    let mut observed = Vec::new();
+    for queue_url in listed.queue_urls() {
+        // "The queue name" is the last segment of a queue's url
+        // (`https://sqs.<region>.amazonaws.com/<account>/<name>`), and it is the queue's
+        // custom name; the url itself is how Amazon SQS addresses the queue and is what
+        // identifies it, so it is the id the configuration item records.
+        let Some(name) = queue_url.rsplit('/').next().filter(|name| !name.is_empty()) else {
+            continue;
+        };
+        // `GetQueueAttributes`' `Attributes`, asked for in full and recorded as the
+        // queue's configuration where the attribute is one.
+        let attributes = match client
+            .get_queue_attributes()
+            .queue_url(queue_url)
+            .attribute_names(::aws_sdk_sqs::types::QueueAttributeName::All)
+            .send()
+            .await
+        {
+            Ok(answer) => answer.attributes.unwrap_or_default(),
+            Err(error) => {
+                ::tracing::warn!(
+                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                    "the configuration recorder could not read an Amazon SQS queue's attributes"
+                );
+                continue;
+            }
+        };
+        let mut configuration = ::serde_json::Map::new();
+        for (attribute, value) in &attributes {
+            if RECORDED_QUEUE_ATTRIBUTES.contains(&attribute.as_str()) {
+                configuration.insert(
+                    attribute.as_str().to_string(),
+                    ::serde_json::Value::String(value.clone()),
+                );
+            }
+        }
+        // `ListQueueTags`' `Tags`: the tags a rule's scope can narrow by.
+        let tags: BTreeMap<String, String> = client
+            .list_queue_tags()
+            .queue_url(queue_url)
+            .send()
+            .await
+            .ok()
+            .and_then(|answer| answer.tags)
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+
+        observed.push(DiscoveredResourceEntry {
+            resource_type: SQS_QUEUE_RESOURCE_TYPE.to_string(),
+            resource_id: queue_url.to_string(),
+            resource_name: Some(name.to_string()),
+            deleted_at: None,
+            // The schema version of a configuration item Config itself recorded is not one
+            // a caller supplied, and this emulator has no catalogue of them, so none is
+            // reported rather than an invented one.
+            schema_version_id: None,
+            configuration: Some(::serde_json::Value::Object(configuration).to_string()),
+            // Amazon SQS reports a queue's whole configuration through one call, so there
+            // is no further block to supplement it with.
+            supplementary_configuration: BTreeMap::new(),
+            tags,
+            first_recorded_at: Some(now),
+            last_recorded_at: Some(now),
+            // The states this queue has already left are kept by the store's own write
+            // path, which carries them over from the item this one replaces.
+            history: Vec::new(),
+        });
+    }
+    Some(observed)
+}
+
+/// An Amazon SQS client over the in-process callback, built the way [`s3_client`] is: the
+/// emulator supplies the transport, so there is nothing to retry, time out, cache an
+/// identity for or watch for a stalled stream.
+fn sqs_client(
+    callback: &smithy_server_runtime::EmbeddedEmulator,
+    region: &str,
+) -> ::aws_sdk_sqs::Client {
+    let config = ::aws_sdk_sqs::Config::builder()
+        .behavior_version(::aws_sdk_sqs::config::BehaviorVersion::latest())
+        .region(::aws_sdk_sqs::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://sqs.{region}.amazonaws.com"))
+        .credentials_provider(callback.aws_credentials_provider())
+        .http_client(callback.http_client())
+        .retry_config(::aws_sdk_sqs::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_sqs::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_sqs::config::IdentityCache::no_cache())
+        .stalled_stream_protection(
+            ::aws_sdk_sqs::config::StalledStreamProtectionConfig::disabled(),
+        )
+        .build();
+    ::aws_sdk_sqs::Client::from_conf(config)
 }
 
 /// An S3 client over the in-process callback.

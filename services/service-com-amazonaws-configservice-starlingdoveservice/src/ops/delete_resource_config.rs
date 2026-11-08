@@ -166,63 +166,81 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        let region = crate::state::request_region(ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
         })?;
 
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
+        // The whole store-touching half of the operation: the deletion is recorded under
+        // the store's guard, and the guard is released before the notification that item
+        // owes is streamed.
+        let recorded = {
+            let mut store = state.lock();
 
-        // A deletion is recorded as a configuration item like any other, so Config
-        // records it only while a configuration recorder is recording.
-        if store.recording_recorder().is_none() {
-            return Err(
-                DeleteResourceConfigErrorModeled::NoRunningConfigurationRecorderException(
-                    NoRunningConfigurationRecorderException {
-                        message: Some(
-                            crate::state::no_running_configuration_recorder_message(Self::NAME),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
+            // A deletion is recorded as a configuration item like any other, so Config
+            // records it only while a configuration recorder is recording.
+            if store.recording_recorder().is_none() {
+                return Err(
+                    DeleteResourceConfigErrorModeled::NoRunningConfigurationRecorderException(
+                        NoRunningConfigurationRecorderException {
+                            message: Some(
+                                crate::state::no_running_configuration_recorder_message(
+                                    Self::NAME,
+                                ),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
 
-        // No registration precondition is judged here: recording that a resource went
-        // away takes no schema to read a configuration document against, so this half of
-        // the lifecycle accepts the resource type it is handed and answers out of what
-        // the inventory holds for it.
-        let key = (input.resource_type.clone(), input.resource_id.clone());
-        let Some(held) = store.discovered_resources.get(&key) else {
-            // Config holds no configuration state for this resource, so there is none
-            // whose deletion could be recorded, and this operation models no error for
-            // a resource that was never recorded: the call is accepted and the
-            // inventory is left exactly as it was, rather than gaining an entry for a
-            // resource Config never saw.
-            return Ok(DeleteResourceConfigOutput);
+            // No registration precondition is judged here: recording that a resource went
+            // away takes no schema to read a configuration document against, so this half
+            // of the lifecycle accepts the resource type it is handed and answers out of
+            // what the inventory holds for it.
+            let key = (input.resource_type.clone(), input.resource_id.clone());
+            let Some(held) = store.discovered_resources.get(&key) else {
+                // Config holds no configuration state for this resource, so there is none
+                // whose deletion could be recorded, and this operation models no error for
+                // a resource that was never recorded: the call is accepted and the
+                // inventory is left exactly as it was, rather than gaining an entry for a
+                // resource Config never saw.
+                return Ok(DeleteResourceConfigOutput);
+            };
+            if held.deleted_at.is_some() {
+                // The resource's current configuration item ALREADY records its deletion,
+                // and the resource has not gone through another state since, so there is
+                // no further deletion to record: the item that records it stands, carrying
+                // the instant it was captured at.
+                return Ok(DeleteResourceConfigOutput);
+            }
+
+            // "This API records a new ConfigurationItem with a ResourceDeleted status":
+            // the new item is the resource as it was last recorded, now carrying the
+            // instant it went away — which is what
+            // [`crate::state::DiscoveredResourceEntry::configuration_item_status`] reports
+            // `ResourceDeleted` from — while the item it replaces becomes one of the
+            // states the resource has left, so the configuration recorded for it stays
+            // readable in its history.
+            let deleted = crate::state::DiscoveredResourceEntry {
+                deleted_at: Some(now),
+                last_recorded_at: Some(now),
+                ..held.clone()
+            };
+            store.record_discovered_resource(deleted)
         };
-        if held.deleted_at.is_some() {
-            // The resource's current configuration item ALREADY records its deletion,
-            // and the resource has not gone through another state since, so there is no
-            // further deletion to record: the item that records it stands, carrying the
-            // instant it was captured at.
-            return Ok(DeleteResourceConfigOutput);
-        }
 
-        // "This API records a new ConfigurationItem with a ResourceDeleted status": the
-        // new item is the resource as it was last recorded, now carrying the instant it
-        // went away — which is what
-        // [`crate::state::DiscoveredResourceEntry::configuration_item_status`] reports
-        // `ResourceDeleted` from — while the item it replaces becomes one of the states
-        // the resource has left, so the configuration recorded for it stays readable in
-        // its history.
-        let deleted = crate::state::DiscoveredResourceEntry {
-            deleted_at: Some(now),
-            last_recorded_at: Some(now),
-            ..held.clone()
-        };
-        store.record_discovered_resource(deleted);
+        // The configuration item recording the deletion is streamed to the delivery
+        // channel's Amazon SNS topic, like every other item Config records.
+        crate::state::stream_recorded_item_changes(
+            ctx.callback(),
+            &*self.engine,
+            &region,
+            recorded.as_slice(),
+            now,
+        )
+        .await;
 
         Ok(DeleteResourceConfigOutput)
     }

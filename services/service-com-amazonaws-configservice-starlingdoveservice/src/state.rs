@@ -133,10 +133,10 @@ pub const RECORDING_FREQUENCY_CONTINUOUS: &str = "CONTINUOUS";
 pub const RECORDING_FREQUENCY_DAILY: &str = "DAILY";
 
 /// `ConfigurationItemStatus` values
-/// (`com.amazonaws.configservice#ConfigurationItemStatus`): the configuration of the
-/// resource has been recorded (`OK`), the resource has been discovered but its
-/// configuration was not recorded (`ResourceDiscovered`), and the resource has been
-/// deleted (`ResourceDeleted`).
+/// (`com.amazonaws.configservice#ConfigurationItemStatus`), as that member's own
+/// documentation states them: "the resource configuration has been updated" (`OK`), "the
+/// resource was newly discovered" (`ResourceDiscovered`), and "the resource was deleted"
+/// (`ResourceDeleted`).
 pub const CONFIGURATION_ITEM_STATUS_OK: &str = "OK";
 /// See [`CONFIGURATION_ITEM_STATUS_OK`].
 pub const CONFIGURATION_ITEM_STATUS_RESOURCE_DISCOVERED: &str = "ResourceDiscovered";
@@ -2339,9 +2339,49 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
     /// [`crate::ops::put_resource_config::ACTIVE_CUSTOM_RESOURCES_QUOTA`] is what a
     /// caller meets first, with the modelled `MaxActiveResourcesExceededException`; this
     /// bound is what holds whatever any future writer does.
-    pub fn record_discovered_resource(&mut self, entry: DiscoveredResourceEntry) {
+    ///
+    /// Answers the configuration item this write RECORDED — the notification the delivery
+    /// channel owes for it ([`change_notification`]) is derived from that — and `None` for
+    /// an observation that recorded no item at all, because the resource is still in the
+    /// state the held item records. Every writer of the inventory goes through here, so
+    /// each owes the notification for what it recorded and nothing owes one for what it
+    /// did not.
+    pub fn record_discovered_resource(
+        &mut self,
+        entry: DiscoveredResourceEntry,
+    ) -> Option<RecordedItemChange> {
         let key = (entry.resource_type.clone(), entry.resource_id.clone());
         let mut entry = entry;
+        // What KIND of configuration item this write records, read off the item the
+        // inventory holds BEFORE this one replaces it: the resource's first item, an item
+        // recording a state it changed into, the item recording that it is gone, or no item
+        // at all.
+        let held = self.discovered_resources.get(&key);
+        let recorded = if entry.last_recorded_at.is_none() {
+            // This write captures no item: there is no instant one was captured at, so
+            // there is no item to stream either.
+            None
+        } else {
+            match held {
+                // A resource the inventory holds no captured item for is being DISCOVERED
+                // by this write, whatever else it already holds about it.
+                None => Some((CHANGE_TYPE_CREATE, None)),
+                Some(held) if held.last_recorded_at.is_none() => {
+                    Some((CHANGE_TYPE_CREATE, None))
+                }
+                Some(held) if !held.records_another_state(&entry) => None,
+                Some(held) if entry.deleted_at.is_some() && held.deleted_at.is_none() => {
+                    Some((CHANGE_TYPE_DELETE, Some(held.recorded_state())))
+                }
+                Some(held) => Some((CHANGE_TYPE_UPDATE, Some(held.recorded_state()))),
+            }
+        };
+        let change = recorded.map(|(change_type, previous)| RecordedItemChange {
+            resource_type: entry.resource_type.clone(),
+            resource_id: entry.resource_id.clone(),
+            change_type,
+            previous,
+        });
         // A resource the inventory already holds keeps the instant Config FIRST
         // recorded it and the states it has already left; the state it is leaving now
         // joins them when this item records a DIFFERENT state, which is what makes the
@@ -2397,6 +2437,7 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
             };
             self.discovered_resources.remove(&key);
         }
+        change
     }
 
     /// The configuration recorder that is RECORDING right now, if any: Config
@@ -2744,6 +2785,13 @@ pub use remediation::*;
 // the modules above so a handler reaches its names as `crate::state::<name>`.
 pub mod snapshot_delivery;
 pub use snapshot_delivery::*;
+
+// What a RECORDED configuration item is STREAMED as — the change notification the delivery
+// channel publishes to its Amazon SNS topic, carrying the item and the diff from the item
+// it replaced — lives in `state/change_notification.rs`, re-exported here like the modules
+// above so a handler reaches its names as `crate::state::<name>`.
+pub mod change_notification;
+pub use change_notification::*;
 
 /// This service's store in the shared engine: call it with a handler's `&*self.engine`.
 ///
@@ -4041,7 +4089,7 @@ pub fn rfc3339_instant(at: SystemTime) -> Option<String> {
 /// comes from this process's own clock, so the fallback is unreachable; it is logged
 /// rather than silently emitted, because a member with an empty value would be
 /// indistinguishable from one a notification does not carry.
-fn event_instant(at: SystemTime) -> String {
+pub(crate) fn event_instant(at: SystemTime) -> String {
     rfc3339_instant(at).unwrap_or_else(|| {
         ::tracing::warn!("an evaluation instant could not be stated as RFC 3339");
         String::new()
