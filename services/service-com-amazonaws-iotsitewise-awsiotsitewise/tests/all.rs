@@ -716,6 +716,11 @@ mod portal_lifecycle;
 mod portal_update;
 #[path = "all/property_value_history.rs"]
 mod property_value_history;
+// In the sorted list, beside the sibling logging suites' concern rather than
+// appended after the list: the END of this file is where every concurrent
+// iotsitewise change appends a declaration of its own.
+#[path = "all/put_logging_options_workspace_registry.rs"]
+mod put_logging_options_workspace_registry;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
 #[path = "all/single_property_aggregates.rs"]
