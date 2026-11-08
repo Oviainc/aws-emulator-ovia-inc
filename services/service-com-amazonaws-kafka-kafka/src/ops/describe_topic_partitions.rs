@@ -23,9 +23,12 @@
 //! refused on its KIND with [`crate::state::serverless_topic_apis_unsupported`]
 //! before the topic is looked up.
 //!
-//! REPORTING ONLY: the one write it makes is the one `observable_topic_in`
-//! materialises — a transition the clock already owed THIS topic, due at the same
-//! instant whether or not anybody called.
+//! REPORTING ONLY: the writes it makes are the ones the settling lookups
+//! materialise — transitions the clock already owed THIS topic and THIS cluster,
+//! each due at the same instant whether or not anybody called. The cluster is
+//! resolved that way because the brokers a partition's replicas are laid out over
+//! come off its record, and an accepted broker-count update installs them when its
+//! operation falls due.
 //!
 //! ## Shape of an operation
 //!
@@ -337,12 +340,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .unwrap_or(MAX_RESULTS_LIMIT as usize)
             .clamp(1, MAX_RESULTS_LIMIT as usize);
 
+        let now = std::time::SystemTime::now();
         let mut state = state.lock();
 
         // The partitions of a topic are held BY a cluster, so a `ClusterArn` this
         // endpoint's region holds no cluster for names a resource that is not
         // there.
-        let Some(cluster) = state.cluster_in(&region, &input.cluster_arn) else {
+        //
+        // Resolved through the SETTLING lookup because the brokers below come off
+        // that record: the broker set an accepted broker-count update installs is
+        // owed at the instant that operation was due, whether or not anybody read
+        // the cluster since, so this reader reports the partitions over the brokers
+        // the cluster holds AT `now` rather than the ones it held before the update
+        // landed.
+        let Some(cluster) = state.settled_cluster_in(&region, &input.cluster_arn, now) else {
             return Err(DescribeTopicPartitionsErrorModeled::NotFoundException(
                 NotFoundException {
                     invalid_parameter: Some("ClusterArn".to_string()),
@@ -388,11 +399,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // derivation every topic reader uses, so a topic a running replicator
         // carries onto this cluster reports its partitions here exactly while
         // `DescribeTopic` reports the topic itself.
-        let Some(topic) = state.observable_topic_in(
-            &input.cluster_arn,
-            &input.topic_name,
-            std::time::SystemTime::now(),
-        ) else {
+        let Some(topic) = state.observable_topic_in(&input.cluster_arn, &input.topic_name, now)
+        else {
             return Err(DescribeTopicPartitionsErrorModeled::NotFoundException(
                 NotFoundException {
                     invalid_parameter: Some("TopicName".to_string()),

@@ -21,7 +21,11 @@
 //!   [`crate::state::topic_name_error`]) is a `BadRequestException`;
 //! * a `ReplicationFactor` above the cluster's broker count is a
 //!   `BadRequestException`: Kafka cannot place more replicas of a partition than
-//!   it has brokers to place them on;
+//!   it has brokers to place them on. The count it is judged against is the one
+//!   the cluster holds at the instant of the call, so the brokers an accepted
+//!   broker-count update installs are available to this check as soon as that
+//!   operation falls due — the cluster is resolved through the settling lookup, as
+//!   every other operation that answers from a cluster's own values does;
 //! * a name the cluster already holds a topic for is a `TopicExistsException`,
 //!   leaving the existing topic untouched;
 //! * a cluster already at [`crate::state::MAX_TOPICS_PER_CLUSTER`] topics answers
@@ -247,13 +251,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        let now = std::time::SystemTime::now();
         let mut state = state.lock();
 
         // A topic is created ON a cluster, so a `ClusterArn` this endpoint's region
         // holds no cluster for names a resource that is not there: reported as the
         // 404 every other topic operation answers for it, with the service's own
         // not-found wording.
-        let Some(cluster) = state.cluster_in(&region, &input.cluster_arn) else {
+        //
+        // Resolved through the SETTLING lookup because the broker count below comes
+        // off that record: the count an accepted broker-count update installs is
+        // owed at the instant that operation was due, whether or not anybody read
+        // the cluster since, so the replication factor is bounded by the brokers the
+        // cluster holds AT `now` rather than by the ones it held before the update
+        // landed.
+        let Some(cluster) = state.settled_cluster_in(&region, &input.cluster_arn, now) else {
             return Err(
                 CreateTopicErrorModeled::NotFoundException(NotFoundException {
                     invalid_parameter: Some("ClusterArn".to_string()),
@@ -288,7 +300,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
-        let now = std::time::SystemTime::now();
         let topic = crate::state::Topic::created(
             cluster,
             input.topic_name,

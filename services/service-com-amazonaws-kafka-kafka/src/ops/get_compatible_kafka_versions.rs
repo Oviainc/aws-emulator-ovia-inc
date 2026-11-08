@@ -15,7 +15,11 @@
 //!
 //! A `ClusterArn` that is not shaped like an MSK cluster ARN is a
 //! `BadRequestException`; a well-formed one this endpoint's region holds no cluster
-//! for is a `NotFoundException`. This operation only REPORTS: it writes nothing.
+//! for is a `NotFoundException`. This operation only REPORTS: the one write it
+//! makes is the materialisation of a transition the clock already owed the cluster
+//! it was asked about — an accepted Apache Kafka version update whose completion
+//! fell due — because the version the cluster RUNS is what the ladder is derived
+//! from.
 //!
 //! Authentication is NOT this handler's business: the emulator verifies every
 //! request signature centrally (see `AGENTS.md`), so the modelled
@@ -190,11 +194,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .into());
                 }
                 let region = crate::state::request_region(ctx.parts());
-                // Reporting only, so the registry is read and never written: which
-                // versions a cluster can move to does not depend on its status, so
-                // this handler has no clock-owed transition to materialise.
-                let store = state.lock();
-                let Some(cluster) = store.cluster_in(&region, cluster_arn) else {
+                // The one write this reporting path makes is the materialisation of
+                // the transitions the clock already owed THIS cluster, each due at
+                // the same instant whether or not anybody asked: the ladder below is
+                // answered from the version the cluster RUNS, and the version an
+                // accepted Apache Kafka version update installs is owed when that
+                // operation was due, so this reader must resolve the cluster as of
+                // `now` or it would publish the ladder of a version the cluster has
+                // already left.
+                let mut store = state.lock();
+                let Some(cluster) =
+                    store.settled_cluster_in(&region, cluster_arn, std::time::SystemTime::now())
+                else {
                     return Err(GetCompatibleKafkaVersionsErrorModeled::NotFoundException(
                         NotFoundException {
                             invalid_parameter: Some("ClusterArn".to_string()),
