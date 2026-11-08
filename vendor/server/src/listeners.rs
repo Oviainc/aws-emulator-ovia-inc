@@ -11,7 +11,7 @@
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
@@ -19,6 +19,7 @@ use parking_lot::Mutex;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{watch, Semaphore};
 
+use crate::TlsCertificateAuthority;
 use crate::listener_guard::{
     caps, classify_browser_request, is_loopback_host, is_websocket_upgrade,
     parse_listener_port_range, BrowserVerdict, PortRange, RemoteOrigins, SurfaceError,
@@ -29,6 +30,9 @@ use crate::listener_guard::{
 /// dropped, so a client that completes TCP but stalls the handshake cannot hold
 /// a connection permit open (slowloris).
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// ALPN protocols an `http()` listener offers: HTTP/2 and HTTP/1.1.
+const HTTP_LISTENER_ALPN: &[&[u8]] = &[b"h2", b"http/1.1"];
 
 /// Resolve the interface the resource listeners bind. This is the SAME
 /// operator control the main emulator port uses ([`crate::bind_address_from_env`]
@@ -163,14 +167,11 @@ impl Default for HttpPolicy {
 }
 
 /// The agent-facing listener handle, reached via `engine.listeners()`. Cheap
-/// to construct; the shared TLS material is generated lazily on first use.
+/// to construct: every listener presents the process's one
+/// [`TlsCertificateAuthority`], made on first use, so a client that trusts the
+/// emulator's `ca.pem` reaches every listener too.
 pub struct Listeners {
-    tls: OnceLock<TlsMaterial>,
-}
-
-struct TlsMaterial {
-    cert_der: Vec<u8>,
-    key_der: Vec<u8>,
+    _private: (),
 }
 
 impl Default for Listeners {
@@ -181,53 +182,17 @@ impl Default for Listeners {
 
 impl Listeners {
     pub fn new() -> Self {
-        Self { tls: OnceLock::new() }
+        Self { _private: () }
     }
 
-    fn tls(&self) -> Result<&TlsMaterial, SurfaceError> {
-        if let Some(m) = self.tls.get() {
-            return Ok(m);
-        }
-        rustls::crypto::aws_lc_rs::default_provider().install_default().ok();
-        // SANs must cover every interface a listener may bind, or a client that
-        // verifies the hostname gets a mismatch against the address the control
-        // plane announced. Always cover loopback (v4 and v6); add the
-        // operator-chosen bind address when it is a specific routable literal. A
-        // wildcard bind (0.0.0.0/::) has no single reachable address to name — a
-        // verifying client there must pin or trust this self-signed cert.
-        let mut sans = vec![
-            "localhost".to_string(),
-            "127.0.0.1".to_string(),
-            "::1".to_string(),
-        ];
-        if let Ok(ip) = crate::bind_address_from_env() {
-            if !ip.is_unspecified() {
-                let s = ip.to_string();
-                if !sans.contains(&s) {
-                    sans.push(s);
-                }
-            }
-        }
-        let cert = rcgen::generate_simple_self_signed(sans)
-        .map_err(|e| SurfaceError::Tls(e.to_string()))?;
-        let m = TlsMaterial {
-            cert_der: cert.cert.der().to_vec(),
-            key_der: cert.key_pair.serialize_der(),
-        };
-        let _ = self.tls.set(m);
-        Ok(self.tls.get().expect("tls material set above"))
-    }
-
-    fn rustls_server_config(&self) -> Result<Arc<rustls::ServerConfig>, SurfaceError> {
-        use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-        let m = self.tls()?;
-        let cert = CertificateDer::from(m.cert_der.clone());
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(m.key_der.clone()));
-        let cfg = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert], key)
+    /// The rustls config every listener starts from: the process certificate, no ALPN.
+    /// The certificate names loopback and the operator-chosen bind address, so a
+    /// client that verifies the hostname matches the address [`ResourceListener::url`]
+    /// reports.
+    fn rustls_server_config(&self) -> Result<rustls::ServerConfig, SurfaceError> {
+        let ca = TlsCertificateAuthority::covering(None)
             .map_err(|e| SurfaceError::Tls(e.to_string()))?;
-        Ok(Arc::new(cfg))
+        ca.server_config().map_err(|e| SurfaceError::Tls(e.to_string()))
     }
 
     /// Open a native-protocol (TCP) listener, TLS-only, on the configured
@@ -250,7 +215,7 @@ impl Listeners {
         handler: H,
         idle: Duration,
     ) -> Result<ResourceListener, SurfaceError> {
-        let server_config = self.rustls_server_config()?;
+        let server_config = Arc::new(self.rustls_server_config()?);
         let acceptor = tokio_rustls::TlsAcceptor::from(server_config);
         serve_native(handler, idle, Some(acceptor)).await
     }
@@ -277,7 +242,7 @@ impl Listeners {
     /// The certificate, key and rustls configuration stay in the core: the
     /// handler can only run the server side of a handshake on its connection.
     pub fn tls_upgrader(&self) -> Result<TlsUpgrader, SurfaceError> {
-        Ok(TlsUpgrader { config: self.rustls_server_config()? })
+        Ok(TlsUpgrader { config: Arc::new(self.rustls_server_config()?) })
     }
 }
 
@@ -418,13 +383,9 @@ impl Listeners {
         handler: H,
         policy: HttpPolicy,
     ) -> Result<ResourceListener, SurfaceError> {
-        let m = self.tls()?;
-        let tls_config = axum_server::tls_rustls::RustlsConfig::from_der(
-            vec![m.cert_der.clone()],
-            m.key_der.clone(),
-        )
-        .await
-        .map_err(|e| SurfaceError::Tls(e.to_string()))?;
+        let mut server_config = self.rustls_server_config()?;
+        server_config.alpn_protocols = HTTP_LISTENER_ALPN.iter().map(|p| p.to_vec()).collect();
+        let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(Arc::new(server_config));
 
         let bind_ip = bind_ip_from_env()?;
         let std_listener = bind_std(bind_ip, listener_port_range_from_env()?)?;
@@ -751,7 +712,9 @@ enum Shutdown {
 }
 
 impl ResourceListener {
-    /// The loopback host the listener is bound to (e.g. `127.0.0.1`).
+    /// The address the listener is bound to (e.g. `127.0.0.1`, or `0.0.0.0` on a
+    /// wildcard bind). To hand a client an endpoint, use [`url`](Self::url), or
+    /// [`authority`](Self::authority) for a field without a scheme.
     pub fn host(&self) -> String {
         self.addr.ip().to_string()
     }
@@ -762,6 +725,29 @@ impl ResourceListener {
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
+    /// The URL a client connects to, such as `https://127.0.0.1:52811`: always
+    /// `https`, loopback for a wildcard bind (which has no single address to dial),
+    /// and an IPv6 address in brackets. Append the resource's own path to it.
+    pub fn url(&self) -> String {
+        format!("https://{}", self.authority())
+    }
+    /// The `host:port` a client dials, such as `127.0.0.1:52811` or `[::1]:52811`:
+    /// the host [`url`](Self::url) names, without the scheme. Use it for a field an
+    /// AWS API returns without a scheme, such as an OpenSearch domain's `Endpoint`.
+    pub fn authority(&self) -> String {
+        authority_for(self.addr)
+    }
+}
+
+/// The `host:port` a client dials for a listener bound on `addr`: loopback for a wildcard
+/// bind, an IPv6 address in brackets. See [`ResourceListener::authority`].
+pub(crate) fn authority_for(addr: SocketAddr) -> String {
+    SocketAddr::new(crate::dialable_host(addr.ip()), addr.port()).to_string()
+}
+
+/// The `https` URL a client dials for a listener bound on `addr`; see [`ResourceListener::url`].
+pub(crate) fn url_for(addr: SocketAddr) -> String {
+    format!("https://{}", authority_for(addr))
 }
 
 impl Drop for ResourceListener {
@@ -804,5 +790,31 @@ mod host_allowed_tests {
         assert!(host_allowed("127.0.0.1", routable));
         assert!(!host_allowed("10.0.0.6", routable));
         assert!(!host_allowed("evil.example", routable));
+    }
+
+    #[test]
+    fn url_is_https_dials_loopback_for_a_wildcard_and_brackets_ipv6() {
+        let url = |addr: &str| url_for(addr.parse().unwrap());
+        assert_eq!(url("127.0.0.1:52811"), "https://127.0.0.1:52811");
+        assert_eq!(url("[::1]:52811"), "https://[::1]:52811");
+        assert_eq!(url("0.0.0.0:52811"), "https://127.0.0.1:52811");
+        assert_eq!(url("[::]:52811"), "https://[::1]:52811");
+        assert_eq!(url("10.0.0.5:443"), "https://10.0.0.5:443");
+        assert_eq!(url("[fd00::5]:443"), "https://[fd00::5]:443");
+    }
+
+    #[test]
+    fn authority_is_the_url_without_its_scheme() {
+        let authority = |addr: &str| authority_for(addr.parse().unwrap());
+        // Loopback as itself; IPv6 bracketed; a wildcard bind dials loopback.
+        assert_eq!(authority("127.0.0.1:52811"), "127.0.0.1:52811");
+        assert_eq!(authority("[::1]:52811"), "[::1]:52811");
+        assert_eq!(authority("[fd00::5]:443"), "[fd00::5]:443");
+        assert_eq!(authority("0.0.0.0:52811"), "127.0.0.1:52811");
+        assert_eq!(authority("[::]:52811"), "[::1]:52811");
+        for addr in ["127.0.0.1:1", "[::]:2", "10.0.0.5:3"] {
+            let addr = addr.parse().unwrap();
+            assert_eq!(url_for(addr), format!("https://{}", authority_for(addr)));
+        }
     }
 }

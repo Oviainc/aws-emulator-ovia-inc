@@ -79,15 +79,7 @@ impl FromStr for Telemetry {
 /// An AWS SDK credentials provider for a connector that vended `credentials`: its access key,
 /// or placeholder keys when it vends none (authentication off accepts any signature).
 pub fn aws_credentials_provider(credentials: &[VendedCredentials]) -> SharedCredentialsProvider {
-    let (key, secret) = credentials
-        .iter()
-        .find_map(|vended| match vended {
-            VendedCredentials::AwsAccessKey {
-                access_key_id,
-                secret_access_key,
-            } => Some((access_key_id.as_str(), secret_access_key.as_str())),
-        })
-        .unwrap_or(("EMULATORPLACEHOLDER", "placeholder"));
+    let (key, secret) = signing_key_pair(credentials);
     SharedCredentialsProvider::new(aws_credential_types::Credentials::new(
         key,
         secret,
@@ -95,6 +87,20 @@ pub fn aws_credentials_provider(credentials: &[VendedCredentials]) -> SharedCred
         None,
         "aws-emulator",
     ))
+}
+
+/// The SigV4 key id and secret a connector that vended `credentials` signs with: its access
+/// key, or placeholder keys when it vends none (authentication off accepts any signature).
+pub fn signing_key_pair(credentials: &[VendedCredentials]) -> (&str, &str) {
+    credentials
+        .iter()
+        .find_map(|vended| match vended {
+            VendedCredentials::AwsAccessKey {
+                access_key_id,
+                secret_access_key,
+            } => Some((access_key_id.as_str(), secret_access_key.as_str())),
+        })
+        .unwrap_or(("EMULATORPLACEHOLDER", "placeholder"))
 }
 
 #[cfg(test)]

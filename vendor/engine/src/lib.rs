@@ -27,7 +27,12 @@
 //!   upgrade, the core-owned `.tls_upgrader()`. The service never binds a socket, chooses a port, or configures TLS
 //!   itself — the core owns the socket, TLS and bind interface and returns the host
 //!   and port to report in the control plane's endpoint fields, so a client connects
-//!   with its normal driver.
+//!   with its normal driver. Report an HTTP endpoint as `listener.url()` (or
+//!   `listener.authority()` for a `host:port` field without a scheme), never a
+//!   `format!` of `host()` and `port()`, which breaks on a wildcard or IPv6 bind. A
+//!   URL a caller fetches later (one the modeled operation returns presigned) comes
+//!   from `ctx.url_signer()`, and the base URL of an output member that carries a
+//!   resource's address from `ctx.endpoint()`, not from a listener of the service's own.
 //!
 //! **Never fabricate a result:** do not echo the input back as the output, do not
 //! pattern-match source text, and do not hand-write an evaluator or engine for a

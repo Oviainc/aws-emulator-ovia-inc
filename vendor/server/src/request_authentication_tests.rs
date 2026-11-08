@@ -303,3 +303,148 @@ fn vended_credentials_debug_redacts_the_secret() {
         "{printed}"
     );
 }
+
+/// What a later caller sends for a URL `presign_url` signed: the URL's path and query, with the
+/// `Host` it connects to and any headers the signer bound.
+fn fetched(url: &str, method: &str, headers: &[(&str, &str)]) -> http::request::Parts {
+    let rest = url.strip_prefix("https://127.0.0.1:8443").expect("the endpoint is kept");
+    let mut builder = http::Request::builder().method(method).uri(rest);
+    builder = builder.header("host", "127.0.0.1:8443");
+    for (name, value) in headers {
+        builder = builder.header(*name, *value);
+    }
+    builder.body(()).unwrap().into_parts().0
+}
+
+fn presigned(
+    signing_name: &str,
+    path: &str,
+    query: &[(&str, &str)],
+    headers: &[(&str, &str)],
+    signed_at: SystemTime,
+) -> String {
+    let target = PresignTarget {
+        endpoint: "https://127.0.0.1:8443",
+        method: "GET",
+        signing_name,
+        region: "us-west-2",
+        path,
+        query,
+        headers,
+    };
+    presign_url(&target, KEY, SECRET, signed_at, 600).expect("signable")
+}
+
+#[test]
+fn presigned_s3_keys_with_spaces_plus_and_encoded_slashes_verify() {
+    for key in ["/b/with space", "/b/a+b", "/b/a%2Fb", "/b/dir/k~1.txt", "/b/naïve"] {
+        let url = presigned("s3", key, &[("response-content-type", "a/b+c")], &[], SystemTime::now());
+        let parts = fetched(&url, "GET", &[]);
+        let decoded = percent_encoding::percent_decode_str(parts.uri.path()).decode_utf8().unwrap();
+        assert_eq!(decoded, key, "the path decodes back to the key");
+        assert_eq!(emulator().verify(&parts, b"", "s3", &store()), Ok(()), "{key}: {url}");
+    }
+}
+
+#[test]
+fn presigned_urls_for_other_signing_names_verify_with_an_empty_body() {
+    let url = presigned("lambda", "/2015-03-31/functions/f", &[], &[], SystemTime::now());
+    let parts = fetched(&url, "GET", &[]);
+    assert_eq!(emulator().verify(&parts, b"", "lambda", &store()), Ok(()), "{url}");
+    assert_eq!(emulator().verify(&parts, b"x", "lambda", &store()), Err(SIGNATURE_MISMATCH));
+}
+
+#[test]
+fn a_presigned_put_with_a_body_verifies_for_any_signing_name_with_the_payload_header() {
+    for (signing_name, path) in [("lambda", "/2015-03-31/functions/f"), ("s3", "/b/k")] {
+        let target = PresignTarget {
+            endpoint: "https://127.0.0.1:8443",
+            method: "PUT",
+            signing_name,
+            region: "us-west-2",
+            path,
+            query: &[],
+            headers: &[("content-type", "application/json")],
+        };
+        let url = presign_url(&target, KEY, SECRET, SystemTime::now(), 600).expect("signable");
+        let mut sent = vec![("content-type", "application/json")];
+        sent.extend(presigned_payload_header(signing_name, "PUT"));
+        let parts = fetched(&url, "PUT", &sent);
+        let body = br#"{"Code":"any body"}"#;
+        assert_eq!(emulator().verify(&parts, body, signing_name, &store()), Ok(()), "{url}");
+    }
+    assert_eq!(
+        presigned_payload_header("lambda", "PUT"),
+        Some(("x-amz-content-sha256", "UNSIGNED-PAYLOAD"))
+    );
+    assert_eq!(presigned_payload_header("lambda", "GET"), None);
+    assert_eq!(presigned_payload_header("s3", "PUT"), None);
+}
+
+#[test]
+fn a_presigned_put_sent_without_its_payload_header_is_refused() {
+    let target = PresignTarget {
+        endpoint: "https://127.0.0.1:8443",
+        method: "PUT",
+        signing_name: "lambda",
+        region: "us-west-2",
+        path: "/2015-03-31/functions/f",
+        query: &[],
+        headers: &[],
+    };
+    let url = presign_url(&target, KEY, SECRET, SystemTime::now(), 600).expect("signable");
+    let parts = fetched(&url, "PUT", &[]);
+    assert_eq!(emulator().verify(&parts, b"body", "lambda", &store()), Err(SIGNATURE_MISMATCH));
+}
+
+#[test]
+fn a_header_the_signer_bound_must_be_sent_as_signed() {
+    let bound = [("content-type", "image/png")];
+    let url = presigned("s3", "/b/k", &[], &bound, SystemTime::now());
+    let sent = fetched(&url, "GET", &bound);
+    assert_eq!(emulator().verify(&sent, b"", "s3", &store()), Ok(()));
+    let changed = fetched(&url, "GET", &[("content-type", "text/html")]);
+    assert_eq!(emulator().verify(&changed, b"", "s3", &store()), Err(SIGNATURE_MISMATCH));
+}
+
+#[test]
+fn a_presigned_url_is_refused_once_tampered_or_expired() {
+    let url = presigned("s3", "/b/k", &[], &[], SystemTime::now());
+    let tampered = fetched(&url.replace("/b/k?", "/b/other?"), "GET", &[]);
+    assert_eq!(emulator().verify(&tampered, b"", "s3", &store()), Err(SIGNATURE_MISMATCH));
+    let an_hour_ago = SystemTime::now() - Duration::from_secs(3600);
+    let expired = fetched(&presigned("s3", "/b/k", &[], &[], an_hour_ago), "GET", &[]);
+    assert_eq!(emulator().verify(&expired, b"", "s3", &store()), Err(ACCESS_DENIED));
+}
+
+#[test]
+fn a_target_without_a_rooted_path_is_not_signed() {
+    let target = PresignTarget {
+        endpoint: "https://127.0.0.1:8443",
+        method: "GET",
+        signing_name: "s3",
+        region: "us-west-2",
+        path: "b/k",
+        query: &[],
+        headers: &[],
+    };
+    assert_eq!(presign_url(&target, KEY, SECRET, SystemTime::now(), 600), None);
+}
+
+/// The verifier refuses a validity of more than seven days, so the signer does not mint one.
+#[test]
+fn a_validity_the_verifier_refuses_is_not_signed() {
+    let target = PresignTarget {
+        endpoint: "https://127.0.0.1:8443",
+        method: "GET",
+        signing_name: "s3",
+        region: "us-west-2",
+        path: "/b/k",
+        query: &[],
+        headers: &[],
+    };
+    let now = SystemTime::now();
+    assert!(presign_url(&target, KEY, SECRET, now, MAX_PRESIGNED_EXPIRES_SECS).is_some());
+    assert_eq!(presign_url(&target, KEY, SECRET, now, MAX_PRESIGNED_EXPIRES_SECS + 1), None);
+    assert_eq!(presign_url(&target, KEY, SECRET, now, 0), None);
+}

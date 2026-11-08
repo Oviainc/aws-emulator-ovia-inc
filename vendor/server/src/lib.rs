@@ -28,6 +28,9 @@ pub mod embedded;
 /// The PKCS#12 trust store published next to `ca.pem` for JVM clients.
 pub mod java_truststore;
 
+mod tls_certificate_authority;
+pub use tls_certificate_authority::TlsCertificateAuthority;
+
 /// Resource-listener surfaces: the agent-facing `tcp()`/`http()` listeners a generated
 /// service opens for a resource (RDS Postgres port, API Gateway invoke URL),
 /// plus the pure transport-safety enforcement the core owns for them.
@@ -182,6 +185,14 @@ pub trait EmulatorService: Clone + Send + Sync + 'static {
         &self,
         req: http::Request<bytes::Bytes>,
     ) -> impl std::future::Future<Output = http::Response<bytes::Bytes>> + Send;
+
+    /// Called once the data port is bound and before it serves, with the URL clients reach it
+    /// at (`https://host:port`, the shared config's `endpoint_url`). A service that hands out
+    /// addresses of itself records it here; the default ignores it. A wrapper forwards it to
+    /// the service it wraps.
+    fn serving_at(&self, endpoint_url: &str) {
+        let _ = endpoint_url;
+    }
 }
 
 /// Shared logic for `HttpConnector::call()`. Called by macro-generated code.
@@ -1219,19 +1230,28 @@ pub async fn serve_production_on_address<S: EmulatorService>(
         .install_default()
         .ok();
 
-    let client_host = match bind_address {
-        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
-        ip if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
-        ip => ip,
-    };
-    let cert = self_signed_certificate(client_host).map_err(|e| ServeError::Tls(e.to_string()))?;
+    let client_host = dialable_host(bind_address);
+    let ca = TlsCertificateAuthority::covering(Some(client_host))
+        .map_err(|e| ServeError::Tls(e.to_string()))?;
+    if !ca.covers(client_host) {
+        return Err(ServeError::Tls(format!(
+            "this process's TLS certificate was made before the data port and does not name \
+             {client_host}; set {BIND_ADDRESS_ENV}={client_host} so every listener covers it"
+        )));
+    }
     let tls_config = axum_server::tls_rustls::RustlsConfig::from_config(
-        data_listener_tls_config(&cert).map_err(|e| ServeError::Tls(e.to_string()))?,
+        data_listener_tls_config(ca).map_err(|e| ServeError::Tls(e.to_string()))?,
     );
 
     // Bind before announcing so the logged address is the REAL post-bind port
     // — essential when the port is `0` (OS-assigned).
     let (data_listener, data_addr) = bind_production_listener(bind_address, data_port)?;
+    let port = data_addr.port();
+
+    // The one published address of the data port: the shared config's `endpoint_url` and the
+    // base of every URL the service hands out are this one value, so they cannot disagree.
+    let endpoint_url = listeners::url_for(SocketAddr::new(client_host, port));
+    service.serving_at(&endpoint_url);
 
     // The router is wrapped in panic containment: a panic in ANY operation
     // handler, extra route, or health probe is answered with a protocol-shaped
@@ -1257,18 +1277,17 @@ pub async fn serve_production_on_address<S: EmulatorService>(
     if let Some(file) = &credentials_file {
         tracing::info!(credentials_file = %file.0.display(), "request authentication enabled");
     }
-    let port = data_addr.port();
-    let ca_file = request_authentication::write_emulator_file(port, "ca.pem", &cert.cert.pem())
+    let ca_file = request_authentication::write_emulator_file(port, "ca.pem", &ca.pem())
         .map_err(ServeError::Io)?;
     // JVMs ignore `ca.pem`; they trust the emulator through this store, named by
     // `-Djavax.net.ssl.trustStore` (see `java_truststore`).
     let java_truststore_file = request_authentication::write_emulator_bytes(
         port,
         java_truststore::FILE_NAME,
-        &java_truststore::emulator_only(cert.cert.der()),
+        &ca.pkcs12_trust_store(),
     )
     .map_err(ServeError::Io)?;
-    let config_text = shared_config_text(SocketAddr::new(client_host, port), &ca_file.0);
+    let config_text = shared_config_text(&endpoint_url, &ca_file.0);
     let config_file = request_authentication::write_emulator_file(port, "config", &config_text)
         .map_err(ServeError::Io)?;
 
@@ -1308,11 +1327,14 @@ pub async fn serve_production_on_address<S: EmulatorService>(
     Ok(())
 }
 
-/// The HTTPS certificate, for `localhost`, `127.0.0.1`, `::1` and the address clients dial; clients trust
-/// it as its own CA through `ca.pem`.
-fn self_signed_certificate(client_host: IpAddr) -> Result<rcgen::CertifiedKey, rcgen::Error> {
-    let names = ["localhost", "127.0.0.1", "::1", &client_host.to_string()].map(String::from);
-    rcgen::generate_simple_self_signed(names)
+/// The address a client dials to reach a listener bound on `bind_address`: the address itself,
+/// or loopback for a wildcard bind, which has no single address to name.
+pub(crate) fn dialable_host(bind_address: IpAddr) -> IpAddr {
+    match bind_address {
+        IpAddr::V6(ip) if ip.is_unspecified() => IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+        ip if ip.is_unspecified() => IpAddr::V4(Ipv4Addr::LOCALHOST),
+        ip => ip,
+    }
 }
 
 /// ALPN protocols the data listener offers: HTTP/1.1 only.
@@ -1328,27 +1350,21 @@ fn self_signed_certificate(client_host: IpAddr) -> Result<rcgen::CertifiedKey, r
 /// HTTP/2 streaming.
 const DATA_LISTENER_ALPN: &[&[u8]] = &[b"http/1.1"];
 
-/// The rustls server config for the data listener: the self-signed `cert`, no
+/// The rustls server config for the data listener: the process certificate `ca`, no
 /// client auth, and [`DATA_LISTENER_ALPN`].
 fn data_listener_tls_config(
-    cert: &rcgen::CertifiedKey,
+    ca: &TlsCertificateAuthority,
 ) -> Result<Arc<rustls::ServerConfig>, rustls::Error> {
-    use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-    let mut config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(
-            vec![CertificateDer::from(cert.cert.der().to_vec())],
-            PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der())),
-        )?;
+    let mut config = ca.server_config()?;
     config.alpn_protocols = DATA_LISTENER_ALPN.iter().map(|p| p.to_vec()).collect();
     Ok(Arc::new(config))
 }
 
 /// The AWS shared config (`AWS_CONFIG_FILE`) that points an SDK or the CLI at this emulator.
-fn shared_config_text(endpoint: SocketAddr, ca_file: &std::path::Path) -> String {
+fn shared_config_text(endpoint_url: &str, ca_file: &std::path::Path) -> String {
     let ca_file = ca_file.display();
     format!(
-        "[default]\nregion = us-east-1\nendpoint_url = https://{endpoint}\nca_bundle = {ca_file}\n\
+        "[default]\nregion = us-east-1\nendpoint_url = {endpoint_url}\nca_bundle = {ca_file}\n\
          s3 =\n  signature_version = s3v4\n"
     )
 }
@@ -1587,6 +1603,10 @@ impl<S: EmulatorService> EmulatorService for WithExtraRoutes<S> {
             return (route.handler)(req).await;
         }
         self.smithy.handle_request(req).await
+    }
+
+    fn serving_at(&self, endpoint_url: &str) {
+        self.smithy.serving_at(endpoint_url);
     }
 }
 
@@ -2144,8 +2164,7 @@ mod tests {
         use rustls::client::danger::ServerCertVerifier;
         use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-        let cert = self_signed_certificate(IpAddr::V4(Ipv4Addr::LOCALHOST)).unwrap();
-        let der = CertificateDer::from(cert.cert.der().to_vec());
+        let der = CertificateDer::from(TlsCertificateAuthority::for_this_process().der().to_vec());
         let mut roots = rustls::RootCertStore::empty();
         roots.add(der.clone()).unwrap();
         let verifier = rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
@@ -2158,9 +2177,18 @@ mod tests {
     }
 
     #[test]
+    fn a_wildcard_bind_is_dialed_on_loopback_and_an_address_as_itself() {
+        let dial = |bind: &str| dialable_host(bind.parse().unwrap()).to_string();
+        check!(dial("0.0.0.0") == "127.0.0.1");
+        check!(dial("::") == "::1");
+        check!(dial("10.0.0.5") == "10.0.0.5");
+        check!(dial("::1") == "::1");
+    }
+
+    #[test]
     fn the_shared_config_names_the_region_endpoint_ca_bundle_and_s3_sigv4() {
-        let endpoint = SocketAddr::from((Ipv4Addr::LOCALHOST, 9297));
-        let text = shared_config_text(endpoint, std::path::Path::new("/h/.emulator/9297/ca.pem"));
+        let endpoint = listeners::url_for(SocketAddr::from((Ipv4Addr::LOCALHOST, 9297)));
+        let text = shared_config_text(&endpoint, std::path::Path::new("/h/.emulator/9297/ca.pem"));
         check!(
             text == "[default]\nregion = us-east-1\nendpoint_url = https://127.0.0.1:9297\nca_bundle = /h/.emulator/9297/ca.pem\ns3 =\n  signature_version = s3v4\n"
         );
@@ -2489,9 +2517,6 @@ mod tests {
 
     #[tokio::test]
     async fn serve_production_serves_health_and_data_over_one_tls_port() {
-        // A fixed non-conflicting test port (the real emulator uses 9297).
-        let data_port: u16 = 18444;
-
         // Mount the AWS surface plus an admin-style extra route to prove the
         // wrapped EmulatorService (WithExtraRoutes) is what gets served.
         let svc = WithExtraRoutes::new(EchoService).route(
@@ -2505,18 +2530,9 @@ mod tests {
             },
         );
 
-        let server = tokio::spawn(async move {
-            let _ = serve_production_on(svc, data_port).await;
-        });
-
-        // Poll rather than sleep a fixed interval: a fixed sleep flakes against a
-        // server that has not finished binding its port yet.
+        let (data_port, server) = serve_production_on_a_free_port(svc).await;
         let client = tls_client();
         let health_url = format!("https://127.0.0.1:{data_port}{HEALTH_PATH}");
-        check!(
-            wait_until_serving(&client, &health_url).await,
-            "the listener must bind"
-        );
 
         // 1) Health on the data port answers 200 "ok" over HTTPS.
         let health = client
@@ -2564,6 +2580,62 @@ mod tests {
             .expect("tls client")
     }
 
+    /// A service that reports the URL `serve_production_on` hands its `serving_at`, so a test
+    /// can serve on an OS-assigned port and still learn which one.
+    #[derive(Clone)]
+    struct ReportsItsUrl<S> {
+        inner: S,
+        url: Arc<Mutex<Option<tokio::sync::oneshot::Sender<String>>>>,
+    }
+
+    impl<S: EmulatorService> EmulatorService for ReportsItsUrl<S> {
+        fn handle_request(
+            &self,
+            req: http::Request<bytes::Bytes>,
+        ) -> impl std::future::Future<Output = http::Response<bytes::Bytes>> + Send {
+            self.inner.handle_request(req)
+        }
+
+        fn serving_at(&self, endpoint_url: &str) {
+            self.inner.serving_at(endpoint_url);
+            if let Some(report) = self.url.lock().take() {
+                let _ = report.send(endpoint_url.to_string());
+            }
+        }
+    }
+
+    /// Serve `svc` through `serve_production_on` on an OS-assigned port, and return that port
+    /// once health answers on it. A fixed port fails whenever anything else on the host holds
+    /// it, such as the same suite building for another platform on a shared build host. A
+    /// serve that ends before binding fails the test with the serve's own error.
+    async fn serve_production_on_a_free_port<S: EmulatorService>(
+        svc: S,
+    ) -> (u16, tokio::task::JoinHandle<Result<(), ServeError>>) {
+        let (report, reported) = tokio::sync::oneshot::channel();
+        let svc = ReportsItsUrl {
+            inner: svc,
+            url: Arc::new(Mutex::new(Some(report))),
+        };
+        let server = tokio::spawn(serve_production_on(svc, 0));
+        let endpoint_url =
+            match tokio::time::timeout(std::time::Duration::from_secs(10), reported).await {
+                Ok(Ok(url)) => url,
+                Ok(Err(_)) => panic!("the emulator ended before binding: {:?}", server.await),
+                Err(_) => panic!("the emulator did not bind its data port within 10s"),
+            };
+        let port: u16 = endpoint_url
+            .rsplit(':')
+            .next()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or_else(|| panic!("no port in {endpoint_url}"));
+        let health_url = format!("https://127.0.0.1:{port}{HEALTH_PATH}");
+        check!(
+            wait_until_serving(&tls_client(), &health_url).await,
+            "the listener must bind"
+        );
+        (port, server)
+    }
+
     /// A JVM with no TLS code reaches the production listener once
     /// `JAVA_TOOL_OPTIONS` names the published `truststore.p12`, and fails the
     /// handshake without it. Skipped when no `JAVA_HOME/bin/java` is present.
@@ -2589,15 +2661,8 @@ mod tests {
             eprintln!("skipped: needs JDK 11 or later, found {major:?}");
             return;
         }
-        let data_port: u16 = 18451;
-        let server = tokio::spawn(async move {
-            let _ = serve_production_on(EchoService, data_port).await;
-        });
+        let (data_port, server) = serve_production_on_a_free_port(EchoService).await;
         let health_url = format!("https://127.0.0.1:{data_port}{HEALTH_PATH}");
-        check!(
-            wait_until_serving(&tls_client(), &health_url).await,
-            "the listener must bind"
-        );
 
         let store = emulator_paths::emulator_home()
             .unwrap()
@@ -4047,8 +4112,6 @@ mod tests {
         // serving health and the AWS surface, the same shape the launcher probes
         // and callers drive. A panic in a handler must not take down
         // the listener or its health answer.
-        let data_port: u16 = 18446;
-
         // The AWS surface plus a panicking EXTRA route, proving containment
         // covers the raw-route seam as well as Smithy dispatch.
         let svc = WithExtraRoutes::new(PanickingService::new()).route(
@@ -4057,16 +4120,9 @@ mod tests {
             |_req| async { panic!("an extra route panics too") },
         );
 
-        let server = tokio::spawn(async move {
-            let _ = serve_production_on(svc, data_port).await;
-        });
-
+        let (data_port, server) = serve_production_on_a_free_port(svc).await;
         let client = tls_client();
         let health_url = format!("https://127.0.0.1:{data_port}{HEALTH_PATH}");
-        check!(
-            wait_until_serving(&client, &health_url).await,
-            "the emulator must bind its listener"
-        );
 
         // 1) A panicking operation answers 500 over TLS.
         let panicked = client

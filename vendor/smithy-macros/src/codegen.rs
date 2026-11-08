@@ -676,11 +676,17 @@ pub fn extract_constraints(smithy_member: &Value, model: &HashMap<String, Value>
 /// case-sensitive equality refuses every such download: HeadObject answers a bare 400 and
 /// GetObject a `ValidationException`.
 ///
+/// `x-amz-sdk-checksum-algorithm` is modeled as the checksum algorithm set
+/// (`CRC32`, `CRC32C`, ...), but the AWS SDK for Swift sends `crc32` in lower case when
+/// the caller chose no algorithm, and S3 serves it: `crc32`, `CRC32` and `Crc32` all
+/// pass there, while a value outside the set is still refused. Enforcing the set as
+/// case-sensitive equality refuses every default Swift `PutObject` and `UploadPart`.
+///
 /// The set is still enforced, but matched without regard to ASCII case: `ENABLED`,
 /// `enabled` and `Enabled` pass, and any other value is refused as before. Every other
 /// bound on the member still applies.
 fn binds_a_client_cased_header(smithy_member: &Value) -> bool {
-    const CLIENT_CASED: [&str; 1] = ["x-amz-checksum-mode"];
+    const CLIENT_CASED: [&str; 2] = ["x-amz-checksum-mode", "x-amz-sdk-checksum-algorithm"];
     smithy_member
         .get("traits")
         .and_then(|t| t.get("smithy.api#httpHeader"))
@@ -1362,7 +1368,21 @@ mod tests {
         assert_eq!(bounded.length, Some((Some(1), Some(9))), "{bounded:?}");
     }
 
-    /// Case-insensitive matching is for that header alone: any other header, and a
+    /// `x-amz-sdk-checksum-algorithm` is sent in lower case by the AWS SDK for Swift and
+    /// S3 serves it, so its set is kept and matched without regard to case, under any
+    /// header casing.
+    #[test]
+    fn the_sdk_checksum_algorithm_header_member_matches_its_enum_set_ignoring_case() {
+        for header in ["x-amz-sdk-checksum-algorithm", "X-Amz-Sdk-Checksum-Algorithm"] {
+            let c = member_constraints(&format!(
+                r#"{{"target":"test#KeyType","traits":{{"smithy.api#httpHeader":"{header}"}}}}"#
+            ));
+            assert!(c.enum_values.is_some(), "{header} lost the set: {c:?}");
+            assert!(c.enum_ignores_case, "{header} matched exactly: {c:?}");
+        }
+    }
+
+    /// Case-insensitive matching is for those headers alone: any other header, and a
     /// member bound to none, matches its set exactly.
     #[test]
     fn only_the_client_cased_header_matches_ignoring_case() {

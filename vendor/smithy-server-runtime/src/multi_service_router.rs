@@ -39,6 +39,9 @@ pub struct MultiServiceRouter {
     authenticators: Vec<&'static dyn RequestAuthenticator>,
     /// Shared by every clone, so a handler's callback sees the credentials its emulator created.
     pub(crate) credential_store: std::sync::Arc<CredentialStore>,
+    /// The base URL every URL this router hands out names, shared by every clone and every
+    /// `UrlSigner` it made: `UNSERVED_URL_BASE` until `serving_at` or `set_url_base`.
+    pub(crate) url_base: std::sync::Arc<crate::endpoint::UrlBase>,
 }
 
 impl MultiServiceRouter {
@@ -85,6 +88,16 @@ impl MultiServiceRouter {
         if enabled {
             self.register_authenticator(SigV4Authenticator::for_this_process());
         }
+        self
+    }
+
+    /// The base URL this router's signed URLs and `OperationContext::endpoint` name while it
+    /// is not served on a port, in place of
+    /// [`UNSERVED_URL_BASE`](crate::endpoint::UNSERVED_URL_BASE). Shared by every clone.
+    /// Serving the router on its data port replaces it with the data port's URL. See
+    /// [`crate::endpoint`].
+    pub fn set_url_base(&mut self, base: crate::EndpointUrl) -> &mut Self {
+        self.url_base.set(base);
         self
     }
 
@@ -421,6 +434,11 @@ impl EmulatorService for MultiServiceRouter {
         req: http::Request<bytes::Bytes>,
     ) -> http::Response<bytes::Bytes> {
         self.dispatch(req).await
+    }
+
+    /// Records the data port's URL, so every URL the router hands out from now on names it.
+    fn serving_at(&self, endpoint_url: &str) {
+        self.url_base.serving_at(endpoint_url);
     }
 }
 

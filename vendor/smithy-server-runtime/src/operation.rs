@@ -28,7 +28,7 @@
 
 use crate::service::ServiceIdentity;
 use emulator_server::embedded::{aws_credentials_provider, SharedCredentialsProvider};
-use emulator_server::{CredentialStore, VendedCredentials};
+use emulator_server::{CredentialStore, TlsCertificateAuthority, VendedCredentials};
 use aws_smithy_runtime_api::client::http::{
     HttpClient, HttpConnector, HttpConnectorFuture, HttpConnectorSettings, SharedHttpClient,
     SharedHttpConnector,
@@ -113,6 +113,20 @@ impl EmbeddedEmulator {
     /// The emulator's SDK `HttpConnector`, for driving the emulator in-process
     /// directly (`connector.call(request)`) without building a full SDK client.
     ///
+    /// It also fetches a URL the emulator handed out while not served on a port (one under
+    /// [`UNSERVED_URL_BASE`](crate::UNSERVED_URL_BASE)): send a request whose URI is the
+    /// whole URL, with any headers [`SignedUrl::required_headers`](crate::SignedUrl::required_headers)
+    /// lists. It is routed by the URL's `X-Amz-Credential` and, with authentication on,
+    /// verified like any other request:
+    ///
+    /// ```ignore
+    /// use aws_smithy_runtime_api::client::orchestrator::HttpRequest;
+    /// use aws_smithy_types::body::SdkBody;
+    ///
+    /// let request = http::Request::get(url.as_str()).body(SdkBody::empty())?;
+    /// let response = emulator.http_connector().call(HttpRequest::try_from(request)?).await?;
+    /// ```
+    ///
     /// For the callback a handler reaches through
     /// [`OperationContext::callback`], the returned connector stamps the next
     /// [`CallbackRecursionDepth`] on every request so the router bounds a
@@ -138,6 +152,18 @@ impl EmbeddedEmulator {
     /// An AWS SDK credentials provider signing with [`credentials`](Self::credentials).
     pub fn aws_credentials_provider(&self) -> SharedCredentialsProvider {
         aws_credentials_provider(&self.credentials)
+    }
+
+    /// The TLS certificate every listener of this process presents: the data port and each
+    /// resource listener a service opens. A host trusts it to reach those listeners, as a
+    /// standalone client trusts the published `ca.pem`: `pem()` for `AWS_CA_BUNDLE` or
+    /// `curl --cacert`, `der()` for a rustls root store, `pkcs12_trust_store()` for a JVM.
+    ///
+    /// # Panics
+    ///
+    /// When the process cannot generate a key pair, which leaves it no TLS at all.
+    pub fn certificate_authority(&self) -> &TlsCertificateAuthority {
+        TlsCertificateAuthority::for_this_process()
     }
 
     /// Mark this handle as the in-process callback a handler uses to call another
@@ -260,6 +286,38 @@ impl<'a> OperationContext<'a> {
     /// same with authentication off; the credentials are just not checked.
     pub fn credential_store(&self) -> &CredentialStore {
         &self.callback.router.credential_store
+    }
+
+    /// SigV4 query-signs URLs a caller fetches later, which lead back to this emulator: use it
+    /// for any URL the modeled operation returns presigned. It signs for the region this
+    /// request was signed for unless the request names one. See
+    /// [`UrlSigner`](crate::UrlSigner).
+    pub fn url_signer(&self) -> crate::UrlSigner {
+        let region = crate::signed_url::signed_region(self.parts);
+        crate::UrlSigner::new(&self.callback.router, region)
+    }
+
+    /// The base URL a later request addresses, for an output member that carries a resource's
+    /// address: `scheme://host[:port]`, with no path, no signature and no expiry. Append the
+    /// resource's own path. Callers send normally signed requests to it.
+    ///
+    /// Returns the data port's URL when the emulator is served, and
+    /// [`UNSERVED_URL_BASE`](crate::endpoint::UNSERVED_URL_BASE) (`https://emulator.invalid`)
+    /// when it is not.
+    ///
+    /// The served URL is the shared config's `endpoint_url`. An unserved one (embedded, or a
+    /// test) a caller reaches in-process through [`EmbeddedEmulator::http_connector`]. It
+    /// names the same base [`url_signer`](Self::url_signer) signs for. See
+    /// [`crate::endpoint`].
+    ///
+    /// # Example
+    ///
+    /// ```ignore
+    /// let address = format!("{}/{resource_id}", ctx.endpoint().as_str());
+    /// output.resource_url = Some(address);
+    /// ```
+    pub fn endpoint(&self) -> crate::EndpointUrl {
+        self.callback.router.url_base.get()
     }
 }
 

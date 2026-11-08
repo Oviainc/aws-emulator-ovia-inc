@@ -468,6 +468,96 @@ fn signable_path<'p>(parts: &'p Parts, signed: &Signature) -> std::borrow::Cow<'
         .into()
 }
 
+/// SigV4's `UriEncode` for a query name or value: only the unreserved characters stay, so a
+/// `+` is sent as `%2B` and never read back as a space.
+const QUERY_ENCODE_SET: &percent_encoding::AsciiSet = &S3_PATH_ENCODE_SET.add(b'/');
+
+/// One request a later caller sends to a URL [`presign_url`] signs.
+pub struct PresignTarget<'a> {
+    /// `https://host:port`, the listener the caller connects to; its host is signed.
+    pub endpoint: &'a str,
+    pub method: &'a str,
+    /// The signing name the target service verifies, such as `s3`.
+    pub signing_name: &'a str,
+    pub region: &'a str,
+    /// The path decoded: it is encoded here as [`SigV4Authenticator::verify`] reads it back.
+    pub path: &'a str,
+    /// Query fields beyond the signature's own, decoded.
+    pub query: &'a [(&'a str, &'a str)],
+    /// Headers the caller must send as given, such as a `content-type` on a `PUT`.
+    pub headers: &'a [(&'a str, &'a str)],
+}
+
+/// The header a caller must send with a presigned request to `signing_name` by `method`, so the
+/// request verifies whatever body it carries: `x-amz-content-sha256: UNSIGNED-PAYLOAD` for a
+/// method that sends a body (`PUT`, `POST`, `PATCH`) to a service outside the S3 family. Those
+/// services verify a body against its hash unless the request declares the payload unsigned,
+/// and the URL is signed before the body exists. An S3-family request needs none: a presigned
+/// S3 request is always verified with an unsigned payload. [`presign_url`] signs the header in.
+pub fn presigned_payload_header(
+    signing_name: &str,
+    method: &str,
+) -> Option<(&'static str, &'static str)> {
+    let sends_body = matches!(method, "PUT" | "POST" | "PATCH");
+    (sends_body && !signs_like_s3(signing_name)).then_some((X_AMZ_CONTENT_SHA256, UNSIGNED_PAYLOAD))
+}
+
+/// The marker a request declares in `x-amz-content-sha256` for a payload its signature leaves out.
+const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
+
+/// The SigV4 query-presigned URL for `target`, signed at `signed_at` with `key_id` and `secret`
+/// and valid for `expires_secs`: the form [`SigV4Authenticator::verify`] accepts, with the same
+/// signing settings and path encoding. The payload is left out of the signature where the
+/// verifier leaves it out: always for an S3-family target, and for any other target where
+/// [`presigned_payload_header`] names a header, which is signed in and which the caller must
+/// send. Any other target is signed for an empty body. `None` when the target cannot be signed
+/// (an empty path, a header that is not valid HTTP) or `expires_secs` is 0 or longer than the
+/// seven days the verifier accepts.
+///
+/// Handlers hand out URLs through the runtime's `UrlSigner`, which fills the endpoint and keys.
+pub fn presign_url(
+    target: &PresignTarget<'_>,
+    key_id: &str,
+    secret: &str,
+    signed_at: SystemTime,
+    expires_secs: u64,
+) -> Option<String> {
+    if expires_secs == 0 || expires_secs > MAX_PRESIGNED_EXPIRES_SECS {
+        return None;
+    }
+    fn encode(text: &str) -> percent_encoding::PercentEncode<'_> {
+        percent_encoding::utf8_percent_encode(text, QUERY_ENCODE_SET)
+    }
+    let path = percent_encoding::utf8_percent_encode(target.path, S3_PATH_ENCODE_SET).to_string();
+    let path = path.starts_with('/').then_some(path)?;
+    let mut query: Vec<String> = target
+        .query
+        .iter()
+        .map(|(name, value)| format!("{}={}", encode(name), encode(value)))
+        .collect();
+    let uri = match query.is_empty() {
+        true => format!("{}{path}", target.endpoint),
+        false => format!("{}{path}?{}", target.endpoint, query.join("&")),
+    };
+    let settings = signing_settings(target.signing_name, Some(expires_secs));
+    let credentials = aws_credential_types::Credentials::builder().provider_name("emulator");
+    let identity = credentials.access_key_id(key_id).secret_access_key(secret).build().into();
+    let params = aws_sigv4::sign::v4::SigningParams::builder().identity(&identity);
+    let params = params.region(target.region).name(target.signing_name);
+    let params = params.time(signed_at).settings(settings).build().ok()?.into();
+    let payload_header = presigned_payload_header(target.signing_name, target.method);
+    let body = match signs_like_s3(target.signing_name) || payload_header.is_some() {
+        true => SignableBody::UnsignedPayload,
+        false => SignableBody::Bytes(&[]),
+    };
+    let headers = target.headers.iter().copied().chain(payload_header);
+    let request = SignableRequest::new(target.method, &uri, headers, body).ok()?;
+    let (instructions, _) = sign(request, &params).ok()?.into_parts();
+    let (_, signature_fields) = instructions.into_parts();
+    query.extend(signature_fields.iter().map(|(name, value)| format!("{name}={}", encode(value))));
+    Some(format!("{}{path}?{}", target.endpoint, query.join("&")))
+}
+
 /// A declared marker (`UNSIGNED-PAYLOAD`, `STREAMING-...`) is signed as written; a declared hash
 /// is not trusted, the body is hashed instead.
 fn payload<'b>(parts: &Parts, body: &'b [u8], signed: &Signature) -> SignableBody<'b> {

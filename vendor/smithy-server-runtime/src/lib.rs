@@ -16,6 +16,7 @@ pub use axum;
 pub use http;
 pub use http_body_util;
 
+pub mod endpoint;
 pub mod errors;
 pub mod extract;
 pub mod multi_service_router;
@@ -23,6 +24,7 @@ pub mod operation;
 pub mod pre_dispatch;
 pub mod router;
 pub mod service;
+pub mod signed_url;
 pub mod virtual_host;
 pub mod wire;
 pub mod wire_protocol;
@@ -45,6 +47,11 @@ pub use service::{
 // The multi-service router: the emulator core that mounts N services and
 // dispatches each request to the one service that claims it.
 pub use multi_service_router::MultiServiceRouter;
+// The TLS root a host trusts this process's listeners by, and the URLs a handler hands out that
+// address this emulator.
+pub use emulator_server::TlsCertificateAuthority;
+pub use endpoint::{EndpointUrl, UNSERVED_URL_BASE};
+pub use signed_url::{SignError, SignedUrl, SignedUrlRequest, UrlSigner, MAX_SIGNED_URL_EXPIRY};
 // The virtual-hosted addresses a service's endpoint rules declare, and the host split.
 pub use virtual_host::{VirtualHost, VirtualHostAddressing};
 // Per-request protocol selection. The `#[smithy_service]` expansion builds a
