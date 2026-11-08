@@ -1452,6 +1452,46 @@ fn stated_preset(output: &Output) -> Option<&str> {
     output.preset.as_deref()
 }
 
+/// The audio descriptions and the video description ONE output is ENCODED from: its own, or
+/// those of the preset it names, resolved against `presets`.
+///
+/// An output states its encoder settings EXACTLY once
+/// ([`ComAmazonawsMediaconvertMediaconvertState::output_problem`]): either inline, in its own
+/// `AudioDescriptions`/`VideoDescription`, or by naming a preset — whose `PresetSettings`
+/// carry the very same two members, because a preset IS the encoder settings its outputs are
+/// written with. So anything that reads what an output is encoded with follows that one
+/// reference, exactly as the validation walk over the same graph resolves it; reading only
+/// the inline members would see nothing at all for an output that names a preset, since such
+/// an output is forbidden from carrying them.
+///
+/// A name the store does NOT hold supplies no description — a preset deleted after the job
+/// was submitted, which supplied none to the walk either — and so does an output that states
+/// nothing. The caller then reads no codec for that output rather than a fabricated one.
+fn output_descriptions<'a>(
+    output: &'a Output,
+    presets: &'a BTreeMap<String, PresetRecord>,
+) -> (&'a [AudioDescription], Option<&'a VideoDescription>) {
+    match stated_preset(output) {
+        Some(name) => presets
+            .get(name)
+            .map(|preset| {
+                (
+                    preset
+                        .settings
+                        .audio_descriptions
+                        .as_deref()
+                        .unwrap_or_default(),
+                    preset.settings.video_description.as_ref(),
+                )
+            })
+            .unwrap_or_default(),
+        None => (
+            output.audio_descriptions.as_deref().unwrap_or_default(),
+            output.video_description.as_ref(),
+        ),
+    }
+}
+
 /// Whether a `ContainerSettings` names the container its output is written in.
 ///
 /// `ContainerSettings$Container` is "Container for this output", and it is the ONE member
@@ -2836,8 +2876,16 @@ impl JobRecord {
     ///
     /// Each `JobsQueryFilterKey` is read off THIS record — the same state [`Self::view`]
     /// reports — so a query matches on what a reader of the job would see, never on the
-    /// text of the request that created it.
-    pub fn matches_filter(&self, key: &str, value: &str) -> bool {
+    /// text of the request that created it. A detail this record states as a REFERENCE to
+    /// another resource is resolved against the store that holds it before it is compared,
+    /// exactly as the validation walk over the same graph resolves it: `presets` is the
+    /// account's presets, which an output's `Preset` names (see [`output_descriptions`]).
+    pub fn matches_filter(
+        &self,
+        key: &str,
+        value: &str,
+        presets: &BTreeMap<String, PresetRecord>,
+    ) -> bool {
         match key {
             // "Your Queue's name or ARN", so either form resolves to the name of the
             // queue this job was sent to, and the name is then compared by the one test
@@ -2856,8 +2904,15 @@ impl JobRecord {
             JOBS_QUERY_FILTER_KEY_JOB_ENGINE_VERSION_USED => {
                 self.job_engine_version_used.as_deref() == Some(value)
             }
-            JOBS_QUERY_FILTER_KEY_AUDIO_CODEC => self.audio_codecs().any(|codec| codec == value),
-            JOBS_QUERY_FILTER_KEY_VIDEO_CODEC => self.video_codecs().any(|codec| codec == value),
+            // "audioCodec - Your output's audio codec" / "videoCodec - Your output's video
+            // codec": the codec an output is ENCODED with, which is the one its effective
+            // encoder settings state — its own descriptions, or the named preset's.
+            JOBS_QUERY_FILTER_KEY_AUDIO_CODEC => {
+                self.audio_codecs(presets).any(|codec| codec == value)
+            }
+            JOBS_QUERY_FILTER_KEY_VIDEO_CODEC => {
+                self.video_codecs(presets).any(|codec| codec == value)
+            }
             // "errorCode - The error code that your job failed with": the code the job
             // reports, which only a job that FAILED carries.
             JOBS_QUERY_FILTER_KEY_ERROR_CODE => self
@@ -2926,18 +2981,26 @@ impl JobRecord {
             .flat_map(|group| group.outputs.iter().flatten())
     }
 
-    /// The `Codec` of every audio description of every output of this job.
-    fn audio_codecs(&self) -> impl Iterator<Item = &str> + '_ {
+    /// The `Codec` of every audio description every output of this job is encoded from —
+    /// its own or its preset's ([`output_descriptions`]).
+    fn audio_codecs<'a>(
+        &'a self,
+        presets: &'a BTreeMap<String, PresetRecord>,
+    ) -> impl Iterator<Item = &'a str> + 'a {
         self.outputs()
-            .flat_map(|output| output.audio_descriptions.iter().flatten())
+            .flat_map(move |output| output_descriptions(output, presets).0)
             .filter_map(|description| description.codec_settings.as_ref())
             .filter_map(|settings| settings.codec.as_deref())
     }
 
-    /// The `Codec` of every output's video description.
-    fn video_codecs(&self) -> impl Iterator<Item = &str> + '_ {
+    /// The `Codec` of the video description every output of this job is encoded from — its
+    /// own or its preset's ([`output_descriptions`]).
+    fn video_codecs<'a>(
+        &'a self,
+        presets: &'a BTreeMap<String, PresetRecord>,
+    ) -> impl Iterator<Item = &'a str> + 'a {
         self.outputs()
-            .filter_map(|output| output.video_description.as_ref())
+            .filter_map(move |output| output_descriptions(output, presets).1)
             .filter_map(|description| description.codec_settings.as_ref())
             .filter_map(|settings| settings.codec.as_deref())
     }
@@ -3101,12 +3164,15 @@ impl JobsQueryRecord {
     /// has no term ONLY when the caller named no filter: a filter that would contribute
     /// none — no key, or no value to compare the key's job detail with — is refused when
     /// the query is started, so no filter list can widen a query by being dropped.
-    pub fn matches(&self, job: &JobRecord) -> bool {
+    ///
+    /// `presets` is the account's presets, which a filter key naming a detail an output
+    /// states by REFERENCE is resolved against ([`JobRecord::matches_filter`]).
+    pub fn matches(&self, job: &JobRecord, presets: &BTreeMap<String, PresetRecord>) -> bool {
         self.terms.is_empty()
             || self
                 .terms
                 .iter()
-                .any(|term| job.matches_filter(&term.key, &term.value))
+                .any(|term| job.matches_filter(&term.key, &term.value, presets))
     }
 
     /// The result page this query reports — the ids it matched and the cursor for the
@@ -4181,8 +4247,9 @@ impl ComAmazonawsMediaconvertMediaconvertState {
         }
         let id = mint_id(now, &mut self.jobs_query_sequence, &self.jobs_queries);
         let due = now + self.jobs_query_completes_after;
+        let presets = &self.presets;
         let page = page_of_jobs(
-            self.jobs.values().filter(|job| record.matches(job)),
+            self.jobs.values().filter(|job| record.matches(job, presets)),
             record.order.as_deref(),
             resume_from,
             record.max_results,

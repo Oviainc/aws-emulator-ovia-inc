@@ -79,6 +79,8 @@ mod job_template_settings_validation;
 mod job_templates;
 #[path = "all/jobs_query.rs"]
 mod jobs_query;
+#[path = "all/jobs_query_output_codecs.rs"]
+mod jobs_query_output_codecs;
 #[path = "all/list_jobs_queue_filter.rs"]
 mod list_jobs_queue_filter;
 #[path = "all/local_refusals_cost_no_input_read.rs"]
