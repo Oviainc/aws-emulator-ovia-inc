@@ -1,0 +1,96 @@
+Issue-Severity: HIGH
+Issue-Corpus: simparity-behavioral-aws-v1
+Issue-Corpus-Kind: behavioral
+Issue-Trace-Ids: scheduler.create-schedule-in-deleting-group-blocked scheduler.create-schedule-invalid-timezone-rejected scheduler.create-schedule-start-after-end-date scheduler.schedule-end-date-before-start-date-rejected scheduler.delete-schedule-group-cascade scheduler.schedule-group-lifecycle-cascade-delete scheduler.update-schedule-on-deleted-group-blocked scheduler.deploy-cfn-schedule-group-with-nested-schedule scheduler.schedule-start-end-date-timestamp-precision-preserved scheduler.schedule-start-end-date-timestamp-precision-round-trip scheduler.schedule-timestamp-precision-round-trip
+Issue-Shape-Id: com.amazonaws.scheduler#AWSChronosService
+Issue-Key: scheduler.create-schedule-in-deleting-group-blocked|run#25|AssertionError|assert rejection_message == expected, f"expected message {expected!r}, got {rejection_message!r}"
+Issue-Key: scheduler.create-schedule-invalid-timezone-rejected|run#12|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
+Issue-Key: scheduler.create-schedule-start-after-end-date|run#10|AssertionError|assert message == expected, f"expected message {expected!r}, got {message!r}"
+Issue-Key: scheduler.schedule-end-date-before-start-date-rejected|run#10|AssertionError|assert message == "The StartDate you specify must come before the EndDate.", (
+Issue-Key: scheduler.delete-schedule-group-cascade|run#15|AssertionError|assert member_error == ("ResourceNotFoundException", gone_message), (
+Issue-Key: scheduler|GetSchedule|ResourceNotFoundException
+Issue-Key: scheduler.update-schedule-on-deleted-group-blocked|run#19|AssertionError|assert get_err.get("Message") == expected_get_message, (
+Issue-Key: scheduler.schedule-start-end-date-timestamp-precision-preserved|run#18|AssertionError|assert got_end == expected_end, (
+Issue-Key: scheduler.schedule-start-end-date-timestamp-precision-round-trip|run#13|AssertionError|assert fetched["StartDate"] == expected_start, (
+Issue-Key: scheduler.schedule-timestamp-precision-round-trip|run#15|AssertionError|assert got_end == expected_end, (
+Issue-Commit: dd999dbcd4bb2e7cddb5a2ba7d5e91a60410d27b
+
+# scheduler: 5 net-new behavioral causes — three refusal messages diverge from AWS's wording, GetSchedule names the schedule when the GROUP is gone, and StartDate/EndDate truncate instead of rounding to the millisecond
+
+> _Note: this issue was identified against the code base at commit `dd999dbcd4bb2e7cddb5a2ba7d5e91a60410d27b`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
+
+## Operation
+CreateSchedule
+
+## Description
+Five distinct root causes in the EventBridge Scheduler control plane, found by replaying simparity-behavioral-aws-v1 against the emulator. Each must be closed before this issue is submitted; each cause below lists the failing check ids it is grounded in. None is marked ALREADY FILED or OWNED in the replay report. Open issue 20261030T010351Z-scheduler-wire-responses-drop-validationexception-messages-modeled-getschedule.md is related to Cause 4 (its Cause 7 covers DeleteSchedule, a different handler) and open issue 20261108T003827Z-scheduler-getschedule-rounds-startdate-enddate-down-a-millisecond.md is related to Cause 5 (same normaliser, reached from the wire corpus); neither carries the behavioral checks below.
+
+Cause 1 of 5: the ValidationException for a write addressed at a schedule group that is being deleted is worded by the emulator, not by AWS.
+AWS: CreateSchedule into a group in state DELETING is refused with HTTP 400 ValidationException (Smithy: CreateSchedule errors include ValidationException, httpError 400; the group-state vocabulary is ScheduleGroupState ACTIVE | DELETING). Recorded behavior: the Message is 'You cannot perform this operation because schedule group ' + the GroupName from the request + ' is being deleted.' The fixed text is 'You cannot perform this operation because schedule group ' and ' is being deleted.'; the only variable part is the group name taken from the request.
+Emulator: right status and right code (400 ValidationException), but the Message is 'Schedule group <GroupName> is being deleted.' — the whole leading clause AWS words the refusal with is missing.
+Why: callers and tooling that match the service's documented refusal text to distinguish 'the group is on its way out, re-create it' from other ValidationExceptions read the emulator's message as a different condition, and an assertion on the refusal text passes against AWS and fails against the emulator.
+Fix: the message helper crate::state::group_is_being_deleted and its one caller, the store.group_is_deleting branch of the CreateSchedule handler (see Traces for file/line).
+Traces: scheduler.create-schedule-in-deleting-group-blocked. Code: services/service-com-amazonaws-scheduler-awschronosservice/src/state.rs:442-444 (group_is_being_deleted); src/ops/create_schedule.rs:260-267.
+
+Cause 2 of 5: the ValidationException for an unknown ScheduleExpressionTimezone uses a different message class than AWS.
+AWS: ScheduleExpressionTimezone (Smithy: ScheduleExpressionTimezone, @length 1..50, 'The timezone in which the scheduling expression is evaluated') naming no IANA zone is refused with HTTP 400 ValidationException. Recorded behavior: the Message is 'Invalid timezone ' + the submitted zone value + '.' — fixed text 'Invalid timezone ' and the trailing '.', with the zone string taken verbatim from the request.
+Emulator: 400 ValidationException with 'Invalid Schedule Expression Timezone <value>.' — a message form this service does not produce (it conflates the zone refusal with the expression refusal class).
+Why: a client that branches on, or surfaces, the refusal text cannot tell an invalid zone from an invalid schedule expression; the message is the only place the service reports which member was rejected, so the diagnosis is wrong.
+Fix: the timezone-refusal message builder in the schedule-definition validation module (invalid_timezone), reached from both writing operations.
+Traces: scheduler.create-schedule-invalid-timezone-rejected. Code: services/service-com-amazonaws-scheduler-awschronosservice/src/state/schedule_definition.rs:221-223 (invalid_timezone) and :231-237 (schedule_expression_timezone_violation); callers src/ops/create_schedule.rs:208-222 and src/ops/update_schedule.rs.
+
+Cause 3 of 5: the ValidationException for a reversed StartDate/EndDate pair is worded by the emulator, not by AWS.
+AWS: a CreateSchedule whose StartDate is after its EndDate (Smithy: StartDate 'The date, in UTC, after which the schedule can begin invoking its target', EndDate 'The date, in UTC, before which the schedule can invoke its target', both plain timestamps) is refused with HTTP 400 ValidationException. Recorded behavior: the Message is the fixed sentence 'The StartDate you specify must come before the EndDate.' — entirely fixed text, with no part taken from the request.
+Emulator: 400 ValidationException with 'StartDate must be earlier than EndDate.' — a paraphrase this service never emits.
+Why: the sentence is the whole diagnostic payload of the refusal; a client or test that matches AWS's documented wording sees an unrecognised rejection, and operators reading emulator logs see text that does not exist in AWS.
+Fix: the window-violation message constant in the schedule-definition validation module (START_DATE_BEFORE_END_DATE, used by schedule_window_violation), reached from both writing operations.
+Traces: scheduler.create-schedule-start-after-end-date, scheduler.schedule-end-date-before-start-date-rejected. Code: services/service-com-amazonaws-scheduler-awschronosservice/src/state/schedule_definition.rs:240 (START_DATE_BEFORE_END_DATE) and :254-267 (schedule_window_violation).
+
+Cause 4 of 5: GetSchedule against a schedule group that does not exist reports the missing SCHEDULE instead of the missing GROUP.
+AWS: GetSchedule resolves the group named by the GroupName query parameter (Smithy: GetSchedule.GroupName -> ScheduleGroupName, httpQuery 'groupName') BEFORE the schedule, so when that group does not exist — including after DeleteScheduleGroup has cascaded away the group and every schedule in it — the ResourceNotFoundException (Smithy: GetSchedule errors include ResourceNotFoundException, httpError 404) names the group: fixed text 'Schedule group ' + the GroupName from the request + ' does not exist.' The schedule name never appears. Recorded behavior across four independent checks, including a CloudFormation-driven one. When the group DOES exist and only the schedule is absent, the message is 'Schedule ' + the Name + ' does not exist.' — the emulator already gets that case right, so only the group-missing branch diverges.
+Emulator: correct status and code (404 ResourceNotFoundException) but always the schedule form, 'Schedule <Name> does not exist.', because the GetSchedule handler never checks group existence: handle() settles the store and goes straight to the (group, name) map lookup, answering crate::state::schedule_does_not_exist on a miss. Note UpdateSchedule in the same flow DOES answer the group form, so the two reads of the same gone group disagree with each other.
+Why: the client cannot distinguish a deleted group from a deleted schedule, so reconciliation recreates the wrong resource — it re-creates a schedule into a group that is gone, which then fails for a third reason — and cascade-delete verification that asserts the group-form message fails against the emulator while passing against AWS.
+Fix: order the lookups in the GetSchedule handler so the group-existence branch runs first and uses the shared group-not-found helper crate::state::group_does_not_exist, exactly as CreateSchedule and UpdateSchedule do.
+Traces: scheduler.delete-schedule-group-cascade, scheduler.schedule-group-lifecycle-cascade-delete, scheduler.update-schedule-on-deleted-group-blocked, scheduler.deploy-cfn-schedule-group-with-nested-schedule. Code: services/service-com-amazonaws-scheduler-awschronosservice/src/ops/get_schedule.rs:191-204 (no group check before store.schedules.get); src/state.rs:431-433 (group_does_not_exist) and :451-453 (schedule_does_not_exist); the correct ordering already exists at src/ops/create_schedule.rs:245-252.
+
+Cause 5 of 5: StartDate/EndDate are normalised by TRUNCATING the sub-second remainder to a whole millisecond, where AWS rounds to the NEAREST millisecond.
+AWS: StartDate/EndDate are plain modelled timestamps (Smithy: CreateSchedule.StartDate -> StartDate, GetSchedule output StartDate/EndDate likewise) and the service holds them at millisecond resolution. Recorded behavior across three independent checks: a submitted sub-second remainder is reported back ROUNDED to the nearest millisecond — a remainder of 123456us comes back 123000us (rounds down) and one of 777777us comes back 778000us (rounds UP). The reported instant always has microsecond % 1000 == 0 and is the nearest millisecond to the submitted instant, never a flooring of it.
+Emulator: GetSchedule returns the submitted instant floored to the millisecond below (777777us -> 777000us, i.e. one millisecond earlier than AWS), because the normaliser computes subsec_nanos / 1_000_000 and multiplies back — integer truncation. The crate's own unit test asserts that flooring (999999ns -> 0), so the wrong rule is pinned by a test that must change with the fix.
+Why: a client that writes a schedule with a sub-second StartDate/EndDate and reads it back gets an instant AWS would never report, so an idempotent reconciler comparing desired-vs-actual timestamps sees a permanent diff and re-writes the schedule forever; for EndDate a one-millisecond-early close can also fall on the wrong side of a boundary check. Related open issue 20261108T003827Z-scheduler-getschedule-rounds-startdate-enddate-down-a-millisecond.md describes the same normaliser from the wire corpus and does not carry these behavioral checks.
+Fix: the instant normaliser in the schedule-definition module (to_millisecond_precision) must round to the nearest millisecond rather than truncate, and its unit test must be re-pinned to the rounding rule; it is applied on write by both writing handlers, so GetSchedule needs no change beyond echoing the stored instant.
+Traces: scheduler.schedule-start-end-date-timestamp-precision-preserved, scheduler.schedule-start-end-date-timestamp-precision-round-trip, scheduler.schedule-timestamp-precision-round-trip. Code: services/service-com-amazonaws-scheduler-awschronosservice/src/state/schedule_definition.rs:281-284 (to_millisecond_precision) and :404-427 (the an_instant_is_held_to_the_millisecond test); applied at src/ops/create_schedule.rs:300-304 and the equivalent in src/ops/update_schedule.rs.
+
+## Evidence
+Replay of simparity-behavioral-aws-v1: 52/73 checks passed (71.2%), 21 mismatched, 0 errored, 0 skipped; emulator serving (scheduler 52/66 passed). Of the 14 scheduler failures, 3 are OWNED by 20261023T191008Z-scheduler-eventbridge-scheduler-never-fires-a-schedule-no-invocation.md and excluded; the remaining 11 are the five causes below. In every message quoted, the bracketed parts are values taken from the request or from emulator state and the surrounding text is the fixed template; the concrete names/ids below are one run's values, not requirements.
+
+Cause 1 — scheduler.create-schedule-in-deleting-group-blocked: code ValidationException matches; message mismatch — expected 'You cannot perform this operation because schedule group <GroupName> is being deleted.', got 'Schedule group <GroupName> is being deleted.' (run: group sim2real-sched-dg-grp-9b137c66186f).
+
+Cause 2 — scheduler.create-schedule-invalid-timezone-rejected: code ValidationException matches; message mismatch — expected 'Invalid timezone <submitted zone>.', got 'Invalid Schedule Expression Timezone <submitted zone>.' (run: zone Not/ARealZone).
+
+Cause 3 — scheduler.create-schedule-start-after-end-date and scheduler.schedule-end-date-before-start-date-rejected: code ValidationException matches; message mismatch — expected the fixed sentence 'The StartDate you specify must come before the EndDate.', got 'StartDate must be earlier than EndDate.'
+
+Cause 4 — four checks, all 404 ResourceNotFoundException with the wrong resource named:
+  scheduler.delete-schedule-group-cascade: after DeleteScheduleGroup cascaded, get_schedule(Name=s, GroupName=g) -> ('ResourceNotFoundException', 'Schedule sim2real-behav-sched-5b63f8140bd6 does not exist.'), expected 'Schedule group <g> does not exist.'
+  scheduler.schedule-group-lifecycle-cascade-delete: 'Schedule sim2real-behav-sched-b-cae555704ea6 does not exist.', expected 'Schedule group sim2real-behav-grp-4ca8cb82abba does not exist.'
+  scheduler.update-schedule-on-deleted-group-blocked: UpdateSchedule's message was correct ('Schedule group <g> does not exist.'); the GetSchedule on the same gone group returned 'Schedule sim2real-sched-ingroup-8ff05065b556 does not exist.', expected 'Schedule group sim2real-sg-del-b778eb3bfaa0 does not exist.'
+  scheduler.deploy-cfn-schedule-group-with-nested-schedule: after the CFN stack holding AWS::Scheduler::ScheduleGroup + nested AWS::Scheduler::Schedule was deleted, GetScheduleGroup's message was correct; get_schedule(Name=s, GroupName=g) returned 'Schedule sim2real-sched-0cd6e2b5ac49 does not exist.', expected 'Schedule group sim2real-sched-grp-73dfb145b0b9 does not exist.'
+The same checks show the schedule-form message IS correct when the group exists and only the schedule is absent, so the divergence is confined to the group-missing branch.
+
+Cause 5 — three checks, GetSchedule 200 with an instant one millisecond early whenever the submitted sub-second remainder rounds UP:
+  scheduler.schedule-start-end-date-timestamp-precision-preserved: sent EndDate ...12:30:45.777777+00:00, expected ...45.778000+00:00, got ...45.777000+00:00.
+  scheduler.schedule-start-end-date-timestamp-precision-round-trip: expected StartDate 2026-11-09T03:25:46.778000+00:00, got 2026-11-09T03:25:46.777000+00:00.
+  scheduler.schedule-timestamp-precision-round-trip: wrote EndDate 2026-11-09T04:21:10.613600+00:00, expected ...10.614000+00:00, got ...10.613000+00:00.
+Submitted remainders that round DOWN (e.g. 123456us -> 123000us) match, which isolates the rule as round-to-nearest vs truncate.
+
+## Steps to Reproduce
+Common setup (as the checks do): iam.create_role trusting scheduler.amazonaws.com with an sqs:SendMessage inline policy, and sqs.create_queue for the target ARN. All calls via boto3 client('scheduler') against the emulator.
+
+1 (Cause 1): scheduler.create_schedule_group(Name=g); scheduler.delete_schedule_group(Name=g); while get_schedule_group(Name=g) still reports State=DELETING, call create_schedule(Name=n, GroupName=g, ScheduleExpression='rate(5 minutes)', FlexibleTimeWindow={'Mode':'OFF'}, Target={'Arn':queue_arn,'RoleArn':role_arn}) -> 400 ValidationException whose Message is 'Schedule group <g> is being deleted.' Expected 'You cannot perform this operation because schedule group <g> is being deleted.' Check scheduler.create-schedule-in-deleting-group-blocked.
+
+2 (Cause 2): create_schedule(..., ScheduleExpression='rate(5 minutes)', ScheduleExpressionTimezone='Not/ARealZone') -> 400 ValidationException 'Invalid Schedule Expression Timezone Not/ARealZone.' Expected 'Invalid timezone Not/ARealZone.' Check scheduler.create-schedule-invalid-timezone-rejected.
+
+3 (Cause 3): create_schedule(..., StartDate=now+2h, EndDate=now+1h) -> 400 ValidationException 'StartDate must be earlier than EndDate.' Expected 'The StartDate you specify must come before the EndDate.' Checks scheduler.create-schedule-start-after-end-date and scheduler.schedule-end-date-before-start-date-rejected.
+
+4 (Cause 4): create_schedule_group(Name=g); create_schedule(Name=s, GroupName=g, ...); delete_schedule_group(Name=g); poll get_schedule_group(Name=g) until it 404s; then get_schedule(Name=s, GroupName=g) -> 404 'Schedule <s> does not exist.' Expected 'Schedule group <g> does not exist.' (Equivalently: get_schedule(Name=<anything>, GroupName=<a group never created>).) Same expectation after a CloudFormation stack holding AWS::Scheduler::ScheduleGroup with a nested AWS::Scheduler::Schedule is deleted. Checks scheduler.delete-schedule-group-cascade, scheduler.schedule-group-lifecycle-cascade-delete, scheduler.update-schedule-on-deleted-group-blocked, scheduler.deploy-cfn-schedule-group-with-nested-schedule.
+
+5 (Cause 5): create_schedule(Name=n, ScheduleExpression='rate(1 hour)', State='DISABLED', FlexibleTimeWindow={'Mode':'OFF'}, Target=t, StartDate=<an instant whose sub-second remainder rounds UP to the next millisecond, e.g. ...45.777777Z>, EndDate=<a later such instant>), then get_schedule(Name=n) -> the reported instant is the millisecond BELOW the submitted one (...45.777000Z) instead of the nearest millisecond (...45.778000Z). Checks scheduler.schedule-start-end-date-timestamp-precision-preserved, scheduler.schedule-start-end-date-timestamp-precision-round-trip, scheduler.schedule-timestamp-precision-round-trip.
