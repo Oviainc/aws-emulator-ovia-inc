@@ -1438,8 +1438,28 @@ pub fn client_token_violation(token: &str) -> Option<String> {
     ))
 }
 
-/// The refusal for a service name the cluster already holds a service under. Shared by
-/// every create that takes one, so the operations cannot word the class differently.
+/// `InvalidParameterException$message` for a `serviceName` the cluster already holds a
+/// service under, whatever `clientToken` the second create carried.
+///
+/// `clientToken` is "An identifier that you provide to ensure the idempotency of the
+/// request", so Amazon ECS words this refusal as the failed idempotent CREATE it is: a
+/// create of a name that is taken is not the request that created it, so it cannot be
+/// answered with that request's service. ONE fixed sentence, naming neither the service
+/// nor the cluster — the collision is scoped to the cluster (the same name is free in
+/// another one), but the scope is not part of the wording.
+///
+/// Shared by every create that takes a `clientToken` BESIDE the service name, so those
+/// operations cannot word the class differently.
+pub const SERVICE_CREATION_NOT_IDEMPOTENT_MESSAGE: &str = "Creation of service was not idempotent.";
+
+/// The refusal a service name the cluster already holds a service under earns from a
+/// create that carries NO idempotency token: `CreateExpressGatewayService` models no
+/// `clientToken`, so a repeat of it is not a request Amazon ECS can recognise as the same
+/// one, and the condition it reports is the name rule its own member states ("This name
+/// must be unique within the specified cluster") rather than a create that was not
+/// idempotent ([`SERVICE_CREATION_NOT_IDEMPOTENT_MESSAGE`], which the creates that take a
+/// token answer). Built from the request, since the name at fault is what the caller has
+/// to change.
 pub fn service_name_taken_message(service_name: &str, cluster_name: &str) -> String {
     format!("service {service_name:?} already exists in cluster {cluster_name:?}")
 }
@@ -2062,13 +2082,20 @@ pub fn network_configuration_violation(
         .is_some_and(|configuration| configuration.awsvpc_configuration.is_some());
     match (network_mode == NETWORK_MODE_AWSVPC, configured) {
         (true, false) => Some(AWSVPC_NETWORK_CONFIGURATION_REQUIRED_MESSAGE.to_string()),
-        (false, true) => Some(format!(
-            "Network Configuration must not be provided when networkMode \
-             '{network_mode}' is specified."
-        )),
+        (false, true) => Some(NETWORK_CONFIGURATION_NOT_VALID_MESSAGE.to_string()),
         _ => None,
     }
 }
+
+/// `InvalidParameterException$message` for a launch that carries a `networkConfiguration`
+/// the network mode of its task definition gives it nothing to configure.
+///
+/// A fixed sentence: it POINTS AT the network mode of the task definition the launch runs
+/// rather than quoting the mode, so the refusal carries no value from the request or from
+/// the stored revision — the caller reads the mode off the task definition the sentence
+/// names.
+pub const NETWORK_CONFIGURATION_NOT_VALID_MESSAGE: &str =
+    "Network Configuration is not valid for the given networkMode of this task definition.";
 
 /// The refusal an exec-enabled launch earns when NO task role resolves for the task it
 /// launches, or `None` when one does (or when the launch does not enable ECS Exec at all).

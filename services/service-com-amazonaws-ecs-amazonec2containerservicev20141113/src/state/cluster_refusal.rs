@@ -18,6 +18,13 @@
 //! so a client can branch on which of the two states it is in (re-create or wait for a
 //! deleted cluster; check the name or the Region for one this account never held).
 //!
+//! Which of the two a TOMBSTONE earns is the question only for a call that works in the
+//! cluster. A describe that answers per NAME has a `failures` channel for the names it
+//! cannot resolve, so it resolves the tombstone instead
+//! ([`holds_cluster`](super::ComAmazonawsEcsAmazonec2containerservicev20141113State::holds_cluster))
+//! and reports those names as `MISSING` — the resources the cluster held went with the
+//! delete — leaving the not-found refusal to a reference that resolves to no record at all.
+//!
 //! Two operations state the TOMBSTONE in their own terms instead, under their own error
 //! code, because the condition they report is the cluster's STATE rather than its absence:
 //! a write of the cluster's own settings ([`cluster_not_active_message`]) and a tagging

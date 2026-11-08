@@ -167,21 +167,21 @@ async fn a_launch_carries_a_network_configuration_exactly_when_the_mode_is_awsvp
                     "case {case:?}: expected {operation} to answer an \
                      InvalidParameterException, got {code:?} with {message:?}"
                 );
-                if needs_configuration {
-                    // The sentence AWS words for the missing configuration.
-                    assert_eq!(
-                        message,
-                        "Network Configuration must be provided when networkMode \
-                         'awsvpc' is specified.",
-                        "case {case:?}: unexpected message from {operation}"
-                    );
+                // Both sentences are FIXED text: the one for a missing configuration names
+                // the one mode that requires one, and the one for a configuration the
+                // revision's mode cannot take points at that task definition's mode
+                // instead of quoting it — so neither carries a value from this request.
+                let expected = if needs_configuration {
+                    "Network Configuration must be provided when networkMode 'awsvpc' is \
+                     specified."
                 } else {
-                    assert!(
-                        message.contains(mode.unwrap_or("bridge")),
-                        "case {case:?}: expected {operation} to name the mode at fault, \
-                         got {message:?}"
-                    );
-                }
+                    "Network Configuration is not valid for the given networkMode of this \
+                     task definition."
+                };
+                assert_eq!(
+                    message, expected,
+                    "case {case:?}: unexpected message from {operation}"
+                );
             }
             assert!(
                 stored_services(&router, &[&service_name], case).await.is_empty(),

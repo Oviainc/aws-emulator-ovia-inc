@@ -2150,9 +2150,20 @@ pub const MAX_CONTAINER_REASON_LENGTH: usize = 255;
 
 /// `InvalidParameterException$message` for a `desiredCount` below the zero its own doc
 /// bounds it at ("The desired number of instantiations of the task definition to keep
-/// running on the service"). A fixed sentence: it names the member and the bound, and
-/// echoes neither the number the request carried nor how this emulator read it.
-pub const DESIRED_COUNT_NEGATIVE_MESSAGE: &str = "DesiredCount can not be lesser than 0";
+/// running on the service"). A fixed sentence: Amazon ECS names WHAT THE COUNT COUNTS —
+/// the tasks the service keeps running — rather than the member that carried it, and the
+/// bound the value crossed, echoing neither the number the request held nor how this
+/// emulator read it. Same sentence for the create and for the update of a service: the
+/// bound belongs to the count, not to the call.
+pub const DESIRED_COUNT_NEGATIVE_MESSAGE: &str = "Task count can not be lesser than 0";
+
+/// `InvalidParameterException$message` for a service whose `schedulingStrategy` needs a
+/// `desiredCount` the request left out — the member's own doc: "This is required if
+/// schedulingStrategy is REPLICA or isn't specified."
+///
+/// A fixed sentence stating the missing member, spelled as the shape names it: a required
+/// member nothing supplied has no value to report, so the refusal carries none.
+pub const DESIRED_COUNT_MISSING_MESSAGE: &str = "DesiredCount is missing";
 
 /// `ClientException$message` for a registration whose `containerDefinitions` repeat a
 /// container name. The name identifies the container within the revision — a

@@ -2324,7 +2324,10 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// existed, and with the sentence that condition carries
     /// ([`Self::cluster_not_found_message`]). The three operations that own the tombstone
     /// read `clusters` directly instead: `DescribeClusters` reports it, `DeleteCluster`
-    /// answers idempotently with it, and `CreateCluster` creates a new cluster over it.
+    /// answers idempotently with it, and `CreateCluster` creates a new cluster over it —
+    /// and a describe that reports its answers per NAME resolves it through
+    /// [`Self::holds_cluster`], since a name it cannot resolve is a failure it reports
+    /// rather than a call it refuses.
     pub fn active_cluster(&self, cluster_name: &str) -> Option<&ClusterRecord> {
         self.clusters
             .get(cluster_name)
@@ -2335,6 +2338,22 @@ impl ComAmazonawsEcsAmazonec2containerservicev20141113State {
     /// only needs to know the cluster is there makes.
     pub fn has_active_cluster(&self, cluster_name: &str) -> bool {
         self.active_cluster(cluster_name).is_some()
+    }
+
+    /// Whether this store HOLDS a cluster record under `cluster_name` at all, whatever
+    /// status it is in — the existence check a describe that reports its answers per NAME
+    /// makes.
+    ///
+    /// The tombstone a delete leaves is still a record this account holds
+    /// (`Cluster$status`: "Clusters with an INACTIVE status may remain discoverable in
+    /// your account for a period of time"), and such a describe has a channel for every
+    /// name it cannot resolve: the resources the cluster held went with the delete, so each
+    /// name the request carries comes back as a `MISSING` failure and the call itself
+    /// answers. Only a reference that resolves to NO record leaves the describe nothing to
+    /// answer about, which is the condition `ClusterNotFoundException` reports
+    /// ([`CLUSTER_NOT_FOUND_MESSAGE`]).
+    pub fn holds_cluster(&self, cluster_name: &str) -> bool {
+        self.clusters.contains_key(cluster_name)
     }
 
     /// The Cloud Map namespace `service`'s tasks are registered in through Service

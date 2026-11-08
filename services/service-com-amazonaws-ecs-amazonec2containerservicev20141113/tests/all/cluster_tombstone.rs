@@ -943,12 +943,13 @@ async fn a_tombstoned_cluster_is_no_longer_a_cluster_an_operation_can_work_in() 
     .await;
 
     // "The cluster has been deleted": the tombstone is discoverable, but it is not a
-    // cluster anything can run, register or read resources in — every one of those
+    // cluster anything can run, register or write resources in — every one of those
     // operations refuses it with the same error code it answers for a name that never
     // existed, and with the sentence that says the cluster is STILL there and inactive,
     // which is what tells the two states apart. Rows: every implemented operation that
-    // resolves a `cluster` to work in.
-    let rows: [TombstoneRow; 10] = [
+    // resolves a `cluster` to WORK IN. The describes that answer per NAME report the
+    // tombstone's names as `MISSING` failures instead — their own table below.
+    let rows: [TombstoneRow; 7] = [
         ("RunTask", |cluster| {
             json!({ "cluster": cluster, "taskDefinition": "gonefamily" })
         }),
@@ -956,9 +957,6 @@ async fn a_tombstoned_cluster_is_no_longer_a_cluster_an_operation_can_work_in() 
             json!({ "cluster": cluster, "task": "a".repeat(32) })
         }),
         ("ListTasks", |cluster| json!({ "cluster": cluster })),
-        ("DescribeTasks", |cluster| {
-            json!({ "cluster": cluster, "tasks": ["a".repeat(32)] })
-        }),
         ("CreateService", |cluster| {
             json!({
                 "cluster": cluster,
@@ -973,14 +971,8 @@ async fn a_tombstoned_cluster_is_no_longer_a_cluster_an_operation_can_work_in() 
         ("DeleteService", |cluster| {
             json!({ "cluster": cluster, "service": "web" })
         }),
-        ("DescribeServices", |cluster| {
-            json!({ "cluster": cluster, "services": ["web"] })
-        }),
         ("ListContainerInstances", |cluster| {
             json!({ "cluster": cluster })
-        }),
-        ("DescribeContainerInstances", |cluster| {
-            json!({ "cluster": cluster, "containerInstances": ["a".repeat(32)] })
         }),
     ];
     for (operation, build) in rows {
@@ -1008,6 +1000,47 @@ async fn a_tombstoned_cluster_is_no_longer_a_cluster_an_operation_can_work_in() 
         assert_eq!(
             message, "Cluster not found.",
             "case {missing:?}: expected the fixed not-found sentence, got {message:?}"
+        );
+    }
+
+    // The describes that answer per NAME are the other half of the rule: the tombstone is
+    // a cluster record this account still holds, so the call itself answers and every name
+    // it carries comes back as a `MISSING` failure — the resources the cluster held went
+    // with the delete. Rows: each implemented describe whose output models `failures`, and
+    // the member that carries the names it reports on.
+    for (operation, request, reported) in [
+        (
+            "DescribeServices",
+            json!({ "cluster": "gone", "services": ["web"] }),
+            "services",
+        ),
+        (
+            "DescribeTasks",
+            json!({ "cluster": "gone", "tasks": ["a".repeat(32)] }),
+            "tasks",
+        ),
+        (
+            "DescribeContainerInstances",
+            json!({ "cluster": "gone", "containerInstances": ["a".repeat(32)] }),
+            "containerInstances",
+        ),
+    ] {
+        let case = format!("{operation} against a deleted cluster");
+        let body = ok(&router, operation, request, &case).await;
+        assert!(
+            list(&body, reported, &case).is_empty(),
+            "case {case:?}: expected the tombstone to hold no {reported}, got {body}"
+        );
+        let failures = list(&body, "failures", &case);
+        assert_eq!(
+            failures.len(),
+            1,
+            "case {case:?}: expected one failure for the one name asked about, got {body}"
+        );
+        assert_eq!(
+            string(&failures[0], "reason", &case),
+            "MISSING",
+            "case {case:?}: expected a MISSING failure, got {body}"
         );
     }
 

@@ -41,11 +41,13 @@ const FAMILY: &str = "inactiveclusterfamily";
 /// `cluster` reference the row is testing.
 type Row = (&'static str, fn(&str) -> Value);
 
-/// The implemented operations that resolve a `cluster` to work in, spanning both the
-/// mutating calls (a create, an update, a delete, a launch, a cluster-level write) and
-/// the reporting ones — the rule belongs to the cluster-resolution step, so it is the
-/// same answer whichever of them asked.
-const ROWS: [Row; 8] = [
+/// The implemented operations that resolve a `cluster` to WORK IN, spanning both the
+/// mutating calls (a create, an update, a delete, a launch, a cluster-level write) and the
+/// listings — the rule belongs to the cluster-resolution step, so it is the same answer
+/// whichever of them asked. A describe that answers per NAME is NOT one of them: it has a
+/// `failures` channel for the names it cannot resolve, so it resolves the tombstone and
+/// reports through that instead (`crate::cluster_tombstone`).
+const ROWS: [Row; 7] = [
     ("CreateService", |cluster| {
         json!({
             "cluster": cluster,
@@ -72,9 +74,6 @@ const ROWS: [Row; 8] = [
         })
     }),
     ("ListTasks", |cluster| json!({ "cluster": cluster })),
-    ("DescribeServices", |cluster| {
-        json!({ "cluster": cluster, "services": ["web"] })
-    }),
     ("ListContainerInstances", |cluster| {
         json!({ "cluster": cluster })
     }),

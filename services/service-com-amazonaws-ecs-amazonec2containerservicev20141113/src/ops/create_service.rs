@@ -449,10 +449,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !daemon && input.desired_count.is_none() {
             return Err(CreateServiceErrorModeled::InvalidParameterException(
                 InvalidParameterException {
-                    message: Some(format!(
-                        "desiredCount is required when schedulingStrategy is {}",
-                        crate::state::SCHEDULING_REPLICA
-                    )),
+                    message: Some(crate::state::DESIRED_COUNT_MISSING_MESSAGE.to_string()),
                 },
             )
             .into());
@@ -866,10 +863,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
                 return Err(CreateServiceErrorModeled::InvalidParameterException(
                     InvalidParameterException {
-                        message: Some(crate::state::service_name_taken_message(
-                            &name,
-                            &cluster_name,
-                        )),
+                        message: Some(
+                            crate::state::SERVICE_CREATION_NOT_IDEMPOTENT_MESSAGE.to_string(),
+                        ),
                     },
                 )
                 .into());

@@ -190,12 +190,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut guard = state.lock();
         guard.advance_clock(::std::time::SystemTime::now());
 
-        if !guard.has_active_cluster(&cluster_name) {
+        // "Clusters with an INACTIVE status may remain discoverable in your account for a
+        // period of time": the tombstone a delete leaves is still a cluster record this
+        // account holds, and this read answers per NAME — the services the cluster held
+        // went with the delete, so each name comes back as a `MISSING` failure below. Only
+        // a reference that resolves to no record at all leaves nothing to report on, which
+        // is what `ClusterNotFoundException` states ([`crate::state::holds_cluster`]).
+        if !guard.holds_cluster(&cluster_name) {
             return Err(DescribeServicesErrorModeled::ClusterNotFoundException(
                 ClusterNotFoundException {
-                    message: Some(crate::state::cluster_refusal_message(
-                        guard.clusters.get(&cluster_name),
-                    )),
+                    message: Some(crate::state::CLUSTER_NOT_FOUND_MESSAGE.to_string()),
                 },
             )
             .into());

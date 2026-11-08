@@ -139,6 +139,8 @@ mod service_load_balancer_cross_field;
 mod service_not_active_refusals;
 #[path = "all/service_projection.rs"]
 mod service_projection;
+#[path = "all/service_refusal_sentences.rs"]
+mod service_refusal_sentences;
 #[path = "all/service_registry_cloud_map_instances.rs"]
 mod service_registry_cloud_map_instances;
 #[path = "all/service_registry_dns_record_rules.rs"]
