@@ -44,6 +44,14 @@ use aws_smithy_schema_server::constraints::{Violation, ViolationKind};
 use smithy_server_runtime::{http, ErasedOperation, Refusal, Refused, Service};
 use std::sync::Arc;
 
+/// The Event API's DATA plane: the two sockets each `Api` is served on — the HTTP endpoint
+/// a publisher POSTs to and the real-time endpoint a subscriber opens a WebSocket against
+/// — which are what the hostnames in `Api$dns` publish. They are SOCKETS rather than
+/// routes of this service, because the seams this file carries take one buffered request
+/// and return one buffered response: see that module for why, and for what each endpoint
+/// answers.
+pub mod event_api;
+
 /// AppSync's own modelled error for a request that is not well formed:
 /// `BadRequestException`, `httpError` 400, with members `message`/`reason`/`detail`
 /// (`smithy_query(query="shape", shape="BadRequestException")`). Every operation of

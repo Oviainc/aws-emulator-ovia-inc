@@ -357,6 +357,11 @@ pub mod iam_authorization;
 /// `@pattern` cannot decide, since Smithy's `@pattern` is a find and that pattern's
 /// alternation is anchored on one side only.
 pub mod iam_entity_path;
+/// The ONE reading of a data-plane connection whose ENCRYPTION is negotiated IN BAND: the
+/// first byte that tells a TLS record from a request in the clear, and the replay of that
+/// byte to whoever reads the stream next — for every service that serves one announced
+/// address over both schemes.
+pub mod in_band_tls;
 /// The ONE reading of whether an in-process call to another emulated service reached that
 /// service at all, rather than being refused by the front door for a request no mounted
 /// service claims — so no performer of such a call maps the transport's own refusal as if

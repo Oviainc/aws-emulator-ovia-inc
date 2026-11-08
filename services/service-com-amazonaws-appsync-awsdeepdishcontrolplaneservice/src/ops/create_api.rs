@@ -173,15 +173,72 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let region = crate::state::request_region(ctx);
-        let mut guard = state.lock();
 
-        // The store is bounded, so a repeated create cannot grow it without limit:
-        // an account holds at most `APIS_PER_REGION` APIs in a Region, and
-        // `ServiceQuotaExceededException` ("The operation exceeded the service quota
-        // for this resource") is the modelled refusal for a create past it. This
-        // emulator serves one Region's worth of state, so the cap applies to the
-        // whole store.
+        // Minting the API's id is all the store is held for here, in a block of its own,
+        // so the guard is out of scope before the sockets below are opened: opening one is
+        // the core's work and is awaited, and no state guard may be held across an await.
+        let api_id = {
+            let mut guard = state.lock();
+
+            // The store is bounded, so a repeated create cannot grow it without limit:
+            // an account holds at most `APIS_PER_REGION` APIs in a Region, and
+            // `ServiceQuotaExceededException` ("The operation exceeded the service quota
+            // for this resource") is the modelled refusal for a create past it. This
+            // emulator serves one Region's worth of state, so the cap applies to the
+            // whole store.
+            if guard.event_apis.len() >= APIS_PER_REGION {
+                return Err(CreateApiErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "an account may hold at most {APIS_PER_REGION} APIs in a Region"
+                        )),
+                    },
+                )
+                .into());
+            }
+
+            // Mint an id that is not already taken. The id is drawn from the state's own
+            // counter, so it is new on every call even for an identical request.
+            let mut api_id = guard.mint_id();
+            while guard.event_apis.contains_key(&api_id) {
+                api_id = guard.mint_id();
+            }
+            api_id
+        };
+
+        // An Event API's endpoints are DATA planes — "real-time message publishing and
+        // message subscriptions over WebSockets" — and the core owns the sockets they are
+        // served on ([`crate::service::event_api`]): they are opened for the id just
+        // minted, and the addresses they landed on are what this API publishes as its
+        // `dns` records, so the values a caller hands a publisher and a WebSocket client
+        // are addresses those clients can reach. Sockets that could not be opened leave
+        // the API UNCREATED rather than publishing endpoints nothing serves.
+        let (http_authority, realtime_authority) =
+            match crate::service::event_api::open_for_api(&*self.engine, &api_id).await {
+                Ok(authorities) => authorities,
+                Err(reason) => {
+                    state.lock().event_data_plane.forget_api(&api_id);
+                    return Err(CreateApiErrorModeled::InternalFailureException(
+                        InternalFailureException {
+                            message: Some(format!(
+                                "this emulator could not open the sockets an Event API's \
+                                 endpoints are served on, so no API was created: {reason}"
+                            )),
+                        },
+                    )
+                    .into());
+                }
+            };
+
+        let mut guard = state.lock();
+        // The quota is weighed AGAIN under this lock, because the one above was released
+        // while the sockets were opened: two creates in flight at once must not both pass
+        // a check made before either inserted, or the account would come to hold more APIs
+        // than the limit the modelled refusal names. The sockets this request opened are
+        // forgotten with the refusal, so nothing stays listening for an API that was not
+        // created.
         if guard.event_apis.len() >= APIS_PER_REGION {
+            guard.event_data_plane.forget_api(&api_id);
             return Err(CreateApiErrorModeled::ServiceQuotaExceededException(
                 ServiceQuotaExceededException {
                     message: Some(format!(
@@ -190,20 +247,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 },
             )
             .into());
-        }
-
-        // Mint an id that is not already taken. The id is drawn from the state's own
-        // counter, so it is new on every call even for an identical request.
-        let mut api_id = guard.mint_id();
-        while guard.event_apis.contains_key(&api_id) {
-            api_id = guard.mint_id();
-        }
-        // The endpoints are published on a host label of their own, minted the same
-        // way and independently of the `apiId`: an AppSync endpoint hostname cannot
-        // be derived from the API's id.
-        let mut host_label = guard.mint_id();
-        while host_label == api_id {
-            host_label = guard.mint_id();
         }
         let seq = guard.next_seq();
 
@@ -214,10 +257,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &region,
                 &format!("apis/{api_id}"),
             ),
-            // The endpoint hostnames are built the same way for either kind of API
-            // (`crate::state::api_dns`); an `Api` publishes its HTTPS endpoint under
-            // the `HTTP` key.
-            dns: crate::state::api_dns(&host_label, &region, crate::state::HTTP_ENDPOINT),
+            // The DNS records publish the two endpoints this API is SERVED on, one per
+            // socket (`crate::state::event_api_dns`): an `Api` publishes its HTTP endpoint
+            // under the `HTTP` key and its real-time one under `REALTIME`.
+            dns: crate::state::event_api_dns(&http_authority, &realtime_authority),
             api_id: api_id.clone(),
             name: input.name,
             owner_contact: input.owner_contact,

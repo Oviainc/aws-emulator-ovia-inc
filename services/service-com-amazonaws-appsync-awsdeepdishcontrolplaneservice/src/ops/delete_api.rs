@@ -173,6 +173,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         }
+        // The API's data plane goes with the record: dropping the listener handles closes
+        // both endpoints' ports and severs every realtime connection open on them, so a
+        // deleted API stops answering where it used to
+        // ([`crate::state::event_data_plane`]).
+        guard.event_data_plane.forget_api(&input.api_id);
 
         Ok(DeleteApiOutput {})
     }

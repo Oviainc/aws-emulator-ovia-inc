@@ -8,6 +8,9 @@ build = "build.rs"
 
 [dependencies]
 engine = { workspace = true }
+# The tree's shared service helpers: the ONE reading of how a client ADDRESSES a data
+# plane (`data_plane_addressing`), which is what an Event API's `dns` records publish.
+service-common = { path = "../common" }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
 aws-smithy-schema-server = { workspace = true }
@@ -16,13 +19,54 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["io-util", "sync", "time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 # Parses the OIDC `issuer`, which AppSync requires to be a valid URL.
 url = "2"
+# The RFC 6455 WebSocket protocol, server side: an Event API's real-time endpoint completes
+# the opening handshake and frames every message with this maintained implementation over
+# the core-owned socket (`src/service/event_api/realtime.rs`) rather than with anything
+# hand-written. `handshake` only — this crate serves the SERVER half and opens no connection
+# of its own, and the core owns TLS.
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake"] }
+# The `Stream`/`Sink` halves of that socket, so a frame arriving and an event delivered to
+# the connection are awaited together.
+futures-util = { version = "0.3", default-features = false }
+# HTTP/1.1 on the core-owned socket the Event API's HTTP endpoint is served on: the publish
+# route (`POST /event`) is read and answered by this maintained server implementation
+# (`src/service/event_api/publish.rs`), never by a hand-written parser.
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
+# Decodes the base64url authorization object a real-time client carries in its subprotocol
+# token, which is the only place a WebSocket client can put a request's own fields.
+base64 = "0.22"
+# `rquickjs` is the QuickJS JavaScript engine, embedded in this process, which is what RUNS
+# a channel namespace's `codeHandlers` — "the event handler functions that run custom
+# business logic to process published events and subscribe requests". It is an EXECUTION
+# SUBSTRATE: caller-supplied code runs in it, so every run is bounded in host code the code
+# cannot reach (wall clock, engine steps, memory, stack and answer size — see
+# `src/service/event_api/handlers.rs`).
+#
+# `loader` is on so an `import` is resolved through this crate's own resolver, which answers
+# with ONE module of this emulator's own and with nothing else; `dyn-load` is NOT enabled,
+# so no host shared object can be loaded, and no other feature that reaches the host is on.
+# Plain QuickJS registers no filesystem, process, environment, network or thread API, and
+# this crate installs exactly one host function (the handler's own logging).
+#
+# It is also a NATIVE component: `rquickjs-sys` compiles the QuickJS C sources with `cc`
+# at build time, and the binding code is `unsafe` by nature; that is accepted because it is
+# the engine's own interpreter loop, the same one the tree's other embedded-JavaScript
+# services use, and no advisory is recorded against the locked version.
+rquickjs = { version = "0.14", features = ["loader"] }
+# The CloudWatch store the `AWS/AppSync` series an Event API's data plane publishes go
+# into: a service's own metric never travels over `PutMetricData` (that API refuses the
+# reserved `AWS/` namespaces), so it is appended to the very store `ListMetrics` and
+# `GetMetricStatistics` read.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 # Parses a caller-supplied GraphQL type definition (SDL), which `CreateType` and
 # `UpdateType` carry.
 apollo-parser = "0.8"
@@ -36,6 +80,11 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# The client half of the data-plane tests: a case dials the API's own announced sockets over
+# TCP (`tokio/net`) and waits a bounded time for a frame (`tokio/time`). The WebSocket client
+# half, the CloudWatch service the metric assertions read through and the base64 the
+# handshake's auth token is written in are already this crate's own dependencies.
+tokio = { workspace = true, features = ["net", "time"] }
 
 [lints]
 workspace = true

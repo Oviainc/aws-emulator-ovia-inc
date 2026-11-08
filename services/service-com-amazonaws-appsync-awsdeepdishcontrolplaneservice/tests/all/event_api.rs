@@ -235,10 +235,9 @@ pub(crate) async fn create_event_api(
     call(router, "POST", "/v2/apis", Some(body)).await
 }
 
-/// The host label an endpoint hostname is published on: its first DNS label.
-fn host_label(hostname: &str) -> &str {
-    hostname.split('.').next().unwrap_or_default()
-}
+/// The address the core binds a resource listener on by default, and so the host an Event
+/// API's two endpoints are published on.
+pub(crate) const LOOPBACK_HOST: &str = "127.0.0.1";
 
 /// Rule 1: a create mints the API's identity, persists what the request carried, and
 /// answers from the stored record — which is the record the reader reports.
@@ -295,29 +294,35 @@ async fn a_created_event_api_is_answered_from_the_record_the_reader_reports() {
             "case {case:?}: expected a creation timestamp, got {api:?}"
         );
 
-        // The DNS records publish an HTTP and a real-time endpoint, both on the API's
-        // own endpoint host label (`Api$dns`).
+        // The DNS records publish the two endpoints the API is SERVED on — "an HTTP and a
+        // real-time endpoint" (`Api$dns`) — as the `host:port` of each endpoint's own
+        // socket on this emulator's interface, because the whole purpose of the value is
+        // that a client dials it and no client on this machine resolves an AWS hostname.
+        // The two endpoints are distinct, and both are reached at the address the core
+        // bound.
         let http = api["dns"]["HTTP"].as_str().unwrap_or_default().to_string();
         let realtime = api["dns"]["REALTIME"]
             .as_str()
             .unwrap_or_default()
             .to_string();
-        assert!(
-            http.ends_with(&format!(".appsync-api.{REGION}.amazonaws.com")),
-            "case {case:?}: expected an HTTP endpoint in {REGION}, got {api:?}"
-        );
-        assert!(
-            realtime.ends_with(&format!(".appsync-realtime-api.{REGION}.amazonaws.com")),
-            "case {case:?}: expected a real-time endpoint in {REGION}, got {api:?}"
-        );
-        assert_eq!(
-            host_label(&http),
-            host_label(&realtime),
-            "case {case:?}: expected both endpoints on one host label, got {api:?}"
-        );
-        assert!(
-            !host_label(&http).is_empty() && host_label(&http) != api_id,
-            "case {case:?}: expected an endpoint host label of its own, got {api:?}"
+        for (endpoint, published) in [("HTTP", &http), ("REALTIME", &realtime)] {
+            let (host, port) = published
+                .rsplit_once(':')
+                .unwrap_or_else(|| panic!("case {case:?}: expected a host:port, got {api:?}"));
+            assert_eq!(
+                host, LOOPBACK_HOST,
+                "case {case:?}: expected dns.{endpoint} on the address the core binds, \
+                 got {api:?}"
+            );
+            assert!(
+                port.parse::<u16>().is_ok_and(|port| port > 0),
+                "case {case:?}: expected dns.{endpoint} to name the port its socket landed \
+                 on, got {api:?}"
+            );
+        }
+        assert_ne!(
+            http, realtime,
+            "case {case:?}: expected the two endpoints on sockets of their own, got {api:?}"
         );
 
         // The configuration comes back as it was sent: every provider and every
