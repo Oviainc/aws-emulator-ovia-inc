@@ -783,6 +783,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
             // still needs one of the two routing keys above.
             || (parts.method == http::Method::GET
                 && hosted_logo_route(&parts.uri.to_string()).is_some())
+            // A pool's key set is fetched by whatever verifier holds a token
+            // this service minted, which follows the token's `iss` claim to
+            // `<iss>/.well-known/jwks.json` — anonymously, with no credential
+            // scope and no `X-Amz-Target`, and at the endpoint the issuer names,
+            // which is the endpoint the token's holder reached this service on.
+            // A GET of exactly that path is therefore claimed here too, so the
+            // key set resolves wherever the issuer announced it rather than only
+            // at this service's published AWS host.
+            || (parts.method == http::Method::GET
+                && jwks_route_pool_id(&parts.uri.to_string()).is_some())
             // The CSV upload target of a user import job
             // (`UserImportJobType.PreSignedUrl`) is written by whatever client
             // holds the locator this service handed out, with no credential

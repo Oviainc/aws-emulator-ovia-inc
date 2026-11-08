@@ -217,6 +217,8 @@ mod terms_branding_and_passkey_refusal_wire;
 mod terms_documents;
 #[path = "all/terms_not_found_message.rs"]
 mod terms_not_found_message;
+#[path = "all/token_issuer_endpoint.rs"]
+mod token_issuer_endpoint;
 #[path = "all/token_signing.rs"]
 mod token_signing;
 #[path = "all/ui_customization.rs"]

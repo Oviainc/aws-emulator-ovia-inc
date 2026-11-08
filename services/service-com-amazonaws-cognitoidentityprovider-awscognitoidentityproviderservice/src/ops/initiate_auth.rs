@@ -669,6 +669,7 @@ async fn password_sign_in(
                     &username,
                     now,
                     ctx.credential_store(),
+                    ctx.parts(),
                 )
                 .ok_or_else(internal_error)?;
             // The sign-in is complete, so the device it came from is now part of
@@ -907,7 +908,14 @@ async fn refresh_sign_in(
 
     let authentication_result = store
         .lock()
-        .refresh_tokens(&user_pool_id, client_id, &username, now, refresh_token)
+        .refresh_tokens(
+            &user_pool_id,
+            client_id,
+            &username,
+            now,
+            refresh_token,
+            ctx.parts(),
+        )
         .ok_or_else(internal_error)?;
     Ok(authenticated(authentication_result))
 }

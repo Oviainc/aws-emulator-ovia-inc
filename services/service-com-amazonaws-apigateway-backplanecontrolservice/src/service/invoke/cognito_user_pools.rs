@@ -189,8 +189,9 @@ fn scopes_satisfied(token: &jwt::CompactJws, required: &[String]) -> bool {
 ///
 /// The pools the authorizer lists are what is looked UP — not the pool the token claims — so a
 /// token naming a pool this emulator holds but the authorizer does not list resolves no key set
-/// and is refused. Each listed ARN's `userpool/{id}` resource names the pool, the pool's own
-/// `issuer()` has to agree with the token's `iss`, and what is read out of the pool is the
+/// and is refused. Each listed ARN's `userpool/{id}` resource names the pool, the token's `iss`
+/// has to be an issuer that pool publishes (`UserPool::publishes_issuer`, which is the pool's
+/// id on an endpoint this emulator serves it at), and what is read out of the pool is the
 /// PUBLIC key set it publishes.
 fn accepted_issuer_key_set<Eng: Send + Sync + 'static>(
     engine: &Eng,
@@ -206,7 +207,7 @@ fn accepted_issuer_key_set<Eng: Send + Sync + 'static>(
         .iter()
         .filter_map(|arn| user_pool_id_of(arn))
         .filter_map(|pool_id| pools.pool(pool_id))
-        .find(|pool| pool.issuer() == claimed)
+        .find(|pool| pool.publishes_issuer(claimed))
         .map(|pool| pool.jwks())
 }
 

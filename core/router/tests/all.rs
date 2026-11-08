@@ -323,6 +323,9 @@ mod cognito_post_confirmation_lambda_trigger;
 mod cognito_group_role_mapping;
 #[path = "all/cognito_sms_caller_role_trust.rs"]
 mod cognito_sms_caller_role_trust;
+// Declared beside its sibling cognito suites, at the head, for the same reason they are here.
+#[path = "all/cognito_authorizer_issuer_endpoint.rs"]
+mod cognito_authorizer_issuer_endpoint;
 #[path = "all/pi_resource_metadata_reflects_rds_configuration.rs"]
 mod pi_resource_metadata_reflects_rds_configuration;
 // At the head for the reason the entries above record: the appended tail and the sorted

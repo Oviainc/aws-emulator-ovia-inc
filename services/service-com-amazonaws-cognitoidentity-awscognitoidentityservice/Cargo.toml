@@ -37,6 +37,11 @@ service-common = { path = "../common" }
 # rather than keeping a second copy of either fact.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
 service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
+# A `Logins` entry made under a user pool's provider name presents that POOL's id token, and
+# the pool decides which issuers it publishes — it is served on every endpoint its callers
+# reach it at — so the user-pool service's OWN reading of that is called here rather than a
+# second copy of the issuer form being kept beside it.
+service-com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

@@ -467,11 +467,12 @@ pub fn published_key_set<Eng: Send + Sync + 'static>(
         ::state::service_state(engine)?;
     // A user pool's issuer URL ends in the pool's own id, which is how the pool that
     // publishes a key set is found; the whole URL still has to agree, because a pool answers
-    // only for the issuer it publishes.
+    // only for an issuer it publishes — one naming an endpoint this emulator serves that
+    // pool at, which is the pool's own reading.
     let user_pool_id = issuer.trim_end_matches('/').rsplit('/').next()?.to_string();
     let pools = pools.lock();
     let pool = pools.pool(&user_pool_id)?;
-    (pool.issuer() == issuer.trim_end_matches('/')).then(|| pool.jwks())
+    pool.publishes_issuer(issuer).then(|| pool.jwks())
 }
 
 /// `at` as whole seconds since the Unix epoch, the unit a token's expiry claim is written in

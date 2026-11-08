@@ -472,6 +472,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &username,
                 now,
                 ctx.credential_store(),
+                ctx.parts(),
             )
             .ok_or_else(internal_error)?;
         Ok(RespondToAuthChallengeOutput {

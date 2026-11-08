@@ -264,6 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         now,
                         &input.refresh_token,
                         ctx.credential_store(),
+                        ctx.parts(),
                     )
                     .ok_or_else(internal_error)?
             }
@@ -274,6 +275,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     &username,
                     now,
                     &input.refresh_token,
+                    ctx.parts(),
                 )
                 .ok_or_else(internal_error)?,
         };

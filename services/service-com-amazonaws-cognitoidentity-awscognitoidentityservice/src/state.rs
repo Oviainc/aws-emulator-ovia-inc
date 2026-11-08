@@ -333,7 +333,7 @@ impl IdentityPool {
             .ok()
             .and_then(|read| read.claim_str(ISSUER_CLAIM).map(ToString::to_string));
         if let Some(issuer) = claimed_issuer {
-            if login_provider_issuer(&issuer) != login_provider_issuer(provider_name) {
+            if !names_the_same_issuer(provider_name, &issuer) {
                 return Some(LoginProviderRefusal::IssuerMismatch);
             }
         }
@@ -791,6 +791,39 @@ pub fn classic_flow_refusal(
     None
 }
 
+/// Whether the issuer a presented token CLAIMS and the `Logins` provider name it was
+/// presented under name the same issuer.
+///
+/// The two are compared as the issuer form both carry ([`login_provider_issuer`]). A
+/// provider name that names an Amazon Cognito USER POOL
+/// ([`cognito_user_pool_named`]) is matched on the POOL instead of on one spelling of
+/// its endpoint: the name is the published
+/// `cognito-idp.<region>.amazonaws.com/<UserPoolId>` form, while a pool stamps into `iss`
+/// the endpoint the sign-in that minted the token reached it on, so which issuers a pool
+/// publishes is the user-pool service's own reading
+/// (`UserPool`'s `is_pool_issuer`) rather than a second copy of the issuer form here.
+fn names_the_same_issuer(provider_name: &str, claimed: &str) -> bool {
+    let named = login_provider_issuer(provider_name);
+    if login_provider_issuer(claimed) == named {
+        return true;
+    }
+    cognito_user_pool_named(named).is_some_and(|(region, user_pool_id)| {
+        ::service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice
+            ::state::is_pool_issuer(region, user_pool_id, claimed)
+    })
+}
+
+/// The region and user-pool id a user-pool provider name states, read out of the
+/// `cognito-idp.<region>.amazonaws.com/<UserPoolId>` form `GetId.Logins` publishes for one
+/// ([`names_cognito_user_pool`]), and `None` for a name of any other shape.
+fn cognito_user_pool_named(provider_name: &str) -> Option<(&str, &str)> {
+    let rest = provider_name.strip_prefix(COGNITO_USER_POOL_PROVIDER_PREFIX)?;
+    let (host_tail, user_pool_id) = rest.split_once('/')?;
+    let region = host_tail.strip_suffix(COGNITO_USER_POOL_PROVIDER_SUFFIX)?;
+    (!region.is_empty() && !user_pool_id.is_empty() && !user_pool_id.contains('/'))
+        .then_some((region, user_pool_id))
+}
+
 /// Whether `provider_name` names an Amazon Cognito user pool: the
 /// `cognito-idp.<region>.amazonaws.com/<UserPoolId>` form `GetId.Logins` publishes for
 /// one ("Amazon Cognito user pool: `cognito-idp.<region>.amazonaws.com/<YOUR_USER_POOL_ID>`",
@@ -805,6 +838,10 @@ pub fn names_cognito_user_pool(provider_name: &str) -> bool {
 /// The prefix of every Amazon Cognito user-pool provider name: the user-pools service's
 /// own endpoint prefix, which every such provider name starts with.
 const COGNITO_USER_POOL_PROVIDER_PREFIX: &str = "cognito-idp.";
+
+/// What follows the region in a user-pool provider name's host, so that the region itself
+/// is what lies between this and [`COGNITO_USER_POOL_PROVIDER_PREFIX`].
+const COGNITO_USER_POOL_PROVIDER_SUFFIX: &str = ".amazonaws.com";
 
 /// The message a `NotAuthorizedException` carries for a `Logins` entry whose provider is
 /// not one the identity pool accepts.

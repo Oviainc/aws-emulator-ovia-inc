@@ -215,21 +215,105 @@ impl RiskConfiguration {
     }
 }
 
+/// The user-pool endpoint a request is SERVED on, as a URL: the endpoint the
+/// request REACHED this service at ([`serves_pool`]), and the published regional
+/// endpoint for a request that reached none this emulator serves the pool at.
+///
+/// A pool's tokens are verified against the endpoint that minted them: the `iss`
+/// claim is the discovery root a verifier fetches `<iss>/.well-known/jwks.json`
+/// from and the issuer it compares against the one it configured from its own
+/// endpoint for this service. So the endpoint a token names has to be the one
+/// the caller is already talking to, which is the host its request addressed —
+/// read with the shared reading of how a request addresses a service
+/// (`service_common::data_plane_addressing`), so no value a host is not shaped
+/// like reaches a token claim.
+pub fn served_endpoint(parts: &::http::request::Parts, region: &str) -> String {
+    let addressed = ::service_common::data_plane_addressing::addressed_host(
+        &parts.uri.to_string(),
+        parts
+            .headers
+            .get(::http::header::HOST)
+            .and_then(|value| value.to_str().ok()),
+    );
+    let host = addressed
+        .filter(|host| serves_pool(region, host))
+        .unwrap_or_else(|| published_endpoint_host(region));
+    format!("https://{host}")
+}
+
+/// Whether `issuer` is a token issuer of the user pool `pool_id` of `region` —
+/// the reading every verifier of a user-pool token shares, here and in the
+/// services that resolve one (an API Gateway `COGNITO_USER_POOLS` authorizer, a
+/// policy store's user-pool identity source, an identity pool's login, a
+/// web-identity federation).
+///
+/// A pool is served on every endpoint its callers reach it at and issues on the
+/// one each of them used ([`served_endpoint`]), so it answers for one issuer per
+/// endpoint rather than for a single URL: `issuer` names the pool when its whole
+/// path is that pool's id and its authority is an endpoint this emulator serves
+/// that pool at ([`serves_pool`]). Everything else is a FOREIGN issuer, which
+/// names this pool no more than it names any other — and what proves a token is
+/// the pool's own remains its signature against the key set the pool publishes.
+pub fn is_pool_issuer(region: &str, pool_id: &str, issuer: &str) -> bool {
+    let Some((origin, named)) = issuer.trim().trim_end_matches('/').rsplit_once('/') else {
+        return false;
+    };
+    if named != pool_id {
+        return false;
+    }
+    let Some(authority) = origin
+        .strip_prefix("https://")
+        .or_else(|| origin.strip_prefix("http://"))
+    else {
+        return false;
+    };
+    serves_pool(region, authority)
+}
+
+/// Whether `authority` is an address this emulator serves a pool of `region` at:
+/// that region's published user-pool endpoint, or a host-shaped address naming
+/// NO service, which is how the emulator's own endpoint is addressed — an
+/// operator binds it wherever they like and a client on this machine resolves
+/// nothing else.
+///
+/// An authority naming a DIFFERENT service's endpoint — including this service's
+/// endpoint in another region, where the pool does not live — is served by that
+/// service and not by this pool.
+fn serves_pool(region: &str, authority: &str) -> bool {
+    authority == published_endpoint_host(region)
+        || (::service_common::data_plane_addressing::is_host_shaped(authority)
+            && !::service_common::data_plane_addressing::names_a_service(authority))
+}
+
+/// This service's published endpoint host in `region`, the address a client that
+/// resolves AWS's own hostnames reaches a pool of that region at.
+fn published_endpoint_host(region: &str) -> String {
+    format!("{SIGNING_NAME}.{region}.amazonaws.com")
+}
+
 impl UserPool {
-    /// The token issuer for this pool: the regional user-pool endpoint.
-    pub fn issuer(&self) -> String {
-        format!(
-            "https://{SIGNING_NAME}.{}.amazonaws.com/{}",
-            self.region, self.id
-        )
+    /// The token issuer for this pool on `endpoint`: the user-pool endpoint the
+    /// pool is served on ([`served_endpoint`]) with this pool's id appended.
+    pub fn issuer(&self, endpoint: &str) -> String {
+        format!("{endpoint}/{}", self.id)
     }
 
     /// Where this pool publishes the key set its tokens are verified against:
     /// `<issuer>/.well-known/jwks.json`, the location the token's `iss` claim
     /// leads a verifier to (Amazon Cognito Developer Guide, "Verifying a JSON
     /// web token").
-    pub fn jwks_uri(&self) -> String {
-        format!("{}/.well-known/jwks.json", self.issuer())
+    pub fn jwks_uri(&self, endpoint: &str) -> String {
+        format!("{}/.well-known/jwks.json", self.issuer(endpoint))
+    }
+
+    /// Whether `issuer` is a token issuer OF THIS POOL — the question a verifier
+    /// holding a token asks to find the pool whose key set verifies it.
+    ///
+    /// A pool issues on the endpoint each of its callers reaches it at, so one
+    /// pool answers for one issuer per endpoint rather than for a single URL;
+    /// [`is_pool_issuer`] is that reading.
+    pub fn publishes_issuer(&self, issuer: &str) -> bool {
+        is_pool_issuer(&self.region, &self.id, issuer)
     }
 
     /// This pool's token-signing key pair, minted when the pool was created.

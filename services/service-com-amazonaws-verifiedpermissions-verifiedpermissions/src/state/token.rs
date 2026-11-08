@@ -407,6 +407,11 @@ pub fn verify<Eng: Send + Sync + 'static>(
 /// An OpenID Connect source "processes either identity (ID) or access tokens"
 /// (`OpenIdConnectTokenSelection`), never both, so one presented in the other member
 /// matches no source rather than being read under the wrong rule.
+///
+/// A user-pool source trusts the POOL its ARN names, and a pool issues on the endpoint
+/// each of its callers reached it at, so the token's issuer is read with the user-pool
+/// service's own reading of which issuers that pool publishes rather than compared to the
+/// one URL this source reports.
 fn matching_source<'s>(
     store: &'s PolicyStore,
     issuer: &str,
@@ -414,7 +419,10 @@ fn matching_source<'s>(
 ) -> Option<&'s IdentitySource> {
     store.identity_sources.values().find(|source| {
         match &source.configuration {
-            IdentitySourceConfiguration::CognitoUserPool(cognito) => cognito.issuer() == issuer,
+            IdentitySourceConfiguration::CognitoUserPool(cognito) => {
+                ::service_com_amazonaws_cognitoidentityprovider_awscognitoidentityproviderservice
+                    ::state::is_pool_issuer(&cognito.region, &cognito.user_pool_id, issuer)
+            }
             IdentitySourceConfiguration::OpenIdConnect(oidc) => {
                 oidc.issuer == issuer
                     && match (&oidc.token_selection, kind) {
@@ -723,11 +731,12 @@ pub fn published_key_set<Eng: Send + Sync + 'static>(engine: &Eng, issuer: &str)
         ::state::service_state(engine)?;
     // A user pool's issuer URL ends in the pool's own id, which is how the pool that
     // publishes a key set is found; the whole URL still has to agree, because a pool
-    // answers only for the issuer it publishes.
+    // answers only for an issuer it publishes — one naming an endpoint this emulator
+    // serves that pool at, which is the pool's own reading.
     let user_pool_id = issuer.rsplit('/').next()?.to_string();
     let pools = pools.lock();
     let pool = pools.pool(&user_pool_id)?;
-    (pool.issuer() == issuer).then(|| pool.jwks())
+    pool.publishes_issuer(issuer).then(|| pool.jwks())
 }
 
 /// Whether the provider `source` points at is one this EMULATOR hosts, so that the key set
