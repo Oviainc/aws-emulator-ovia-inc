@@ -20,11 +20,13 @@
 mod bedrock_agentcore_data_plane_parent_resources;
 #[path = "all/cloudformation_fifo_resource_generated_names.rs"]
 mod cloudformation_fifo_resource_generated_names;
-// Declared here, in this same head region, for the reason the entry above records.
+// Declared here, in this same head region, for the reason the entry above records: this
+// suite holds the committed `Cargo.lock` to the workspace's manifests, so it belongs to no
+// service's span of the sorted list.
+#[path = "all/workspace_lockfile_covers_every_manifest.rs"]
+mod workspace_lockfile_covers_every_manifest;
 #[path = "all/cloudformation_asset_bucket_publishing_role.rs"]
 mod cloudformation_asset_bucket_publishing_role;
-#[path = "all/cloudformation_wafv2_protection_stack.rs"]
-mod cloudformation_wafv2_protection_stack;
 // Declared here, in this same head region, for the reason the entry above records: the
 // appended tail and the sorted `c…` span (where every cloudformation suite lands) are both
 // regions concurrently landing suites add their line to.
@@ -985,6 +987,8 @@ mod apigateway_repeated_stage_requests;
 mod apigateway_iam_authenticated_invoke;
 #[path = "all/cloudformation_rollback_triggers_revert_the_operation.rs"]
 mod cloudformation_rollback_triggers_revert_the_operation;
+#[path = "all/cloudformation_wafv2_protection_stack.rs"]
+mod cloudformation_wafv2_protection_stack;
 #[path = "all/lambda_sqs_event_source_batching_window.rs"]
 mod lambda_sqs_event_source_batching_window;
 // Declared HERE, beside the sibling suites above in the same quiet `n`/`o` gap, for the
