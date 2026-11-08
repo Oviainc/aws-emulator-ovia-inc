@@ -26,6 +26,10 @@ use crate::ops::types::{
     UPDATE_LOGGING_CONFIGURATION_STATE_VALUES,
 };
 
+/// Resolving the destination a logging configuration logs to against the service that owns
+/// it, which is what a write that names one is gated on.
+pub mod log_destinations;
+
 /// `CreateRoom`/`UpdateRoom` default for `maximumMessageRatePerSecond`, from the model's
 /// own documentation of that member ("Maximum number of messages per second that can be
 /// sent to the room (by all clients). Default: 10.").
@@ -153,6 +157,12 @@ pub const LOGGING_CONFIGURATIONS_PER_REGION: usize = 50;
 /// `LoggingConfigurationArn` pattern
 /// (`^arn:aws:ivschat:[a-z0-9-]+:[0-9]+:logging-configuration/[a-zA-Z0-9-]+$`).
 pub const LOGGING_CONFIGURATION_ARN_INFIX: &str = ":logging-configuration/";
+
+/// This service's own namespace: the model's `arnNamespace` and `sigv4Name`, which
+/// `smithy_query(query="service_info")` reports as `ivschat` for both. It is the service
+/// segment of every ARN this service mints, and the prefix of the IAM action a refusal
+/// that names the attempted operation spells (`<namespace>:<OperationName>`).
+pub const SERVICE_NAMESPACE: &str = "ivschat";
 
 /// The state `CreateLoggingConfiguration` reports a configuration it just minted in.
 ///
@@ -455,41 +465,23 @@ impl ComAmazonawsIvschatAmazoninteractivevideoservicechatState {
 /// that is the value the caller has to fix.
 ///
 /// `resourceType` is the modelled `ResourceType` enum's only value; `resourceId` is the
-/// id the identifier named, when it names one.
+/// id the identifier named, under either of this service's two resource identifiers — a
+/// room's or a logging configuration's — when it names one.
 pub fn resource_not_found(identifier: &str) -> ResourceNotFoundException {
     ResourceNotFoundException {
         message: format!("Resource: {identifier} not found"),
         resource_id: ComAmazonawsIvschatAmazoninteractivevideoservicechatState::room_id_of(
             identifier,
         )
+        .or_else(|| {
+            ComAmazonawsIvschatAmazoninteractivevideoservicechatState::logging_configuration_id_of(
+                identifier,
+            )
+        })
         .unwrap_or_default()
         .to_string(),
         // `RESOURCE_TYPE_VALUES` is the generated catalog of the modelled `ResourceType`
         // enum; ROOM is the only member it carries.
-        resource_type: RESOURCE_TYPE_VALUES
-            .first()
-            .copied()
-            .unwrap_or("ROOM")
-            .to_string(),
-    }
-}
-
-/// The modelled `ResourceNotFoundException` for a logging-configuration identifier that
-/// names no stored logging configuration.
-///
-/// `resourceId` is the `LoggingConfigurationID` the identifier named, which matches that
-/// member's `^[a-zA-Z0-9]+$` pattern. `resourceType` is the modelled `ResourceType`
-/// enum's only member — the enum carries exactly one value, so it is the only one the
-/// shape admits. The message is built from the request, so it names the identifier the
-/// caller has to fix.
-pub fn logging_configuration_not_found(identifier: &str) -> ResourceNotFoundException {
-    ResourceNotFoundException {
-        message: format!("Logging configuration not found for identifier {identifier}."),
-        resource_id: ComAmazonawsIvschatAmazoninteractivevideoservicechatState::logging_configuration_id_of(
-            identifier,
-        )
-        .unwrap_or_default()
-        .to_string(),
         resource_type: RESOURCE_TYPE_VALUES
             .first()
             .copied()

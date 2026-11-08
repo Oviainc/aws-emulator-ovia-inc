@@ -17,6 +17,17 @@ emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
 tokio = { workspace = true }
+# The clients that resolve a logging configuration's destination where the service that
+# owns it holds it, over the in-process callback into this same emulator
+# (`src/state/log_destinations.rs`): an Amazon S3 bucket, a CloudWatch Logs log group and
+# an Amazon Kinesis Data Firehose delivery stream. No network client feature is enabled:
+# the transport is the emulator's own.
+aws-sdk-s3 = { version = "1", default-features = false }
+aws-sdk-cloudwatchlogs = { version = "1", default-features = false }
+# Pinned: from 1.127.0 this client requires `aws-smithy-http` 0.64.3, which the workspace's
+# signing stack does not resolve to; 1.126.0 is the newest release that builds against the
+# `aws-smithy-http` this lock already holds.
+aws-sdk-firehose = { version = "=1.126.0", default-features = false }
 # Hex codec for the opaque `nextToken` ListRooms issues.
 hex = { workspace = true }
 bytes = { workspace = true }
@@ -29,6 +40,12 @@ emulator-core-build-support = { workspace = true }
 
 [dev-dependencies]
 sha2 = { workspace = true }
+# The destination-resolution suite mounts the services that OWN a logging configuration's
+# destination beside this one on a single engine — exactly as the assembled emulator does —
+# because a create or update resolves the destination by calling them in process.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
+service-com-amazonaws-firehose-firehose-20150804 = { workspace = true }
 
 [lints]
 workspace = true

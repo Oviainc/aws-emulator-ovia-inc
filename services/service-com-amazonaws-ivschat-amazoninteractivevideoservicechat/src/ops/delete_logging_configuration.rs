@@ -195,24 +195,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if store.logging_configuration(&input.identifier).is_none() {
             return Err(
                 DeleteLoggingConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::logging_configuration_not_found(&input.identifier),
+                    crate::state::resource_not_found(&input.identifier),
                 )
                 .into(),
             );
         }
 
         // A configuration a room still logs to is in use: the modelled refusal is
-        // `ConflictException`, and the store is left as it was. `resourceId` names the
-        // first room still holding the attachment, which is what the caller has to detach.
+        // `ConflictException`, and the store is left as it was. The message is built from
+        // the operation and the request — it names what the caller asked for and the
+        // identifier it asked about, and reports nothing of how many rooms hold the
+        // attachment. `resourceId` names the first room still holding it, which is what the
+        // caller has to detach.
         let attached = store.rooms_attached_to_logging_configuration(&input.identifier);
         if let Some(room_id) = attached.first() {
             return Err(DeleteLoggingConfigurationErrorModeled::ConflictException(
                 ConflictException {
                     message: format!(
-                        "logging configuration {} is attached to {} room(s) and cannot be \
-                         deleted.",
-                        input.identifier,
-                        attached.len()
+                        "Unable to perform {}:{} while {} is still attached to a chat room",
+                        crate::state::SERVICE_NAMESPACE,
+                        Self::NAME,
+                        input.identifier
                     ),
                     resource_id: room_id.clone(),
                     // The modelled `ResourceType` enum carries exactly one member, and the

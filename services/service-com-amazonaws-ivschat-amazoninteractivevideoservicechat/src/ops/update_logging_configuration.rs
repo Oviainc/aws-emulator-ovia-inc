@@ -4,7 +4,10 @@
 //! IMPLEMENTED: applies the members the request carries to the stored logging
 //! configuration in [`crate::state`] — a member the request omits is left unchanged —
 //! bumps its `updateTime` and reports the record as stored. Answers the modelled
-//! `ResourceNotFoundException` when `identifier` names no stored configuration.
+//! `ResourceNotFoundException` when `identifier` names no stored configuration, and the
+//! same refusal when the destination the update names is one the service that owns it
+//! reports absent ([`crate::state::log_destinations`]), in which case the stored
+//! configuration is left exactly as it was.
 //!
 //! A 501 from this operation would mean "nobody has written it yet"; it no longer
 //! answers one.
@@ -166,7 +169,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // Modeled constraints are already refused BEFORE this handler runs, so reaching
         // here means `identifier` satisfies the modelled `LoggingConfigurationIdentifier`
         // pattern and `name` its length and pattern.
@@ -195,12 +197,46 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // What this service holds is judged first, under its own guard, which is dropped
+        // before the cross-service resolution below: the caller hears about the
+        // configuration it addressed before it hears about the destination it named.
+        let stored = state
+            .lock()
+            .logging_configuration(&input.identifier)
+            .is_some();
+        if !stored {
+            return Err(
+                UpdateLoggingConfigurationErrorModeled::ResourceNotFoundException(
+                    crate::state::resource_not_found(&input.identifier),
+                )
+                .into(),
+            );
+        }
+
+        // A destination this update MOVES the configuration to is resolved where the
+        // service that owns it holds it, by the same rule a create is held to, before the
+        // stored record is touched: a destination reported absent leaves the configuration
+        // logging where it already logged. No guard is held across the call.
+        if let Some(destination) = input.destination_configuration.as_ref() {
+            let region = crate::state::request_region(ctx);
+            if let Some(refusal) = crate::state::log_destinations::unresolvable_destination(
+                ctx, &region, destination,
+            )
+            .await
+            {
+                return Err(
+                    UpdateLoggingConfigurationErrorModeled::ResourceNotFoundException(refusal)
+                        .into(),
+                );
+            }
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = state.lock();
         let Some(configuration) = store.logging_configuration_mut(&input.identifier) else {
             return Err(
                 UpdateLoggingConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::logging_configuration_not_found(&input.identifier),
+                    crate::state::resource_not_found(&input.identifier),
                 )
                 .into(),
             );

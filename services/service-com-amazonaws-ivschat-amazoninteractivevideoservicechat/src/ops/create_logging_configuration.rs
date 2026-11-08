@@ -6,6 +6,12 @@
 //! named and its tags. Every member of the response is read back out of the stored
 //! record, so a later `GetLoggingConfiguration` answers exactly what this call returned.
 //!
+//! The destination is a resource of another service, so it is resolved where that service
+//! holds it before anything is minted or stored
+//! ([`crate::state::log_destinations`]): a request naming a destination that service
+//! reports absent answers the modelled `ResourceNotFoundException` and leaves no
+//! configuration behind.
+//!
 //! A 501 from this operation would mean "nobody has written it yet"; it no longer
 //! answers one.
 //!
@@ -183,11 +189,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
-        let mut store = state.lock();
 
-        // The store is bounded, so a repeated create cannot grow it without limit: past
-        // this Region's bound the modelled refusal is `ServiceQuotaExceededException`.
-        if store.logging_configurations_at_quota() {
+        // This service's OWN bound is judged first, under its own guard, which is dropped
+        // before the cross-service resolution below: a local fault is never reported from
+        // behind a call to another service. The store is bounded, so a repeated create
+        // cannot grow it without limit: past this Region's bound the modelled refusal is
+        // `ServiceQuotaExceededException`.
+        let at_quota = state.lock().logging_configurations_at_quota();
+        if at_quota {
             return Err(
                 CreateLoggingConfigurationErrorModeled::ServiceQuotaExceededException(
                     ServiceQuotaExceededException {
@@ -211,10 +220,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
 
+        // The destination is a resource of ANOTHER service, and chat content cannot be
+        // logged to one that is not there: it is resolved where that service holds it
+        // BEFORE an id, an ARN or a record of this service's own exists, so a destination
+        // reported absent leaves nothing behind. No guard is held across the call.
+        if let Some(refusal) = crate::state::log_destinations::unresolvable_destination(
+            ctx,
+            &region,
+            &input.destination_configuration,
+        )
+        .await
+        {
+            return Err(
+                CreateLoggingConfigurationErrorModeled::ResourceNotFoundException(refusal).into(),
+            );
+        }
+
+        let mut store = state.lock();
+
         let id = store.mint_logging_configuration_id();
         let configuration = crate::state::LoggingConfiguration {
             arn: ::engine::emulator_arn(
-                "ivschat",
+                crate::state::SERVICE_NAMESPACE,
                 &region,
                 &format!("logging-configuration/{id}"),
             ),

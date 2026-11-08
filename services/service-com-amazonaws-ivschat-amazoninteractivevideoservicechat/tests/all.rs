@@ -17,6 +17,8 @@ mod date_time_members_wire_form;
 mod empty_success_answers;
 #[path = "all/logging_configuration_lifecycle.rs"]
 mod logging_configuration_lifecycle;
+#[path = "all/logging_destination_resolution.rs"]
+mod logging_destination_resolution;
 #[path = "all/room_lifecycle.rs"]
 mod room_lifecycle;
 #[path = "all/state_roundtrip.rs"]

@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(configuration) = store.logging_configuration(&input.identifier) else {
             return Err(
                 GetLoggingConfigurationErrorModeled::ResourceNotFoundException(
-                    crate::state::logging_configuration_not_found(&input.identifier),
+                    crate::state::resource_not_found(&input.identifier),
                 )
                 .into(),
             );
