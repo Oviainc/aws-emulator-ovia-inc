@@ -50,11 +50,11 @@ const VPC_CIDR: &str = "10.52.0.0/16";
 /// over the router's in-process callback.
 ///
 /// `pub(crate)` so a sibling suite over the same fact — what a DB INSTANCE reports about
-/// the group it was created in — drives one network through the same seam rather than
-/// standing up a second copy of it.
+/// the group it was created in, and what a group made of DISCOVERED subnets covers — drives
+/// one network through the same seam rather than standing up a second copy of it.
 pub(crate) struct Account {
     pub(crate) router: MultiServiceRouter,
-    ec2: ::aws_sdk_ec2::Client,
+    pub(crate) ec2: ::aws_sdk_ec2::Client,
 }
 
 impl Account {
@@ -293,7 +293,7 @@ pub(crate) fn assert_reported_zones(
 /// The `DBSubnetGroupDoesNotCoverEnoughAZs` sentence pair for `coverage`, as Amazon RDS
 /// words it: the requirement, the coverage the request's own subnets add up to, and what to
 /// do about it.
-fn coverage_message(coverage: &str) -> String {
+pub(crate) fn coverage_message(coverage: &str) -> String {
     format!(
         "The DB subnet group doesn't meet Availability Zone (AZ) coverage requirement. \
          Current AZ coverage: {coverage}. Add subnets to cover at least 2 AZs."

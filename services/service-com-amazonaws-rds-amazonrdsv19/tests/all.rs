@@ -109,6 +109,8 @@ mod db_snapshot_deletion;
 mod db_snapshot_restore;
 #[path = "all/db_subnet_group_deletion.rs"]
 mod db_subnet_group_deletion;
+#[path = "all/db_subnet_group_discovered_zone_coverage.rs"]
+mod db_subnet_group_discovered_zone_coverage;
 #[path = "all/db_subnet_group_ec2_zones.rs"]
 mod db_subnet_group_ec2_zones;
 #[path = "all/db_subnet_group_in_use_wording.rs"]
