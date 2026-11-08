@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeResize
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeResize`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeResize::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the LAST resize of the cluster the request names: which shape the
+//! cluster is moving to, how far the move has got and what kind of resize it is.
+//! A cluster whose shape has never been changed has no resize to report at all,
+//! which is refused with the modelled `ResizeNotFoundFault` (404) rather than
+//! answered with an empty progress record.
+//!
+//! The record itself is written by the call that changes a cluster's shape (see
+//! [`crate::state::StoredResize`]), and only its status moves afterwards, which
+//! the clock owes — so this read reports a stored record and computes nothing
+//! about the cluster.
 //!
 //! ## Shape of an operation
 //!
@@ -126,12 +128,19 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `DescribeResizeError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#DescribeResize")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#DescribeResize",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeResizeErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
     ResizeNotFoundFault(ResizeNotFoundFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -185,18 +194,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeResize` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeResizeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeResize"))
+        use crate::state as st;
+
+        // A read needs nothing from the request beyond its deserialized input.
+        let _ = ctx;
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                DescribeResizeErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let now = ::std::time::Instant::now();
+        let mut store = state.lock();
+        // The only write a read makes: every transition the clock already owed at
+        // this instant, which a later caller would have seen anyway.
+        store.settle(now);
+
+        // The cluster the request names is resolved first: a resize is a resize
+        // OF a cluster, so a name this account holds no cluster under names no
+        // resize either, and that resource's own fault says so.
+        let Some(stored) = store.cluster(&input.cluster_identifier) else {
+            return Err(DescribeResizeErrorModeled::ClusterNotFoundFault(
+                ClusterNotFoundFault {
+                    message: Some(st::cluster_not_found_message(
+                        st::ClusterNotFoundWording::IdentifierThenNotFound,
+                        &input.cluster_identifier,
+                    )),
+                },
+            )
+            .into());
+        };
+        // "If no resize operation has ever been initiated for the specified
+        // cluster, a HTTP 404 error is returned."
+        let Some(resize) = stored.resize.as_ref() else {
+            return Err(DescribeResizeErrorModeled::ResizeNotFoundFault(
+                ResizeNotFoundFault {
+                    message: Some(st::resize_not_found_message(&input.cluster_identifier)),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeResizeOutput {
+            target_node_type: resize.target_node_type.clone(),
+            target_number_of_nodes: resize.target_number_of_nodes,
+            target_cluster_type: resize.target_cluster_type.clone(),
+            status: Some(resize.status_at(now).to_string()),
+            elapsed_time_in_seconds: Some(resize.elapsed_seconds(now)),
+            estimated_time_to_completion_in_seconds: Some(resize.remaining_seconds(now)),
+            resize_type: Some(resize.resize_type.clone()),
+            target_encryption_type: Some(resize.target_encryption_type.clone()),
+            // Every remaining member of `ResizeProgressMessage` is a fact about
+            // DATA the resize moved — the tables it imported, the megabytes it
+            // transferred and the rate it moved them at. This control plane moves
+            // none, so it reports none of them rather than a volume nothing
+            // copied.
+            ..Default::default()
+        })
     }
 }

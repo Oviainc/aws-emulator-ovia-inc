@@ -331,9 +331,6 @@ mod cognito_post_confirmation_lambda_trigger;
 mod cognito_group_role_mapping;
 #[path = "all/cognito_sms_caller_role_trust.rs"]
 mod cognito_sms_caller_role_trust;
-// Declared beside its sibling cognito suites, at the head, for the same reason they are here.
-#[path = "all/cognito_authorizer_issuer_endpoint.rs"]
-mod cognito_authorizer_issuer_endpoint;
 #[path = "all/pi_resource_metadata_reflects_rds_configuration.rs"]
 mod pi_resource_metadata_reflects_rds_configuration;
 // At the head for the reason the entries above record: the appended tail and the sorted
@@ -531,8 +528,6 @@ mod elb_classic_network_resources_resolve_in_ec2;
 // collide.
 #[path = "all/emr_job_flow_role_instance_profile.rs"]
 mod emr_job_flow_role_instance_profile;
-#[path = "all/emr_studio_network_resolution.rs"]
-mod emr_studio_network_resolution;
 // Declared HERE too, in the sorted list rather than appended at the tail, for the reason
 // the note above gives: the appended region at the end of this file is where every
 // concurrent router suite lands, so a line added there conflicts with every other suite
@@ -970,10 +965,6 @@ mod cloudformation_updates_lambda_functions;
 mod cloudformation_provisions_lambda_event_source_mappings;
 #[path = "all/cloudformation_lambda_versions_and_aliases.rs"]
 mod cloudformation_lambda_versions_and_aliases;
-// Declared here, in this quiet span rather than in the contended tail: the log group a stack
-// declares, with the retention it declares, in CloudWatch Logs.
-#[path = "all/cloudformation_provisions_logs_log_groups.rs"]
-mod cloudformation_provisions_logs_log_groups;
 // Declared here, in the sorted block, for the reason the entries above give: the appended
 // tail of this file is the contended region every other new suite lands in.
 #[path = "all/cloudformation_sam_http_api_definitions.rs"]
@@ -1015,11 +1006,6 @@ mod sns_lambda_cdk_subscription_delivery;
 // and the log group the invocation that path makes writes its run to.
 #[path = "all/apigateway_proxy_lambda_ddb_pipeline.rs"]
 mod apigateway_proxy_lambda_ddb_pipeline;
-// EVERY suite in this file is declared EXACTLY ONCE: a second `mod` for one file is a
-// redefinition (and `clippy::duplicate_mod`), which stops this target compiling. Two
-// regions here are documented as where a concurrently landing suite adds its line, so the
-// same suite is sometimes appended to both; a line removed in this file is therefore always
-// a duplicate of one that stands elsewhere in it, never a suite dropped.
 // Declared here, in the appended tail: what a DICOM import job leaves in its data store,
 // read from the objects Amazon S3 holds under the role IAM holds.
 #[path = "all/medical_imaging_dicom_import.rs"]
@@ -1109,22 +1095,13 @@ mod zz_opensearch_fgac_probe;
 // the sorted list either.
 #[path = "all/all_rs_declares_each_suite_once.rs"]
 mod all_rs_declares_each_suite_once;
-// `cloudformation_wafv2_protection_stack` is NOT re-declared here: it is already declared in
-// the sorted head, and a second `mod` for the same file is a redefinition that stops this
-// target from compiling.
-// `bedrock_agentcore_data_plane_parent_resources` is NOT re-declared here either: it stands
-// in the sorted head, and one `mod` per file is what this target compiles with.
-// Declared here, in the appended tail, for the reason the entries above record: the sorted
-// `e…` span is a region concurrently landing suites add their line to.
-// declaration of each stands. `bedrock_agentcore_data_plane_parent_resources`, which stood
-// just below, was appended the same way and is declared in that head too.
-// `cloudformation_wafv2_protection_stack`, `lambda_sqs_event_source_batching_window`,
-// `cloudformation_asset_bucket_publishing_role` and
-// `bedrock_agentcore_data_plane_parent_resources` — are each ALREADY declared above, in the
-// Several suites that stood here are each ALREADY declared above: two concurrent changes
-// appended the same entry, which is a redefinition and stops this target from compiling, so
-// the duplicate lines are removed and the first declaration of each stands.
-// appended tail and the sorted `c…`/`s…` spans are both regions concurrently landing suites
+// `cloudformation_wafv2_protection_stack` and
+// `bedrock_agentcore_data_plane_parent_resources` are NOT re-declared here: each is already
+// declared in the sorted head, and a second `mod` for one file is a redefinition that stops
+// this target from compiling. Several other suites stood here the same way —
+// `apigateway_iam_authenticated_invoke`, `lambda_sqs_event_source_batching_window`,
+// `cloudformation_asset_bucket_publishing_role` — and each stands in that head too, so the
+// lines that were appended here a second time are gone and ONE declaration of each remains.
 #[path = "all/cloudformation_rest_api_serves_its_stage.rs"]
 mod cloudformation_rest_api_serves_its_stage;
 // Declared HERE, beside the sibling SESv2 suites above in this quiet span, for the same
@@ -1184,6 +1161,29 @@ mod sns_lambda_invoke_permission_revocation;
 // the stack published, and the records the function pointed at it leaves in it.
 #[path = "all/cloudformation_declared_log_group_takes_its_function_logs.rs"]
 mod cloudformation_declared_log_group_takes_its_function_logs;
+// Declared here, in the appended tail rather than in the sorted `c` span, for the reason
+// the notes above record: both the tail and that span are where concurrently landing suites
+// put their lines, and a line in the middle of the span conflicts with all of them.
+#[path = "all/cloudformation_provisions_redshift_subnet_groups.rs"]
+mod cloudformation_provisions_redshift_subnet_groups;
+// Declared beside its sibling cognito suites, at the head, for the same reason they are here.
+#[path = "all/cognito_authorizer_issuer_endpoint.rs"]
+mod cognito_authorizer_issuer_endpoint;
+#[path = "all/emr_studio_network_resolution.rs"]
+mod emr_studio_network_resolution;
+// Declared here, in this quiet span rather than in the contended tail: the log group a stack
+// declares, with the retention it declares, in CloudWatch Logs.
+#[path = "all/cloudformation_provisions_logs_log_groups.rs"]
+mod cloudformation_provisions_logs_log_groups;
+// EVERY suite in this file is declared EXACTLY ONCE: a second `mod` for one file is a
+// redefinition (and `clippy::duplicate_mod`), which stops this target compiling. Two
+// regions here are documented as where a concurrently landing suite adds its line, so the
+// same suite is sometimes appended to both; a line removed in this file is therefore always
+// a duplicate of one that stands elsewhere in it, never a suite dropped.
+// Declared here, in the appended tail: WAFv2 protection a stack provisions. It stood twice in
+// this tail and once in the sorted head across concurrent changes; one declaration of each
+// suite is what this target compiles, so the entry lives here, once.
+// appended tail and the sorted `c…` span are both regions concurrently landing suites add
 // Declared in the appended tail, which is where every new suite inserts its lines: what a
 // stack publishes for the `Fn::GetAtt` attributes of an `AWS::EC2::Instance` it launched —
 // the values Amazon EC2 itself reports for that instance.

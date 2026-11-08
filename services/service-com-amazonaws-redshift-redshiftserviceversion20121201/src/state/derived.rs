@@ -384,6 +384,36 @@ pub fn default_availability_zone(cluster_identifier: &str, region: &str) -> Stri
     zones[index].clone()
 }
 
+/// Another Availability Zone of the same Region as `primary`, which is where a
+/// Multi-AZ cluster's SECOND compute unit is.
+///
+/// Source: `smithy_query(query="doc", shape="Cluster", member="MultiAZ")` — "a
+/// boolean value that, if true, indicates that the cluster is deployed in TWO
+/// Availability Zones" — so the secondary zone is never the primary one. A
+/// zone's name is its Region's code followed by the zone letter (see
+/// [`region_availability_zones`]), so the Region a zone belongs to is its name
+/// without that letter, and the choice among that Region's remaining zones is
+/// derived from the cluster identifier rather than drawn per run: the same
+/// cluster always reports the same secondary zone.
+pub fn secondary_availability_zone(cluster_identifier: &str, primary: &str) -> String {
+    let region = match primary.char_indices().next_back() {
+        Some((index, last)) if ZONE_LETTERS.contains(&last) => &primary[..index],
+        _ => primary,
+    };
+    let zones: Vec<String> = region_availability_zones(region)
+        .into_iter()
+        .filter(|zone| zone != primary)
+        .collect();
+    // A Region publishes at least [`DEFAULT_ZONE_COUNT`] zones, so removing the
+    // primary one always leaves at least one to place the secondary unit in.
+    let Some(count) = ::std::num::NonZeroUsize::new(zones.len()) else {
+        return primary.to_string();
+    };
+    let index = digest_byte(&format!("multi-az-secondary/{cluster_identifier}")) as usize
+        % count.get();
+    zones[index].clone()
+}
+
 /// The 30-minute weekly maintenance window Redshift assigns when the request
 /// names none, in the `ddd:hh24:mi-ddd:hh24:mi` form Redshift reports.
 ///
@@ -513,6 +543,26 @@ pub fn cluster_nodes(
         nodes.push(node(format!("COMPUTE-{index}"), index + 1));
     }
     nodes
+}
+
+/// The nodes of the SECONDARY compute unit of a Multi-AZ cluster, in the order
+/// Redshift reports them.
+///
+/// Source: `smithy_query(query="shape", shape="SecondaryClusterInfo")` — "the
+/// nodes in the secondary compute unit". A Multi-AZ cluster runs the same
+/// topology twice, so the second unit has the same roles and the same count as
+/// the primary one ([`cluster_nodes`]) with addresses of its own: the seed names
+/// the unit, so the two units of one cluster never report the same node.
+pub fn secondary_cluster_nodes(
+    cluster_identifier: &str,
+    cluster_type: &str,
+    number_of_nodes: i32,
+) -> Vec<ClusterNode> {
+    cluster_nodes(
+        &format!("{cluster_identifier}/secondary"),
+        cluster_type,
+        number_of_nodes,
+    )
 }
 
 /// The largest `NumberOfNodes` one cluster may have.

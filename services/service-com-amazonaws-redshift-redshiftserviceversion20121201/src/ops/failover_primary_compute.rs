@@ -1,15 +1,17 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op FailoverPrimaryCompute
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `FailoverPrimaryCompute`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`FailoverPrimaryCompute::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Fails the primary compute unit of a Multi-AZ cluster over to the Availability
+//! Zone its SECONDARY unit is in: the two zones swap, so the cluster's
+//! `AvailabilityZone` becomes the zone the secondary unit was in and
+//! `MultiAZSecondary` reports the zone the primary was in. The cluster is
+//! `modifying` from this call and available again a span later, applied by the
+//! store's clock-owed settle rather than by this call.
+//!
+//! A cluster that is not deployed in two Availability Zones has no second compute
+//! unit to fail over to, and one the service is already working on cannot take the
+//! failover as well: both are refused with the modelled `InvalidClusterStateFault`.
 //!
 //! ## Shape of an operation
 //!
@@ -86,13 +88,20 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `FailoverPrimaryComputeError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#FailoverPrimaryCompute")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#FailoverPrimaryCompute",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum FailoverPrimaryComputeErrorModeled {
     ClusterNotFoundFault(ClusterNotFoundFault),
     InvalidClusterStateFault(InvalidClusterStateFault),
     UnauthorizedOperation(UnauthorizedOperation),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -146,18 +155,133 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `FailoverPrimaryCompute` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(FailoverPrimaryComputeErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("FailoverPrimaryCompute"))
+        use crate::state as st;
+
+        // The failover changes nothing outside this service, so nothing is
+        // awaited here and `ctx` carries only the request's metadata.
+        let _ = ctx;
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(
+                FailoverPrimaryComputeErrorModeled::DependentServiceUnavailableFault(
+                    DependentServiceUnavailableFault {
+                        message: Some(st::STORE_UNAVAILABLE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let started = ::std::time::Instant::now();
+        let mut store = state.lock();
+        store.settle(started);
+
+        // The cluster to fail over has to be there, and it has to be in the
+        // state that admits the work: the order every cluster-scoped operation
+        // of this service resolves a name in.
+        let Some(position) = store.cluster_position(&input.cluster_identifier) else {
+            return Err(FailoverPrimaryComputeErrorModeled::ClusterNotFoundFault(
+                ClusterNotFoundFault {
+                    message: Some(st::cluster_not_found_message(
+                        st::ClusterNotFoundWording::IdentifierThenNotFound,
+                        &input.cluster_identifier,
+                    )),
+                },
+            )
+            .into());
+        };
+        let invalid_state = || -> Self::Error {
+            FailoverPrimaryComputeErrorModeled::InvalidClusterStateFault(
+                InvalidClusterStateFault {
+                    // One sentence for every state a failover cannot be done
+                    // from, which is the operation's own recorded wording: see
+                    // [`st::FAILOVER_NOT_POSSIBLE_NOW`].
+                    message: Some(st::FAILOVER_NOT_POSSIBLE_NOW.to_string()),
+                },
+            )
+            .into()
+        };
+        let stored = &mut store.clusters[position];
+        let cluster_identifier = stored
+            .cluster
+            .cluster_identifier
+            .clone()
+            .unwrap_or_default();
+        // A cluster the service is already working on cannot take the failover as
+        // well.
+        if stored.cluster.cluster_status.as_deref() != Some(st::STATUS_AVAILABLE) {
+            return Err(invalid_state());
+        }
+        // "Fails over the primary compute unit of the specified MULTI-AZ
+        // cluster": a cluster deployed in one Availability Zone has no second
+        // compute unit for its primary to move to.
+        if stored.cluster.multi_az.as_deref() != Some(st::MULTI_AZ_ENABLED) {
+            return Err(invalid_state());
+        }
+
+        // The failover itself: the primary unit moves to the zone the secondary
+        // one holds, and the secondary unit takes the zone the primary was in —
+        // the two SWAP. Both zones are the cluster's own record, so the swap is
+        // written there and the derived member set follows it. A Multi-AZ cluster
+        // always reports a secondary zone ([`st::populate_derived_members`]
+        // derives one for every cluster whose `MultiAZ` is enabled), and the zone
+        // that rule would derive is what a record missing one swaps with — so the
+        // failover always moves the primary unit.
+        let primary_zone = stored.cluster.availability_zone.clone().unwrap_or_default();
+        let secondary_zone = stored
+            .cluster
+            .multi_az_secondary
+            .as_ref()
+            .and_then(|secondary| secondary.availability_zone.clone())
+            .filter(|zone| *zone != primary_zone)
+            .unwrap_or_else(|| {
+                st::secondary_availability_zone(&cluster_identifier, &primary_zone)
+            });
+        stored.cluster.availability_zone = Some(secondary_zone);
+        // The secondary unit's zone is written through the same member the derived
+        // rule keeps, so the swap survives the re-derivation below.
+        stored.cluster.multi_az_secondary = Some(SecondaryClusterInfo {
+            availability_zone: Some(primary_zone),
+            cluster_nodes: stored
+                .cluster
+                .multi_az_secondary
+                .as_ref()
+                .and_then(|secondary| secondary.cluster_nodes.clone()),
+        });
+        // The cluster is being worked on from this call, and is available again
+        // a span later — applied by the store's clock-owed settle, which also
+        // re-publishes the endpoint. The due instant is stored and nothing
+        // sleeps for it.
+        stored.cluster.cluster_status = Some(st::STATUS_MODIFYING.to_string());
+        stored.available_at = started + st::PROVISIONING_SPAN;
+        // The connection endpoint's ADDRESS does not move — it is the cluster's
+        // own ([`st::endpoint_address`]) and a client keeps using it across a
+        // failover, which is what deploying the cluster in two zones is for — but
+        // the interface the cluster is reached through is in the zone the cluster
+        // now serves from, so the VPC endpoint is re-derived there through the one
+        // rule every cluster's VPC endpoints come from.
+        stored.endpoint.vpc_endpoints = Some(st::cluster_vpc_endpoints(
+            &cluster_identifier,
+            stored.cluster.vpc_id.as_deref().unwrap_or_default(),
+            stored
+                .cluster
+                .availability_zone
+                .as_deref()
+                .unwrap_or_default(),
+        ));
+        stored.refresh_endpoint();
+        // Re-derive every member this service computes from the cluster's own
+        // configuration — the secondary compute unit's NODES among them, while
+        // the zone the swap above wrote is kept — through the same rule the
+        // create and the modify paths use.
+        let cluster_type = stored.cluster_type.clone();
+        st::populate_derived_members(
+            &mut stored.cluster,
+            &cluster_type,
+            ::aws_smithy_types::DateTime::from(::std::time::SystemTime::now()),
+        );
+
+        Ok(FailoverPrimaryComputeOutput {
+            cluster: Some(stored.cluster.clone()),
+        })
     }
 }

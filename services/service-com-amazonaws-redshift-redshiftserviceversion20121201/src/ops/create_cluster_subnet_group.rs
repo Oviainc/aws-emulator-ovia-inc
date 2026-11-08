@@ -290,8 +290,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(
                 CreateClusterSubnetGroupErrorModeled::ClusterSubnetGroupAlreadyExistsFault(
                     ClusterSubnetGroupAlreadyExistsFault {
-                        message: Some(format!(
-                            "Cluster subnet group '{name}' already exists."
+                        message: Some(st::subnet_group_already_exists_message(
+                            &input.cluster_subnet_group_name,
                         )),
                     },
                 )

@@ -2836,6 +2836,12 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // "Cannot end with a hyphen or contain two consecutive hyphens" (that member's own
         // doc) — Redshift's model carries no `@length` for it.
         REDSHIFT_CLUSTER => rules(63, Characters::LowercaseAlphanumeric),
+        // Amazon Redshift `CreateClusterSubnetGroup.ClusterSubnetGroupName`: "Must contain
+        // no more than 255 alphanumeric characters or hyphens" (that member's own doc) —
+        // Redshift's model carries no `@length` for it. Mixed case is accepted and folded
+        // ("Amazon Redshift stores the value as a lowercase string"), so only the LENGTH is
+        // a bound a generated name could break.
+        REDSHIFT_CLUSTER_SUBNET_GROUP => rules(255, Characters::AsGenerated),
         // Amazon EC2 `CreateSecurityGroup.GroupName`: "Up to 255 characters in length"
         // (Amazon EC2 API reference) — EC2's model carries no `@length` for it.
         EC2_SECURITY_GROUP => rules(255, Characters::AsGenerated),

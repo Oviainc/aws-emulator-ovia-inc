@@ -59,7 +59,8 @@ use crate::ops::types::{
     RecurringCharge,
     Recommendation,
     RedshiftIdcApplication, ReservedNode, ReservedNodeConfigurationOption,
-    ReservedNodeExchangeStatus, ReservedNodeOffering, Snapshot, SnapshotCopyGrant, Subnet,
+    ReservedNodeExchangeStatus, ReservedNodeOffering, SecondaryClusterInfo, Snapshot,
+    SnapshotCopyGrant, Subnet,
     SupportedOperation,
     SupportedPlatform, UpdateTarget,
     VpcEndpoint, VpcSecurityGroupMembership,
@@ -98,6 +99,11 @@ mod naming;
 /// The subnets a cluster subnet group is made of, resolved against the service
 /// that owns them.
 mod ec2_subnets;
+/// The audit-log delivery a cluster is configured with, and the Amazon S3 bucket
+/// it writes to.
+mod logging;
+/// The resize a cluster's last shape change started, and how a read reports it.
+mod resize;
 /// The snapshot schedules an account created, and the invocation times computed
 /// from their definitions.
 mod snapshot_schedules;
@@ -106,10 +112,12 @@ pub use clusters::*;
 pub use ec2_subnets::*;
 pub use derived::*;
 pub use events::*;
+pub use logging::*;
 pub use naming::*;
 pub use parameters::*;
 pub use policy_resources::*;
 pub use reserved_nodes::*;
+pub use resize::*;
 pub use snapshot_schedules::*;
 pub use tags::*;
 
@@ -2061,6 +2069,17 @@ pub struct StoredCluster {
     /// database holds at most one user under a name however often credentials
     /// are issued for it.
     pub database_users: BTreeMap<String, BTreeSet<String>>,
+    /// How this cluster's audit logging is configured: what `EnableLogging` put
+    /// on it and `DescribeLoggingStatus` reports back.
+    ///
+    /// A cluster nobody enabled logging on carries the DEFAULT record, which is
+    /// logging disabled — an account that has configured nothing still has a
+    /// logging status to read (see [`ClusterLogging`]).
+    pub logging: ClusterLogging,
+    /// The LAST resize of this cluster, and `None` for a cluster whose shape has
+    /// never been changed — which is what makes `DescribeResize` answer
+    /// `ResizeNotFound` for it (see [`StoredResize`]).
+    pub resize: Option<StoredResize>,
 }
 
 impl StoredCluster {

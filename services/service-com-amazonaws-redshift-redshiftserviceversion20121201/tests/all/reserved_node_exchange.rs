@@ -231,6 +231,9 @@ fn seed_ds2(emulator: &Emulator, cluster_identifier: &str) -> String {
         ),
         // A seeded cluster names no admin user, so its database holds none.
         database_users: Default::default(),
+        // A seeded cluster has had no logging enabled and no resize asked for.
+        logging: Default::default(),
+        resize: None,
     });
     store.reserved_nodes.push(state::StoredReservedNode {
         node: ReservedNode {

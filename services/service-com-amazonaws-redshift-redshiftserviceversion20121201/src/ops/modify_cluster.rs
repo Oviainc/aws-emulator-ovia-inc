@@ -573,10 +573,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ModifyCluster<Eng
         // — which is an event of its own in the published catalog.
         let master_password_updated =
             input.manage_master_password == Some(true) || input.master_user_password.is_some();
+        // Whether this call changes the cluster's SHAPE, which is what makes it a
+        // resize: "when you decide to change your cluster's node type or number
+        // of nodes … you can use DescribeResize to track the progress of the
+        // resize request". The comparison is against what the cluster carries
+        // NOW, so a modify that re-states the shape it already has resizes
+        // nothing.
+        let resized = cluster_type != stored.cluster_type
+            || Some(number_of_nodes) != stored.cluster.number_of_nodes
+            || input
+                .node_type
+                .as_deref()
+                .is_some_and(|wanted| Some(wanted) != stored.cluster.node_type.as_deref());
         stored.cluster_type = cluster_type;
         stored.cluster.number_of_nodes = Some(number_of_nodes);
         if let Some(node_type) = input.node_type.clone() {
             stored.cluster.node_type = Some(node_type);
+        }
+        // The resize record this shape change starts, which REPLACES whatever
+        // resize the cluster last had: a cluster holds the LAST one, and
+        // `DescribeResize` reports it (see [`st::StoredResize`]). The target is
+        // the shape resolved above, so the record and the cluster cannot
+        // disagree about what the cluster is becoming.
+        if resized {
+            stored.resize = Some(st::StoredResize::started(
+                ::std::time::Instant::now(),
+                stored.cluster.node_type.clone(),
+                Some(stored.cluster_type.clone()),
+                stored.cluster.number_of_nodes,
+                stored.cluster.encrypted.unwrap_or(false),
+            ));
         }
         if let Some(value) = input.automated_snapshot_retention_period {
             stored.cluster.automated_snapshot_retention_period = Some(value);
@@ -615,8 +641,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> ModifyCluster<Eng
             stored.cluster.ip_address_type = Some(value);
         }
         if let Some(value) = input.multi_az {
-            stored.cluster.multi_az =
-                Some(if value { "Enabled" } else { "Disabled" }.to_string());
+            stored.cluster.multi_az = Some(st::multi_az_value(value));
         }
         if let Some(value) = input.extra_compute_for_automatic_optimization {
             stored.cluster.extra_compute_for_automatic_optimization = Some(value.to_string());

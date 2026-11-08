@@ -1761,6 +1761,145 @@ pub(crate) async fn describe_redshift_cluster(
     }
 }
 
+/// The error code Amazon Redshift answers for a cluster subnet group it does not hold:
+/// `ClusterSubnetGroupNotFoundFault`'s own `awsQueryError` code, which is what an awsQuery
+/// client branches on.
+pub(crate) const REDSHIFT_SUBNET_GROUP_NOT_FOUND: &str = "ClusterSubnetGroupNotFoundFault";
+
+/// The members `CreateClusterSubnetGroup` takes, from Amazon Redshift's own model
+/// (`smithy_query(query="operation", operation="CreateClusterSubnetGroup")`), with each
+/// list's element name from its list shape's member `@xmlName`
+/// (`smithy_query(query="shape", shape="SubnetIdentifierList,TagList")`).
+pub(crate) const CREATE_CLUSTER_SUBNET_GROUP_MEMBERS: &[(&str, QueryMember)] = &[
+    ("ClusterSubnetGroupName", QueryMember::Scalar),
+    ("Description", QueryMember::Scalar),
+    ("SubnetIds", QueryMember::List("SubnetIdentifier")),
+    ("Tags", QueryMember::List("Tag")),
+];
+
+/// The properties of `AWS::Redshift::ClusterSubnetGroup` the walk does NOT turn into a
+/// create member, for the same reasons the DB subnet group's are
+/// ([`DB_SUBNET_GROUP_PROPERTIES_NOT_SENT`]): the type declares no name property at all —
+/// the name is the one CloudFormation generated, which this arm pushes — and the tag list
+/// carries the declared tags PLUS the ones CloudFormation propagates, which this arm merges.
+pub(crate) const CLUSTER_SUBNET_GROUP_PROPERTIES_NOT_SENT: &[&str] = &["Tags"];
+
+/// Create the cluster subnet group an `AWS::Redshift::ClusterSubnetGroup` declares.
+///
+/// The type's remaining two properties (`Description`, `SubnetIds`) are
+/// `CreateClusterSubnetGroup`'s own members, spelled identically on both sides, with the
+/// name CloudFormation decided — this resource's physical id, which is what "Ref returns
+/// the name of the cluster subnet group" means — and the merged tag list pushed by this arm
+/// the way the DB subnet group's are.
+///
+/// The group is what a cluster's `ClusterSubnetGroupName` names, and Amazon Redshift
+/// resolves that name against the groups it HOLDS before it will create a cluster in one
+/// (`ClusterSubnetGroupNotFoundFault`), so a stack that declares both has to create this
+/// one for real too — the same reason [`create_db_subnet_group`] exists.
+pub(crate) async fn create_cluster_subnet_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut parameters = query_members(
+        &resource.properties,
+        CREATE_CLUSTER_SUBNET_GROUP_MEMBERS,
+        // Every property of this type is its member's own name.
+        &[],
+        CLUSTER_SUBNET_GROUP_PROPERTIES_NOT_SENT,
+        REDSHIFT_CLUSTER_SUBNET_GROUP,
+    )?;
+    parameters.push((
+        "ClusterSubnetGroupName".to_string(),
+        resource.physical_resource_id.clone(),
+    ));
+    push_tag_list(
+        &mut parameters,
+        "Tags",
+        "Tag",
+        &tags_of(&resource.properties, propagated),
+    );
+    call_query(
+        ctx,
+        REDSHIFT_SIGNING_NAME,
+        region,
+        REDSHIFT_API_VERSION,
+        "CreateClusterSubnetGroup",
+        &parameters,
+    )
+    .await?;
+    // The group's own name is the handle every Amazon Redshift call takes it by, and it is
+    // already this resource's physical id; the type publishes it as its one attribute too.
+    Ok(Created::attributes(BTreeMap::from([(
+        "ClusterSubnetGroupName".to_string(),
+        resource.physical_resource_id.clone(),
+    )])))
+}
+
+/// Delete the cluster subnet group a stack created, addressed by its name — this resource's
+/// physical id. A group Amazon Redshift no longer has
+/// (`ClusterSubnetGroupNotFoundFault`) is already in the state the delete asks for.
+pub(crate) async fn delete_cluster_subnet_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    let parameters = vec![(
+        "ClusterSubnetGroupName".to_string(),
+        physical_resource_id.to_string(),
+    )];
+    match call_query(
+        ctx,
+        REDSHIFT_SIGNING_NAME,
+        region,
+        REDSHIFT_API_VERSION,
+        "DeleteClusterSubnetGroup",
+        &parameters,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(refusal) if refusal.code == REDSHIFT_SUBNET_GROUP_NOT_FOUND => Ok(()),
+        Err(refusal) => Err(refusal),
+    }
+}
+
+/// The cluster subnet group's configuration as Amazon Redshift reports it, for drift
+/// detection. A group it no longer has (`ClusterSubnetGroupNotFoundFault`) was deleted.
+///
+/// Its scalar members are read the same way the DB subnet group's are, which covers the one
+/// property a declaration can drift in under the same name (`Description`); `SubnetIds` is
+/// reported as the `Subnets` structure list, which is not that property's form, so it is not
+/// compared ([`super::drift`]).
+pub(crate) async fn describe_cluster_subnet_group(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let parameters = vec![(
+        "ClusterSubnetGroupName".to_string(),
+        physical_resource_id.to_string(),
+    )];
+    match call_query(
+        ctx,
+        REDSHIFT_SIGNING_NAME,
+        region,
+        REDSHIFT_API_VERSION,
+        "DescribeClusterSubnetGroups",
+        &parameters,
+    )
+    .await
+    {
+        Ok(answered) => Ok(Some(Value::Object(xml_scalar_children(
+            &answered,
+            "ClusterSubnetGroup",
+        )))),
+        Err(refusal) if refusal.code == REDSHIFT_SUBNET_GROUP_NOT_FOUND => Ok(None),
+        Err(refusal) => Err(refusal),
+    }
+}
+
 /// Create the DB subnet group an `AWS::RDS::DBSubnetGroup` declares.
 ///
 /// The type's four properties are `CreateDBSubnetGroup`'s own members, named identically on

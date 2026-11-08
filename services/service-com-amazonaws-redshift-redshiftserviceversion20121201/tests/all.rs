@@ -21,6 +21,8 @@ mod authentication_profiles;
 mod batch_delete_cluster_snapshots;
 #[path = "all/batch_modify_cluster_snapshots.rs"]
 mod batch_modify_cluster_snapshots;
+#[path = "all/cluster_audit_logging.rs"]
+mod cluster_audit_logging;
 #[path = "all/cluster_credentials.rs"]
 mod cluster_credentials;
 #[path = "all/cluster_endpoint_publication.rs"]
@@ -37,6 +39,8 @@ mod cluster_parameter_groups;
 mod cluster_parameters;
 #[path = "all/cluster_request_validation.rs"]
 mod cluster_request_validation;
+#[path = "all/cluster_resize_progress.rs"]
+mod cluster_resize_progress;
 #[path = "all/cluster_security_groups.rs"]
 mod cluster_security_groups;
 #[path = "all/cluster_structure.rs"]
@@ -87,6 +91,8 @@ mod maintenance_tracks;
 mod modify_cluster_parameter_group;
 #[path = "all/modify_cluster_snapshot.rs"]
 mod modify_cluster_snapshot;
+#[path = "all/multi_az_secondary.rs"]
+mod multi_az_secondary;
 #[path = "all/namespace_registration.rs"]
 mod namespace_registration;
 #[path = "all/namespace_registration_serverless.rs"]
@@ -103,6 +109,8 @@ mod query_protocol_refusals;
 mod reboot_cluster;
 #[path = "all/redshift_idc_applications.rs"]
 mod redshift_idc_applications;
+#[path = "all/refusal_message_templates.rs"]
+mod refusal_message_templates;
 #[path = "all/resource_policies.rs"]
 mod resource_policies;
 #[path = "all/resource_tags.rs"]

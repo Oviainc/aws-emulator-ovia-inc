@@ -492,7 +492,8 @@ use super::template::{
     KINESIS_STREAM,
     KMS_ALIAS, KMS_KEY,
     MQ_BROKER, MSK_CLUSTER,
-    MSK_SERVERLESS_CLUSTER, OPENSEARCH_DOMAIN, REDSHIFT_CLUSTER, ROUTE53RESOLVER_ENDPOINT,
+    MSK_SERVERLESS_CLUSTER, OPENSEARCH_DOMAIN, REDSHIFT_CLUSTER,
+    REDSHIFT_CLUSTER_SUBNET_GROUP, ROUTE53RESOLVER_ENDPOINT,
     ROUTE53RESOLVER_FIREWALL_DOMAIN_LIST, ROUTE53RESOLVER_FIREWALL_RULE_GROUP,
     ROUTE53RESOLVER_FIREWALL_RULE_GROUP_ASSOCIATION,
     ROUTE53RESOLVER_RULE,
@@ -736,6 +737,15 @@ pub(super) enum Provisioner {
     /// declaration asks for applied by `ModifyDBProxyTargetGroup`.
     RdsDbProxyTargetGroup,
     RedshiftCluster,
+    /// `AWS::Redshift::ClusterSubnetGroup`: the subnet group a provisioned Redshift cluster
+    /// is launched into, which `CreateClusterSubnetGroup` creates under the name
+    /// CloudFormation generated for the resource and `DeleteClusterSubnetGroup` deletes.
+    ///
+    /// Amazon Redshift resolves a cluster's `ClusterSubnetGroupName` against the groups it
+    /// HOLDS before it will create a cluster in one (`ClusterSubnetGroupNotFoundFault`), so
+    /// a stack declaring both has to create this one for real too — exactly the position
+    /// `AWS::RDS::DBSubnetGroup` is in ([`Provisioner::RdsDbSubnetGroup`]).
+    RedshiftClusterSubnetGroup,
     EventsRule,
     SsmParameter,
     StepFunctionsActivity,
@@ -905,6 +915,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         RDS_DB_PROXY => Some(Provisioner::RdsDbProxy),
         RDS_DB_PROXY_TARGET_GROUP => Some(Provisioner::RdsDbProxyTargetGroup),
         REDSHIFT_CLUSTER => Some(Provisioner::RedshiftCluster),
+        REDSHIFT_CLUSTER_SUBNET_GROUP => Some(Provisioner::RedshiftClusterSubnetGroup),
         EVENTS_RULE => Some(Provisioner::EventsRule),
         SSM_PARAMETER => Some(Provisioner::SsmParameter),
         STEP_FUNCTIONS_ACTIVITY => Some(Provisioner::StepFunctionsActivity),
@@ -1150,6 +1161,9 @@ impl Provisioner {
             }
             Self::RedshiftCluster => {
                 create_redshift_cluster(ctx, region, resource, propagated).await
+            }
+            Self::RedshiftClusterSubnetGroup => {
+                create_cluster_subnet_group(ctx, region, resource, propagated).await
             }
             Self::RdsDbSubnetGroup => {
                 create_db_subnet_group(ctx, region, resource, propagated).await
@@ -2163,6 +2177,9 @@ impl Provisioner {
                 delete_redshift_cluster(ctx, region, physical_resource_id, final_snapshot)
                     .await
             }
+            Self::RedshiftClusterSubnetGroup => {
+                delete_cluster_subnet_group(ctx, region, physical_resource_id).await
+            }
             Self::RdsDbSubnetGroup => {
                 delete_db_subnet_group(ctx, region, physical_resource_id).await
             }
@@ -2754,6 +2771,11 @@ impl Provisioner {
             // identifier it was created under.
             Self::RedshiftCluster => {
                 describe_redshift_cluster(ctx, region, physical_resource_id).await
+            }
+            // Amazon Redshift's own read of the subnet group the stack created, by the name
+            // it was created under.
+            Self::RedshiftClusterSubnetGroup => {
+                describe_cluster_subnet_group(ctx, region, physical_resource_id).await
             }
             // The AgentCore control plane's own read of the identity, by the name it was
             // created under.

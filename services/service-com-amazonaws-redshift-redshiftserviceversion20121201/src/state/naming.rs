@@ -293,14 +293,27 @@ pub const CREDENTIAL_DURATION_MAX_SECONDS: i32 = 3600;
 
 /// How long the credentials a request asks for last, or why the request's
 /// `DurationSeconds` is outside the documented window.
+///
+/// The refusal is Amazon Redshift's own recorded wording for this error class —
+/// `Token duration must be between <min> and <max> seconds` — whose only
+/// variable parts are the two documented bounds, both constants: the refusal
+/// does not echo the value the request asked for, so a caller matching on the
+/// sentence sees the same one whatever it sent.
 pub fn credential_duration(requested: Option<i32>) -> Result<Duration, String> {
     let seconds = requested.unwrap_or(CREDENTIAL_DURATION_DEFAULT_SECONDS);
     if !(CREDENTIAL_DURATION_MIN_SECONDS..=CREDENTIAL_DURATION_MAX_SECONDS).contains(&seconds) {
-        return Err(format!(
-            "Invalid value for DurationSeconds: {seconds}. DurationSeconds must be between {CREDENTIAL_DURATION_MIN_SECONDS} and {CREDENTIAL_DURATION_MAX_SECONDS}."
-        ));
+        return Err(credential_duration_out_of_range_message());
     }
     Ok(Duration::from_secs(seconds.unsigned_abs().into()))
+}
+
+/// Why a `DurationSeconds` outside the documented window is refused. See
+/// [`credential_duration`].
+pub fn credential_duration_out_of_range_message() -> String {
+    format!(
+        "Token duration must be between {CREDENTIAL_DURATION_MIN_SECONDS} and \
+         {CREDENTIAL_DURATION_MAX_SECONDS} seconds"
+    )
 }
 
 /// The `DbUser` a `GetClusterCredentials` response reports for the user named in

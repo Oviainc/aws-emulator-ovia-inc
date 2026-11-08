@@ -783,14 +783,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
                     .clone()
                     .unwrap_or_else(|| "ipv4".to_string()),
             ),
-            multi_az: Some(
-                if input.multi_az.unwrap_or(false) {
-                    "Enabled"
-                } else {
-                    "Disabled"
-                }
-                .to_string(),
-            ),
+            multi_az: Some(st::multi_az_value(input.multi_az.unwrap_or(false))),
             catalog_arn: input
                 .catalog_name
                 .as_deref()
@@ -825,6 +818,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> CreateCluster<Eng
             // The admin user the request named is a user OF the cluster's
             // database from the moment the cluster is allocated.
             database_users: st::initial_database_users(cluster.master_username.as_deref()),
+            // Audit logging is off until `EnableLogging` turns it on, and the
+            // cluster has been resized exactly as often as it has been created:
+            // never.
+            logging: st::ClusterLogging::default(),
+            resize: None,
         });
 
         Ok((

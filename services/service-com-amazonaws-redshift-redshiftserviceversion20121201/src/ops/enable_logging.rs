@@ -1,15 +1,25 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op EnableLogging
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `EnableLogging`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`EnableLogging::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Turns a cluster's audit logging on and records where it is delivered: the
+//! bucket and key prefix an S3 delivery writes under, the destination type and
+//! the log types being exported. What is stored is what
+//! `DescribeLoggingStatus` reports back, through one record
+//! ([`crate::state::ClusterLogging`]).
+//!
+//! Every precondition is checked BEFORE anything is stored: the cluster has to
+//! exist and be available, and an S3 delivery's `BucketName` has to be "the name
+//! of an EXISTING S3 bucket" that "the cluster must have read bucket and put
+//! object permissions" on — both of which are facts of the service that owns the
+//! bucket, so they are resolved against it
+//! ([`crate::state::resolve_log_bucket`]) and never assumed here.
+//!
+//! Those bucket preconditions belong to the S3 destination, which is the one a
+//! request that names no `LogDestinationType` asks for: `BucketName` and
+//! `S3KeyPrefix` describe no other destination. A request naming `cloudwatch` or
+//! `s3table` names no bucket to resolve, so what it configures is the destination
+//! and the log types it asked for, which the logging status then reports back.
 //!
 //! ## Shape of an operation
 //!
@@ -129,7 +139,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-redshift-redshiftservic
 // here — hence the `EnableLoggingError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.redshift#EnableLogging")]
+// `DependentServiceUnavailableFault` is widened in: the model does not list it for
+// this operation, but the service declares the shape, and it is the only modelled
+// way to say "the control-plane store could not be reached".
+#[smithy_macros::operation_error(
+    "com.amazonaws.redshift#EnableLogging",
+    extra_errors = ["DependentServiceUnavailableFault"]
+)]
 #[derive(Debug)]
 pub enum EnableLoggingErrorModeled {
     BucketNotFoundFault(BucketNotFoundFault),
@@ -139,6 +155,7 @@ pub enum EnableLoggingErrorModeled {
     InvalidS3BucketNameFault(InvalidS3BucketNameFault),
     InvalidS3KeyPrefixFault(InvalidS3KeyPrefixFault),
     UnsupportedOperationFault(UnsupportedOperationFault),
+    DependentServiceUnavailableFault(DependentServiceUnavailableFault),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -187,23 +204,183 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     const OUTPUT_SCHEMA: &'static ::aws_smithy_schema::Schema = super::types::ENABLE_LOGGING_OUTPUT_SCHEMA;
     const SUCCESS_STATUS: u16 = 200u16;
 
+    /// The write itself, in three stages: what the REQUEST alone decides, then
+    /// the cluster's own state, then the bucket as Amazon S3 reports it — and
+    /// only then the record. The store's guard is taken for each stage that
+    /// needs it and RELEASED before the hop to S3, so nothing is awaited while
+    /// this service's state is locked.
     async fn handle(
         &self,
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `EnableLogging` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(EnableLoggingErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("EnableLogging"))
+        use crate::state as st;
+
+        let Some(state) = st::service_state(&*self.engine) else {
+            return Err(EnableLoggingErrorModeled::DependentServiceUnavailableFault(
+                DependentServiceUnavailableFault {
+                    message: Some(st::STORE_UNAVAILABLE.to_string()),
+                },
+            )
+            .into());
+        };
+        let region = st::request_region(ctx);
+
+        // "The log destination type. An enum with possible values of s3,
+        // cloudwatch, and s3table": a request that names none asks for the
+        // destination `BucketName` and `S3KeyPrefix` describe, which is S3.
+        let destination = input
+            .log_destination_type
+            .clone()
+            .unwrap_or_else(|| st::LOG_DESTINATION_S3.to_string());
+
+        // The request's own values first, before the store is read at all.
+        // `S3KeyPrefix` needs none: the member's modelled `@pattern` IS the
+        // documented character set, and the framework refuses a value outside a
+        // modelled constraint before this handler runs, so there is no prefix
+        // left here for `InvalidS3KeyPrefixFault` to report.
+
+        // The cluster has to be there and available: logging is a configuration
+        // OF a cluster, and one the service is still working on takes no
+        // configuration change.
+        {
+            let mut store = state.lock();
+            store.settle(::std::time::Instant::now());
+            configurable_cluster(&store, &input.cluster_identifier)?;
+        }
+
+        // An S3 delivery names a bucket, and both facts about it — that the
+        // account HAS it, and that its policy admits the delivery — belong to
+        // the service that owns it, so they are resolved there with NO lock
+        // held.
+        if destination == st::LOG_DESTINATION_S3 {
+            let invalid_bucket_name = |message: &str| -> Self::Error {
+                EnableLoggingErrorModeled::InvalidS3BucketNameFault(InvalidS3BucketNameFault {
+                    message: Some(message.to_string()),
+                })
+                .into()
+            };
+            let Some(bucket) = input.bucket_name.as_deref() else {
+                return Err(invalid_bucket_name(st::MISSING_S3_BUCKET_NAME));
+            };
+            // A name outside Amazon S3's own naming rules names no bucket
+            // anywhere, so it is refused before S3 is asked about it. The rules
+            // are the ones every service in this workspace reads a caller's
+            // bucket name under.
+            if !::service_common::s3_bucket_name::is_well_formed(bucket) {
+                return Err(invalid_bucket_name(st::INVALID_S3_BUCKET_NAME));
+            }
+            match st::resolve_log_bucket(
+                ctx,
+                &region,
+                &input.cluster_identifier,
+                bucket,
+                input.s3_key_prefix.as_deref(),
+            )
+            .await
+            {
+                st::LogBucketResolution::NotFound => {
+                    return Err(EnableLoggingErrorModeled::BucketNotFoundFault(
+                        BucketNotFoundFault {
+                            message: Some(st::bucket_not_found_message(bucket)),
+                        },
+                    )
+                    .into())
+                }
+                st::LogBucketResolution::PolicyInsufficient => {
+                    return Err(
+                        EnableLoggingErrorModeled::InsufficientS3BucketPolicyFault(
+                            InsufficientS3BucketPolicyFault {
+                                message: Some(st::insufficient_bucket_policy_message(bucket)),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+                // The bucket is there and admits the delivery — or Amazon S3
+                // could not be asked at all, which establishes nothing about the
+                // bucket and so refuses nothing (see `st::logging`).
+                st::LogBucketResolution::Admitted | st::LogBucketResolution::Unknown => {}
+            }
+        }
+
+        // The record a later `DescribeLoggingStatus` reports verbatim. The
+        // cluster's precondition is asked AGAIN under this guard: it may have
+        // been deleted, or put to work by another call, while the bucket was
+        // being resolved, and this call must configure neither.
+        let mut store = state.lock();
+        store.settle(::std::time::Instant::now());
+        let position = configurable_cluster(&store, &input.cluster_identifier)?;
+        let logging = st::ClusterLogging {
+            logging_enabled: true,
+            bucket_name: input.bucket_name.clone(),
+            s3_key_prefix: input.s3_key_prefix.clone(),
+            log_destination_type: Some(destination),
+            log_exports: input.log_exports.clone().unwrap_or_default(),
+        };
+        store.clusters[position].logging = logging.clone();
+
+        // Turning a cluster's audit logging on, and naming where it is
+        // delivered, is the security-relevant event of this operation, so it is
+        // attributable in the emulator's own log: which operation, the access key
+        // id the request presented, which cluster, which destination and the
+        // outcome. The same record `GetClusterCredentials` leaves for the
+        // credential it issues.
+        ::tracing::info!(
+            operation = Self::NAME,
+            presented_access_key_id = %::engine::extract_akid(&ctx.parts().headers),
+            cluster_identifier = %input.cluster_identifier,
+            log_destination_type = ?logging.log_destination_type,
+            bucket_name = ?logging.bucket_name,
+            outcome = "enabled",
+            "enabled audit logging for a provisioned cluster"
+        );
+
+        Ok(logging.enable_output())
     }
+}
+
+/// Where in the store the cluster this request configures sits, or why it can
+/// take no logging configuration: it has to be there, and it has to be
+/// `available`.
+///
+/// ONE rule, asked twice — before the hop to Amazon S3 and again under the guard
+/// the write takes — so the two passes cannot judge the cluster differently.
+fn configurable_cluster(
+    store: &crate::state::ComAmazonawsRedshiftRedshiftserviceversion20121201State,
+    cluster_identifier: &str,
+) -> Result<usize, EnableLoggingError> {
+    use crate::state as st;
+
+    let Some(position) = store.cluster_position(cluster_identifier) else {
+        return Err(cluster_not_found(cluster_identifier));
+    };
+    let status = store
+        .clusters
+        .get(position)
+        .and_then(|stored| stored.cluster.cluster_status.clone())
+        .unwrap_or_default();
+    if status != st::STATUS_AVAILABLE {
+        return Err(EnableLoggingErrorModeled::InvalidClusterStateFault(
+            InvalidClusterStateFault {
+                message: Some(st::invalid_cluster_state_message(
+                    cluster_identifier,
+                    &status,
+                )),
+            },
+        )
+        .into());
+    }
+    Ok(position)
+}
+
+/// What a request naming a cluster this account does not have is refused with.
+fn cluster_not_found(cluster_identifier: &str) -> EnableLoggingError {
+    EnableLoggingErrorModeled::ClusterNotFoundFault(ClusterNotFoundFault {
+        message: Some(crate::state::cluster_not_found_message(
+            crate::state::ClusterNotFoundWording::IdentifierThenNotFound,
+            cluster_identifier,
+        )),
+    })
+    .into()
 }

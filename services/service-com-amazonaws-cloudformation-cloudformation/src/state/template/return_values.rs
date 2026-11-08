@@ -2034,6 +2034,16 @@ pub const SQS_QUEUE: &str = "AWS::SQS::Queue";
 /// ([`naming_rules`]).
 pub const REDSHIFT_CLUSTER: &str = "AWS::Redshift::Cluster";
 
+/// The cluster SUBNET GROUP of Amazon Redshift: the subnets of a VPC a cluster is
+/// launched into, which a cluster's `ClusterSubnetGroupName` names.
+///
+/// "Ref returns the name of the cluster subnet group" and the type declares no name
+/// property of its own — its three properties are `Description`, `SubnetIds` and `Tags` —
+/// so the name is one CloudFormation GENERATES, held to Amazon Redshift's own rules for
+/// it ([`naming_rules`]), and that generated name is the physical resource id a dependent
+/// cluster resolves the group by.
+pub const REDSHIFT_CLUSTER_SUBNET_GROUP: &str = "AWS::Redshift::ClusterSubnetGroup";
+
 /// The two resource types that carry a QUEUE's access policy: the one that applies a
 /// document to a list of queues, and the one that belongs to a single queue.
 ///

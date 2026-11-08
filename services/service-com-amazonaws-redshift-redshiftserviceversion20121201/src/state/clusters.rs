@@ -78,6 +78,44 @@ pub fn populate_derived_members(
         availability_status(cluster.cluster_status.as_deref().unwrap_or_default()).to_string(),
     );
 
+    // "The secondary compute unit of a cluster, if Multi-AZ deployment is turned
+    // on" (`smithy_query(query="shape", shape="Cluster",
+    // member="MultiAZSecondary")`): a cluster deployed in two Availability Zones
+    // HAS a second compute unit, so one whose `MultiAZ` says so reports where
+    // that unit is and which nodes it runs, and one deployed in a single zone
+    // reports none. Derived here, beside the primary unit's own nodes, so the
+    // create, the modify, the restore and the failover paths cannot report
+    // different member sets for one cluster.
+    //
+    // WHERE the unit is, once decided, is kept: the zone a cluster's second
+    // compute unit sits in is a fact of its deployment, so a record that already
+    // carries one (a cluster whose primary has been failed over into the other
+    // zone, which swaps the two) reports that zone, and only a record that
+    // carries none — or one whose stored zone is now the PRIMARY's — chooses a
+    // zone for the unit.
+    cluster.multi_az_secondary = (cluster.multi_az.as_deref() == Some(MULTI_AZ_ENABLED)).then(
+        || {
+            let primary = cluster.availability_zone.clone().unwrap_or_default();
+            let placed = cluster
+                .multi_az_secondary
+                .as_ref()
+                .and_then(|secondary| secondary.availability_zone.clone())
+                .filter(|zone| *zone != primary)
+                .unwrap_or_else(|| secondary_availability_zone(&identifier, &primary));
+            SecondaryClusterInfo {
+                availability_zone: Some(placed),
+                cluster_nodes: Some(secondary_cluster_nodes(
+                    &identifier,
+                    cluster_type,
+                    cluster
+                        .number_of_nodes
+                        .unwrap_or(1)
+                        .clamp(1, MAX_NODES_PER_CLUSTER),
+                )),
+            }
+        },
+    );
+
     // "Describes a group of DeferredMaintenanceWindow objects": a cluster whose
     // maintenance nobody deferred reports an EMPTY group rather than none.
     cluster.deferred_maintenance_windows.get_or_insert_default();
@@ -88,6 +126,61 @@ pub fn populate_derived_members(
     if let Some(window) = cluster.preferred_maintenance_window.as_deref() {
         cluster.next_maintenance_window_start_time = next_maintenance_window_start(window, now);
     }
+}
+
+/// `Cluster$MultiAZ` for a cluster deployed in TWO Availability Zones, and for
+/// one deployed in a single zone.
+///
+/// Source: `smithy_query(query="doc", shape="Cluster", member="MultiAZ")` — "A
+/// boolean value that, if true, indicates that the cluster is deployed in two
+/// Availability Zones" — reported as the `Enabled` / `Disabled` pair that
+/// member's own documentation speaks in rather than as `true` / `false`.
+pub const MULTI_AZ_ENABLED: &str = "Enabled";
+/// See [`MULTI_AZ_ENABLED`].
+pub const MULTI_AZ_DISABLED: &str = "Disabled";
+
+/// What `Cluster$MultiAZ` reports for a request whose `MultiAZ` asked for
+/// `enabled`.
+///
+/// ONE rule for every path that sets the member (`CreateCluster`,
+/// `ModifyCluster`, `RestoreFromClusterSnapshot`), so no two of them can report
+/// the same deployment differently — and so the derived
+/// `Cluster$MultiAZSecondary` beside it is decided by one spelling (see
+/// [`populate_derived_members`]).
+pub fn multi_az_value(enabled: bool) -> String {
+    if enabled {
+        MULTI_AZ_ENABLED
+    } else {
+        MULTI_AZ_DISABLED
+    }
+    .to_string()
+}
+
+/// Why a `FailoverPrimaryCompute` cannot be served as the cluster stands.
+///
+/// Recorded Amazon Redshift wording for this operation's `InvalidClusterStateFault`
+/// (awsQuery code `InvalidClusterState`): fixed text with no variable part — the
+/// refusal names neither the cluster nor which precondition it broke. It covers
+/// every state a failover cannot be done from, which is what the operation has to
+/// say: a cluster deployed in a single Availability Zone has no second compute
+/// unit for its primary to move to (`FailoverPrimaryCompute` "fails over the
+/// primary compute unit of the specified MULTI-AZ cluster"), and one the service
+/// is already working on cannot take the failover as well.
+pub const FAILOVER_NOT_POSSIBLE_NOW: &str =
+    "You can't failover primary compute of your cluster now. Try again later.";
+
+/// Why an operation that needs a RUNNING cluster refuses one that is not
+/// available, naming the cluster and the state it is in.
+///
+/// `smithy_query(query="shape", shape="InvalidClusterStateFault")` — "The
+/// specified cluster is not in the `available` state" — which is the fixed part
+/// of the sentence; the cluster the request named and the state it is actually in
+/// are the variable parts a caller needs to decide whether to wait. One function
+/// for every operation whose precondition is just that, so two of them cannot
+/// word it differently; an operation whose recorded refusal says more than this
+/// (the restart, which names the action) keeps its own sentence.
+pub fn invalid_cluster_state_message(cluster_identifier: &str, status: &str) -> String {
+    format!("Cluster {cluster_identifier} is in state {status}; it must be {STATUS_AVAILABLE}.")
 }
 
 /// The IAM role associations a cluster reports for `arns`, each at `apply_status`.
@@ -336,6 +429,20 @@ pub fn subnet_group_not_found_message(
             format!("Cluster subnet group '{requested}' does not exist.")
         }
     }
+}
+
+/// How a create refuses a `ClusterSubnetGroupName` the account already has a
+/// group under, quoting the name as the REQUEST spelled it — the caller has to
+/// recognise what it asked for, exactly as
+/// [`subnet_group_not_found_message`] quotes it.
+///
+/// Recorded Amazon Redshift wording for `ClusterSubnetGroupAlreadyExistsFault`
+/// (`smithy_query(query="shape", shape="ClusterSubnetGroupAlreadyExistsFault")`
+/// — "A ClusterSubnetGroupName is already used by an existing cluster subnet
+/// group"): the fixed text is `The Cluster subnet group '` + the name + `'
+/// already exists.`
+pub fn subnet_group_already_exists_message(requested: &str) -> String {
+    format!("The Cluster subnet group '{requested}' already exists.")
 }
 
 /// Why the snapshot `snapshot`, named by `identifier`, cannot be deleted as it

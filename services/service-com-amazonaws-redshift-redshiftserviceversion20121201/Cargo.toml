@@ -56,6 +56,11 @@ chrono = { version = "0.4", default-features = false, features = ["std"] }
 # the pair a `RegisterNamespace` / `DeregisterNamespace` names exists is a
 # question only it can answer (`state::serverless`).
 aws-sdk-redshiftserverless = { version = "1", default-features = false }
+# The Amazon S3 client `EnableLogging` resolves the audit-log bucket through,
+# over the same in-process callback: whether the account has the bucket, and what
+# its policy permits, are facts of the service that owns it
+# (`state::logging`).
+aws-sdk-s3 = { version = "1", default-features = false }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -88,6 +93,11 @@ service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # registration change names are ITS resources: the suite creates them there and
 # registers them here. Another workspace member this repository already locks.
 service-com-amazonaws-redshiftserverless-redshiftserverless = { workspace = true }
+# The audit-logging suite mounts Amazon S3 beside Redshift on one engine, because
+# the bucket `EnableLogging` names is ITS resource: the suite creates the bucket
+# and puts the delivery policy on it there, and enables logging here. Another
+# workspace member this repository already locks.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

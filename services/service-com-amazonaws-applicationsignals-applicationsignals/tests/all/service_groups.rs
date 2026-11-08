@@ -561,13 +561,18 @@ async fn listed_services_carry_their_own_groups_on_every_page() {
         let case = format!("MaxResults={page_size}");
         let mut walked: Vec<Value> = Vec::new();
         let mut token: Option<String> = None;
+        // ONE window for the whole walk, as a client paging a report asks for: the cursor a
+        // page hands back names a position in the read THAT page served, so a later page
+        // asked for over a different window is a different read and the cursor is not its
+        // to resume. `window()` is computed from the clock, so re-deriving it per request
+        // moved the window whenever the second ticked between two pages.
+        let window = window();
         for _ in 0..services.len() + 2 {
             let uri = match token.as_deref() {
                 Some(token) => format!(
-                    "/services?{}&MaxResults={page_size}&NextToken={token}",
-                    window()
+                    "/services?{window}&MaxResults={page_size}&NextToken={token}"
                 ),
-                None => format!("/services?{}&MaxResults={page_size}", window()),
+                None => format!("/services?{window}&MaxResults={page_size}"),
             };
             let (status, answer) = call(&router, "GET", &uri, None).await;
             assert_eq!(

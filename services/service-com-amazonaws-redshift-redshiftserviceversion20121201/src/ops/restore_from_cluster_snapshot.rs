@@ -1039,9 +1039,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
             multi_az: Some(
                 input
                     .multi_az
-                    .map(|on| if on { "Enabled" } else { "Disabled" }.to_string())
+                    .map(st::multi_az_value)
                     .or_else(|| source.and_then(|cluster| cluster.multi_az.clone()))
-                    .unwrap_or_else(|| "Disabled".to_string()),
+                    .unwrap_or_else(|| st::MULTI_AZ_DISABLED.to_string()),
             ),
             catalog_arn: input
                 .catalog_name
@@ -1082,6 +1082,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> RestoreFromCluste
             // A restored cluster has the database the snapshot holds, so its
             // admin user is a user of it exactly as a created cluster's is.
             database_users: st::initial_database_users(cluster.master_username.as_deref()),
+            // A restore configures no logging and performs no resize: the
+            // restored cluster starts where a created one does.
+            logging: st::ClusterLogging::default(),
+            resize: None,
         });
 
         // The snapshot this cluster was built from, as the event naming it
