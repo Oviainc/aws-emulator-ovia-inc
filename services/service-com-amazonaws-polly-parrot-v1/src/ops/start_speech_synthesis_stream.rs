@@ -34,7 +34,9 @@
 //! * every name in `LexiconNames` is resolved in the lexicon store of the Region
 //!   the request was signed for, and its lexemes are applied to the text that is
 //!   spoken;
-//! * `LanguageCode` has to be a language the voice speaks;
+//! * `LanguageCode` selects which language a bilingual voice speaks and states no
+//!   requirement on the voice, so a language the chosen voice does not speak is
+//!   streamed with that voice rather than refused;
 //! * each `TextEvent` is billed the way Amazon Polly bills characters — every
 //!   character of plain text, and for `ssml` the text content only — and `ssml`
 //!   text is read as a real XML document and checked against the SSML vocabulary
@@ -120,7 +122,8 @@ use aws_smithy_types::body::SdkBody;
 use aws_smithy_types::event_stream::{Header, HeaderValue, Message};
 use bytes::Buf;
 use service_common::event_stream::{
-    deserialize_request, error_response, event_stream_only_response, frame_event,
+    deserialize_request, error_response, event_stream_only_response, frame_event, read_request,
+    RequestRefusal,
 };
 use smithy_server_runtime::{BoxFuture, OperationContext, ServerHttpProtocol, Service};
 use std::sync::Arc;
@@ -374,9 +377,9 @@ impl<Eng: Send + Sync + 'static> StartSpeechSynthesisStream<Eng> {
         };
 
         // The two state reads: the lexicons this request names must be stored in the
-        // Region it was signed for, and the voice it names decides which engine and
-        // which language it may ask for — read off the catalog `DescribeVoices`
-        // serves, so the two operations cannot disagree about a voice.
+        // Region it was signed for, and the voice it names decides which engine it may
+        // ask for — read off the catalog `DescribeVoices` serves, so the two
+        // operations cannot disagree about a voice.
         let state = crate::state::service_state(&*self.engine).ok_or_else(service_failure)?;
         let mut lexicons = lexicon::Lexicons::default();
         if let Some(names) = settings.lexicon_names.as_ref() {
@@ -425,24 +428,16 @@ impl<Eng: Send + Sync + 'static> StartSpeechSynthesisStream<Eng> {
                 &format!("Member must be a voice that supports the {STREAMING_ENGINE} engine"),
             ));
         }
-        // A bilingual voice's additional language counts, which is what
-        // `LanguageCode` is for.
-        if let Some(language) = settings.language_code.as_deref() {
-            if !voice.speaks(language, true) {
-                return Err(field_refusal(
-                    "languageCode",
-                    language,
-                    &format!(
-                        "Member must be a language the voice {} speaks",
-                        settings.voice_id
-                    ),
-                ));
-            }
-        }
-
+        // "Specify this parameter only when using a bilingual voice. If a bilingual
+        // voice is used and no language code is specified, Amazon Polly uses the
+        // default language of the bilingual voice"
+        // (`StartSpeechSynthesisStreamInput$LanguageCode`): the member SELECTS a
+        // bilingual voice's language and states no requirement on the voice, so a
+        // language the chosen voice does not speak is not a refusal here either — the
+        // same reading `SynthesizeSpeech` takes of its own copy of the member.
         let events = decode_action_stream(protocol, req).await?;
         // The voice the request named decides the timbre of the speech, read off the
-        // same catalog row its engine and language were checked against.
+        // same catalog row its engine was checked against.
         let timbre = render::Timbre::for_gender(Some(voice.gender));
         frame_stream(
             protocol,
@@ -765,7 +760,11 @@ fn encoded_chunk(output_format: &str, sample_rate: u32, samples: &[f32]) -> Opti
 /// payload member is excluded from it), so an empty body is what keeps the body
 /// codec from being pointed at event-stream frames, and the model's own enums and
 /// bounds are what admit or refuse the request. `Err` carries the refusal sentence
-/// the framework's own boundary would have worded.
+/// the framework's own boundary would have worded, built from the VIOLATIONS the shared
+/// reader hands back ([`service_common::event_stream::read_request`]) through this
+/// service's own statement of them ([`crate::service::validation::stated_envelope`]) — so
+/// a header-bound member and a body member of another operation state one enum's accepted
+/// values alike.
 fn settings_from_headers(
     protocol: &dyn ServerHttpProtocol,
     req: &Request,
@@ -782,11 +781,20 @@ fn settings_from_headers(
             .headers_mut()
             .append(name.to_string(), value.to_string());
     }
-    deserialize_request(
+    read_request(
         protocol,
         &headers_only,
         &StartSpeechSynthesisStreamSettings::SCHEMA,
     )
+    .map_err(|refusal| match refusal {
+        // The violations are stated the way this service states them, in the framework's
+        // own envelope — the one path the refusal seam takes for every other operation.
+        RequestRefusal::Invalid(violations) => {
+            crate::service::validation::stated_envelope(&violations)
+        }
+        // A request the codec could not read at all has no violation to state.
+        RequestRefusal::Unreadable(message) => message,
+    })
 }
 
 /// Read ONE decoded frame's payload into the modelled event structure and check it

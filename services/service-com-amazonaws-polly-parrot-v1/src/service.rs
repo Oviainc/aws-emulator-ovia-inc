@@ -45,6 +45,11 @@
 //! builds its modelled failures through it, so one error code cannot acquire two
 //! different messages.
 //!
+//! `override_refusal` is the seam this service DOES take, for one thing the framework
+//! cannot know: the accepted value set a refusal states for an enumerated member is
+//! the SERVICE's published set, not the order the model declares that enum in. See
+//! [`validation`].
+//!
 //! `override_protocol` is the seam this service DOES take, for two things the generic
 //! renderer cannot express: an error document whose `message` member is present and
 //! `null` when the code carries no message, and an errortype header qualified by this
@@ -59,6 +64,9 @@ use crate::ops::start_speech_synthesis_stream::{self, StartSpeechSynthesisStream
 use service_common::event_stream::EventStreamRoute;
 use service_common::request_path;
 
+/// The accepted value set this service states when it refuses a value outside an
+/// enumerated member.
+pub mod validation;
 pub mod wire;
 /// What XML itself admits around a document element, for the operations that read one.
 pub mod xml;
@@ -145,14 +153,16 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // The centralized walk calls this on a framework-level refusal (an absent
         // required member, or a value outside a declared bound) to let this
         // service reword it. Returning `None` keeps the framework's default
-        // wording. To state a refusal the way the emulated service states it,
-        // replace this body with a `match refusal { .. }` that returns
-        // `Some(Refused { code, message })` for the cases you reword and `None`
-        // for the rest. Replace BOTH the code and the message: a client branches
-        // on the code, so a message without its matching code is worse than
-        // leaving both alone.
-        let _ = refusal;
-        None
+        // wording.
+        //
+        // ONE thing this service states differently: the accepted values of an
+        // enumerated member are stated as the SERVICE publishes that enum's set,
+        // which is not the order the model happens to declare its members in (see
+        // [`validation`]). The code stays `ValidationException` and the envelope
+        // stays the framework's, so only the list of values inside the clause moves;
+        // every refusal this service states exactly as the framework does keeps the
+        // framework's own rendering.
+        validation::stated_refusal(refusal)
     }
 
     fn override_routing_error(
@@ -214,15 +224,19 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
 /// contract offers. One code carries NO message at all
 /// (`SynthesisTaskNotFoundException`), which is likewise what Amazon Polly answers.
 ///
-/// Three modelled errors are deliberately absent: `UnsupportedPlsAlphabetException`,
-/// `EngineNotSupportedException` and `InvalidTaskIdException`. Amazon Polly does not
-/// answer with any of them — a lexicon declaring an alphabet it does not support is
+/// FOUR modelled errors are deliberately absent: `UnsupportedPlsAlphabetException`,
+/// `EngineNotSupportedException`, `InvalidTaskIdException` and
+/// `LanguageNotSupportedException`. Amazon Polly does not answer with any of them — a
+/// lexicon declaring an alphabet it does not support is
 /// refused as an invalid PLS document (`InvalidLexiconException`), a voice/engine
 /// mismatch is refused as a request-shape failure (`ValidationException`, whose message
-/// the framework builds from the request), and a `TaskId` is either one the model's
+/// the framework builds from the request), a `TaskId` is either one the model's
 /// pattern admits, in which case it names a task or names none
 /// (`SynthesisTaskNotFoundException`), or one it does not, which the request boundary
-/// refuses — so there is nothing here to construct them with.
+/// refuses, and a `LanguageCode` the model's enum admits is SERVED whatever voice the
+/// request names — the member selects the language of a bilingual voice and states no
+/// requirement on the voice, so no synthesis request reaches a language the service
+/// cannot speak at all. So there is nothing here to construct them with.
 pub mod errors {
     #[allow(unused_imports)]
     use crate::ops::types::*;
@@ -256,9 +270,6 @@ pub mod errors {
     pub const TEXT_LENGTH_EXCEEDED: &str = "Maximum text length has been exceeded";
     /// OBSERVED: `UnsupportedPlsLanguageException`.
     pub const UNSUPPORTED_PLS_LANGUAGE: &str = "Unsupported PLS language";
-    /// The model's own sentence for `LanguageNotSupportedException`.
-    pub const LANGUAGE_NOT_SUPPORTED: &str =
-        "The language specified is not currently supported by Amazon Polly in this capacity.";
     /// The model's own sentence for `ServiceFailureException`.
     pub const SERVICE_FAILURE: &str = "An unknown condition has caused a service failure.";
 
@@ -272,7 +283,6 @@ pub mod errors {
         ("InvalidNextTokenException", Some(INVALID_NEXT_TOKEN)),
         ("InvalidSampleRateException", Some(INVALID_SAMPLE_RATE)),
         ("InvalidSsmlException", Some(INVALID_SSML)),
-        ("LanguageNotSupportedException", Some(LANGUAGE_NOT_SUPPORTED)),
         ("LexiconNotFoundException", Some(LEXICON_NOT_FOUND)),
         ("LexiconSizeExceededException", Some(LEXICON_SIZE_EXCEEDED)),
         (
@@ -323,13 +333,6 @@ pub mod errors {
     pub fn invalid_ssml() -> InvalidSsmlException {
         InvalidSsmlException {
             message: Some(INVALID_SSML.to_string()),
-        }
-    }
-
-    /// The voice does not speak the requested language.
-    pub fn language_not_supported() -> LanguageNotSupportedException {
-        LanguageNotSupportedException {
-            message: Some(LANGUAGE_NOT_SUPPORTED.to_string()),
         }
     }
 
@@ -416,10 +419,6 @@ pub mod errors {
                 ("InvalidNextTokenException", invalid_next_token().message),
                 ("InvalidSampleRateException", invalid_sample_rate().message),
                 ("InvalidSsmlException", invalid_ssml().message),
-                (
-                    "LanguageNotSupportedException",
-                    language_not_supported().message,
-                ),
                 ("LexiconNotFoundException", lexicon_not_found().message),
                 (
                     "LexiconSizeExceededException",

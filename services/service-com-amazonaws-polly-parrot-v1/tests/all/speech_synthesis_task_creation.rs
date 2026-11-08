@@ -436,18 +436,6 @@ async fn a_refused_request_records_no_task() {
             400,
             "ValidationException",
         ),
-        (
-            "a language the voice does not speak",
-            serde_json::json!({
-                "Text": "hello world",
-                "VoiceId": "Joanna",
-                "LanguageCode": "hi-IN",
-                "OutputFormat": "mp3",
-                "OutputS3BucketName": OUTPUT_BUCKET,
-            }),
-            400,
-            "LanguageNotSupportedException",
-        ),
     ];
 
     for (case, request, status, code) in &rows {

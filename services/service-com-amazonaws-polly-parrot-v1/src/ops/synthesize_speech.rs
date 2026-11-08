@@ -22,13 +22,15 @@
 //! * every name in `LexiconNames` is resolved in the lexicon store of the Region the
 //!   request was signed for, and a name that Region does not store is
 //!   `LexiconNotFoundException` (404);
-//! * `Engine` and `LanguageCode` are checked against the voice the request names, as
-//!   the voice catalog `DescribeVoices` serves records it, so the two operations
-//!   cannot disagree: an engine the voice does not support is the request-shape
-//!   refusal `ValidationException` (which is what Amazon Polly answers for it, not
-//!   the modelled `EngineNotSupportedException`) and a language it does not speak is
-//!   `LanguageNotSupportedException`. A voice the seeded catalog does not carry is not
-//!   narrowed, because that catalog is a stated subset;
+//! * `Engine` is checked against the voice the request names, as the voice catalog
+//!   `DescribeVoices` serves records it, so the two operations cannot disagree: an
+//!   engine the voice does not support is the request-shape refusal
+//!   `ValidationException` (which is what Amazon Polly answers for it, not the modelled
+//!   `EngineNotSupportedException`). A voice the seeded catalog does not carry is not
+//!   narrowed, because that catalog is a stated subset. `LanguageCode` is NOT such a
+//!   check: it selects which language a bilingual voice speaks and states no
+//!   requirement on the voice, so a language the chosen voice does not speak is
+//!   synthesized with that voice in its own language rather than refused;
 //! * `ContentType` is the `OutputFormat`'s documented media type;
 //! * `ssml` input is read as an XML DOCUMENT — exactly one root element, and nothing
 //!   but whitespace, comments and processing instructions around it — and checked
@@ -1044,11 +1046,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // `VoiceId` decides which engines and languages the request may name, and the
-        // voice catalog is where that is recorded — so the check reads the same state
+        // `VoiceId` decides which engines the request may name, and the voice catalog
+        // is where that is recorded — so the check reads the same state
         // `DescribeVoices` reports and the two cannot disagree. The catalog carries
         // every voice the model declares, so every `VoiceId` that reaches here is
-        // narrowed by the voice's own engines and languages.
+        // narrowed by the voice's own engines.
         if let Some(voice) = state
             .lock()
             .voices
@@ -1071,18 +1073,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             // "Optional language code … This is only necessary if using a bilingual
             // voice, such as Aditi, which can be used for either Indian English
-            // (en-IN) or Hindi (hi-IN)" (`SynthesizeSpeechInput$LanguageCode`), so a
-            // language the voice does not speak is one Amazon Polly cannot serve with
-            // it. A bilingual voice's additional language counts, which is the whole
-            // point of the member.
-            if let Some(language) = input.language_code.as_deref() {
-                if !voice.speaks(language, true) {
-                    return Err(SynthesizeSpeechErrorModeled::LanguageNotSupportedException(
-                        crate::service::errors::language_not_supported(),
-                    )
-                    .into());
-                }
-            }
+            // (en-IN) or Hindi (hi-IN)" (`SynthesizeSpeechInput$LanguageCode`): the
+            // member SELECTS the language of a bilingual voice and states no
+            // requirement on the voice, so a value the chosen voice does not speak is
+            // not a refusal — Amazon Polly serves such a request, synthesizing with
+            // the voice the request named. The language is therefore read by the
+            // bilingual voice's own default and never checked against the catalog
+            // here; the modelled `LanguageNotSupportedException` is for a language the
+            // service cannot synthesize at all (see `crate::service::errors`).
         }
 
         // The voice the request named decides the timbre of the speech, read off the

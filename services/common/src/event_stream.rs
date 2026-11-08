@@ -15,6 +15,9 @@
 //!
 //! * [`deserialize_request`] — read a request into the modelled input shape through the
 //!   service's own protocol, then check it against the model's constraints.
+//! * [`read_request`] — the same read, handing the refusal back STRUCTURALLY (one
+//!   [`Violation`] per requirement the request broke) instead of already worded, for a
+//!   service that states a requirement in its own words.
 //! * [`frame_event`] — serialize one modelled event structure as ONE
 //!   `vnd.amazon.eventstream` frame, through the service's own protocol (so the frame
 //!   headers and the payload encoding are the protocol's, not this file's).
@@ -46,7 +49,7 @@ use aws_smithy_runtime_api::http::{Request, Response, StatusCode};
 use aws_smithy_schema::serde::{SerdeError, SerializableStruct};
 use aws_smithy_schema::Schema;
 use aws_smithy_schema_server::constraints::{envelope, validate};
-use aws_smithy_schema_server::{missing_member_message, DeserializableStruct, ProtocolError};
+use aws_smithy_schema_server::{DeserializableStruct, ProtocolError, Violation, ViolationKind};
 use aws_smithy_types::body::SdkBody;
 use smithy_server_runtime::{
     BoxFuture, ErasedOperation, OperationContext, OperationError, ServerHttpProtocol, Service,
@@ -70,23 +73,82 @@ pub fn deserialize_request<T>(
 where
     T: DeserializableStruct + SerializableStruct,
 {
-    let mut deserializer = protocol
-        .deserialize_input(req, schema)
-        .map_err(|error| format!("the request could not be read: {error}"))?;
-    let value = T::deserialize(&mut *deserializer).map_err(render_serde_error)?;
-    drop(deserializer);
-    match envelope(&validate(&value, schema)) {
-        Some(message) => Err(message),
-        None => Ok(value),
+    read_request(protocol, req, schema).map_err(RequestRefusal::stated)
+}
+
+/// Why the shared reader refused a request, before any words were chosen for it.
+///
+/// The framework describes a boundary refusal STRUCTURALLY and leaves the wording to
+/// whoever emulates the service (`smithy_server_runtime::Refusal`), because no model
+/// records it. A hand-authored operation reads its own request, so it needs the refusal
+/// in the same form the refusal seam gets it in — otherwise a service that states a
+/// requirement its own way can only restate the sentence it was handed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RequestRefusal {
+    /// The request was read and broke the model's rules: one violation per requirement,
+    /// as the framework's own walk reports them, and an absent required member as the
+    /// violation it is.
+    Invalid(Vec<Violation>),
+    /// The request could not be READ at all — a body the protocol's codec could not
+    /// parse — which has no violation form, so the reader's own sentence is carried.
+    Unreadable(String),
+}
+
+impl RequestRefusal {
+    /// The sentence this refusal is worded with, every violation stated as the FRAMEWORK
+    /// states it.
+    ///
+    /// A service that words a requirement its own way restates the violations first and
+    /// renders the envelope itself, which is what having them structurally is for.
+    #[must_use]
+    pub fn stated(self) -> String {
+        match self {
+            // One violation renders, and the reader builds this variant from a non-empty
+            // walk only, so the envelope is always there.
+            Self::Invalid(violations) => envelope(&violations).unwrap_or_default(),
+            Self::Unreadable(message) => message,
+        }
     }
 }
 
-/// Word a deserialization failure the way the framework's own boundary does, so an
-/// absent required member reads the same here as on a non-streaming operation.
-fn render_serde_error(error: SerdeError) -> String {
+/// As [`deserialize_request`], with the refusal handed back structurally
+/// ([`RequestRefusal`]) rather than already worded.
+///
+/// Every other part of the read is that function's: the HTTP bindings and the body codec
+/// are the service's own protocol's, and the rules checked are the model's.
+pub fn read_request<T>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &Request,
+    schema: &Schema,
+) -> Result<T, RequestRefusal>
+where
+    T: DeserializableStruct + SerializableStruct,
+{
+    let mut deserializer = protocol.deserialize_input(req, schema).map_err(|error| {
+        RequestRefusal::Unreadable(format!("the request could not be read: {error}"))
+    })?;
+    let value = T::deserialize(&mut *deserializer).map_err(refusal_of_serde_error)?;
+    drop(deserializer);
+    let violations = validate(&value, schema);
+    if violations.is_empty() {
+        Ok(value)
+    } else {
+        Err(RequestRefusal::Invalid(violations))
+    }
+}
+
+/// A deserialization failure as the framework's own boundary describes it: an absent
+/// required member is the VIOLATION it is — which is how that boundary reports one, so
+/// the two cannot drift — and anything else has no violation form.
+fn refusal_of_serde_error(error: SerdeError) -> RequestRefusal {
     match error {
-        SerdeError::MissingMember { member_name } => missing_member_message(&member_name),
-        other => other.to_string(),
+        SerdeError::MissingMember { member_name } => RequestRefusal::Invalid(vec![Violation {
+            path: member_name,
+            kind: ViolationKind::MissingRequiredMember,
+            value: None,
+            sensitive: false,
+        }]),
+        other => RequestRefusal::Unreadable(other.to_string()),
     }
 }
 

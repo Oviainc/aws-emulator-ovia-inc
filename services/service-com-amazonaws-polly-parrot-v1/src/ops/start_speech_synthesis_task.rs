@@ -424,8 +424,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // The voice decides which engines and languages the request may name, read off
-        // the catalog `DescribeVoices` serves so the two cannot disagree about a voice.
+        // The voice decides which engines the request may name, read off the catalog
+        // `DescribeVoices` serves so the two cannot disagree about a voice.
+        // `LanguageCode` is not such a check: it selects the language of a bilingual
+        // voice and states no requirement on the voice, so a language the chosen voice
+        // does not speak is recorded and synthesized rather than refused — the same
+        // reading the synchronous path takes.
         let voice = {
             let guard = state.lock();
             guard
@@ -442,16 +446,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(crate::scaffolded::Scaffolded::validation(format!(
                     "This voice does not support the selected engine: {engine}"
                 )));
-            }
-            if let Some(language) = input.language_code.as_deref() {
-                if !voice.speaks(language, true) {
-                    return Err(
-                        StartSpeechSynthesisTaskErrorModeled::LanguageNotSupportedException(
-                            crate::service::errors::language_not_supported(),
-                        )
-                        .into(),
-                    );
-                }
             }
         }
 

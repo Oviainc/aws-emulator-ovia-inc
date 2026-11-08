@@ -1056,11 +1056,12 @@ async fn speech_marks_are_json_only_and_computed_from_the_text() {
     }
 }
 
-/// RULE: `Engine` and `LanguageCode` are checked against the voice the request names,
-/// as the catalog `DescribeVoices` serves records it — so an engine the voice does not
-/// support is the request-shape refusal `ValidationException` and a language it does
-/// not speak is `LanguageNotSupportedException`, while a bilingual voice's additional
-/// language is accepted.
+/// RULE: `Engine` is checked against the voice the request names, as the catalog
+/// `DescribeVoices` serves records it — so an engine the voice does not support is the
+/// request-shape refusal `ValidationException`. `LanguageCode` is NOT such a check: it
+/// selects which language a bilingual voice speaks and states no requirement on the
+/// voice, so a bilingual voice's additional language and a language the voice does not
+/// speak at all are both synthesized with the voice the request named.
 #[tokio::test]
 async fn synthesis_checks_the_voice_against_the_catalog() {
     let polly = Polly::new();
@@ -1075,7 +1076,9 @@ async fn synthesis_checks_the_voice_against_the_catalog() {
         // Aditi is the bilingual voice the model's own documentation names: en-IN by
         // default, hi-IN as an additional language.
         ("Aditi", "standard", Some("hi-IN"), None),
-        ("Joanna", "neural", Some("hi-IN"), Some("LanguageNotSupportedException")),
+        // A language the voice does not speak is served too: the member only selects a
+        // bilingual voice's language (see `crate::language_code_and_voice`).
+        ("Joanna", "neural", Some("hi-IN"), None),
     ];
     for (voice, engine, language, expected) in table {
         let mut request = serde_json::json!({

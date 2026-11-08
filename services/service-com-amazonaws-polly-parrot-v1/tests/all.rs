@@ -21,6 +21,8 @@ mod error_message_wording;
 mod error_semantics;
 #[path = "all/error_type_header.rs"]
 mod error_type_header;
+#[path = "all/language_code_and_voice.rs"]
+mod language_code_and_voice;
 #[path = "all/lexicon_language_code.rs"]
 mod lexicon_language_code;
 #[path = "all/lexicon_listing.rs"]
@@ -61,6 +63,8 @@ mod ssml_billed_characters;
 mod ssml_vocabulary;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stated_enum_value_set.rs"]
+mod stated_enum_value_set;
 // The synthesis-task fixtures the task suites share.
 #[path = "all/support.rs"]
 mod support;

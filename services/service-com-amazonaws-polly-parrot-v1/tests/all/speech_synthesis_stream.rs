@@ -594,9 +594,12 @@ async fn a_synthesis_parameter_the_operation_does_not_admit_is_refused_on_its_me
             refused_field: None,
         },
         HeaderRow {
+            // `LanguageCode` only selects a bilingual voice's language, so a language
+            // the voice does not speak is streamed with that voice rather than refused
+            // (see `crate::language_code_and_voice`).
             case: "a language the voice does not speak",
             overrides: &[("x-amzn-LanguageCode", "de-DE")],
-            refused_field: Some("languageCode"),
+            refused_field: None,
         },
         HeaderRow {
             case: "a lexicon no Region of this emulator stores",

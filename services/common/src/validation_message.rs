@@ -82,7 +82,15 @@
 //! One rendering here is not a sentence but an ORDER: [`in_sorted_enum_order`] states an
 //! enumerated type's value set lexicographically, which is how AWS lists it where a model
 //! declares its members in an order of its own. A service hands its violations through it
-//! before the envelope is rendered, so the clause itself stays the framework's. The other
+//! before the envelope is rendered, so the clause itself stays the framework's. A service
+//! whose recordings show an order that is neither the model's nor lexicographic — its own
+//! published set, which may also list FEWER values than the model declares — states that
+//! one instead: [`in_stated_enum_order`] over the rows it publishes
+//! ([`StatedEnumValueSets`]), recognised by the value SET so every member targeting one
+//! enum is stated alike, with the rows' DATA living in that service's own crate. A
+//! hand-authored operation reading its own request reaches the same rows, because the
+//! shared request reader hands its refusal back structurally
+//! ([`crate::event_stream::read_request`]). The other
 //! order is over the CLAUSES rather than inside one: [`in_pattern_first_order`] states a
 //! member's `@pattern` requirement before that member's other requirements, for a front
 //! door whose recordings show that order, with the members themselves left where the walk
@@ -492,6 +500,69 @@ pub fn in_pattern_first_order(violations: &[Violation]) -> Vec<&Violation> {
         .collect();
     keyed.sort_by_key(|(key, _)| *key);
     keyed.into_iter().map(|(_, violation)| violation).collect()
+}
+
+/// A service's own statement of the value sets it lists in an order of its own: one row
+/// per enumerated type, holding the values as the MODEL declares them and the values as
+/// the SERVICE states them, in the order it states them.
+///
+/// A row's two halves are matched as SETS, not pairwise, so the model half may be written
+/// in any order — and the service half may hold FEWER values than the model declares,
+/// which is what a service whose published set lags its schema lists. Which values a
+/// member ADMITS is never decided here: that is the enum the member targets, so a value
+/// missing from the service half is still accepted.
+///
+/// The values a row holds are the service's own data, so the rows live in the service
+/// crate; everything done WITH them is below.
+pub type StatedEnumValueSets<'s> = [(&'s [&'s str], &'s [&'s str])];
+
+/// The values `stated` says a service lists for the enumerated type whose declared value
+/// set is `declared`, and `None` for a set it pins no order of.
+///
+/// `declared` is matched as a SET: a refusal reports the values a member admits rather
+/// than the shape they came from, so every member targeting one enum — in any operation,
+/// in whatever binding carried the value, at any depth — is stated alike, and the order
+/// the schema happened to present them in does not decide whether the row is found.
+#[must_use]
+pub fn stated_enum_value_set<'s>(
+    declared: &[String],
+    stated: &StatedEnumValueSets<'s>,
+) -> Option<&'s [&'s str]> {
+    let presented: BTreeSet<&str> = declared.iter().map(String::as_str).collect();
+    stated
+        .iter()
+        .find(|(modelled, _)| {
+            modelled.len() == presented.len()
+                && modelled.iter().all(|value| presented.contains(value))
+        })
+        .map(|(_, service)| *service)
+}
+
+/// `violation` with an enumerated type's value set stated as the SERVICE lists that set
+/// ([`stated_enum_value_set`]), and any other violation — and any set `stated` pins no
+/// order of — returned unchanged.
+///
+/// The counterpart of [`in_sorted_enum_order`] for a service whose order is its own rather
+/// than lexicographic. The CLAUSE stays the framework's: only what goes into it moves, so
+/// the member path, the echoed value and the requirement's wording keep coming from the one
+/// place that writes them. A service hands its violations through this before the envelope
+/// is rendered, and reads back from the result whether anything moved at all.
+#[must_use]
+pub fn in_stated_enum_order(violation: &Violation, stated: &StatedEnumValueSets<'_>) -> Violation {
+    let ViolationKind::EnumValue(declared) = &violation.kind else {
+        return violation.clone();
+    };
+    let Some(service) = stated_enum_value_set(declared, stated) else {
+        return violation.clone();
+    };
+    Violation {
+        path: violation.path.clone(),
+        kind: ViolationKind::EnumValue(
+            service.iter().map(|value| (*value).to_string()).collect(),
+        ),
+        value: violation.value.clone(),
+        sensitive: violation.sensitive,
+    }
 }
 
 /// The magnitudes a floating-point value is quoted back in PLAIN decimal form: at least
@@ -1621,12 +1692,12 @@ mod tests {
         aws_validation_refusal_withholding, aws_validation_refusal_withholding_violations,
         aws_validation_refusal_withholding_with, element_set_requirement, enum_value_not_found,
         envelope_over, float_value_text, in_float_value_rendering, in_pattern_first_order,
-        map_key_refusal, map_key_refusal_quoting, must_be_at_least, must_be_at_most,
-        must_be_one_of, must_match_pattern, parameter_pattern_mismatch,
+        in_stated_enum_order, map_key_refusal, map_key_refusal_quoting, must_be_at_least,
+        must_be_at_most, must_be_one_of, must_match_pattern, parameter_pattern_mismatch,
         parameter_pattern_refusal, parameter_value_mismatch, parameters_value_mismatch,
         pattern_mismatch, pattern_requirement_unstated, property_count_refusal,
         quoting_the_submitted_collection, quoting_the_whole_submitted_value, requirement,
-        string_too_long, string_too_short,
+        stated_enum_value_set, string_too_long, string_too_short, StatedEnumValueSets,
     };
     use crate::validation::unanchored_grouping_alternation;
     use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
@@ -2720,6 +2791,127 @@ mod tests {
                 "case {case:?}: expected {expected:?}, got {actual:?}"
             );
         }
+    }
+
+    /// RULE: a value set a service publishes an order of its own for is stated in that
+    /// order wherever it is reported — restated on the violation and restated inside an
+    /// already-worded sentence alike — while every other set keeps the order it arrived in.
+    ///
+    /// The rows differ along what the statement generalises over: the order the declared
+    /// set is presented in, whether the service's half lists every declared value, which
+    /// of several published enums the set belongs to, and a set with no row at all.
+    #[test]
+    fn a_published_value_set_is_stated_in_the_services_own_order() {
+        // Two published sets: one listing the declared values in the service's own order,
+        // one listing FEWER values than the model declares.
+        const REORDERED_DECLARED: [&str; 3] = ["custom", "managed", "shared"];
+        const REORDERED_STATED: [&str; 3] = ["managed", "shared", "custom"];
+        const LAGGING_DECLARED: [&str; 3] = ["ssml", "text", "markdown"];
+        const LAGGING_STATED: [&str; 2] = ["text", "ssml"];
+        const PUBLISHED: &StatedEnumValueSets<'static> = &[
+            (&REORDERED_DECLARED, &REORDERED_STATED),
+            (&LAGGING_DECLARED, &LAGGING_STATED),
+        ];
+
+        /// One row: the case, the set as it was presented, and the values stated for it.
+        type Row = (&'static str, &'static [&'static str], Option<&'static [&'static str]>);
+
+        let rows: [Row; 6] = [
+            (
+                "a published set, in declared order",
+                &REORDERED_DECLARED,
+                Some(&REORDERED_STATED),
+            ),
+            (
+                "the same set, presented in another order",
+                &["shared", "custom", "managed"],
+                Some(&REORDERED_STATED),
+            ),
+            (
+                "a published set the service lists fewer values of",
+                &LAGGING_DECLARED,
+                Some(&LAGGING_STATED),
+            ),
+            ("a set with no row", &["IPV4", "DUALSTACK"], None),
+            (
+                "a published set missing one value is another set",
+                &["custom", "managed"],
+                None,
+            ),
+            ("no values at all", &[], None),
+        ];
+        for (case, presented, stated) in rows {
+            let declared: Vec<String> = presented.iter().map(|v| (*v).to_owned()).collect();
+            let found = stated_enum_value_set(&declared, PUBLISHED);
+            assert_eq!(
+                found, stated,
+                "case {case:?}: expected {stated:?}, got {found:?}"
+            );
+
+            // On the violation: only the values move, and the clause is the framework's.
+            let reported = violation("policyType", ViolationKind::EnumValue(declared), "nope");
+            let restated = in_stated_enum_order(&reported, PUBLISHED);
+            let expected = match stated {
+                Some(stated) => ViolationKind::EnumValue(
+                    stated.iter().map(|v| (*v).to_owned()).collect(),
+                ),
+                None => reported.kind.clone(),
+            };
+            assert_eq!(
+                restated.kind, expected,
+                "case {case:?}: wrong value set on the violation, got {:?}",
+                restated.kind
+            );
+            assert_eq!(
+                (restated.path.as_str(), restated.value.as_deref()),
+                ("policyType", Some("nope")),
+                "case {case:?}: nothing but the value set may move"
+            );
+        }
+
+        // Two sets in one refusal, each stated on its own terms, and every other
+        // violation kind left alone.
+        let reported = [
+            violation(
+                "policyType",
+                ViolationKind::EnumValue(
+                    REORDERED_DECLARED.iter().map(|v| (*v).to_owned()).collect(),
+                ),
+                "nope",
+            ),
+            violation(
+                "addressType",
+                ViolationKind::EnumValue(vec!["IPV4".to_owned(), "DUALSTACK".to_owned()]),
+                "other",
+            ),
+            violation("name", ViolationKind::MinLength(1), ""),
+        ];
+        let stated: Vec<String> = reported
+            .iter()
+            .map(|reported| in_stated_enum_order(reported, PUBLISHED).message())
+            .collect();
+        let expected: Vec<String> = [
+            violation(
+                "policyType",
+                ViolationKind::EnumValue(
+                    REORDERED_STATED.iter().map(|v| (*v).to_owned()).collect(),
+                ),
+                "nope",
+            ),
+            violation(
+                "addressType",
+                ViolationKind::EnumValue(vec!["IPV4".to_owned(), "DUALSTACK".to_owned()]),
+                "other",
+            ),
+            violation("name", ViolationKind::MinLength(1), ""),
+        ]
+        .iter()
+        .map(Violation::message)
+        .collect();
+        assert_eq!(
+            stated, expected,
+            "each clause must state its own enum's set, got {stated:?}"
+        );
     }
 
     /// RULE: a MAP member over its `@length` maximum is stated as the schema layer's
