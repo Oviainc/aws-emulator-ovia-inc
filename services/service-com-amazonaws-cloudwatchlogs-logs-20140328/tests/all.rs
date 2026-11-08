@@ -29,6 +29,8 @@ mod cmk_group_fan_out_isolation;
 mod cmk_key_policy_scope;
 #[path = "all/configuration_templates.rs"]
 mod configuration_templates;
+#[path = "all/dangling_query_commands.rs"]
+mod dangling_query_commands;
 #[path = "all/data_protection_policies.rs"]
 mod data_protection_policies;
 #[path = "all/data_protection_policy.rs"]
@@ -141,6 +143,8 @@ mod log_group_name_pattern_lists;
 mod log_group_pattern_projection;
 #[path = "all/log_group_tags.rs"]
 mod log_group_tags;
+#[path = "all/log_groups_for_query.rs"]
+mod log_groups_for_query;
 #[path = "all/log_stream_removal.rs"]
 mod log_stream_removal;
 #[path = "all/lookup_table_column_names.rs"]

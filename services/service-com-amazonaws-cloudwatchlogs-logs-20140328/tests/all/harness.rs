@@ -226,6 +226,57 @@ pub fn error_code(body: &Value) -> String {
     raw.rsplit(['#', '/']).next().unwrap_or(raw).to_string()
 }
 
+/// The request id the SDK error envelope in `said` reports, asserted to carry the 8-4-4-4-12
+/// lowercase-hex form every AWS request id has.
+///
+/// Shared here because every suite whose subject is a refusal this service states inside that
+/// envelope — the inverted query window, the refusals addressed by id, the parser diagnostic —
+/// has to read the id out of the message before it can compare the rest of it, and the id is
+/// this response's own rather than anything a case can state.
+pub fn envelope_request_id(case: &str, said: &str) -> String {
+    let after = said
+        .split_once("Request ID: ")
+        .unwrap_or_else(|| panic!("case {case}: the envelope names a request id, got {said:?}"))
+        .1;
+    let request_id = after
+        .split_once(';')
+        .unwrap_or_else(|| panic!("case {case}: the request id ends its field, got {said:?}"))
+        .0
+        .to_string();
+    let groups: Vec<&str> = request_id.split('-').collect();
+    assert_eq!(
+        groups.iter().map(|group| group.len()).collect::<Vec<_>>(),
+        vec![8usize, 4, 4, 4, 12],
+        "case {case}: expected an 8-4-4-4-12 request id, got {request_id:?}"
+    );
+    assert!(
+        groups.iter().all(|group| group
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())),
+        "case {case}: expected lowercase hex in the request id, got {request_id:?}"
+    );
+    request_id
+}
+
+/// `said` with the SDK error envelope this service states a refusal inside stripped off,
+/// having asserted that the envelope reports `status` and `code` — the status and the error
+/// code the response itself answers with — and this response's own request id.
+///
+/// One definition of the envelope's shape, shared with [`envelope_request_id`], so a suite
+/// whose subject is the SENTENCE a refusal carries states only that sentence.
+pub fn without_sdk_envelope(case: &str, said: &str, status: u16, code: &str) -> String {
+    let request_id = envelope_request_id(case, said);
+    let envelope = format!(
+        " (Service: AWSLogs; Status Code: {status}; Error Code: {code}; Request ID: \
+         {request_id}; Proxy: null)"
+    );
+    said.strip_suffix(&envelope)
+        .unwrap_or_else(|| {
+            panic!("case {case}: expected {envelope:?} after the sentence, got {said:?}")
+        })
+        .to_string()
+}
+
 /// Wall-clock milliseconds, the unit every CloudWatch Logs timestamp member carries.
 pub fn now_ms() -> i64 {
     i64::try_from(

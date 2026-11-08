@@ -200,7 +200,10 @@ fn invalid_parameter(message: String) -> StartQueryError {
 /// whole value of the refusal — a caller has to be able to tell WHERE the query is wrong, and
 /// two different faults in two different queries cannot read alike. Both variable parts come
 /// from the request: the symbol is the text the compiler stopped on, taken out of the query
-/// string itself, and the position is that text's place in it. The accompanying
+/// string itself, and the position is that text's place in it. The diagnostic is stated
+/// inside the SDK error envelope this service's refusals carry
+/// ([`crate::state::with_sdk_error_envelope`]), so the status and the code stated in the text
+/// are the ones the response itself answers with. The accompanying
 /// `QueryCompileError` carries the compiler's own account of WHAT is wrong plus the character
 /// range it stopped in, which is the structure the model declares for the detail.
 fn malformed_query(
@@ -208,7 +211,10 @@ fn malformed_query(
     failure: &crate::state::query_compile::QueryCompileFailure,
 ) -> StartQueryError {
     StartQueryErrorModeled::MalformedQueryException(MalformedQueryException {
-        message: Some(unexpected_symbol_message(query, failure)),
+        message: Some(crate::state::with_sdk_error_envelope(
+            &unexpected_symbol_message(query, failure),
+            ENVELOPE_MALFORMED_QUERY,
+        )),
         query_compile_error: Some(QueryCompileError {
             message: Some(failure.message.clone()),
             location: Some(QueryCompileErrorLocation {
@@ -232,10 +238,6 @@ fn malformed_query(
 /// (`QueryString` bounds only its length), so the place is stated the way a parser states
 /// one: the LINE the symbol is on, counted from one, and its character position WITHIN that
 /// line, counted from zero.
-///
-/// Nothing else is appended: this fault class is stated as the diagnostic alone, unlike the
-/// refusals of this service that carry the SDK error envelope
-/// ([`crate::state::with_sdk_error_envelope`]).
 fn unexpected_symbol_message(
     query: &str,
     failure: &crate::state::query_compile::QueryCompileFailure,
@@ -276,6 +278,12 @@ fn line_and_position(query: &str, offset: usize) -> (usize, usize) {
 /// What the diagnostic names as the symbol when the compiler stopped at the END of the query
 /// string: there is no text there to name, and the fault is that the query ended.
 const END_OF_QUERY_SYMBOL: &str = "<EOF>";
+
+/// The status and code of a refusal for a query string that does not compile, as the model
+/// declares `MalformedQueryException` for this operation (client error, HTTP 400) — the pair
+/// the SDK envelope of this refusal states ([`crate::state::with_sdk_error_envelope`]).
+const ENVELOPE_MALFORMED_QUERY: crate::state::SdkEnvelopeFacts =
+    (400, "MalformedQueryException");
 
 /// The three members a request may name the log groups to query by, in the order
 /// `StartQuery`'s own documentation lists them ("Either exactly one of the following

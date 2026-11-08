@@ -14,6 +14,9 @@
 //! * the pipeline's shape: a query with no command at all, a stage that is empty, or a `|`
 //!   followed by a word that is no command of the language ([`COMMANDS`]), is not a query;
 //! * the command of each stage: it has to be one of the commands the query language defines;
+//! * the operand of each stage: a command the language writes with one
+//!   ([`COMMANDS_TAKING_AN_OPERAND`]) is not a command without it, so a query that ends — or
+//!   reaches the next stage separator — before the operand it owes does not compile;
 //! * the regular expression a `parse` or `filter` command carries: it is compiled with the
 //!   `regex` crate, so an expression that is not a regular expression at all — an unclosed
 //!   group, a dangling quantifier — is refused where it stands;
@@ -180,6 +183,16 @@ pub fn compile(query: &str) -> Result<CompiledQuery, QueryCompileFailure> {
         if let Some(failure) = unseparated_command(arguments, arguments_offset) {
             return Err(failure);
         }
+        // A command of the language is the command WORD plus what it acts on, so a stage
+        // holding the word alone is a command the query never finished writing: the compiler
+        // stops where the operand was owed ([`missing_operand_failure`]) rather than accepting
+        // a stage that commands nothing.
+        if COMMANDS_TAKING_AN_OPERAND.contains(&lowercased.as_str()) && arguments.trim().is_empty()
+        {
+            // The command is named as the QUERY spells it, the way the unknown-command
+            // failure above names the word it stopped on.
+            return Err(missing_operand_failure(query, &command, arguments_offset));
+        }
         if lowercased == PARSE || lowercased == FILTER {
             check_regex_pattern(&lowercased, arguments, arguments_offset)?;
         }
@@ -229,9 +242,82 @@ pub fn compile(query: &str) -> Result<CompiledQuery, QueryCompileFailure> {
     Ok(compiled)
 }
 
+/// The commands that take an OPERAND, each spelled as [`COMMANDS`] spells it.
+///
+/// Source: the CloudWatch Logs Insights query syntax `StartQuery` refers to, the same
+/// document [`COMMANDS`] is read off — which writes each of these as the command word
+/// followed by what it acts on: the log groups `SOURCE` selects, the fields `display`,
+/// `fields` and `dedup` name, the expression `filter` selects records by, the aggregation
+/// `stats` computes, the field `sort` orders by, the pattern `parse` extracts with, the field
+/// `pattern` clusters and the field `unmask` reveals. None of those operands is optional, so
+/// a stage holding one of these words alone commands nothing.
+///
+/// Three commands of [`COMMANDS`] are deliberately absent: `diff`, which that syntax writes
+/// on its own (it compares the stage's records with the previous period and takes no
+/// operand), and `limit` and `lookup`, whose own required argument is judged by the check
+/// that reads it ([`check_limit_count`], [`lookup_table_name`]) and reported in the terms
+/// that check states.
+const COMMANDS_TAKING_AN_OPERAND: [&str; 10] = [
+    SOURCE, "display", FIELDS, FILTER, "stats", "sort", PARSE, "pattern", "dedup", "unmask",
+];
+
+/// The failure a command whose operand the query never wrote is refused with: the compiler
+/// stopped where that operand was owed, which is `at`.
+///
+/// What stands at `at` decides the span. When nothing but blank space follows it in the whole
+/// query, the compiler ran out of INPUT: the span is the zero-width position at the END of the
+/// query string, which is what names the end of the query as the symbol it stopped on — the
+/// convention the empty-stage branch of [`compile`] reports an exhausted query with, so one
+/// query that ends early and another that ends early further along are placed the same way,
+/// each at its own end. When a symbol DOES stand there — the `|` opening the next stage of a
+/// pipeline whose earlier command is the incomplete one — that symbol is what the query got
+/// wrong, so the span covers it, and ONE token of it: a token is a run of word characters
+/// ([`is_word_character`]), and any other character is a token of its own, so a separator
+/// written against the next command (`fields |sort x`) is named as the one character it is.
+fn missing_operand_failure(query: &str, command: &str, at: usize) -> QueryCompileFailure {
+    let message = format!("The {command} command requires an argument.");
+    let characters: Vec<char> = query.chars().collect();
+    let mut index = at.min(characters.len());
+    while characters
+        .get(index)
+        .is_some_and(|character| character.is_whitespace())
+    {
+        index += 1;
+    }
+    let symbol: String = match characters.get(index) {
+        None => String::new(),
+        Some(first) if !is_word_character(*first) => first.to_string(),
+        Some(_) => characters[index..]
+            .iter()
+            .take_while(|character| is_word_character(**character))
+            .collect(),
+    };
+    if symbol.is_empty() {
+        return QueryCompileFailure {
+            message,
+            start_char_offset: characters.len(),
+            end_char_offset: characters.len(),
+        };
+    }
+    QueryCompileFailure {
+        message,
+        start_char_offset: index,
+        end_char_offset: index + symbol.chars().count(),
+    }
+}
+
+/// Whether `character` is part of a WORD of the query language — a command, a field name, a
+/// number — rather than a token of its own. The word characters are the ones a field name is
+/// written from ([`is_field_name`]), so a name and the command before it tokenize alike.
+fn is_word_character(character: char) -> bool {
+    character.is_alphanumeric() || matches!(character, '@' | '_' | '.')
+}
+
 /// How many characters of leading blank space `text` opens with.
 fn leading_blank_chars(text: &str) -> usize {
-    text.chars().take_while(|character| character.is_whitespace()).count()
+    text.chars()
+        .take_while(|character| character.is_whitespace())
+        .count()
 }
 
 /// Split `query` into its pipeline stages.

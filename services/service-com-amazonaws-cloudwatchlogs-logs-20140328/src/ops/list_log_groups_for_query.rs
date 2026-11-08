@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListLogGroupsForQuery
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListLogGroupsForQuery`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListLogGroupsForQuery::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: resolves `queryId` against the queries this account holds and reports the log
+//! groups that query reads. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -127,6 +120,40 @@ pub struct ListLogGroupsForQuery<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// The kind tag this operation's pagination cursor carries, so a token minted by another
+/// paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "ListLogGroupsForQuery";
+
+/// Where the next page resumes: the last log-group identifier returned, plus the query the
+/// enumeration belongs to. A continuation that names another query is refused, because the
+/// token is only a position within ONE query's log groups.
+#[derive(Debug, Clone)]
+struct Cursor {
+    query_id: String,
+    after: String,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "queryId": self.query_id,
+            "after": self.after,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        Some(Self {
+            query_id: value.get("queryId")?.as_str()?.to_string(),
+            after: value.get("after")?.as_str()?.to_string(),
+        })
+    }
+}
+
 impl<Eng> ListLogGroupsForQuery<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -153,18 +180,108 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListLogGroupsForQuery` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListLogGroupsForQueryErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // The Region the request was signed for: a log group's ARN names the Region it lives
+        // in, and this report names the log groups by ARN.
+        let region = crate::state::request_region(ctx.parts());
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListLogGroupsForQueryError::from(
+                ListLogGroupsForQueryErrorModeled::ServiceUnavailableException(
+                    ServiceUnavailableException {
+                        message: Some("the log store is unavailable".to_string()),
+                    },
+                ),
+            )
+        })?;
+        let store = state.lock();
+
+        // "The ID of the query to use. This query ID is from the response to your StartQuery
+        // operation": the id has to name a query of this account, and what it would take to
+        // report another account's query — or one that was never started — is permission
+        // this caller does not have on it. So an id that resolves to no query of this account
+        // is an AUTHORIZATION refusal ("You don't have sufficient permissions to perform this
+        // action") rather than a missing resource, and it is answered with the bare code: the
+        // refusal tells the caller nothing about whether such a query exists elsewhere, which
+        // is why it carries no sentence at all.
+        let Some(query) = store.queries.get(&input.query_id) else {
+            return Err(ListLogGroupsForQueryErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(String::new()),
+                },
+            )
+            .into());
+        };
+
+        let cursor = match input.next_token.as_deref() {
+            Some(token) => {
+                let cursor = Cursor::decode(token)
+                    .filter(|cursor| cursor.query_id == input.query_id)
+                    .ok_or_else(|| {
+                        ListLogGroupsForQueryError::from(
+                            ListLogGroupsForQueryErrorModeled::InvalidParameterException(
+                                InvalidParameterException {
+                                    message: Some(
+                                        crate::state::INVALID_NEXT_TOKEN_MESSAGE.to_string(),
+                                    ),
+                                },
+                            ),
+                        )
+                    })?;
+                Some(cursor)
+            }
+            None => None,
+        };
+
+        // "An array of the names and ARNs of the log groups that were processed in the
+        // query": the groups are the ones the query reads, held on the query record, each
+        // named by its ARN — the identifier that names a log group whichever account and
+        // Region it lives in. The enumeration is ordered by that identifier, so a page a
+        // client resumes names the same position on every call.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListLogGroupsForQuery"))
+        // A query whose own `SOURCE` command selects the log groups is recorded with none:
+        // which groups such a selection matches is decided where the query is STARTED
+        // (`crate::ops::start_query`, which stores the groups the request named and does not
+        // resolve a `SOURCE` selection into them), so this report names what that record
+        // holds rather than resolving the selection a second time here — one place decides
+        // which groups a query reads, and this operation reports it.
+        let mut identifiers: Vec<String> = query
+            .log_group_names
+            .iter()
+            .map(|name| crate::state::log_group_arn(&region, name, false))
+            .collect();
+        identifiers.sort_unstable();
+        identifiers.dedup();
+
+        let first = match &cursor {
+            Some(cursor) => identifiers.partition_point(|identifier| *identifier <= cursor.after),
+            None => 0,
+        };
+        // "Limits the number of returned log groups to the specified number." `maxResults` is
+        // modelled `range 50..500`, so the boundary validator has already refused a value
+        // outside it; a request naming none gets this service's own list page size.
+        let limit = usize::try_from(input.max_results.unwrap_or(crate::state::DEFAULT_LIST_LIMIT))
+            .unwrap_or(0)
+            .max(1);
+        let last = first.saturating_add(limit).min(identifiers.len());
+        let page = &identifiers[first..last];
+
+        // A token only where a page follows this one: "The token for the next set of items to
+        // return." A query reads at most `crate::state::MAX_QUERY_LOG_GROUPS` log groups while
+        // the smallest page this member admits is its modelled minimum of 50, so with today's
+        // bounds no page ever follows — the continuation is stated because the operation is
+        // `@paginated` and the bound is the model's rather than this enumeration's, and a token
+        // of another enumeration is refused above either way.
+        let next_token = page.last().filter(|_| last < identifiers.len()).map(|last| {
+            Cursor {
+                query_id: input.query_id.clone(),
+                after: last.clone(),
+            }
+            .encode()
+        });
+
+        Ok(ListLogGroupsForQueryOutput {
+            log_group_identifiers: Some(page.to_vec()),
+            next_token,
+        })
     }
 }

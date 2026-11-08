@@ -32,7 +32,9 @@ use service_com_amazonaws_cloudwatchlogs_logs_20140328::state::{
     INVALID_NEXT_TOKEN_MESSAGE, LOG_GROUP_NAME_REGEX_PATTERN,
 };
 
-use crate::harness::{base_ms, batch, group_with_stream, now_ms, Logs};
+use crate::harness::{
+    base_ms, batch, envelope_request_id, group_with_stream, now_ms, without_sdk_envelope, Logs,
+};
 
 /// The modelled codes these refusals are answered under.
 const NOT_FOUND: &str = "ResourceNotFoundException";
@@ -239,33 +241,6 @@ async fn a_query_definition_id_that_is_not_stored_is_refused_in_the_services_wor
         vec!["kept".to_string()],
         "case the stored definition: a refused call changes nothing, got {names:?}"
     );
-}
-
-/// The request id the SDK envelope in `said` reports, asserted to carry the 8-4-4-4-12
-/// lowercase-hex form every AWS request id has.
-fn envelope_request_id(case: &str, said: &str) -> String {
-    let after = said
-        .split_once("Request ID: ")
-        .unwrap_or_else(|| panic!("case {case}: the envelope names a request id, got {said:?}"))
-        .1;
-    let request_id = after
-        .split_once(';')
-        .unwrap_or_else(|| panic!("case {case}: the request id ends its field, got {said:?}"))
-        .0
-        .to_string();
-    let groups: Vec<&str> = request_id.split('-').collect();
-    assert_eq!(
-        groups.iter().map(|group| group.len()).collect::<Vec<_>>(),
-        vec![8usize, 4, 4, 4, 12],
-        "case {case}: expected an 8-4-4-4-12 request id, got {request_id:?}"
-    );
-    assert!(
-        groups.iter().all(|group| group
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())),
-        "case {case}: expected lowercase hex in the request id, got {request_id:?}"
-    );
-    request_id
 }
 
 /// Ordering log streams by event time together with a name prefix is refused with the
@@ -475,7 +450,8 @@ async fn a_nexttoken_a_read_cannot_resume_from_is_refused_with_one_sentence() {
 /// A query string that does not compile is refused with the service's PARSER DIAGNOSTIC: the
 /// message names the symbol the compiler stopped on and where that symbol sits in the
 /// submitted string, so two different faults do not read alike and a caller can tell where
-/// the query is wrong. The diagnostic stands alone — this class carries no SDK envelope.
+/// the query is wrong. The diagnostic is stated inside the SDK envelope of the refusal it is
+/// answered under, the way every message of this service that carries one states it.
 #[tokio::test]
 async fn a_query_that_does_not_compile_is_refused_with_the_parsers_diagnostic() {
     let logs = Logs::new();
@@ -550,7 +526,9 @@ async fn a_query_that_does_not_compile_is_refused_with_the_parsers_diagnostic() 
             code, MALFORMED_QUERY,
             "case {case}: expected {MALFORMED_QUERY}, got {code} with {body}"
         );
-        let said = message(case, &body);
+        // The envelope reports the status and the code the response itself answers with, and
+        // this response's own request id; the diagnostic is what it wraps.
+        let said = without_sdk_envelope(case, &message(case, &body), 400, MALFORMED_QUERY);
         // The symbol the compiler stopped on is its LAST occurrence in each row's query
         // string (for the redefinition row the first one is the definition), so the line
         // and position below are read off the query rather than restated per row.

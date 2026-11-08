@@ -21,7 +21,7 @@
 
 use serde_json::{json, Value};
 
-use crate::harness::{now_ms, Logs};
+use crate::harness::{envelope_request_id, now_ms, Logs};
 
 /// The operations under test.
 const START: &str = "StartQuery";
@@ -45,35 +45,6 @@ fn expected_message(request_id: &str) -> String {
          {REFUSAL_STATUS}; Error Code: {INVALID_PARAMETER}; Request ID: {request_id}; \
          Proxy: null)"
     )
-}
-
-/// The request id the envelope in `said` reports, asserted to carry the 8-4-4-4-12
-/// lowercase-hex form every AWS request id has.
-fn envelope_request_id(case: &str, said: &str) -> String {
-    let after = said
-        .split_once("Request ID: ")
-        .unwrap_or_else(|| {
-            panic!("case {case:?}: the envelope names a request id, got {said:?}")
-        })
-        .1;
-    let request_id = after
-        .split_once(';')
-        .unwrap_or_else(|| panic!("case {case:?}: the request id ends its field, got {said:?}"))
-        .0
-        .to_string();
-    let groups: Vec<&str> = request_id.split('-').collect();
-    assert_eq!(
-        groups.iter().map(|group| group.len()).collect::<Vec<_>>(),
-        vec![8usize, 4, 4, 4, 12],
-        "case {case:?}: expected an 8-4-4-4-12 request id, got {request_id:?}"
-    );
-    assert!(
-        groups.iter().all(|group| group
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())),
-        "case {case:?}: expected lowercase hex in the request id, got {request_id:?}"
-    );
-    request_id
 }
 
 /// The message a refusal reports.
