@@ -311,6 +311,61 @@ impl From<CreateStackErrorModeled> for CreateStackError {
     }
 }
 
+/// What a create naming a stack name that is already IN USE by a live stack of the Region
+/// answers, or `None` for a name no live stack of that Region carries.
+///
+/// "The name must be unique in the Region in which you are creating the stack" — unique
+/// among the LIVE stacks OF THAT REGION: the same name in another Region is another stack
+/// and both coexist, and a name is free again once its stack's deletion has completed. The
+/// decision is this function's alone, so the create makes it in ONE place: once BEFORE the
+/// template it submits is weighed — a request that cannot have the name is refused for the
+/// name, whatever the body says — and again under the writing lock, where another request
+/// may have taken the name since.
+fn name_in_use(
+    store: &crate::state::ComAmazonawsCloudformationCloudformationState,
+    region: &str,
+    input: &CreateStackInput,
+) -> Option<Result<CreateStackOutput, CreateStackError>> {
+    let live = store
+        .live_stacks(region)
+        .find(|live| live.stack_name == input.stack_name)?;
+    // "Specify this token if you plan to retry requests so that CloudFormation knows that
+    // you're not attempting to create a stack with the same name": a create repeating the
+    // name AND the token the create of that live stack claimed is that retry, so it
+    // re-answers the stack that create made — nothing is created a second time — rather
+    // than refusing the name.
+    let retried = input
+        .client_request_token
+        .as_deref()
+        .and_then(|token| live.client_request_token_claim(token))
+        .filter(|claimed| claimed.opened == status::CREATE_IN_PROGRESS);
+    if let Some(claimed) = retried {
+        return Some(Ok(CreateStackOutput {
+            stack_id: Some(live.stack_id.clone()),
+            operation_id: claimed.operation_id.clone(),
+        }));
+    }
+    // Not that retry, but a token one of the stack's OTHER operations already claimed: a
+    // second operation under a token that names another is the duplicate submission the
+    // modelled `TokenAlreadyExistsException` refuses, whichever operation presents it.
+    if let Some(message) =
+        crate::state::reused_client_request_token(live, input.client_request_token.as_deref())
+    {
+        return Some(Err(CreateStackErrorModeled::TokenAlreadyExistsException(
+            TokenAlreadyExistsException {
+                message: Some(message),
+            },
+        )
+        .into()));
+    }
+    Some(Err(CreateStackErrorModeled::AlreadyExistsException(
+        AlreadyExistsException {
+            message: Some(format!("Stack [{}] already exists", input.stack_name)),
+        },
+    )
+    .into()))
+}
+
 /// The `CreateStack` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -426,6 +481,48 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // a stored body is caller-sized otherwise.
         crate::state::validate_template_body(&template_body)
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // "Only one of the Capabilities and ResourceType parameters can be specified": the
+        // two members state two different bounds on this create, so a request stating both
+        // states no one bound and is refused for its SHAPE, before either bound is weighed
+        // (`crate::state::resource_type_allow_list`).
+        crate::state::resource_type_allow_list::one_bound(
+            input.capabilities.as_deref().unwrap_or_default(),
+            input.resource_types.as_deref().unwrap_or_default(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // This service was mounted on an engine that is not the shared in-memory
+            // one, so there is no store to create the stack in: nothing was written, and
+            // 501 is the only honest answer.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateStack"));
+        };
+        // "The name must be unique in the Region in which you are creating the stack": the
+        // name is a property of the REQUEST, so a create naming a live stack of this Region
+        // is refused with the modelled `AlreadyExistsException` HERE — before the template
+        // it submits is weighed at all — and the stack that already has the name is left
+        // exactly as it was. A create weighing the body first would answer a request that
+        // cannot have the name for something about its template instead ([`name_in_use`]).
+        {
+            let mut store = state.lock();
+            // Materialises only the transitions the clock already owed, which would have
+            // happened on any other request at this instant — among them the deletion that
+            // frees a name again.
+            store.settle(::std::time::SystemTime::now());
+            if let Some(answered) =
+                name_in_use(&store, &crate::state::request_region(ctx.parts()), &input)
+            {
+                return answered;
+            }
+        }
+        // "If the list of resource types doesn't include a resource that you're creating,
+        // the stack creation fails": the bound this request put on its own deploy is
+        // weighed against the template it submits, before anything is created
+        // (`crate::state::resource_type_allow_list`).
+        crate::state::validate_allowed_resource_types(
+            &template_body,
+            input.resource_types.as_deref().unwrap_or_default(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         // "If your stack template contains one or more macros, and you choose to create a
         // stack directly from the processed template [...] you must acknowledge this
         // capability" — the modelled refusal for the request that has not.
@@ -521,12 +618,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &parameter_values,
         );
 
-        let Some(state) = crate::state::service_state(&*self.engine) else {
-            // This service was mounted on an engine that is not the shared in-memory
-            // one, so there is no store to create the stack in: nothing was written, and
-            // 501 is the only honest answer.
-            return Err(crate::scaffolded::Scaffolded::not_implemented("CreateStack"));
-        };
         // "CloudFormation uses the role's credentials to make calls on your behalf": a
         // role whose trust policy does not let cloudformation.amazonaws.com assume it is
         // one the stack could never deploy under, so the request is refused before
@@ -677,7 +768,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusals it makes before asking anybody are — nothing is created, and the create
         // fails and rolls back naming the export rather than completing a stack whose
         // resource carries no imported value.
-        let refused_deployment = transform_failure.or_else(|| stack.unresolved_import_failure());
+        // "Set to true to disable pre-deployment validations in [...] stack operations",
+        // default false: with them ON, a declaration whose property value its type's
+        // contract does not admit fails the create before anything is provisioned —
+        // nothing is asked of the service that owns the resource, so no resource of this
+        // stack is created and none reports an event of its own — while a create that
+        // disables them deploys the declaration as written and the same problem surfaces
+        // as that resource's own failure ([`crate::state::property_validation`]).
+        let property_failure = (input.disable_validation != Some(true))
+            .then(|| crate::state::property_validation::failure(&stack.current_resources()))
+            .flatten();
+        let refused_deployment = transform_failure
+            .or_else(|| {
+                property_failure
+                    .as_ref()
+                    .map(|failure| failure.reason.clone())
+            })
+            .or_else(|| stack.unresolved_import_failure());
 
         // The store lock is taken for the write and RELEASED at the end of this block:
         // the calls that create the stack's resources run after it, and each of those
@@ -687,51 +794,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut store = state.lock();
             store.settle(now);
 
-            // "The name must be unique in the Region in which you are creating the stack"
-            // — unique among the LIVE stacks OF THAT REGION: the same name in another
-            // Region is another stack and both coexist, and a name is free again once its
-            // stack's deletion has completed.
-            if let Some(live) = store
-                .live_stacks(&region)
-                .find(|live| live.stack_name == input.stack_name)
-            {
-                // "Specify this token if you plan to retry requests so that CloudFormation
-                // knows that you're not attempting to create a stack with the same name":
-                // a create repeating the name AND the token the create of that live stack
-                // claimed is that retry, so it re-answers the stack that create made —
-                // nothing is created a second time — rather than refusing the name.
-                let retried = input
-                    .client_request_token
-                    .as_deref()
-                    .and_then(|token| live.client_request_token_claim(token))
-                    .filter(|claimed| claimed.opened == status::CREATE_IN_PROGRESS);
-                if let Some(claimed) = retried {
-                    return Ok(CreateStackOutput {
-                        stack_id: Some(live.stack_id.clone()),
-                        operation_id: claimed.operation_id.clone(),
-                    });
-                }
-                // Not that retry, but a token one of the stack's OTHER operations already
-                // claimed: a second operation under a token that names another is the
-                // duplicate submission the modelled `TokenAlreadyExistsException` refuses,
-                // whichever operation presents it.
-                if let Some(message) = crate::state::reused_client_request_token(
-                    live,
-                    input.client_request_token.as_deref(),
-                ) {
-                    return Err(CreateStackErrorModeled::TokenAlreadyExistsException(
-                        TokenAlreadyExistsException {
-                            message: Some(message),
-                        },
-                    )
-                    .into());
-                }
-                return Err(CreateStackErrorModeled::AlreadyExistsException(
-                    AlreadyExistsException {
-                        message: Some(format!("Stack [{}] already exists", input.stack_name)),
-                    },
-                )
-                .into());
+            // "The name must be unique in the Region in which you are creating the stack":
+            // re-asserted HERE, under the writing lock, rather than trusted from the check
+            // this handler made before it weighed the template — between the two, another
+            // request may have taken the name ([`name_in_use`] is the one decision).
+            if let Some(answered) = name_in_use(&store, &region, &input) {
+                return answered;
             }
 
             // "The quota for the resource has already been reached": the store holds at
@@ -803,8 +871,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 status::CREATE_IN_PROGRESS,
                 status::CREATE_COMPLETE,
                 Some(operation_id.clone()),
-                Some(client_request_token),
+                Some(client_request_token.clone()),
             );
+            // A pre-deployment validation this create's resources did not pass is reported
+            // as the validation result it is: an event about the resource NOTHING was done
+            // to, naming the validation, its status and what failed it — which is the detail
+            // `DescribeEvents` reports for a failure CloudFormation caught before
+            // provisioning ([`crate::state::property_validation`]).
+            if let Some(failure) = &property_failure {
+                stack.record_validation_failure(
+                    now,
+                    &failure.logical_id,
+                    &failure.resource_type,
+                    crate::state::StoredValidationFailure {
+                        name: crate::state::property_validation::PROPERTY_VALIDATION.to_string(),
+                        status: crate::state::early_validation::VALIDATION_FAILED.to_string(),
+                        reason: failure.reason.clone(),
+                    },
+                    Some(operation_id.clone()),
+                    Some(client_request_token),
+                );
+            }
             // The create was accepted — the request is valid and the stack exists — but
             // this service cannot deploy that template, so the operation it started ends
             // in the modelled CREATE_FAILED with the reason, never in a CREATE_COMPLETE

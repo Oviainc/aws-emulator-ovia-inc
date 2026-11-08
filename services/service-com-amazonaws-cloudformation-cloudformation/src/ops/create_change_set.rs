@@ -398,6 +398,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // before the change set exists (`crate::state::stack_tags`).
         crate::state::stack_tags::validate_optional_tags(input.tags.as_deref())
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // "Only one of the Capabilities and ResourceType parameters can be specified": the
+        // two members state two different bounds on the operation this change set plans, so
+        // a request stating both states no one bound and is refused for its SHAPE
+        // (`crate::state::resource_type_allow_list`).
+        crate::state::resource_type_allow_list::one_bound(
+            input.capabilities.as_deref().unwrap_or_default(),
+            input.resource_types.as_deref().unwrap_or_default(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         if let Some(body) = &input.template_body {
             // The documented `TemplateBody` maximum, which the model carries no `@length`
             // for.
@@ -791,6 +800,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for here: "this capacity doesn't apply to creating change sets, and specifying it
         // when creating change sets has no effect" — reviewing a macro's expansion in a
         // change set is the very thing the acknowledgement stands in for.
+        // "If the list of resource types doesn't include a resource that you're creating,
+        // the stack creation fails": the bound this request put on the operation it plans is
+        // weighed against the template that plan would deploy, before the plan is written
+        // (`crate::state::resource_type_allow_list`).
+        crate::state::validate_allowed_resource_types(
+            &template_body,
+            input.resource_types.as_deref().unwrap_or_default(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
         let parameters =
             crate::state::merged_parameters(&previous_parameters, input.parameters.as_deref())

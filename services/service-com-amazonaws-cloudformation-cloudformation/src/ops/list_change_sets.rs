@@ -201,9 +201,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(change_set_summary)
             .collect();
         // `@paginated(inputToken: NextToken, outputToken: NextToken, items: Summaries)`:
-        // one response carries one bounded page, and the token resumes just past it.
-        let (summaries, next_token) = crate::state::paginate(
+        // one response carries one bounded page, and the token resumes just past it. The
+        // token is SCOPED to this stack — these are the stack's own change sets
+        // ([`crate::state::PageScope`]).
+        let stack_id = stack.stack_id.clone();
+        let (summaries, next_token) = crate::state::paginate_in(
             crate::state::PageOf::ChangeSetSummaries,
+            crate::state::PageScope(&stack_id),
             summaries,
             input.next_token.as_deref(),
         )

@@ -228,8 +228,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // for and no larger than the documented ceiling ("by default the
         // ListResourceScanResources API action will return at most 100 results in each
         // response. The maximum value is 100"), plus the token that resumes just past it.
-        let (resources, next_token) = crate::state::paginate_at_most(
+        let (resources, next_token) = crate::state::paginate_in_at_most(
             crate::state::PageOf::ScannedResources,
+            crate::state::PageScope(&input.resource_scan_id),
             listed,
             input.next_token.as_deref(),
             Some(scans::page_size(

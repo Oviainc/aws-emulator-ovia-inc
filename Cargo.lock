@@ -9127,6 +9127,7 @@ dependencies = [
  "http",
  "percent-encoding",
  "quick-xml",
+ "regex",
  "serde_json",
  "service-com-amazonaws-apigatewayv2-apigatewayv2",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",

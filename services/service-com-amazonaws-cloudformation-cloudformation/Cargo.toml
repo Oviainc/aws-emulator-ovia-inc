@@ -57,6 +57,10 @@ percent-encoding = "2"
 # `versionId` query — rather than hand-rolling a URL parser over caller-supplied text
 # (`state::template_url`).
 url = "2"
+# Applies a parameter declaration's own `AllowedPattern` to the value a stack operation
+# passes for it (`state::parameter_constraints`): the pattern is a regular expression the
+# template author wrote, matched by the maintained engine rather than by a hand-rolled one.
+regex = "1.13"
 # A CloudFormation template body is JSON *or* YAML ("You can write CloudFormation
 # templates in JSON or YAML"), and the YAML spelling carries the short-form intrinsic
 # tags (`!Ref`, `!GetAtt`) that give a template its meaning. yaml-rust2 is a pure-Rust

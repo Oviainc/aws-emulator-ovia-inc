@@ -288,8 +288,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // operation's results, as every paginated read of this service counts into the
         // collection it answers.
         let max_results = input.max_results.and_then(|max| usize::try_from(max).ok());
-        let (summaries, next_token) = crate::state::paginate_at_most(
+        // The token is SCOPED to the operation whose results it pages, inside the StackSet
+        // that holds it ([`crate::state::PageScope`]).
+        let scope = format!("{}/{}", stack_set.stack_set_id, input.operation_id);
+        let (summaries, next_token) = crate::state::paginate_in_at_most(
             crate::state::PageOf::StackSetOperationResultSummaries,
+            crate::state::PageScope(&scope),
             summaries,
             input.next_token.as_deref(),
             max_results,

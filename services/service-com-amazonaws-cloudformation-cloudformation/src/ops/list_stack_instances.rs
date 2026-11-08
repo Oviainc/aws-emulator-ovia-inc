@@ -298,8 +298,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // collection it answers, so a caller walking the pages keeps the narrowing it
         // started with.
         let max_results = input.max_results.and_then(|max| usize::try_from(max).ok());
-        let (summaries, next_token) = crate::state::paginate_at_most(
+        let stack_set_id = stack_set.stack_set_id.clone();
+        let (summaries, next_token) = crate::state::paginate_in_at_most(
             crate::state::PageOf::StackInstanceSummaries,
+            crate::state::PageScope(&stack_set_id),
             summaries,
             input.next_token.as_deref(),
             max_results,

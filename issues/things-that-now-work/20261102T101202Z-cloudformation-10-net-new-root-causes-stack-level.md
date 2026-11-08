@@ -1,7 +1,7 @@
 Issue-Severity: HIGH
 Issue-Corpus: simparity-behavioral-aws-v1
 Issue-Corpus-Kind: behavioral
-Issue-Trace-Ids: cloudformation.cfn-topstacks-duplicate-stack-name-rejected-leaving-the-original cloudformation.parameter-constraint-description-on-number-and-allowed-values cloudformation.parameter-constraint-description-replaces-pattern-message cloudformation.stack-create-resource-types-excluding-template-type-rejected cloudformation.stack-create-resource-types-with-capabilities cloudformation.stack-update-resource-types-excluding-added-type-rejected cloudformation.stack-update-disable-validation-defers-property-error-to-provisioning cloudformation.template-body-size-boundary-create-and-update-stack cloudformation.create-stack-instances-duplicate-operation-id cloudformation.cfn-topstacks-list-stack-resources-forged-next-token-rejected cloudformation.cfn-topstacks-list-stacks-unknown-status-filter-rejected
+Issue-Trace-Ids: cloudformation.cfn-topstacks-duplicate-stack-name-rejected-leaving-the-original cloudformation.parameter-constraint-description-on-number-and-allowed-values cloudformation.parameter-constraint-description-replaces-pattern-message cloudformation.stack-create-resource-types-excluding-template-type-rejected cloudformation.stack-create-resource-types-with-capabilities cloudformation.stack-update-resource-types-excluding-added-type-rejected cloudformation.create-stack-instances-duplicate-operation-id cloudformation.cfn-topstacks-list-stack-resources-forged-next-token-rejected cloudformation.cfn-topstacks-list-stacks-unknown-status-filter-rejected
 Issue-Shape-Id: com.amazonaws.cloudformation#CloudFormation
 Issue-Key: cloudformation.cfn-topstacks-duplicate-stack-name-rejected-leaving-the-original|run#6|AssertionError|assert code == "AlreadyExistsException", f"a duplicate name must raise AlreadyExistsException; got {code!r}"
 Issue-Key: cloudformation.parameter-constraint-description-on-number-and-allowed-values|_refused#8|AssertionError|raise AssertionError(f"CreateStack with {params!r} was accepted as {stack_id}")
@@ -9,12 +9,17 @@ Issue-Key: cloudformation.parameter-constraint-description-replaces-pattern-mess
 Issue-Key: cloudformation.stack-create-resource-types-excluding-template-type-rejected|_error#7|AssertionError|raise AssertionError(f"expected the call to be refused, but it succeeded: {result!r}")
 Issue-Key: cloudformation.stack-create-resource-types-with-capabilities|_error#10|AssertionError|raise AssertionError(f"expected the call to be refused, but it succeeded: {result!r}")
 Issue-Key: cloudformation.stack-update-resource-types-excluding-added-type-rejected|_error#5|AssertionError|raise AssertionError(f"expected the call to be refused, but it succeeded: {result!r}")
-Issue-Key: cloudformation.stack-update-disable-validation-defers-property-error-to-provisioning|run#10|AssertionError|assert _of(validated, "Param") == [], f"validation must stop the update before Param is provisioned: {validated!r}"
-Issue-Key: cloudformation.template-body-size-boundary-create-and-update-stack|run#13|AssertionError|assert (code, msg) == ("ValidationError", _length_message(over_new)), (
 Issue-Key: cloudformation.create-stack-instances-duplicate-operation-id|run#12|AssertionError|assert code == "OperationIdAlreadyExistsException", f"expected OperationIdAlreadyExistsException, got {code!r}"
 Issue-Key: cloudformation.cfn-topstacks-list-stack-resources-forged-next-token-rejected|run#17|AssertionError|assert cross.get("Message") == "Hash mismatch.", (
 Issue-Key: cloudformation.cfn-topstacks-list-stacks-unknown-status-filter-rejected|run#5|AssertionError|assert got == ("ValidationError", _ACTIVE_FILTER_MESSAGE), (
 Issue-Commit: 765add48a71cdb59193040bf215c1324536972c5
+
+> _RESOLVED for the nine causes whose keys this header still carries. Causes 6 and 7 — the
+> `ValidationStatusReason`/`ValidationPath` of the pre-deployment property validation, and the
+> prefix the template-size refusal quotes from a body that carries no separator — are
+> implemented as behaviour and still divergent in WORDING, so their two keys moved to
+> `issues/things-that-do-not-work/20261102T120000Z-cloudformation-two-pre-provision-refusal-wordings-remain-divergent.md`,
+> which carries them as its own blocking evidence._
 
 # cloudformation: 10 net-new root causes — stack-level validation and refusal taxonomy (duplicate names, parameter constraints, ResourceTypes, NextToken, enum filters)
 

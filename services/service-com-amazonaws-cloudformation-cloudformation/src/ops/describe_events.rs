@@ -492,9 +492,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
         // `@paginated(inputToken: NextToken, outputToken: NextToken,
-        // items: OperationEvents)`: one response carries one bounded page.
-        let (operation_events, next_token) = crate::state::paginate(
+        // items: OperationEvents)`: one response carries one bounded page, and the token is
+        // SCOPED to the stack whose operations it pages ([`crate::state::PageScope`]).
+        let stack_id = stack.stack_id.clone();
+        let (operation_events, next_token) = crate::state::paginate_in(
             crate::state::PageOf::OperationEvents,
+            crate::state::PageScope(&stack_id),
             operation_events,
             input.next_token.as_deref(),
         )

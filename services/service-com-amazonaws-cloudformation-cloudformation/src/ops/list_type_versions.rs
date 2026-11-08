@@ -371,8 +371,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let max_results = input
             .max_results
             .and_then(|max_results| usize::try_from(max_results).ok());
-        let (type_version_summaries, next_token) = crate::state::paginate_at_most(
+        // The token is SCOPED to the extension whose versions it pages
+        // ([`crate::state::PageScope`]).
+        let scope = format!("{}/{}", extension.type_kind, extension.type_name);
+        let (type_version_summaries, next_token) = crate::state::paginate_in_at_most(
             crate::state::PageOf::TypeVersionSummaries,
+            crate::state::PageScope(&scope),
             summaries,
             input.next_token.as_deref(),
             max_results,

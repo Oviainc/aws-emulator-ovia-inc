@@ -325,6 +325,8 @@ mod stack_event_timeline;
 mod stack_exports;
 #[path = "all/stack_failure_reason.rs"]
 mod stack_failure_reason;
+#[path = "all/stack_input_contracts.rs"]
+mod stack_input_contracts;
 #[path = "all/stack_lifecycle.rs"]
 mod stack_lifecycle;
 #[path = "all/stack_output_resolution.rs"]

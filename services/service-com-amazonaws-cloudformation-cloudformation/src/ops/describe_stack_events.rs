@@ -198,7 +198,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &input.stack_name,
             ))
         })?;
-
+        // The stack the token this read hands out is scoped to: its stack id, which names
+        // the one stack whose event stream is being paged whichever way the request named
+        // it.
+        let stack_id = stack.stack_id.clone();
         // "Returns all stack related events for a specified stack in reverse chronological
         // order": the stack's own status events and the per-resource events of each
         // operation are ONE stream, newest first. The store appends in order, so reading it
@@ -221,9 +224,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let newest_first: Vec<StackEvent> =
             newest_first.into_iter().map(stack_event_view).collect();
         // `@paginated(inputToken: NextToken, outputToken: NextToken,
-        // items: StackEvents)`: one response carries one bounded page.
-        let (stack_events, next_token) = crate::state::paginate(
+        // items: StackEvents)`: one response carries one bounded page, and the token is
+        // SCOPED to this stack — a stack's events are the stack's, so a token minted while
+        // paging another stack's is told apart from a corrupt one
+        // ([`crate::state::PageScope`]).
+        let (stack_events, next_token) = crate::state::paginate_in(
             crate::state::PageOf::StackEvents,
+            crate::state::PageScope(&stack_id),
             newest_first,
             input.next_token.as_deref(),
         )

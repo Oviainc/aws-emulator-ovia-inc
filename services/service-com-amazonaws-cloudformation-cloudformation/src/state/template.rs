@@ -459,6 +459,26 @@ pub struct DeclaredParameter {
     /// (`ParameterConstraints`) — and is EMPTY for a declaration that permits any value of
     /// its type.
     pub allowed_values: Vec<String>,
+    /// `AllowedPattern`: "A regular expression that represents the patterns to allow for
+    /// String types", as the declaration spells it.
+    pub allowed_pattern: Option<String>,
+    /// `ConstraintDescription`: "A string that explains a constraint when the constraint is
+    /// violated" — the clause CloudFormation reports IN PLACE of the constraint's own
+    /// default clause, which is what the member is documented FOR ("by adding a constraint
+    /// description … you can display the following customized error message").
+    pub constraint_description: Option<String>,
+    /// `MinValue`: "A numeric value that determines the smallest numeric value you want to
+    /// allow for Number types."
+    pub min_value: Option<f64>,
+    /// `MaxValue`: "A numeric value that determines the largest numeric value you want to
+    /// allow for Number types."
+    pub max_value: Option<f64>,
+    /// `MinLength`: "An integer value that determines the smallest number of characters you
+    /// want to allow for String types."
+    pub min_length: Option<u64>,
+    /// `MaxLength`: "An integer value that determines the largest number of characters you
+    /// want to allow for String types."
+    pub max_length: Option<u64>,
 }
 
 /// The latest `AWSTemplateFormatVersion`, which is the version in FORCE for a template that
@@ -958,6 +978,19 @@ pub fn document_within(body: &str, max_bytes: usize) -> Option<Value> {
     yaml_document(body, max_bytes)
 }
 
+/// A constraint a parameter declaration states as a NUMBER, in whatever scalar spelling the
+/// body states it with: `MinValue`/`MaxValue` are "a numeric value", and a body that quotes
+/// one states the same constraint as one that does not.
+fn declared_number(stated: &Value) -> Option<f64> {
+    scalar_text(stated)?.trim().parse::<f64>().ok()
+}
+
+/// The same reading for a constraint stated as a COUNT of characters
+/// (`MinLength`/`MaxLength`, "an integer value"), which is never negative.
+fn declared_length(stated: &Value) -> Option<u64> {
+    scalar_text(stated)?.trim().parse::<u64>().ok()
+}
+
 /// Whether a built tree is within [`MAX_TEMPLATE_NODES`] nodes.
 ///
 /// Iterative, with an explicit stack: a recursive walk of a caller-supplied tree would
@@ -1051,6 +1084,24 @@ fn template_of(document: &Value) -> Option<Template> {
                     .and_then(Value::as_array)
                     .map(|values| values.iter().filter_map(scalar_text).collect())
                     .unwrap_or_default(),
+                // The other constraints a declaration may state, each read in whatever
+                // scalar spelling the body states it with (a JSON body quotes a number
+                // where a YAML one may not), since every one of them is a value a request's
+                // own parameter value is held to.
+                allowed_pattern: declaration
+                    .get("AllowedPattern")
+                    .and_then(Value::as_str)
+                    .filter(|pattern| !pattern.is_empty())
+                    .map(ToString::to_string),
+                constraint_description: declaration
+                    .get("ConstraintDescription")
+                    .and_then(Value::as_str)
+                    .filter(|description| !description.is_empty())
+                    .map(ToString::to_string),
+                min_value: declaration.get("MinValue").and_then(declared_number),
+                max_value: declaration.get("MaxValue").and_then(declared_number),
+                min_length: declaration.get("MinLength").and_then(declared_length),
+                max_length: declaration.get("MaxLength").and_then(declared_length),
             });
         }
     }

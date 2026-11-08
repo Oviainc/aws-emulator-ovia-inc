@@ -588,6 +588,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // itself owns onto the stack (`crate::state::stack_tags`).
         crate::state::stack_tags::validate_optional_tags(input.tags.as_deref())
             .map_err(crate::scaffolded::Scaffolded::validation_error)?;
+        // "Only one of the Capabilities and ResourceType parameters can be specified": the
+        // two members state two different bounds on this update, so a request stating both
+        // states no one bound and is refused for its SHAPE, before either is weighed
+        // (`crate::state::resource_type_allow_list`).
+        crate::state::resource_type_allow_list::one_bound(
+            input.capabilities.as_deref().unwrap_or_default(),
+            input.resource_types.as_deref().unwrap_or_default(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Not the shared in-memory engine: there is no stack to update, and nothing
@@ -726,6 +735,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // "If the list of resource types doesn't include a resource that you're creating,
+        // the stack creation fails": the bound THIS request put on its own deploy — the
+        // member is the permission this call works with, so a request that states none
+        // states no bound — is weighed against the template this update would deploy,
+        // before the stack is touched (`crate::state::resource_type_allow_list`).
+        crate::state::validate_allowed_resource_types(
+            &template_body,
+            input.resource_types.as_deref().unwrap_or_default(),
+        )
+        .map_err(crate::scaffolded::Scaffolded::validation_error)?;
         let parameters =
             crate::state::merged_parameters(&previous.parameters, input.parameters.as_deref())
                 .map_err(crate::scaffolded::Scaffolded::validation_error)?;
@@ -1186,8 +1205,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Region publishes has no value to import, so CloudFormation refuses the
             // deployment before anything is asked of the services that own the resources —
             // the update then fails naming the export and is rolled back below.
-            let refused_deployment =
-                withdraws_an_export_in_use.or_else(|| stack.unresolved_import_failure());
+            // "Set to true to disable pre-deployment validations in [...] stack
+            // operations", default false: with them ON, a declaration whose property value
+            // its type's contract does not admit fails the update before anything is
+            // provisioned — nothing is asked of the service that owns the resource, so no
+            // resource of this stack is changed and none reports an event of its own —
+            // while an update that disables them deploys the declaration as written and
+            // the same problem surfaces as that resource's own failure
+            // ([`crate::state::property_validation`]). The failure is reported as the
+            // validation result it is, on an event about the resource NOTHING was done to,
+            // which is the detail `DescribeEvents` carries.
+            let property_failure = (input.disable_validation != Some(true))
+                .then(|| crate::state::property_validation::failure(&stack.current_resources()))
+                .flatten();
+            if let Some(failure) = &property_failure {
+                stack.record_validation_failure(
+                    ::std::time::SystemTime::now(),
+                    &failure.logical_id,
+                    &failure.resource_type,
+                    crate::state::StoredValidationFailure {
+                        name: crate::state::property_validation::PROPERTY_VALIDATION.to_string(),
+                        status: crate::state::early_validation::VALIDATION_FAILED.to_string(),
+                        reason: failure.reason.clone(),
+                    },
+                    Some(operation_id.clone()),
+                    stack.client_request_token.clone(),
+                );
+            }
+            let refused_deployment = withdraws_an_export_in_use
+                .or_else(|| {
+                    property_failure
+                        .as_ref()
+                        .map(|failure| failure.reason.clone())
+                })
+                .or_else(|| stack.unresolved_import_failure());
             (
                 stack.stack_id.clone(),
                 stack.region.clone(),

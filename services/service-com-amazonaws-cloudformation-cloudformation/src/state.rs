@@ -260,6 +260,18 @@ pub mod template;
 /// one answers.
 pub mod template_validation;
 
+/// What a parameter value in force on a stack operation is held to: the constraints the
+/// template's own declaration of that parameter states.
+pub mod parameter_constraints;
+
+/// The resource types a stack operation may work with: the `ResourceTypes` a request states,
+/// and the template it is weighed against.
+pub mod resource_type_allow_list;
+
+/// The pre-deployment validation a stack operation's resources are held to: the property
+/// values a resource type's own contract admits.
+pub mod property_validation;
+
 /// What a client reads ABOUT a template before it deploys one: the capabilities its
 /// declarations require, the resource types it defines and the properties an import of each
 /// of those types takes.
@@ -678,7 +690,7 @@ pub const MAX_DESCRIBED_STACK_RESOURCES: usize = 100;
 /// the constraint it failed.
 pub fn validate_template_body(template_body: &str) -> Result<(), String> {
     if template_body.len() > TEMPLATE_BODY_MAX_BYTES {
-        return Err(template_body_too_long());
+        return Err(template_body_too_long(Some(template_body)));
     }
     Ok(())
 }
@@ -713,12 +725,70 @@ pub fn validate_one_template_source(
 /// The refusal a template body past [`TEMPLATE_BODY_MAX_BYTES`] is held to, in the one
 /// place that words it: a body submitted by REFERENCE is held to the same ceiling, and the
 /// two cannot drift apart about what it is ([`template_url`]).
-pub fn template_body_too_long() -> String {
+///
+/// A constraint-violation message is BUILT FROM THE REQUEST — `1 validation error detected:
+/// Value '<value>' at '<member>' failed to satisfy constraint: <requirement>` — so the
+/// member's own value is part of the refusal and not prose: the message is the only place
+/// the service reports the offending input back. A template body is the one member of this
+/// service whose value is caller-SIZED, so what the message quotes is its leading
+/// [`QUOTED_TEMPLATE_PREFIX`] characters followed by the total it elided
+/// ([`quoted_template_body`]), rather than a response as large as the request.
+/// `submitted` carries the bytes where the refusal is made on a body this service HAS; a
+/// body refused by its reported length alone, before any of it was read, states the
+/// constraint without a value it never held.
+pub fn template_body_too_long(submitted: Option<&str>) -> String {
+    let value = match submitted {
+        Some(body) => format!("'{}' ", quoted_template_body(body)),
+        None => String::new(),
+    };
     format!(
-        "1 validation error detected: Value at 'templateBody' failed to satisfy \
+        "1 validation error detected: Value {value}at 'templateBody' failed to satisfy \
          constraint: Member must have length less than or equal to \
          {TEMPLATE_BODY_MAX_BYTES}"
     )
+}
+
+/// How much of a template body a refusal quotes before the marker naming how much of it was
+/// left out.
+///
+/// A constraint message's echoed value is BOUNDED wherever the member it is about is one a
+/// caller sizes: the framework's own constraint walk quotes a prefix of a long value rather
+/// than the value (`vendor/smithy-schema-server/src/constraints.rs`), and the shared rule for
+/// what such a message echoes says a service whose member is larger than the default ceiling
+/// states its own ceiling (`service_common::validation`). This is that ceiling for the one
+/// member of this service a caller sizes, and it is CHOSEN: enough of the document for its
+/// author to recognise which body was refused, and a constant, so the refusal's size does not
+/// follow the request's.
+pub const QUOTED_TEMPLATE_PREFIX: usize = 50;
+
+/// The template body as a refusal QUOTES it: itself where it is no longer than
+/// [`QUOTED_TEMPLATE_PREFIX`], else that much of its leading text followed by a marker
+/// naming the number of characters the value holds in all.
+///
+/// A template body is the one member of this service whose value a caller SIZES, and the
+/// value is quoted so the caller can see what was refused — which its leading text and its
+/// total length answer, while a message as large as the request would make the refusal a
+/// second copy of the template. What it keeps is cut at a separator where the kept text has
+/// one (so the quote ends on a whole word of the document), else at the character the budget
+/// runs out at, which is what a body written as one unbroken run of characters is quoted by.
+pub fn quoted_template_body(body: &str) -> String {
+    let characters = body.chars().count();
+    if characters <= QUOTED_TEMPLATE_PREFIX {
+        return body.to_string();
+    }
+    let kept: String = body.chars().take(QUOTED_TEMPLATE_PREFIX).collect();
+    // Cut back to just past the last separator the kept text carries, keeping it: a quote
+    // that ends mid-word says less about the document than one that ends at a boundary of
+    // it. The separator's own width is what the cut steps over, so a multi-byte one is
+    // never cut inside.
+    let separator = kept
+        .char_indices()
+        .rfind(|(_, character)| character.is_whitespace());
+    let kept = match separator {
+        Some((at, character)) => kept[..at + character.len_utf8()].to_string(),
+        None => kept,
+    };
+    format!("{kept}...<{characters} chars total>")
 }
 
 /// `CAPABILITY_AUTO_EXPAND` when the template names a macro the request has not
@@ -776,6 +846,27 @@ pub fn validate_template_quotas(template_body: &str) -> Result<(), String> {
 pub fn validate_resource_types(template_body: &str) -> Result<(), String> {
     match template::parse(template_body) {
         Some(template) => resource_types::refuse_unrecognized(&template),
+        None => Ok(()),
+    }
+}
+
+/// `Err(message)` for a template declaring a resource type the request's own
+/// `ResourceTypes` does not cover — the bound every operation that states that member is
+/// held to, before anything is created ([`resource_type_allow_list`] is where the rule
+/// lives).
+///
+/// `Ok(())` for a body this service's reader will not read at all: a body it cannot read
+/// declares no type to hold to the list, and is answered by the template-format rules
+/// instead.
+pub fn validate_allowed_resource_types(
+    template_body: &str,
+    allowed: &[String],
+) -> Result<(), String> {
+    match template::parse(template_body) {
+        Some(template) => match resource_type_allow_list::refusal(&template, allowed) {
+            Some(message) => Err(message),
+            None => Ok(()),
+        },
         None => Ok(()),
     }
 }
@@ -1682,6 +1773,8 @@ mod stack_nesting;
 /// Resolving the service role a stack operation acts as, against the account's own IAM
 /// records ([`service_role_trust`]).
 mod service_role_trust;
+mod pagination;
+pub use pagination::*;
 pub use service_role_trust::*;
 
 /// The CONFIGURATION one stack operation runs under: its `DeploymentConfig` and its
@@ -4210,165 +4303,6 @@ pub fn no_export_named(export_name: &str) -> String {
 /// member rather than an empty one.
 pub fn non_empty<T>(list: Vec<T>) -> Option<Vec<T>> {
     (!list.is_empty()).then_some(list)
-}
-
-/// Which paginated read a cursor belongs to. A token one operation issued must not
-/// resume a page of another operation's collection, so the cursor carries the collection
-/// it counts into and a token from elsewhere is refused rather than silently applied.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PageOf {
-    /// `DescribeStacks`'s `Stacks`.
-    Stacks,
-    /// `ListStacks`'s `StackSummaries`.
-    StackSummaries,
-    /// `DescribeStackEvents`'s `StackEvents`.
-    StackEvents,
-    /// `DescribeEvents`'s `OperationEvents`.
-    OperationEvents,
-    /// `ListStackResources`'s `StackResourceSummaries`.
-    StackResourceSummaries,
-    /// `DescribeStackResourceDrifts`'s `StackResourceDrifts`.
-    StackResourceDrifts,
-    /// `DescribeChangeSet`'s `Changes`.
-    Changes,
-    /// `ListChangeSets`'s `Summaries`.
-    ChangeSetSummaries,
-    /// `ListHookResults`'s `HookResults`.
-    HookResults,
-    /// `ListResourceScans`'s `ResourceScanSummaries`.
-    ResourceScanSummaries,
-    /// `DescribeChangeSetHooks`'s `Hooks`.
-    ChangeSetHooks,
-    /// `ListExports`'s `Exports`.
-    Exports,
-    /// `DescribeAccountLimits`'s `AccountLimits`.
-    AccountLimits,
-    /// `ListTypes`'s `TypeSummaries`.
-    TypeSummaries,
-    /// `ListTypeVersions`'s `TypeVersionSummaries`.
-    TypeVersionSummaries,
-    /// `ListTypeRegistrations`'s `RegistrationTokenList`.
-    RegistrationTokens,
-    /// `ListStackInstances`'s `Summaries`.
-    StackInstanceSummaries,
-    /// `ListStackSets`'s `Summaries`.
-    StackSetSummaries,
-    /// `ListStackSetOperations`'s `Summaries`.
-    StackSetOperationSummaries,
-    /// `ListStackSetOperationResults`'s `Summaries`.
-    StackSetOperationResultSummaries,
-    /// `ListStackSetAutoDeploymentTargets`'s `Summaries`.
-    StackSetAutoDeploymentTargetSummaries,
-    /// `ListGeneratedTemplates`'s `Summaries`.
-    TemplateSummaries,
-    /// `ListImports`'s `Imports`.
-    Imports,
-    /// `ListStackInstanceResourceDrifts`'s `Summaries`.
-    StackInstanceResourceDrifts,
-    /// `ListResourceScanRelatedResources`'s `RelatedResources`.
-    RelatedResources,
-    /// `ListResourceScanResources`'s `Resources`.
-    ScannedResources,
-}
-
-impl PageOf {
-    /// The discriminant the cursor carries.
-    fn tag(self) -> &'static str {
-        match self {
-            Self::Stacks => "stacks",
-            Self::StackSummaries => "summaries",
-            Self::StackEvents => "events",
-            Self::OperationEvents => "operation-events",
-            Self::StackResourceSummaries => "resources",
-            Self::StackResourceDrifts => "resource-drifts",
-            Self::Changes => "changes",
-            Self::ChangeSetSummaries => "change-set-summaries",
-            Self::HookResults => "hookresults",
-            Self::ResourceScanSummaries => "resource-scan-summaries",
-            Self::ChangeSetHooks => "change-set-hooks",
-            Self::Exports => "exports",
-            Self::AccountLimits => "account-limits",
-            Self::TypeSummaries => "type-summaries",
-            Self::TypeVersionSummaries => "type-version-summaries",
-            Self::RegistrationTokens => "registration-tokens",
-            Self::StackInstanceSummaries => "stack-instance-summaries",
-            Self::StackSetSummaries => "stack-set-summaries",
-            Self::StackSetOperationSummaries => "stack-set-operation-summaries",
-            Self::StackSetOperationResultSummaries => "stack-set-operation-result-summaries",
-            Self::StackSetAutoDeploymentTargetSummaries => {
-                "stack-set-auto-deployment-target-summaries"
-            }
-            Self::TemplateSummaries => "template-summaries",
-            Self::Imports => "imports",
-            Self::StackInstanceResourceDrifts => "stack-instance-resource-drifts",
-            Self::RelatedResources => "related-resources",
-            Self::ScannedResources => "scanned-resources",
-        }
-    }
-}
-
-/// Encode a page cursor as an opaque, self-describing `NextToken`.
-///
-/// Hex of the JSON cursor: it satisfies the modelled `NextToken` length (1..1024) and
-/// carries the whole cursor, so paging needs no server-side token table — a reporting
-/// operation must not write to state just because it was read.
-pub fn encode_next_token(page_of: PageOf, offset: usize) -> String {
-    ::hex::encode(::serde_json::json!({ "c": page_of.tag(), "o": offset }).to_string())
-}
-
-/// The offset a `NextToken` resumes at, or `None` when the token is not one this service
-/// issued for THIS collection.
-pub fn decode_next_token(page_of: PageOf, token: &str) -> Option<usize> {
-    let bytes = ::hex::decode(token).ok()?;
-    let cursor: ::serde_json::Value = ::serde_json::from_slice(&bytes).ok()?;
-    if cursor.get("c")?.as_str()? != page_of.tag() {
-        return None;
-    }
-    usize::try_from(cursor.get("o")?.as_u64()?).ok()
-}
-
-/// One page of a paginated read: the items from the request's cursor on, at most
-/// [`PAGE_SIZE`] of them, plus the `NextToken` that resumes just past them (`None` on the
-/// last page).
-///
-/// `Err(message)` for a token this service never issued for this collection — a bad
-/// request, not an empty page. The message names the token that was rejected, in the form
-/// this service words that refusal (`<token> is not a valid NextToken`).
-pub fn paginate<T>(
-    page_of: PageOf,
-    items: Vec<T>,
-    token: Option<&str>,
-) -> Result<(Vec<T>, Option<String>), String> {
-    paginate_at_most(page_of, items, token, None)
-}
-
-/// [`paginate`], for a read whose request CHOOSES how large a page is: `MaxResults` is
-/// "the maximum number of results to be returned with a single call", so a request that
-/// names one gets at most that many items and the `NextToken` that resumes just past
-/// them.
-///
-/// A request that names none gets this service's own page size ([`PAGE_SIZE`]), which is
-/// also the ceiling: one response carries one bounded page whatever maximum is asked for.
-/// The cursor counts ITEMS, not pages, so a caller may ask for a different maximum on
-/// every call and still walk the collection exactly once.
-pub fn paginate_at_most<T>(
-    page_of: PageOf,
-    items: Vec<T>,
-    token: Option<&str>,
-    max_results: Option<usize>,
-) -> Result<(Vec<T>, Option<String>), String> {
-    let page_size = max_results.unwrap_or(PAGE_SIZE).clamp(1, PAGE_SIZE);
-    let offset = match token {
-        None => 0,
-        Some(token) => decode_next_token(page_of, token)
-            .filter(|offset| *offset <= items.len())
-            .ok_or_else(|| format!("{token} is not a valid NextToken"))?,
-    };
-    let remaining = items.len() - offset;
-    let next_token =
-        (remaining > page_size).then(|| encode_next_token(page_of, offset + page_size));
-    let page = items.into_iter().skip(offset).take(page_size).collect();
-    Ok((page, next_token))
 }
 
 /// A stored instant as the modelled timestamp type.

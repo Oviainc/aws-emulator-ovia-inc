@@ -239,9 +239,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .map(hook_view)
             .collect();
         // `NextToken` is "the token for the next set of items to return", so one response
-        // carries one bounded page of the plan and the token resumes just past it.
-        let (hooks, next_token) = crate::state::paginate(
+        // carries one bounded page of the plan and the token resumes just past it — SCOPED
+        // to this change set, whose plan it pages ([`crate::state::PageScope`]).
+        let change_set_id = change_set.change_set_id.clone();
+        let (hooks, next_token) = crate::state::paginate_in(
             crate::state::PageOf::ChangeSetHooks,
+            crate::state::PageScope(&change_set_id),
             selected,
             input.next_token.as_deref(),
         )

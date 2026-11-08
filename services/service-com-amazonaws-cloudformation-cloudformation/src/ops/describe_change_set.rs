@@ -338,8 +338,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })?;
         // `@paginated(inputToken: NextToken, outputToken: NextToken, items: Changes)`: one
         // response carries one bounded page of changes, and the token resumes just past it.
-        let (changes, next_token) = crate::state::paginate(
+        // The token is SCOPED to this change set — the changes are the change set's own
+        // ([`crate::state::PageScope`]).
+        let change_set_id = change_set.change_set_id.clone();
+        let (changes, next_token) = crate::state::paginate_in(
             crate::state::PageOf::Changes,
+            crate::state::PageScope(&change_set_id),
             change_set.changes.iter().map(change_view).collect(),
             input.next_token.as_deref(),
         )

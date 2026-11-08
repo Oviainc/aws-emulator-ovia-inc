@@ -228,8 +228,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // StackSet's operations, as every paginated read of this service counts into the
         // collection it answers.
         let max_results = input.max_results.and_then(|max| usize::try_from(max).ok());
-        let (summaries, next_token) = crate::state::paginate_at_most(
+        let stack_set_id = stack_set.stack_set_id.clone();
+        let (summaries, next_token) = crate::state::paginate_in_at_most(
             crate::state::PageOf::StackSetOperationSummaries,
+            crate::state::PageScope(&stack_set_id),
             summaries,
             input.next_token.as_deref(),
             max_results,

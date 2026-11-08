@@ -304,8 +304,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // pageSize: MaxResults)`: one response carries at most the `MaxResults` the request
         // asks for, and the token resumes just past that page.
         let max_results = input.max_results.and_then(|max| usize::try_from(max).ok());
-        let (summaries, next_token) = crate::state::paginate_at_most(
+        // The token is SCOPED to the one stack instance of the one operation whose rows it
+        // pages ([`crate::state::PageScope`]).
+        let scope = format!(
+            "{}/{}/{}/{}",
+            stack_set.stack_set_id,
+            input.operation_id,
+            input.stack_instance_account,
+            input.stack_instance_region
+        );
+        let (summaries, next_token) = crate::state::paginate_in_at_most(
             crate::state::PageOf::StackInstanceResourceDrifts,
+            crate::state::PageScope(&scope),
             summaries,
             input.next_token.as_deref(),
             max_results,

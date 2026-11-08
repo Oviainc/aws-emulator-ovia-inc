@@ -508,7 +508,8 @@ async fn the_pages_of_a_large_stack_enumerate_every_resource_exactly_once() {
 #[tokio::test]
 async fn a_next_token_this_operation_never_issued_is_refused() {
     let router = router();
-    create_stack(&router, "list-token", &template_with(3), &[]).await;
+    let (_, created) = create_stack(&router, "list-token", &template_with(3), &[]).await;
+    let stack_id = xml_text(&created, "StackId").expect("CreateStack answers a StackId");
     wait_for_the_transition().await;
 
     // A cursor past the end of the stack's resources is not one this operation handed out
@@ -546,9 +547,14 @@ async fn a_next_token_this_operation_never_issued_is_refused() {
         );
     }
 
-    // The cursor the first page hands back IS accepted, so the refusals above are about
-    // the token and not about the operation.
-    let first = state::encode_next_token(state::PageOf::StackResourceSummaries, 0);
+    // The cursor at the start of THIS stack's resources IS accepted, so the refusals above
+    // are about the token and not about the operation: the token this read hands out is
+    // scoped to the stack whose resources it pages.
+    let first = state::encode_scoped_next_token(
+        state::PageOf::StackResourceSummaries,
+        state::PageScope(&stack_id),
+        0,
+    );
     let (status, body) = list_stack_resources(
         &router,
         &[member("StackName", "list-token"), member("NextToken", &first)],

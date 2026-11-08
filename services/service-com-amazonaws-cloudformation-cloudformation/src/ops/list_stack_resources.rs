@@ -218,11 +218,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .iter()
             .map(stack_resource_summary)
             .collect();
+        // The stack the token this read hands out is scoped to: its stack id, which names
+        // the one stack whose resources are being paged whichever way the request named it.
+        let stack_id = stack.stack_id.clone();
         // `@paginated(inputToken: NextToken, outputToken: NextToken, items:
         // StackResourceSummaries)`: one response carries one bounded page, and the token
-        // resumes just past it.
-        let (stack_resource_summaries, next_token) = crate::state::paginate(
+        // resumes just past it. The token is SCOPED to this stack — a stack's resources are
+        // the stack's, so a token minted while paging ANOTHER stack's resources is told
+        // apart from a corrupt one and refused as the mismatch it is
+        // ([`crate::state::PageScope`]).
+        let (stack_resource_summaries, next_token) = crate::state::paginate_in(
             crate::state::PageOf::StackResourceSummaries,
+            crate::state::PageScope(&stack_id),
             summaries,
             input.next_token.as_deref(),
         )

@@ -254,8 +254,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // items: RelatedResources, pageSize: MaxResults)`: one response carries one page, as
         // large as the request asked for and no larger than the documented ceiling, plus the
         // token that resumes just past it.
-        let (related_resources, next_token) = crate::state::paginate_at_most(
+        let (related_resources, next_token) = crate::state::paginate_in_at_most(
             crate::state::PageOf::RelatedResources,
+            crate::state::PageScope(&input.resource_scan_id),
             related,
             input.next_token.as_deref(),
             Some(page_size(input.max_results)),

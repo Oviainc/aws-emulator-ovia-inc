@@ -104,12 +104,12 @@ pub fn refusal(
     if let Some(message) = parameter_name_refusal(&document) {
         return Some(message);
     }
-    // A parameter's `Default` is the value in force when the request passes none ("a value of
-    // the appropriate type for the template to use if no value is specified"), so the
-    // declaration itself is refused where that value is not one the parameter's own
-    // `AllowedValues` admits — "an array containing the list of values allowed for the
-    // parameter" is the set every value of it has to come from, the default included.
-    if let Some(message) = parameter_default_refusal(body) {
+    // Every value IN FORCE is held to its own declaration: the `Parameters` section is the
+    // template's input contract, so a value outside what the declaration admits — one the
+    // request supplied, or the declaration's own `Default` where it supplied none, since both
+    // are values of that parameter — is refused before anything is provisioned
+    // ([`super::parameter_constraints`], the ONE place that rule lives).
+    if let Some(message) = super::parameter_constraints::refusal(body, supplied) {
         return Some(message);
     }
     // The directives are read from the SUBMITTED document: whether a template uses one is a
@@ -161,51 +161,6 @@ fn parameter_name_refusal(document: &Value) -> Option<String> {
     Some(format!(
         "Template format error: Parameter name {name} is non alphanumeric."
     ))
-}
-
-/// `Some(message)` for a parameter whose declared `Default` is not a value its own
-/// `AllowedValues` admits, naming the parameter whose declaration it is.
-///
-/// A declaration permitting any value of its type (no `AllowedValues`) and one stating no
-/// `Default` are both consistent: there is no value to hold to a set. A LIST-typed parameter
-/// states several values in one default — "CommaDelimitedList: an array of literal strings
-/// that are separated by commas" — and each of them has to be admitted, since each is a value
-/// of that parameter.
-fn parameter_default_refusal(body: &str) -> Option<String> {
-    let declared = template::parse(body)?;
-    let off = declared.parameters.iter().find(|parameter| {
-        let Some(default) = parameter.default.as_deref() else {
-            return false;
-        };
-        if parameter.allowed_values.is_empty() {
-            return false;
-        }
-        declared_values(parameter, default)
-            .any(|value| !parameter.allowed_values.iter().any(|allowed| allowed == value))
-    })?;
-    Some(format!(
-        "Parameter '{}' must be one of AllowedValues",
-        off.key
-    ))
-}
-
-/// The values one parameter's `Default` puts in force: the whole text for a scalar parameter,
-/// and each comma-separated entry for a list-typed one (`CommaDelimitedList` and every
-/// `List<…>` type), whose value IS that array.
-fn declared_values<'a>(
-    parameter: &template::DeclaredParameter,
-    default: &'a str,
-) -> impl Iterator<Item = &'a str> {
-    let listed = parameter
-        .declared_type
-        .as_deref()
-        .is_some_and(|declared_type| declared_type.contains("List"));
-    let values: Vec<&str> = if listed {
-        default.split(',').map(str::trim).collect()
-    } else {
-        vec![default]
-    };
-    values.into_iter()
 }
 
 /// What an expression inside a template resolves against where the REQUEST decides it.

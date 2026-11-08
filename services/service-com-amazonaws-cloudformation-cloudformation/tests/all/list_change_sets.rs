@@ -731,7 +731,7 @@ async fn a_stack_at_its_change_set_quota_is_answered_in_one_page() {
 #[tokio::test]
 async fn a_next_token_this_operation_never_issued_is_refused() {
     let (router, engine) = router_with_engine();
-    create_change_set(
+    let (_, stack_id) = create_change_set(
         &router,
         "a token this operation never issued",
         "cs-list-token",
@@ -780,9 +780,14 @@ async fn a_next_token_this_operation_never_issued_is_refused() {
         );
     }
 
-    // The cursor at the start of THIS collection IS accepted, so the refusals above are
-    // about the token and not about the operation.
-    let first = state::encode_next_token(state::PageOf::ChangeSetSummaries, 0);
+    // The cursor at the start of THIS stack's collection IS accepted, so the refusals above
+    // are about the token and not about the operation: the token a paginated read of one
+    // stack hands out is scoped to that stack.
+    let first = state::encode_scoped_next_token(
+        state::PageOf::ChangeSetSummaries,
+        state::PageScope(&stack_id),
+        0,
+    );
     let (status, body) = list_change_sets(
         &router,
         &[

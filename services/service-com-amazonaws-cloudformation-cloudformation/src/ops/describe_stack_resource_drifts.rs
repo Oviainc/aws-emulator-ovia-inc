@@ -224,10 +224,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `@paginated(inputToken: NextToken, outputToken: NextToken, pageSize: MaxResults)`:
         // "the maximum number of results to be returned with a single call. If the number
         // of available results exceeds this maximum, the response includes a NextToken
-        // value" that resumes just past the page.
+        // value" that resumes just past the page. The token is SCOPED to this stack — these
+        // are the stack's own resources ([`crate::state::PageScope`]).
+        let stack_id = stack.stack_id.clone();
         let max_results = input.max_results.and_then(|max| usize::try_from(max).ok());
-        let (stack_resource_drifts, next_token) = crate::state::paginate_at_most(
+        let (stack_resource_drifts, next_token) = crate::state::paginate_in_at_most(
             crate::state::PageOf::StackResourceDrifts,
+            crate::state::PageScope(&stack_id),
             drifts,
             input.next_token.as_deref(),
             max_results,

@@ -178,9 +178,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         }
         // `@paginated(inputToken: NextToken, outputToken: NextToken, items: Imports)`: one
-        // response carries one bounded page, and `NextToken` identifies the next.
-        let (page, next_token) = crate::state::paginate(
+        // response carries one bounded page, and `NextToken` identifies the next — SCOPED to
+        // the export whose importers it pages ([`crate::state::PageScope`]).
+        let (page, next_token) = crate::state::paginate_in(
             crate::state::PageOf::Imports,
+            crate::state::PageScope(&input.export_name),
             imports,
             input.next_token.as_deref(),
         )
