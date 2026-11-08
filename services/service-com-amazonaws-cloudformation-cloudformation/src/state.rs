@@ -423,6 +423,11 @@ pub mod stack_set_rollout;
 /// operation that takes a `Tags` list admits from a request.
 pub mod stack_tags;
 
+/// How this service holds the FREE TEXT a caller hands it to store: as ASCII, so a codepoint
+/// outside ASCII reads back as one `?`.
+pub mod ascii_text;
+pub use ascii_text::ascii_text;
+
 /// The TIMELINE of one stack operation's walk over a stack's resources: when each resource
 /// was scheduled and when it finished, which is what the per-resource `StackEvent`s of that
 /// operation are stamped with.
@@ -4417,11 +4422,17 @@ pub fn timestamp(at: SystemTime) -> ::aws_smithy_types::DateTime {
 }
 
 /// The request's `Tags` as stored tags.
+///
+/// A tag is caller-authored FREE TEXT, which this service holds as ASCII
+/// ([`ascii_text`]): a tag whose key or value carries a codepoint outside ASCII is held,
+/// and so read back, with that codepoint replaced by one `?`. Applied HERE, at the one
+/// write every operation that takes a `Tags` list goes through, so a stack, a change set
+/// and a stack set all hold a tag the same way and a read reports what is stored.
 pub fn stored_tags(tags: &[crate::ops::types::Tag]) -> Vec<StoredTag> {
     tags.iter()
         .map(|tag| StoredTag {
-            key: tag.key.clone(),
-            value: tag.value.clone(),
+            key: ascii_text(&tag.key),
+            value: ascii_text(&tag.value),
         })
         .collect()
 }

@@ -397,6 +397,8 @@ mod stack_set_refusal_wording;
 mod stack_set_revision_rollout;
 #[path = "all/stack_status_accepts_an_update.rs"]
 mod stack_status_accepts_an_update;
+#[path = "all/stack_tag_ascii_text.rs"]
+mod stack_tag_ascii_text;
 #[path = "all/stack_tag_propagation.rs"]
 mod stack_tag_propagation;
 #[path = "all/stack_teardown_events.rs"]

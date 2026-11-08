@@ -1829,17 +1829,15 @@ fn aws_published_record(region: &str, type_name: &str) -> StoredExtension {
 /// The configuration document the registry holds for what one `SetTypeConfiguration` call
 /// submitted: the submitted text with every codepoint outside ASCII replaced by one `?`.
 ///
-/// CloudFormation stores an extension's configuration data as ASCII text, so a document that
+/// CloudFormation stores an extension's configuration data as ASCII text
+/// ([`super::ascii_text`], the same rule a stack's tags are held by), so a document that
 /// carries a codepoint outside it reads back with that codepoint replaced one-for-one — the
 /// document's STRUCTURE is untouched (every delimiter, name and nesting level survives,
 /// because each of those is ASCII already) and only the characters it cannot hold change.
 /// Applied at the WRITE, so what a read reports is what the registry holds rather than a
 /// second transformation a read invented.
 pub fn ascii_configuration(configuration: &str) -> String {
-    configuration
-        .chars()
-        .map(|character| if character.is_ascii() { character } else { '?' })
-        .collect()
+    super::ascii_text(configuration)
 }
 
 #[cfg(test)]
