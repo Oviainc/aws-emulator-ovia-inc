@@ -188,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // which is what lets this call bring it back.
             return Err(UndeprecateDomainErrorModeled::UnknownResourceFault(
                 UnknownResourceFault {
-                    message: Some(format!("Unknown domain: {}", input.name)),
+                    message: Some(crate::state::unknown_domain_message(&input.name)),
                 },
             )
             .into());

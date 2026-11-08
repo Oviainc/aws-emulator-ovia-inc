@@ -176,18 +176,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // A run the clock already closed is out of scope for a cancel request, so the
         // service's own start-to-close reaping is materialised before the lookup.
         guard.materialise_due_timeouts_in(&input.domain, requested_at);
+        // The fault names the resource whose lookup failed: this call WRITES into the
+        // domain, so an absent domain is reported as the domain, and inside an existing
+        // one the unresolved resource is the execution — reported by `workflowId` alone,
+        // which is this operation's own form. Unlike `SignalWorkflowExecution`, whose
+        // message carries the pair when a run was addressed, the recorded answers for
+        // this operation and for `TerminateWorkflowExecution` name the `workflowId`
+        // alone even for a request that supplied a `runId`, so the form does not depend
+        // on how the execution was addressed here.
         let unknown = || {
             RequestCancelWorkflowExecutionErrorModeled::UnknownResourceFault(
                 UnknownResourceFault {
-                    message: Some(format!(
-                        "Unknown execution, workflowId = {}",
-                        input.workflow_id
+                    message: Some(crate::state::unknown_execution_by_workflow_id_message(
+                        &input.workflow_id,
                     )),
                 },
             )
         };
         let Some(domain) = guard.domains.get_mut(&input.domain) else {
-            return Err(unknown().into());
+            return Err(
+                RequestCancelWorkflowExecutionErrorModeled::UnknownResourceFault(
+                    UnknownResourceFault {
+                        message: Some(crate::state::unknown_domain_message(&input.domain)),
+                    },
+                )
+                .into(),
+            );
         };
         // An omitted `runId` addresses the one run of this `workflowId` that is still
         // open: "If the runId isn't specified, the WorkflowExecutionCancelRequested

@@ -41,10 +41,17 @@ struct SignalCase {
     with_run_id: bool,
 }
 
-/// The expected `UnknownResourceFault` message: the requested execution and nothing
-/// else, the same clause every execution-scoped operation of this service uses.
+/// The expected `UnknownResourceFault` message when the request ADDRESSED a `runId`:
+/// the requested execution and nothing else, the same clause every execution-scoped
+/// operation of this service uses.
 fn unknown_execution_message(workflow_id: &str, run_id: &str) -> String {
     format!("Unknown execution: WorkflowExecution=[workflowId={workflow_id}, runId={run_id}]")
+}
+
+/// The expected `UnknownResourceFault` message when the request named a `workflowId`
+/// ALONE: the id it supplied, with no `runId` clause it never asked about.
+fn unknown_execution_by_workflow_id_message(workflow_id: &str) -> String {
+    format!("Unknown execution, workflowId = {workflow_id}")
 }
 
 /// Every event of one run's history, oldest first.
@@ -364,7 +371,7 @@ async fn a_signal_to_a_run_that_is_not_open_is_refused_and_appends_nothing() {
                     "workflowId": "wf-1",
                     "signalName": "too-late",
                 }),
-                unknown_execution_message("wf-1", ""),
+                unknown_execution_by_workflow_id_message("wf-1"),
             ),
         ];
         for (addressing, body, expected_message) in &requests {

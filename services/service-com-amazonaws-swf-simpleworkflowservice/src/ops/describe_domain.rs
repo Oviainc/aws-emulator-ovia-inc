@@ -132,7 +132,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(domain) = guard.domains.get(&input.name) else {
             return Err(DescribeDomainErrorModeled::UnknownResourceFault(
                 UnknownResourceFault {
-                    message: Some(format!("Unknown domain: {}", input.name)),
+                    message: Some(crate::state::unknown_domain_message(&input.name)),
                 },
             )
             .into());

@@ -140,10 +140,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let guard = state.lock();
-        // An `UnknownResourceFault` message names the resource the lookup failed on and
-        // nothing else: the domain when no domain is stored under that name, otherwise
-        // the requested type, in the `WorkflowType=[name=.., version=..]` form every
-        // operation of this service that reports a missing workflow type uses.
+        // An `UnknownResourceFault` message names the resource the REQUEST asked for.
+        // This operation addresses one workflow type, so the type is what the fault
+        // names — in the `WorkflowType=[name=.., version=..]` form every operation of
+        // this service that reports a missing workflow type uses — whether the lookup
+        // missed because the domain holds no such type or because this service holds no
+        // such domain: either way the type the request named is what could not be
+        // resolved, and the domain the lookup was scoped to is never part of the clause.
         let unknown_type = || {
             DescribeWorkflowTypeErrorModeled::UnknownResourceFault(UnknownResourceFault {
                 message: Some(crate::state::unknown_workflow_type_message(
@@ -152,11 +155,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
         };
-        let domain = guard.domains.get(&input.domain).ok_or_else(|| {
-            DescribeWorkflowTypeErrorModeled::UnknownResourceFault(UnknownResourceFault {
-                message: Some(format!("Unknown domain: {}", input.domain)),
-            })
-        })?;
+        let domain = guard.domains.get(&input.domain).ok_or_else(unknown_type)?;
         let workflow_type = domain
             .workflow_types
             .get(&(

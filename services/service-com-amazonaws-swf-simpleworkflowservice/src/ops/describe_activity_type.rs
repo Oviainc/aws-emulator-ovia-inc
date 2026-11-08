@@ -168,10 +168,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let guard = state.lock();
-        // An `UnknownResourceFault` message names the resource the lookup failed on and
-        // nothing else: the domain when no domain is stored under that name, otherwise
-        // the requested type, in the `ActivityType=[name=.., version=..]` form every
-        // operation of this service that reports a missing activity type uses.
+        // An `UnknownResourceFault` message names the resource the REQUEST asked for.
+        // This operation addresses one activity type, so the type is what the fault
+        // names — in the `ActivityType=[name=.., version=..]` form every operation of
+        // this service that reports a missing activity type uses — whether the lookup
+        // missed because the domain holds no such type or because this service holds no
+        // such domain: either way the type the request named is what could not be
+        // resolved, and the domain the lookup was scoped to is never part of the clause.
         let unknown_type = || {
             DescribeActivityTypeErrorModeled::UnknownResourceFault(UnknownResourceFault {
                 message: Some(crate::state::unknown_activity_type_message(
@@ -180,11 +183,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
         };
-        let domain = guard.domains.get(&input.domain).ok_or_else(|| {
-            DescribeActivityTypeErrorModeled::UnknownResourceFault(UnknownResourceFault {
-                message: Some(format!("Unknown domain: {}", input.domain)),
-            })
-        })?;
+        let domain = guard.domains.get(&input.domain).ok_or_else(unknown_type)?;
         let activity_type = domain
             .activity_types
             .get(&(

@@ -210,12 +210,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         // "closeStatusFilter, executionFilter, typeFilter and tagFilter are mutually
-        // exclusive. You can specify at most one of these in a request."
+        // exclusive. You can specify at most one of these in a request." The refusal
+        // names the shapes these members target — `closeStatusFilter`
+        // (CloseStatusFilter), `executionFilter` (WorkflowExecutionFilter),
+        // `typeFilter` (WorkflowTypeFilter) and `tagFilter` (TagFilter) — in the order
+        // the input declares them.
         crate::state::validate_exclusive_filters(&[
-            ("closeStatusFilter", input.close_status_filter.is_some()),
-            ("executionFilter", input.execution_filter.is_some()),
-            ("typeFilter", input.type_filter.is_some()),
-            ("tagFilter", input.tag_filter.is_some()),
+            ("CloseStatusFilter", input.close_status_filter.is_some()),
+            ("WorkflowExecutionFilter", input.execution_filter.is_some()),
+            ("WorkflowTypeFilter", input.type_filter.is_some()),
+            ("TagFilter", input.tag_filter.is_some()),
         ])
         .map_err(crate::scaffolded::Scaffolded::validation)?;
 
@@ -240,7 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // while its executions stay visible.
         let domain = guard.domains.get(&input.domain).ok_or_else(|| {
             ListClosedWorkflowExecutionsErrorModeled::UnknownResourceFault(UnknownResourceFault {
-                message: Some(format!("Unknown domain: {}", input.domain)),
+                message: Some(crate::state::unknown_domain_message(&input.domain)),
             })
         })?;
 

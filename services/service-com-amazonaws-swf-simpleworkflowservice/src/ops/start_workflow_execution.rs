@@ -265,7 +265,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(domain) = guard.domains.get_mut(&input.domain) else {
             return Err(StartWorkflowExecutionErrorModeled::UnknownResourceFault(
                 UnknownResourceFault {
-                    message: Some(format!("Unknown domain: {}", input.domain)),
+                    message: Some(crate::state::unknown_domain_message(&input.domain)),
                 },
             )
             .into());
@@ -302,16 +302,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // that is still open is the modelled already-started fault, never a second
         // open run under the same id.
         //
-        // The fault's code carries the whole meaning, and the recorded service answer
-        // pairs it with an EMPTY message: the colliding run's identity is not part of
-        // the envelope, so a caller is never handed the `runId` of a run it did not
-        // start. The member is PRESENT and empty rather than absent, which is how the
-        // recorded envelope carries it — do not "simplify" this to `None`.
-        if domain.open_by_workflow_id.contains_key(&input.workflow_id) {
+        // The fault IDENTIFIES the incumbent: besides the code, it carries the
+        // `workflowExecution` of the run that holds the id — the requested `workflowId`
+        // with the `runId` taken from this service's own open-run index — which is what
+        // lets a caller that collided describe, signal or terminate that run without a
+        // separate visibility query. The recorded service answer pairs that identity
+        // with an EMPTY message, present rather than absent; do not "simplify" the
+        // message to `None`.
+        if let Some(open_run_id) = domain.open_by_workflow_id.get(&input.workflow_id) {
             return Err(
                 StartWorkflowExecutionErrorModeled::WorkflowExecutionAlreadyStartedFault(
                     WorkflowExecutionAlreadyStartedFault {
                         message: Some(String::new()),
+                        workflow_execution: Some(WorkflowExecution {
+                            workflow_id: input.workflow_id.clone(),
+                            run_id: open_run_id.clone(),
+                        }),
                     },
                 )
                 .into(),

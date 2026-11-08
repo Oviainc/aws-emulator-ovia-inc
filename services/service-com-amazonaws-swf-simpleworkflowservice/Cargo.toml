@@ -25,6 +25,9 @@ tracing = { workspace = true }
 # (moved up from `[dev-dependencies]`, where the scaffold placed them).
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Writes the server-generated `runId` in base64, the alphabet Amazon SWF's own run ids
+# are written in.
+base64 = "0.22"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

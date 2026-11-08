@@ -187,23 +187,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // service's own start-to-close reaping is materialised before the lookup.
         guard.materialise_due_timeouts_in(&input.domain, signaled_at);
 
-        // An `UnknownResourceFault` message names the resource the lookup failed on and
-        // nothing else: the domain when no domain is stored under that name, otherwise
-        // the requested execution, in the
-        // `WorkflowExecution=[workflowId=.., runId=..]` form every execution-scoped
-        // operation of this service uses.
+        // An `UnknownResourceFault` names the resource whose lookup failed, built from
+        // what the request supplied and nothing else. This call WRITES into the domain,
+        // so the domain it writes into is resolved first and an absent one is reported
+        // as the domain; inside an existing domain the unresolved resource is the
+        // execution, addressed by `(workflowId, runId)` when a run was named and by
+        // `workflowId` alone when it was not — "the current open workflow execution with
+        // the matching workflowId" — so the fault names it in the form that identity was
+        // addressed in and never renders a `runId` the caller left out.
         let unknown_execution = || {
             SignalWorkflowExecutionErrorModeled::UnknownResourceFault(UnknownResourceFault {
-                message: Some(crate::state::unknown_execution_message(
+                message: Some(crate::state::unknown_execution_requested_message(
                     &input.workflow_id,
-                    input.run_id.as_deref().unwrap_or_default(),
+                    input.run_id.as_deref(),
                 )),
             })
         };
         let Some(domain) = guard.domains.get_mut(&input.domain) else {
             return Err(SignalWorkflowExecutionErrorModeled::UnknownResourceFault(
                 UnknownResourceFault {
-                    message: Some(format!("Unknown domain: {}", input.domain)),
+                    message: Some(crate::state::unknown_domain_message(&input.domain)),
                 },
             )
             .into());

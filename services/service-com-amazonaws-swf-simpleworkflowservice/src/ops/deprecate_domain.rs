@@ -185,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // every other domain reader of this service reports it.
             return Err(DeprecateDomainErrorModeled::UnknownResourceFault(
                 UnknownResourceFault {
-                    message: Some(format!("Unknown domain: {}", input.name)),
+                    message: Some(crate::state::unknown_domain_message(&input.name)),
                 },
             )
             .into());

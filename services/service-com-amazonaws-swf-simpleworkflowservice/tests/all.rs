@@ -41,10 +41,14 @@ mod domain_tagging;
 mod domain_undeprecation;
 #[path = "all/domain_untagging.rs"]
 mod domain_untagging;
+#[path = "all/duplicate_start_fault_identity.rs"]
+mod duplicate_start_fault_identity;
 #[path = "all/execution_record_projection.rs"]
 mod execution_record_projection;
 #[path = "all/execution_start_to_close_timeout.rs"]
 mod execution_start_to_close_timeout;
+#[path = "all/exclusive_filter_refusal_message.rs"]
+mod exclusive_filter_refusal_message;
 #[path = "all/fixed_fault_message_text.rs"]
 mod fixed_fault_message_text;
 #[path = "all/list_activity_types.rs"]
@@ -69,6 +73,8 @@ mod record_activity_task_heartbeat;
 mod request_cancel_workflow_execution;
 #[path = "all/respond_decision_task_completed.rs"]
 mod respond_decision_task_completed;
+#[path = "all/run_id_shape.rs"]
+mod run_id_shape;
 #[path = "all/signal_history_pagination.rs"]
 mod signal_history_pagination;
 #[path = "all/signal_workflow_execution.rs"]

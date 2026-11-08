@@ -459,6 +459,9 @@ async fn a_triple_naming_no_stored_type_is_an_unknown_resource() {
 
     let cases = vec![
         UnknownCase {
+            // A WRITE resolves the domain it writes into first, so an absent domain is
+            // reported as the domain; only a request inside an existing domain reports
+            // the type.
             case: "domain never registered",
             domain: "no-such-domain".to_string(),
             workflow_type: type_ref("orders", "1.0"),

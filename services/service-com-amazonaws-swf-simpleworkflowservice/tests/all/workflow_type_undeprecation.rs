@@ -479,6 +479,9 @@ async fn a_triple_naming_no_stored_workflow_type_is_an_unknown_resource() {
         let absent_version = absent_variant(&case.version, MAX_TYPE_VERSION_LEN);
         let missing = vec![
             (
+                // A WRITE resolves the domain it writes into first, so an absent domain
+                // is reported as the domain; only a request inside an existing domain
+                // reports the type.
                 "domain never registered",
                 "no-such-domain".to_string(),
                 case.name.clone(),

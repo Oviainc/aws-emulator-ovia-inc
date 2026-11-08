@@ -176,10 +176,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // specify at most one of these in a request." The model cannot express that, so
         // a request carrying two of them is refused here as a bad request rather than
         // counted under some invented precedence.
+        // The refusal names the shapes these members target — `executionFilter`
+        // (WorkflowExecutionFilter), `typeFilter` (WorkflowTypeFilter) and `tagFilter`
+        // (TagFilter) — in the order the input declares them.
         crate::state::validate_exclusive_filters(&[
-            ("executionFilter", input.execution_filter.is_some()),
-            ("typeFilter", input.type_filter.is_some()),
-            ("tagFilter", input.tag_filter.is_some()),
+            ("WorkflowExecutionFilter", input.execution_filter.is_some()),
+            ("WorkflowTypeFilter", input.type_filter.is_some()),
+            ("TagFilter", input.tag_filter.is_some()),
         ])
         .map_err(crate::scaffolded::Scaffolded::validation)?;
 

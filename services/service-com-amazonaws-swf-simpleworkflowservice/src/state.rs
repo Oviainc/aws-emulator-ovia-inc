@@ -3379,6 +3379,39 @@ pub fn unknown_execution_message(workflow_id: &str, run_id: &str) -> String {
     format!("Unknown execution: WorkflowExecution=[workflowId={workflow_id}, runId={run_id}]")
 }
 
+/// The `UnknownResourceFault` message for an execution addressed by `workflowId` ALONE:
+/// `Unknown execution, workflowId = <workflowId>`.
+///
+/// A request that names no `runId` addresses "the current open workflow execution with
+/// the specified workflowId", so the only identifier it supplied is that id — and a
+/// fault message renders what the request supplied and nothing else, never a member the
+/// caller left out. [`unknown_execution_requested_message`] is what chooses between this
+/// form and the `(workflowId, runId)` pair of [`unknown_execution_message`].
+pub fn unknown_execution_by_workflow_id_message(workflow_id: &str) -> String {
+    format!("Unknown execution, workflowId = {workflow_id}")
+}
+
+/// The `UnknownResourceFault` message for an execution an operation taking an OPTIONAL
+/// `runId` failed to resolve: the pair when the request addressed a run, the `workflowId`
+/// alone when it did not.
+pub fn unknown_execution_requested_message(workflow_id: &str, run_id: Option<&str>) -> String {
+    match run_id.filter(|id| !id.is_empty()) {
+        Some(run_id) => unknown_execution_message(workflow_id, run_id),
+        None => unknown_execution_by_workflow_id_message(workflow_id),
+    }
+}
+
+/// The `UnknownResourceFault` message for a name no domain record of this service is
+/// stored under: `Unknown domain: <name>`, built from the request alone.
+///
+/// This is the clause every operation whose unresolved resource is the DOMAIN reports —
+/// a domain lifecycle call, whose subject is the domain itself, and a call that works
+/// inside a domain (a listing, a poll, a registration or a start writing into it), which
+/// resolves the enclosing domain before anything in it.
+pub fn unknown_domain_message(name: &str) -> String {
+    format!("Unknown domain: {name}")
+}
+
 /// The `UnknownResourceFault` message for an ARN that names no stored domain of this
 /// service, shared by the three tag operations that address a domain by its ARN.
 ///
@@ -3389,7 +3422,7 @@ pub fn unknown_execution_message(workflow_id: &str, run_id: &str) -> String {
 /// asked for instead.
 pub fn unknown_domain_resource_message(resource_arn: &str) -> String {
     match domain_name_from_arn(resource_arn) {
-        Some(name) => format!("Unknown domain: {name}"),
+        Some(name) => unknown_domain_message(name),
         None => format!("Unknown resource: {resource_arn}"),
     }
 }
@@ -3555,11 +3588,17 @@ pub fn now() -> DateTime {
 ///
 /// `sequence` comes from [`Domain::next_run_sequence`], which is strictly increasing
 /// per domain, so `(domain, sequence)` is unique across the store and therefore so is
-/// this id — two starts in the same nanosecond still get different ones. The SHA-256
-/// hex digest is 64 characters, exactly the modelled `WorkflowRunId` maximum, and
+/// this id — two starts in the same nanosecond still get different ones. The digest
 /// makes the id opaque the way the real service's run ids are: a caller cannot derive
 /// it from its own request.
+///
+/// The 32 digest bytes are written in base64, the mixed-case alphanumeric-plus-`+/=`
+/// alphabet Amazon SWF's own run ids are written in, which is 44 characters — inside
+/// the modelled `WorkflowRunId` length (1..64) — and the same for every start, so one
+/// generator serves every run this service mints.
 pub fn new_run_id(domain: &str, workflow_id: &str, sequence: u64, at: DateTime) -> String {
+    use ::base64::Engine as _;
+
     let mut digest = Sha256::new();
     digest.update(domain.as_bytes());
     digest.update([0u8]);
@@ -3568,7 +3607,7 @@ pub fn new_run_id(domain: &str, workflow_id: &str, sequence: u64, at: DateTime) 
     digest.update(sequence.to_be_bytes());
     digest.update(at.secs().to_be_bytes());
     digest.update(at.subsec_nanos().to_be_bytes());
-    ::hex::encode(digest.finalize())
+    ::base64::engine::general_purpose::STANDARD.encode(digest.finalize())
 }
 
 /// The opaque `taskToken` a `DecisionTask` carries: a handle on ONE decision task of
@@ -3948,27 +3987,28 @@ pub fn execution_matches_filters(
 }
 
 /// Refuse a visibility request that names more than one of the mutually exclusive
-/// filters, listing the ones it named.
+/// filters, naming the ones it did supply.
 ///
 /// Every visibility operation documents the same rule on each of them:
 /// "executionFilter, typeFilter and tagFilter are mutually exclusive. You can specify
 /// at most one of these in a request." The model cannot express it, so the boundary
 /// validator passes it and the handler applies this.
+///
+/// The refusal names the conflicting filters by the SHAPE each input member targets
+/// (`WorkflowExecutionFilter`, `WorkflowTypeFilter`, `TagFilter`, `CloseStatusFilter`),
+/// as a bracketed list in the order the operation declares them, which is the
+/// machine-parsable list a caller reads the conflict out of. Each caller passes the
+/// shape names its own input members target.
 pub fn validate_exclusive_filters(filters: &[(&str, bool)]) -> Result<(), String> {
-    let named: Vec<&str> = filters
+    let supplied: Vec<&str> = filters
         .iter()
         .filter(|(_, given)| *given)
-        .map(|(member, _)| *member)
+        .map(|(shape, _)| *shape)
         .collect();
-    if named.len() > 1 {
+    if supplied.len() > 1 {
         return Err(format!(
-            "{} are mutually exclusive; specify at most one of them in a request, got {}",
-            filters
-                .iter()
-                .map(|(member, _)| *member)
-                .collect::<Vec<_>>()
-                .join(", "),
-            named.join(" and ")
+            "Cannot specify more than one exclusive filters in the same query: [{}]",
+            supplied.join(", ")
         ));
     }
     Ok(())

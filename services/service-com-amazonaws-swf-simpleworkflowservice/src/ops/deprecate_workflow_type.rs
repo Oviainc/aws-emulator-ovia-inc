@@ -180,10 +180,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         let mut guard = state.lock();
+        // A WRITE resolves the domain it writes into before the type inside it, so an
+        // absent domain is reported as the domain — the resource whose lookup failed —
+        // and only a request that reaches an existing domain reports the type.
+        let unknown_type = || {
+            DeprecateWorkflowTypeErrorModeled::UnknownResourceFault(UnknownResourceFault {
+                message: Some(crate::state::unknown_workflow_type_message(
+                    &input.workflow_type.name,
+                    &input.workflow_type.version,
+                )),
+            })
+        };
         let Some(domain) = guard.domains.get_mut(&input.domain) else {
             return Err(DeprecateWorkflowTypeErrorModeled::UnknownResourceFault(
                 UnknownResourceFault {
-                    message: Some(format!("Unknown domain: {}", input.domain)),
+                    message: Some(crate::state::unknown_domain_message(&input.domain)),
                 },
             )
             .into());
@@ -194,15 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             input.workflow_type.version.clone(),
         );
         let Some(workflow_type) = domain.workflow_types.get_mut(&key) else {
-            return Err(DeprecateWorkflowTypeErrorModeled::UnknownResourceFault(
-                UnknownResourceFault {
-                    message: Some(crate::state::unknown_workflow_type_message(
-                        &input.workflow_type.name,
-                        &input.workflow_type.version,
-                    )),
-                },
-            )
-            .into());
+            return Err(unknown_type().into());
         };
 
         // Deprecation is a one-way move off REGISTERED: a type that is already

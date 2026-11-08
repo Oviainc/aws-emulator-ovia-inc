@@ -43,5 +43,10 @@ pub struct DefaultUndefinedFault {
 #[derive(Debug, Clone, Default)]
 pub struct WorkflowExecutionAlreadyStartedFault {
     pub message: Option<String>,
+    /// The open run that holds the requested `workflowId`. The member was added to this
+    /// service's on-disk model from the recorded AWS responses — the shipped model
+    /// snapshot carries no such member on this shape, while AWS reports it on this fault
+    /// — and its value is the colliding execution found in this service's own state.
+    pub workflow_execution: Option<WorkflowExecution>,
 }
 

@@ -610,24 +610,28 @@ async fn a_triple_naming_no_stored_activity_type_is_an_unknown_resource() {
     register_domain(&emulator, other, other).await;
 
     // Every operation of this lifecycle resolves the triple the same way, so each one
-    // must refuse each way of missing identically.
+    // must refuse each way of missing identically — with one documented split: a WRITE
+    // resolves the domain it writes into before the type inside it, so it reports an
+    // ABSENT DOMAIN as the domain, while the READ resolves the type directly and reports
+    // the type it was asked for. The flag below is which of the two an operation is.
     let operations = [
-        "DeprecateActivityType",
-        "UndeprecateActivityType",
-        "DeleteActivityType",
-        "DescribeActivityType",
+        ("DeprecateActivityType", true),
+        ("UndeprecateActivityType", true),
+        ("DeleteActivityType", true),
+        ("DescribeActivityType", false),
     ];
 
     for case in &cases {
         let absent_name = absent_variant(&case.name, MAX_TYPE_NAME_LEN);
         let absent_version = absent_variant(&case.version, MAX_TYPE_VERSION_LEN);
+        let absent_domain = "no-such-domain";
         let missing = vec![
             (
                 "domain never registered",
-                "no-such-domain".to_string(),
+                absent_domain.to_string(),
                 case.name.clone(),
                 case.version.clone(),
-                "Unknown domain: no-such-domain".to_string(),
+                format!("Unknown type: {}", type_reference(&case.name, &case.version)),
             ),
             (
                 // The lookup is domain-scoped: the type exists, just not here.
@@ -660,8 +664,15 @@ async fn a_triple_naming_no_stored_activity_type_is_an_unknown_resource() {
         ];
 
         for (why, domain, name, version, expected_message) in missing {
-            for operation in operations {
+            for (operation, writes) in operations {
                 let label = format!("{} / {why} / {operation}", case.case);
+                // Only the absent-domain row differs between the two kinds: a write
+                // names the domain it could not resolve, a read names the type.
+                let expected = if writes && domain == absent_domain {
+                    format!("Unknown domain: {absent_domain}")
+                } else {
+                    expected_message.clone()
+                };
                 let (status, body) = emulator
                     .call(operation, &type_request(&domain, &name, &version))
                     .await;
@@ -677,7 +688,7 @@ async fn a_triple_naming_no_stored_activity_type_is_an_unknown_resource() {
                     .and_then(Value::as_str)
                     .unwrap_or_else(|| panic!("case {label:?}: expected a message, got {body:?}"));
                 assert_eq!(
-                    message, expected_message,
+                    message, expected,
                     "case {label:?}: the fault is built from the requested resource, \
                      got {message:?}"
                 );

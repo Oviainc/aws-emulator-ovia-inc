@@ -206,7 +206,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if !guard.domains.contains_key(&input.domain) {
                 return Err(PollForActivityTaskErrorModeled::UnknownResourceFault(
                     UnknownResourceFault {
-                        message: Some(format!("Unknown domain: {}", input.domain)),
+                        message: Some(crate::state::unknown_domain_message(&input.domain)),
                     },
                 )
                 .into());
@@ -276,7 +276,7 @@ fn answer_poll(
     let Some(domain) = guard.domains.get_mut(&input.domain) else {
         return Err(PollForActivityTaskErrorModeled::UnknownResourceFault(
             UnknownResourceFault {
-                message: Some(format!("Unknown domain: {}", input.domain)),
+                message: Some(crate::state::unknown_domain_message(&input.domain)),
             },
         )
         .into());

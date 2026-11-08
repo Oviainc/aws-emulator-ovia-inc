@@ -150,12 +150,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `executionStatus=CLOSED` with `closeStatus=TIMED_OUT` instead of staying OPEN
         // forever.
         guard.materialise_due_timeouts_in(&input.domain, swept_at);
-        // An `UnknownResourceFault` message names the resource the lookup failed on and
-        // nothing else: the domain when no domain is stored under that name, otherwise
-        // the requested execution, in the
-        // `WorkflowExecution=[workflowId=.., runId=..]` form every execution-scoped
-        // operation of this service uses. The domain the lookup was scoped to is never
-        // appended to that clause.
+        // An `UnknownResourceFault` message names the resource the REQUEST asked for.
+        // This operation addresses one execution, so the execution is what the fault
+        // names — in the `WorkflowExecution=[workflowId=.., runId=..]` form every
+        // execution-scoped operation of this service uses — whether the lookup missed
+        // because the domain holds no such run or because this service holds no such
+        // domain. The domain the lookup was scoped to is never part of that clause.
         let unknown_execution = || {
             DescribeWorkflowExecutionErrorModeled::UnknownResourceFault(UnknownResourceFault {
                 message: Some(crate::state::unknown_execution_message(
@@ -164,11 +164,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )),
             })
         };
-        let domain = guard.domains.get(&input.domain).ok_or_else(|| {
-            DescribeWorkflowExecutionErrorModeled::UnknownResourceFault(UnknownResourceFault {
-                message: Some(format!("Unknown domain: {}", input.domain)),
-            })
-        })?;
+        let domain = guard
+            .domains
+            .get(&input.domain)
+            .ok_or_else(unknown_execution)?;
         let execution = domain
             .executions
             .get(&(

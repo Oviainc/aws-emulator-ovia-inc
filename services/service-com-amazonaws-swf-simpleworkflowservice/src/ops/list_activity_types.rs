@@ -188,7 +188,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the types already registered there stay listable.
         let domain = guard.domains.get(&input.domain).ok_or_else(|| {
             ListActivityTypesErrorModeled::UnknownResourceFault(UnknownResourceFault {
-                message: Some(format!("Unknown domain: {}", input.domain)),
+                message: Some(crate::state::unknown_domain_message(&input.domain)),
             })
         })?;
 

@@ -250,7 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(domain) = guard.domains.get_mut(&input.domain) else {
             return Err(RegisterWorkflowTypeErrorModeled::UnknownResourceFault(
                 UnknownResourceFault {
-                    message: Some(format!("Unknown domain: {}", input.domain)),
+                    message: Some(crate::state::unknown_domain_message(&input.domain)),
                 },
             )
             .into());

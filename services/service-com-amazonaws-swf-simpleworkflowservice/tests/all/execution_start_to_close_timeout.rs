@@ -490,10 +490,10 @@ async fn a_budget_that_is_not_spent_yet_leaves_the_run_open() {
 }
 
 #[tokio::test]
-async fn the_already_started_fault_carries_an_empty_message() {
-    // The fault's code carries the whole meaning, so the envelope names no resource:
-    // one row per way the colliding start differs from the first, none of which may put
-    // the open run's identity into the message.
+async fn the_already_started_fault_carries_an_empty_message_and_the_open_run() {
+    // The fault's message is empty and its `workflowExecution` IDENTIFIES the run that
+    // holds the id: one row per way the colliding start differs from the first, none of
+    // which changes either.
     let variants: &[(&str, Option<&str>)] = &[
         ("the identical request", None),
         ("a different execution budget", Some("600")),
@@ -530,11 +530,10 @@ async fn the_already_started_fault_carries_an_empty_message() {
             message, "",
             "case {case:?}: the fault's message is empty, got {message:?}"
         );
-        assert!(
-            !serde_json::to_string(&refused)
-                .expect("the fault body serializes")
-                .contains(&run_id),
-            "case {case:?}: the envelope must not leak the open run's runId, \
+        assert_eq!(
+            refused.get("workflowExecution"),
+            Some(&json!({ "workflowId": "wf-1", "runId": run_id })),
+            "case {case:?}: the fault names the open run that holds the workflowId, \
              got {refused:?}"
         );
     }
