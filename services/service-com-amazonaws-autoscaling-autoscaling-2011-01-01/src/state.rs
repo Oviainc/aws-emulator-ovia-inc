@@ -215,6 +215,15 @@ pub const ACCOUNT_MAX_CALL_RATE_REFILL_RATE: f64 = 5.0;
 /// on the same footing as [`ACCOUNT_MAX_CALL_RATE_REFILL_RATE`].
 pub const ACCOUNT_MAX_CALL_RATE_BUCKET_SIZE: i32 = 30;
 
+/// The most target groups ONE call may name, which bounds both the legacy
+/// target-group attach and the legacy detach.
+///
+/// From the model's own documentation for
+/// `DetachLoadBalancerTargetGroupsType$TargetGroupARNs`: "You can specify up to 10
+/// target groups." The member carries no modelled length, so the bound is the
+/// service's own and is checked by the handler.
+pub const MAX_TARGET_GROUPS_PER_CALL: usize = 10;
+
 /// The most scaling activities this service retains; appending past it drops the
 /// oldest.
 ///
@@ -370,6 +379,13 @@ impl StoredGroup {
     /// How many instances this group must launch to reach `desired_capacity`.
     pub fn launches_needed(&self, desired_capacity: i32) -> i32 {
         (desired_capacity - self.active_instance_count()).max(0)
+    }
+
+    /// The target groups attached to this group, as the group itself holds them:
+    /// empty for a group that has none, so a caller never distinguishes "no
+    /// attachments" from an absent member.
+    pub fn attached_target_groups(&self) -> &[String] {
+        self.target_group_arns.as_deref().unwrap_or_default()
     }
 }
 
@@ -1548,6 +1564,30 @@ const ABSENT_GROUP_PREFIX: &str = "AutoScalingGroup name not found - ";
 /// punctuation included, is fixed text.
 pub fn absent_group_message(name: &str) -> String {
     format!("{ABSENT_GROUP_PREFIX}AutoScalingGroup {name} not found")
+}
+
+/// The message Amazon EC2 Auto Scaling refuses a legacy target-group detach that
+/// names a target group the group does not hold with, which names those target
+/// groups.
+///
+/// The refusal is for the request as a WHOLE: a call that mixes attached target
+/// groups with one that is not attached detaches none of them, so the message says
+/// what was wrong with the request rather than reporting a partial result.
+pub fn unattached_target_groups_message(arns: &[String]) -> String {
+    format!(
+        "Trying to remove Target Groups that are not part of the group: {}",
+        arns.join(", ")
+    )
+}
+
+/// The message a call naming more target groups than
+/// [`MAX_TARGET_GROUPS_PER_CALL`] is refused with, which quotes the bound the
+/// caller has to come back under.
+pub fn too_many_target_groups_message() -> String {
+    format!(
+        "Trying to update too many Target Groups at once. The limit is \
+         {MAX_TARGET_GROUPS_PER_CALL}"
+    )
 }
 
 /// The absent-group refusal whose detail QUOTES the name it was asked for.

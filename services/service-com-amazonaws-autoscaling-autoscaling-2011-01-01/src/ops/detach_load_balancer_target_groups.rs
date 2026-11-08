@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DetachLoadBalancerTargetGroups
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DetachLoadBalancerTargetGroups`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DetachLoadBalancerTargetGroups::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Detaches target groups from one Auto Scaling group, as a WHOLE: every ARN the
+//! request names must be attached to that group, and a request that names one that is
+//! not detaches none of them, so the group's attachments are either all the request
+//! asked for or exactly what they were.
+//!
+//! AWS reports a target group a detach removed as `Removing` through
+//! `DescribeLoadBalancerTargetGroups` while the group's instances deregister from it.
+//! That reader is still a scaffold stub, owned by its own issue, so this handler drops
+//! the attachment from the group's own `TargetGroupARNs` — the collection
+//! `DescribeAutoScalingGroups` reports — rather than storing a transient state no
+//! implemented operation could report.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +150,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DetachLoadBalancerTargetGroups` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DetachLoadBalancerTargetGroupsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DetachLoadBalancerTargetGroups"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DetachLoadBalancerTargetGroupsErrorModeled::ResourceContentionFault(
+                    ResourceContentionFault {
+                        message: Some(
+                            "the Auto Scaling store is not mounted on this engine".to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        let name = input.auto_scaling_group_name;
+        let requested = input.target_group_ar_ns;
+        // The member's own documented bound, which the model does not express as a
+        // length, so it is checked here rather than at the boundary.
+        if requested.len() > crate::state::MAX_TARGET_GROUPS_PER_CALL {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::too_many_target_groups_message(),
+            ));
+        }
+
+        let now = ::std::time::SystemTime::now();
+        let mut state = state.lock();
+        state.materialize_due(&*self.engine, now);
+
+        let Some(group) = state.groups.get_mut(&name) else {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::absent_group_message(&name),
+            ));
+        };
+
+        // Checked for EVERY named target group before any of them is removed: the
+        // request is one unit of work, so one ARN this group never held refuses the
+        // whole call and leaves the attachments it does hold in place.
+        let unattached: Vec<String> = requested
+            .iter()
+            .filter(|arn| !group.attached_target_groups().contains(arn))
+            .cloned()
+            .collect();
+        if !unattached.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::unattached_target_groups_message(&unattached),
+            ));
+        }
+
+        let remaining: Vec<String> = group
+            .attached_target_groups()
+            .iter()
+            .filter(|arn| !requested.contains(arn))
+            .cloned()
+            .collect();
+        group.target_group_arns = Some(remaining);
+
+        crate::state::audit(
+            ctx.parts(),
+            "DetachLoadBalancerTargetGroups",
+            &name,
+            "target groups detached",
+        );
+        Ok(DetachLoadBalancerTargetGroupsOutput {})
     }
 }
