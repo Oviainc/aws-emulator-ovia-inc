@@ -9,7 +9,10 @@
 //! A `ResourceArn` naming no resource this service holds is answered 404 through
 //! [`crate::state::tagging_not_found`], the same way `TagResource` answers it, and that
 //! member's `@pattern` is off the boundary (`skip_validation` on `UntagResourceInput`)
-//! for the same recorded reason.
+//! for the same recorded reason. One it holds for AMAZON WEB SERVICES rather than for
+//! this account is a resource that EXISTS and whose tags are not the caller's to remove,
+//! so it earns the modelled 403 instead
+//! ([`crate::state::is_aws_owned_taggable_resource`]).
 //!
 //! A `TagKeys` entry in the reserved `aws:` namespace is REFUSED with the modelled 400
 //! `ValidationException` and removes nothing: the tags under that prefix are Amazon Web
@@ -187,6 +190,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(addressed) = crate::state::parse_taggable_arn(&input.resource_arn) else {
             return Err(crate::state::tagging_not_found());
         };
+        // A resource Amazon Web Services owns is present without this account creating
+        // it, so the store holding no record of it is not non-existence: the call is
+        // refused for its OWNER rather than reported not-found, and it removes nothing.
+        if crate::state::is_aws_owned_taggable_resource(&addressed.arn) {
+            return Err(UntagResourceErrorModeled::AccessDeniedException(
+                crate::state::tagging_access_denied(),
+            )
+            .into());
+        }
         let Some(stored) = state.resource_tags_mut(&addressed.arn) else {
             return Err(crate::state::tagging_not_found());
         };

@@ -33,7 +33,6 @@ mod cloudformation_rollback_triggers_revert_the_operation;
 // service's span of the sorted list.
 #[path = "all/workspace_lockfile_covers_every_manifest.rs"]
 mod workspace_lockfile_covers_every_manifest;
-// Declared here, in this same head region, for the reason the entry above records: the
 // appended tail and the sorted `c…` span (where every cloudformation suite lands) are both
 // regions concurrently landing suites add their line to.
 #[path = "all/cloudformation_sfn_reference_starts_execution.rs"]
@@ -984,16 +983,12 @@ mod apigateway_proxy_lambda_ddb_pipeline;
 // verifies request signatures.
 #[path = "all/apigateway_iam_authenticated_invoke.rs"]
 mod apigateway_iam_authenticated_invoke;
-#[path = "all/cloudformation_rollback_triggers_revert_the_operation.rs"]
-mod cloudformation_rollback_triggers_revert_the_operation;
 #[path = "all/lambda_sqs_event_source_batching_window.rs"]
 mod lambda_sqs_event_source_batching_window;
 // Declared here, in the appended tail: what a DICOM import job leaves in its data store,
 // read from the objects Amazon S3 holds under the role IAM holds.
 #[path = "all/medical_imaging_dicom_import.rs"]
 mod medical_imaging_dicom_import;
-#[path = "all/cloudformation_wafv2_protection_stack.rs"]
-mod cloudformation_wafv2_protection_stack;
 // Declared here, in the appended tail: what REPEATED requests to one deployed stage are each
 // answered with, and the one stream record each new item they write carries.
 #[path = "all/apigateway_repeated_stage_requests.rs"]
@@ -1010,21 +1005,6 @@ mod cloudformation_provisions_codebuild_projects;
 mod ecr_push_triggers_its_pipeline;
 #[path = "all/codepipeline_build_action_invokes_codebuild.rs"]
 mod codepipeline_build_action_invokes_codebuild;
-// Declared here, in this same head region, for the reason the entry above records: this
-// suite holds the committed `Cargo.lock` to the workspace's manifests, so it belongs to no
-// service's span of the sorted list.
-#[path = "all/workspace_lockfile_covers_every_manifest.rs"]
-mod workspace_lockfile_covers_every_manifest;
-#[path = "all/cloudformation_sfn_reference_starts_execution.rs"]
-mod cloudformation_sfn_reference_starts_execution;
-// Declared here, in this same head region, for the reason the entries above record: the
-#[path = "all/cloudformation_lambda_ssm_sourced_update.rs"]
-mod cloudformation_lambda_ssm_sourced_update;
-#[path = "all/cognito_sms_caller_role_trust.rs"]
-mod cognito_sms_caller_role_trust;
-// Declared in this same head region, for the reason the note above records.
-#[path = "all/bedrock_agentcore_data_plane_parent_resources.rs"]
-mod bedrock_agentcore_data_plane_parent_resources;
 // Declared here, in this same head region, for the reason the entries above record: the
 #[path = "all/cloudformation_lambda_ssm_sourced_update.rs"]
 mod cloudformation_lambda_ssm_sourced_update;
@@ -1039,15 +1019,5 @@ mod cloudformation_imports_an_existing_queue;
 // delivers.
 #[path = "all/logs_subscription_filter_to_firehose_s3.rs"]
 mod logs_subscription_filter_to_firehose_s3;
-// Declared here, in the appended tail: what a DICOM import job leaves in its data store,
-// read from the objects Amazon S3 holds under the role IAM holds.
-#[path = "all/medical_imaging_dicom_import.rs"]
-mod medical_imaging_dicom_import;
-// Declared here, in the appended tail: what REPEATED requests to one deployed stage are each
-// answered with, and the one stream record each new item they write carries.
-#[path = "all/apigateway_repeated_stage_requests.rs"]
-mod apigateway_repeated_stage_requests;
 #[path = "all/zz_opensearch_fgac_probe.rs"]
 mod zz_opensearch_fgac_probe;
-#[path = "all/cloudformation_asset_bucket_publishing_role.rs"]
-mod cloudformation_asset_bucket_publishing_role;

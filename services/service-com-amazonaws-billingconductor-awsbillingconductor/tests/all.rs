@@ -29,6 +29,8 @@ mod association_delete_gate_spans_billing_periods;
 mod association_size_is_billing_period_scoped;
 #[path = "all/auto_associate_billing_group_cap.rs"]
 mod auto_associate_billing_group_cap;
+#[path = "all/aws_managed_pricing_plan_tagging.rs"]
+mod aws_managed_pricing_plan_tagging;
 #[path = "all/batch_disassociate_resources_from_custom_line_item.rs"]
 mod batch_disassociate_resources_from_custom_line_item;
 #[path = "all/batch_resource_association_closed_billing_period.rs"]

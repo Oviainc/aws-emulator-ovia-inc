@@ -9,7 +9,11 @@
 //! A `ResourceArn` naming no resource this service holds is answered 404 through
 //! [`crate::state::tagging_not_found`], the same way `TagResource` answers it, and that
 //! member's `@pattern` is off the boundary (`skip_validation` on
-//! `ListTagsForResourceInput`) for the same recorded reason.
+//! `ListTagsForResourceInput`) for the same recorded reason. One it holds for AMAZON WEB
+//! SERVICES rather than for this account is a resource that EXISTS, with tags that are
+//! not the caller's to read, so it earns the modelled 403 instead
+//! ([`crate::state::is_aws_owned_taggable_resource`]) — reporting it not-found would tell
+//! a client a resource of every account does not exist.
 //!
 //! This operation is NOT payer-account-gated
 //! (`crate::service::PAYER_UNGATED_OPERATIONS`). The response is BOUNDED by what the
@@ -157,6 +161,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The `ResourceArn` pattern is NOT refused by the boundary (see this module's
         // header), so the ARN is resolved here.
         let _ = ctx;
+        // A resource Amazon Web Services owns is present without this account creating
+        // it, so the store holding no record of it is not non-existence: the read is
+        // refused for its OWNER rather than reported not-found. Decided from the ARN
+        // alone, before the store is reached, exactly as the write halves decide it.
+        if crate::state::is_aws_owned_taggable_resource(&input.resource_arn) {
+            return Err(ListTagsForResourceErrorModeled::AccessDeniedException(
+                crate::state::tagging_access_denied(),
+            )
+            .into());
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(ListTagsForResourceErrorModeled::InternalServerException(
                 InternalServerException {

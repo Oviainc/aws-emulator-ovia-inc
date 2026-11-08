@@ -13,7 +13,10 @@
 //! is the recorded `NotFoundException` rather than the model's
 //! `ResourceNotFoundException`. The member's own `@pattern` is NOT enforced at the
 //! boundary (`skip_validation` on `TagResourceInput`) for the same recorded reason: AWS
-//! resolves the ARN and answers that 404 even for a value the pattern refuses.
+//! resolves the ARN and answers that 404 even for a value the pattern refuses. A
+//! resource this service holds for AMAZON WEB SERVICES rather than for this account
+//! exists without any create, and its tags are not the caller's to write, so it earns the
+//! modelled 403 instead ([`crate::state::is_aws_owned_taggable_resource`]).
 //!
 //! A `Tags` key in the reserved `aws:` namespace is REFUSED with the modelled 400
 //! `ValidationException` instead of stored, and the resource's tags are left exactly as
@@ -206,6 +209,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(addressed) = crate::state::parse_taggable_arn(&input.resource_arn) else {
             return Err(crate::state::tagging_not_found());
         };
+        // A resource Amazon Web Services owns is present without this account creating
+        // it, so the store holding no record of it is not non-existence: the call is
+        // refused for its OWNER rather than reported not-found, and it writes nothing.
+        if crate::state::is_aws_owned_taggable_resource(&addressed.arn) {
+            return Err(TagResourceErrorModeled::AccessDeniedException(
+                crate::state::tagging_access_denied(),
+            )
+            .into());
+        }
         let Some(stored) = state.resource_tags_mut(&addressed.arn) else {
             return Err(crate::state::tagging_not_found());
         };
