@@ -30,6 +30,11 @@
 //! HOLDS: they are served, keep their own status and name no error shape.
 //!
 //! Every assertion names its case and reports the value it saw.
+//!
+//! The fixture below (a pool that remembers devices, a signed-in user of it, and the
+//! device its sign-in minted) is `pub(crate)` so a sibling suite asserting the SAME rule
+//! over another part of this surface drives it through this one, rather than through a
+//! second copy.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -45,7 +50,7 @@ const GOOD_PASSWORD: &str = "Passw0rd!2024";
 /// A value submitted as an `AccessToken` that no sign-in of this emulator issued, in the
 /// form `TokenModelType`'s pattern demands (`^[A-Za-z0-9-_=.]+$`, from
 /// `smithy_query(query="operation",operation="GetUser")`).
-const UNISSUED_TOKEN: &str = "not.an.access.token";
+pub(crate) const UNISSUED_TOKEN: &str = "not.an.access.token";
 
 /// A terms-document id nothing created, in the form `TermsIdType`'s pattern demands (a
 /// version-4 UUID, from `smithy_query(query="operation",operation="DescribeTerms")`).
@@ -58,13 +63,13 @@ const UNMINTED_BRANDING: &str = "2ee7b8c3-7a2b-4a4d-9c0e-3d5f7a9b1c2e";
 
 /// A device key no sign-in minted, in the form `DeviceKeyType`'s pattern demands
 /// (`^[\w-]+_[0-9a-f-]+$`, from `smithy_query(query="operation",operation="AdminGetDevice")`).
-const UNMINTED_DEVICE: &str = "us-east-1_00000000-0000-4000-8000-000000000000";
+pub(crate) const UNMINTED_DEVICE: &str = "us-east-1_00000000-0000-4000-8000-000000000000";
 
 /// The device credentials a confirm REGISTERS: "a Secure Remote Password (SRP)
 /// value that your application generates when you register a user's device"
 /// (`smithy_query(query="shape",shape="DeviceSecretVerifierConfigType")`), which
 /// `ConfirmDevice` is served only with.
-fn device_credentials() -> Value {
+pub(crate) fn device_credentials() -> Value {
     json!({
         "PasswordVerifier": "ZGV2aWNlLXBhc3N3b3JkLXZlcmlmaWVy",
         "Salt": "ZGV2aWNlLXNhbHQ",
@@ -88,7 +93,10 @@ fn device_configuration() -> Value {
 
 /// A pool that remembers devices, with one app client that allows the password sign-in
 /// these tests drive: the minted pool id and app client id.
-async fn pool_with_client(router: &MultiServiceRouter, pool_name: &str) -> (String, String) {
+pub(crate) async fn pool_with_client(
+    router: &MultiServiceRouter,
+    pool_name: &str,
+) -> (String, String) {
     let created = ok(
         router,
         "CreateUserPool",
@@ -118,7 +126,7 @@ async fn pool_with_client(router: &MultiServiceRouter, pool_name: &str) -> (Stri
 
 /// Create `username` with a permanent password, so it is confirmed and can sign in, then
 /// sign it in and return the `AuthenticationResult` the sign-in issued.
-async fn signed_in(
+pub(crate) async fn signed_in(
     router: &MultiServiceRouter,
     user_pool_id: &str,
     client_id: &str,
@@ -155,7 +163,7 @@ async fn signed_in(
 }
 
 /// The access token a sign-in issued.
-fn access_token(authenticated: &Value) -> String {
+pub(crate) fn access_token(authenticated: &Value) -> String {
     authenticated["AccessToken"]
         .as_str()
         .unwrap_or_else(|| panic!("a sign-in issues an access token: {authenticated}"))
@@ -163,7 +171,7 @@ fn access_token(authenticated: &Value) -> String {
 }
 
 /// The device key a sign-in against a pool that remembers devices minted for it.
-fn device_key(authenticated: &Value) -> String {
+pub(crate) fn device_key(authenticated: &Value) -> String {
     authenticated["NewDeviceMetadata"]["DeviceKey"]
         .as_str()
         .unwrap_or_else(|| panic!("a sign-in mints a device key: {authenticated}"))

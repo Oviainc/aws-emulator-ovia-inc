@@ -85,6 +85,8 @@ mod delete_user_pool_domain;
 mod delete_web_authn_credential;
 #[path = "all/describe_terms_by_client.rs"]
 mod describe_terms_by_client;
+#[path = "all/device_refusal_wire.rs"]
+mod device_refusal_wire;
 #[path = "all/device_remembering.rs"]
 mod device_remembering;
 #[path = "all/domain_lookup_and_condition_messages.rs"]
