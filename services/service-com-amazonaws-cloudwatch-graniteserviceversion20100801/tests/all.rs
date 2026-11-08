@@ -69,6 +69,8 @@ mod composite_alarms;
 mod composite_rule_child_datapoints;
 #[path = "all/composite_rule_over_published_children.rs"]
 mod composite_rule_over_published_children;
+#[path = "all/dashboard_body_byte_fidelity.rs"]
+mod dashboard_body_byte_fidelity;
 #[path = "all/dashboard_body_validation.rs"]
 mod dashboard_body_validation;
 #[path = "all/dashboards.rs"]

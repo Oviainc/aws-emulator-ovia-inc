@@ -40,3 +40,29 @@ Replay (simparity-wire-aws-v1), 3 clusters.
 2. PutDashboard a body with no whitespace between tokens, then GetDashboard it (cloudwatch-dashboard-create-update-and-invalid-body#task#2) and byte-compare DashboardBody against what was submitted.
 3. ListDashboards (same fixture, task#3) and compare DashboardEntries[0].Size with the byte length of the submitted body.
 4. Repeat the ListDashboards check on monitoring-dashboard-put-get-delete-lifecycle#task#3.
+
+## Disposition
+
+Closed with every cause DECLINED: the emulator already implements the requirement this report
+states, and the recorded numbers count bytes the replay never submits to it.
+
+* The dashboard document is stored and reported as the exact text the request carried
+  (`PutDashboard` stores `DashboardBody` verbatim, `GetDashboard` returns it unchanged), and
+  `DashboardEntry$Size` is the byte length of that stored text
+  (`src/ops/list_dashboards.rs`). Both are pinned by `tests/all/opaque_document_fidelity.rs`
+  and `tests/all/dashboard_body_byte_fidelity.rs`.
+* Cause 1 is not a defect: the separator-spaced text the report calls a "re-serialized form"
+  is the text the recorded `PutDashboard` request carries and the emulator holds; the compact
+  string it calls "expected" is the corpus's minified rendering of the recorded response (the
+  replay grader compares `DashboardBody` as JSON, not as text). The key for it replays clean.
+* Causes 2 and 3 cannot be derived: the recorded `Size` exceeds the document the replayed
+  request carries by a constant within a fixture family and a different amount between
+  families (24 bytes for the three families of one generator; another value for the
+  tags/not-found fixture, whose 106-byte document with one tag matches neither the document's
+  bytes, nor those plus 24, nor those plus the tag's text, JSON member, key/value map,
+  modelled `{Key,Value}` object, `TagList` array or a flat per-tag cost — each tried by
+  replay). An excess independent of the document, its length, the dashboard's name and its
+  tags is not a function of the request or of stored state, so reproducing it would mean
+  writing a recorded number into the handler.
+* Consequence: those replay units still diverge on `$.DashboardEntries[*].Size` only, by the
+  byte counts above. Nothing else in them diverges.
