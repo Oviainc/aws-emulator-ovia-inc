@@ -4,6 +4,12 @@
 //! `CreateNotebookInstance` writes, the statuses and clock spans it moves through, and
 //! the presigned-URL reading its console sign-in needs.
 //!
+//! A notebook instance is accepted before SageMaker resolves the role it would run as, so
+//! the answer about that role travels on the INSTANCE: the create records it
+//! ([`NotebookInstance::creation_failure_reason`]) and the clock reveals it as the modelled
+//! `Failed` status with the `FailureReason` naming the role, the way a custom image's
+//! `CREATE_FAILED` works.
+//!
 //! Moved out of [`super`] unchanged, so the parent module stays inside the project's
 //! file-length limit. Every name is re-exported from [`super`], so a handler keeps
 //! naming `crate::state::…`.
@@ -25,6 +31,16 @@ pub const NOTEBOOK_INSTANCE_QUOTA: usize = 1_000;
 /// reach; `InService` is spelled the same as an endpoint's, so [`STATUS_IN_SERVICE`]
 /// stands for both.
 pub const NOTEBOOK_INSTANCE_STATUS_PENDING: &str = "Pending";
+
+/// The `NotebookInstanceStatus` an instance whose provisioning could not be completed
+/// settles into, from the modelled `NotebookInstanceStatus` enum
+/// (`smithy_query shape=NotebookInstanceStatus`).
+///
+/// A notebook instance is accepted before SageMaker finds out whether it can assume the role
+/// the request named, so the answer travels on the INSTANCE — this status and the
+/// `FailureReason` naming the role — rather than as a refusal of the create (see
+/// [`NotebookInstance::creation_failure_reason`]).
+pub const NOTEBOOK_INSTANCE_STATUS_FAILED: &str = "Failed";
 
 /// The `NotebookInstanceStatus` an instance carries while `StopNotebookInstance` is
 /// terminating its ML compute instance, from the modelled `NotebookInstanceStatus` enum
@@ -144,10 +160,15 @@ pub struct NotebookInstance {
     pub name: String,
     pub arn: String,
     pub status: String,
-    /// Why the instance failed, for the `Failed` status. No implemented operation moves
-    /// an instance there yet (the start and update operations are still stubs), so
-    /// it is stored `None` and reported absent.
+    /// Why the instance failed, for the `Failed` status: `None` until a transition the
+    /// clock owes puts the instance there ([`NotebookInstance::settle_status`]).
     pub failure_reason: Option<String>,
+    /// Why this instance's provisioning cannot complete, resolved at create time and
+    /// revealed by the clock: the instance settles into
+    /// [`NOTEBOOK_INSTANCE_STATUS_FAILED`] carrying this as its `FailureReason` instead of
+    /// reaching `InService`. `None` for a create nothing was answered against, which is
+    /// the one that comes up.
+    pub creation_failure_reason: Option<String>,
     /// The Jupyter host the instance serves on, minted at create from the name and the
     /// signed region (see [`notebook_instance_url`]).
     pub url: String,
@@ -200,8 +221,16 @@ impl NotebookInstance {
     /// Answers whether the transition happened on this call, so the caller can record it.
     pub fn settle_status(&mut self, now: SystemTime) -> bool {
         if self.status == NOTEBOOK_INSTANCE_STATUS_PENDING && now >= self.in_service_at {
-            self.status = STATUS_IN_SERVICE.to_string();
             self.last_modified_time = self.in_service_at;
+            // What the create resolved against the instance decides WHICH status the clock
+            // owed: an instance whose provisioning could not complete fails with the reason
+            // that create recorded, and never comes up.
+            if let Some(reason) = self.creation_failure_reason.clone() {
+                self.status = NOTEBOOK_INSTANCE_STATUS_FAILED.to_string();
+                self.failure_reason = Some(reason);
+                return true;
+            }
+            self.status = STATUS_IN_SERVICE.to_string();
             self.provisioned = true;
             return true;
         }

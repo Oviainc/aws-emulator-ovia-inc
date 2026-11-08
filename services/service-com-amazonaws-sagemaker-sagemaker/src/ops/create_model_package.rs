@@ -8,6 +8,11 @@
 //! and refusing a name already in use. This is the ONLY file to touch for this
 //! operation.
 //!
+//! Two refusals this operation settles before anything is registered: a container image path
+//! outside the two formats the member documents (see [`crate::state::container_image`]), and
+//! a `ClientToken` this account has already SPENT on another request or on a registration
+//! that is gone — neither of which has a first answer to replay.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -272,6 +277,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let now = ::std::time::SystemTime::now();
 
+        // Every container of the package is PULLED from the image path it names, and the
+        // recorded registration refuses a path that is not one of the two formats the member
+        // documents ("SageMaker supports both registry/repository[:tag] and
+        // registry/repository[@digest] image path formats"): a value that is no reference at
+        // all, or one naming no registry, names nothing to pull, so the registration is
+        // refused for it before anything is stored (see `crate::state::container_image`).
+        // What registry HOLDS the image is not part of admission.
+        if crate::state::first_image_outside_the_documented_formats(container_images(&input))
+            .is_some()
+        {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::INVALID_IMAGE_PATH,
+            ));
+        }
+
         // The identity the request asks for, before any of it is registered: an
         // unversioned package is identified by its own name and no group, a version by
         // the group it joins (named here, per `ArnOrName`, by name or by group ARN).
@@ -285,17 +305,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
 
-        // A retry that presents the same idempotency token answers the first call's ARN:
-        // `ClientToken` "guarantees that the call to this API is idempotent", so a replay
-        // registers neither a second package nor a second version. The replay is scoped
-        // to the identity this request asks for, so a token reused for a different
-        // package is a fresh call rather than an unrelated package's ARN.
-        if let Some(package) = input.client_token.as_deref().and_then(|token| {
-            store.model_package_for_client_token(token, &target_name, target_group.as_deref())
-        }) {
-            return Ok(CreateModelPackageOutput {
-                model_package_arn: package.arn.clone(),
-            });
+        // `ClientToken` is this operation's idempotency token, and the recorded service
+        // SPENDS it: a retry presenting a token this account has already registered a model
+        // package with registers nothing — neither a second package nor a second version —
+        // and is refused with the modelled conflict naming the package that token minted.
+        // The record outlives the package, so a retry is refused after the registration has
+        // been deleted too. It is scoped to the identity the request asks for, so a token
+        // reused for a DIFFERENT package is a fresh call rather than a refusal about an
+        // unrelated one.
+        if input
+            .client_token
+            .as_deref()
+            .and_then(|token| {
+                store.model_package_registered_with_client_token(
+                    token,
+                    &target_name,
+                    target_group.as_deref(),
+                )
+            })
+            .is_some()
+        {
+            return Err(CreateModelPackageErrorModeled::ConflictException(ConflictException {
+                message: Some(spent_client_token(&client_token_identity(
+                    target_group.is_some(),
+                    &target_name,
+                ))),
+            })
+            .into());
         }
 
         // The store is bounded, so a caller varying names or registering versions cannot
@@ -390,6 +426,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             None => None,
         };
 
+        // The token is SPENT by this registration, recorded beside the packages so a retry
+        // presenting it replays this answer even once the package is deleted.
+        store.remember_model_package_client_token(
+            input.client_token.as_deref(),
+            &key,
+            &name,
+            group_name.as_deref(),
+            &arn,
+        );
         store.model_packages.insert(
             key,
             crate::state::ModelPackage {
@@ -449,5 +494,67 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(CreateModelPackageOutput {
             model_package_arn: arn,
         })
+    }
+}
+
+/// Every container image path this registration names, in the order the request carries
+/// them: the inference specification's containers first, then each additional inference
+/// specification's.
+///
+/// A container that names no image names no path to settle, which is why the member is read
+/// as an option rather than as a value.
+fn container_images(input: &CreateModelPackageInput) -> Vec<&str> {
+    input
+        .inference_specification
+        .iter()
+        .flat_map(|specification| specification.containers.iter())
+        .chain(
+            input
+                .additional_inference_specifications
+                .iter()
+                .flatten()
+                .flat_map(|specification| specification.containers.iter()),
+        )
+        .filter_map(|container| container.image.as_deref())
+        .collect()
+}
+
+/// How this operation words a retry presenting an idempotency token this account has already
+/// SPENT: the IDENTITY the registration that spent it was made under — the model package
+/// group a version joined, or the name an unversioned package was registered under — in the
+/// clause recorded SageMaker states it in, and the window the token stays spent for.
+///
+/// A spent token registers nothing a second time, so the retry cannot be served: the modelled
+/// `ConflictException` (HTTP 400) is the conflict between the token the request carries and
+/// the registration it already stands for. The window is SageMaker's own published one for an
+/// idempotency token — "This token is valid for 8 hours. If you retry the request with the
+/// same client token within this timeframe and the same parameters" (`ClientToken`'s doc on
+/// the operations that document the timeframe) — so the sentence tells the caller when the
+/// token frees up again. It carries nothing else: not the token, which the caller sent, and
+/// not the ARN, which the refused call does not report.
+///
+/// The sentence is the recorded one, so it states the "different request parameters" clause
+/// whichever retry presented the token: the registry SPENDS a token on the registration it
+/// made, and what the emulator records about that registration is its identity rather than a
+/// copy of the request, so it cannot — and does not need to — tell a byte-identical retry
+/// from an altered one to answer it.
+fn spent_client_token(identity: &str) -> String {
+    format!(
+        "Specified idempotent client token in Model package with {identity} was used with \
+         different request parameters in the last {CLIENT_TOKEN_WINDOW_HOURS} hours."
+    )
+}
+
+/// How long a `ClientToken` this operation has spent stays spent, in hours: SageMaker's own
+/// published idempotency window ("This token is valid for 8 hours", `ClientToken`'s doc).
+const CLIENT_TOKEN_WINDOW_HOURS: u32 = 8;
+
+/// The clause [`spent_client_token`] names a registration's identity with: the model package
+/// GROUP a version joined, or the NAME an unversioned package was registered under.
+fn client_token_identity(versioned: bool, target_name: &str) -> String {
+    if versioned {
+        format!("Group:{target_name}")
+    } else {
+        format!("Name:{target_name}")
     }
 }

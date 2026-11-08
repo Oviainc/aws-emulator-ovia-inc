@@ -6,6 +6,13 @@
 //! ARN, its Jupyter URL and its network-interface id. This is the ONLY file to touch for
 //! this operation.
 //!
+//! The instance RUNS AS the `RoleArn` the request names: a role this account's IAM HOLDS and
+//! whose trust document does not admit SageMaker is refused with 400 `ValidationException`
+//! and nothing is stored, while a role IAM holds nothing under is ACCEPTED and the
+//! provisioning fails on the instance — the clock settles it into the modelled `Failed`
+//! status with the `FailureReason` naming the role, never `InService` (see
+//! [`crate::state::notebook_instance`]).
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -247,12 +254,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The instance RUNS AS the role the request names ("SageMaker AI assumes this role
         // to perform tasks on your behalf"), so the role is settled before anything is
         // stored and before the store is locked: only what the emulator's OWN IAM ANSWERED
-        // is refused (see `crate::state::admission`).
-        if crate::state::execution_role_is_unassumable(ctx, &region, &input.role_arn).await {
+        // is refused (see `crate::state::admission`). A role IAM HOLDS whose trust document
+        // does not admit SageMaker is refused here; a role IAM holds nothing under is
+        // ACCEPTED, which is what the recorded service does — the provisioning then fails on
+        // the instance itself, as the failure reason resolved below.
+        if crate::state::admission::held_execution_role_is_unassumable(ctx, &region, &input.role_arn)
+            .await
+        {
             return Err(crate::scaffolded::Scaffolded::validation(
                 crate::state::could_not_assume_role(&input.role_arn),
             ));
         }
+        // Why this instance will never come up, for an accepted create whose role SageMaker
+        // cannot assume after all: the reason travels on the instance, as the `Failed` status
+        // and the `FailureReason` the clock owes it (see `crate::state::notebook_instance`).
+        let creation_failure_reason =
+            crate::state::execution_role_is_unassumable(ctx, &region, &input.role_arn)
+                .await
+                .then(|| crate::state::admission::unable_to_assume_role_with_arn(&input.role_arn));
         let arn = crate::state::resource_arn(
             &region,
             crate::state::NOTEBOOK_INSTANCE_ARN_KIND,
@@ -310,6 +329,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // `InService`, which the reader materialises once it comes due.
                 status: crate::state::NOTEBOOK_INSTANCE_STATUS_PENDING.to_string(),
                 failure_reason: None,
+                creation_failure_reason,
                 url: crate::state::notebook_instance_url(&region, &input.notebook_instance_name),
                 instance_type: input.instance_type.clone(),
                 ip_address_type: input

@@ -50,6 +50,10 @@ use std::sync::Arc;
 // handlers that enforce a constraint the model cannot express.
 pub(crate) mod validation;
 
+/// Whether IAM lets a request perform the action it names, which the ML Lineage reads decide
+/// before they report anything ([`authorization::authorize`]).
+pub mod authorization;
+
 /// This service's own Smithy shape id, whose LOCAL name (`SageMaker`) is what an
 /// awsJson1_1 request names its target service by
 /// (`X-Amz-Target: SageMaker.<Operation>`).

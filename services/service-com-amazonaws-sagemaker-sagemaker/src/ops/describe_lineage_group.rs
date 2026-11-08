@@ -156,6 +156,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // is half the identity: a group an entity materialised in another Region is not
         // this caller's, and is reported absent.
         let region = crate::state::request_region(ctx);
+        // WHO is asking is settled before the store is read: a principal IAM does not allow
+        // to perform this action is told that and nothing about the group (see
+        // `crate::service::authorization`), judged against the ARN the requested name
+        // resolves to in the Region the caller signed for.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::resource_arn(&region, "lineage-group", &input.lineage_group_name),
+        )
+        .map_err(crate::scaffolded::Scaffolded::access_denied)?;
         let store = state.lock();
         let Some(group) = store.lineage_group(&region, &input.lineage_group_name) else {
             // Never a 200 with empty members: a caller cannot tell that from a lineage

@@ -120,22 +120,9 @@ pub const MODEL_ARCHIVE_OBJECT: &str = "model.tar.gz";
 /// the run reads it.
 const MANIFEST_FILE: &str = "ManifestFile";
 
-/// The IAM action reading one training object is authorized under: "you must have permission
-/// to perform the `s3:GetObject` action" (`GetObject`'s own documentation).
-const GET_OBJECT_ACTION: &str = "s3:GetObject";
-
-/// The IAM action writing the model artifact is authorized under: "you must have the
-/// `s3:PutObject` permission" (`PutObject`'s own documentation).
-const PUT_OBJECT_ACTION: &str = "s3:PutObject";
-
-/// The IAM action listing a channel's location is authorized under: "you must have
-/// permission to perform the `s3:ListBucket` action" (`ListObjectsV2`'s own documentation).
-/// It is granted on the BUCKET rather than on an object, which is what the refusal names.
-const LIST_BUCKET_ACTION: &str = "s3:ListBucket";
-
-/// The partition an Amazon S3 object ARN carries when the execution role's own ARN names
-/// none this emulator can read.
-const DEFAULT_PARTITION: &str = "aws";
+// The IAM actions an Amazon S3 read or write is authorized under, the partition an Amazon S3
+// ARN carries and the location an `s3://` URI names are this service's ONE reading of an
+// Amazon S3 location ([`super::s3_access`]), reached here through `use super::*`.
 
 /// What a training job's run produced, recorded when the run reported and revealed by the
 /// clock ([`super::TrainingJob::settle_status`]).
@@ -293,46 +280,9 @@ impl LinearModel {
     }
 }
 
-/// An `s3://bucket/key` URI split into its parts.
-///
-/// The modelled `S3Uri` pattern (`^(https|s3)://([^/]+)/?(.*)$`) is enforced before a handler
-/// runs, so a value reaching here carries a bucket; `None` for one this reading cannot take a
-/// bucket off.
-#[derive(Debug, Clone)]
-struct S3Location {
-    bucket: String,
-    key: String,
-}
-
-impl S3Location {
-    /// The location `uri` names, or `None` for a value that names no `s3://` bucket.
-    fn parse(uri: &str) -> Option<Self> {
-        let rest = uri.strip_prefix("s3://")?;
-        let (bucket, key) = rest.split_once('/').unwrap_or((rest, ""));
-        (!bucket.is_empty()).then(|| Self {
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-        })
-    }
-
-    /// This location's URI, as the caller wrote one.
-    fn uri(&self) -> String {
-        format!("s3://{}/{}", self.bucket, self.key)
-    }
-
-    /// The ARN of the object this location names, which is the resource an Amazon S3 action
-    /// on it is authorized against (`arn:<partition>:s3:::<bucket>/<key>` — an Amazon S3
-    /// object ARN carries no Region and no account).
-    fn object_arn(&self, partition: &str) -> String {
-        format!("arn:{partition}:s3:::{}/{}", self.bucket, self.key)
-    }
-
-    /// The ARN of the BUCKET this location is in, which is the resource a listing of it is
-    /// authorized against (`arn:<partition>:s3:::<bucket>`).
-    fn bucket_arn(&self, partition: &str) -> String {
-        format!("arn:{partition}:s3:::{}", self.bucket)
-    }
-}
+// The location an `s3://` URI names — `S3Location`, with its `uri`, `object_arn` and
+// `bucket_arn` readings — lives in [`super::s3_access`], the one place this service reads an
+// Amazon S3 location, and is reached here through `use super::*`.
 
 /// How many epochs a dataset of `records` rows and `columns` features is fitted for: as many
 /// as [`MAX_FIT_OPERATIONS`] admits, never more than [`MAX_EPOCHS`] and never none.
@@ -366,9 +316,7 @@ pub async fn absent_input_objects(
     region: &str,
     request: &CreateTrainingJobInput,
 ) -> Option<String> {
-    let partition = ::service_common::arn::parse(&request.role_arn)
-        .map_or(DEFAULT_PARTITION, |role| role.partition)
-        .to_string();
+    let partition = arn_partition(&request.role_arn);
     let client = s3_client(ctx, region);
     for channel in request.input_data_config.iter().flatten() {
         let Some(source) = channel.data_source.s3_data_source.as_ref() else {
@@ -429,9 +377,7 @@ pub async fn run_training_job(
             "the output location names no Amazon S3 bucket",
         ));
     };
-    let partition = ::service_common::arn::parse(&request.role_arn)
-        .map_or(DEFAULT_PARTITION, |role| role.partition)
-        .to_string();
+    let partition = arn_partition(&request.role_arn);
     let client = s3_client(ctx, region);
 
     let mut remaining_bytes = MAX_RUN_INPUT_BYTES;
@@ -1011,35 +957,9 @@ fn model_archive(document: &::serde_json::Value) -> ::std::io::Result<Vec<u8>> {
     encoder.finish()
 }
 
-/// An Amazon S3 client over the in-process callback into this same emulator.
-///
-/// The callback is the framework's seam for calling another emulated service: it routes in
-/// process, so the `endpoint_url` below is an ADDRESS the in-process router reads rather than
-/// a host any resolver looks up, no socket is opened and this client reaches the emulator's
-/// own Amazon S3 and nothing else. There is nothing to retry, time out or watch for a stalled
-/// stream, each of which would need a sleep implementation this client is not given; the same
-/// goes for caching the identity.
-fn s3_client(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    region: &str,
-) -> ::aws_sdk_s3::Client {
-    let region = ::service_common::arn::region_label(region).unwrap_or(DEFAULT_REGION);
-    let config = ::aws_sdk_s3::Config::builder()
-        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
-        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
-        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
-        // The emulator serves one endpoint for every service, so the bucket travels in the
-        // path rather than in a per-bucket host the router could not resolve.
-        .force_path_style(true)
-        .credentials_provider(ctx.callback().aws_credentials_provider())
-        .http_client(ctx.callback().http_client())
-        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
-        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
-        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
-        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
-        .build();
-    ::aws_sdk_s3::Client::from_conf(config)
-}
+// An Amazon S3 client over the in-process callback into this same emulator lives in
+// `super::s3_access`, the one place this service builds one, and is reached here through
+// `use super::*`.
 
 #[cfg(test)]
 mod tests {

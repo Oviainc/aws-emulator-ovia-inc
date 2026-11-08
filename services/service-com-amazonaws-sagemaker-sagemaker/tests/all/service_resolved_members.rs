@@ -136,6 +136,11 @@ fn training_specification(image: &str, channels: usize, state_required: Option<b
 }
 
 /// An `InferenceSpecification` whose containers are `images`.
+///
+/// A model package's container image has to be one of the two formats its member documents
+/// (`registry/repository[:tag]` / `registry/repository[@digest]`), so the rows below name a
+/// repository behind this account's own Amazon ECR registry; the registry holds none of
+/// them, which registration does not ask about.
 fn inference_specification(images: &[&str]) -> Value {
     let containers: Vec<Value> = images
         .iter()
@@ -526,42 +531,49 @@ async fn model_package_reads_report_the_members_the_registry_supplies() {
         PackageRow {
             case: "versioned-defaults",
             versioned: true,
-            images: &["inference:1"],
+            images: &["000000000000.dkr.ecr.us-east-1.amazonaws.com/inference:1"],
             certify: None,
             registration: None,
         },
         PackageRow {
             case: "versioned-certified",
             versioned: true,
-            images: &["inference:1"],
+            images: &["000000000000.dkr.ecr.us-east-1.amazonaws.com/inference:1"],
             certify: Some(true),
             registration: None,
         },
         PackageRow {
             case: "versioned-two-containers",
             versioned: true,
-            images: &["inference:1", "inference:2"],
+            images: &[
+                "000000000000.dkr.ecr.us-east-1.amazonaws.com/inference:1",
+                "000000000000.dkr.ecr.us-east-1.amazonaws.com/inference:2",
+            ],
             certify: Some(false),
             registration: None,
         },
         PackageRow {
             case: "versioned-logged",
             versioned: true,
-            images: &["inference:1"],
+            images: &["000000000000.dkr.ecr.us-east-1.amazonaws.com/inference:1"],
             certify: None,
             registration: Some("Logged"),
         },
         PackageRow {
             case: "unversioned-defaults",
             versioned: false,
-            images: &["inference:9"],
+            images: &["000000000000.dkr.ecr.us-east-1.amazonaws.com/inference:9"],
             certify: None,
             registration: None,
         },
         PackageRow {
             case: "unversioned-three-containers",
             versioned: false,
-            images: &["a:1", "b:2", "c:3"],
+            images: &[
+                "000000000000.dkr.ecr.us-east-1.amazonaws.com/a:1",
+                "000000000000.dkr.ecr.us-east-1.amazonaws.com/b:2",
+                "000000000000.dkr.ecr.us-east-1.amazonaws.com/c:3",
+            ],
             certify: None,
             registration: Some("Registered"),
         },
@@ -653,7 +665,9 @@ async fn batch_describe_summarises_a_version_registered_from_a_source_algorithm(
                     &json!({
                         "AlgorithmName": algorithm,
                         "TrainingSpecification": training_specification("trainer:1", 1, None),
-                        "InferenceSpecification": inference_specification(&["inference:7"]),
+                        "InferenceSpecification": inference_specification(
+                            &["000000000000.dkr.ecr.us-east-1.amazonaws.com/inference:7"],
+                        ),
                     }),
                 )
                 .await;
@@ -663,7 +677,9 @@ async fn batch_describe_summarises_a_version_registered_from_a_source_algorithm(
             "ModelPackageDescription": "описание — a non-ASCII description",
         });
         if own_containers {
-            body["InferenceSpecification"] = inference_specification(&["inference:1"]);
+            body["InferenceSpecification"] = inference_specification(
+                &["000000000000.dkr.ecr.us-east-1.amazonaws.com/inference:1"],
+            );
         } else {
             body["SourceAlgorithmSpecification"] = json!({
                 "SourceAlgorithms": [{
@@ -729,9 +745,9 @@ async fn batch_describe_summarises_a_version_registered_from_a_source_algorithm(
         // so the batch read reports the package with an empty container list rather than
         // withholding the whole summary over containers nothing declared.
         let expected_images: Vec<&str> = if own_containers {
-            vec!["inference:1"]
+            vec!["000000000000.dkr.ecr.us-east-1.amazonaws.com/inference:1"]
         } else if register_algorithm {
-            vec!["inference:7"]
+            vec!["000000000000.dkr.ecr.us-east-1.amazonaws.com/inference:7"]
         } else {
             Vec::new()
         };

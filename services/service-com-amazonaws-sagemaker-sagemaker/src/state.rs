@@ -130,8 +130,27 @@ pub use job_config_schema::{
 /// Re-exported below, so a handler names them as `crate::state::…` like every other slice.
 pub mod admission;
 pub use admission::{
-    could_not_assume_role, execution_role_is_unassumable, no_s3_objects_found,
-    vpc_placement_refusal, SECURITY_GROUPS_NOT_SPECIFIED, SERVICE_PRINCIPAL,
+    could_not_access_model_data, could_not_assume_role, could_not_find_model_data,
+    execution_role_is_unassumable, no_s3_objects_found, vpc_placement_refusal,
+    SECURITY_GROUPS_NOT_SPECIFIED, SERVICE_PRINCIPAL,
+};
+
+/// The Amazon S3 ACCESS slice: the one reading of an Amazon S3 location a request names and
+/// the one question a create asks about it — can the execution role read what it names?
+/// Re-exported below, so a handler names them as `crate::state::…` like every other slice.
+pub mod s3_access;
+pub use s3_access::{
+    arn_partition, first_unreadable_location, s3_client, S3Location, UnreadableLocation,
+    DEFAULT_PARTITION, GET_OBJECT_ACTION, LIST_BUCKET_ACTION, PUT_OBJECT_ACTION,
+};
+
+/// The CONTAINER IMAGE slice: the one reading of a container image path a request names, and
+/// the sentence a path that is no reference at all is refused with. Re-exported below, so a
+/// handler names them as `crate::state::…` like every other slice.
+pub mod container_image;
+pub use container_image::{
+    first_image_outside_the_documented_formats, first_malformed_container_image,
+    image_names_no_registry, malformed_container_image, INVALID_IMAGE_PATH,
 };
 
 /// The cluster-policy slice of this state: HyperPod clusters and the cluster policies
@@ -900,6 +919,16 @@ pub const MODEL_PACKAGE_REGISTRATION_TYPE_REGISTERED: &str = "Registered";
 /// loop cannot grow the store without end. It is the emulator's own bound, not an AWS
 /// one: real SageMaker's deduplication window is not published.
 pub const MODEL_PACKAGE_UPDATE_TOKEN_HISTORY: usize = 64;
+
+/// How many `CreateModelPackage` idempotency tokens this account remembers.
+///
+/// A spent token has to outlive the package it registered (see
+/// [`ComAmazonawsSagemakerSagemakerState::model_package_client_tokens`]), so the record
+/// cannot be bounded by the package store and is bounded here instead: a caller registering
+/// package after package drops the oldest token rather than growing the store without end.
+/// The emulator's own bound, not an AWS one: real SageMaker's deduplication window is not
+/// published.
+pub const MODEL_PACKAGE_CLIENT_TOKEN_HISTORY: usize = 256;
 
 /// The largest number of additional inference specifications one model package may hold:
 /// "Total number of additional Inference Specifications can not exceed 15"
@@ -2492,6 +2521,38 @@ pub struct ComAmazonawsSagemakerSagemakerState {
     /// `DeleteAssociation` address one by. See [`Association`], at the end of this module
     /// with the rest of the lineage-association slice.
     pub associations: BTreeMap<(String, String), Association>,
+    /// Every `CreateModelPackage` idempotency token this account has SPENT, oldest first:
+    /// which identity it registered and the ARN it minted.
+    ///
+    /// Kept beside the packages rather than on them, because the question a retry asks
+    /// outlives the record: a token already spent registers nothing a second time, even once
+    /// the package it registered has been deleted, so a retry presenting it is refused
+    /// ([`Self::model_package_registered_with_client_token`]). Bounded by
+    /// [`MODEL_PACKAGE_CLIENT_TOKEN_HISTORY`], so a caller registering package after
+    /// package cannot grow the store without end.
+    pub model_package_client_tokens: Vec<SpentModelPackageToken>,
+}
+
+/// One `CreateModelPackage` idempotency token this account has spent: the token, the
+/// identity the call that spent it registered, and the ARN that call minted.
+///
+/// The identity is what scopes the record: a token reused for a DIFFERENT package is a fresh
+/// call rather than a refusal about an unrelated one, so the name and the group are part of
+/// it.
+#[derive(Debug, Clone)]
+pub struct SpentModelPackageToken {
+    /// The `ClientToken` the call presented.
+    pub token: String,
+    /// The store key ([`model_package_key`]) that call registered, which is what resolves
+    /// whether the package it minted is still held.
+    pub key: String,
+    /// The package name the retry has to ask for to be a replay of this call.
+    pub name: String,
+    /// The model package group the retry has to ask for, and `None` for an unversioned
+    /// package.
+    pub group: Option<String>,
+    /// The ARN the call answered, which is what a refusal of a retry names.
+    pub arn: String,
 }
 
 impl ComAmazonawsSagemakerSagemakerState {
@@ -2754,28 +2815,62 @@ impl ComAmazonawsSagemakerSagemakerState {
             .count()
     }
 
-    /// The model package the call that presented `token` registered under the same
-    /// identity (`name` plus `group`), if one is stored.
+    /// The ARN of the model package the call that presented `token` registered under the same
+    /// identity (`name` plus `group`), if this account has spent that token.
     ///
-    /// This is what makes `CreateModelPackage` idempotent: a retry carrying the same
-    /// `ClientToken` answers the ARN of the package found here instead of registering
-    /// another. The match is scoped to the identity the retry asks for, so a token reused
-    /// for a DIFFERENT package is not answered with an unrelated package's ARN.
+    /// This is what makes `CreateModelPackage` idempotent: a token already spent registers
+    /// nothing a second time — neither a second package nor a second version — so a retry
+    /// presenting it is refused, naming the registration it already stands for. The record
+    /// outlives the package, so a retry presenting a token whose registration has since been
+    /// deleted is refused too rather than quietly registering a fresh version under a token
+    /// already used.
     ///
-    /// The token lives ON the package record rather than in a map of its own, so it is
-    /// bounded by [`MODEL_PACKAGE_QUOTA`] and released with the record it belongs to —
-    /// hence the scan, as [`Self::artifact_named`] does for the same reason.
-    pub fn model_package_for_client_token(
+    /// The match is scoped to the identity the retry asks for, so a token reused for a
+    /// DIFFERENT package is a fresh call rather than a refusal naming an unrelated package.
+    pub fn model_package_registered_with_client_token(
         &self,
         token: &str,
         name: &str,
         group: Option<&str>,
-    ) -> Option<&ModelPackage> {
-        self.model_packages.values().find(|package| {
-            package.client_token.as_deref() == Some(token)
-                && package.name == name
-                && package.group_name.as_deref() == group
-        })
+    ) -> Option<&str> {
+        self.model_package_client_tokens
+            .iter()
+            .rev()
+            .find(|spent| {
+                spent.token == token && spent.name == name && spent.group.as_deref() == group
+            })
+            .map(|spent| spent.arn.as_str())
+    }
+
+    /// Record that `token` was spent registering the package `key` under `arn`, so a retry
+    /// presenting it is refused rather than registering again.
+    ///
+    /// The oldest records are dropped past [`MODEL_PACKAGE_CLIENT_TOKEN_HISTORY`], which a
+    /// caller cannot tell from a token whose deduplication window has passed. A call that
+    /// presented no token records nothing.
+    pub fn remember_model_package_client_token(
+        &mut self,
+        token: Option<&str>,
+        key: &str,
+        name: &str,
+        group: Option<&str>,
+        arn: &str,
+    ) {
+        let Some(token) = token else {
+            return;
+        };
+        self.model_package_client_tokens.push(SpentModelPackageToken {
+            token: token.to_string(),
+            key: key.to_string(),
+            name: name.to_string(),
+            group: group.map(ToString::to_string),
+            arn: arn.to_string(),
+        });
+        if self.model_package_client_tokens.len() > MODEL_PACKAGE_CLIENT_TOKEN_HISTORY {
+            let overflow =
+                self.model_package_client_tokens.len() - MODEL_PACKAGE_CLIENT_TOKEN_HISTORY;
+            self.model_package_client_tokens.drain(..overflow);
+        }
     }
 
     /// Whether another model card fits, i.e. the store is below [`MODEL_CARD_QUOTA`].

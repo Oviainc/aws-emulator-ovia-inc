@@ -8,6 +8,9 @@
 //! the same refusal differently:
 //!
 //! * the execution role the resource would RUN AS ([`execution_role_is_unassumable`]);
+//! * the Amazon S3 location its work would READ, asked through [`crate::state::s3_access`]
+//!   and worded per resource family ([`could_not_access_model_data`] for the hosting
+//!   creates, [`no_s3_objects_found`] for the training ones);
 //! * the network placement it asks for ([`SECURITY_GROUPS_NOT_SPECIFIED`]).
 //!
 //! One QUESTION about the role, several SENTENCES: the recorded refusals word an
@@ -81,6 +84,32 @@ pub fn execution_role_arn_is_invalid(role_arn: &str) -> String {
         "The execution role ARN \"{role_arn}\" is invalid. Please ensure that the role exists \
          and that its trust relationship policy allows the action \"sts:AssumeRole\" for the \
          service principal \"{SERVICE_PRINCIPAL}\"."
+    )
+}
+
+/// How the hosting creates word an Amazon S3 location whose model artifact Amazon S3 answers
+/// is NOT THERE: the location AS THE CALLER SENT IT, and nothing else — there is no
+/// permission to check or Region to name when the object does not exist.
+#[must_use]
+pub fn could_not_find_model_data(s3_url: &str) -> String {
+    format!("Could not find model data at {s3_url}.")
+}
+
+/// How the hosting creates word an Amazon S3 location whose model artifact SageMaker could
+/// not READ AS the execution role: the location AS THE CALLER SENT IT, the role the request
+/// supplied, and the Region the request addressed — the three things that decide whether the
+/// artifact can be read.
+///
+/// The condition this states is a GRANT the artifact's own policies withhold, which is a
+/// different fact from the object not being there ([`could_not_find_model_data`]): the caller
+/// is told what has to hold for the read to be allowed.
+#[must_use]
+pub fn could_not_access_model_data(s3_url: &str, role_arn: &str, region: &str) -> String {
+    format!(
+        "Could not access model data at {s3_url}. Please ensure that the role \"{role_arn}\" \
+         exists and that its trust relationship policy allows the action \"sts:AssumeRole\" \
+         for the service principal \"{SERVICE_PRINCIPAL}\". Also ensure that the role has \
+         \"s3:GetObject\" permissions and that the object is located in {region}."
     )
 }
 

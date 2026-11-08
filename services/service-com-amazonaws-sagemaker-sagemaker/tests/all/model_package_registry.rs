@@ -12,7 +12,7 @@
 //! create/describe round trip for every optional member; version numbering inside a
 //! group; the refusals (a name already in use, a group that does not exist, the two
 //! mutually exclusive kind members, an identifier no package answers to); the
-//! idempotency-token replay; the `Pending` -> `Completed` transition the clock owes; and
+//! idempotency-token record; the `Pending` -> `Completed` transition the clock owes; and
 //! the model-card sanitization `IncludedData=MetadataOnly` asks for.
 //!
 //! A versioned package needs its group to exist first, so the versioned cases create it
@@ -858,11 +858,15 @@ async fn registration_into_a_group_that_does_not_exist_is_refused() {
     );
 }
 
-/// RULE: `ClientToken` makes the call idempotent — a repeat presenting the same token
-/// answers the ARN the first call minted and registers neither a second package nor a
-/// second version, while a different token registers a new one.
+/// RULE: a `ClientToken` is SPENT by the registration that presented it — a repeat
+/// presenting the same token is refused with the modelled `ConflictException`, naming the
+/// model package that token registered, and registers neither a second package nor a second
+/// version, while a different token registers a new one.
+///
+/// (The whole rule, with every form of retry, is driven by `model_package_admission`; these
+/// rows are the registry's own view of it.)
 #[tokio::test]
-async fn a_repeated_client_token_replays_the_first_answer() {
+async fn a_repeated_client_token_registers_nothing_a_second_time() {
     let emulator = Emulator::new();
     emulator.create_group(state::DEFAULT_REGION, "idempotent").await;
     let rows = [
@@ -888,10 +892,21 @@ async fn a_repeated_client_token_replays_the_first_answer() {
             "case {case:?}: expected the ARN for {expected_resource:?}, got {first:?}"
         );
         for repeat in 1..=2 {
-            let replayed = emulator.create(case, &body).await;
+            let (status, refused) = emulator.call("CreateModelPackage", &body).await;
             assert_eq!(
-                replayed, first,
-                "case {case:?}: repeat {repeat} must replay the first ARN, got {replayed:?}"
+                (status, error_code(&refused).as_str()),
+                (400, "ConflictException"),
+                "case {case:?}: repeat {repeat} must be refused, got {status} with {refused}"
+            );
+            assert!(
+                message(&refused).contains(&format!("Name:{expected_resource}"))
+                    || message(&refused).contains(&format!(
+                        "Group:{}",
+                        expected_resource.split('/').next().unwrap_or_default()
+                    )),
+                "case {case:?}: repeat {repeat} must name the registration the token was \
+                 spent on, got {:?}",
+                message(&refused)
             );
         }
     }
@@ -909,8 +924,7 @@ async fn a_repeated_client_token_replays_the_first_answer() {
         "case \"a fresh token registers a new version\": expected version 2, got {second:?}"
     );
 
-    // And a repeated token under a name already in use still answers its own ARN rather
-    // than the conflict a fresh call would get.
+    // A name already in use is refused whether a token is presented or not.
     let (status, refused) = emulator
         .call("CreateModelPackage", &json!({"ModelPackageName": "token-package"}))
         .await;
@@ -919,8 +933,8 @@ async fn a_repeated_client_token_replays_the_first_answer() {
         "case \"same name, no token\": expected HTTP 400, got {status} with {refused}"
     );
 
-    // The replay is scoped to the package the retry asks for: the same token naming a
-    // DIFFERENT package registers that package rather than answering the first one's ARN.
+    // The record is scoped to the package the retry asks for: the same token naming a
+    // DIFFERENT package registers that package rather than being refused about the first.
     let rows = [
         (
             "a used token on another unversioned name",

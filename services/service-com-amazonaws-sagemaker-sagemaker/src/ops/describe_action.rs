@@ -164,6 +164,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.action_name,
         );
 
+        // WHO is asking is settled before the store is read: a principal IAM does not allow
+        // to perform this action is told that and nothing about the entity (see
+        // `crate::service::authorization`), judged against the ARN the request's identifier
+        // resolves to.
+        crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME, &key)
+            .map_err(crate::scaffolded::Scaffolded::access_denied)?;
+
         let store = state.lock();
         let Some(action) = store.actions.get(&key) else {
             // Never a 200 with empty fields: a caller cannot tell that from an action

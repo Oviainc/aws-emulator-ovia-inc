@@ -306,6 +306,10 @@ fn image_uri(repository: &str, tag: &str) -> String {
 }
 
 /// The five creates the role rule is driven over, one per resource kind.
+///
+/// `CreateNotebookInstance` is NOT among them: the hosting reading it takes — accept a role
+/// this account's IAM holds nothing under, and fail the resource instead — is driven by
+/// `sagemaker_execution_role_admission` beside the other creates that take it.
 fn creates_under_a_role() -> Vec<CreateUnderARole> {
     vec![
         CreateUnderARole {
@@ -371,19 +375,6 @@ fn creates_under_a_role() -> Vec<CreateUnderARole> {
             },
             reader: "DescribeJob",
             read_body: |name| json!({ "JobName": name, "JobCategory": "AgentRFT" }),
-            refusal: could_not_assume,
-        },
-        CreateUnderARole {
-            operation: "CreateNotebookInstance",
-            body: |name, role| {
-                json!({
-                    "NotebookInstanceName": name,
-                    "InstanceType": "ml.t3.medium",
-                    "RoleArn": role,
-                })
-            },
-            reader: "DescribeNotebookInstance",
-            read_body: |name| json!({ "NotebookInstanceName": name }),
             refusal: could_not_assume,
         },
         CreateUnderARole {
@@ -498,9 +489,11 @@ struct ImageCase {
 }
 
 /// RULE: a model package is registered around the container image path the request names,
-/// WHATEVER the registry holds — the recorded service registers a package naming an image
-/// in a registry of another account, and one naming a repository this account's registry
-/// does not hold, so registration resolves no image.
+/// WHATEVER the registry holds — the recorded service registers a package naming an image in
+/// a registry of another account, and one naming a repository this account's registry does
+/// not hold, so registration resolves no image. What it does hold the path to is its FORM:
+/// one of the two the member documents, so a value naming no registry is refused (the rows
+/// for that live in the SageMaker crate's `model_package_admission` suite).
 #[test]
 fn a_model_package_is_registered_around_whatever_image_the_request_names() {
     std::thread::Builder::new()
@@ -585,8 +578,8 @@ fn a_model_package_is_registered_around_whatever_image_the_request_names() {
                     image: format!("{OTHER_ACCOUNT}.dkr.ecr.{REGION}.amazonaws.com/inference:1"),
                 },
                 ImageCase {
-                    case: "a path naming no ECR registry at all",
-                    image: "library/inference:1".to_string(),
+                    case: "another registry's host",
+                    image: "registry.example.com/team/inference:1".to_string(),
                 },
             ];
 

@@ -9,7 +9,10 @@
 //! The model's containers RUN AS the `ExecutionRoleArn` the request names, so a role this
 //! account's IAM HOLDS and whose trust policy does not admit SageMaker is refused with 400
 //! `ValidationException` and nothing is stored; a role IAM holds nothing under is accepted,
-//! which is what the recorded service does (see [`crate::state::admission`]).
+//! which is what the recorded service does (see [`crate::state::admission`]). The model data
+//! each container names is READ AS that role, so a location Amazon S3 answers no object for,
+//! or one a bucket policy denies the role, is refused the same way (see
+//! [`crate::state::s3_access`]).
 //!
 //! ## Shape of an operation
 //!
@@ -181,6 +184,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
         let region = crate::state::request_region(ctx);
+        // Every container of the model is PULLED from the image path it names, so a path that
+        // is no image reference at all names nothing to pull and the create is refused for it
+        // before anything is stored. One rule for every container image member of this
+        // service (see `crate::state::container_image`), settled before the role because it
+        // needs nothing but the request.
+        let images: Vec<&str> = input
+            .primary_container
+            .iter()
+            .chain(input.containers.iter().flatten())
+            .filter_map(|container| container.image.as_deref())
+            .collect();
+        if crate::state::first_malformed_container_image(images).is_some() {
+            return Err(crate::scaffolded::Scaffolded::validation(
+                crate::state::INVALID_IMAGE_PATH,
+            ));
+        }
         // The model's containers RUN AS `ExecutionRoleArn`, so the role is settled before
         // anything is stored and before the store is locked: only what the emulator's OWN
         // IAM ANSWERED is refused, and — because this family is recorded registering a
@@ -194,6 +213,39 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 return Err(crate::scaffolded::Scaffolded::validation(
                     crate::state::admission::execution_role_arn_is_invalid(role_arn),
                 ));
+            }
+            // The model's artifact is READ AS that role when the model is deployed, and
+            // SageMaker settles that read before it registers the model: a container whose
+            // model data names no object, or one a bucket policy fences the role off, backs
+            // no deployable model, so the create is refused for it rather than accepted into
+            // a model that could only fail later (see `crate::state::s3_access`). A request
+            // that names no role assumes none, so there is nothing to read as and nothing to
+            // settle.
+            let artifacts = model_data_locations(
+                input.primary_container.as_ref(),
+                input.containers.as_deref(),
+            );
+            if let Some(unreadable) = crate::state::first_unreadable_location(
+                ctx,
+                &region,
+                role_arn,
+                artifacts.iter().map(String::as_str),
+            )
+            .await
+            {
+                // Two conditions, two sentences: an object that is not there is named as
+                // model data that could not be FOUND, while one whose read the artifact's own
+                // policies withhold is named as model data that could not be ACCESSED, with
+                // what has to hold for it to be (see `crate::state::admission`).
+                let refusal = match unreadable {
+                    crate::state::UnreadableLocation::NoObject(uri) => {
+                        crate::state::could_not_find_model_data(uri)
+                    }
+                    crate::state::UnreadableLocation::Denied(uri) => {
+                        crate::state::could_not_access_model_data(uri, role_arn, &region)
+                    }
+                };
+                return Err(crate::scaffolded::Scaffolded::validation(refusal));
             }
         }
         let arn = crate::state::resource_arn(&region, "model", &input.model_name);
@@ -255,4 +307,34 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::record_state_change(Self::NAME, &arn, ctx);
         Ok(CreateModelOutput { model_arn: arn })
     }
+}
+
+/// Every Amazon S3 location the model's containers hold their model data at, in the order the
+/// request carries them: the primary container's first, then each of the inference pipeline's.
+///
+/// A container holds its model data at `ModelDataUrl` ("the S3 path where the model artifacts
+/// … are stored") or at `ModelDataSource.S3DataSource.S3Uri` ("specifies the S3 path of ML
+/// model data to deploy"), and a data source may carry a manifest naming where the artifacts
+/// are listed (`ManifestS3Uri`) — each of them a location the deployment reads, so each is a
+/// location this create settles. A container that names none holds no model data, which the
+/// model's own image may well supply, so it contributes nothing to settle.
+fn model_data_locations(
+    primary: Option<&ContainerDefinition>,
+    containers: Option<&[ContainerDefinition]>,
+) -> Vec<String> {
+    primary
+        .into_iter()
+        .chain(containers.unwrap_or_default())
+        .flat_map(|container| {
+            let source = container.model_data_source.as_ref();
+            let s3_source = source.and_then(|source| source.s3_data_source.as_ref());
+            [
+                container.model_data_url.clone(),
+                s3_source.map(|source| source.s3_uri.clone()),
+                s3_source.and_then(|source| source.manifest_s3_uri.clone()),
+            ]
+        })
+        .flatten()
+        .filter(|uri| !uri.is_empty())
+        .collect()
 }

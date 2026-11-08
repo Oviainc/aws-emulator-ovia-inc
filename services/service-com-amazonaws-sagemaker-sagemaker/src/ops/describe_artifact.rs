@@ -149,9 +149,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
+
+        // WHO is asking is settled before the store is read: a principal IAM does not allow
+        // to perform this action is told that and nothing about the artifact, so a refused
+        // call cannot be used to find out whether one exists (see
+        // `crate::service::authorization`). The resource is the ARN the REQUEST carried,
+        // which is the only identifier this operation addresses an artifact by.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &input.artifact_arn,
+        )
+        .map_err(crate::scaffolded::Scaffolded::access_denied)?;
 
         let store = state.lock();
         let artifact = store.artifacts.get(&input.artifact_arn).ok_or_else(|| {

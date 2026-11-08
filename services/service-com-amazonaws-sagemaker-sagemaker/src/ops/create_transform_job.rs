@@ -4,8 +4,10 @@
 //!
 //! Starts a batch transform job: validates the sizing rules the service documents but
 //! does not model, refuses a duplicate name (`ResourceInUse`) or a `ModelName` no stored
-//! model answers to (`ResourceNotFound`), then persists the job as `InProgress` with the
-//! instant the clock owes it a terminal status, and answers its ARN.
+//! model answers to (`ResourceNotFound`), refuses an input location the model's execution
+//! role cannot read (400 `ValidationException`, see [`crate::state::s3_access`]), then
+//! persists the job as `InProgress` with the instant the clock owes it a terminal status,
+//! and answers its ARN.
 //!
 //! The run itself needs the model's inference container, which this emulator does not
 //! run, so the job reaches the modelled `Failed` with a `FailureReason` that says so
@@ -222,48 +224,91 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx);
         let arn = crate::state::resource_arn(&region, "transform-job", &input.transform_job_name);
 
-        let mut store = state.lock();
-        // A name already taken is refused before the quota is consulted: the request adds
-        // no record, so "the store is full" is not why it fails.
+        // Everything decided from the STORE is decided here, under one guard that is
+        // released before the question below is put to another service: a transform job's
+        // name, the store's bound, and the model the job would run — whose execution role is
+        // what the input location is then settled against.
+        let execution_role_arn = {
+            let store = state.lock();
+            // A name already taken is refused before the quota is consulted: the request
+            // adds no record, so "the store is full" is not why it fails.
+            //
+            // "The name must be unique within an Amazon Web Services Region in an Amazon Web
+            // Services account" (`TransformJobName`'s model doc): a name already taken is
+            // refused with the modelled in-use error, never overwritten — otherwise the
+            // caller reads a 200 for a job it did not create and loses the one it did.
+            if store.transform_jobs.contains_key(&input.transform_job_name) {
+                return Err(CreateTransformJobErrorModeled::ResourceInUse(ResourceInUse {
+                    message: Some(name_already_taken(&arn)),
+                })
+                .into());
+            }
+            // The store is bounded, so a caller varying `TransformJobName` cannot grow it
+            // without end. `ResourceLimitExceeded` is the limit failure this operation
+            // models.
+            if !store.transform_jobs_below_quota() {
+                return Err(CreateTransformJobErrorModeled::ResourceLimitExceeded(
+                    ResourceLimitExceeded {
+                        message: Some(format!(
+                            "The account-level service limit for transform jobs is {}, with \
+                             current utilization of {} and a request delta of 1.",
+                            crate::state::TRANSFORM_JOB_QUOTA,
+                            store.transform_jobs.len()
+                        )),
+                    },
+                )
+                .into());
+            }
+            // "ModelName must be the name of an existing Amazon SageMaker model within an
+            // Amazon Web Services Region in an Amazon Web Services account" (this
+            // operation's model doc), so a job naming no stored model is refused with the
+            // modelled not-found error and nothing is persisted.
+            let Some(model) = store.models.get(&input.model_name) else {
+                return Err(CreateTransformJobErrorModeled::ResourceNotFound(ResourceNotFound {
+                    message: Some(crate::state::could_not_find(
+                        crate::state::MODEL_KIND_LABEL,
+                        &input.model_name,
+                    )),
+                })
+                .into());
+            };
+            model.execution_role_arn.clone()
+        };
+
+        // The transform reads the dataset the input names ("TransformInput - Describes the
+        // dataset to be transformed and the Amazon S3 location where it is stored"), so a
+        // location that holds no object, or one the role is denied the read of, backs no
+        // transform at all and the job is refused for it rather than admitted with no input
+        // (see `crate::state::s3_access`). A model that assumes no role has none to read as.
         //
-        // "The name must be unique within an Amazon Web Services Region in an Amazon Web
-        // Services account" (`TransformJobName`'s model doc): a name already taken is
-        // refused with the modelled in-use error, never overwritten — otherwise the
-        // caller reads a 200 for a job it did not create and loses the one it did.
+        // BOTH conditions are worded with the one sentence this family states, deliberately:
+        // `crate::state::no_s3_objects_found` is written for exactly that — "one sentence for
+        // one condition: whether the bucket is in another Region, holds nothing under that
+        // prefix, or is one the role may not list, what the caller is told is that the data
+        // source names no object". The hosting creates are the family that words the two
+        // apart (`create_model`).
+        let input_uri = input.transform_input.data_source.s3_data_source.s3_uri.clone();
+        if let Some(role_arn) = execution_role_arn.as_deref() {
+            if let Some(unreadable) =
+                crate::state::first_unreadable_location(ctx, &region, role_arn, [input_uri.as_str()])
+                    .await
+            {
+                let uri = unreadable.uri();
+                let bucket = crate::state::S3Location::parse(uri)
+                    .map(|location| location.bucket)
+                    .unwrap_or_default();
+                return Err(crate::scaffolded::Scaffolded::validation(
+                    crate::state::no_s3_objects_found(uri, &region, role_arn, &bucket),
+                ));
+            }
+        }
+
+        let mut store = state.lock();
+        // The guard was released for the question above, so the name is resolved again: a
+        // call that took it in the meantime keeps it, and this one is the duplicate.
         if store.transform_jobs.contains_key(&input.transform_job_name) {
             return Err(CreateTransformJobErrorModeled::ResourceInUse(ResourceInUse {
-                message: Some(format!(
-                    "Transform job names must be unique within an Amazon Web Services \
-                     account and Amazon Web Services Region: \"{arn}\" already exists."
-                )),
-            })
-            .into());
-        }
-        // The store is bounded, so a caller varying `TransformJobName` cannot grow it
-        // without end. `ResourceLimitExceeded` is the limit failure this operation models.
-        if !store.transform_jobs_below_quota() {
-            return Err(CreateTransformJobErrorModeled::ResourceLimitExceeded(
-                ResourceLimitExceeded {
-                    message: Some(format!(
-                        "The account-level service limit for transform jobs is {}, with \
-                         current utilization of {} and a request delta of 1.",
-                        crate::state::TRANSFORM_JOB_QUOTA,
-                        store.transform_jobs.len()
-                    )),
-                },
-            )
-            .into());
-        }
-        // "ModelName must be the name of an existing Amazon SageMaker model within an
-        // Amazon Web Services Region in an Amazon Web Services account" (this operation's
-        // model doc), so a job naming no stored model is refused with the modelled
-        // not-found error and nothing is persisted.
-        if !store.models.contains_key(&input.model_name) {
-            return Err(CreateTransformJobErrorModeled::ResourceNotFound(ResourceNotFound {
-                message: Some(crate::state::could_not_find(
-                    crate::state::MODEL_KIND_LABEL,
-                    &input.model_name,
-                )),
+                message: Some(name_already_taken(&arn)),
             })
             .into());
         }
@@ -307,6 +352,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             transform_job_arn: arn,
         })
     }
+}
+
+/// How this operation words a `TransformJobName` already registered: the ARN the name
+/// resolves to, quoted. Stated once, because the name is resolved twice — once under the
+/// guard the store questions are answered under, and once under the guard the record is
+/// written with (see `handle`).
+fn name_already_taken(arn: &str) -> String {
+    format!(
+        "Transform job names must be unique within an Amazon Web Services account and \
+         Amazon Web Services Region: \"{arn}\" already exists."
+    )
 }
 
 /// `MaxConcurrentTransforms` as the service resolves it: the request's value, or the

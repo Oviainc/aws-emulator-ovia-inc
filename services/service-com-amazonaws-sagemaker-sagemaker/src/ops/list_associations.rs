@@ -197,6 +197,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine)
             .ok_or_else(|| crate::scaffolded::Scaffolded::validation(crate::state::NO_STATE))?;
 
+        // WHO is asking is settled before the store is read: a principal IAM does not allow
+        // to perform this action is told that and nothing about what the account holds (see
+        // `crate::service::authorization`). A listing names no resource of its own, so it is
+        // judged against the resource IAM writes for such a request.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            crate::service::authorization::ANY_RESOURCE,
+        )
+        .map_err(crate::scaffolded::Scaffolded::access_denied)?;
+
         // `SortBy`, `SortOrder` and the `AssociationType` filter each select exactly one
         // member of a modelled enum, which the boundary validator does not enforce, so
         // anything else is refused here rather than silently ignored. The accepted sets

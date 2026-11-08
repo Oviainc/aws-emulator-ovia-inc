@@ -109,6 +109,8 @@ mod lineage_context_lifecycle;
 mod lineage_entity_association_guard;
 #[path = "all/lineage_group_policy.rs"]
 mod lineage_group_policy;
+#[path = "all/lineage_read_authorization.rs"]
+mod lineage_read_authorization;
 #[path = "all/lineage_group_reporting.rs"]
 mod lineage_group_reporting;
 #[path = "all/lineage_groups.rs"]
@@ -143,6 +145,8 @@ mod mlflow_app_lifecycle;
 mod mlflow_app_presigned_url;
 #[path = "all/mlflow_tracking_server.rs"]
 mod mlflow_tracking_server;
+#[path = "all/model_artifact_admission.rs"]
+mod model_artifact_admission;
 #[path = "all/model_card_deletion.rs"]
 mod model_card_deletion;
 #[path = "all/model_card_export_jobs.rs"]
@@ -151,6 +155,8 @@ mod model_card_export_jobs;
 mod model_card_governance;
 #[path = "all/model_card_updates.rs"]
 mod model_card_updates;
+#[path = "all/model_package_admission.rs"]
+mod model_package_admission;
 #[path = "all/model_package_group_lifecycle.rs"]
 mod model_package_group_lifecycle;
 #[path = "all/model_package_group_policy.rs"]

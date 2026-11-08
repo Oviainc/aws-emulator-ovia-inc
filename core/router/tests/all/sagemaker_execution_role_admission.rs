@@ -205,6 +205,15 @@ fn hyperpod_cannot_assume(role_arn: &str) -> String {
     )
 }
 
+/// How the notebook-instance create words it: the role ARN as the request carried it, then
+/// the fixed sentence naming the principal that has to be allowed to assume the role.
+fn could_not_assume_role(role_arn: &str) -> String {
+    format!(
+        "Could not assume role {role_arn}. Please ensure that the role exists and allows \
+         principal 'sagemaker.amazonaws.com' to assume the role."
+    )
+}
+
 /// How the hosting creates word it: the role ARN as the request carried it, quoted.
 fn execution_role_arn_is_invalid(role_arn: &str) -> String {
     format!(
@@ -374,6 +383,28 @@ fn creates_under_a_role() -> Vec<RoleCreate> {
             readback: Readback::ByName {
                 reader: "DescribeModel",
                 body: |name| json!({ "ModelName": name }),
+            },
+        },
+        RoleCreate {
+            // A notebook instance takes the same reading as the hosting creates: the
+            // recorded service ACCEPTS one named against a role this account's IAM holds
+            // nothing under and then drives the instance to the modelled `Failed` status
+            // (asserted, with the status it settles into, by the SageMaker crate's
+            // `model_artifact_admission` suite), while a role whose stored trust document
+            // admits another service only is refused here.
+            operation: "CreateNotebookInstance",
+            body: |name, role| {
+                json!({
+                    "NotebookInstanceName": name,
+                    "InstanceType": "ml.t3.medium",
+                    "RoleArn": role,
+                })
+            },
+            refusal: could_not_assume_role,
+            refuses_an_absent_role: false,
+            readback: Readback::ByName {
+                reader: "DescribeNotebookInstance",
+                body: |name| json!({ "NotebookInstanceName": name }),
             },
         },
     ]

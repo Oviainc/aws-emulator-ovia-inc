@@ -148,6 +148,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // half its identity — the same key `DescribeLineageGroup` looks one up by.
         let region = crate::state::request_region(ctx);
 
+        // WHO is asking is settled before the store is read: a principal IAM does not allow
+        // to perform this action is told that and nothing about the group (see
+        // `crate::service::authorization`), judged against the ARN the requested identifier
+        // resolves to.
+        crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::resource_arn(
+                &region,
+                crate::state::LINEAGE_GROUP_KIND,
+                crate::state::name_from_arn_or_name(&input.lineage_group_name),
+            ),
+        )
+        .map_err(crate::scaffolded::Scaffolded::access_denied)?;
+
         // `LineageGroupName` is modelled `LineageGroupNameOrArn`, so the request addresses
         // the group by its bare name OR by its full ARN. An ARN naming another partition,
         // Region, account or resource kind addresses no group of this account's, which is

@@ -157,6 +157,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // ARN addresses exactly the one it names.
         let key = crate::state::context_key(ctx, &input.context_name);
 
+        // WHO is asking is settled before the store is read: a principal IAM does not allow
+        // to perform this action is told that and nothing about the entity (see
+        // `crate::service::authorization`), judged against the ARN the request's identifier
+        // resolves to.
+        crate::service::authorization::authorize(&*self.engine, ctx, Self::NAME, &key)
+            .map_err(crate::scaffolded::Scaffolded::access_denied)?;
+
         let store = state.lock();
         let Some(context) = store.contexts.get(&key) else {
             // Never a 200 with empty members: a caller cannot tell that from a context
