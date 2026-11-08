@@ -1276,29 +1276,16 @@ pub const VALIDATION_EXCEPTION_CODE: &str = "ValidationException";
 /// expression from the model member the value was sent for, the value from the
 /// request itself (already elided by the framework before it reaches here).
 ///
+/// The report itself is the shared one
+/// (`service_common::validation_message::pattern_constraint_report`), which the V2
+/// endpoint of this same service states too, so the two cannot drift; what stays here
+/// is WHICH class this service rewords.
+///
 /// Only the pattern class is reworded. A violation of any OTHER modelled
 /// constraint keeps the framework's own wording, which is also what this service's
 /// handler-side refusals state (see [`enum_violation`] and
 /// [`additional_info_violation`]), so a request that breaks a non-pattern rule
 /// reads the same whichever layer judged it.
 pub fn pattern_constraint_report(violations: &[::smithy_server_runtime::Violation]) -> Option<String> {
-    if violations.is_empty() {
-        return None;
-    }
-    let entries: Vec<String> = violations.iter().map(pattern_report_entry).collect::<Option<_>>()?;
-    Some(format!("[{}]", entries.join(", ")))
-}
-
-/// One entry of [`pattern_constraint_report`], or `None` when `violation` is not a
-/// `@pattern` violation.
-fn pattern_report_entry(violation: &::smithy_server_runtime::Violation) -> Option<String> {
-    let ::smithy_server_runtime::ViolationKind::Pattern(pattern) = &violation.kind else {
-        return None;
-    };
-    // A `@sensitive` member's value is withheld by the framework, which leaves the
-    // entry stating the expression alone rather than echoing anything.
-    let shown = violation.value.as_deref().unwrap_or_default();
-    Some(format!(
-        "ECMA 262 regex \"{pattern}\" does not match input string \"{shown}\""
-    ))
+    ::service_common::validation_message::pattern_constraint_report(violations)
 }

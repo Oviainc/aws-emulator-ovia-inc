@@ -57,6 +57,13 @@
 //! how the resource-tagging layer refuses an ARN of another vendor, which it decides
 //! before any lookup.
 //!
+//! A service that states those findings for the `@pattern` class ALONE — every other
+//! constraint class keeping the framework's wording, because no recording of that service
+//! shows its words for them — has the whole message in one call:
+//! [`pattern_constraint_report`], the bracketed list over [`pattern_mismatch`], which
+//! declines any refusal holding another class so no message is half in one voice and half
+//! in the other.
+//!
 //! The other difference this module owns is the VALUE half of a clause: a COLLECTION
 //! (list or map) whose `@length` was broken is stated with no value at all —
 //! `Value at '<member path>' failed to satisfy constraint: …` — where a scalar states the
@@ -694,6 +701,51 @@ pub fn in_float_value_rendering(
 #[must_use]
 pub fn bracketed_findings(findings: &[String]) -> String {
     format!("[{}]", findings.join(", "))
+}
+
+/// The whole message a service states for a request whose values are outside the
+/// `@pattern`s of the members they were sent for: that layer's bracketed list
+/// ([`bracketed_findings`]) holding one [`pattern_mismatch`] finding per violated member,
+/// in the order the validating walk found them.
+///
+/// The brackets are the list itself, so one violated member reads
+/// `[ECMA 262 regex "…" does not match input string "…"]` and two state both findings
+/// inside the one pair.
+///
+/// Both halves of a finding come from the request being refused: the expression from the
+/// `@pattern` of the member the value was sent for, and the value from the request itself
+/// (already elided by the framework's own echo ceiling before it reaches here). A member
+/// the model marks `@sensitive` reaches here with its value withheld, so its finding
+/// states the expression and no input string.
+///
+/// ALL OR NOTHING. `None` when the refusal carries no violation at all, or when any one of
+/// them broke some other constraint than its member's `@pattern`: a message half in this
+/// layer's voice and half in the framework's is worse than the framework's consistent
+/// default, so such a refusal keeps the framework's whole wording. A service that states
+/// this layer's findings for the OTHER constraint classes too builds its message from the
+/// sentences beside [`pattern_mismatch`] over [`bracketed_findings`] instead.
+#[must_use]
+pub fn pattern_constraint_report(violations: &[Violation]) -> Option<String> {
+    if violations.is_empty() {
+        return None;
+    }
+    let findings: Vec<String> = violations
+        .iter()
+        .map(pattern_finding)
+        .collect::<Option<Vec<_>>>()?;
+    Some(bracketed_findings(&findings))
+}
+
+/// One finding of [`pattern_constraint_report`], or `None` when `violation` broke some
+/// other constraint than its member's `@pattern`.
+fn pattern_finding(violation: &Violation) -> Option<String> {
+    let ViolationKind::Pattern(pattern) = &violation.kind else {
+        return None;
+    };
+    Some(pattern_mismatch(
+        pattern,
+        violation.value.as_deref().unwrap_or_default(),
+    ))
 }
 
 /// The message a service states for a MAP whose KEY broke one of the constraints the
@@ -1695,9 +1747,10 @@ mod tests {
         in_stated_enum_order, map_key_refusal, map_key_refusal_quoting, must_be_at_least,
         must_be_at_most, must_be_one_of, must_match_pattern, parameter_pattern_mismatch,
         parameter_pattern_refusal, parameter_value_mismatch, parameters_value_mismatch,
-        pattern_mismatch, pattern_requirement_unstated, property_count_refusal,
-        quoting_the_submitted_collection, quoting_the_whole_submitted_value, requirement,
-        stated_enum_value_set, string_too_long, string_too_short, StatedEnumValueSets,
+        pattern_constraint_report, pattern_mismatch, pattern_requirement_unstated,
+        property_count_refusal, quoting_the_submitted_collection,
+        quoting_the_whole_submitted_value, requirement, stated_enum_value_set, string_too_long,
+        string_too_short, StatedEnumValueSets,
     };
     use crate::validation::unanchored_grouping_alternation;
     use aws_smithy_schema::{Schema, ShapeId, ShapeType, TraitMap};
@@ -2735,6 +2788,86 @@ mod tests {
                 r#"string "{value}" is too short (length: {length}, required minimum: {min})"#
             );
             let actual = string_too_short(value, length, min);
+            assert_eq!(
+                actual, expected,
+                "case {case:?}: expected {expected:?}, got {actual:?}"
+            );
+        }
+    }
+
+    /// RULE: the pattern report lists one finding per member outside its `@pattern`,
+    /// inside ONE pair of brackets and in the order the walk found them, and declines a
+    /// refusal holding any other constraint class.
+    ///
+    /// The rows span what the report generalises over: how many members broke a pattern,
+    /// the expressions and values they carried, a withheld (`@sensitive`) value, the other
+    /// constraint classes, a mixed refusal, and the empty one.
+    #[test]
+    fn the_pattern_report_brackets_one_finding_per_member_outside_its_pattern() {
+        let one = violation(
+            "name",
+            ViolationKind::Pattern(r"^[A-Za-z0-9]+$".to_owned()),
+            "bad name",
+        );
+        let another = violation(
+            "clientToken",
+            ViolationKind::Pattern(r"^[A-Za-z0-9_.-]{0,63}$".to_owned()),
+            "bad token",
+        );
+        let withheld = Violation {
+            value: None,
+            sensitive: true,
+            ..one.clone()
+        };
+
+        // (case, the violations, the report expected — `None` keeps the framework's)
+        let rows: [(&str, Vec<Violation>, Option<String>); 7] = [
+            (
+                "one member outside its pattern",
+                vec![one.clone()],
+                Some(
+                    r#"[ECMA 262 regex "^[A-Za-z0-9]+$" does not match input string "bad name"]"#
+                        .to_owned(),
+                ),
+            ),
+            (
+                "two members, in the order the walk found them",
+                vec![one.clone(), another.clone()],
+                Some(
+                    r#"[ECMA 262 regex "^[A-Za-z0-9]+$" does not match input string "bad name", ECMA 262 regex "^[A-Za-z0-9_.-]{0,63}$" does not match input string "bad token"]"#
+                        .to_owned(),
+                ),
+            ),
+            (
+                "the same two the other way round",
+                vec![another.clone(), one.clone()],
+                Some(
+                    r#"[ECMA 262 regex "^[A-Za-z0-9_.-]{0,63}$" does not match input string "bad token", ECMA 262 regex "^[A-Za-z0-9]+$" does not match input string "bad name"]"#
+                        .to_owned(),
+                ),
+            ),
+            (
+                "a withheld value states the expression alone",
+                vec![withheld],
+                Some(
+                    r#"[ECMA 262 regex "^[A-Za-z0-9]+$" does not match input string ""]"#
+                        .to_owned(),
+                ),
+            ),
+            (
+                "another constraint class on its own",
+                vec![violation("name", ViolationKind::MinLength(2), "a")],
+                None,
+            ),
+            (
+                "a pattern mixed with another class",
+                vec![violation("name", ViolationKind::MinLength(2), "a"), one],
+                None,
+            ),
+            ("no violation at all", Vec::new(), None),
+        ];
+        for (case, violations, expected) in rows {
+            let actual = pattern_constraint_report(&violations);
             assert_eq!(
                 actual, expected,
                 "case {case:?}: expected {expected:?}, got {actual:?}"
