@@ -9,11 +9,14 @@
 //!
 //! Every output member is computed from state (see [`crate::state`]):
 //!
-//! 1. the `token` must be a JSON Web Token — three base64url segments, a JOSE header
-//!    that is a JSON object naming the algorithm and the key the token was signed with,
-//!    and a claim set — otherwise `InvalidTokenException` (400). This is a question about
-//!    the VALUE, so it is answered BEFORE any state is read: a token that is not a JWT is
-//!    refused as such whether or not the cluster the URI names exists;
+//! 1. the `token` must be a JSON Web Token — three base64url segments whose first is a
+//!    JOSE header, a JSON object naming the algorithm and the key the token was signed
+//!    with — otherwise `InvalidTokenException` (400). This is a question about the VALUE,
+//!    so it is answered BEFORE any state is read: a token that is not a JWT is refused as
+//!    such whether or not the cluster the URI names exists. Reading the value stops at
+//!    the header, so the segments past it are never decoded and no claim is ever read:
+//!    the modelled `ExpiredTokenException` is reachable only from the issuing cluster's
+//!    own record of what it issued (step 3), never from an `exp` the caller wrote;
 //! 2. the `kid` the header names must resolve to a key the OIDC provider of the cluster
 //!    named by the `clusterName` label publishes — otherwise the header names no key and
 //!    the answer is `InvalidTokenException` (400) again. Resolving the key id is the last
@@ -403,10 +406,12 @@ fn refused(caller_akid: &str, cluster_name: &str, error_code: &str) {
 /// Each layer of the read has its own message, so two tokens that are wrong in different
 /// ways are told apart by the one thing each has to change. The caller is told WHICH JOSE
 /// header names nothing, and which one names something this service cannot use; every way
-/// a value fails to be a readable JWT at all — its length, its segments, their encoding,
-/// a segment that is not a JSON object, a header object that is not a JOSE header — is
-/// one answer, "it could not be parsed", since the caller's fix is the same and the part
-/// that failed is a detail of the parse. Which part it was goes to the log instead.
+/// a value fails to be a readable JWT at all — its length, its segments, the encoding of
+/// its header segment, a header segment that is not a JSON object, a header object that is
+/// not a JOSE header — is one answer, "it could not be parsed", since the caller's fix is
+/// the same and the part that failed is a detail of the parse. Which part it was goes to
+/// the log instead. No segment past the header reaches this function at all: none of them
+/// is read, so none of them can be the reason a value was refused.
 ///
 /// NO PART OF THE TOKEN IS INTERPOLATED. `token` is `@sensitive` and carries a
 /// credential, and an error body is logged by the clients that read it, so the message
@@ -429,8 +434,8 @@ fn malformed_token(malformation: TokenMalformation) -> AssumeRoleForPodIdentityE
         }
         TokenMalformation::Length
         | TokenMalformation::Segments
-        | TokenMalformation::Encoding(_)
-        | TokenMalformation::NotJson(_)
+        | TokenMalformation::HeaderEncoding
+        | TokenMalformation::HeaderNotJson
         | TokenMalformation::NotJoseHeader => {
             "Failed to parse the token included in the request.".to_string()
         }

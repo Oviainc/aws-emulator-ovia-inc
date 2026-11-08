@@ -40,8 +40,12 @@
 //! real service rejects a value that is not one before it looks anything up. So the
 //! tokens this module mints carry a real header and a real claim set (see
 //! [`Cluster::issue_service_account_token`]) and [`parse_service_account_token`] checks
-//! that form on a presented token. The claims are descriptive only: nothing in them is
-//! ever trusted, since who a token names comes from the issuing cluster's record.
+//! that form on a presented token. Only the HEADER segment of a presented token is read,
+//! though: reading a token stops at the key its header names, so neither the claim set
+//! nor the signature of a presented value is decoded or judged, and nothing in them can
+//! change how the value is refused. The claims a minted token carries are descriptive
+//! only: nothing in them is ever trusted, since who a token names comes from the issuing
+//! cluster's record.
 
 use std::collections::hash_map::RandomState;
 use std::collections::HashMap;
@@ -670,17 +674,6 @@ pub struct JoseHeaders {
     pub key_id: String,
 }
 
-/// Which segment of a presented token could not be read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum JwtSegment {
-    /// The first segment: the JOSE header.
-    Header,
-    /// The second segment: the claim set.
-    Claims,
-    /// The third segment: the signature.
-    Signature,
-}
-
 /// Why a presented value is not a JSON Web Token at all.
 ///
 /// Every variant is about the VALUE's form, so none of them needs state to decide — which
@@ -692,10 +685,10 @@ pub enum TokenMalformation {
     Length,
     /// Not three non-empty dot-separated segments.
     Segments,
-    /// A segment is not base64url.
-    Encoding(JwtSegment),
-    /// A segment that must be JSON does not decode to a JSON object.
-    NotJson(JwtSegment),
+    /// The header segment — the only segment that is read — is not base64url.
+    HeaderEncoding,
+    /// The header segment is base64url but does not decode to a JSON object.
+    HeaderNotJson,
     /// The header segment IS a JSON object, but not a JOSE header: the one parameter JWS
     /// makes mandatory ([`ALGORITHM_HEADER`]) is absent or is not a string, or the
     /// [`KEY_ID_HEADER`] the object does carry holds a JSON value that could never be a
@@ -718,14 +711,15 @@ pub enum TokenMalformation {
 
 /// Read `token` as a JSON Web Token and report its JOSE header.
 ///
-/// A JWT is three base64url segments joined by `.`: a header and a claim set, each
-/// base64url-encoded JSON, and a signature. This checks exactly that form and then the
-/// JOSE header, layer by layer, from the shallowest defect to the deepest, so a header
-/// that is wrong in several ways is always reported on the shallowest one:
+/// A JWT is three base64url segments joined by `.`: a base64url-encoded JSON header, a
+/// claim set, and a signature. This checks that the value HAS those three segments and
+/// then reads the FIRST one only, layer by layer, from the shallowest defect to the
+/// deepest, so a header that is wrong in several ways is always reported on the
+/// shallowest one:
 ///
-/// 1. the header segment must read as a JOSE header at all — a JSON object whose `alg` is
-///    there and is a string, and whose `kid`, if it carries one, is a string or `null` —
-///    otherwise it did not parse ([`TokenMalformation::NotJoseHeader`]);
+/// 1. the header segment must read as a JOSE header at all — base64url of a JSON object
+///    whose `alg` is there and is a string, and whose `kid`, if it carries one, is a
+///    string or `null` — otherwise it did not parse ([`TokenMalformation::NotJoseHeader`]);
 /// 2. `alg` must name the algorithm clusters sign projected tokens with
 ///    ([`TOKEN_SIGNING_ALGORITHM`]), otherwise it names a signature nothing here produces;
 /// 3. `kid` must name something — absent, `null`, empty and blank all name nothing, so all
@@ -733,6 +727,11 @@ pub enum TokenMalformation {
 /// 4. `kid` must have the form every key id in a JWKS takes ([`is_signing_key_id`]); a
 ///    value outside it resolves to no key under any provider, which is the part of
 ///    resolving a key id that needs no state.
+///
+/// The segments PAST the header — the claim set and the signature — are not decoded and
+/// not judged here or anywhere on this path: reading a presented token stops at the key
+/// its header names, so a payload that is not even JSON and a well-formed claim set
+/// carrying the same header are the same value as far as this read is concerned.
 ///
 /// Never who the token names, which is [`Cluster::verify_service_account_token`]'s
 /// question, and never WHICH provider publishes the key it names, which is
@@ -757,11 +756,12 @@ pub fn parse_service_account_token(token: &str) -> Result<JoseHeaders, TokenMalf
         return Err(TokenMalformation::Segments);
     }
 
-    let header = json_segment(header, JwtSegment::Header)?;
-    // The claim set has to read as JSON too — a JWT whose payload is not a claim set is
-    // not a JWT — but nothing in it is trusted, so no claim is read out of it here.
-    let _ = json_segment(claims, JwtSegment::Claims)?;
-    decode_jwt_segment(signature).ok_or(TokenMalformation::Encoding(JwtSegment::Signature))?;
+    // ONLY the header segment is read. `claims` and `signature` are required to BE there
+    // and to be non-empty (above) and nothing more: no claim gates this exchange — who a
+    // token names comes from the issuing cluster's record — and the signature is
+    // authenticated by that record too, so neither segment's content can decide how a
+    // value is refused.
+    let header = header_object(header)?;
 
     // LAYER 1, the structural parse of the header itself: a JOSE header names the
     // algorithm its signature was produced with, so an object that does not carry `alg`
@@ -820,15 +820,15 @@ fn string_header<'a>(
         .filter(|value| !value.trim().is_empty())
 }
 
-/// One base64url segment of a JWT read as a JSON object.
-fn json_segment(
+/// The header segment of a JWT read as a JSON object — the one segment of a presented
+/// token this service decodes.
+fn header_object(
     segment: &str,
-    which: JwtSegment,
 ) -> Result<::serde_json::Map<String, ::serde_json::Value>, TokenMalformation> {
-    let bytes = decode_jwt_segment(segment).ok_or(TokenMalformation::Encoding(which))?;
+    let bytes = decode_jwt_segment(segment).ok_or(TokenMalformation::HeaderEncoding)?;
     match ::serde_json::from_slice::<::serde_json::Value>(&bytes) {
         Ok(::serde_json::Value::Object(members)) => Ok(members),
-        _ => Err(TokenMalformation::NotJson(which)),
+        _ => Err(TokenMalformation::HeaderNotJson),
     }
 }
 

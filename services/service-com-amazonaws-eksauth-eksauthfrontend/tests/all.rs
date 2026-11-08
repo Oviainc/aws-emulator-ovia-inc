@@ -17,5 +17,7 @@ mod assume_role_for_pod_identity;
 mod rejection_errors;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/token_claims_are_never_read.rs"]
+mod token_claims_are_never_read;
 #[path = "all/token_header_layers.rs"]
 mod token_header_layers;

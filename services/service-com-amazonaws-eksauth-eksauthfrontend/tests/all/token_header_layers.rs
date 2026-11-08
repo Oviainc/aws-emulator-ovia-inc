@@ -361,13 +361,13 @@ async fn every_header_defect_is_reported_at_its_own_layer() {
 /// The parse layer is ONE answer for every way a value fails to read as a token, whatever
 /// part of it failed: the caller's fix is the same, so a header that is not base64url, one
 /// that is not a JSON object and one that is a JSON object but not a JOSE header are all
-/// the same message.
+/// the same message. Only the HEADER segment can put a value in this class — the segments
+/// past it are not read (see `token_claims_are_never_read.rs`).
 #[tokio::test]
 async fn the_whole_parse_class_is_one_message() {
     let harness = Harness::seeded();
     let claims = encode_jwt_segment(r#"{"sub":"system:serviceaccount:default:my-sa"}"#);
     let signature = encode_jwt_segment([0_u8; 32]);
-    let good_header = encode_jwt_segment(format!(r#"{{"alg":"RS256","kid":"{}"}}"#, key_id(4)));
 
     let rows: &[(&str, String)] = &[
         (
@@ -389,14 +389,8 @@ async fn the_whole_parse_class_is_one_message() {
             ),
         ),
         (
-            "a claim set that is not a JSON object",
-            format!("{good_header}.{}.{signature}", encode_jwt_segment("42x")),
-        ),
-        (
-            "a signature that is not base64url",
-            format!("{good_header}.{claims}.A"),
-        ),
-        (
+            // The header segment is base64url of a JSON object, but the object is not a
+            // JOSE header, so the value did not read either.
             "a header that is a JSON object but not a JOSE header",
             token_with_header(&serde_json::json!({ "typ": "JWT" })),
         ),

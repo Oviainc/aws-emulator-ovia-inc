@@ -27,8 +27,8 @@
 //! the handler are all exercised.
 
 use service_com_amazonaws_eksauth_eksauthfrontend::state::{
-    decode_jwt_segment, encode_jwt_segment, parse_service_account_token, JwtSegment,
-    TokenMalformation, TOKEN_SIGNING_ALGORITHM,
+    decode_jwt_segment, encode_jwt_segment, parse_service_account_token, TokenMalformation,
+    TOKEN_SIGNING_ALGORITHM,
 };
 
 use crate::assume_role_for_pod_identity::{Harness, SEEDS};
@@ -132,13 +132,14 @@ pub(crate) fn token_for_key(key_id: &str) -> String {
 }
 
 /// RULE 1, over the parse itself: a value is a JWT only if it is three non-empty
-/// base64url segments whose header and claim set are JSON objects and whose header
-/// carries every JOSE parameter JWS requires.
+/// segments whose FIRST one is base64url of a JSON object carrying every JOSE parameter
+/// JWS requires. What the other two segments hold is not part of the read — see
+/// `token_claims_are_never_read.rs` for that half of the rule.
 ///
-/// The rows differ along form — segment count, emptiness, encoding, JSON type, and each
-/// required header in turn — and include the rows the wire cannot carry (a token with
-/// two or four segments fails the modelled `JwtToken` pattern before the handler sees
-/// it, so they are only reachable here).
+/// The rows differ along form — segment count, emptiness, the header's encoding and JSON
+/// type, and each required header in turn — and include the rows the wire cannot carry (a
+/// token with two or four segments fails the modelled `JwtToken` pattern before the
+/// handler sees it, so they are only reachable here).
 #[test]
 fn only_three_json_segments_with_the_required_headers_parse_as_a_token() {
     let good_claims = encode_jwt_segment(r#"{"sub":"system:serviceaccount:default:my-sa"}"#);
@@ -189,17 +190,7 @@ fn only_three_json_segments_with_the_required_headers_parse_as_a_token() {
         (
             "a header that is not base64url",
             token_of("A", &good_claims, &good_signature),
-            TokenMalformation::Encoding(JwtSegment::Header),
-        ),
-        (
-            "a claim set that is not base64url",
-            token_of(&good_header, "A", &good_signature),
-            TokenMalformation::Encoding(JwtSegment::Claims),
-        ),
-        (
-            "a signature that is not base64url",
-            token_of(&good_header, &good_claims, "A"),
-            TokenMalformation::Encoding(JwtSegment::Signature),
+            TokenMalformation::HeaderEncoding,
         ),
         (
             "a header that is not JSON",
@@ -208,7 +199,7 @@ fn only_three_json_segments_with_the_required_headers_parse_as_a_token() {
                 &good_claims,
                 &good_signature,
             ),
-            TokenMalformation::NotJson(JwtSegment::Header),
+            TokenMalformation::HeaderNotJson,
         ),
         (
             "a header that is a JSON array",
@@ -217,16 +208,7 @@ fn only_three_json_segments_with_the_required_headers_parse_as_a_token() {
                 &good_claims,
                 &good_signature,
             ),
-            TokenMalformation::NotJson(JwtSegment::Header),
-        ),
-        (
-            "a claim set that is a JSON string",
-            token_of(
-                &good_header,
-                &encode_jwt_segment(r#""claims""#),
-                &good_signature,
-            ),
-            TokenMalformation::NotJson(JwtSegment::Claims),
+            TokenMalformation::HeaderNotJson,
         ),
         (
             // Absent, `null`, empty and blank all name no key, so all four are the same
@@ -325,6 +307,37 @@ fn only_three_json_segments_with_the_required_headers_parse_as_a_token() {
         );
     }
 
+    // The same three values whose SECOND or THIRD segment is unreadable are tokens: the
+    // read stops at the header, so the segments past it only have to be there. What a
+    // caller is answered for each is pinned in `token_claims_are_never_read.rs`.
+    let past_the_header: &[(&str, String)] = &[
+        (
+            "a claim set that is not base64url",
+            token_of(&good_header, "A", &good_signature),
+        ),
+        (
+            "a claim set that is a JSON string",
+            token_of(
+                &good_header,
+                &encode_jwt_segment(r#""claims""#),
+                &good_signature,
+            ),
+        ),
+        (
+            "a signature that is not base64url",
+            token_of(&good_header, &good_claims, "A"),
+        ),
+    ];
+    for (name, token) in past_the_header {
+        let parsed = parse_service_account_token(token);
+        assert_eq!(
+            parsed.as_ref().map(|headers| headers.key_id.clone()),
+            Ok(key_id(1)),
+            "case {name:?}: a segment past the header is not read, so the token parses and \
+             reports the key it named, got {parsed:?}"
+        );
+    }
+
     // And the form that IS a token: every required header is reported back.
     let well_formed = key_id(7);
     let headers = parse_service_account_token(&token_for_key(&well_formed))
@@ -389,17 +402,6 @@ async fn a_token_that_is_not_a_jwt_is_invalid_for_every_cluster_name() {
             token_of(
                 "A",
                 &encode_jwt_segment(r#"{"sub":"x"}"#),
-                &encode_jwt_segment([0_u8; 32]),
-            ),
-        ),
-        (
-            "a claim set that is not a JSON object",
-            token_of(
-                &encode_jwt_segment(format!(
-                    r#"{{"alg":"RS256","kid":"{}"}}"#,
-                    harness.signing_key_id(CLUSTER)
-                )),
-                &encode_jwt_segment("42rubbish"),
                 &encode_jwt_segment([0_u8; 32]),
             ),
         ),
