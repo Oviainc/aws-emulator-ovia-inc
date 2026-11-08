@@ -359,6 +359,19 @@ fn fold_id_digits(digest: &[u8], digits: usize) -> String {
 /// How many characters a service `Id` carries behind its `srv-` prefix.
 const SERVICE_ID_DIGITS: usize = 16;
 
+/// How many characters an `OperationId` carries in its leading body segment.
+///
+/// Cloud Map's operation ids are opaque two-segment tokens — a body, a hyphen and a
+/// shorter trailing segment (`4yejorelbukcjzpnr6tlmrghsjwpngf4-k95yg2u7` in the API
+/// reference's `RegisterInstance`/`GetOperation` examples) — and the model constrains
+/// only the overall length (`OperationId`, 0..255). Both segments are lowercase
+/// alphanumeric, so the whole token is 41 characters.
+const OPERATION_ID_BODY_DIGITS: usize = 32;
+
+/// How many characters an `OperationId` carries in the segment behind its hyphen. See
+/// [`OPERATION_ID_BODY_DIGITS`].
+const OPERATION_ID_SUFFIX_DIGITS: usize = 8;
+
 /// The `Id` of the service called `name` in the namespace `namespace_id`.
 ///
 /// A service is addressed inside its namespace by its `Name` — the pair is what
@@ -670,23 +683,46 @@ impl ComAmazonawsServicediscoveryRoute53autonamingV20170314State {
     /// (just the digits when `prefix` is empty), unique for the lifetime of this store.
     ///
     /// The digits come from a SHA-256 of the monotonic counter and the wall clock, so
-    /// an id is neither guessable nor derived from any request value. `digits` is
-    /// clamped to the digest width, so an id is at most 32 characters long.
+    /// an id is opaque, unique for the lifetime of this store and derived from no
+    /// request value. `digits` is clamped to the digest width, so an id is at most 32
+    /// characters long.
     pub fn next_id(&mut self, prefix: &str, digits: usize) -> String {
-        self.id_seq = self.id_seq.wrapping_add(1);
-        let nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let mut hasher = Sha256::new();
-        hasher.update(prefix.as_bytes());
-        hasher.update(self.id_seq.to_be_bytes());
-        hasher.update(nanos.to_be_bytes());
-        let body = fold_id_digits(&hasher.finalize(), digits);
+        let body = self.mint_digits(prefix, digits);
         if prefix.is_empty() {
             body
         } else {
             format!("{prefix}-{body}")
         }
+    }
+
+    /// Mint `digits` opaque lowercase-alphanumeric id characters.
+    ///
+    /// `domain` labels the run so the several segments of one id are independent of
+    /// each other; each call also advances the store's counter, so no two runs repeat.
+    fn mint_digits(&mut self, domain: &str, digits: usize) -> String {
+        self.id_seq = self.id_seq.wrapping_add(1);
+        let nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let mut hasher = Sha256::new();
+        hasher.update(domain.as_bytes());
+        hasher.update(self.id_seq.to_be_bytes());
+        hasher.update(nanos.to_be_bytes());
+        fold_id_digits(&hasher.finalize(), digits)
+    }
+
+    /// Mint the `OperationId` an asynchronous call reports.
+    ///
+    /// The token is two hyphen-separated runs of lowercase alphanumerics — see
+    /// [`OPERATION_ID_BODY_DIGITS`] — and is opaque: each run is derived from the
+    /// store's counter and the clock, never from any request value, so the same
+    /// request made twice is answered with two different ids.
+    fn next_operation_id(&mut self) -> String {
+        format!(
+            "{}-{}",
+            self.mint_digits("operation", OPERATION_ID_BODY_DIGITS),
+            self.mint_digits("operation-suffix", OPERATION_ID_SUFFIX_DIGITS)
+        )
     }
 
     /// Mint the id of the Route 53 hosted zone a DNS namespace carries —
@@ -711,8 +747,7 @@ impl ComAmazonawsServicediscoveryRoute53autonamingV20170314State {
         now: SystemTime,
         targets: impl IntoIterator<Item = (String, String)>,
     ) -> String {
-        // An `OperationId` carries no prefix; 32 digits is the digest width.
-        let id = self.next_id("", 32);
+        let id = self.next_operation_id();
         self.operations.insert(
             id.clone(),
             OperationRecord {
