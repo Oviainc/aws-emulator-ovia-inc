@@ -440,23 +440,46 @@ fn fresh_version_token() -> String {
 /// A secret is encrypted under the key the request named, or — when it named none — under
 /// the Amazon Web Services managed key `aws/secretsmanager`, which is what
 /// `MasterUserSecretKmsKeyId` documents as the default. Either way the key is resolved
-/// through KMS, so what is reported is the key's OWN identity rather than an alias that
-/// may later point elsewhere: `DescribeKey` "associates the alias with an Amazon Web
-/// Services managed key and returns its KeyId and Arn" for a predefined AWS alias.
-///
-/// A lookup KMS does not answer — a deployment with no KMS mounted beside this service, a
-/// fault, a key this account does not hold — says nothing about the identifier, so the
-/// identifier the secret was created under stands. None of the operations that take a
-/// `MasterUserSecretKmsKeyId` models a KMS fault for a key that cannot be resolved.
+/// through [`resolve_key_arn`], so what is reported is the key's OWN identity rather than an
+/// alias that may later point elsewhere.
 async fn encrypting_key_id(
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     requested: Option<&str>,
 ) -> String {
-    let named = requested.unwrap_or(SECRETS_MANAGER_DEFAULT_KEY_ALIAS);
+    resolve_key_arn(
+        ctx,
+        region,
+        requested.unwrap_or(SECRETS_MANAGER_DEFAULT_KEY_ALIAS),
+    )
+    .await
+}
+
+/// The ARN of the KMS key `named` resolves to, for a member that reports the key something
+/// of this service is encrypted under.
+///
+/// `DescribeKey` "associates the alias with an Amazon Web Services managed key and returns
+/// its KeyId and Arn" for a predefined AWS alias, so an alias is resolved to the key's own
+/// identity rather than reported as given.
+///
+/// A lookup KMS does not answer — a deployment with no KMS mounted beside this service, a
+/// fault, a key this account does not hold — says nothing about the identifier, so `named`
+/// stands: the resource is still encrypted under that key, and that is what names it. None
+/// of the operations that take a key identifier models a KMS fault for a key that cannot be
+/// resolved, which is why this answers a `String` rather than a `Result`.
+///
+/// `pub(super)` because every member of this service that reports an encryption key — the
+/// managed secret's above and a cluster's or instance's storage key
+/// ([`super::storage_encryption_key`]) — resolves it this one way, so no two of them state
+/// the fallback differently.
+pub(super) async fn resolve_key_arn(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    named: &str,
+) -> String {
     let Some(kms) = kms_client(ctx, region) else {
         // The signing scope names no Region this emulator can ask KMS in, so nothing was
-        // learned about the key and the identifier the secret was created under stands.
+        // learned about the key and the identifier in hand stands.
         return named.to_string();
     };
     match kms.describe_key().key_id(named).send().await {
@@ -469,8 +492,8 @@ async fn encrypting_key_id(
             ::tracing::debug!(
                 kms_key = named,
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "KMS did not resolve the key the master user secret is encrypted under; \
-                 reporting the identifier the secret was created with"
+                "KMS did not resolve the key this service reports something as encrypted \
+                 under; reporting the identifier in hand"
             );
             named.to_string()
         }

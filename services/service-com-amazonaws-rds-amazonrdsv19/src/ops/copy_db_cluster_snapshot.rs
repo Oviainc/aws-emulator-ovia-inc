@@ -268,15 +268,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .resolve_cluster_snapshot_key(&region, requested)
             .ok_or_else(|| source_not_found(requested, &region))?;
 
-        if store
-            .db_cluster_snapshots
-            .contains_key(&(region.clone(), target_key.clone()))
-        {
+        if store.holds_cluster_snapshot(&region, &target_key) {
             return Err(
                 CopyDBClusterSnapshotErrorModeled::DBClusterSnapshotAlreadyExistsFault(
                     DBClusterSnapshotAlreadyExistsFault {
-                        message: Some(format!(
-                            "DB cluster snapshot already exists: {target_key}"
+                        message: Some(crate::state::db_cluster_snapshot_already_exists_message(
+                            &target_key,
                         )),
                     },
                 )
@@ -286,18 +283,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The region's manual cluster-snapshot quota, and the number of regions this store
         // keeps records for at all: the store cannot be grown without bound, and the
         // modelled fault says exactly this.
-        if store.cluster_snapshots_in(&region).len()
-            >= crate::state::DB_CLUSTER_SNAPSHOT_QUOTA_PER_REGION
-            || !store.has_room_for_region(&region)
-        {
+        if store.cluster_snapshot_room_is_exhausted(&region) {
             return Err(CopyDBClusterSnapshotErrorModeled::SnapshotQuotaExceededFault(
                 SnapshotQuotaExceededFault {
-                    message: Some(format!(
-                        "the request would exceed the allowed number of manual DB cluster \
-                         snapshots ({} per region, in at most {} regions)",
-                        crate::state::DB_CLUSTER_SNAPSHOT_QUOTA_PER_REGION,
-                        crate::state::MAX_REGIONS
-                    )),
+                    message: Some(crate::state::db_cluster_snapshot_quota_message()),
                 },
             )
             .into());

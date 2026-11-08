@@ -283,6 +283,31 @@ pub fn db_cluster_snapshot_not_found_message(named: &str) -> String {
     format!("DBClusterSnapshot not found: {named}")
 }
 
+/// The sentence the `DBClusterSnapshotAlreadyExistsFault` carries for `named`: "the user
+/// already has a DB cluster snapshot with the given identifier", worded as the resource
+/// type and the identifier the snapshot would be stored under.
+///
+/// One wording for every operation that MINTS a cluster snapshot — `CreateDBClusterSnapshot`,
+/// `CopyDBClusterSnapshot` and the final snapshot `DeleteDBCluster` takes — so no two of them
+/// word the same collision differently.
+pub fn db_cluster_snapshot_already_exists_message(named: &str) -> String {
+    format!("DB cluster snapshot already exists: {named}")
+}
+
+/// The sentence the `SnapshotQuotaExceededFault` carries when another manual DB cluster
+/// snapshot cannot be stored: the bound this emulator writes under, stated as the per-region
+/// quota and the number of regions it keeps records for
+/// ([`ComAmazonawsRdsAmazonrdsv19State::cluster_snapshot_room_is_exhausted`], which is the
+/// predicate this sentence reports). Shared by the same three operations as
+/// [`db_cluster_snapshot_already_exists_message`].
+pub fn db_cluster_snapshot_quota_message() -> String {
+    format!(
+        "the request would exceed the allowed number of manual DB cluster snapshots ({} per \
+         region, in at most {} regions)",
+        DB_CLUSTER_SNAPSHOT_QUOTA_PER_REGION, MAX_REGIONS
+    )
+}
+
 /// A stored DB snapshot: the source instance's settings as they stood when the
 /// snapshot was taken, which is why they are copied rather than re-read later.
 #[derive(Debug, Clone)]
@@ -455,6 +480,32 @@ impl DbSnapshotRecord {
 }
 
 impl ComAmazonawsRdsAmazonrdsv19State {
+    /// Whether this store already holds a DB cluster snapshot under `key` in `region` —
+    /// what every operation that MINTS one is held to, since a second snapshot under one
+    /// identifier would overwrite the cluster state the first one holds.
+    ///
+    /// One reading for the three operations that mint a cluster snapshot
+    /// (`CreateDBClusterSnapshot`, `CopyDBClusterSnapshot`, and the final snapshot
+    /// `DeleteDBCluster` takes), each of which lifts it into its own modelled
+    /// `DBClusterSnapshotAlreadyExistsFault`.
+    pub fn holds_cluster_snapshot(&self, region: &str, key: &str) -> bool {
+        self.db_cluster_snapshots
+            .contains_key(&(region.to_string(), key.to_string()))
+    }
+
+    /// Whether another manual DB cluster snapshot can be stored for `region` at all: the
+    /// region's own quota ([`DB_CLUSTER_SNAPSHOT_QUOTA_PER_REGION`]) and the number of
+    /// regions this store keeps records for ([`MAX_REGIONS`]).
+    ///
+    /// The one bound the three minting operations write under, so no two of them differ
+    /// about how many snapshots a region holds; each lifts it into its own modelled
+    /// `SnapshotQuotaExceededFault`, worded by
+    /// [`db_cluster_snapshot_quota_message`].
+    pub fn cluster_snapshot_room_is_exhausted(&self, region: &str) -> bool {
+        self.cluster_snapshots_in(region).len() >= DB_CLUSTER_SNAPSHOT_QUOTA_PER_REGION
+            || !self.has_room_for_region(region)
+    }
+
     /// The key of the DB snapshot `value` names IN `region`: either its identifier, as the
     /// snapshot was taken under it, or its ARN — `RestoreDBInstanceFromDBSnapshot`
     /// documents both ("If you are restoring from a shared manual DB snapshot, the

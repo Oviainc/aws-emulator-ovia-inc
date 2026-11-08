@@ -242,6 +242,9 @@ mod clusters;
 // record a resource stores for it, and the minting a request that turns
 // `ManageMasterUserPassword` on depends on.
 mod managed_master_secret;
+// The KMS key an encrypted resource's storage is reported under: the one the request named,
+// or the account's default key for this service where it named none.
+mod storage_encryption_key;
 // The identity a call RDS makes of its OWN presents to the service serving it: the one
 // place this crate acts as its own service principal rather than as the caller.
 mod service_principal_call;
@@ -264,6 +267,7 @@ pub use published_values::*;
 pub use clusters::*;
 pub use instances::*;
 pub use managed_master_secret::*;
+pub use storage_encryption_key::*;
 pub use service_principal_call::*;
 pub use master_user_credentials::*;
 pub use data_plane::{
@@ -939,6 +943,17 @@ impl ComAmazonawsRdsAmazonrdsv19State {
                 })
                 .map(|other| other.identifier.clone())
                 .collect(),
+            // "backing-up — the DB cluster is currently being backed up": a backup of this
+            // cluster is in flight exactly while a snapshot OF it is still being taken, so
+            // it is read off those snapshot records — as the members above are read off the
+            // instances — and never copied onto the cluster.
+            backing_up: self
+                .cluster_snapshots_in(&record.region)
+                .into_iter()
+                .any(|snapshot| {
+                    snapshot.db_cluster_identifier == record.identifier
+                        && snapshot.status == SNAPSHOT_STATUS_CREATING
+                }),
         }
     }
 
@@ -2852,9 +2867,14 @@ fn base36(value: u64, width: usize) -> String {
 /// published ids are cited.
 pub fn hosted_zone_id(region: &str, endpoint_domain: &str) -> String {
     /// The published RDS hosted zone ids this emulator carries, as
-    /// `(region, endpoint domain, hosted zone id)`.
-    const PUBLISHED: &[(&str, &str, &str)] =
-        &[("us-east-1", RDS_ENDPOINT_DOMAIN, "Z2R2ITUGPM61AM")];
+    /// `(region, endpoint domain, hosted zone id)`, from the "Amazon Relational Database
+    /// Service (Amazon RDS)" row of "Service endpoints and quotas … hosted zone IDs"
+    /// (Amazon Route 53 Developer Guide, "Values that you specify when you create alias
+    /// resource record sets").
+    const PUBLISHED: &[(&str, &str, &str)] = &[
+        ("us-east-1", RDS_ENDPOINT_DOMAIN, "Z2R2ITUGPM61AM"),
+        ("us-west-2", RDS_ENDPOINT_DOMAIN, "Z1PVIF0B656C1W"),
+    ];
 
     PUBLISHED
         .iter()
@@ -3085,20 +3105,13 @@ pub const GP3_BASELINE_STORAGE_THROUGHPUT: i32 = 125;
 /// this is the status every instance this service holds reports.
 pub const ACTIVITY_STREAM_STOPPED: &str = "stopped";
 
-/// Whether `engine` is the engine of the Amazon DocumentDB control plane this front door
-/// also serves, the one whose cluster envelope carries members of its own; see
-/// [`DOCDB_ENGINE`] and [`DbClusterRecord::to_wire`].
-pub fn is_docdb_engine(engine: &str) -> bool {
-    engine.eq_ignore_ascii_case(DOCDB_ENGINE)
-}
-
-/// `DocdbAnalyticsEnabled` for a cluster of [`DOCDB_ENGINE`] created without the Amazon
-/// DocumentDB analytics capability: no member of either control plane's `CreateDBCluster`
-/// turns it on, so a cluster this service holds never has it.
+/// `DocdbAnalyticsEnabled` for a cluster created without the Amazon DocumentDB analytics
+/// capability: no member of any `CreateDBCluster` this front door serves turns it on, so a
+/// cluster this service holds never has it.
 pub const DEFAULT_DOCDB_ANALYTICS_ENABLED: bool = false;
 
-/// `CustomDataGroupPresent` for a cluster of [`DOCDB_ENGINE`] created without a custom
-/// data group: no member of either control plane's `CreateDBCluster` supplies one.
+/// `CustomDataGroupPresent` for a cluster created without a custom data group: no member of
+/// any `CreateDBCluster` this front door serves supplies one.
 pub const DEFAULT_CUSTOM_DATA_GROUP_PRESENT: bool = false;
 
 /// `AutoMinorVersionUpgrade` for a cluster whose request named nothing:

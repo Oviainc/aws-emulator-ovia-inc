@@ -266,9 +266,14 @@ async fn the_modification_path_words_its_not_found_fault_with_one_fixed_sentence
 /// refusal was about the member pair and about nothing else.
 #[derive(Debug, Clone, Copy)]
 enum PastTheGuard {
-    /// The delete is taken: HTTP 200, with the resource's status member reporting it on its
-    /// way out.
-    DeleteTaken { status_member: &'static str },
+    /// The delete is taken: HTTP 200, with the resource's status member reporting the
+    /// status it carries when the call returns — a DB instance reports `deleting` ("the
+    /// status of the Amazon RDS DB instance is deleting"), while a DB cluster's delete
+    /// acknowledges the cluster as it FOUND it and moves it on the next read.
+    DeleteTaken {
+        status_member: &'static str,
+        status: &'static str,
+    },
     /// The call reaches the lookup BEHIND the guard, which answers its own modelled fault.
     Fault { status: u16, code: &'static str },
 }
@@ -340,6 +345,7 @@ async fn a_delete_that_names_neither_final_snapshot_member_answers_one_fixed_sen
             params: owned(&[("DBInstanceIdentifier", "emu-nofinal-mysql")]),
             past_the_guard: PastTheGuard::DeleteTaken {
                 status_member: "DBInstanceStatus",
+                status: "deleting",
             },
         },
         DeleteCase {
@@ -348,6 +354,7 @@ async fn a_delete_that_names_neither_final_snapshot_member_answers_one_fixed_sen
             params: owned(&[("DBInstanceIdentifier", "EMU-NOFINAL-UPPER")]),
             past_the_guard: PastTheGuard::DeleteTaken {
                 status_member: "DBInstanceStatus",
+                status: "deleting",
             },
         },
         DeleteCase {
@@ -356,6 +363,7 @@ async fn a_delete_that_names_neither_final_snapshot_member_answers_one_fixed_sen
             params: owned(&[("DBInstanceIdentifier", "emu-nofinal-fresh")]),
             past_the_guard: PastTheGuard::DeleteTaken {
                 status_member: "DBInstanceStatus",
+                status: "deleting",
             },
         },
         DeleteCase {
@@ -364,6 +372,7 @@ async fn a_delete_that_names_neither_final_snapshot_member_answers_one_fixed_sen
             params: owned(&[("DBClusterIdentifier", "emu-nofinal-aurora")]),
             past_the_guard: PastTheGuard::DeleteTaken {
                 status_member: "Status",
+                status: "available",
             },
         },
         DeleteCase {
@@ -372,6 +381,7 @@ async fn a_delete_that_names_neither_final_snapshot_member_answers_one_fixed_sen
             params: owned(&[("DBClusterIdentifier", "emu-nofinal-docdb")]),
             past_the_guard: PastTheGuard::DeleteTaken {
                 status_member: "Status",
+                status: "available",
             },
         },
         DeleteCase {
@@ -420,13 +430,16 @@ async fn a_delete_that_names_neither_final_snapshot_member_answers_one_fixed_sen
         let mut params = row.params.clone();
         params.push(("SkipFinalSnapshot", "true".to_string()));
         match row.past_the_guard {
-            PastTheGuard::DeleteTaken { status_member } => {
+            PastTheGuard::DeleteTaken {
+                status_member,
+                status: expected,
+            } => {
                 let taken = expect_ok(case, call(&router, row.action, &params).await);
                 let status = text(&taken, status_member);
                 assert_eq!(
-                    status, "deleting",
+                    status, expected,
                     "case {case:?}: expected the accepted delete to report the resource as \
-                     deleting, got {status:?} in {taken}"
+                     {expected:?}, got {status:?} in {taken}"
                 );
             }
             PastTheGuard::Fault { status, code } => {

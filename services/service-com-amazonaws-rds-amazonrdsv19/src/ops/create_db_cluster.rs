@@ -721,10 +721,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         // `DBSubnetGroupName`: "Must match the name of an existing DB subnet group." It is
         // folded the way `CreateDBSubnetGroup` stores it, and resolved in the store below.
-        let db_subnet_group_name = input
+        let named_subnet_group_name = input
             .db_subnet_group_name
             .as_ref()
             .map(|name| name.to_ascii_lowercase());
+        // Where the cluster is PLACED: the group the request named, or — "If there is no DB
+        // subnet group, then it is a non-VPC DB instance", and every cluster this operation
+        // creates is in the account's VPC — the DB subnet group the real service provides
+        // alongside that VPC ([`crate::state::DEFAULT_DB_SUBNET_GROUP`]). A cluster placed
+        // there is placed in a group that resolves, so the member reports it rather than
+        // leaving a client to guess where the cluster's subnets are.
+        let db_subnet_group_name = Some(
+            named_subnet_group_name
+                .clone()
+                .unwrap_or_else(|| crate::state::DEFAULT_DB_SUBNET_GROUP.to_string()),
+        );
         let key = (region.clone(), identifier.clone());
         // What this create is REFUSED for, and what resolving the request's references
         // produced, decided under the store's guard — which is then released, because
@@ -739,7 +750,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // resource type's modelled not-found fault: a create AWS would never have
             // accepted must leave no cluster behind for a later call to find.
             let mut named_subnet_group = None;
-            if let Some(name) = &db_subnet_group_name {
+            if let Some(name) = &named_subnet_group_name {
                 let Some(group) = store.resolve_db_subnet_group(&region, name) else {
                     return Err(CreateDBClusterErrorModeled::DBSubnetGroupNotFoundFault(
                         DBSubnetGroupNotFoundFault {
@@ -1005,6 +1016,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into());
             }
         }
+        // `StorageEncrypted` / `KmsKeyId`: a cluster created with encryption turned on and
+        // no key named is encrypted under the account's default key for this service, so
+        // that key's identifier is what the cluster carries — resolved through the same KMS
+        // this emulator mounts, with the guard released, like the accessibility check above.
+        let storage_encrypted = input.storage_encrypted.unwrap_or(false);
+        let kms_key_id = crate::state::storage_encryption_key_id(
+            ctx,
+            &region,
+            input.kms_key_id.clone(),
+            storage_encrypted,
+        )
+        .await;
         // `VpcSecurityGroupIds`: "A list of EC2 VPC security groups to associate with this
         // DB cluster", which are Amazon EC2's resources — so each one the request names is
         // resolved against EC2 over the in-process callback, which cannot be done under the
@@ -1176,8 +1199,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `EnablePerformanceInsights` / `EnableLocalWriteForwarding` /
             // `EnableGlobalWriteForwarding` each turn something ON that the request asks
             // for, so a cluster created without them has it off.
-            storage_encrypted: input.storage_encrypted.unwrap_or(false),
-            kms_key_id: input.kms_key_id,
+            storage_encrypted,
+            kms_key_id,
             // "The storage type isn't returned when you set it to `aurora`" — the Aurora
             // default, and the sibling control planes' own member says the same of its
             // `standard` — so only a storage type the cluster was really created with,

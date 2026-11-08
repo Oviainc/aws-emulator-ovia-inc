@@ -1051,17 +1051,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // What this call ANSWERS with: the cluster with every change written onto it, in the
+        // status it carried when the call arrived. See the status block below for why that is
+        // the status the acknowledgement reports.
+        let db_cluster = store.cluster_to_wire(&record);
+
         if changed && takes_the_cluster_out_of_service {
-            // The cluster is out of service while this change is applied: RDS answers
-            // `modifying`, and it settles back to `available` on its own, until when no
-            // further modification is taken.
+            // The cluster is out of service while this change is applied: RDS reports it
+            // `modifying` from the next read on, and it settles back to `available` on its
+            // own, until when no further modification is taken. The envelope this call
+            // answers with is projected ABOVE, from the cluster as it stands with the change
+            // written on it and the status it still carried: the modification's own
+            // transition is not in effect while the acknowledgement is written, which is
+            // why the real service answers a modification with the status the cluster had.
             record.status = crate::state::DB_CLUSTER_STATUS_MODIFYING.to_string();
             record.pending_status = Some(crate::state::PendingStatus::in_a_moment(
                 crate::state::DB_CLUSTER_STATUS_AVAILABLE,
             ));
         }
 
-        let db_cluster = store.cluster_to_wire(&record);
         let renamed_key = (region, record.identifier.clone());
         store.db_clusters.insert(renamed_key.clone(), record);
         // A rename moves the cluster to a new key, and its engine endpoint moves with it:

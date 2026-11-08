@@ -235,14 +235,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The user already has a DB cluster snapshot with the given identifier" is the
         // modelled already-exists fault: a second snapshot under one identifier would
         // otherwise overwrite the first, losing the cluster state it holds.
-        if store
-            .db_cluster_snapshots
-            .contains_key(&(region.clone(), snapshot_key.clone()))
-        {
+        if store.holds_cluster_snapshot(&region, &snapshot_key) {
             return Err(
                 CreateDBClusterSnapshotErrorModeled::DBClusterSnapshotAlreadyExistsFault(
                     DBClusterSnapshotAlreadyExistsFault {
-                        message: Some(format!("DB cluster snapshot already exists: {snapshot_key}")),
+                        message: Some(crate::state::db_cluster_snapshot_already_exists_message(
+                            &snapshot_key,
+                        )),
                     },
                 )
                 .into(),
@@ -250,21 +249,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         // The region's manual cluster-snapshot quota, and the number of regions this store
         // keeps records for at all: the store cannot be grown without bound, and the
-        // modelled fault says exactly this — the same bound `CopyDBClusterSnapshot` writes
-        // under.
-        if store.cluster_snapshots_in(&region).len()
-            >= crate::state::DB_CLUSTER_SNAPSHOT_QUOTA_PER_REGION
-            || !store.has_room_for_region(&region)
-        {
+        // modelled fault says exactly this — the same bound `CopyDBClusterSnapshot` and the
+        // final snapshot `DeleteDBCluster` takes write under.
+        if store.cluster_snapshot_room_is_exhausted(&region) {
             return Err(
                 CreateDBClusterSnapshotErrorModeled::SnapshotQuotaExceededFault(
                     SnapshotQuotaExceededFault {
-                        message: Some(format!(
-                            "the request would exceed the allowed number of manual DB cluster \
-                             snapshots ({} per region, in at most {} regions)",
-                            crate::state::DB_CLUSTER_SNAPSHOT_QUOTA_PER_REGION,
-                            crate::state::MAX_REGIONS
-                        )),
+                        message: Some(crate::state::db_cluster_snapshot_quota_message()),
                     },
                 )
                 .into(),

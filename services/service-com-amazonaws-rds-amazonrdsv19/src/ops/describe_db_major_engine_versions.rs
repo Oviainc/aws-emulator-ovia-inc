@@ -479,6 +479,13 @@ const LIFECYCLE_CALENDAR: &[MajorVersionLifecycle] = &[
         "2028-11-30T00:00:00Z",
         Some("2031-11-30T00:00:00Z"),
     ),
+    lifecycle(
+        "aurora-postgresql",
+        "17",
+        "2025-04-24T00:00:00Z",
+        "2029-11-30T00:00:00Z",
+        Some("2032-11-30T00:00:00Z"),
+    ),
     // --- MariaDB ----------------------------------------------------------
     // Every MariaDB family carries the standard window alone; see
     // [`offers_extended_support`].

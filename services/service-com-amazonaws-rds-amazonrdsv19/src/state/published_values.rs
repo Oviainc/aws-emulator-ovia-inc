@@ -532,6 +532,16 @@ pub const DB_CLUSTER_STATUS_MODIFYING: &str = "modifying";
 /// AWS waiters poll for.
 pub const DB_CLUSTER_STATUS_DELETING: &str = "deleting";
 
+/// The status a DB cluster reports while a backup of it is being taken, as the published
+/// cluster-status list carries it (Amazon Aurora User Guide, "Viewing Amazon Aurora DB
+/// cluster status": `backing-up` — "the DB cluster is currently being backed up").
+///
+/// This service reaches it on one path: a `DeleteDBCluster` that asks for a final DB
+/// cluster snapshot takes that snapshot before the cluster goes, and the cluster is backing
+/// up while it is taken. Transient, like the statuses above — the clock owes the cluster
+/// [`DB_CLUSTER_STATUS_DELETING`] once the snapshot is made, and its removal after that.
+pub const DB_CLUSTER_STATUS_BACKING_UP: &str = "backing-up";
+
 /// The status a DB cluster reports while a stop is running, as the published cluster-status
 /// list carries it (Amazon Aurora User Guide, "Viewing Amazon Aurora DB cluster status").
 ///
@@ -1239,6 +1249,20 @@ pub fn check_db_instance_class(db_instance_class: &str) -> Result<(), String> {
 /// `db.<family>.<size>` (`DescribeOrderableDBInstanceOptions` offers it for the Aurora
 /// engines).
 pub const SERVERLESS_INSTANCE_CLASS: &str = "db.serverless";
+
+/// The Aurora Serverless v2 platform version a cluster configured with Serverless v2
+/// capacity runs on: `DBCluster$ServerlessV2PlatformVersion` is "the version of the Aurora
+/// Serverless V2 platform used by the DB cluster", a service-managed version AWS publishes
+/// for a Region and upgrades on its own, written as a whole number
+/// (`DescribeServerlessV2PlatformVersions$ServerlessV2PlatformVersion`: "Example: 3").
+///
+/// Reference data, like the engine-version catalogue: no request names it and nothing here
+/// chooses it per cluster, so every cluster this service holds that HAS a Serverless v2
+/// scaling configuration runs on the one version this emulator publishes — which is what
+/// the real service's "default platform version … the version used for new DB clusters"
+/// (`DescribeServerlessV2PlatformVersions$DefaultOnly`) is. A cluster with no Serverless v2
+/// capacity configured runs on no Serverless v2 platform and reports none.
+pub const DEFAULT_SERVERLESS_V2_PLATFORM_VERSION: &str = "4";
 
 /// Refuse a DB instance this service offers no orderable option for.
 ///

@@ -18,6 +18,10 @@ pub struct ClusterMembership {
     pub read_replica_identifiers: Vec<String>,
     /// `MultiAZ`: whether the member instances sit in more than one Availability Zone.
     pub multi_az: bool,
+    /// Whether a backup of the cluster is in flight — a snapshot OF it is still being taken
+    /// — which is the `backing-up` status the cluster reports while it lasts; see
+    /// [`DbClusterRecord::reported_status`].
+    pub backing_up: bool,
 }
 
 /// A stored DB cluster: everything the service persists about it.
@@ -195,7 +199,15 @@ impl DbClusterRecord {
         if self.pending_status.as_ref().is_some_and(|p| now >= p.due_at) {
             let pending = self.pending_status.take().expect("checked just above");
             match pending.change {
-                PendingChange::Status(status) => self.status = status,
+                PendingChange::Status(status) => {
+                    self.status = status;
+                    // A cluster that reaches `deleting` on the clock — the end of the final
+                    // snapshot a delete asked for — still owes the removal that delete
+                    // accepted, so the clock takes it from here.
+                    if self.status == DB_CLUSTER_STATUS_DELETING {
+                        self.pending_status = Some(PendingStatus::removal_in_a_moment());
+                    }
+                }
                 PendingChange::Removal => return true,
             }
         }
@@ -266,8 +278,21 @@ impl DbClusterRecord {
 
     /// Whether a delete has already been accepted for this cluster, so it is on its way
     /// out and nothing further can be done to it.
+    ///
+    /// A delete is accepted at once, whatever the cluster is DOING while it runs: one whose
+    /// request asked for a final DB cluster snapshot is backing that snapshot up and reaches
+    /// `deleting` after it ([`Self::begin_deletion_after_final_snapshot`]), so the question
+    /// is whether the record carries the delete — its status or the change the clock owes it
+    /// — and not only whether it reports `deleting` now.
     pub fn is_deleting(&self) -> bool {
-        self.status == DB_CLUSTER_STATUS_DELETING
+        if self.status == DB_CLUSTER_STATUS_DELETING {
+            return true;
+        }
+        match self.pending_status.as_ref().map(|pending| &pending.change) {
+            Some(PendingChange::Removal) => true,
+            Some(PendingChange::Status(status)) => status == DB_CLUSTER_STATUS_DELETING,
+            None => false,
+        }
     }
 
     /// Accept a delete: the cluster reports `deleting` from now on, and the clock owes
@@ -279,6 +304,32 @@ impl DbClusterRecord {
     pub fn begin_deletion(&mut self) {
         self.status = DB_CLUSTER_STATUS_DELETING.to_string();
         self.pending_status = Some(PendingStatus::removal_in_a_moment());
+    }
+
+    /// Accept a delete that takes a FINAL DB cluster snapshot first: "RDS creates a DB
+    /// cluster snapshot before it deletes the DB cluster", so the cluster is backing up
+    /// while that snapshot is taken, reaches [`DB_CLUSTER_STATUS_DELETING`] once it is made
+    /// ([`Self::settle`]) and leaves the store after that. The delete is accepted from this
+    /// call on either way ([`Self::is_deleting`]).
+    pub fn begin_deletion_after_final_snapshot(&mut self) {
+        self.status = DB_CLUSTER_STATUS_BACKING_UP.to_string();
+        self.pending_status = Some(PendingStatus::in_a_moment(DB_CLUSTER_STATUS_DELETING));
+    }
+
+    /// `Status`: the status the cluster REPORTS, which is the stored one plus what the
+    /// records around it say the cluster is doing.
+    ///
+    /// A cluster that is up reports `backing-up` while a backup of it is in flight ("the DB
+    /// cluster is currently being backed up", the published cluster-status list) — the
+    /// snapshot being taken is the work, so the status follows the snapshot record rather
+    /// than being written onto the cluster when one is asked for. A cluster in any other
+    /// stored status is doing THAT, and reports it: a cluster still being created, stopped,
+    /// modifying or on its way out is not described by the backup running inside it.
+    pub fn reported_status(&self, membership: &ClusterMembership) -> String {
+        if membership.backing_up && self.status == DB_CLUSTER_STATUS_AVAILABLE {
+            return DB_CLUSTER_STATUS_BACKING_UP.to_string();
+        }
+        self.status.clone()
     }
 
     /// Whether this cluster has an automated backup at all: "The number of days for which
@@ -439,7 +490,7 @@ impl DbClusterRecord {
             db_cluster_identifier: Some(self.identifier.clone()),
             db_cluster_arn: Some(self.arn()),
             db_cluster_resource_id: Some(self.resource_id.clone()),
-            status: Some(self.status.clone()),
+            status: Some(self.reported_status(membership)),
             engine: Some(self.engine.clone()),
             engine_version: self.engine_version.clone(),
             engine_mode: Some(self.engine_mode.clone()),
@@ -516,6 +567,15 @@ impl DbClusterRecord {
             performance_insights_kms_key_id: self.performance_insights_kms_key_id.clone(),
             performance_insights_retention_period: self.performance_insights_retention_period,
             serverless_v2_scaling_configuration: self.serverless_v2_scaling.clone(),
+            // "The version of the Aurora Serverless V2 platform used by the DB cluster":
+            // reported for a cluster that HAS Serverless v2 capacity configured, and for
+            // one only — a cluster with no such capacity runs on no Serverless v2 platform,
+            // which is what reporting nothing says. The version itself is the one this
+            // service publishes ([`DEFAULT_SERVERLESS_V2_PLATFORM_VERSION`]).
+            serverless_v2_platform_version: self
+                .serverless_v2_scaling
+                .as_ref()
+                .map(|_| DEFAULT_SERVERLESS_V2_PLATFORM_VERSION.to_string()),
             scaling_configuration_info: self.scaling_configuration.clone(),
             associated_roles: Some(self.associated_roles.clone()),
             domain_memberships: Some(
@@ -553,20 +613,17 @@ impl DbClusterRecord {
             db_system_id: self.db_system_id.clone(),
             upgrade_rollout_order: Some(DEFAULT_UPGRADE_ROLLOUT_ORDER.to_string()),
             // `StartActivityStream` is still a stub, so no cluster this service holds has
-            // a database activity stream running. The Amazon DocumentDB view of this front
-            // door carries the status under a member name of its own as well, so a cluster
-            // of that control plane's engine reports the one status under both names, as
-            // the recorded envelope does.
+            // a database activity stream running. The recorded cluster envelope of this
+            // front door carries the status under a member name of its own as well, for a
+            // cluster of EVERY engine it serves, so the one status is reported under both
+            // names.
             activity_stream_status: Some(ACTIVITY_STREAM_STOPPED.to_string()),
-            db_activity_stream_status: is_docdb_engine(&self.engine)
-                .then(|| ACTIVITY_STREAM_STOPPED.to_string()),
-            // The two capability flags the Amazon DocumentDB view reports on every cluster
-            // of its own engine, and only there: a cluster of another engine has no such
-            // capability to report on.
-            docdb_analytics_enabled: is_docdb_engine(&self.engine)
-                .then_some(DEFAULT_DOCDB_ANALYTICS_ENABLED),
-            custom_data_group_present: is_docdb_engine(&self.engine)
-                .then_some(DEFAULT_CUSTOM_DATA_GROUP_PRESENT),
+            db_activity_stream_status: Some(ACTIVITY_STREAM_STOPPED.to_string()),
+            // The two capability flags the recorded envelope carries on every cluster this
+            // front door reports, whatever its engine: neither capability is turned on for
+            // a cluster created here, which is what reporting them `false` says.
+            docdb_analytics_enabled: Some(DEFAULT_DOCDB_ANALYTICS_ENABLED),
+            custom_data_group_present: Some(DEFAULT_CUSTOM_DATA_GROUP_PRESENT),
             // "Indicates whether the DB cluster is a clone of a DB cluster owned by a
             // different Amazon Web Services account": nothing here clones one.
             cross_account_clone: Some(false),

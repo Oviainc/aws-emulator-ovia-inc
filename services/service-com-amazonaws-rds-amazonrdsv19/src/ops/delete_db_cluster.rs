@@ -1,20 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteDBCluster
-//! IMPLEMENTED: this operation accepts the delete of the stored DB cluster, answers with
-//! the cluster in the transient `deleting` status and retires the record, so every later
-//! read of the identifier is the modelled `DBClusterNotFoundFault` — the signal a client
-//! (and every AWS waiter) polls for. This is the ONLY file to touch for it.
+//! IMPLEMENTED: this operation accepts the delete of the stored DB cluster, takes the final
+//! DB cluster snapshot the request asked for, and retires the record, so every later read
+//! of the identifier is the modelled `DBClusterNotFoundFault` — the signal a client (and
+//! every AWS waiter) polls for. This is the ONLY file to touch for it.
 //!
-//! The records, the `deleting` status and the clock that removes the record live in
-//! [`crate::state`], shared with `CreateDBCluster` and `DescribeDBClusters`.
-//!
-//! Taking a FINAL DB CLUSTER SNAPSHOT is the one documented path this operation cannot
-//! serve: a DB cluster snapshot is a resource of its own, and this crate has no store for
-//! one — `CreateDBClusterSnapshot`, `DescribeDBClusterSnapshots` and
-//! `DeleteDBClusterSnapshot` are all still scaffolded — so a delete that asks for one is
-//! answered through the 501 channel rather than silently dropping the snapshot the caller
-//! asked to keep.
+//! The records, the transient statuses and the clock that removes the record live in
+//! [`crate::state`], shared with `CreateDBCluster` and `DescribeDBClusters`; the final
+//! snapshot is written into the same store `CreateDBClusterSnapshot` writes, so
+//! `DescribeDBClusterSnapshots` reports it once the cluster is gone.
 //!
 //! ## Shape of an operation
 //!
@@ -273,17 +268,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 MAX_FINAL_DB_SNAPSHOT_IDENTIFIER_LEN,
             )
             .map_err(DeleteDBClusterError::invalid_parameter_value)?;
-            // The request is well formed and asks for a DB cluster snapshot to OUTLIVE the
-            // cluster. Taking that final snapshot is not written yet, so the honest answer
-            // is the 501 channel: accepting the delete here would report a snapshot nothing
-            // took. The store the snapshot would be written to is the one
-            // `CreateDBClusterSnapshot` writes (`store.db_cluster_snapshots`), so this path
-            // is a stub of its own rather than a missing resource.
-            // `SkipFinalSnapshot=true` — the teardown path — is served below.
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "DeleteDBCluster with a FinalDBSnapshotIdentifier (taking a final DB cluster \
-                 snapshot)",
-            ));
         }
 
         // "The database can't be deleted when deletion protection is enabled"
@@ -379,17 +363,98 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
-        // Every refusal is behind us, so the delete is ACCEPTED from here: the cluster
-        // reports `deleting` and the clock owes its removal. The next read inside the span
-        // still sees `deleting`; every read after it is the `DBClusterNotFoundFault` above.
+        // Every refusal is behind us, so the delete is ACCEPTED from here.
+        //
+        // What the request asked for decides what the cluster is doing now. A delete that
+        // asks for a FINAL DB CLUSTER SNAPSHOT — "RDS creates a DB cluster snapshot before
+        // it deletes the DB cluster" — starts by taking that snapshot, so the cluster is
+        // backing up while it is taken and reaches `deleting` once it is made. A delete that
+        // skips it starts nothing synchronously: the cluster keeps the status it had, and the
+        // clock owes it `deleting` and then its removal. Either way the acknowledgement
+        // below reports the cluster as it stands when this call returns, and every read
+        // after it follows the record until the identifier names nothing and answers the
+        // `DBClusterNotFoundFault` above.
+        let final_snapshot = match &input.final_db_snapshot_identifier {
+            // "This parameter is stored as a lowercase string", the way
+            // `CreateDBClusterSnapshot` keys the snapshot it mints.
+            Some(named) => {
+                let snapshot_identifier = named.to_ascii_lowercase();
+                let snapshot_key = (region.clone(), snapshot_identifier.clone());
+                // "The user already has a DB cluster snapshot with the given identifier":
+                // the final snapshot is a manual DB cluster snapshot like any other, so it
+                // is held to the same two bounds `CreateDBClusterSnapshot` writes under —
+                // the ones `crate::state` states once for every operation that mints one.
+                if store.holds_cluster_snapshot(&region, &snapshot_identifier) {
+                    return Err(
+                        DeleteDBClusterErrorModeled::DBClusterSnapshotAlreadyExistsFault(
+                            DBClusterSnapshotAlreadyExistsFault {
+                                message: Some(
+                                    crate::state::db_cluster_snapshot_already_exists_message(
+                                        &snapshot_identifier,
+                                    ),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                if store.cluster_snapshot_room_is_exhausted(&region) {
+                    return Err(DeleteDBClusterErrorModeled::SnapshotQuotaExceededFault(
+                        SnapshotQuotaExceededFault {
+                            message: Some(crate::state::db_cluster_snapshot_quota_message()),
+                        },
+                    )
+                    .into());
+                }
+                let source = store
+                    .db_clusters
+                    .get(&key)
+                    .expect("the cluster was found above and the store is locked");
+                // `DBCluster$CopyTagsToSnapshot` — "indicates whether tags from the DB
+                // cluster are copied to snapshots of the DB cluster" — holds for the final
+                // snapshot as it does for one `CreateDBClusterSnapshot` takes.
+                let tags = if source.copy_tags_to_snapshot {
+                    source.tags.clone()
+                } else {
+                    Vec::new()
+                };
+                let snapshot = crate::state::DbClusterSnapshotRecord::from_cluster(
+                    source,
+                    // Whether the cluster has any DB instance in it, which decides the
+                    // storage the snapshot holds and the port it was taken on.
+                    !live_members.is_empty(),
+                    &snapshot_identifier,
+                    tags,
+                );
+                store.db_cluster_snapshots.insert(snapshot_key, snapshot);
+                true
+            }
+            None => false,
+        };
+        // The cluster as this call FOUND it, kept for the acknowledgement below.
+        let found = store
+            .db_clusters
+            .get(&key)
+            .expect("the cluster was found above and the store is locked")
+            .clone();
         let accepted = {
             let record = store
                 .db_clusters
                 .get_mut(&key)
                 .expect("the cluster was found above and the store is locked");
-            record.begin_deletion();
+            if final_snapshot {
+                record.begin_deletion_after_final_snapshot();
+            } else {
+                record.begin_deletion();
+            }
             record.clone()
         };
+        // What this call ANSWERS with: the cluster as it stands at the end of the call. A
+        // delete that takes a final snapshot is taking it now, so it answers the cluster
+        // backing up; a delete that skips the snapshot started nothing, so it answers the
+        // cluster as it found it — the `deleting` the record now carries is the status the
+        // NEXT read reports, which is where a waiter picks the delete up.
+        let answered = if final_snapshot { accepted } else { found };
         // A Multi-AZ DB cluster's members are terminated with it, as the operation
         // documents; each reports `deleting` and is removed by the same clock.
         for member in &live_members {
@@ -437,7 +502,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .retain(|member| *member != cluster_arn);
         }
 
-        let db_cluster = store.cluster_to_wire(&accepted);
+        let db_cluster = store.cluster_to_wire(&answered);
         // The delete is accepted and cannot be reverted, so the region's event log records
         // the cluster's deletion here, where it was accepted.
         store.record_event(

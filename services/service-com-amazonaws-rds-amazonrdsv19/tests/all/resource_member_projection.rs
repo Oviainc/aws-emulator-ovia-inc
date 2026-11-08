@@ -193,22 +193,19 @@ fn assert_cluster_members(case: &str, label: &str, cluster: &str, row: &ClusterC
         );
     }
 
-    // The members the Amazon DocumentDB view of this front door reports on a cluster of
-    // ITS engine, and only there: the two capability flags, and the activity-stream status
-    // under that view's own member name — which it carries BESIDE this model's own name
-    // for such a cluster, while a cluster of any other engine reports only this model's.
-    let docdb = state::is_docdb_engine(row.engine);
-    for (member, on_docdb, on_other) in [
-        ("DocdbAnalyticsEnabled", Some("false"), None),
-        ("CustomDataGroupPresent", Some("false"), None),
-        ("DBActivityStreamStatus", Some("stopped"), None),
-        ("ActivityStreamStatus", Some("stopped"), Some("stopped")),
+    // The members the recorded cluster envelope of this front door carries on every cluster
+    // it reports, whatever the engine: the two capability flags, and the activity-stream
+    // status under BOTH of the names the envelope carries it under.
+    for (member, expected) in [
+        ("DocdbAnalyticsEnabled", "false"),
+        ("CustomDataGroupPresent", "false"),
+        ("DBActivityStreamStatus", "stopped"),
+        ("ActivityStreamStatus", "stopped"),
     ] {
-        let expected = if docdb { on_docdb } else { on_other };
         let reported = optional_text(cluster, member);
         assert_eq!(
             reported.as_deref(),
-            expected,
+            Some(expected),
             "case {case:?}: expected {member} {expected:?} for engine {:?}, got {reported:?}",
             row.engine
         );

@@ -281,19 +281,31 @@ async fn modify_db_cluster_writes_every_named_setting_onto_the_stored_cluster() 
         let mut request = vec![("DBClusterIdentifier", "emu-modify-cluster")];
         request.extend_from_slice(params);
         let answered = expect_ok(case, call(&router, "ModifyDBCluster", &request).await);
-        // A modification the cluster's instances must be restarted for is acknowledged with
-        // the cluster already `modifying`, and the clock owes the return to `available`; one
-        // that needs no downtime leaves the cluster as it was.
+        // The acknowledgement reports the cluster as this call FOUND it: the transition a
+        // modification starts is not in effect while the answer is written, so the status it
+        // carries is the one the cluster still had.
+        let status = text(&answered, "Status");
+        assert_eq!(
+            status, DB_CLUSTER_STATUS_AVAILABLE,
+            "case {case:?}: expected the acknowledgement to report the status the cluster \
+             carried, got {status:?}"
+        );
+        // The transition is what the NEXT read reports: a modification the cluster's
+        // instances must be restarted for leaves the cluster `modifying` until the clock
+        // settles it back, and one that needs no downtime leaves it as it was.
         let expected_status = if *out_of_service {
             DB_CLUSTER_STATUS_MODIFYING
         } else {
             DB_CLUSTER_STATUS_AVAILABLE
         };
-        let status = text(&answered, "Status");
+        let during = text(
+            &describe_cluster(&router, "emu-modify-cluster").await,
+            "Status",
+        );
         assert_eq!(
-            status, expected_status,
+            during, expected_status,
             "case {case:?}: expected the cluster to report {expected_status} while the \
-             modification applies, got {status:?}"
+             modification applies, got {during:?}"
         );
         wait_for_settle();
 
@@ -417,11 +429,11 @@ async fn two_modifications_of_one_cluster_serialise() {
 
     // The first modification takes the cluster out of service — the `Port` its instances
     // accept connections on is one the engine has to be restarted to serve — so it leaves
-    // the cluster `modifying`; a second one arriving before the clock has settled it sees a
-    // state the operation cannot be performed in. One accepted, one refused — whichever
-    // order the two arrive in. Each modification carries a second, READ-BACK setting
-    // beside the port, because a cluster whose engine this emulator serves publishes the
-    // port its own listener answers on rather than the configured one.
+    // the cluster `modifying` from the next read on; a second one arriving before the clock
+    // has settled it sees a state the operation cannot be performed in. One accepted, one
+    // refused — whichever order the two arrive in. Each modification carries a second,
+    // READ-BACK setting beside the port, because a cluster whose engine this emulator serves
+    // publishes the port its own listener answers on rather than the configured one.
     let first = expect_ok(
         "the accepted modification",
         call(
@@ -437,8 +449,14 @@ async fn two_modifications_of_one_cluster_serialise() {
     );
     assert_eq!(
         text(&first, "Status"),
+        DB_CLUSTER_STATUS_AVAILABLE,
+        "case \"the accepted modification\": the acknowledgement reports the status the \
+         cluster carried: {first}"
+    );
+    assert_eq!(
+        text(&describe_cluster(&router, "emu-race-cluster").await, "Status"),
         DB_CLUSTER_STATUS_MODIFYING,
-        "case \"the accepted modification\": {first}"
+        "case \"the accepted modification\": the next read reports the cluster out of service"
     );
     for case in ["the first loser", "the second loser"] {
         expect_error(

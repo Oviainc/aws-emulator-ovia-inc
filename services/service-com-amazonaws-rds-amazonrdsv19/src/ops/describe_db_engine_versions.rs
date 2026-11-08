@@ -1485,6 +1485,28 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "16",
         "aurora-postgresql16",
         STATUS_AVAILABLE,
+        DefaultLevel::Major,
+        &AURORA_POSTGRESQL_15,
+    ),
+    // The current build of the Aurora PostgreSQL line, and so this engine's default: a
+    // family's rows have to reach the builds the engine is being created with TODAY (see
+    // the Aurora MySQL 3 row above), and a create that names no version provisions the
+    // ENGINE's default, which is the build the engine has moved to.
+    row(
+        "aurora-postgresql",
+        "17.4",
+        "17",
+        "aurora-postgresql17",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &AURORA_POSTGRESQL_15,
+    ),
+    row(
+        "aurora-postgresql",
+        "17.9",
+        "17",
+        "aurora-postgresql17",
+        STATUS_AVAILABLE,
         DefaultLevel::Engine,
         &AURORA_POSTGRESQL_15,
     ),

@@ -460,8 +460,9 @@ async fn a_delete_that_names_neither_snapshot_member_asks_for_one_of_them() {
             "case {case:?}: the refusal must name both members, got {message:?}"
         );
 
-        // Exactly one of them: served, and the cluster is on its way out. So the two
-        // refusals above are about the combination, not about deleting the cluster.
+        // Exactly one of them: served, and the delete is accepted — it answers the cluster
+        // as it FOUND it, and the cluster is on its way out from the next read on. So the
+        // two refusals above are about the combination, not about deleting the cluster.
         let body = expect_ok(
             case,
             call(
@@ -476,8 +477,22 @@ async fn a_delete_that_names_neither_snapshot_member_asks_for_one_of_them() {
         );
         let status = text(&body, "Status");
         assert_eq!(
-            status, "deleting",
+            status, "available",
             "case {case:?}: the delete that names one member is served, got {body}"
+        );
+        let during = expect_ok(
+            case,
+            call(
+                &router,
+                "DescribeDBClusters",
+                &params!["DBClusterIdentifier" => identifier],
+            )
+            .await,
+        );
+        let during_status = text(&during, "Status");
+        assert_eq!(
+            during_status, "deleting",
+            "case {case:?}: the next read reports the cluster on its way out, got {during}"
         );
     }
 }

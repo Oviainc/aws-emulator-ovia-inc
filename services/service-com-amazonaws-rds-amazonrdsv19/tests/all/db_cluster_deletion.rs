@@ -9,12 +9,12 @@
 //! the router keys on.
 //!
 //! The rule under test: a delete RETIRES the resource it names. `DeleteDBCluster` answers
-//! HTTP 200 reporting the cluster in the transient `deleting` status, the record then
-//! leaves the service, and every later read of that identifier is the modelled
-//! `DBClusterNotFoundFault` (HTTP 404) — so the delete-then-wait-for-gone idiom every AWS
-//! waiter is written around terminates. A cluster other records still depend on, or whose
-//! delete is already running, is refused with the modelled state fault and left exactly as
-//! it was.
+//! HTTP 200 reporting the cluster as the delete FOUND it, the cluster then reports the
+//! transient `deleting` status, the record leaves the service, and every later read of that
+//! identifier is the modelled `DBClusterNotFoundFault` (HTTP 404) — so the
+//! delete-then-wait-for-gone idiom every AWS waiter is written around terminates. A cluster
+//! other records still depend on, or whose delete is already running, is refused with the
+//! modelled state fault and left exactly as it was.
 //!
 //! The table below spans what the rule generalises over: both cluster TYPES
 //! `CreateDBCluster` documents (Aurora DB clusters and Multi-AZ DB clusters) across five
@@ -95,8 +95,7 @@ const MULTI_AZ_SETTINGS: &[(&str, &str)] = &[
     ("Iops", "1000"),
 ];
 
-/// `DeleteDBCluster`'s own `Status` for an accepted delete, and the one a read inside the
-/// span it owes reports.
+/// The `Status` a read inside the span the clock owes an accepted delete reports.
 const DELETING: &str = "deleting";
 
 /// `CreateDBCluster` with its two required members plus `extra`.
@@ -253,13 +252,16 @@ async fn a_delete_retires_the_cluster_and_the_read_then_answers_the_modelled_not
         );
         let status_in_response = text(&reported[0], "Status");
         assert_eq!(
-            status_in_response, DELETING,
-            "case {:?}: an accepted delete must report {DELETING:?}, got {status_in_response:?}",
-            row.case
+            status_in_response,
+            row.status.reported(),
+            "case {:?}: an accepted delete reports the cluster as it found it ({:?}), got \
+             {status_in_response:?}",
+            row.case,
+            row.status.reported()
         );
 
         // Inside the span the clock owes, the cluster is still readable and reports the
-        // same transient status the delete answered with.
+        // transient status the accepted delete moved it into.
         let during = reported_status(&router, row.identifier).await;
         assert_eq!(
             during.as_deref(),
@@ -457,8 +459,9 @@ async fn an_aurora_cluster_that_still_has_db_instances_is_refused_until_they_are
     );
     assert_eq!(
         text(&accepted, "Status"),
-        DELETING,
-        "the delete must be accepted once the members are gone, got {accepted}"
+        "available",
+        "the delete must be accepted once the members are gone, reporting the cluster as it \
+         found it, got {accepted}"
     );
     wait_for_settle();
     let after = reported_status(&router, "emu-dc-members").await;
@@ -501,8 +504,9 @@ async fn a_multi_az_cluster_delete_terminates_its_members() {
     );
     assert_eq!(
         text(&accepted, "Status"),
-        DELETING,
-        "the delete must be accepted for a Multi-AZ DB cluster with members, got {accepted}"
+        "available",
+        "the delete must be accepted for a Multi-AZ DB cluster with members, reporting the \
+         cluster as it found it, got {accepted}"
     );
     let member = expect_ok(
         "the member inside the deleting window",
@@ -755,26 +759,9 @@ async fn the_final_snapshot_members_are_refused_as_the_api_documents_them() {
         );
     }
 
-    // A well-formed request for a final DB cluster snapshot asks for a snapshot this
-    // operation does not take yet — that path is its own stub, while the snapshot a caller
-    // asks for directly is served by `CreateDBClusterSnapshot` — so it is answered through
-    // the 501 channel rather than accepted with the snapshot quietly dropped.
-    expect_error(
-        "a well-formed final DB cluster snapshot",
-        call(
-            &router,
-            "DeleteDBCluster",
-            &[
-                ("DBClusterIdentifier", "emu-dc-snapshot"),
-                ("FinalDBSnapshotIdentifier", "emu-dc-snapshot-final"),
-            ],
-        )
-        .await,
-        501,
-        "NotImplemented",
-    );
-
-    // Every refusal above left the cluster exactly as it was.
+    // A well-formed request for a final DB cluster snapshot is SERVED: the snapshot is taken
+    // before the cluster goes, which is what `db_cluster_snapshots` drives end to end. Every
+    // refusal above left the cluster exactly as it was.
     let untouched = reported_status(&router, "emu-dc-snapshot").await;
     assert_eq!(
         untouched.as_deref(),

@@ -39,6 +39,8 @@ mod db_cluster_create_record;
 mod db_cluster_deletion;
 #[path = "all/db_cluster_engine_endpoint.rs"]
 mod db_cluster_engine_endpoint;
+#[path = "all/db_cluster_envelope_members.rs"]
+mod db_cluster_envelope_members;
 #[path = "all/db_cluster_snapshots.rs"]
 mod db_cluster_snapshots;
 #[path = "all/db_cluster_subject_operations.rs"]
@@ -258,3 +260,8 @@ mod static_reference_catalogs;
 mod valid_db_instance_modifications;
 #[path = "all/wire_decimal_doubles.rs"]
 mod wire_decimal_doubles;
+// Declared because the build enforces that every file under `tests/all/` is: the suite this
+// names is an INERT placeholder (see its own docs) whose subject — the whole `DBCluster`
+// envelope — is asserted member by member by `db_cluster_envelope_members`.
+#[path = "all/zz_envelope_dump.rs"]
+mod zz_envelope_dump;
