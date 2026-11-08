@@ -24,11 +24,11 @@ use smithy_server_runtime::MultiServiceRouter;
 /// The Region every request signs for unless a case says otherwise. Deliberately not the
 /// emulator's default, so an association served here proves the Region came from the
 /// request's SigV4 credential scope.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// A second Region, to pin that an association is reachable only through the Region it was
 /// created in.
-const OTHER_REGION: &str = "us-east-1";
+pub(crate) const OTHER_REGION: &str = "us-east-1";
 
 /// A third Region, to pin that the store's own total guard spans every Region while the
 /// documented association limit is measured per Region.
@@ -39,7 +39,7 @@ const TARGET_PREFIX: &str = "AmazonSSM";
 
 /// A command document Systems Manager publishes whose every parameter carries a default,
 /// so a create that supplies none satisfies it (`state::PUBLISHED_DOCUMENTS`).
-const AGENT: &str = "AWS-UpdateSSMAgent";
+pub(crate) const AGENT: &str = "AWS-UpdateSSMAgent";
 
 /// A command document Systems Manager publishes that declares one parameter with no
 /// default, so a create has to supply a value for it (same catalogue).
@@ -51,14 +51,14 @@ const AUTOMATION: &str = "AWS-EnableS3BucketEncryption";
 
 /// A node id of the form the modelled `InstanceId` pattern admits (`i-` and 17
 /// characters), named by the deprecated `InstanceId` member and by a target.
-const NODE: &str = "i-0123456789abcdef0";
+pub(crate) const NODE: &str = "i-0123456789abcdef0";
 
 /// A second node id, of the shorter form the same pattern admits.
 const OTHER_NODE: &str = "i-0abc1234";
 
 /// A router with just this service mounted, and the engine it was mounted on — the handle
 /// a case reads the store through.
-fn service() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn service() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Signatures are not what these tests are about; the router still reads the SigV4
@@ -122,12 +122,12 @@ async fn call(router: &MultiServiceRouter, operation: &str, body: &Value) -> (u1
 }
 
 /// `CreateAssociation` with `body`, signed for [`REGION`].
-async fn create(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
+pub(crate) async fn create(router: &MultiServiceRouter, body: &Value) -> (u16, Value) {
     call(router, "CreateAssociation", body).await
 }
 
 /// The `AssociationDescription` of a create that must have succeeded.
-async fn created(router: &MultiServiceRouter, case: &str, body: &Value) -> Value {
+pub(crate) async fn created(router: &MultiServiceRouter, case: &str, body: &Value) -> Value {
     let (status, parsed) = create(router, body).await;
     assert_eq!(
         status, 200,
@@ -146,7 +146,7 @@ async fn describe_in_region(
 }
 
 /// The `AssociationDescription` a read of `body` must report.
-async fn described(router: &MultiServiceRouter, case: &str, body: &Value) -> Value {
+pub(crate) async fn described(router: &MultiServiceRouter, case: &str, body: &Value) -> Value {
     let (status, parsed) = describe_in_region(router, REGION, body).await;
     assert_eq!(
         status, 200,
@@ -157,7 +157,7 @@ async fn described(router: &MultiServiceRouter, case: &str, body: &Value) -> Val
 }
 
 /// The wire error code of a failure body (`__type`, without its namespace).
-fn error_code(body: &Value) -> String {
+pub(crate) fn error_code(body: &Value) -> String {
     let rendered = body["__type"].as_str().unwrap_or("<no __type>");
     rendered
         .split('#')
@@ -186,7 +186,7 @@ fn text(body: &Value, member: &str) -> String {
 /// `Creating` once the create has settled ([`associations::ASSOCIATION_CREATION_DELAY`]), so
 /// two reads taken at different instants are compared over everything else and the overview
 /// is asserted for what holds at EVERY instant ([`assert_progress_only`]).
-fn without_overview(description: &Value) -> Value {
+pub(crate) fn without_overview(description: &Value) -> Value {
     let mut stripped = description.clone();
     if let Some(members) = stripped.as_object_mut() {
         members.remove("Overview");
@@ -219,7 +219,7 @@ fn assert_progress_only(description: &Value, case: &str) {
 }
 
 /// How many associations the store holds, to pin that a refused create persisted nothing.
-fn stored_associations(engine: &Arc<engine::InMemoryEngine>) -> usize {
+pub(crate) fn stored_associations(engine: &Arc<engine::InMemoryEngine>) -> usize {
     engine
         .state::<ComAmazonawsSsmAmazonssmState>()
         .lock()
