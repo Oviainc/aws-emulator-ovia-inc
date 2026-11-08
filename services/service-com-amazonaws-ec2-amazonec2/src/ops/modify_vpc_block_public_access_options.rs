@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyVpcBlockPublicAccessOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyVpcBlockPublicAccessOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: puts the VPC Block Public Access mode of the Region the request was signed
+//! for to the one it names and answers the options now in effect, read back out of the store
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::vpc_block_public_access_options`]) so a
+//! `DescribeVpcBlockPublicAccessOptions` made after it reports exactly the same options.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyVpcBlockPublicAccessOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The options are left in the non-terminal `update-in-progress` state, the clock owing them
+//! `update-complete` one [`crate::state::TRANSITION_DELAY`] later.
+//!
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -146,18 +146,60 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyVpcBlockPublicAccessOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyVpcBlockPublicAccessOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::state;
+
+        // "The mode of VPC BPA" (`InternetGatewayBlockMode`), held to the modelled catalog
+        // and stored as the catalog's own word rather than the request's text. The member is
+        // modelled as that enum, so the boundary refuses a word outside it before this
+        // handler runs; resolving it here is what keeps request text out of the store.
+        let requested = input.internet_gateway_block_mode.as_str();
+        let Some(mode) = state::internet_gateway_block_mode(requested) else {
+            return Err(state::invalid_parameter_value(format!(
+                "Value ({requested}) for parameter internetGatewayBlockMode is invalid. \
+                 Valid values are {valid}",
+                valid = INTERNET_GATEWAY_BLOCK_MODE_VALUES.join(", "),
+            )));
+        };
+
+        // VPC BPA blocks resources "in VPCs and subnets that you own in a Region", so the
+        // Region the request was signed for is the one being modified and every other
+        // Region's options are left where they were.
+        let region = state::request_region(ctx.parts());
+
+        let store = state::require_service_state(&*self.engine)?;
+        let mut store = store.lock();
+
+        // The store holds these options for a bounded number of Regions, and the Region comes
+        // from the caller, so a request that would push it past that ceiling is refused rather
+        // than stored. A Region already recorded costs nothing.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyVpcBlockPublicAccessOptions"))
+        // This sits BEFORE the DryRun check the way the other account-level settings' own
+        // ceilings do: DryRun asks whether the request WOULD have succeeded, so a request this
+        // emulator could not have carried out is answered with that reason instead.
+        if store.would_exceed_vpc_block_public_access_option_regions(&region) {
+            return Err(crate::scaffolded::Scaffolded::request_limit_exceeded(format!(
+                "This emulator holds the VPC Block Public Access options of {} Regions, \
+                 which is as many as it stores",
+                state::MAX_VPC_BPA_OPTION_REGIONS
+            )));
+        }
+
+        // DryRun sits AFTER validation and BEFORE the write: the flag asks whether the request
+        // WOULD have succeeded, so one that would have succeeded leaves the options untouched.
+        // "If you have the required permissions, the error response is DryRunOperation"
+        // (`DryRun`).
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        // "Details related to the VPC Block Public Access (BPA) options"
+        // (`ModifyVpcBlockPublicAccessOptionsResult$VpcBlockPublicAccessOptions`): the options
+        // now in effect, read back OUT of the store rather than echoed from the request, so
+        // this answer says exactly what a `DescribeVpcBlockPublicAccessOptions` made after it
+        // reports.
+        let in_effect = store.set_vpc_block_public_access_options(&region, mode);
+        Ok(ModifyVpcBlockPublicAccessOptionsOutput {
+            vpc_block_public_access_options: Some(in_effect),
+        })
     }
 }

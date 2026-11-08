@@ -1,15 +1,13 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeVpcBlockPublicAccessOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeVpcBlockPublicAccessOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! IMPLEMENTED: reports this account's VPC Block Public Access options for the Region the
+//! request was signed for, out of the store
+//! ([`crate::state::ComAmazonawsEc2Amazonec2State::vpc_block_public_access_options`]) — the
+//! mode `ModifyVpcBlockPublicAccessOptions` put that Region into, or the default a Region it
+//! has never been called for sits in.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeVpcBlockPublicAccessOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -137,18 +135,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeVpcBlockPublicAccessOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeVpcBlockPublicAccessOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeVpcBlockPublicAccessOptions"))
+        use crate::state;
+
+        // VPC BPA blocks resources "in VPCs and subnets that you own in a Region", so the
+        // options this reports are the ones of the Region the request was signed for; every
+        // other Region's are left out of the answer rather than mixed into it.
+        let region = state::request_region(ctx.parts());
+
+        let store = state::require_service_state(&*self.engine)?;
+
+        // DryRun sits before the read: "If you have the required permissions, the error
+        // response is DryRunOperation" (`DryRun`), and every caller of this emulator is
+        // permitted, so a dry run reports that outcome and reads nothing. This operation
+        // takes no other parameter, so there is nothing else to validate first.
+        if input.dry_run.unwrap_or(false) {
+            return Err(state::dry_run_operation());
+        }
+
+        let mut store = store.lock();
+        // The clock-owed transition this read is allowed to apply — the same call every other
+        // describe of this crate makes: a Region a `ModifyVpcBlockPublicAccessOptions`
+        // answered as `update-in-progress` is `update-complete` once that update's due
+        // instant has passed, whether or not anybody called, so applying it here changes
+        // nothing a later caller would not have seen anyway.
+        store.materialize_due_transitions();
+
+        // "Details related to the options"
+        // (`DescribeVpcBlockPublicAccessOptionsResult$VpcBlockPublicAccessOptions`), read out
+        // of the store through the one projection the modify answers with too, so the two
+        // operations cannot report one Region's options differently.
+        Ok(DescribeVpcBlockPublicAccessOptionsOutput {
+            vpc_block_public_access_options: Some(store.vpc_block_public_access_options(&region)),
+        })
     }
 }

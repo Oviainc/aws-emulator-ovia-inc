@@ -2772,6 +2772,11 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// the module docs. Ordered by id, which is the order
     /// `DescribeVpcBlockPublicAccessExclusions` reports and pages over.
     pub vpc_block_public_access_exclusions: BTreeMap<String, VpcBlockPublicAccessExclusionRecord>,
+    /// This account's VPC Block Public Access OPTIONS, by Region — see the module docs. BPA
+    /// is a setting of a Region rather than a resource, so this is keyed by the Region the
+    /// request was signed for and a Region with no entry is one the account has never
+    /// modified.
+    pub vpc_block_public_access_options: BTreeMap<String, VpcBlockPublicAccessOptionsRecord>,
     /// Every import image task the account has started, by `ImportTaskId` — see the module
     /// docs. Ordered by id, which is the order `DescribeImportImageTasks` reports and pages
     /// over.
@@ -3378,6 +3383,9 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             ipam_routing_policy_registration_deltas: BTreeMap::new(),
             ipam_routing_policy_registration_delta_client_tokens: HashMap::new(),
             vpc_block_public_access_exclusions: BTreeMap::new(),
+            // A fresh account has modified no Region's VPC BPA options, so every Region
+            // reports the default state and the `off` mode without a record of its own.
+            vpc_block_public_access_options: BTreeMap::new(),
             import_image_tasks: BTreeMap::new(),
             import_image_task_client_tokens: HashMap::new(),
             // A fresh account has cancelled no import task, so the clock owes none of them

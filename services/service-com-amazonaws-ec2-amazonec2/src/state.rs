@@ -909,6 +909,21 @@
 //! instance's [`PendingTransition`] and a `pending` VPC's `available` move, applied by
 //! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`].
 //!
+//! ## VPC Block Public Access options
+//!
+//! [`ComAmazonawsEc2Amazonec2State::vpc_block_public_access_options`] holds the account's
+//! VPC BPA options for one Region as a [`VpcBlockPublicAccessOptionsRecord`], keyed by that
+//! Region: BPA is a SETTING of a Region rather than a resource, so there is no id to key it
+//! by and no describe to page over, and a Region with no record at all is one the account has
+//! never modified. The modelled shape both operations report is PROJECTED from the record
+//! ([`ComAmazonawsEc2Amazonec2State::vpc_block_public_access_options`]), the account id and
+//! Region it carries being facts of the request and the emulator rather than of the setting.
+//! `ModifyVpcBlockPublicAccessOptions` leaves the options in the non-terminal
+//! `update-in-progress` state, so the clock owes them `update-complete` one
+//! [`TRANSITION_DELAY`] later — the same span, off the same monotonic clock, as a
+//! `create-in-progress` exclusion's own move, applied by
+//! [`ComAmazonawsEc2Amazonec2State::materialize_due_transitions`].
+//!
 //! ## NAT gateways
 //!
 //! [`ComAmazonawsEc2Amazonec2State::nat_gateways`] holds the account's NAT gateways as the
@@ -2263,6 +2278,7 @@ mod store_image_tasks_and_route_servers;
 /// `crate::state::route_server_propagations_at` like any helper of this module.
 mod route_server_propagations;
 mod image_block_public_access_and_metadata_defaults;
+mod vpc_block_public_access_options;
 mod image_usage_report_store;
 mod capacity_billing_and_recycle_bins;
 mod ipam;
@@ -2323,6 +2339,7 @@ pub use ipam_pool_cidrs::*;
 pub use capacity_billing_and_recycle_bins::*;
 pub use image_usage_report_store::*;
 pub use image_block_public_access_and_metadata_defaults::*;
+pub use vpc_block_public_access_options::*;
 pub use store_image_tasks_and_route_servers::*;
 pub use route_server_propagations::*;
 pub use spot_instance_requests::*;

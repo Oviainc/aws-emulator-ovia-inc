@@ -15,6 +15,14 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The VPC Block Public Access OPTIONS of one Region: the mode
+// `ModifyVpcBlockPublicAccessOptions` puts it into, the default a Region no modify was made
+// for reports, the clock-owed `update-in-progress` -> `update-complete` move, and what each
+// of the two operations refuses without writing. Declared beside `prefix_lists` for the
+// reason the note above gives: the sorted neighbourhood and the tail of this file are where
+// every new ec2 suite inserts its lines.
+#[path = "all/vpc_block_public_access_options.rs"]
+mod vpc_block_public_access_options;
 // How this service refuses a request that violates a PUBLISHED parameter limit: the
 // page-size bounds of a paged describe, the instance-count range of a Capacity Reservation,
 // the order of a launch's two counts, the one attribute type a modify names, the attributes

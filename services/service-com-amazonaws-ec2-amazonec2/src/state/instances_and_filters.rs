@@ -793,6 +793,11 @@ impl ComAmazonawsEc2Amazonec2State {
                 record.pending = None;
             }
         }
+        // A Region's VPC BPA options a `ModifyVpcBlockPublicAccessOptions` answered as
+        // `update-in-progress` reach `update-complete` once that update's due instant has
+        // passed, whether or not anybody called — the same contract as the exclusion move
+        // above.
+        self.complete_due_vpc_block_public_access_option_updates(now);
         // An association `CreateLocalGatewayRouteTableVpcAssociation` answered as
         // `associating` reaches `associated` once its due instant has passed, whether or not
         // anybody called — the same contract as the `pending` VPC above.
