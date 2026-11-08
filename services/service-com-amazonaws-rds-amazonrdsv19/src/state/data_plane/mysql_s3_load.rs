@@ -811,16 +811,26 @@ pub fn load(
             .collect::<Vec<_>>()
             .join(", ")
     );
-    let inside_the_clients_transaction = database.in_transaction(&target);
+    let inside_the_clients_transaction = database.in_transaction(facts.connection_id);
     if !inside_the_clients_transaction {
-        database.execute(&target, "BEGIN", &[])?;
+        // The load's own transaction is one of this SESSION's, not the engine connection's,
+        // so the rows another session writes while it runs are no part of it.
+        database.begin_transaction(facts.connection_id);
     }
     let outcome = (|| -> Result<u64, EngineError> {
         let mut loaded = 0u64;
         for (_, body) in objects {
             for record in records(load, body)? {
                 let values = row_values(load, &record, columns.len());
-                database.execute(&target, &statement, &values)?;
+                // Loaded FOR the session, so a row this load wrote is one the client's own
+                // transaction can roll back, exactly as the other wire's bulk load does.
+                database.execute_for(
+                    facts.connection_id,
+                    &target,
+                    &super::wire_session::server_view(facts),
+                    &statement,
+                    &values,
+                )?;
                 loaded += 1;
             }
         }
@@ -831,11 +841,11 @@ pub fn load(
     }
     match outcome {
         Ok(loaded) => {
-            database.execute(&target, "COMMIT", &[])?;
+            database.commit_transaction(facts.connection_id);
             Ok(loaded)
         }
         Err(error) => {
-            let _ = database.execute(&target, "ROLLBACK", &[]);
+            let _ = database.rollback_transaction(facts.connection_id);
             Err(error)
         }
     }

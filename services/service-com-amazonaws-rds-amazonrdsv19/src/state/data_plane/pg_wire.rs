@@ -85,10 +85,11 @@ impl ::emulator_server::NativeHandler for PostgresWire {
 /// started. Dropping it ends the session's row in `pg_stat_ssl` and rolls back whatever
 /// it had not committed — on every path, including a severed connection.
 ///
-/// The teardown runs the two statements on the dropping thread rather than on a blocking
-/// task, because `Drop` cannot await: they are a single-row delete and a rollback on the
-/// instance's own connection, which is also why this is the one place the session's
-/// teardown can be guaranteed to happen at all.
+/// The session is taken out of the endpoint's registry on the dropping thread, so the next
+/// login is counted against `max_connections` correctly at once; the ENGINE work — the
+/// catalog row and the rollback of what this session never committed — goes to the blocking
+/// pool ([`wire_session::off_the_async_worker`]), because a drop runs on an async worker and
+/// `Drop` cannot await.
 struct Session {
     database: Arc<InstanceDatabase>,
     sessions: super::pg_sessions::SessionRegistry,
@@ -101,12 +102,17 @@ struct Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.sessions.ended(self.pid);
-        let _ = self.database.execute(
-            &self.name,
-            "DELETE FROM pg_stat_ssl WHERE pid = ?",
-            &[Some(self.pid.to_string())],
-        );
-        self.database.rollback_open_transaction();
+        let engine = Arc::clone(&self.database);
+        let name = self.name.clone();
+        let pid = self.pid;
+        wire_session::off_the_async_worker(move || {
+            let _ = engine.execute(
+                &name,
+                "DELETE FROM pg_stat_ssl WHERE pid = ?",
+                &[Some(pid.to_string())],
+            );
+            let _ = engine.rollback_transaction(pid);
+        });
     }
 }
 
@@ -337,7 +343,7 @@ async fn serve_session(
     // by, since it cancels nothing (see the cancel request above).
     key_data.extend_from_slice(&session_pid.to_be_bytes());
     send(&mut conn, b'K', &key_data).await?;
-    ready(&mut conn, &database_handle, &session_facts.database, false).await?;
+    ready(&mut conn, &database_handle, session_facts.connection_id, false).await?;
 
     // 5. The query protocols.
     let mut generation = context.generation.clone();
@@ -386,7 +392,7 @@ async fn serve_session(
                 ready(
                     &mut conn,
                     &database_handle,
-                    &session_facts.database,
+                    session_facts.connection_id,
                     failed_in_transaction,
                 )
                 .await?;
@@ -552,13 +558,13 @@ async fn serve_session(
             }
             // Sync.
             b'S' => {
-                if !database_handle.in_transaction(&session_facts.database) {
+                if !database_handle.in_transaction(session_facts.connection_id) {
                     failed_in_transaction = false;
                 }
                 ready(
                     &mut conn,
                     &database_handle,
-                    &session_facts.database,
+                    session_facts.connection_id,
                     failed_in_transaction,
                 )
                 .await?;
@@ -1157,6 +1163,11 @@ fn sqlstate(kind: EngineErrorKind) -> &'static str {
         EngineErrorKind::NotNullViolation => "23502",
         EngineErrorKind::CheckViolation => "23514",
         EngineErrorKind::ForeignKeyViolation => "23503",
+        // `lock_not_available` and `deadlock_detected`: a row another transaction holds,
+        // which a `NOWAIT` statement is refused for and which a cycle of waiting
+        // transactions is broken with.
+        EngineErrorKind::LockNotAvailable => "55P03",
+        EngineErrorKind::Deadlock => "40P01",
         EngineErrorKind::DataError => "22000",
         EngineErrorKind::Cancelled => "57014",
         // `program_limit_exceeded`: the statement asked for more than this endpoint
@@ -1231,14 +1242,14 @@ async fn fatal(
     error_response(conn, "FATAL", code, message).await
 }
 
-/// `ReadyForQuery` with the transaction status the engine is actually in.
+/// `ReadyForQuery` with the transaction status THIS SESSION is in.
 async fn ready(
     conn: &mut ::emulator_server::ListenerConn,
     database: &Arc<InstanceDatabase>,
-    name: &str,
+    session: u32,
     failed: bool,
 ) -> std::io::Result<()> {
-    let status = match (database.in_transaction(name), failed) {
+    let status = match (database.in_transaction(session), failed) {
         (true, true) => b'E',
         (true, false) => b'T',
         (false, _) => b'I',

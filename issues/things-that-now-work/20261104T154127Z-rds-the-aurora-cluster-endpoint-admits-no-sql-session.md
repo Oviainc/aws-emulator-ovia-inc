@@ -8,6 +8,44 @@ Issue-Commit: ed43c7c5e13b0f1212f82cf25816ea1e565f9817
 
 # rds: an Aurora PostgreSQL cluster endpoint admits no SQL session (split out of the two-cause report)
 
+## Resolution
+
+The cause is FIXED: an Aurora PostgreSQL cluster's endpoint now admits a SQL session and
+serves the PostgreSQL ENGINE BEHAVIOUR the check asserts on it.
+
+* The cluster's own engine endpoint is opened by `CreateDBCluster` and published as
+  `DBCluster$Endpoint`/`$Port` (`src/state/data_plane/cluster_endpoint.rs`), so a client
+  completes a TLS PostgreSQL session on it as the cluster's master user against the database
+  the create named.
+* A TRANSACTION is now the SESSION's rather than the database connection's
+  (`src/state/data_plane/session_transactions.rs`): two sessions hold two independent
+  transactions at once, and a `ROLLBACK` puts back the rows that session changed — the rows a
+  cascading foreign-key action took with them included — and nobody else's.
+* The rows a transaction has written or reserved are HELD against every other transaction
+  (`src/state/data_plane/row_locks.rs`, `src/state/data_plane/lock_plan.rs`): `SELECT … FOR
+  UPDATE`/`FOR SHARE` and their `NOWAIT`/`SKIP LOCKED` forms are served, a statement that
+  asked not to wait for a held row is refused `lock_not_available` (`55P03`), a waiting
+  statement is served once the holder ends, and a cycle of two waiting transactions ends with
+  exactly ONE victim told `deadlock_detected` (`40P01`).
+* A refused row NAMES the constraint it violated
+  (`src/state/data_plane/constraint_names.rs`): `duplicate key value violates unique
+  constraint "<name>"` (`23505`) and the two foreign-key sentences (`23503`), under the name
+  the client gave the constraint or the one PostgreSQL gives one it names itself.
+* The check's TEARDOWN no longer hangs: `DeleteDBInstance` required `SkipFinalSnapshot` or
+  `FinalDBSnapshotIdentifier` for every instance, including a DB CLUSTER MEMBER, which holds
+  no storage of its own and takes no final DB snapshot — a member's delete naming neither
+  member is now served (`src/ops/delete_db_instance.rs`).
+
+Pinned by `tests/all/aurora_engine_row_locks.rs` and `tests/all/cluster_member_deletion.rs`.
+
+What REMAINS for this check, and it is not this service crate's to serve: the check asserts
+`DBCluster$Port == 5432`, while the published port is the one the core assigned the
+listener — `Listeners::tcp_plaintext` (`vendor/server/src/listeners.rs`) takes no requested
+port and binds within `EMULATOR_LISTENER_PORT_RANGE`. That gap is filed as
+`issues/things-that-do-not-work/20261105T090000Z-rds-a-db-instance-publishes-the-listeners-port-not-the-requested-port.md`
+and `issues/things-that-do-not-work/20261106T031005Z-rds-7-net-new-causes-endpoint-port-publishes.md`,
+which carry that replay key, and it needs the core listener API to accept a port.
+
 > _Split out of `issues/things-that-now-work/20261104T154127Z-rds-2-net-new-causes-the-az-coverage.md`, whose cause 1 (the AZ-coverage refusal) is fixed. The cause below is NOT fixed; it keeps the original report's numbering, trace id and Issue-Key so it stays filed and replayable. It was identified against the code base at commit `ed43c7c5e13b0f1212f82cf25816ea1e565f9817`, so trace it back to the current code base._
 
 ## Operation

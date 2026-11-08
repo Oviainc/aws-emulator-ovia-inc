@@ -267,6 +267,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `InvalidParameterCombination` code RDS answers members that cannot hold together
         // with, naming them — the same answer `DeleteDBCluster` and `DeleteTenantDatabase`
         // give the same pair.
+        //
+        // An instance that is a MEMBER OF A DB CLUSTER is the exception, and it is the
+        // cluster's own shape that makes it one: a cluster member has no storage of its own
+        // — "Aurora DB clusters ... the data is held in the cluster volume", and a snapshot
+        // of that data is a DB CLUSTER snapshot, which `DeleteDBCluster` is what takes.
+        // There is therefore no final DB snapshot for this delete to create or to skip, and
+        // a request that names neither member is served: the member is deleted and the
+        // cluster's data stays with the cluster.
+        let a_cluster_member = store.db_instances[&key].db_cluster_identifier.is_some();
         let skip_final_snapshot = input.skip_final_snapshot.unwrap_or(false);
         match (skip_final_snapshot, &input.final_db_snapshot_identifier) {
             (true, Some(_)) => {
@@ -274,7 +283,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     crate::state::ONLY_ONE_FINAL_SNAPSHOT_MEMBER,
                 ));
             }
-            (false, None) => {
+            (false, None) if !a_cluster_member => {
                 return Err(DeleteDBInstanceError::invalid_parameter_combination(
                     crate::state::FINAL_SNAPSHOT_MEMBER_REQUIRED,
                 ));

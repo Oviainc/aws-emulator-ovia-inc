@@ -118,6 +118,11 @@ impl ::emulator_server::NativeHandler for MySqlWire {
 
 /// Rolls back whatever a session had not committed when it ends — on every path,
 /// including a severed connection — and takes the session out of the endpoint's registry.
+///
+/// The registry entry goes on the dropping thread, so the next login is counted against
+/// `max_connections` correctly at once; the ROLLBACK is engine work and goes to the blocking
+/// pool ([`wire_session::off_the_async_worker`]), because a drop runs on an async worker and
+/// `Drop` cannot await.
 struct Session {
     database: Arc<InstanceDatabase>,
     sessions: super::pg_sessions::SessionRegistry,
@@ -127,7 +132,11 @@ struct Session {
 impl Drop for Session {
     fn drop(&mut self) {
         self.sessions.ended(self.connection_id);
-        self.database.rollback_open_transaction();
+        let engine = Arc::clone(&self.database);
+        let connection_id = self.connection_id;
+        wire_session::off_the_async_worker(move || {
+            let _ = engine.rollback_transaction(connection_id);
+        });
     }
 }
 
@@ -269,7 +278,7 @@ async fn serve_session(
         &mut conn,
         sequence.wrapping_add(1),
         &database_handle,
-        &session_facts.database,
+        session_facts.connection_id,
         0,
         0,
     )
@@ -316,7 +325,7 @@ async fn serve_session(
                         &mut conn,
                         sequence.wrapping_add(1),
                         &database_handle,
-                        &session_facts.database,
+                        session_facts.connection_id,
                         0,
                         0,
                     )
@@ -352,7 +361,7 @@ async fn serve_session(
                     &mut conn,
                     sequence.wrapping_add(1),
                     &database_handle,
-                    &session_facts.database,
+                    session_facts.connection_id,
                     0,
                     0,
                 )
@@ -528,7 +537,7 @@ async fn serve_query(
             conn,
             sequence,
             database,
-            &facts.database,
+            facts.connection_id,
             answer.result.affected,
             answer.result.last_insert_id,
         )
@@ -538,7 +547,7 @@ async fn serve_query(
         conn,
         sequence,
         database,
-        &facts.database,
+        facts.connection_id,
         &answer.result,
         deprecate_eof,
     )
@@ -575,7 +584,7 @@ async fn serve_s3_load(
         .map_err(|error| std::io::Error::other(error.to_string()))?
     };
     match loaded {
-        Ok(loaded) => write_ok(conn, sequence, database, &facts.database, loaded, 0).await,
+        Ok(loaded) => write_ok(conn, sequence, database, facts.connection_id, loaded, 0).await,
         Err(error) => write_engine_error(conn, sequence, &error).await,
     }
 }
@@ -586,7 +595,7 @@ async fn write_result_set(
     conn: &mut ::emulator_server::ListenerConn,
     sequence: u8,
     database: &Arc<InstanceDatabase>,
-    name: &str,
+    session: u32,
     result: &super::sql_engine::ResultSet,
     deprecate_eof: bool,
 ) -> std::io::Result<()> {
@@ -604,7 +613,7 @@ async fn write_result_set(
     }
     if !deprecate_eof {
         sequence = sequence.wrapping_add(1);
-        write_packet(conn, sequence, &eof_packet(database, name)).await?;
+        write_packet(conn, sequence, &eof_packet(database, session)).await?;
     }
     for row in &result.rows {
         let mut payload = Vec::new();
@@ -619,10 +628,10 @@ async fn write_result_set(
     }
     sequence = sequence.wrapping_add(1);
     if deprecate_eof {
-        let payload = ok_payload(database, name, 0, 0, true);
+        let payload = ok_payload(database, session, 0, 0, true);
         write_packet(conn, sequence, &payload).await?;
     } else {
-        write_packet(conn, sequence, &eof_packet(database, name)).await?;
+        write_packet(conn, sequence, &eof_packet(database, session)).await?;
     }
     conn.flush().await
 }
@@ -792,6 +801,11 @@ fn statement_error(kind: EngineErrorKind) -> (u16, &'static str) {
         EngineErrorKind::NotNullViolation => (1048, "23000"),
         EngineErrorKind::CheckViolation => (3819, "HY000"),
         EngineErrorKind::ForeignKeyViolation => (1452, "23000"),
+        // `ER_LOCK_NOWAIT` and `ER_LOCK_DEADLOCK`: a row another transaction holds, which a
+        // `NOWAIT` statement is refused for and which a cycle of waiting transactions is
+        // broken with.
+        EngineErrorKind::LockNotAvailable => (3572, "HY000"),
+        EngineErrorKind::Deadlock => (1213, "40001"),
         EngineErrorKind::DataError => (1366, "HY000"),
         EngineErrorKind::Cancelled => (1317, "70100"),
         // `ER_UNKNOWN_ERROR`: the statement asked for more than this endpoint serves,
@@ -843,11 +857,11 @@ async fn write_ok(
     conn: &mut ::emulator_server::ListenerConn,
     sequence: u8,
     database: &Arc<InstanceDatabase>,
-    name: &str,
+    session: u32,
     affected: u64,
     last_insert_id: i64,
 ) -> std::io::Result<()> {
-    let payload = ok_payload(database, name, affected, last_insert_id, false);
+    let payload = ok_payload(database, session, affected, last_insert_id, false);
     write_packet(conn, sequence, &payload).await?;
     conn.flush().await
 }
@@ -856,7 +870,7 @@ async fn write_ok(
 /// `CLIENT_DEPRECATE_EOF`.
 fn ok_payload(
     database: &Arc<InstanceDatabase>,
-    name: &str,
+    session: u32,
     affected: u64,
     last_insert_id: i64,
     ends_result_set: bool,
@@ -864,23 +878,22 @@ fn ok_payload(
     let mut payload = vec![if ends_result_set { 0xfe } else { 0x00 }];
     put_length_encoded(&mut payload, affected);
     put_length_encoded(&mut payload, last_insert_id.max(0).unsigned_abs());
-    payload.extend_from_slice(&status_flags(database, name).to_le_bytes());
+    payload.extend_from_slice(&status_flags(database, session).to_le_bytes());
     payload.extend_from_slice(&0u16.to_le_bytes());
     payload
 }
 
 /// One `EOF` packet, for a client that did not ask for `CLIENT_DEPRECATE_EOF`.
-fn eof_packet(database: &Arc<InstanceDatabase>, name: &str) -> Vec<u8> {
+fn eof_packet(database: &Arc<InstanceDatabase>, session: u32) -> Vec<u8> {
     let mut payload = vec![0xfeu8];
     payload.extend_from_slice(&0u16.to_le_bytes());
-    payload.extend_from_slice(&status_flags(database, name).to_le_bytes());
+    payload.extend_from_slice(&status_flags(database, session).to_le_bytes());
     payload
 }
 
-/// The session's status flags: autocommit, and whether a transaction is open on the
-/// database it is connected to.
-fn status_flags(database: &Arc<InstanceDatabase>, name: &str) -> u16 {
-    if database.in_transaction(name) {
+/// The session's status flags: autocommit, and whether THIS SESSION has a transaction open.
+fn status_flags(database: &Arc<InstanceDatabase>, session: u32) -> u16 {
+    if database.in_transaction(session) {
         SERVER_STATUS_AUTOCOMMIT | SERVER_STATUS_IN_TRANS
     } else {
         SERVER_STATUS_AUTOCOMMIT

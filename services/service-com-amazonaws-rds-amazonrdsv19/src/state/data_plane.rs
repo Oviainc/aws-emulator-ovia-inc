@@ -26,6 +26,12 @@
 //!   from the cluster's own record;
 //! * [`sql_engine`] — the in-process SQLite database each of an instance's databases runs
 //!   its statements against;
+//! * [`session_transactions`] — the transaction each SESSION has open on it, and the rows
+//!   its `ROLLBACK` puts back;
+//! * [`row_locks`] — the rows those transactions hold against each other, and
+//!   [`lock_plan`] — which rows one statement asks for;
+//! * [`constraint_names`] — the constraint a refused row violated, named as the client's own
+//!   engine names it;
 //! * [`wire_session`] — what is shared by the two wires: the admission decision, the
 //!   server commands (`SHOW`, `SET`) and the session values a statement can read;
 //! * [`server_statements`] — the statements the server answers out of the instance's own
@@ -52,8 +58,10 @@ use tokio::sync::watch;
 use super::{ComAmazonawsRdsAmazonrdsv19State, DbInstanceRecord, RegionalKey};
 
 pub mod cluster_endpoint;
+pub mod constraint_names;
 pub mod dialect;
 pub mod iam_auth_token;
+pub mod lock_plan;
 pub mod mysql_s3_load;
 pub mod mysql_wire;
 pub mod pg_copy;
@@ -61,7 +69,9 @@ pub mod pg_grants;
 pub mod pg_server;
 pub mod pg_sessions;
 pub mod pg_wire;
+pub mod row_locks;
 pub mod server_statements;
+pub mod session_transactions;
 pub mod sql_engine;
 pub mod tls_probe;
 pub mod wire_session;
@@ -225,11 +235,15 @@ impl DbEngineEndpoint {
     ///
     /// What a restart of the database engine does: "Rebooting a DB instance results in a
     /// momentary outage" and a stopped instance serves nobody, so the connections an
-    /// engine held do not survive either. Each severed session rolls back the work it had
-    /// not committed ([`sql_engine::InstanceDatabase::rollback_open_transaction`]).
+    /// engine held do not survive either. The work none of them committed does not survive
+    /// it either: the engine's run ends, so every transaction still open is rolled back here
+    /// rather than waiting for each severed session's own teardown to get to it
+    /// ([`sql_engine::InstanceDatabase::rollback_open_transactions`], which is what each
+    /// session's teardown then finds nothing left to do).
     pub fn sever_sessions(&self) {
         let next = self.generation.borrow().wrapping_add(1);
         let _ = self.generation.send(next);
+        self.database.rollback_open_transactions();
     }
 }
 

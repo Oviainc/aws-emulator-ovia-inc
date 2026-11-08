@@ -15,6 +15,8 @@
 mod account_attributes;
 #[path = "all/already_exists_refusal_sentences.rs"]
 mod already_exists_refusal_sentences;
+#[path = "all/aurora_engine_row_locks.rs"]
+mod aurora_engine_row_locks;
 #[path = "all/aws_managed_group_catalog.rs"]
 mod aws_managed_group_catalog;
 #[path = "all/ca_certificate_material.rs"]
@@ -23,6 +25,8 @@ mod ca_certificate_material;
 mod certificate_override;
 #[path = "all/cluster_create_refusal_wording.rs"]
 mod cluster_create_refusal_wording;
+#[path = "all/cluster_member_deletion.rs"]
+mod cluster_member_deletion;
 #[path = "all/cluster_parameter_groups.rs"]
 mod cluster_parameter_groups;
 #[path = "all/cluster_parameter_value_range.rs"]

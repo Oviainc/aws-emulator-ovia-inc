@@ -21,7 +21,7 @@ use sqlparser::tokenizer::{Token, Tokenizer, Whitespace};
 use tokio::sync::watch;
 
 use super::sql_engine::{Cell, ColumnInfo, EngineError, EngineErrorKind, InstanceDatabase, ResultSet};
-use super::{dialect, server_statements, EngineWire};
+use super::{dialect, lock_plan, row_locks, server_statements, EngineWire};
 use crate::state::ComAmazonawsRdsAmazonrdsv19State;
 
 /// How many bytes of SQL one statement may carry, matching the engine's own statement
@@ -1140,6 +1140,23 @@ impl StatementAnswer {
     }
 }
 
+/// Run a session's teardown OFF the async worker it is dropping on.
+///
+/// A session ends when its connection future is dropped, which happens on a runtime worker,
+/// and its teardown is engine work: a row-by-row restore of whatever the session left
+/// uncommitted, taken behind the engine's own lock. CPU-bound work on a worker starves the
+/// runtime, and `Drop` cannot await, so the work is handed to the BLOCKING pool — where a
+/// statement of this endpoint runs anyway. With no runtime to hand (a drop outside one) it
+/// runs here instead, still bounded by the rollback's own deadline.
+pub fn off_the_async_worker(work: impl FnOnce() + Send + 'static) {
+    match ::tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn_blocking(work);
+        }
+        Err(_) => work(),
+    }
+}
+
 /// Run one statement for a session: a server command answered from this emulator's own
 /// state, or a statement handed to the SQL engine with the session's values substituted
 /// into it.
@@ -1205,12 +1222,151 @@ pub fn run_statement(
     // Where the statement's own names put it, and the statement as the engine reads it.
     let (target, stream) = resolve_qualifiers(database, facts, &stream)?;
     let prepared = dialect::render_for_engine(facts, &stream);
+    // The rows this statement locks, taken BEFORE it runs: a row another transaction holds
+    // is not this statement's to read for update or to write, and the locking clause the
+    // statement carried is served here rather than handed to an engine with no grammar for
+    // it.
+    let held = take_the_rows_it_locks(database, facts, &target, &prepared, params)?;
+    let prepared = held.engine_sql.unwrap_or(prepared);
     let result = database
-        .execute_as(&target, &server_view(facts), &prepared, params)
+        .execute_for(
+            facts.connection_id,
+            &target,
+            &server_view(facts),
+            &prepared,
+            params,
+        )
         .map_err(|error| {
-            server_statements::as_the_engine_words_it(facts.wire, &prepared, error)
-        })?;
-    Ok(StatementAnswer::new(verb, result))
+            let error = server_statements::as_the_engine_words_it(facts.wire, &prepared, error);
+            super::constraint_names::as_the_engine_names_it(
+                database, facts, &target, &prepared, error,
+            )
+        });
+    // The rows a statement WROTE are the rows its transaction has to be able to put back.
+    if result.is_ok() && held.writes {
+        database.note_changed_rows(facts.connection_id, &target, &held.rows);
+    }
+    // Outside a transaction the locks live for the statement: both engines release a row
+    // lock a statement took when the statement that is its own transaction ends.
+    if !database.in_transaction(facts.connection_id) {
+        database.locks().release_rows(facts.connection_id, &held.rows);
+    }
+    Ok(StatementAnswer::new(verb, result?))
+}
+
+/// What taking the rows a statement locks came to: the rows this session now holds, whether
+/// the statement writes them, and the statement the engine is to run for it.
+struct HeldRows {
+    rows: Vec<row_locks::RowKey>,
+    writes: bool,
+    /// The statement with its locking clause removed, for the statements that carried one.
+    engine_sql: Option<String>,
+}
+
+/// Take the row locks `sql` asks for, answering what the engine is to run and which rows
+/// this session now holds.
+///
+/// The rows are the statement's own ([`lock_plan`]). A statement that carried a locking
+/// CLAUSE is this server's to serve, so one whose rows it cannot identify — more of them than
+/// this endpoint locks, or a row query the engine will not run — is REFUSED rather than
+/// served with the clause dropped: answering `FOR UPDATE NOWAIT` with the rows another
+/// transaction holds would be worse than telling the client what this endpoint does not
+/// serve. A statement that carried no clause (an `UPDATE`, a `DELETE`) runs as it always did
+/// when its rows cannot be identified, because the lock it takes is the engine's own and
+/// implicit. The other refusals are the engine's own conditions — `NOWAIT` on a row another
+/// transaction holds, and a wait that would close a cycle, which ends this transaction as the
+/// engine ends the one it chooses.
+fn take_the_rows_it_locks(
+    database: &InstanceDatabase,
+    facts: &SessionFacts,
+    target: &str,
+    sql: &str,
+    params: &[Option<String>],
+) -> Result<HeldRows, EngineError> {
+    let Some(plan) = lock_plan::plan(facts.wire, sql) else {
+        return Ok(HeldRows {
+            rows: Vec::new(),
+            writes: false,
+            engine_sql: None,
+        });
+    };
+    let Some(ids) = database.row_ids(target, &server_view(facts), &plan.rows_sql, sql, params)
+    else {
+        if plan.carries_a_clause() {
+            return Err(unservable_clause(&plan));
+        }
+        return Ok(HeldRows {
+            rows: Vec::new(),
+            writes: false,
+            engine_sql: None,
+        });
+    };
+    let table = plan.table.to_ascii_lowercase();
+    let rows: Vec<row_locks::RowKey> = ids
+        .into_iter()
+        .map(|rowid| (target.to_string(), table.clone(), rowid))
+        .collect();
+    let deadline = super::sql_engine::statement_deadline(&server_view(facts)).0;
+    match database.locks().acquire(
+        facts.connection_id,
+        &rows,
+        plan.mode,
+        plan.policy,
+        deadline,
+    ) {
+        row_locks::LockOutcome::Granted(granted) => {
+            let ids: Vec<i64> = granted.iter().map(|(_, _, rowid)| *rowid).collect();
+            let engine_sql = plan.engine_sql(Some(&ids));
+            if plan.carries_a_clause() && engine_sql.is_none() {
+                database.locks().release_rows(facts.connection_id, &granted);
+                return Err(unservable_clause(&plan));
+            }
+            Ok(HeldRows {
+                engine_sql,
+                rows: granted,
+                writes: plan.writes,
+            })
+        }
+        row_locks::LockOutcome::Unavailable => Err(EngineError::new(
+            EngineErrorKind::LockNotAvailable,
+            format!("could not obtain lock on row in relation \"{}\"", plan.table),
+        )),
+        row_locks::LockOutcome::Deadlocked => {
+            // The engine that detects a deadlock ends ONE of the transactions in the cycle,
+            // and this is the one: its rows go back and its locks are let go, which is what
+            // lets the transactions it was waiting for finish.
+            let _ = database.rollback_transaction(facts.connection_id);
+            Err(EngineError::new(
+                EngineErrorKind::Deadlock,
+                "deadlock detected",
+            ))
+        }
+        row_locks::LockOutcome::TimedOut => Err(EngineError::new(
+            EngineErrorKind::Cancelled,
+            super::sql_engine::ENDPOINT_DEADLINE_CANCELLATION,
+        )),
+        row_locks::LockOutcome::TooMany => Err(EngineError::new(
+            EngineErrorKind::LimitExceeded,
+            format!(
+                "this endpoint holds at most {} locked rows at once",
+                row_locks::MAX_HELD_ROWS
+            ),
+        )),
+    }
+}
+
+/// What a client is told when its own locking clause cannot be served over the statement it
+/// sent: the rows the clause names could not be identified, so the clause is refused rather
+/// than dropped.
+fn unservable_clause(plan: &lock_plan::LockPlan) -> EngineError {
+    EngineError::new(
+        EngineErrorKind::LimitExceeded,
+        format!(
+            "this endpoint serves a row-locking clause over at most {} rows of one statement, \
+             and only where it can identify them in relation \"{}\"",
+            super::sql_engine::MAX_LOCKED_ROWS, plan.table
+        ),
+    )
 }
 
 /// The isolation level the session reports after a transaction-control statement, or `None`
@@ -1306,7 +1462,7 @@ fn catalogs_named(tokens: &[Token]) -> Vec<&'static str> {
 }
 
 /// What the server functions in this session's statement answer from.
-fn server_view(facts: &SessionFacts) -> super::sql_engine::ServerView {
+pub fn server_view(facts: &SessionFacts) -> super::sql_engine::ServerView {
     super::sql_engine::ServerView {
         settings: facts.all_settings(),
         postmaster_start_time: facts.runtime.postmaster_start_time,
@@ -1422,9 +1578,13 @@ pub fn describe_statement(
     let Ok((target, stream)) = resolve_qualifiers(database, facts, &stream) else {
         return Vec::new();
     };
-    database
-        .describe(&target, &dialect::render_for_engine(facts, &stream))
-        .unwrap_or_default()
+    let prepared = dialect::render_for_engine(facts, &stream);
+    // A locking clause is this server's to serve, not the engine's to plan: the columns a
+    // `SELECT … FOR UPDATE` produces are the columns of the same query without it.
+    let described = lock_plan::plan(facts.wire, &prepared)
+        .and_then(|plan| plan.engine_sql(None))
+        .unwrap_or(prepared);
+    database.describe(&target, &described).unwrap_or_default()
 }
 
 /// The server commands a client sends that are not queries over its own tables.

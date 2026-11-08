@@ -534,8 +534,8 @@ pub fn database_exists(database: &InstanceDatabase, facts: &SessionFacts, name: 
 /// Why the server answers these rather than the engine: with `autocommit` on — the default
 /// on both engines — a `COMMIT` with no transaction open is a SUCCESS, which is what every
 /// driver that commits after a statement batch depends on, and the embedded engine refuses
-/// it. The transaction itself is still the engine's: what this decides is whether the
-/// engine is asked to open or end one.
+/// it. The transaction is the SESSION's ([`super::session_transactions`]), so what this
+/// decides is whether this session's transaction is opened or ended.
 pub fn transaction_control(
     database: &InstanceDatabase,
     facts: &SessionFacts,
@@ -543,7 +543,8 @@ pub fn transaction_control(
 ) -> Result<Option<StatementAnswer>, EngineError> {
     let first = words.first().map(String::as_str).unwrap_or_default();
     let second = words.get(1).map(String::as_str).unwrap_or_default();
-    let open = database.in_transaction(&facts.database);
+    let session = facts.connection_id;
+    let open = database.in_transaction(session);
     match (first, second) {
         ("BEGIN", "" | "WORK" | "TRANSACTION" | "ISOLATION" | "READ" | "DEFERRABLE" | "NOT")
         | ("START", "TRANSACTION") => {
@@ -552,8 +553,8 @@ pub fn transaction_control(
                     // "Beginning a transaction causes any pending transaction to be
                     // committed", so the session is left in a new one.
                     EngineWire::MySql => {
-                        database.execute(&facts.database, "COMMIT", &[])?;
-                        database.execute(&facts.database, "BEGIN", &[])?;
+                        database.commit_transaction(session);
+                        database.begin_transaction(session);
                         StatementAnswer::new("BEGIN", ResultSet::changed(0, 0))
                     }
                     // PostgreSQL warns and stays in the transaction it is in.
@@ -567,7 +568,7 @@ pub fn transaction_control(
                     }
                 }));
             }
-            database.execute(&facts.database, "BEGIN", &[])?;
+            database.begin_transaction(session);
             Ok(Some(StatementAnswer::new("BEGIN", ResultSet::changed(0, 0))))
         }
         ("COMMIT", "" | "WORK" | "TRANSACTION" | "AND")
@@ -585,10 +586,14 @@ pub fn transaction_control(
             let chain = second == "AND"
                 && words.get(2).map(String::as_str).unwrap_or_default() == "CHAIN";
             if open {
-                database.execute(&facts.database, verb, &[])?;
+                if rollback {
+                    database.rollback_transaction(session)?;
+                } else {
+                    database.commit_transaction(session);
+                }
             }
             if chain {
-                database.execute(&facts.database, "BEGIN", &[])?;
+                database.begin_transaction(session);
             }
             if open {
                 return Ok(Some(StatementAnswer::new(verb, ResultSet::changed(0, 0))));

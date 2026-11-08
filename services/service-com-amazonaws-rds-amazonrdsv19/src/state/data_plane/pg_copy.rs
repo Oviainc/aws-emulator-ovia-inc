@@ -139,13 +139,14 @@ pub fn load(
     let text = String::from_utf8_lossy(data);
     let mut loaded = 0u64;
     // A `COPY` the client sent INSIDE a transaction of its own loads into that transaction:
-    // the rows are the client's to commit or roll back, and `COPY` opens nothing of its own
-    // (the engine has one transaction per database, so a second `BEGIN` would be refused).
-    // A `COPY` outside one is its own transaction, which is what makes "COPY stops
-    // operation at the first error" leave no rows behind.
-    let inside_the_clients_transaction = database.in_transaction(&facts.database);
+    // the rows are the client's to commit or roll back, so each row is loaded for the
+    // SESSION and recorded against the transaction it has open. A `COPY` outside one is its
+    // OWN transaction — one of this session's, not the engine connection's, so the rows of
+    // another session running at the same time are no part of it — which is what makes "COPY
+    // stops operation at the first error" leave no rows behind.
+    let inside_the_clients_transaction = database.in_transaction(facts.connection_id);
     if !inside_the_clients_transaction {
-        database.execute(&facts.database, "BEGIN", &[])?;
+        database.begin_transaction(facts.connection_id);
     }
     let outcome = (|| -> Result<u64, EngineError> {
         for line in text.split('\n') {
@@ -158,7 +159,13 @@ pub fn load(
                 continue;
             }
             let values = row_values(line, &columns)?;
-            database.execute(&facts.database, &statement, &values)?;
+            database.execute_for(
+                facts.connection_id,
+                &facts.database,
+                &super::wire_session::server_view(facts),
+                &statement,
+                &values,
+            )?;
             loaded += 1;
         }
         Ok(loaded)
@@ -170,11 +177,11 @@ pub fn load(
     }
     match outcome {
         Ok(loaded) => {
-            database.execute(&facts.database, "COMMIT", &[])?;
+            database.commit_transaction(facts.connection_id);
             Ok(loaded)
         }
         Err(error) => {
-            let _ = database.execute(&facts.database, "ROLLBACK", &[]);
+            let _ = database.rollback_transaction(facts.connection_id);
             Err(error)
         }
     }
