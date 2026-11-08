@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/call_preconditions.rs"]
 mod call_preconditions;
+#[path = "all/ended_transaction_sentence.rs"]
+mod ended_transaction_sentence;
 #[path = "all/json_record_values.rs"]
 mod json_record_values;
 #[path = "all/malformed_transaction_ids.rs"]
@@ -29,3 +31,5 @@ mod sql_data_api;
 mod state_roundtrip;
 #[path = "all/statement_names.rs"]
 mod statement_names;
+#[path = "all/transaction_id_classes.rs"]
+mod transaction_id_classes;

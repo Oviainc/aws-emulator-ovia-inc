@@ -147,10 +147,10 @@ fn postgresql_catalog_error(database: &str) -> String {
 /// of that form that some other cluster's `BeginTransaction` issued.
 ///
 /// Entirely fixed text, and a VALIDATION fault rather than a lookup miss: the id is not
-/// this resource's to resolve, so nothing is looked up and nothing is changed. The
-/// transaction it names may well still be running on the resource that issued it, which is
-/// what makes this a different answer from the one an id of this resource's own that
-/// resolves to nothing gets (`super::TRANSACTION_NOT_RUNNING_MESSAGE`).
+/// this resource's to resolve, so nothing is looked up and nothing is changed. That is a
+/// different answer from the one an id this resource COULD have issued and no running
+/// transaction answers to gets (`super::TRANSACTION_NOT_RUNNING_MESSAGE`), which is the
+/// transaction store's own — the separation a client branches on.
 const INVALID_TRANSACTION_ID_MESSAGE: &str = "Invalid transaction ID";
 
 /// Admit one call, or report the first leg of the chain that refuses it.

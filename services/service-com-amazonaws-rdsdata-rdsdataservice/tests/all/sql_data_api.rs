@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use service_com_amazonaws_rdsdata_rdsdataservice::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-const RESOURCE_ARN: &str = "arn:aws:rds:us-east-1:000000000000:cluster:demo";
+pub(crate) const RESOURCE_ARN: &str = "arn:aws:rds:us-east-1:000000000000:cluster:demo";
 const SECRET_ARN: &str = "arn:aws:secretsmanager:us-east-1:000000000000:secret:demo";
 
 /// One emulator with one Data API client pointed at it. The suites beside this
