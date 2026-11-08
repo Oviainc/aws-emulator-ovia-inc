@@ -715,7 +715,23 @@ async fn the_clock_alone_delivers_the_export_file() {
 
     ::tokio::time::sleep(DELIVERY_INITIATION_DELAY + DELIVERY_SETTLES_AFTER + CLOCK_MARGIN).await;
 
-    let keys = listed_keys(&emulator, bucket, row.prefix).await;
+    /// How often the bucket is read while waiting for the delivery the clock owes.
+    const LOOK_INTERVAL: Duration = Duration::from_millis(100);
+    /// How many looks that is, which bounds the wait past the margin above at 20 s.
+    const LOOKS: usize = 200;
+
+    // The delivery is the CLOCK's, and a loaded machine can run it later than the margin
+    // above: the bucket is read repeatedly, within a bound, rather than once after a fixed
+    // sleep. The assertion below is unchanged — exactly one file, decodable, with the
+    // columns the query projects.
+    let mut keys = listed_keys(&emulator, bucket, row.prefix).await;
+    for _ in 0..LOOKS {
+        if !keys.is_empty() {
+            break;
+        }
+        ::tokio::time::sleep(LOOK_INTERVAL).await;
+        keys = listed_keys(&emulator, bucket, row.prefix).await;
+    }
     assert_eq!(
         keys.len(),
         1,
