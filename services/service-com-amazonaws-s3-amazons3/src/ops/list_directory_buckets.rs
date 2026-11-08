@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListDirectoryBuckets
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListDirectoryBuckets`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListDirectoryBuckets::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Lists the DIRECTORY buckets of this account — "returns a list of all Amazon S3 directory
+//! buckets owned by the authenticated sender of the request" — paged by
+//! `MaxDirectoryBuckets` and resumed by `ContinuationToken`.
+//! Implemented here — this is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -155,20 +150,127 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListDirectoryBuckets` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListDirectoryBucketsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListDirectoryBuckets"))
+        // How many buckets this page may carry. `MaxDirectoryBuckets` is modelled
+        // `range {min 0, max 1000}`, so the boundary validator has already refused anything
+        // outside it and the clamp is what keeps this handler total rather than a second
+        // statement of that bound. A page size of ZERO is a page that carries no bucket,
+        // which is what the analogous listing of this service answers a `max-keys` of zero
+        // with ([`super::list_objects_v2`]): the page reports what it was asked for and the
+        // continuation token says there is more. Absent, the default page is the ceiling the
+        // member itself carries — "when the number is more than the count of buckets that
+        // are owned by an Amazon Web Services account, return all the buckets in response"
+        // (`ListDirectoryBucketsRequest$MaxDirectoryBuckets`), which is what that page does.
+        let page_limit = match input.max_directory_buckets {
+            Some(requested) => requested.clamp(0, MAX_DIRECTORY_BUCKETS_PER_PAGE) as usize,
+            None => DEFAULT_PAGE_SIZE,
+        };
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INTERNAL_ERROR_CODE,
+                crate::state::INTERNAL_ERROR_STATUS,
+                "the shared S3 store is unreachable from this engine",
+            )
+        })?;
+        let store = state.lock();
+        // The key this store mints and reads its page tokens under, taken off the store
+        // before its buckets are walked ([`crate::state::PagedListing`]).
+        let page_tokens = store.page_token_key();
+
+        // `DirectoryBucketToken` is `length {min 0}`, so an EMPTY continuation token is a
+        // legal value that names no cursor — the first page, exactly as if none had been
+        // sent. Every other value is read through the ONE token codec every paged listing of
+        // this service mints and reads with, so a token this store did not mint for THIS
+        // listing names no page and is refused rather than read as a position the caller
+        // chose.
+        let resume_at = match input.continuation_token.as_deref() {
+            Some(token) if !token.is_empty() => Some(
+                crate::state::decode_continuation_token(&page_tokens, LISTING, token).ok_or_else(
+                    || {
+                        crate::scaffolded::Scaffolded::unmodeled(
+                            crate::state::INVALID_ARGUMENT_CODE,
+                            crate::state::INVALID_ARGUMENT_STATUS,
+                            CONTINUATION_TOKEN_REFUSAL,
+                        )
+                    },
+                )?,
+            ),
+            _ => None,
+        };
+
+        let mut buckets: Vec<Bucket> = Vec::new();
+        let mut next_continuation_token: Option<String> = None;
+
+        // The store's bucket map is sorted, so this walk is already in ascending bucket-name
+        // order and a page's resume point is simply the next name in it. It reports the
+        // DIRECTORY buckets of this account alone: the general purpose ones are the listing
+        // `ListBuckets` serves, on its own endpoint
+        // ([`crate::state::ComAmazonawsS3Amazons3State::directory_account_buckets`]).
+        for (name, bucket) in store.directory_account_buckets() {
+            // The token's name is the first one this page owes, inclusive.
+            if resume_at.as_deref().is_some_and(|from| name < from) {
+                continue;
+            }
+            // Out of slots: this bucket starts the NEXT page, and its name is what the token
+            // hands back.
+            if buckets.len() >= page_limit {
+                next_continuation_token = Some(crate::state::encode_continuation_token(
+                    &page_tokens,
+                    LISTING,
+                    name,
+                ));
+                break;
+            }
+            buckets.push(Bucket {
+                name: Some(name.to_string()),
+                // "Date the bucket was created" — the instant the store recorded, not the
+                // instant of this read, so two listings report the same date.
+                creation_date: bucket.created_at().map(::aws_smithy_types::DateTime::from),
+                // "The BucketRegion response element is not part of the
+                // ListDirectoryBuckets Response Syntax" (this operation's own
+                // documentation).
+                bucket_region: None,
+                // "The Amazon Resource Name (ARN) of the S3 bucket" (`Bucket$BucketArn`),
+                // built from the bucket's own recorded kind and Region
+                // ([`crate::state::Bucket::arn`]) — the `s3express` ARN of a directory
+                // bucket, which is what lets a caller that has just listed one name it to
+                // another service.
+                bucket_arn: Some(bucket.arn(name)),
+            });
+        }
+
+        Ok(ListDirectoryBucketsOutput {
+            // The `<Buckets>` container is always present, holding one entry per bucket this
+            // page reports; an account with no directory bucket lists an empty one rather
+            // than omitting it.
+            buckets: Some(buckets),
+            // The NEXT page's cursor: this operation is `@paginated` with
+            // `inputToken: ContinuationToken, outputToken: ContinuationToken`
+            // (`smithy_query(query="operation",operation="ListDirectoryBuckets")`), so what
+            // a page hands back is the token the next call resumes at — absent exactly when
+            // this page reported the last directory bucket, which is how a paginating client
+            // knows it has them all.
+            continuation_token: next_continuation_token,
+        })
     }
 }
+
+/// The most buckets one page carries when the request names no `max-directory-buckets`: the
+/// ceiling `MaxDirectoryBuckets` itself carries (`range {min 0, max 1000}`,
+/// `smithy_query(query="operation",operation="ListDirectoryBuckets")`).
+const DEFAULT_PAGE_SIZE: usize = MAX_DIRECTORY_BUCKETS_PER_PAGE as usize;
+
+/// The most buckets one page may carry however large a `max-directory-buckets` asks for
+/// (`MaxDirectoryBuckets`'s own `range {min 0, max 1000}`).
+const MAX_DIRECTORY_BUCKETS_PER_PAGE: i32 = 1_000;
+
+/// The listing a `ContinuationToken` of this operation is minted and read under, so a token
+/// issued for another paged listing of this service names no page here
+/// ([`crate::state::PagedListing`], the ONE token codec they all share).
+const LISTING: crate::state::PagedListing = crate::state::PagedListing::DirectoryBuckets;
+
+/// The sentence a continuation token this operation did not mint is refused with, the one
+/// S3 states for a bad continuation token (the same refusal `ListBuckets` answers).
+const CONTINUATION_TOKEN_REFUSAL: &str = "The continuation token provided is incorrect";

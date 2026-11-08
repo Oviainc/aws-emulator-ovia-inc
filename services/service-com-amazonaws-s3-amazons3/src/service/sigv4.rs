@@ -217,6 +217,42 @@ pub(super) fn remember(request: &Request, addressed_bucket: Option<&str>) {
     });
 }
 
+/// The SigV4 credential scope `request` presents — `<access key id>/<date>/<region>/<AWS
+/// service>/aws4_request` — however it travelled, or `None` for a request that presents none
+/// this emulator can read.
+///
+/// The SPLITTING is `emulator_server::sigv4_credential_scope`'s, "the single source of SigV4
+/// scope parsing" this whole emulator reads a scope with (this service already reads a
+/// request's Region through it — [`crate::state::request_region`]), so the five fields, the
+/// `aws4_request` terminator and the emptiness checks are applied in exactly one place and a
+/// truncated or malformed scope names nothing. What this adds is WHERE the scope travelled: a
+/// presigned request carries it in `X-Amz-Credential` rather than in an `Authorization`
+/// header, which that parser reads none of, so the value this module's own query reader takes
+/// out of the query string is handed to the same parser in the one shape it reads.
+///
+/// `pub(super)`: the routing seam reads which ENDPOINT a request reached and which CREDENTIAL
+/// it is signed with from here, so nothing re-splits a credential scope.
+pub(super) fn credential_scope(request: &Request) -> Option<::emulator_server::SigV4Scope> {
+    let presented = match request.headers().get(http::header::AUTHORIZATION.as_str()) {
+        Some(header) => header.to_string(),
+        None => format!(
+            "{SIGV4_ALGORITHM} Credential={}",
+            query_parameter(wire::request_query(request.uri()), CREDENTIAL_PARAMETER)?
+        ),
+    };
+    let mut headers = ::http::HeaderMap::new();
+    headers.insert(
+        ::http::header::AUTHORIZATION,
+        ::http::HeaderValue::from_str(&presented).ok()?,
+    );
+    ::emulator_server::sigv4_credential_scope(&headers)
+}
+
+/// The query parameter a PRESIGNED request carries its credential scope in — the
+/// `X-Amz-`-prefixed spelling of the `Authorization` header's `Credential` field, which is
+/// how every SigV4 field travels on such a request.
+const CREDENTIAL_PARAMETER: &str = "X-Amz-Credential";
+
 /// The note [`remember`] recorded for the request this thread is serving, TAKEN: the note is
 /// request-scoped, so reading it is what ends it. A later refusal on this thread that was
 /// not preceded by this service's own routing of a request then reads nothing at all rather

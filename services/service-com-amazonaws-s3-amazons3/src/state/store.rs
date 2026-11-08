@@ -57,7 +57,7 @@ pub struct ComAmazonawsS3Amazons3State {
     /// [`Self::published_retained_bytes`].
     pub(super) published_versions: usize,
     /// The sessions `CreateSession` has vended and not released, as `credential id ->
-    /// the instant it expires`.
+    /// the session`.
     ///
     /// Kept because a session has a LIFETIME: "temporary security credentials are scoped to
     /// the bucket and expire after 5 minutes" (`CreateSession`'s own documentation), and a
@@ -66,9 +66,26 @@ pub struct ComAmazonawsS3Amazons3State {
     /// expired so the vending operation can forget them, and
     /// [`Self::record_vended_session`] bounds how many this process holds at once.
     ///
-    /// Private: the two methods below are the only way in or out, so the quota and the
+    /// Each record also carries what the session is SCOPED to — "temporary security
+    /// credentials are scoped to the bucket" — so a request presenting a session token can
+    /// be judged against the bucket that session was created for
+    /// ([`Self::session_for_token`]).
+    ///
+    /// Private: the methods below are the only way in or out, so the quota and the
     /// release cannot be applied in one place and skipped in another.
-    pub(super) vended_sessions: BTreeMap<String, SystemTime>,
+    pub(super) vended_sessions: BTreeMap<String, VendedSession>,
+    /// The renames this store has performed, as `client token -> (the instant it was
+    /// recorded, the rename)`.
+    ///
+    /// Kept because `RenameObject` "supports idempotency using a client token"
+    /// (`RenameObjectRequest$ClientToken`): a retry under the same token has to succeed
+    /// without renaming anything again, and one under the same token with other parameters
+    /// has to be refused — neither of which can be answered without the completed call.
+    ///
+    /// Private: `state/renames.rs` holds the two methods that read and write it, so the
+    /// bound on how many are remembered cannot be applied in one place and skipped in
+    /// another.
+    pub(super) completed_renames: BTreeMap<String, (SystemTime, CompletedRename)>,
     /// The names of the metadata tables that exist in the managed table bucket's namespace
     /// ([`METADATA_TABLE_NAMESPACE`]).
     ///
@@ -120,6 +137,7 @@ impl Default for ComAmazonawsS3Amazons3State {
             published_retained_bytes: 0,
             published_versions: 0,
             vended_sessions: BTreeMap::new(),
+            completed_renames: BTreeMap::new(),
             metadata_namespace_tables: BTreeSet::new(),
             page_tokens: ::service_common::page_tokens::PageTokenKey::new(),
         };
@@ -149,7 +167,7 @@ impl ComAmazonawsS3Amazons3State {
         let expired: Vec<String> = self
             .vended_sessions
             .iter()
-            .filter(|(_, expires_at)| **expires_at <= now)
+            .filter(|(_, session)| session.expires_at <= now)
             .map(|(id, _)| id.clone())
             .collect();
         for id in &expired {
@@ -167,10 +185,44 @@ impl ComAmazonawsS3Amazons3State {
     /// does. Read and written under the one guard the caller already holds, so two
     /// concurrent vends cannot both pass a bound only one of them fits in.
     pub fn record_vended_session(&mut self, id: &str, expires_at: SystemTime) -> bool {
+        self.record_session(
+            id,
+            VendedSession {
+                expires_at,
+                scope: None,
+            },
+        )
+    }
+
+    /// [`Self::record_vended_session`] for a session `CreateSession` vended: the same bound,
+    /// and the SCOPE the session was created with — the directory bucket it is for and the
+    /// token a Zonal endpoint request presents it with.
+    pub fn record_vended_session_on(
+        &mut self,
+        id: &str,
+        expires_at: SystemTime,
+        bucket: &str,
+        token: &str,
+    ) -> bool {
+        self.record_session(
+            id,
+            VendedSession {
+                expires_at,
+                scope: Some(SessionScope {
+                    bucket: bucket.to_string(),
+                    token: token.to_string(),
+                }),
+            },
+        )
+    }
+
+    /// The one way a session joins the store, so the bound is applied to every kind of
+    /// record ([`MAX_VENDED_SESSIONS`]).
+    fn record_session(&mut self, id: &str, session: VendedSession) -> bool {
         if self.vended_sessions.len() >= MAX_VENDED_SESSIONS {
             return false;
         }
-        self.vended_sessions.insert(id.to_string(), expires_at);
+        self.vended_sessions.insert(id.to_string(), session);
         true
     }
 
@@ -178,6 +230,68 @@ impl ComAmazonawsS3Amazons3State {
     /// so a request presenting it presents a credential the emulator ISSUED.
     pub fn holds_vended_session(&self, access_key_id: &str) -> bool {
         self.vended_sessions.contains_key(access_key_id)
+    }
+
+    /// What the session the credential `key_id` belongs to authorizes on the bucket named
+    /// `bucket` at `now`, or `None` when `key_id` names no scoped session at all — a
+    /// credential this rule has nothing to say about.
+    ///
+    /// The other half of "temporary security credentials are scoped to the bucket and expire
+    /// after 5 minutes": the scope and the expiry belong to the CREDENTIALS and not only to
+    /// the token they are presented with, so a request signed with a session's key pair
+    /// reaches the bucket that session was created for, while that session lives, and
+    /// nothing else. Read-only, and judged by the one verdict
+    /// [`Self::session_token_verdict`] answers, so a session is judged the same whichever of
+    /// its halves the request presented.
+    pub fn session_credential_verdict(
+        &self,
+        key_id: &str,
+        bucket: &str,
+        now: SystemTime,
+    ) -> Option<SessionTokenVerdict> {
+        let session = self.vended_sessions.get(key_id)?;
+        let scope = session.scope.as_ref()?;
+        if session.expires_at <= now {
+            return Some(SessionTokenVerdict::Expired);
+        }
+        Some(match scope.bucket == bucket {
+            true => SessionTokenVerdict::Authorized,
+            false => SessionTokenVerdict::OtherBucket,
+        })
+    }
+
+    /// What the session token `token` authorizes on the bucket named `bucket`, at `now`.
+    ///
+    /// Read-only, and the expiry is applied HERE rather than by releasing anything: "after
+    /// the expiration time, any calls that you make with those credentials will fail", so a
+    /// token whose session the clock has expired authorizes nothing, whether or not a later
+    /// vend has got round to forgetting it ([`Self::release_expired_sessions`]).
+    pub fn session_token_verdict(
+        &self,
+        token: &str,
+        bucket: &str,
+        now: SystemTime,
+    ) -> SessionTokenVerdict {
+        let named = self.vended_sessions.values().find(|session| {
+            session
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.token == token)
+        });
+        let Some(session) = named else {
+            return SessionTokenVerdict::Unknown;
+        };
+        if session.expires_at <= now {
+            return SessionTokenVerdict::Expired;
+        }
+        match session
+            .scope
+            .as_ref()
+            .is_some_and(|scope| scope.bucket == bucket)
+        {
+            true => SessionTokenVerdict::Authorized,
+            false => SessionTokenVerdict::OtherBucket,
+        }
     }
 
     /// Whether the managed table bucket's namespace already holds a metadata table named
@@ -397,6 +511,27 @@ impl ComAmazonawsS3Amazons3State {
     pub fn account_buckets(&self) -> impl Iterator<Item = (&str, &Bucket)> + '_ {
         self.buckets()
             .filter(|(_, bucket)| bucket.provisioned_by.is_none() && !bucket.aws_published)
+    }
+
+    /// Every GENERAL PURPOSE bucket of the caller's own S3 account, as `(name, bucket)` in
+    /// bucket-name order.
+    ///
+    /// [`Self::account_buckets`] less the DIRECTORY buckets: the two kinds of bucket are
+    /// listed by two different operations, each on its own endpoint — `ListBuckets`
+    /// "returns a list of all buckets owned by the authenticated sender of the request" and
+    /// "is not supported for directory buckets", while `ListDirectoryBuckets` "returns a
+    /// list of all Amazon S3 directory buckets owned by the authenticated sender" (their own
+    /// documentation) — so neither listing reports the other's buckets.
+    pub fn general_purpose_account_buckets(&self) -> impl Iterator<Item = (&str, &Bucket)> + '_ {
+        self.account_buckets()
+            .filter(|(_, bucket)| !bucket.is_directory())
+    }
+
+    /// Every DIRECTORY bucket of the caller's own S3 account, as `(name, bucket)` in
+    /// bucket-name order. See [`Self::general_purpose_account_buckets`].
+    pub fn directory_account_buckets(&self) -> impl Iterator<Item = (&str, &Bucket)> + '_ {
+        self.account_buckets()
+            .filter(|(_, bucket)| bucket.is_directory())
     }
 
     /// How many stored versions the caller-stored half of this store holds, which is what

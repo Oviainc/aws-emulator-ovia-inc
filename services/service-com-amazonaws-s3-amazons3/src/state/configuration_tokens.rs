@@ -1,15 +1,21 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The ONE continuation token every listing of a bucket's id-addressed configurations
-//! hands back, and the one reading of a token a caller hands in.
+//! The ONE continuation token every PAGED listing of this service hands back, and the one
+//! reading of a token a caller hands in.
+//!
+//! (The file keeps the name it was written under, when the four listings of a bucket's
+//! id-addressed configurations were the only pagers that minted one; nothing but the module
+//! path depends on it.)
 //!
 //! Each of those listings pages, and the token that resumes a truncated page is the
 //! service's to mint and the caller's to hand back unread: "the continuation token is an
 //! opaque value that Amazon S3 understands"
-//! (`ListBucketMetricsConfigurationsOutput$NextContinuationToken`), and "the token is
+//! (`ListBucketMetricsConfigurationsOutput$NextContinuationToken`), "the token is
 //! obfuscated and is not a usable value"
-//! (`ListBucketAnalyticsConfigurationsOutput$NextContinuationToken`). Two things follow,
-//! and neither is served by rendering the cursor itself:
+//! (`ListBucketAnalyticsConfigurationsOutput$NextContinuationToken`) and "ContinuationToken
+//! is obfuscated and is not a real bucket name"
+//! (`ListDirectoryBucketsRequest$ContinuationToken`). Two things follow, and neither is
+//! served by rendering the cursor itself:
 //!
 //! * a token must not be a plain rendering of the position it resumes at — a value whose
 //!   text IS a stored id invites a caller to compute the next one rather than round-trip
@@ -23,13 +29,13 @@
 //! ([`::service_common::page_tokens::PageTokenKey`], the workspace's one reading of that):
 //! no caller can produce the authenticator for a cursor of its own, and a token minted by
 //! another store — another process, a restarted one — names no page here either. The
-//! cursor is SCOPED to the listing it was issued for, so a token from one configuration
-//! family is not a cursor into another. Opaque, NOT confidential, exactly as that module
+//! cursor is SCOPED to the listing it was issued for, so a token from one listing is not a
+//! cursor into another. Opaque, NOT confidential, exactly as that module
 //! puts it: what a caller cannot do is make a token of its own.
 //!
-//! No page is kept on the side: the cursor is the first configuration id the page did not
-//! report, which is why every one of these listings walks its configurations in ascending
-//! id order.
+//! No page is kept on the side: the cursor is the first thing the page did not report — a
+//! configuration id, a bucket name — which is why every one of these listings walks what it
+//! reports in ascending order.
 
 use ::service_common::jwt::{decode_base64url, encode_base64url};
 
@@ -37,14 +43,17 @@ pub use ::service_common::page_tokens::PageTokenKey;
 
 /// The listing a continuation token was issued for.
 ///
-/// Named inside the token so a `NextContinuationToken` from one family's listing names no
+/// Named inside the token so a `NextContinuationToken` from one listing names no
 /// page of another's: the four families a bucket holds per-id configurations of, each bound
 /// at its own subresource (`?analytics`, `?metrics`, `?inventory`,
-/// `?intelligent-tiering`).
+/// `?intelligent-tiering`), and the account's DIRECTORY buckets, which pages by bucket name
+/// on its own endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ConfigurationListing {
+pub enum PagedListing {
     /// `ListBucketAnalyticsConfigurations`.
     Analytics,
+    /// `ListDirectoryBuckets`.
+    DirectoryBuckets,
     /// `ListBucketIntelligentTieringConfigurations`.
     IntelligentTiering,
     /// `ListBucketInventoryConfigurations`.
@@ -53,12 +62,14 @@ pub enum ConfigurationListing {
     Metrics,
 }
 
-impl ConfigurationListing {
-    /// The name this listing is authenticated under, inside the token. The subresource the
-    /// listing is bound at, which is one name per family and no part of any response.
+impl PagedListing {
+    /// The name this listing is authenticated under, inside the token. One name per listing
+    /// and no part of any response — the subresource a configuration listing is bound at,
+    /// and the resource the bucket listing reports.
     fn label(self) -> &'static str {
         match self {
             Self::Analytics => "analytics",
+            Self::DirectoryBuckets => "directory-buckets",
             Self::IntelligentTiering => "intelligent-tiering",
             Self::Inventory => "inventory",
             Self::Metrics => "metrics",
@@ -67,12 +78,13 @@ impl ConfigurationListing {
 }
 
 /// The separator between the listing a token was issued for and the position in it: a unit
-/// separator, which no subresource name and no configuration id carries
-/// ([`super::CONFIGURATION_ID_PATTERN`]), so the two halves of a cursor cannot run together.
+/// separator, which no listing's label and no cursor carries (no configuration id
+/// ([`super::CONFIGURATION_ID_PATTERN`]) and no bucket name admits it), so the two halves of
+/// a cursor cannot run together.
 const CURSOR_SEPARATOR: char = '\u{1f}';
 
-/// The `NextContinuationToken` that resumes a listing at `first_id_not_returned`
-/// (inclusive): the authenticated bytes of that position, rendered in base64url.
+/// The `NextContinuationToken` that resumes a listing at `first_not_returned` (inclusive):
+/// the authenticated bytes of that position, rendered in base64url.
 ///
 /// Base64 is the spelling an AWS continuation token has, in the URL-safe alphabet (RFC 4648
 /// §5) so the value survives the `continuation-token` query parameter of the next request
@@ -83,22 +95,22 @@ const CURSOR_SEPARATOR: char = '\u{1f}';
 /// instead of serving from a position the caller chose.
 pub fn encode_continuation_token(
     key: &PageTokenKey,
-    listing: ConfigurationListing,
-    first_id_not_returned: &str,
+    listing: PagedListing,
+    first_not_returned: &str,
 ) -> String {
     encode_base64url(&key.mint(&format!(
-        "{}{CURSOR_SEPARATOR}{first_id_not_returned}",
+        "{}{CURSOR_SEPARATOR}{first_not_returned}",
         listing.label()
     )))
 }
 
-/// The configuration id `token` resumes `listing` at (inclusive), or `None` for any value
+/// The position `token` resumes `listing` at (inclusive), or `None` for any value
 /// this store did not mint for that listing: one that is not base64url, one whose
 /// authenticator does not match the cursor it travels with, one issued for another
-/// family's listing, and one carrying no cursor at all.
+/// listing, and one carrying no cursor at all.
 pub fn decode_continuation_token(
     key: &PageTokenKey,
-    listing: ConfigurationListing,
+    listing: PagedListing,
     token: &str,
 ) -> Option<String> {
     let cursor = key.cursor_of(&decode_base64url(token)?)?;
@@ -118,18 +130,21 @@ mod tests {
         let key = PageTokenKey::new();
         let other_store = PageTokenKey::new();
         let listings = [
-            ConfigurationListing::Analytics,
-            ConfigurationListing::IntelligentTiering,
-            ConfigurationListing::Inventory,
-            ConfigurationListing::Metrics,
+            PagedListing::Analytics,
+            PagedListing::DirectoryBuckets,
+            PagedListing::IntelligentTiering,
+            PagedListing::Inventory,
+            PagedListing::Metrics,
         ];
         for listing in listings {
-            // Ids spanning what a configuration id may be: one character, every character
-            // class the id rule allows, and one at the published ceiling.
+            // Cursors spanning what one can be: one character, every character class a
+            // configuration id allows, one at the published ceiling, and a directory
+            // bucket's name.
             for id in [
                 "a".to_string(),
                 "Report.one-2_3".to_string(),
                 "z".repeat(MAX_CONFIGURATION_ID_CHARS),
+                "base--usw2-az1--x-s3".to_string(),
             ] {
                 let token = encode_continuation_token(&key, listing, &id);
                 assert_eq!(
@@ -188,7 +203,7 @@ mod tests {
             ("a minted token's shape", shaped),
         ] {
             assert_eq!(
-                decode_continuation_token(&key, ConfigurationListing::Metrics, &token),
+                decode_continuation_token(&key, PagedListing::Metrics, &token),
                 None,
                 "case {case}: expected no position for {token:?}"
             );

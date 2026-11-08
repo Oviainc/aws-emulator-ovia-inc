@@ -127,6 +127,10 @@ mod cli_download_legs;
 mod copy_source_header_envelopes;
 #[path = "all/directory_bucket_conditional_deletes.rs"]
 mod directory_bucket_conditional_deletes;
+#[path = "all/directory_bucket_listings.rs"]
+mod directory_bucket_listings;
+#[path = "all/directory_bucket_renames.rs"]
+mod directory_bucket_renames;
 #[path = "all/delete_marker_refusal_headers.rs"]
 mod delete_marker_refusal_headers;
 #[path = "all/directory_bucket_sessions_and_appends.rs"]
@@ -137,6 +141,8 @@ mod error_message_envelope;
 // `error_message_envelope`, which spans the same rule from the model's own catalog.
 #[path = "all/error_messages.rs"]
 mod error_messages;
+#[path = "all/express_session_tokens.rs"]
+mod express_session_tokens;
 #[path = "all/general_purpose_bucket_names.rs"]
 mod general_purpose_bucket_names;
 #[path = "all/global_condition_keys.rs"]

@@ -64,6 +64,9 @@
 // the request carries, and the account the request says owns the bucket — see
 // `service/authorization.rs`.
 pub mod authorization;
+// The S3 Express session token a Zonal endpoint request presents, and what it authorizes —
+// see `service/express_session.rs`.
+pub mod express_session;
 // The refusal a request addressing a bucket by a name S3 can address no bucket by earns, for
 // every operation of this service but the create — see `service/invalid_bucket_name.rs`.
 pub mod invalid_bucket_name;
@@ -129,6 +132,28 @@ const PEER_PATH_SEGMENTS: &[&str] = &["v20180820"];
 /// `s3` — the emulator's own signature verification already treats the two as one family —
 /// so a request carrying that scope is this service's, and is claimed as such.
 const S3_EXPRESS_SIGNING_NAME: &str = "s3express";
+
+/// Whether `req`'s SigV4 credential scope names the S3 EXPRESS signing name
+/// ([`S3_EXPRESS_SIGNING_NAME`]).
+///
+/// The scope is read through [`sigv4::credential_scope`], which reads it with the one parser
+/// this whole emulator reads a credential scope with, so a truncated or malformed scope names
+/// no endpoint at all. The signing name it carries is compared the way the framework's own
+/// routing key compares one — trimmed and case-insensitively, so `S3Express` and `s3express`
+/// name the same endpoint here and there.
+///
+/// It is what tells one endpoint of this model from another where the address cannot: a
+/// client of this emulator reaches every endpoint under one host, and the S3 Express control
+/// endpoint (`s3express-control.<region>.amazonaws.com`) and the general purpose one bind the
+/// same method and path for two different operations.
+fn signed_for_s3_express(req: &RtRequest) -> bool {
+    sigv4::credential_scope(req).is_some_and(|scope| {
+        scope
+            .service
+            .trim()
+            .eq_ignore_ascii_case(S3_EXPRESS_SIGNING_NAME)
+    })
+}
 
 /// The header a request announces the media type of its payload in, which is what tells a
 /// BROWSER-FORM upload from every other `POST` addressed to a bucket
@@ -715,6 +740,27 @@ fn published_refusal(violation: &Violation) -> Option<Refused> {
 /// speaks, and the refusal below is the same for every value of it.
 const SELECT_SUBRESOURCE: &str = "select";
 
+/// The query parameter the model's own URI patterns disambiguate two operations bound to one
+/// method and path by (`/?x-id=ListBuckets` against `/?x-id=ListDirectoryBuckets`).
+const DISCRIMINATOR_PARAMETER: &str = "x-id";
+
+/// The operation a root-path `GET` on the S3 EXPRESS control endpoint names, as the model's
+/// routing table keys it.
+const LIST_DIRECTORY_BUCKETS: &str = "ListDirectoryBuckets";
+
+/// Every query parameter the DIRECTORY bucket listing itself binds, plus the model's own
+/// discriminator: `ContinuationToken` `@httpQuery("continuation-token")` and
+/// `MaxDirectoryBuckets` `@httpQuery("max-directory-buckets")`
+/// (`smithy_query(query="operation",operation="ListDirectoryBuckets")`).
+///
+/// What tells that listing from a request that merely LOOKS root-path at this seam: a query
+/// naming anything else names another operation of this service.
+const DIRECTORY_BUCKET_LISTING_PARAMETERS: &[&str] = &[
+    DISCRIMINATOR_PARAMETER,
+    "continuation-token",
+    "max-directory-buckets",
+];
+
 /// Whether `query` — a request URI's query string — carries the parameter `name`, with or
 /// without a value. A subresource arrives as a bare flag (`?select`), so a reader that
 /// insisted on `=` would miss it.
@@ -1039,6 +1085,14 @@ fn front_door<Eng: Send + Sync + 'static>(
         post_object::POST_OBJECT,
         Box::new(post_object::PostObject::new(Arc::clone(engine))),
     );
+    // The refusal of a Zonal endpoint request whose S3 EXPRESS SESSION TOKEN authorizes
+    // nothing on the bucket it addressed, one entry per condition: the seam that decides
+    // which condition it is hands back a borrow of an operation this service already holds,
+    // so the three answers are built here rather than per request. See
+    // [`express_session`] for the rule and for why it is answered as an operation.
+    for (key, refusal) in express_session::SESSION_DENIED_KEYS {
+        table.add_operation(key, Box::new(express_session::SessionDenied::new(refusal)));
+    }
     // And the refusal a request earns for the bucket NAME it addresses, held here for the
     // same reason and under a key of the same kind
     // ([`invalid_bucket_name::REFUSE_INVALID_BUCKET_NAME`]): it stands in front of every
@@ -1180,6 +1234,83 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
                 .bucket(name)
                 .is_some_and(|bucket| !bucket.is_directory())
         })
+    }
+
+    /// Whether `req` is the listing of this account's DIRECTORY buckets rather than of its
+    /// general purpose ones.
+    ///
+    /// Two operations of this model are bound to `GET /` — `ListBuckets` at
+    /// `/?x-id=ListBuckets` and `ListDirectoryBuckets` at `/?x-id=ListDirectoryBuckets`
+    /// (`smithy_query(query="operation",operation="ListBuckets,ListDirectoryBuckets")`) —
+    /// and AWS tells them apart by the ENDPOINT the request reached: the directory-bucket
+    /// listing is served by `s3express-control.<region>.amazonaws.com` and the general
+    /// purpose one by `s3.<region>.amazonaws.com`. A client of this emulator reaches both
+    /// under one host, so the address cannot decide it and the `x-id` discriminator is one
+    /// AWS SDKs do not reliably put on the wire. What the request does carry is the SCOPE it
+    /// was signed for: the control endpoint's signing name is `s3express`
+    /// ([`signed_for_s3_express`]), and no other operation of this model is bound to the
+    /// root path, so a root-path request signed for it is this listing. The `x-id` the model
+    /// publishes is honoured too, for a client that does send it.
+    ///
+    /// The QUERY has to be this listing's own as well ([`DIRECTORY_BUCKET_LISTING_PARAMETERS`]):
+    /// a request addressing a bucket this emulator does NOT hold carries that bucket in its
+    /// host and nothing in its path-style address, so a Zonal `GET /{Bucket}?list-type=2`
+    /// against an absent directory bucket reaches this seam looking like a root-path request —
+    /// and a query naming another operation's subresource is that operation's request,
+    /// answered about the address it named, never this listing.
+    fn addresses_directory_bucket_listing(&self, req: &RtRequest) -> bool {
+        if req.method() != http::Method::GET {
+            return false;
+        }
+        if first_path_segment(&self.path_style_path(req)).is_some() {
+            return false;
+        }
+        let query = wire::request_query(req.uri());
+        let names_another_request = query
+            .split('&')
+            .filter(|parameter| !parameter.is_empty())
+            .map(|parameter| parameter.split('=').next().unwrap_or(parameter))
+            .any(|name| !DIRECTORY_BUCKET_LISTING_PARAMETERS.contains(&name));
+        if names_another_request {
+            return false;
+        }
+        signed_for_s3_express(req)
+            || query_value(query, DISCRIMINATOR_PARAMETER) == Some(LIST_DIRECTORY_BUCKETS)
+    }
+
+    /// The refusal `req`'s S3 EXPRESS SESSION earns, served as the operation that answers it,
+    /// or `None` for a request this rule has nothing to say about.
+    ///
+    /// A request addressing no bucket names nothing for a session to be scoped to, and one
+    /// that neither presents a session token nor is signed with a session's own key pair
+    /// presents no session at all. Everything else is judged against the sessions
+    /// `CreateSession` vended — "temporary security credentials are scoped to the bucket and
+    /// expire after 5 minutes" — on the request's address read in the PATH-STYLE form every
+    /// route of this service is bound in, so a virtual-hosted-style Zonal request (the form a
+    /// client addresses a directory bucket in) is judged about the bucket its host named.
+    ///
+    /// Read-only: the guard is taken, the verdict is read, and nothing is written.
+    fn refused_session_token(&self, req: &RtRequest) -> Option<&dyn ErasedOperation> {
+        let path = self.path_style_path(req);
+        let bucket = first_path_segment(&path)?;
+        let state = crate::state::service_state(&*self.engine)?;
+        let now = ::std::time::SystemTime::now();
+        // The TOKEN the request presents, judged against the session that carries it.
+        if let Some(token) = express_session::presented_token(req) {
+            let verdict = state.lock().session_token_verdict(token, bucket, now);
+            return self.door.get(express_session::denial_key(verdict)?);
+        }
+        // A request that presents no token may still be SIGNED with a session's own key
+        // pair, which carries the same scope and the same expiry: "temporary security
+        // credentials are scoped to the bucket and expire after 5 minutes", so such a
+        // request reaches the bucket its session was created for while that session lives.
+        // A credential that is not a session's says nothing, which leaves every other
+        // request of this service exactly as it was.
+        let key_id = sigv4::credential_scope(req)?.access_key_id;
+        let verdict = state
+            .lock()
+            .session_credential_verdict(&key_id, bucket, now)?;
+        self.door.get(express_session::denial_key(verdict)?)
     }
 
     /// Whether `req` is the BROWSER-FORM upload of an object: "the POST operation adds an
@@ -1552,8 +1683,20 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         sigv4::remember(req, first_path_segment(&self.path_style_path(req)));
         // A request addressing a bucket by a name S3 can address no bucket by is refused for
         // the NAME, whichever operation its address names; see
-        // [`Self::refuses_the_bucket_name`] and [`invalid_bucket_name`].
+        // [`Self::refuses_the_bucket_name`] and [`invalid_bucket_name`]. First, because a
+        // name no bucket can be addressed by is refused for itself before anything about the
+        // caller's session is asked.
         if let Some(refusal) = self.refuses_the_bucket_name(req) {
+            return Some(refusal);
+        }
+        // A Zonal endpoint request carries the session it acts under in its
+        // `x-amz-s3session-token` header, and may equally be signed with that session's own
+        // key pair; a session "scoped to the bucket" authorizes nothing on another one — so a
+        // session that does not cover the bucket this request addressed is refused here,
+        // whichever operation it addressed. The framework has already verified the request's
+        // SIGNATURE by the time it reaches this seam, so this refusal is only ever about the
+        // session. See [`express_session`].
+        if let Some(refusal) = self.refused_session_token(req) {
             return Some(refusal);
         }
         // A `?session` request against a bucket that HAS no session subresource — a general
@@ -1566,6 +1709,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
                 .entry
                 .routing_table()
                 .get(LISTING_WITHOUT_SUBRESOURCE);
+        }
+        // The listing of this account's DIRECTORY buckets, which shares its method and path
+        // with the listing of its general purpose ones and is told from it by the endpoint
+        // the request reached — see [`Self::addresses_directory_bucket_listing`]. Resolved
+        // before the model's routing table, which cannot tell two routes apart on a
+        // discriminator the request does not carry.
+        if self.addresses_directory_bucket_listing(req) {
+            return self.entry.routing_table().get(LIST_DIRECTORY_BUCKETS);
         }
         // The BROWSER-FORM upload of an object, which the model's routing table cannot name
         // at all: no operation is bound at `POST /{Bucket}`, so the request resolved to

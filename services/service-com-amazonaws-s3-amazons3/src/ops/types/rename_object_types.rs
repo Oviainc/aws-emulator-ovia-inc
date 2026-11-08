@@ -11,7 +11,16 @@ use super::*;
 
 smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 
-#[smithy_macros::smithy(shape = "com.amazonaws.s3#RenameObjectRequest")]
+// `skip_validation = ["RenameSource"]`: AWS does not enforce `RenameSource`'s `@pattern` at
+// the boundary for this member. The pattern (`^\/?.+\/.+$`) admits only a value carrying a
+// slash, while the operation itself is served for "an existing object's NAME as the source"
+// (`RenameObject`'s own documentation) — a key of the addressed bucket, which needs no slash
+// and which recorded behaviour shows S3 renaming. So the value's form is judged in the
+// handler, which is the only place that can tell a key the bucket holds from one it does not.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.s3#RenameObjectRequest",
+    skip_validation = ["RenameSource"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct RenameObjectInput {
     pub bucket: String,

@@ -14,6 +14,30 @@ use super::*;
 pub const NO_SUCH_BUCKET_CODE: &str = "NoSuchBucket";
 /// See [`NO_SUCH_BUCKET_CODE`].
 pub const NO_SUCH_BUCKET_MESSAGE: &str = "The specified bucket does not exist";
+/// [`NO_SUCH_BUCKET_MESSAGE`] as the DIRECTORY bucket surface words it: the same condition,
+/// terminated with a full stop.
+///
+/// The Zonal and `s3express-control` endpoints answer their own error documents, and the
+/// sentence they carry for this code ends in a full stop where the general purpose endpoint's
+/// does not — as recorded against `CreateSession`, whose only modelled error it is, for a
+/// directory-bucket name nothing holds. Read through [`no_such_bucket_message`], so the two
+/// surfaces cannot be worded differently in two places.
+pub const DIRECTORY_BUCKET_NO_SUCH_BUCKET_MESSAGE: &str = "The specified bucket does not exist.";
+
+/// The sentence a bucket named `bucket` that this emulator does not hold is refused with: the
+/// one the SURFACE that name belongs to words.
+///
+/// WHICH surface a name belongs to is read off the name itself, which is also what every SDK
+/// resolves the endpoint from: a name shaped `<base>--<zone-id>--x-s3` names a directory
+/// bucket ([`directory_bucket_zone`]) and no other name can be served by a Zonal or
+/// `s3express-control` endpoint at all. The ONE place that choice is made, so every operation
+/// that answers this code about a name nothing holds words it the same way.
+pub fn no_such_bucket_message(bucket: &str) -> &'static str {
+    match directory_bucket_zone(bucket).is_some() {
+        true => DIRECTORY_BUCKET_NO_SUCH_BUCKET_MESSAGE,
+        false => NO_SUCH_BUCKET_MESSAGE,
+    }
+}
 /// "The specified key does not exist." — what a read of an object no bucket holds
 /// answers with.
 pub const NO_SUCH_KEY_CODE: &str = "NoSuchKey";
@@ -323,6 +347,8 @@ pub const IF_NONE_MATCH_CONDITION: &str = "If-None-Match";
 /// See [`IF_MATCH_CONDITION`].
 pub const IF_UNMODIFIED_SINCE_CONDITION: &str = "If-Unmodified-Since";
 /// See [`IF_MATCH_CONDITION`].
+pub const IF_MODIFIED_SINCE_CONDITION: &str = "If-Modified-Since";
+/// See [`IF_MATCH_CONDITION`].
 pub const IF_MATCH_LAST_MODIFIED_TIME_CONDITION: &str = "x-amz-if-match-last-modified-time";
 /// See [`IF_MATCH_CONDITION`].
 pub const IF_MATCH_SIZE_CONDITION: &str = "x-amz-if-match-size";
@@ -338,6 +364,19 @@ pub const COPY_SOURCE_IF_UNMODIFIED_SINCE_CONDITION: &str =
 /// See [`IF_MATCH_CONDITION`] — the header the annotation operations bind their own
 /// conditional member from (`PutObjectAnnotationRequest$ObjectIfMatch`).
 pub const OBJECT_IF_MATCH_CONDITION: &str = "x-amz-object-if-match";
+/// See [`IF_MATCH_CONDITION`] — the four headers `RenameObject` binds its SOURCE conditions
+/// from (`smithy_query(query="operation",operation="RenameObject")` reports `SourceIfMatch:
+/// {httpHeader: "x-amz-rename-source-if-match"}` and the three beside it), which is the name
+/// the client wrote on the request it has to change.
+pub const RENAME_SOURCE_IF_MATCH_CONDITION: &str = "x-amz-rename-source-if-match";
+/// See [`RENAME_SOURCE_IF_MATCH_CONDITION`].
+pub const RENAME_SOURCE_IF_NONE_MATCH_CONDITION: &str = "x-amz-rename-source-if-none-match";
+/// See [`RENAME_SOURCE_IF_MATCH_CONDITION`].
+pub const RENAME_SOURCE_IF_MODIFIED_SINCE_CONDITION: &str =
+    "x-amz-rename-source-if-modified-since";
+/// See [`RENAME_SOURCE_IF_MATCH_CONDITION`].
+pub const RENAME_SOURCE_IF_UNMODIFIED_SINCE_CONDITION: &str =
+    "x-amz-rename-source-if-unmodified-since";
 /// The code S3 answers a read of a bucket that has no ownership controls associated with
 /// it, with HTTP 404 — the case `GetBucketOwnershipControls`'s own documentation describes
 /// ("A bucket doesn't have OwnershipControls settings in the following cases: … You've
@@ -777,6 +816,18 @@ pub const NOT_IMPLEMENTED_STATUS: u16 = 501;
 /// header class rather than the member, so nothing of the request is interpolated into it.
 pub const NOT_IMPLEMENTED_HEADER_MESSAGE: &str =
     "A header you provided implies functionality that is not implemented";
+
+/// The code S3 answers a request that asks a bucket for a PARAMETER its bucket type does not
+/// serve at all: `NotSupported`, HTTP 501.
+///
+/// Distinct from [`NOT_IMPLEMENTED_CODE`], which says the service has not implemented what
+/// the request implies: this one says the request asked for something this KIND of bucket
+/// does not have — a directory bucket's listing has no "start after this key", as recorded
+/// against `ListObjectsV2` on one. The model declares no shape for the code, so it travels
+/// through the unmodelled channel.
+pub const NOT_SUPPORTED_CODE: &str = "NotSupported";
+/// The HTTP status [`NOT_SUPPORTED_CODE`] is rendered with: 501, as recorded.
+pub const NOT_SUPPORTED_STATUS: u16 = 501;
 
 /// "The CORS configuration does not exist": the code `GetBucketCors` answers for a bucket
 /// no cors configuration has been set on, with HTTP 404 (Amazon S3 "Error responses").
@@ -1706,6 +1757,32 @@ pub const ACCESS_DENIED_CODE: &str = "AccessDenied";
 pub const ACCESS_DENIED_STATUS: u16 = 403;
 /// See [`ACCESS_DENIED_CODE`] — the text that same published list carries for it.
 pub const ACCESS_DENIED_MESSAGE: &str = "Access Denied";
+
+/// The code S3 answers a request presenting a security token that names nothing, with the
+/// status and the message that code carries (Amazon S3 "Error responses", list of error
+/// codes: "InvalidToken — The provided token is malformed or otherwise invalid", HTTP 400).
+///
+/// What an S3 EXPRESS session token no session of this emulator carries earns: nothing can be
+/// said about a session that was never vended — see `crate::service::express_session`.
+pub const INVALID_TOKEN_CODE: &str = "InvalidToken";
+/// See [`INVALID_TOKEN_CODE`].
+pub const INVALID_TOKEN_STATUS: u16 = 400;
+/// See [`INVALID_TOKEN_CODE`] — the text that same published list carries for it.
+pub const INVALID_TOKEN_MESSAGE: &str = "The provided token is malformed or otherwise invalid.";
+
+/// The code S3 answers a request presenting a security token whose lifetime has passed, with
+/// the status and the message that code carries (same published list: "ExpiredToken — The
+/// provided token has expired", HTTP 400).
+///
+/// What an S3 EXPRESS session the CLOCK has expired earns — "after the expiration time, any
+/// calls that you make with those credentials will fail" (`CreateSession`'s own
+/// documentation) — which is what tells a caller to take a new session rather than to fix its
+/// request.
+pub const EXPIRED_TOKEN_CODE: &str = "ExpiredToken";
+/// See [`EXPIRED_TOKEN_CODE`].
+pub const EXPIRED_TOKEN_STATUS: u16 = 400;
+/// See [`EXPIRED_TOKEN_CODE`] — the text that same published list carries for it.
+pub const EXPIRED_TOKEN_MESSAGE: &str = "The provided token has expired.";
 
 /// The message S3 refuses a request carrying no credential against a Requester Pays bucket
 /// with: "Anonymous users cannot invoke requests against Requester Pays buckets" — fixed

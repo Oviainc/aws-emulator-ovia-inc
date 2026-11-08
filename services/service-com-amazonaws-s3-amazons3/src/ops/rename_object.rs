@@ -1,26 +1,22 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RenameObject
-//! SCAFFOLDED, NOT IMPLEMENTED: a rename IN a directory bucket answers HTTP 501
-//! `NotImplemented` and asserts NOTHING about `RenameObject`'s real behaviour. Implement it
-//! here — this is the ONLY file to touch for this operation.
+//! Renames an object IN a directory bucket — "you can use RenameObject by specifying an
+//! existing object's name as the source and the new name of the object as the destination
+//! within the same directory bucket" — under the source and destination preconditions the
+//! request carries and the client token that makes a retry idempotent.
+//! Implemented here — this is the ONLY file to touch for this operation.
 //!
-//! What IS implemented is the answer a rename addressed to a GENERAL PURPOSE bucket earns,
-//! because that is not this operation's behaviour but a refusal of the `?renameObject`
-//! parameter itself: S3 serves a rename for directory buckets alone, so the parameter implies
-//! functionality a general purpose bucket's endpoint does not implement and the request is
-//! refused with HTTP 501 `NotImplemented` naming it
+//! What a rename addressed to a GENERAL PURPOSE bucket earns is a refusal of the
+//! `?renameObject` parameter itself rather than this operation's behaviour: S3 serves a
+//! rename for directory buckets alone, so the parameter implies functionality a general
+//! purpose bucket's endpoint does not implement and the request is refused with HTTP 501
+//! `NotImplemented` naming it
 //! ([`crate::service::object_write::DIRECTORY_BUCKET_ONLY_QUERY_PARAMETERS`], the catalog the
 //! object-write path is judged by too, since a request carrying the parameter without this
 //! operation's required members is shaped like an ordinary write). A bucket this emulator
 //! does not hold answers `NoSuchBucket` (HTTP 404), as the write path answers the same
 //! address.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RenameObject::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -159,10 +155,17 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 // here — hence the `RenameObjectError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.s3#RenameObject")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.s3#RenameObject",
+    // `NoSuchKey` (404) is what S3 answers a rename whose SOURCE the bucket does not hold:
+    // the operation renames "an existing object", and the model declares the shape while
+    // listing no error for this operation, so it is widened in here rather than invented.
+    extra_errors = ["NoSuchKey"]
+)]
 #[derive(Debug)]
 pub enum RenameObjectErrorModeled {
     IdempotencyParameterMismatch(IdempotencyParameterMismatch),
+    NoSuchKey(NoSuchKey),
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
@@ -214,11 +217,37 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Without the store there is no object to rename, and neither modelled error
+            // says that, so the scaffold's 501 carries what is true.
+            return Err(crate::scaffolded::Scaffolded::not_implemented("RenameObject"));
+        };
+
+        // The SOURCE this rename names, read off `x-amz-rename-source`: "you can use
+        // RenameObject by specifying an existing object's name as the source" (this
+        // operation's own documentation), optionally with the bucket in front of it, and
+        // "within the same directory bucket" — so what the value names is a key of the
+        // bucket this request addressed ([`source_key`]). A value naming no key at all names
+        // no source object, which is a parameter that is not valid for this request.
+        let Some(source_key) = source_key(&input.rename_source, &input.bucket) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::INVALID_REQUEST_CODE,
+                crate::state::INVALID_REQUEST_STATUS,
+                crate::state::INVALID_REQUEST_MESSAGE,
+            ));
+        };
+        let asked = crate::state::CompletedRename {
+            bucket: input.bucket.clone(),
+            key: input.key.clone(),
+            source_key: source_key.clone(),
+        };
+
+        // Everything this rename decides is decided under ONE guard, so no reader can see
+        // the destination written while the source is still there, and two concurrent
+        // renames under one client token cannot both be read as the first.
+        let mut store = state.lock();
 
         // A rename addressed to a GENERAL PURPOSE bucket asks for functionality that
         // bucket's endpoint does not implement: this operation "renames an existing object in
@@ -231,39 +260,314 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // what this emulator recorded rather than by the shape of the name — and a bucket
         // this emulator does not hold answers that instead, the way the write path answers it
         // for the same address, since the kind of a bucket that is not there says nothing.
-        let held = crate::state::service_state(&*self.engine)
-            .map(|state| state.lock().bucket(&input.bucket).map(|bucket| bucket.is_directory()));
-        match held {
-            Some(None) => {
-                return Err(crate::scaffolded::Scaffolded::unmodeled(
-                    crate::state::NO_SUCH_BUCKET_CODE,
-                    NO_SUCH_BUCKET_STATUS,
-                    crate::state::NO_SUCH_BUCKET_MESSAGE,
-                ))
-            }
-            Some(Some(true)) => {}
-            _ => {
-                return Err(
-                    crate::scaffolded::Scaffolded::not_implemented_query_parameter(
-                        crate::service::object_write::RENAME_OBJECT_PARAMETER,
-                    ),
-                )
+        let Some(bucket) = store.bucket(&input.bucket) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_BUCKET_CODE,
+                NO_SUCH_BUCKET_STATUS,
+                crate::state::no_such_bucket_message(&input.bucket),
+            ));
+        };
+        if !bucket.is_directory() {
+            return Err(
+                crate::scaffolded::Scaffolded::not_implemented_query_parameter(
+                    crate::service::object_write::RENAME_OBJECT_PARAMETER,
+                ),
+            );
+        }
+
+        // The CLIENT TOKEN, before anything is read about the objects: "if you retry a
+        // request that completed successfully using the same client token and the same
+        // parameters, the retry succeeds without performing any further actions. If you retry
+        // a successful request using the same client token, but one or more of the parameters
+        // are different, the retry fails and an IdempotentParameterMismatch error is
+        // returned" (`RenameObjectRequest$ClientToken`) — so a retry is answered from the
+        // completed call rather than performed again, which is also what makes it safe for a
+        // client that cannot tell a lost response from a lost request.
+        if let Some(token) = client_token(&input) {
+            match store.rename_idempotency(token, &asked) {
+                crate::state::RenameIdempotency::Fresh => {}
+                crate::state::RenameIdempotency::Repeated => return Ok(RenameObjectOutput {}),
+                crate::state::RenameIdempotency::ParametersDiffer => {
+                    // The wire code is the one S3 puts on the error document and the one this
+                    // operation's own documentation names — "the retry fails and an
+                    // IdempotentParameterMismatch error is returned"
+                    // (`RenameObjectRequest$ClientToken`) — which is not the name the model
+                    // gives the SHAPE (`IdempotencyParameterMismatch`). A client branches on
+                    // the code, so the refusal travels on the unmodelled channel carrying the
+                    // code S3 sends, with the modelled status and the sentence the shape
+                    // publishes.
+                    return Err(crate::scaffolded::Scaffolded::unmodeled(
+                        IDEMPOTENT_PARAMETER_MISMATCH_CODE,
+                        IDEMPOTENT_PARAMETER_MISMATCH_STATUS,
+                        IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE,
+                    ));
+                }
             }
         }
 
-        // Implement `RenameObject` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RenameObjectErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RenameObject"))
+        // The object being renamed, and the one the destination key already holds (if any).
+        // Both are read before anything is written, so every precondition below is judged
+        // against the state this rename starts from.
+        let Some(source) = bucket.object(&source_key).cloned() else {
+            // About the SOURCE key, which is not the one the request addressed — the
+            // addressed key is the destination — so the refusal names it itself.
+            return Err(crate::scaffolded::Scaffolded::Modeled(
+                RenameObjectErrorModeled::NoSuchKey(NoSuchKey {}),
+            )
+            .naming_object(&source_key, None));
+        };
+        let destination = bucket.object(&input.key).cloned();
+
+        // The preconditions, source first: each is a condition of the object it names, and a
+        // rename refused for one leaves both keys exactly as they were. S3 answers a
+        // precondition that does not hold `PreconditionFailed` (412) naming the header that
+        // did not hold ([`crate::scaffolded::Scaffolded::precondition_failed`]).
+        if let Some(condition) = unmet_source_condition(&input, &source) {
+            return Err(crate::scaffolded::Scaffolded::precondition_failed(condition));
+        }
+        if let Some(condition) = unmet_destination_condition(&input, destination.as_ref()) {
+            return Err(crate::scaffolded::Scaffolded::precondition_failed(condition));
+        }
+
+        // A rename onto the source's own name changes nothing: the object already carries
+        // that name, so there is nothing to move and nothing to remove — and performing it
+        // as a write followed by a delete would take the object away.
+        if source_key == input.key {
+            if let Some(token) = client_token(&input) {
+                store.record_completed_rename(token, asked, ::std::time::SystemTime::now());
+            }
+            return Ok(RenameObjectOutput {});
+        }
+
+        // The MOVE: the object is recorded under the destination key through the one place an
+        // object is ever recorded (so a rename is bounded by exactly the ceilings a write is,
+        // and is refused the same way), and the source key is taken away only once that write
+        // was taken — so a refused rename leaves the object where it was.
+        let Some(outcome) = store.put_object(&input.bucket, &input.key, source) else {
+            return Err(crate::scaffolded::Scaffolded::unmodeled(
+                crate::state::NO_SUCH_BUCKET_CODE,
+                NO_SUCH_BUCKET_STATUS,
+                crate::state::no_such_bucket_message(&input.bucket),
+            ));
+        };
+        match outcome {
+            crate::state::ObjectWrite::Created | crate::state::ObjectWrite::Replaced => {}
+            // The destination key is longer than S3 stores a key under, which is the refusal
+            // the write of such a key earns ([`crate::service::object_write`]).
+            crate::state::ObjectWrite::KeyTooLong { .. } => {
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::service::object_write::KEY_TOO_LONG_CODE,
+                    crate::service::object_write::KEY_REFUSAL_STATUS,
+                    crate::service::object_write::KEY_TOO_LONG_MESSAGE,
+                ));
+            }
+            crate::state::ObjectWrite::MetadataTooLarge { bytes } => {
+                return Err(crate::scaffolded::Scaffolded::metadata_too_large(bytes));
+            }
+            // The emulator's own ceilings, not AWS quotas, so no AWS error code describes
+            // them: they go out through the framework's 400 `ValidationException` channel,
+            // the same channel every other write of this service uses for them.
+            other => {
+                return Err(crate::scaffolded::Scaffolded::validation(format!(
+                    "renaming {source_key:?} to {:?} in the bucket {:?} is past a limit this \
+                     emulator keeps ({other:?}); delete an object before renaming into it",
+                    input.key, input.bucket
+                )));
+            }
+        }
+        store.remove_object(&input.bucket, &source_key);
+
+        // The completed call, remembered under the token that asked for it, so a retry is
+        // answered from it rather than performed again.
+        if let Some(token) = client_token(&input) {
+            store.record_completed_rename(token, asked, ::std::time::SystemTime::now());
+        }
+
+        ::tracing::info!(
+            operation = Self::NAME,
+            bucket = %input.bucket,
+            outcome = "renamed",
+            "renamed an object in a directory bucket"
+        );
+        Ok(RenameObjectOutput {})
     }
 }
+
+/// The client token this request carries, or `None` for one that carries none.
+///
+/// `ClientToken` is `@idempotencyToken`, so an SDK that sends none has one generated for it;
+/// an EMPTY value names no token at all.
+fn client_token(input: &RenameObjectInput) -> Option<&str> {
+    input
+        .client_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|token| !token.is_empty())
+}
+
+/// The KEY the rename source `source` names in the bucket named `bucket`, or `None` for a
+/// value that names no key at all.
+///
+/// "You can use RenameObject by specifying an existing object's name as the source and the
+/// new name of the object as the destination WITHIN THE SAME directory bucket" (this
+/// operation's own documentation): the source is an object of the bucket the request
+/// addressed, so what the value names is a key of that bucket — written either as the key
+/// alone or with the bucket in front of it, and with the one leading slash the member's own
+/// pattern admits (`^\/?.+\/.+$`). Only the addressed bucket's own name is read as such a
+/// qualifier, because a key may itself contain slashes and nothing else in the value can tell
+/// a bucket from the first segment of a key.
+fn source_key(source: &str, bucket: &str) -> Option<String> {
+    let value = source.strip_prefix('/').unwrap_or(source);
+    let key = value
+        .strip_prefix(&format!("{bucket}/"))
+        .unwrap_or(value)
+        .to_string();
+    (!key.is_empty()).then_some(key)
+}
+
+/// The SOURCE precondition this request carries that does NOT hold against `source`, named
+/// by the header it arrived on, or `None` when every one of them holds.
+///
+/// The four conditions are the four a COPY source carries, word for word — "renames the
+/// object if the source exists and if its entity tag (ETag) matches the specified ETag"
+/// (`RenameObjectRequest$SourceIfMatch`) and the three beside it — so they are judged by the
+/// one rule every source precondition in this service is judged by
+/// ([`crate::state::unmet_copy_source_precondition`], which carries the RFC 7232 precedence
+/// between the tag and the date members), and only the HEADER a refusal names is this
+/// operation's own ([`renamed_condition`]).
+fn unmet_source_condition(input: &RenameObjectInput, source: &crate::state::Object) -> Option<&'static str> {
+    let conditions = crate::state::CopySourceConditions {
+        if_match: input.source_if_match.as_deref(),
+        if_none_match: input.source_if_none_match.as_deref(),
+        if_modified_since: input
+            .source_if_modified_since
+            .as_ref()
+            .map(::aws_smithy_types::DateTime::secs),
+        if_unmodified_since: input
+            .source_if_unmodified_since
+            .as_ref()
+            .map(::aws_smithy_types::DateTime::secs),
+    };
+    let unmet = crate::state::unmet_copy_source_precondition(&conditions, source)?;
+    Some(renamed_condition(unmet, SOURCE_CONDITION_HEADERS))
+}
+
+/// The DESTINATION precondition this request carries that does NOT hold against the object
+/// the destination key holds (`held`, `None` when it holds none), named by the header it
+/// arrived on, or `None` when every one of them holds.
+///
+/// The two ENTITY-TAG conditions are a conditional write's, word for word — "renames the
+/// object only if the destination does not already exist in the specified directory bucket.
+/// If the object does exist when you send a request with If-None-Match:*, the S3 API will
+/// return a 412 Precondition Failed error" (`RenameObjectRequest$DestinationIfNoneMatch`) and
+/// "renames the object only if the ETag … matches the ETag of the object in S3"
+/// (`$DestinationIfMatch`) — so they are judged by the rule every conditional write of this
+/// service is judged by ([`crate::state::unmet_write_precondition`]).
+///
+/// The two DATE conditions constrain an object that is THERE — "renames the object if the
+/// destination exists and if it has been modified since the specified time"
+/// (`$DestinationIfModifiedSince`), "renames the object if it hasn't been modified since the
+/// specified time" (`$DestinationIfUnmodifiedSince`) — so they are judged against that
+/// object, by the same shared rule the source's dates are, and a destination that holds
+/// nothing satisfies them.
+fn unmet_destination_condition(
+    input: &RenameObjectInput,
+    held: Option<&crate::state::Object>,
+) -> Option<&'static str> {
+    if let Some(condition) = crate::state::unmet_write_precondition(
+        held.map(|object| object.etag.as_str()),
+        input.destination_if_match.as_deref(),
+        input.destination_if_none_match.as_deref(),
+    ) {
+        return Some(condition);
+    }
+    let held = held?;
+    let conditions = crate::state::CopySourceConditions {
+        if_match: None,
+        if_none_match: None,
+        if_modified_since: input
+            .destination_if_modified_since
+            .as_ref()
+            .map(::aws_smithy_types::DateTime::secs),
+        if_unmodified_since: input
+            .destination_if_unmodified_since
+            .as_ref()
+            .map(::aws_smithy_types::DateTime::secs),
+    };
+    let unmet = crate::state::unmet_copy_source_precondition(&conditions, held)?;
+    Some(renamed_condition(unmet, DESTINATION_CONDITION_HEADERS))
+}
+
+/// The header THIS operation binds the condition the shared rule named (`unmet`) from.
+///
+/// The shared rule names the member by the COPY source's header, because that is the request
+/// it was written for; `headers` is the pair list that maps each of them to the header the
+/// same condition arrives on here, so one rule can judge both operations' conditions and each
+/// refusal still names the header the client wrote. A condition with no row keeps the name
+/// the rule gave it.
+fn renamed_condition(unmet: &'static str, headers: ConditionHeaders) -> &'static str {
+    headers
+        .iter()
+        .find(|(copy_source, _)| *copy_source == unmet)
+        .map(|(_, renamed)| *renamed)
+        .unwrap_or(unmet)
+}
+
+/// The rows [`renamed_condition`] reads: `(the shared rule's name, this operation's header)`.
+type ConditionHeaders = &'static [(&'static str, &'static str)];
+
+/// The four headers this operation binds its SOURCE conditions from
+/// (`smithy_query(query="operation",operation="RenameObject")`).
+const SOURCE_CONDITION_HEADERS: ConditionHeaders = &[
+    (
+        crate::state::COPY_SOURCE_IF_MATCH_CONDITION,
+        crate::state::RENAME_SOURCE_IF_MATCH_CONDITION,
+    ),
+    (
+        crate::state::COPY_SOURCE_IF_NONE_MATCH_CONDITION,
+        crate::state::RENAME_SOURCE_IF_NONE_MATCH_CONDITION,
+    ),
+    (
+        crate::state::COPY_SOURCE_IF_MODIFIED_SINCE_CONDITION,
+        crate::state::RENAME_SOURCE_IF_MODIFIED_SINCE_CONDITION,
+    ),
+    (
+        crate::state::COPY_SOURCE_IF_UNMODIFIED_SINCE_CONDITION,
+        crate::state::RENAME_SOURCE_IF_UNMODIFIED_SINCE_CONDITION,
+    ),
+];
+
+/// The two DATE headers this operation binds its DESTINATION conditions from (the same
+/// operation reader): the standard HTTP condition headers, which is how S3's document words
+/// them.
+const DESTINATION_CONDITION_HEADERS: ConditionHeaders = &[
+    (
+        crate::state::COPY_SOURCE_IF_MODIFIED_SINCE_CONDITION,
+        crate::state::IF_MODIFIED_SINCE_CONDITION,
+    ),
+    (
+        crate::state::COPY_SOURCE_IF_UNMODIFIED_SINCE_CONDITION,
+        crate::state::IF_UNMODIFIED_SINCE_CONDITION,
+    ),
+];
 
 /// The status S3 answers [`crate::state::NO_SUCH_BUCKET_CODE`] with: 404, the one every
 /// bucket-scoped operation of this crate answers a bucket this emulator does not hold with.
 const NO_SUCH_BUCKET_STATUS: u16 = 404;
+
+/// The wire error code a retry under a client token with other parameters earns: "the retry
+/// fails and an `IdempotentParameterMismatch` error is returned"
+/// (`RenameObjectRequest$ClientToken`), which is the code S3's error document carries — the
+/// model names the SHAPE `IdempotencyParameterMismatch`, and a client branches on the code.
+const IDEMPOTENT_PARAMETER_MISMATCH_CODE: &str = "IdempotentParameterMismatch";
+
+/// The status that code is answered with: the `httpError 400` the model declares for the
+/// shape (`smithy_query(query="operation",operation="RenameObject")`).
+const IDEMPOTENT_PARAMETER_MISMATCH_STATUS: u16 = 400;
+
+/// The sentence that code carries, as the shape publishes it (`IdempotencyParameterMismatch`:
+/// "Parameters on this idempotent request are inconsistent with parameters used in previous
+/// request(s).").
+const IDEMPOTENT_PARAMETER_MISMATCH_MESSAGE: &str =
+    "Parameters on this idempotent request are inconsistent with parameters used in previous \
+     request(s).";

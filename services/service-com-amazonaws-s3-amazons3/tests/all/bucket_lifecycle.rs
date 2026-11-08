@@ -121,6 +121,35 @@ impl Answer {
             .and_then(|(_, rest)| rest.split_once(&format!("</{name}>")))
             .map(|(text, _)| super::bucket_tagging::unescaped(text))
     }
+
+    /// The text of EVERY `<name>` element of the body, in the order the document carries
+    /// them, with the XML escaping the serializer applies undone — [`Self::element`] for a
+    /// member a document repeats, such as the `<Name>` of each bucket a listing reports.
+    ///
+    /// `pub(crate)`, beside the single-element reader: a suite that reads a repeated member
+    /// goes through this one rather than slicing the body a second way.
+    pub(crate) fn elements(&self, name: &str) -> Vec<String> {
+        elements_of(&String::from_utf8_lossy(&self.body), name)
+            .iter()
+            .map(|text| super::bucket_tagging::unescaped(text))
+            .collect()
+    }
+}
+
+/// The text of every `<name>` element of `xml`, in document order, exactly as the document
+/// carries it.
+///
+/// `pub(crate)`: the ONE reading of a repeated element in this test crate — [`Answer::elements`]
+/// reads a response body through it (and undoes the escaping its own single-element reader
+/// undoes), and a suite holding the document as text
+/// ([`super::notification_destination_validation`]) reads that text through it.
+pub(crate) fn elements_of(xml: &str, name: &str) -> Vec<String> {
+    let (open, close) = (format!("<{name}>"), format!("</{name}>"));
+    xml.split(&open)
+        .skip(1)
+        .filter_map(|rest| rest.split_once(&close))
+        .map(|(text, _)| text.to_string())
+        .collect()
 }
 
 /// Dispatch one request with the given headers and an XML (or empty) body.
@@ -201,7 +230,12 @@ pub(crate) async fn send_in_region(
 /// The one place this harness puts a request on the wire: `authorization` carries the
 /// credential scope the emulator reads the endpoint's Region out of, and `host` the endpoint
 /// the request is addressed to.
-async fn send_bytes_signed(
+///
+/// `pub(crate)`: a suite whose case varies the credential SCOPE — the signing name of the
+/// endpoint a client reached, or the key id a session vended ([`super::directory_bucket_listings`],
+/// [`super::express_session_tokens`]) — drives its requests through this one helper rather
+/// than rebuilding the dispatch.
+pub(crate) async fn send_bytes_signed(
     router: &MultiServiceRouter,
     authorization: &str,
     method: &str,

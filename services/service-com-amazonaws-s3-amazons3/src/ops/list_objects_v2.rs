@@ -376,6 +376,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .bucket(&input.bucket)
             .ok_or(ListObjectsV2ErrorModeled::NoSuchBucket(NoSuchBucket {}))?;
 
+        // The listing constraints a DIRECTORY bucket carries, each of them stated by the
+        // member the request sent it on — see [`directory_bucket_listing_refusal`]. Judged
+        // once the bucket's kind is known and before anything it holds is reported, so a
+        // listing a Zonal endpoint cannot perform reports nothing instead of reporting the
+        // wrong thing.
+        if bucket.is_directory() {
+            if let Some(refusal) = directory_bucket_listing_refusal(&input) {
+                return Err(refusal);
+            }
+        }
+
         // "You must have READ access to the bucket" — the `s3:ListBucket` permission — to list
         // its objects (this operation's own documentation of its general purpose bucket
         // permissions), so a signed request is authorized against the documents in force on
@@ -568,3 +579,73 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })
     }
 }
+
+/// The refusal a listing of a DIRECTORY bucket earns for asking for something that surface
+/// does not support, or `None` for one it serves.
+///
+/// Three constraints, each published by the member the request carries it on:
+///
+/// * "For directory buckets, / is the only supported delimiter"
+///   (`ListObjectsV2Request$Delimiter`);
+/// * "`StartAfter` is where you want Amazon S3 to start listing from … This functionality is
+///   not supported for directory buckets" (`ListObjectsV2Request$StartAfter`);
+/// * "For directory buckets, only prefixes that end in a delimiter (/) are supported"
+///   (`ListObjectsV2Request$Prefix`).
+///
+/// The first and the third are a VALUE this bucket type cannot list by, which S3 answers
+/// `InvalidRequest` (400) with the sentence that names the value it does support; the second
+/// is a whole parameter the bucket type does not serve, which it answers `NotSupported`
+/// (501). Each sentence states the constraint and no value from the request.
+///
+/// A member the request does not carry asks for nothing, and an EMPTY value is no value: a
+/// listing that states no prefix and no delimiter is the whole bucket, which is what a
+/// directory bucket serves.
+fn directory_bucket_listing_refusal(input: &ListObjectsV2Input) -> Option<ListObjectsV2Error> {
+    let stated = |value: &Option<String>| {
+        value
+            .as_deref()
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+    };
+    if stated(&input.delimiter).is_some_and(|delimiter| delimiter != DIRECTORY_BUCKET_DELIMITER) {
+        return Some(crate::scaffolded::Scaffolded::unmodeled(
+            crate::state::INVALID_REQUEST_CODE,
+            crate::state::INVALID_REQUEST_STATUS,
+            UNSUPPORTED_DELIMITER_MESSAGE,
+        ));
+    }
+    if stated(&input.start_after).is_some() {
+        return Some(crate::scaffolded::Scaffolded::unmodeled(
+            crate::state::NOT_SUPPORTED_CODE,
+            crate::state::NOT_SUPPORTED_STATUS,
+            UNSUPPORTED_START_AFTER_MESSAGE,
+        ));
+    }
+    if stated(&input.prefix).is_some_and(|prefix| !prefix.ends_with(DIRECTORY_BUCKET_DELIMITER)) {
+        return Some(crate::scaffolded::Scaffolded::unmodeled(
+            crate::state::INVALID_REQUEST_CODE,
+            crate::state::INVALID_REQUEST_STATUS,
+            UNSUPPORTED_PREFIX_MESSAGE,
+        ));
+    }
+    None
+}
+
+/// The one delimiter a directory bucket's listing supports, and therefore the one character a
+/// prefix of such a listing may end with: "for directory buckets, / is the only supported
+/// delimiter" (`ListObjectsV2Request$Delimiter`).
+const DIRECTORY_BUCKET_DELIMITER: &str = "/";
+
+/// The sentence S3 refuses a directory-bucket listing that names any other delimiter with.
+const UNSUPPORTED_DELIMITER_MESSAGE: &str = "This bucket only supports '/' as a delimiter";
+
+/// The sentence S3 refuses a directory-bucket listing that asks to start after a key with:
+/// `start-after` is a query parameter this bucket type does not serve at all.
+const UNSUPPORTED_START_AFTER_MESSAGE: &str =
+    "This bucket does not support start-after query parameter for ListObjectsV2 API.";
+
+/// The sentence S3 refuses a directory-bucket listing whose prefix does not end in the
+/// delimiter with, which also states what to send instead.
+const UNSUPPORTED_PREFIX_MESSAGE: &str =
+    "This bucket does not support a prefix that does not end in a delimiter. Specify a prefix \
+     path ending with a delimiter and try again.";

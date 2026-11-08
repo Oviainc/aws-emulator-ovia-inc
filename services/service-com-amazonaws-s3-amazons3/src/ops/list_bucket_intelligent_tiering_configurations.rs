@@ -154,8 +154,8 @@ const CONFIGURATIONS_PER_PAGE: usize = 100;
 
 /// Which listing a continuation token of this operation was issued for, so a token minted
 /// for a sibling configuration family's listing is not read as a cursor into this one.
-const LISTING: crate::state::ConfigurationListing =
-    crate::state::ConfigurationListing::IntelligentTiering;
+const LISTING: crate::state::PagedListing =
+    crate::state::PagedListing::IntelligentTiering;
 
 /// The `ListBucketIntelligentTieringConfigurations` operation.
 ///

@@ -4623,6 +4623,10 @@ mod lifecycle;
 mod object;
 // The wire codes, statuses and sentences a refusal of this service carries.
 mod refusals;
+// The renames this store has performed, remembered by the client token that asked for them.
+mod renames;
+// One session `CreateSession` vended, and what it is scoped to.
+mod sessions;
 // The bucket map itself, and the operations the store performs on it.
 mod store;
 // A multipart upload in progress, with the integrity checks and minted ids it shares.
@@ -4633,6 +4637,8 @@ pub use configuration_tokens::*;
 pub use lifecycle::*;
 pub use object::*;
 pub use refusals::*;
+pub use renames::*;
+pub use sessions::*;
 pub use store::*;
 pub use uploads::*;
 

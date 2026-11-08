@@ -37,8 +37,6 @@ mod cloudformation_asset_bucket_publishing_role;
 // regions concurrently landing suites add their line to.
 #[path = "all/cloudformation_sfn_reference_starts_execution.rs"]
 mod cloudformation_sfn_reference_starts_execution;
-#[path = "all/cloudformation_rest_api_serves_its_stage.rs"]
-mod cloudformation_rest_api_serves_its_stage;
 // appended tail and the sorted `r…` span are both regions concurrently landing suites add
 // their line to.
 #[path = "all/rds_s3_snapshot_export_flow.rs"]
@@ -827,10 +825,6 @@ mod sesv2_sns_event_destination_topic_policy;
 mod ses_send_events_reach_a_subscribed_queue;
 #[path = "all/ses_bulk_send_entry_headers_override_the_template.rs"]
 mod ses_bulk_send_entry_headers_override_the_template;
-// Declared HERE, beside the sibling SESv2 suites above in this quiet span, for the same
-// reason as they are.
-#[path = "all/ses_send_event_reports_what_answered.rs"]
-mod ses_send_event_reports_what_answered;
 #[path = "all/shared_signing_name_routing.rs"]
 mod shared_signing_name_routing;
 #[path = "all/ssm_contacts_replication_set.rs"]
@@ -1030,6 +1024,7 @@ mod cloudformation_wafv2_protection_stack;
 // already declared before appending it here.
 // Declared HERE, beside the sibling suites above in the same quiet `n`/`o` gap, for the
 // reason those entries record: the appended tail at the end of this file and the `e…` span
+// are both regions concurrently landing suites add their line to.
 #[path = "all/eks_control_plane_logs.rs"]
 mod eks_control_plane_logs;
 // Declared in this same head region, for the reason the note above records.
@@ -1039,19 +1034,20 @@ mod bedrock_agentcore_data_plane_parent_resources;
 // at the end of this file: the tail is where every suite landing in the same window appends.
 #[path = "all/cloudfront_edge_metrics_drive_the_alarm_chain.rs"]
 mod cloudfront_edge_metrics_drive_the_alarm_chain;
-// The five suites that stood here — `apigateway_iam_authenticated_invoke`,
-// `cloudformation_rollback_triggers_revert_the_operation`,
-// `cloudformation_wafv2_protection_stack`, `lambda_sqs_event_source_batching_window` and
-// `cloudformation_asset_bucket_publishing_role` — are each ALREADY declared above (the first
-// four in the sorted head, the fifth at line 34, and the wafv2 one at line 1006). Two
-// from compiling; the duplicate lines are removed here and the first declaration of each
-// stands.
+// Nothing below this point re-declares a suite: several landing in the same window each
+// appended their own entry to this tail, so the same suite stood here two and three times
+// over, which is a redefinition (`E0428`) that stops this target from compiling. The
+// duplicate lines are gone and ONE declaration of each suite stands —
+// `all_rs_declares_each_suite_once` below is what keeps it that way, so add a NEW suite in
+// the sorted span its name belongs to and check it is not declared already before appending
+// it here.
 // Declared here, in the appended tail: what a stack declaring the `AWS::Config::*` resources
 // really creates in AWS Config, which no crate-local suite can see both sides of.
 #[path = "all/cloudformation_provisions_config_recording.rs"]
 mod cloudformation_provisions_config_recording;
 // Declared here, in the appended tail, for the reason the entries above record: the tail and
 // the sorted `c…` span (where every cloudformation and codepipeline suite would land) are
+// both regions concurrently landing suites add their line to.
 #[path = "all/cloudformation_provisions_codebuild_projects.rs"]
 mod cloudformation_provisions_codebuild_projects;
 #[path = "all/ecr_push_triggers_its_pipeline.rs"]
@@ -1065,27 +1061,12 @@ mod zz_opensearch_fgac_probe;
 // the sorted list either.
 #[path = "all/all_rs_declares_each_suite_once.rs"]
 mod all_rs_declares_each_suite_once;
-// `cloudformation_wafv2_protection_stack` is NOT re-declared here: it is already declared in
-// the sorted head, and a second `mod` for the same file is a redefinition that stops this
-// target from compiling.
-// `bedrock_agentcore_data_plane_parent_resources` is NOT re-declared here either: it stands
-// in the sorted head, and one `mod` per file is what this target compiles with.
-// Declared here, in the appended tail, for the reason the entries above record: the sorted
-// `e…` span is a region concurrently landing suites add their line to.
-// `cloudformation_asset_bucket_publishing_role` — are each ALREADY declared above, in the
-// sorted head. Two concurrent changes appended the same entry, which is a redefinition and
-// stops this target from compiling; the duplicate lines are removed here and the first
-// declaration of each stands. `bedrock_agentcore_data_plane_parent_resources`, which stood
-// just below, was appended the same way and is declared in that head too.
-// The suites that stood here — `apigateway_iam_authenticated_invoke`,
-// `cloudformation_wafv2_protection_stack`, `lambda_sqs_event_source_batching_window`,
-// `cloudformation_asset_bucket_publishing_role` and
-// `bedrock_agentcore_data_plane_parent_resources` — are each ALREADY declared above, in the
-// declaration of each stands.
-// Several suites that stood here are each ALREADY declared above: two concurrent changes
-// appended the same entry, which is a redefinition and stops this target from compiling, so
-// the duplicate lines are removed and the first declaration of each stands.
-// appended tail and the sorted `c…`/`s…` spans are both regions concurrently landing suites
+#[path = "all/cloudformation_rest_api_serves_its_stage.rs"]
+mod cloudformation_rest_api_serves_its_stage;
+// Declared HERE, beside the sibling SESv2 suites above in this quiet span, for the same
+// reason as they are.
+#[path = "all/ses_send_event_reports_what_answered.rs"]
+mod ses_send_event_reports_what_answered;
 #[path = "all/ses_configuration_sets_shared_across_v1_and_v2.rs"]
 mod ses_configuration_sets_shared_across_v1_and_v2;
 #[path = "all/cloudformation_deployed_configuration_set_reaches_the_email_api.rs"]
@@ -1103,10 +1084,6 @@ mod sesv2_probe;
 mod sesv2_probe2;
 #[path = "all/sesv2_probe3.rs"]
 mod sesv2_probe3;
-// `bedrock_agentcore_data_plane_parent_resources` — are each ALREADY declared above. Two
-// concurrent changes declared the same entry, which is a redefinition and stops this target
-// `bedrock_agentcore_data_plane_parent_resources` — are each ALREADY declared above in the
-// sorted head. Concurrent changes appended the same entry twice, which is a redefinition and
 // Declared here, in this same head region, for the reason the note above records: the sorted
 // `s…` span every SNS suite lands in is a region concurrently landing suites append to.
 #[path = "all/sns_lambda_invoke_permission_revocation.rs"]
@@ -1115,20 +1092,12 @@ mod sns_lambda_invoke_permission_revocation;
 // the stack published, and the records the function pointed at it leaves in it.
 #[path = "all/cloudformation_declared_log_group_takes_its_function_logs.rs"]
 mod cloudformation_declared_log_group_takes_its_function_logs;
-// appended tail and the sorted `c…` span are both regions concurrently landing suites add
 // Declared in the appended tail, which is where every new suite inserts its lines: what a
 // stack publishes for the `Fn::GetAtt` attributes of an `AWS::EC2::Instance` it launched —
 // the values Amazon EC2 itself reports for that instance.
 #[path = "all/cloudformation_ec2_instance_rollback.rs"]
 mod cloudformation_ec2_instance_rollback;
-// stops this target from compiling; the duplicate lines are removed here and ONE declaration
-// of each stands. `eks_control_plane_logs` is the same case and is declared above too.
-// Several suites that stood in this appended tail are each ALREADY declared in the sorted
-// head above, where their own entry records why they were placed there. Two concurrent
-// changes appending the same entry is a redefinition — and, for one file reached under two
-// names, a duplicate module — either of which stops this target from compiling; the
-// duplicate tail lines are removed and the first declaration of each stands.
-// `cloudformation_asset_bucket_publishing_role`, `bedrock_agentcore_data_plane_parent_resources`
-// and `eks_control_plane_logs` — are each ALREADY declared above. Two concurrent changes
-// appended the same entry, which is a redefinition and stops this target from compiling; the
-// duplicate lines are removed here and the first declaration of each stands.
+// Several suites that stood in this tail were each ALREADY declared above, in the sorted head
+// or earlier in the tail, where their own entry records why they were placed there: two
+// concurrent changes appending one entry is a redefinition that stops this target from
+// compiling, so the duplicate lines are gone and ONE declaration of each stands.

@@ -158,7 +158,9 @@
 #[allow(unused_imports)]
 use super::types::*;
 
-use ::emulator_server::aws_credentials::{AWS_SESSION, SECRET_ACCESS_KEY, SESSION_TOKEN};
+use ::emulator_server::aws_credentials::{
+    AWS_ACCESS_KEY, AWS_SESSION, SECRET_ACCESS_KEY, SESSION_TOKEN,
+};
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -171,6 +173,13 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-s3-amazons3.json");
 // here — hence the `CreateSessionError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
+//
+// `NoSuchBucket` is this operation's one modelled error, and the handler answers that
+// code and its modelled 404 through the unmodelled channel instead: the sentence a
+// modelled error carries comes from this service's catalog keyed by the CODE alone, and
+// the Zonal endpoint words this code's sentence differently from the general purpose
+// surface (see `crate::state::DIRECTORY_BUCKET_NO_SUCH_BUCKET_MESSAGE`). The document on
+// the wire — code, status, message and `<BucketName>` — is the same either way.
 #[smithy_macros::operation_error("com.amazonaws.s3#CreateSession")]
 #[derive(Debug)]
 pub enum CreateSessionErrorModeled {
@@ -245,7 +254,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let encryption = {
             let store = state.lock();
             let Some(bucket) = store.bucket(&input.bucket) else {
-                return Err(CreateSessionErrorModeled::NoSuchBucket(NoSuchBucket {}).into());
+                // The one error this operation models, worded as the endpoint that would
+                // have served the bucket words it. `NoSuchBucket` carries no `@message`
+                // member (no error shape in this model declares one), so the sentence comes
+                // from this service's catalog keyed by the CODE alone — and the two surfaces
+                // of S3 word this code's sentence differently, which
+                // [`crate::state::no_such_bucket_message`] is the one place that chooses
+                // between. The refusal therefore travels on the unmodelled channel carrying
+                // the modelled code and the modelled 404, which is the same document on the
+                // wire, plus the `<BucketName>` every bucket-scoped refusal of this service
+                // names.
+                return Err(crate::scaffolded::Scaffolded::unmodeled(
+                    crate::state::NO_SUCH_BUCKET_CODE,
+                    NO_SUCH_BUCKET_STATUS,
+                    crate::state::no_such_bucket_message(&input.bucket),
+                ));
             };
             // This operation "creates a session that establishes temporary security
             // credentials to support fast authentication and authorization for the Zonal
@@ -279,13 +302,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // below is measured against: the expiry is enforced, not merely reported.
         let expires_at = ::std::time::SystemTime::now() + SESSION_DURATION;
 
-        // The credential this call returns: created in the emulator's credential store, so
-        // the emulator ACCEPTS requests signed with it and neither the id nor the secrets
-        // are chosen here.
-        let minted = ctx.credential_store().create(&AWS_SESSION);
+        // What this call hands back, and WHY it is two credentials rather than one. A Zonal
+        // endpoint request presents the two halves of a session in two different places: it
+        // is SIGNED with the key pair, and it carries the session token in the
+        // `x-amz-s3session-token` header — "you also apply the session token to the
+        // x-amz-s3session-token request header for authorization" (this operation's own
+        // documentation) — never in the `x-amz-security-token` header an STS temporary
+        // credential travels in. So:
+        //
+        // * the PAIR is an access key the credential store minted, which is what the
+        //   emulator verifies the request's signature under; and
+        // * the TOKEN is a session secret the same store minted, forgotten by the store
+        //   again because nothing signs with it: it is presented for AUTHORIZATION, and this
+        //   service is what authorizes it, against the bucket the session is scoped to
+        //   (`crate::service::express_session`).
+        //
+        // Neither the id nor either secret is chosen here.
+        let minted = ctx.credential_store().create(&AWS_ACCESS_KEY);
+        let vended_token = ctx.credential_store().create(&AWS_SESSION);
+        let vended_secret = vended_token.secret(SESSION_TOKEN).map(str::to_string);
+        // The token credential is forgotten the moment its secret is in hand: a credential
+        // whose secret this call hands to the caller must not stay signable. A delete that
+        // does not happen leaves exactly the state the comment above says must not exist, so
+        // it is reported rather than dropped — the id names a credential and no secret, so
+        // the line leaks nothing.
+        if let Err(error) = ctx.credential_store().delete(&vended_token.id) {
+            ::tracing::warn!(
+                operation = Self::NAME,
+                ?error,
+                "the credential the session token was minted from could not be forgotten \
+                 again; it stays in this process's credential store"
+            );
+        }
         let (Some(secret_access_key), Some(session_token)) = (
             minted.secret(SECRET_ACCESS_KEY).map(str::to_string),
-            minted.secret(SESSION_TOKEN).map(str::to_string),
+            vended_secret,
         ) else {
             // A credential without the secrets a caller has to sign with is no session at
             // all; it is forgotten again rather than returned half-made.
@@ -308,7 +359,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let (released, recorded) = {
             let mut store = state.lock();
             let released = store.release_expired_sessions(::std::time::SystemTime::now());
-            let recorded = store.record_vended_session(&minted.id, expires_at);
+            let recorded = store.record_vended_session_on(
+                &minted.id,
+                expires_at,
+                &input.bucket,
+                &session_token,
+            );
             (released, recorded)
         };
         for id in released {
@@ -361,3 +417,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// How long a session's credentials are valid: "temporary security credentials are scoped to
 /// the bucket and expire after 5 minutes" (this operation's own documentation).
 const SESSION_DURATION: ::std::time::Duration = ::std::time::Duration::from_secs(5 * 60);
+
+/// The status the one error this operation models is answered with: `NoSuchBucket`,
+/// `httpError 404` (`smithy_query(query="operation",operation="CreateSession")`).
+const NO_SUCH_BUCKET_STATUS: u16 = 404;

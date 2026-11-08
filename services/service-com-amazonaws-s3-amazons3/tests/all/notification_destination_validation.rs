@@ -545,15 +545,12 @@ fn payload(destinations: &[Named], event: &str) -> String {
     body
 }
 
-/// The text of every `<name>` element of `xml`, in document order.
+/// The text of every `<name>` element of `xml`, in document order, exactly as the document
+/// carries it — the test crate's one reading of a repeated element
+/// ([`super::bucket_lifecycle::elements_of`]), so this suite and the harness's own
+/// `Answer::elements` cannot read one document two ways.
 fn elements(xml: &str, name: &str) -> Vec<String> {
-    let open = format!("<{name}>");
-    let close = format!("</{name}>");
-    xml.split(&open)
-        .skip(1)
-        .filter_map(|rest| rest.split_once(&close))
-        .map(|(value, _)| value.to_string())
-        .collect()
+    super::bucket_lifecycle::elements_of(xml, name)
 }
 
 /// `PUT /<bucket>?notification` carrying `body`, and `x-amz-skip-destination-validation`
