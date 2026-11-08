@@ -173,12 +173,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        let _ = ctx;
+
+        // The Region the deletes are published to EventBridge in: the one the request was
+        // signed for, read before anything is removed.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
 
         crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
 
         // `imageIds` is modelled `@length(1..100)`, so a batch naming nothing, or more
-        // than the batch maximum, was already refused at the boundary.
+        // than the batch maximum, was already refused at the boundary. The store is written
+        // under its lock, which the helper below holds for its own body alone: the guard is
+        // not `Send`, and the publication that follows is awaited.
+        let (output, removals) = Self::delete_images(&state, &input, now)?;
+        // One image action per delete this batch really performed, published with the
+        // store's lock released, for the reason `PutImage` gives: a rule's target may call
+        // back into this service.
+        crate::state::image_events::publish(ctx.callback(), &region, &removals).await;
+
+        Ok(output)
+    }
+}
+
+impl<Eng> BatchDeleteImage<Eng> {
+    /// Remove what the batch names, and answer both the response the delete gives its
+    /// caller and the image actions it performed.
+    ///
+    /// Everything this operation writes happens here, under the store's lock; the caller
+    /// publishes those actions once that lock is gone.
+    fn delete_images(
+        state: &::engine::ServiceState<
+            crate::state::ComAmazonawsEcrAmazonec2containerregistryV20150921State,
+        >,
+        input: &BatchDeleteImageInput,
+        now: ::std::time::SystemTime,
+    ) -> Result<
+        (
+            BatchDeleteImageOutput,
+            Vec<crate::state::image_events::ImageAction>,
+        ),
+        BatchDeleteImageError,
+    > {
         let mut store = state.lock();
         let repo = store
             .repository_mut(&input.repository_name)
@@ -249,9 +284,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Both members are reported, empty or not: the answer to a batch is the two
         // lists it partitions into.
-        Ok(BatchDeleteImageOutput {
+        let output = BatchDeleteImageOutput {
             image_ids: Some(deleted),
             failures: Some(failures),
-        })
+        };
+        // One action per delete this batch really performed — the identifiers the answer
+        // reports — for the caller to publish once this lock is released.
+        let removals: Vec<crate::state::image_events::ImageAction> = output
+            .image_ids
+            .iter()
+            .flatten()
+            .filter_map(|id| {
+                Some(crate::state::image_events::ImageAction {
+                    repository_name: input.repository_name.clone(),
+                    action_type: crate::state::image_events::ACTION_TYPE_DELETE,
+                    image_digest: id.image_digest.clone()?,
+                    image_tag: id.image_tag.clone(),
+                    at: now,
+                })
+            })
+            .collect();
+        Ok((output, removals))
     }
 }

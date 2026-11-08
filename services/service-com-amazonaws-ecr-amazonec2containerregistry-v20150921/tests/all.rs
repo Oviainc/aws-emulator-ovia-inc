@@ -21,6 +21,8 @@ mod batch_get_image;
 mod create_repository_contract;
 #[path = "all/error_message_construction.rs"]
 mod error_message_construction;
+#[path = "all/image_action_events.rs"]
+mod image_action_events;
 #[path = "all/image_metadata.rs"]
 mod image_metadata;
 #[path = "all/image_replication_status.rs"]

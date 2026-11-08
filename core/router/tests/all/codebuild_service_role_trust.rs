@@ -336,10 +336,117 @@ async fn create_project_refuses_a_role_whose_trust_policy_withholds_codebuild() 
     }
 }
 
-/// RULE, for the role a BUILD runs as: `serviceRoleOverride` "overrides the one specified
-/// in the build project" for that build, so it is held to the same question — and a
-/// refused start leaves the project with no build at all, while the project's own role
-/// still starts one.
+/// RULE: the sentence CodeBuild states for a service role it cannot assume is FIXED text —
+/// the three numbered conditions AWS words it with, in that order, with no part of the
+/// request quoted back — so it is the same sentence whatever made the role unassumable, and
+/// a client that matches on it (or an operator reading a CI failure) gets AWS's own
+/// remediation text rather than this emulator's prose.
+///
+/// The rows differ along WHY the role cannot be assumed: this account holds no such role,
+/// the role trusts another service only, and the role's own trust policy denies this
+/// service — and along WHICH operation resolves the role (the project's own `serviceRole`
+/// and a build's `serviceRoleOverride`).
+#[tokio::test]
+async fn the_unassumable_service_role_refusal_carries_awss_own_three_conditions() {
+    /// The recorded sentence, word for word.
+    const SENTENCE: &str = "CodeBuild is not authorized to perform: sts:AssumeRole on \
+                            service role. Please verify that: 1) The provided service role \
+                            exists, 2) The role name is case-sensitive and matches exactly, \
+                            and 3) The role has the necessary trust policy configured.";
+
+    assert_eq!(
+        expected_refusal(),
+        SENTENCE,
+        "the service's own sentence must be the recorded one, got {:?}",
+        expected_refusal()
+    );
+
+    let router = emulator();
+    // The project a build's override is refused against, which runs as a role this
+    // service may assume.
+    let own_role = role_with_trust(
+        &router,
+        "codebuild-wording-project",
+        &trust_allowing(&["codebuild.amazonaws.com"]),
+    )
+    .await;
+    let (status, created) = codebuild(
+        &router,
+        "CreateProject",
+        create_project_body("wording-proj", &own_role),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "CreateProject: expected 200, got {status}: {created}"
+    );
+
+    // (case, the role a request hands CodeBuild)
+    let denied = role_with_trust(
+        &router,
+        "codebuild-wording-denied",
+        &json!({
+            "Version": "2012-10-17",
+            "Statement": [{
+                "Effect": "Deny",
+                "Principal": { "Service": "codebuild.amazonaws.com" },
+                "Action": "sts:AssumeRole"
+            }]
+        })
+        .to_string(),
+    )
+    .await;
+    let other_service = role_with_trust(
+        &router,
+        "codebuild-wording-other",
+        &trust_allowing(&["ec2.amazonaws.com"]),
+    )
+    .await;
+    let rows: [(&str, String); 3] = [
+        (
+            "a role this account's IAM holds nothing under",
+            "arn:aws:iam::000000000000:role/codebuild-wording-absent".to_string(),
+        ),
+        ("a role trusted by another service only", other_service),
+        ("a role whose trust policy denies this service", denied),
+    ];
+
+    for (index, (case, role_arn)) in rows.iter().enumerate() {
+        // The role the PROJECT would run as.
+        let (status, refused) = codebuild(
+            &router,
+            "CreateProject",
+            create_project_body(&format!("wording-{index}"), role_arn),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: CreateProject must refuse the role, got {status}: {refused}"
+        );
+        assert_eq!(
+            refused["message"].as_str(),
+            Some(SENTENCE),
+            "case {case:?}: CreateProject must state AWS's own three conditions, got {refused}"
+        );
+
+        // The role one BUILD would run as: the same question, so the same sentence.
+        let (status, refused) = codebuild(
+            &router,
+            "StartBuild",
+            json!({"projectName": "wording-proj", "serviceRoleOverride": role_arn}),
+        )
+        .await;
+        assert_eq!(
+            status, 400,
+            "case {case:?}: StartBuild must refuse the override, got {status}: {refused}"
+        );
+        assert_eq!(
+            refused["message"].as_str(),
+            Some(SENTENCE),
+            "case {case:?}: StartBuild must state AWS's own three conditions, got {refused}"
+        );
+    }
+}
 #[tokio::test]
 async fn start_build_refuses_a_service_role_override_it_cannot_assume() {
     let router = emulator();

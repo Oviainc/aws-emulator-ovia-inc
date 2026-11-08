@@ -339,6 +339,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 variables: target.variables,
                 variables_map: target.variables_map,
                 source_revisions: target.source_revisions,
+                // The rollback runs the SAME revisions the target execution ran, so the
+                // artifact revisions it reports are the target's too.
+                source_artifact_revisions: target.source_artifact_revisions,
                 // Re-running the stage reads the same sources the target execution read,
                 // so it carries the target's overrides too.
                 source_overrides: target.source_overrides,

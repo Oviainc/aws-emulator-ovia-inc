@@ -22,7 +22,7 @@ use std::io::Read as _;
 use std::time::SystemTime;
 
 use super::execution::{
-    is_terminal_status, transition_held, ArtifactRef, Job, JobOutcome,
+    is_terminal_status, transition_held, ArtifactRef, EnvironmentOverrides, Job, JobOutcome,
     ACTION_STEP, CLAIM_TIMEOUT, FAILURE_CONFIGURATION_ERROR, FAILURE_JOB_FAILED,
     MAX_ADVANCE_STEPS, MAX_ARCHIVE_ENTRIES, MAX_EXTRACTED_BYTES, MAX_EXTRACTED_ENTRY_BYTES,
     MAX_SOURCE_BYTES, MAX_SOURCE_FILES,
@@ -38,6 +38,14 @@ use super::{
 };
 use crate::ops::types::{Condition, SourceRevision};
 
+/// The work a CodeBuild action's build is started and settled by, in
+/// `state/driver/build_action.rs`.
+mod build_action;
+/// The work an Amazon ECR source action's image is resolved and packed by, in
+/// `state/driver/image_source.rs`.
+mod image_source;
+pub use image_source::{resolved_ecr_source_revisions, StartedSourceRevision};
+
 /// The `ActionCategory` of an action that waits for a human decision.
 const CATEGORY_APPROVAL: &str = "Approval";
 
@@ -52,6 +60,16 @@ const PROVIDER_S3: &str = "S3";
 /// The `provider` of a source action whose revisions live in a CodeCommit repository.
 const PROVIDER_CODE_COMMIT: &str = "CodeCommit";
 
+/// The `provider` of a source action whose revisions are the images of an Amazon ECR
+/// repository.
+const PROVIDER_ECR: &str = "ECR";
+
+/// The `ActionCategory` of an action that builds its input.
+const CATEGORY_BUILD: &str = "Build";
+
+/// The `provider` of an action whose work is a build of an AWS CodeBuild project.
+const PROVIDER_CODE_BUILD: &str = "CodeBuild";
+
 /// The `provider` of an action whose work is an invocation of a Lambda function.
 const PROVIDER_LAMBDA: &str = "Lambda";
 
@@ -64,6 +82,24 @@ const CONFIG_BRANCH_NAME: &str = "BranchName";
 
 /// The configuration key naming the function a Lambda action invokes.
 const CONFIG_FUNCTION_NAME: &str = "FunctionName";
+
+/// The configuration key naming the tag an Amazon ECR source action sources the image of
+/// (CodePipeline's action-structure reference for the Amazon ECR source action).
+const CONFIG_IMAGE_TAG: &str = "ImageTag";
+
+/// The tag an Amazon ECR source action sources when its declaration names none: the
+/// action's `ImageTag` is "optional" and "if not specified, the value defaults to
+/// `latest`".
+const DEFAULT_IMAGE_TAG: &str = "latest";
+
+/// The configuration key naming the project a CodeBuild action builds (that same
+/// reference, for the CodeBuild build and test actions).
+const CONFIG_PROJECT_NAME: &str = "ProjectName";
+
+/// The configuration key carrying the environment variables a CodeBuild action overrides
+/// the project's with: "a set of environment variables" as a JSON ARRAY of
+/// `{name, value, type}` objects, in the action's own configuration.
+const CONFIG_ENVIRONMENT_VARIABLES: &str = "EnvironmentVariables";
 
 /// The configuration key carrying the text a Lambda action's event passes through.
 const CONFIG_USER_PARAMETERS: &str = "UserParameters";
@@ -684,6 +720,20 @@ fn step_stage(
                 continue;
             }
             if action.is_in_progress() {
+                // An action WAITING for a run it started in another service is not stuck:
+                // its next step is to READ that run, which falls due like every other
+                // step of this engine rather than being waited for. A claim another call
+                // is still inside is left alone; one that ran out is reclaimed HERE,
+                // rather than falling through to a second start of the same work.
+                if action.external_run.is_some() {
+                    let claim_in_flight = action.claimed.is_some_and(|claimed| {
+                        now.duration_since(claimed).unwrap_or_default() < CLAIM_TIMEOUT
+                    });
+                    if claim_in_flight || action.due.is_some_and(|due| due > now) {
+                        continue;
+                    }
+                    return poll_action(record, stage, index, now);
+                }
                 // Either a human has not answered this action's approval yet, or another
                 // call is performing its work (and may still be within its claim).
                 // Either way it is THIS action that waits and not the rest of its run
@@ -716,6 +766,31 @@ fn step_stage(
     record.stages[stage].status = Some(STAGE_SUCCEEDED.to_string());
     record.last_update_time = now;
     None
+}
+
+/// Claim the next step of an action that is WAITING for a run in another service: reading
+/// that run, which is what settles the action once the run has finished.
+///
+/// The only work this engine starts in another service and comes back to is a BUILD (see
+/// [`ActionRun::external_run`](super::execution::ActionRun::external_run)), so the step is
+/// the read of that build. Nothing about the action's status changes here: it was and
+/// stays `InProgress` until the build it names reaches a terminal status.
+fn poll_action(
+    record: &mut PipelineExecutionRecord,
+    stage: usize,
+    index: usize,
+    now: SystemTime,
+) -> Option<Job> {
+    let execution_id = record.pipeline_execution_id.clone();
+    let action = &mut record.stages[stage].actions[index];
+    let build_id = action.external_run.clone()?;
+    action.claimed = Some(now);
+    Some(Job::CodeBuildPoll {
+        execution_id,
+        stage,
+        action: index,
+        build_id,
+    })
 }
 
 /// Start one action: either it waits for a decision, or it claims the work it needs to
@@ -758,6 +833,14 @@ fn start_action(
         &record.source_overrides,
         &record.stages[stage].actions[index].name,
     );
+    // The revision this execution was STARTED for, as its own record carries it: an
+    // Amazon ECR source action sources that image rather than whatever its tag names by
+    // the time the action runs.
+    let pinned_revision = record
+        .source_revisions
+        .iter()
+        .find(|revision| revision.action_name == record.stages[stage].actions[index].name)
+        .and_then(|revision| revision.revision_id.clone());
     let produced = record.artifacts.clone();
     // What the action IS comes from the pinned declaration, not from a copy in the
     // execution record, and from the declared stage the PLAN names rather than from the
@@ -1118,6 +1201,115 @@ fn start_action(
         });
     }
 
+    if category == CATEGORY_SOURCE && provider == PROVIDER_ECR {
+        // An Amazon ECR source action's revision is an IMAGE of the repository its
+        // configuration names, at the tag it names: the work is resolving that tag to
+        // the image the registry holds and producing the image's detail as the output
+        // artifact, which is what a deploy action downstream reads the image URI from.
+        if let Some(key) = &artifact_encryption_key {
+            let detail = format!(
+                "the pipeline's artifact store declares the customer managed key {key}, \
+                 and this emulator cannot encrypt an artifact object with KMS, so the \
+                 artifact cannot be produced as declared"
+            );
+            fail_action(action, FAILURE_CONFIGURATION_ERROR, &detail, now);
+            return None;
+        }
+        let Some(repository) = config.get(CONFIG_REPOSITORY_NAME) else {
+            fail_action(
+                action,
+                FAILURE_CONFIGURATION_ERROR,
+                &format!(
+                    "an {provider} {category} action must declare the configuration key \
+                     {CONFIG_REPOSITORY_NAME}"
+                ),
+                now,
+            );
+            return None;
+        };
+        if output_artifacts.is_empty() {
+            fail_action(
+                action,
+                FAILURE_CONFIGURATION_ERROR,
+                &format!(
+                    "an {provider} {category} action must declare an output artifact to \
+                     produce"
+                ),
+                now,
+            );
+            return None;
+        }
+        let outputs = output_artifacts
+            .iter()
+            .map(|name| ArtifactRef {
+                bucket: artifact_bucket.clone(),
+                key: artifact_key(&pipeline_name, name),
+                revision: None,
+            })
+            .collect();
+        action.claimed = Some(now);
+        return Some(Job::EcrSource {
+            execution_id,
+            stage,
+            action: index,
+            repository: repository.clone(),
+            // The declaration's tag, or the one the action documents as its default.
+            image_tag: config
+                .get(CONFIG_IMAGE_TAG)
+                .filter(|tag| !tag.is_empty())
+                .cloned()
+                .unwrap_or_else(|| DEFAULT_IMAGE_TAG.to_string()),
+            image_digest: pinned_revision,
+            outputs,
+        });
+    }
+
+    if category == CATEGORY_BUILD && provider == PROVIDER_CODE_BUILD {
+        // A CodeBuild action's work IS a build of the project its configuration names:
+        // the action is performed by starting that build and is settled from the build's
+        // own terminal status, which the next step of the action reads. So nothing here
+        // reports an outcome — the build has not run yet.
+        let Some(project_name) = config.get(CONFIG_PROJECT_NAME) else {
+            fail_action(
+                action,
+                FAILURE_CONFIGURATION_ERROR,
+                &format!(
+                    "a {provider} {category} action must declare the configuration key \
+                     {CONFIG_PROJECT_NAME}"
+                ),
+                now,
+            );
+            return None;
+        };
+        let environment_overrides = match config
+            .get(CONFIG_ENVIRONMENT_VARIABLES)
+            .map(|declared| declared_environment_overrides(declared))
+        {
+            None => Vec::new(),
+            Some(Ok(overrides)) => overrides,
+            Some(Err(detail)) => {
+                fail_action(
+                    action,
+                    FAILURE_CONFIGURATION_ERROR,
+                    &format!(
+                        "the configuration key {CONFIG_ENVIRONMENT_VARIABLES} of this \
+                         action {detail}"
+                    ),
+                    now,
+                );
+                return None;
+            }
+        };
+        action.claimed = Some(now);
+        return Some(Job::CodeBuildStart {
+            execution_id,
+            stage,
+            action: index,
+            project_name: project_name.clone(),
+            environment_overrides,
+        });
+    }
+
     // Work this emulator cannot perform. Nothing is reported as having run: the action
     // fails with the reason, and the execution reaches the modelled `Failed` status.
     let detail = format!(
@@ -1126,6 +1318,42 @@ fn start_action(
     );
     fail_action(action, FAILURE_CONFIGURATION_ERROR, &detail, now);
     None
+}
+
+/// The environment variables a CodeBuild action's `EnvironmentVariables` configuration
+/// overrides the project's with, as `(name, value, type)`.
+///
+/// The configuration value is a JSON ARRAY of objects, each with a `name` and a `value`
+/// and optionally a `type` — the action's own documented form — so a value that is not
+/// that is a declaration this action cannot be run as, which the caller reports as the
+/// `ConfigurationError` it is. `Err` carries the clause that says what is wrong with it.
+///
+/// Nothing is judged about the variables themselves here: the entry count and the names
+/// are CodeBuild's to accept or refuse, and that service's refusal is what the action then
+/// reports.
+fn declared_environment_overrides(declared: &str) -> Result<EnvironmentOverrides, &'static str> {
+    let document: ::serde_json::Value =
+        ::serde_json::from_str(declared).map_err(|_| "is not a JSON document")?;
+    let entries = document
+        .as_array()
+        .ok_or("is not a JSON array of environment variables")?;
+    let mut overrides = Vec::with_capacity(entries.len());
+    for entry in entries {
+        let name = entry
+            .get("name")
+            .and_then(::serde_json::Value::as_str)
+            .ok_or("carries an entry that states no name")?;
+        let value = entry
+            .get("value")
+            .and_then(::serde_json::Value::as_str)
+            .ok_or("carries an entry that states no value")?;
+        let kind = entry
+            .get("type")
+            .and_then(::serde_json::Value::as_str)
+            .map(str::to_string);
+        overrides.push((name.to_string(), value.to_string(), kind));
+    }
+    Ok(overrides)
 }
 
 /// Record a failure against one action.
@@ -1137,6 +1365,8 @@ fn fail_action(
 ) {
     action.status = Some(ACTION_FAILED.to_string());
     action.claimed = None;
+    // The action is settled, so it is no longer waiting for anything.
+    action.external_run = None;
     action.summary = Some(message.to_string());
     action.error = Some((code.to_string(), message.to_string()));
     action.last_status_change = now;
@@ -1220,13 +1450,14 @@ fn record_outcome(
         } => {
             action.status = Some(ACTION_SUCCEEDED.to_string());
             action.claimed = None;
+            action.external_run = None;
             action.summary = Some(summary);
             action.last_status_change = now;
             action.external_execution_id = external_id;
             let produced = match job {
-                Job::S3Source { outputs, .. } | Job::CodeCommitSource { outputs, .. } => {
-                    outputs.as_slice()
-                }
+                Job::S3Source { outputs, .. }
+                | Job::CodeCommitSource { outputs, .. }
+                | Job::EcrSource { outputs, .. } => outputs.as_slice(),
                 _ => &[],
             };
             for (name, location) in output_names.iter().zip(produced.iter()) {
@@ -1247,7 +1478,7 @@ fn record_outcome(
             // artifact produced from a revision did not resolve one.
             let sourced = matches!(
                 job,
-                Job::S3Source { .. } | Job::CodeCommitSource { .. }
+                Job::S3Source { .. } | Job::CodeCommitSource { .. } | Job::EcrSource { .. }
             );
             if let (true, Some(revision)) = (sourced, revision) {
                 let existing = record
@@ -1272,6 +1503,23 @@ fn record_outcome(
         } => {
             fail_action(action, &code, &message, now);
             action.external_execution_id = external_id;
+        }
+        // The work is RUNNING in another service: the action keeps the `InProgress`
+        // status it already reports, the run it is waiting for is recorded on it, and the
+        // step that reads that run again becomes due a span from now — the same span every
+        // other step of this engine waits, stored rather than slept on. The claim is
+        // released, so whichever call or clock tick comes next performs that read.
+        JobOutcome::Running {
+            external_run,
+            summary,
+        } => {
+            action.claimed = None;
+            action.summary = Some(summary);
+            action.due = Some(now + ACTION_STEP);
+            // What a client sees as the run performing this action, which is the handle
+            // the next step reads it by.
+            action.external_execution_id = Some(external_run.clone());
+            action.external_run = Some(external_run);
         }
     }
     record.last_update_time = now;
@@ -1429,6 +1677,40 @@ async fn run_job(
                 *extract,
             )
             .await
+        }
+        Job::EcrSource {
+            repository,
+            image_tag,
+            image_digest,
+            outputs,
+            ..
+        } => {
+            image_source::run_ecr_source(
+                callback,
+                &s3_client(callback, region),
+                region,
+                repository,
+                image_tag,
+                image_digest.as_deref(),
+                outputs,
+            )
+            .await
+        }
+        Job::CodeBuildStart {
+            project_name,
+            environment_overrides,
+            ..
+        } => {
+            build_action::run_codebuild_start(
+                callback,
+                region,
+                project_name,
+                environment_overrides,
+            )
+            .await
+        }
+        Job::CodeBuildPoll { build_id, .. } => {
+            build_action::run_codebuild_poll(callback, region, build_id).await
         }
     }
 }

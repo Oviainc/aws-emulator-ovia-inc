@@ -164,6 +164,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let state = crate::state::require_state(&*self.engine)?;
         let region = crate::state::request_region(&ctx.parts().headers);
+        // An execution is started FOR a particular revision of each of its sources, so
+        // the revisions its sources hold are resolved BEFORE the record is written — with
+        // no lock held, because resolving one reads the service that owns the source. A
+        // pipeline this call then finds gone is refused below, exactly as it would be
+        // without this pass.
+        let declaration = state
+            .lock()
+            .pipelines
+            .get(&input.name)
+            .map(|pipeline| pipeline.declaration.clone());
+        let started_revisions = match &declaration {
+            Some(declaration) => {
+                crate::state::driver::resolved_ecr_source_revisions(
+                    ctx.callback(),
+                    &region,
+                    declaration,
+                )
+                .await
+            }
+            None => Vec::new(),
+        };
         let execution_id = {
             let mut state = state.lock();
 
@@ -302,6 +323,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         revision_id: Some(source_override.revision_value.clone()),
                         revision_summary: None,
                         revision_url: None,
+                    })
+                    // Beside them, the revisions this start RESOLVED from the sources
+                    // themselves — for an action the request overrode, the override is
+                    // the revision in force, so the resolved one is not recorded for it.
+                    .chain(
+                        started_revisions
+                            .iter()
+                            .filter(|resolved| {
+                                !source_overrides.iter().any(|source_override| {
+                                    source_override.action_name == resolved.action_name
+                                })
+                            })
+                            .map(|resolved| SourceRevision {
+                                action_name: resolved.action_name.clone(),
+                                revision_id: Some(resolved.revision_id.clone()),
+                                revision_summary: None,
+                                revision_url: None,
+                            }),
+                    )
+                    .collect(),
+                // Which ARTIFACT each resolved revision belongs to, so the execution
+                // reports the revision it is running before the action that produces that
+                // artifact from it has run.
+                source_artifact_revisions: started_revisions
+                    .iter()
+                    .flat_map(|resolved| {
+                        resolved
+                            .artifact_names
+                            .iter()
+                            .map(|name| (name.clone(), resolved.revision_id.clone()))
                     })
                     .collect(),
                 source_overrides,

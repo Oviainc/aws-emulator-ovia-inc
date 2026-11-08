@@ -61,6 +61,9 @@ aws-sdk-sfn = { version = "1", default-features = false }
 # A Kinesis data stream target is delivered to with `PutRecord`, over the same
 # in-process callback.
 aws-sdk-kinesis = { version = "1", default-features = false }
+# A CodePipeline pipeline target is delivered to with `StartPipelineExecution`,
+# over the same in-process callback.
+aws-sdk-codepipeline = { version = "1", default-features = false }
 # `FailedInvocations`, the metric EventBridge counts an undeliverable event on,
 # is appended to the CloudWatch store in the SAME shared engine (the `AWS/Events`
 # namespace). CloudWatch refuses a `PutMetricData` into a reserved `AWS/`

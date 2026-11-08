@@ -2637,6 +2637,12 @@ fn naming_rules(resource_type: &str) -> Option<NameRules> {
         // `@length(min: 2, max: 128)` (CodeBuild's own Smithy model), which a generated
         // name is already inside character-wise and may only be longer than.
         CODEBUILD_REPORT_GROUP => rules(128, Characters::AsGenerated),
+        // CodeBuild `CreateProject.name`: `ProjectName`, `@length(min: 2, max: 150)` with
+        // pattern `^[A-Za-z0-9][A-Za-z0-9\-_]{1,149}$` (CodeBuild's own Smithy model),
+        // which a generated name is already inside — letters, digits and the hyphen are all
+        // admitted, and it starts with a letter because a stack name does — but may be
+        // longer than.
+        CODEBUILD_PROJECT => rules(150, Characters::AsGenerated),
         // CodeCommit `CreateRepository.repositoryName`: `RepositoryName`,
         // `@length(min: 1, max: 100)` with pattern `^[\w\.-]+$` (CodeCommit's own Smithy
         // model), which a generated name is already inside — letters, digits and the hyphen
@@ -3304,6 +3310,7 @@ pub const IMPLEMENTED_RESOURCE_TYPES: &[&str] = &[
     CLOUDWATCH_METRIC_STREAM,
     CODEARTIFACT_DOMAIN,
     CODEARTIFACT_REPOSITORY,
+    CODEBUILD_PROJECT,
     CODEBUILD_REPORT_GROUP,
     COGNITO_USER_POOL,
     "AWS::DynamoDB::Table",

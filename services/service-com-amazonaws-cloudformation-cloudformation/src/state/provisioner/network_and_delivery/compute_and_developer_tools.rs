@@ -2048,6 +2048,175 @@ pub(crate) fn codebuild_report_group_arn(resource: &StoredResource, region: &str
     )
 }
 
+// ---------------------------------------------------------------------------
+// AWS CodeBuild: AWS::CodeBuild::Project
+// ---------------------------------------------------------------------------
+
+/// The properties of an `AWS::CodeBuild::Project` that are NOT members of
+/// `CreateProject`, and so never travel in its request.
+///
+/// `Name` is the one value CloudFormation decides (this resource's physical id) and is set
+/// on the way out; `Tags` is the create's own member beside the project, carrying the tags
+/// CloudFormation gives the resource as well ([`tags_of`]); and the last three are each
+/// another call's business — a webhook (`CreateWebhook`) for `Triggers`, the project's
+/// visibility (`UpdateProjectVisibility`) for `Visibility` and the role that call takes for
+/// `ResourceAccessRole`. Everything else the type publishes IS a `CreateProject` member
+/// under the same name with a lower-case initial, so the evaluated document is carried
+/// through with that one transformation ([`camel_cased`]).
+pub(crate) const CODEBUILD_PROJECT_PROPERTIES_NOT_SENT: &[&str] = &[
+    "name",
+    "tags",
+    "triggers",
+    "visibility",
+    "resourceAccessRole",
+];
+
+/// The one `ProjectSource` member whose property name is not its API member under a
+/// lower-case initial: a template declares `BuildSpec` and the model spells it
+/// `buildspec` (`ProjectSource$buildspec`, "the buildspec file declaration to use for the
+/// builds in this build project").
+///
+/// `(as camel_cased leaves it, as the model spells it)`, applied to the primary `Source`
+/// and to every entry of `SecondarySources`, which are the same shape.
+pub(crate) const CODEBUILD_BUILDSPEC_MEMBER: (&str, &str) = ("buildSpec", "buildspec");
+
+/// The `Project` members CodeBuild reports under this type's own property names, as
+/// `(property, member)` pairs, for drift detection.
+///
+/// The nested structures are not among them, for the reason the report group's catalogue
+/// gives: a property the read reports differently is not evidence of anything
+/// ([`super::drift`]). `Tags` is left out because the tags a resource carries change
+/// independently of its declaration.
+pub(crate) const CODEBUILD_PROJECT_REPORTED_PROPERTIES: &[(&str, &str)] = &[
+    ("Name", "name"),
+    ("Description", "description"),
+    ("ServiceRole", "serviceRole"),
+    ("SourceVersion", "sourceVersion"),
+    ("EncryptionKey", "encryptionKey"),
+    ("TimeoutInMinutes", "timeoutInMinutes"),
+    ("QueuedTimeoutInMinutes", "queuedTimeoutInMinutes"),
+    ("ConcurrentBuildLimit", "concurrentBuildLimit"),
+    ("BadgeEnabled", "badgeEnabled"),
+];
+
+/// Create the build project an `AWS::CodeBuild::Project` declares — so a client that
+/// deployed the stack and then calls `codebuild start-build` or `batch-get-projects` for
+/// the project the stack reports gets the project, rather than CodeBuild refusing a
+/// resource its own stack just reported created.
+///
+/// "Ref returns the project name", which is this resource's physical id and the one value
+/// `CreateProject` takes to key the project by, so the project is created under it and the
+/// id the stack already computed stays in force. The ARN that create ANSWERS with is
+/// recorded as the type's published `Arn` attribute, so `Fn::GetAtt` reads the ARN
+/// CodeBuild really keyed the project by.
+///
+/// The project carries the tags the declaration asks for plus the stack's own
+/// ([`tags_of`]), as the `[{key, value}]` list CodeBuild's own `Tag` shape spells.
+pub(crate) async fn create_codebuild_project(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+    propagated: &[(String, String)],
+) -> Result<Created, Refusal> {
+    let mut request = match camel_cased(&resource.properties, 0)? {
+        Value::Object(object) => object,
+        _ => Map::new(),
+    };
+    for property in CODEBUILD_PROJECT_PROPERTIES_NOT_SENT {
+        request.remove(*property);
+    }
+    // The one member spelled differently on the two sides, in the primary source and in
+    // each secondary one.
+    if let Some(source) = request.get_mut("source") {
+        respell_buildspec(source);
+    }
+    for source in request
+        .get_mut("secondarySources")
+        .and_then(Value::as_array_mut)
+        .into_iter()
+        .flatten()
+    {
+        respell_buildspec(source);
+    }
+    // The one member CloudFormation itself decides.
+    request.insert(
+        "name".to_string(),
+        Value::String(resource.physical_resource_id.clone()),
+    );
+    let tags = tags_of(&resource.properties, propagated);
+    if !tags.is_empty() {
+        request.insert("tags".to_string(), tags_as_list(&tags, LOWER_CASED_TAG));
+    }
+
+    let answered = call_codebuild(ctx, region, "CreateProject", &Value::Object(request)).await?;
+    let mut attributes = BTreeMap::new();
+    if let Some(arn) = reported_member(&answered, "project")
+        .get("arn")
+        .and_then(scalar_text)
+    {
+        attributes.insert("Arn".to_string(), arn);
+    }
+    Ok(Created::attributes(attributes))
+}
+
+/// Move a source's `buildSpec` member — what [`camel_cased`] makes of the declared
+/// `BuildSpec` — to the name the model spells it under
+/// ([`CODEBUILD_BUILDSPEC_MEMBER`]). A source that declares none is left as it is.
+fn respell_buildspec(source: &mut Value) {
+    let (as_cased, as_modelled) = CODEBUILD_BUILDSPEC_MEMBER;
+    let Some(members) = source.as_object_mut() else {
+        return;
+    };
+    if let Some(buildspec) = members.remove(as_cased) {
+        members.insert(as_modelled.to_string(), buildspec);
+    }
+}
+
+/// Delete the project a stack created, addressed by the NAME it was created under — the
+/// handle `DeleteProject` takes.
+///
+/// `DeleteProject` models no does-not-exist error: a project CodeBuild no longer holds is
+/// already in the state the delete asks for, and that call says so itself.
+pub(crate) async fn delete_codebuild_project(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<(), Refusal> {
+    call_codebuild(
+        ctx,
+        region,
+        "DeleteProject",
+        &serde_json::json!({ "name": physical_resource_id }),
+    )
+    .await?;
+    Ok(())
+}
+
+/// The project's configuration as CodeBuild reports it, for drift detection.
+///
+/// `BatchGetProjects` reports a name it holds no project for in `projectsNotFound` rather
+/// than refusing the read, so an answer carrying no project is that service saying it no
+/// longer holds the resource — the `DELETED` drift status.
+pub(crate) async fn describe_codebuild_project(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    physical_resource_id: &str,
+) -> Result<Option<Value>, Refusal> {
+    let request = serde_json::json!({ "names": [physical_resource_id] });
+    let answered = call_codebuild(ctx, region, "BatchGetProjects", &request).await?;
+    let Some(project) = answered
+        .get("projects")
+        .and_then(Value::as_array)
+        .and_then(|projects| projects.first())
+    else {
+        return Ok(None);
+    };
+    Ok(Some(reported_as_properties(
+        project,
+        CODEBUILD_PROJECT_REPORTED_PROPERTIES,
+    )))
+}
+
 /// Call one CodeBuild operation on the awsJson1_1 wire its model declares.
 pub(crate) async fn call_codebuild(
     ctx: &smithy_server_runtime::OperationContext<'_>,

@@ -1000,10 +1000,56 @@ dependencies = [
 ]
 
 [[package]]
+name = "aws-sdk-codebuild"
+version = "1.145.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0fa5c12158483966268c29e1ca534d322688e12d535c35ebe481dacae57f6627"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "fastrand",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
 name = "aws-sdk-codecommit"
 version = "1.123.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1edf24991c3ab5e0e7417c07fbb2b8d84827613459bc5237a5b25b903b7d170"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "fastrand",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-codepipeline"
+version = "1.131.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5f23af1af444c7e7964a9483e3836d1b3772441ca5771629e83d7e89f42ec0d9"
 dependencies = [
  "arc-swap",
  "aws-credential-types",
@@ -1092,6 +1138,31 @@ dependencies = [
  "aws-smithy-types",
  "aws-smithy-xml",
  "aws-types",
+ "fastrand",
+ "http",
+ "regex-lite",
+ "tracing",
+]
+
+[[package]]
+name = "aws-sdk-ecr"
+version = "1.138.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1aecb6e71c02b1eab61918637b688fc89e1aca2c59827ce4b43303dc349454a5"
+dependencies = [
+ "arc-swap",
+ "aws-credential-types",
+ "aws-runtime",
+ "aws-smithy-async",
+ "aws-smithy-http",
+ "aws-smithy-json 0.65.1",
+ "aws-smithy-observability",
+ "aws-smithy-runtime",
+ "aws-smithy-runtime-api",
+ "aws-smithy-schema 1.2.0",
+ "aws-smithy-types",
+ "aws-types",
+ "bytes",
  "fastrand",
  "http",
  "regex-lite",
@@ -10045,7 +10116,9 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-codebuild",
  "aws-sdk-codecommit",
+ "aws-sdk-ecr",
  "aws-sdk-eventbridge",
  "aws-sdk-iam",
  "aws-sdk-lambda",
@@ -10055,11 +10128,14 @@ dependencies = [
  "aws-smithy-types",
  "base64 0.22.1",
  "bytes",
+ "chrono",
  "hex",
  "http",
  "serde_json",
  "serde_json_path",
+ "service-com-amazonaws-codebuild-codebuild-20161006",
  "service-com-amazonaws-codecommit-codecommit-20150413",
+ "service-com-amazonaws-ecr-amazonec2containerregistry-v20150921",
  "service-com-amazonaws-eventbridge-awsevents",
  "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-lambda-awsgirapiservice",
@@ -11331,6 +11407,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-eventbridge",
  "aws-sigv4",
  "aws-smithy-runtime-api",
  "aws-smithy-schema 0.2.1",
@@ -11764,6 +11841,7 @@ dependencies = [
  "aws-emulator-smithy-macros",
  "aws-emulator-smithy-schema-server",
  "aws-emulator-smithy-server-runtime",
+ "aws-sdk-codepipeline",
  "aws-sdk-kinesis",
  "aws-sdk-lambda",
  "aws-sdk-sfn",

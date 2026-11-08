@@ -477,6 +477,7 @@ use super::template::{
     APIGATEWAYV2_STAGE, BACKUP_PLAN, BACKUP_SELECTION, BACKUP_VAULT, BATCH_COMPUTE_ENVIRONMENT,
     BATCH_JOB_QUEUE, BATCH_SERVICE_ENVIRONMENT, CLOUDWATCH_DASHBOARD,
     CLOUDWATCH_METRIC_STREAM, CODEARTIFACT_DOMAIN, CODEARTIFACT_REPOSITORY,
+    CODEBUILD_PROJECT,
     CODEBUILD_REPORT_GROUP, CODECOMMIT_REPOSITORY, CODEDEPLOY_APPLICATION,
     CODEDEPLOY_DEPLOYMENT_CONFIG, CODEDEPLOY_DEPLOYMENT_GROUP,
     COGNITO_USER_POOL_GROUP, DEFAULT_SCHEDULE_GROUP, EC2_SECURITY_GROUP, EC2_SUBNET,
@@ -659,6 +660,11 @@ pub(super) enum Provisioner {
     /// `CreateReportGroup` creates under the name the template states and
     /// `DeleteReportGroup` removes by the ARN that service keyed it by.
     CodeBuildReportGroup,
+    /// `AWS::CodeBuild::Project`: a build project of that same service, which
+    /// `CreateProject` creates under the name the template states and `DeleteProject`
+    /// removes by that name — so the project a stack reports created is one every
+    /// CodeBuild read and every `StartBuild` resolves.
+    CodeBuildProject,
     EcsCluster,
     SqsQueue,
     /// `AWS::SQS::QueuePolicy` and `AWS::SQS::QueueInlinePolicy`, which are not resources
@@ -847,6 +853,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         CODEPIPELINE_PIPELINE => Some(Provisioner::CodePipelinePipeline),
         CODEPIPELINE_CUSTOM_ACTION_TYPE => Some(Provisioner::CodePipelineCustomActionType),
         CODEBUILD_REPORT_GROUP => Some(Provisioner::CodeBuildReportGroup),
+        CODEBUILD_PROJECT => Some(Provisioner::CodeBuildProject),
         ECS_CLUSTER => Some(Provisioner::EcsCluster),
         SQS_QUEUE => Some(Provisioner::SqsQueue),
         SQS_QUEUE_POLICY | SQS_QUEUE_INLINE_POLICY => Some(Provisioner::SqsQueuePolicy),
@@ -1324,6 +1331,12 @@ impl Provisioner {
             }
             Self::CodeBuildReportGroup => {
                 create_codebuild_report_group(ctx, region, resource, propagated).await
+            }
+            // `AWS::CodeBuild::Project` publishes `Tags`, and `CreateProject` takes a tag
+            // list of its own, so a project a stack creates carries the tags
+            // CloudFormation gives it beside the ones the declaration asks for.
+            Self::CodeBuildProject => {
+                create_codebuild_project(ctx, region, resource, propagated).await
             }
             // `AWS::SES::ConfigurationSet` publishes `Name`, `DeliveryOptions`,
             // `ReputationOptions`, `SendingOptions`, `SuppressionOptions`,
@@ -2281,6 +2294,11 @@ impl Provisioner {
             Self::CodeBuildReportGroup => {
                 delete_codebuild_report_group(ctx, region, resource).await
             }
+            // A project is addressed by the NAME it was created under, which is this
+            // resource's physical id.
+            Self::CodeBuildProject => {
+                delete_codebuild_project(ctx, region, physical_resource_id).await
+            }
             Self::SesConfigurationSet => {
                 delete_ses_configuration_set(ctx, region, physical_resource_id).await
             }
@@ -2633,6 +2651,11 @@ impl Provisioner {
             // Read back by the same ARN the delete addresses the group by.
             Self::CodeBuildReportGroup => {
                 describe_codebuild_report_group(ctx, region, resource).await
+            }
+            // Read back out of the batch read of projects, by the name the project was
+            // created under.
+            Self::CodeBuildProject => {
+                describe_codebuild_project(ctx, region, physical_resource_id).await
             }
             Self::SesConfigurationSet => {
                 describe_ses_configuration_set(ctx, region, physical_resource_id).await

@@ -3135,6 +3135,17 @@ pub struct PipelineExecutionRecord {
     /// The source revisions this execution was started with, plus the ones its source
     /// actions resolved as they ran.
     pub source_revisions: Vec<SourceRevision>,
+    /// The revision the execution was STARTED FOR, per output artifact of the source
+    /// actions that resolved one at start, keyed by `OutputArtifact$name`.
+    ///
+    /// An execution is started for a particular revision of each of its sources: the start
+    /// resolves what the sources hold at that instant
+    /// ([`driver::resolved_ecr_source_revisions`]), which is what makes an execution that
+    /// has not reached its source action yet — or that was superseded before it did — still
+    /// report the revision it was running. [`Self::artifacts`] carries the artifacts an
+    /// action really PRODUCED, so a produced artifact's own revision is what the execution
+    /// then reports for it ([`Self::to_execution`]).
+    pub source_artifact_revisions: BTreeMap<String, String>,
     /// The source-revision OVERRIDES this execution runs with, as the start that
     /// created it stated them.
     ///
@@ -3199,8 +3210,13 @@ impl PipelineExecutionRecord {
             pipeline_execution_id: Some(self.pipeline_execution_id.clone()),
             status: Some(self.status.clone()),
             status_summary: self.status_summary.clone(),
-            artifact_revisions: (!self.artifacts.is_empty()).then(|| {
-                self.artifacts
+            // Every artifact whose revision this execution knows: the ones its actions
+            // have produced, each at the revision it was produced from, plus the ones the
+            // START resolved and no action has produced yet — an execution reports the
+            // revision it is running from the instant it was started for it.
+            artifact_revisions: {
+                let mut revisions: Vec<crate::ops::types::ArtifactRevision> = self
+                    .artifacts
                     .iter()
                     .map(|(name, location)| crate::ops::types::ArtifactRevision {
                         name: Some(name.clone()),
@@ -3210,8 +3226,22 @@ impl PipelineExecutionRecord {
                         created: None,
                         revision_url: None,
                     })
-                    .collect()
-            }),
+                    .collect();
+                revisions.extend(
+                    self.source_artifact_revisions
+                        .iter()
+                        .filter(|(name, _)| !self.artifacts.contains_key(*name))
+                        .map(|(name, revision)| crate::ops::types::ArtifactRevision {
+                            name: Some(name.clone()),
+                            revision_id: Some(revision.clone()),
+                            revision_change_identifier: None,
+                            revision_summary: None,
+                            created: None,
+                            revision_url: None,
+                        }),
+                );
+                (!revisions.is_empty()).then_some(revisions)
+            },
             variables: optional_list(self.variables.clone()),
             trigger: Some(self.trigger.clone()),
             execution_mode: Some(self.execution_mode.clone()),
@@ -3816,8 +3846,12 @@ pub fn start_execution(
             .collect(),
         variables,
         // Nothing pinned a revision and no source action has resolved one yet, so the
-        // execution carries none until one does.
+        // execution carries none until one does. This start is made with the store's lock
+        // held — it is a WEBHOOK's or a poll's, which cannot call the services that own
+        // the sources — so the revisions a start resolves when it can
+        // (`ops::start_pipeline_execution`) are not resolved here.
         source_revisions: Vec::new(),
+        source_artifact_revisions: BTreeMap::new(),
         source_overrides: Vec::new(),
         stages: plan_stages(&declaration, now),
         artifact_bucket,

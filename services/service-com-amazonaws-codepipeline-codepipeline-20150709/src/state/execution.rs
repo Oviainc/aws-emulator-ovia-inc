@@ -289,6 +289,15 @@ pub struct ActionRun {
     /// when the work was performed by one: the commit a source action resolved, the
     /// function an invoke action ran. `None` while nothing external has run.
     pub external_execution_id: Option<String>,
+    /// The run this action is WAITING FOR in the service that performs its work, when
+    /// that work is a job of another service rather than something one call does: the
+    /// build a `CodeBuild` action started. `None` for every action whose work finishes
+    /// inside the call that started it.
+    ///
+    /// It is what lets the engine come BACK to a started run: an action holding one stays
+    /// `InProgress` and is settled from that run's own terminal status, which is read each
+    /// time the action's next step falls due ([`ACTION_STEP`]) rather than waited for.
+    pub external_run: Option<String>,
 }
 
 impl ActionRun {
@@ -503,6 +512,7 @@ fn plan_action(action: &ActionDeclaration, now: SystemTime) -> ActionRun {
         last_status_change: now,
         start_time: None,
         external_execution_id: None,
+        external_run: None,
     }
 }
 
@@ -765,6 +775,11 @@ pub fn is_terminal_status(status: &str) -> bool {
     )
 }
 
+/// The environment variables a CodeBuild action overrides the project's with, as
+/// `(name, value, type)` — the three members of the `EnvironmentVariable` that call takes,
+/// with the type left to the service's own default where the declaration states none.
+pub type EnvironmentOverrides = Vec<(String, String, Option<String>)>;
+
 /// One unit of real work the engine has claimed and must now perform.
 #[derive(Debug, Clone)]
 pub enum Job {
@@ -841,6 +856,51 @@ pub enum Job {
         /// delivered under `key` instead of the archive itself.
         extract: bool,
     },
+    /// An Amazon ECR source action: resolve the image the configuration names and write
+    /// the image detail of it into the artifact store.
+    EcrSource {
+        /// The execution the action belongs to.
+        execution_id: String,
+        /// The stage's index in the execution's plan.
+        stage: usize,
+        /// The action's index in that stage.
+        action: usize,
+        /// The repository the action's configuration names.
+        repository: String,
+        /// The tag whose image the action sources.
+        image_tag: String,
+        /// The image the execution was STARTED for, when its start resolved one: the
+        /// action sources THAT image rather than whatever the tag names when it runs.
+        image_digest: Option<String>,
+        /// Where the produced artifacts are written.
+        outputs: Vec<ArtifactRef>,
+    },
+    /// A CodeBuild action: start a build of the project the configuration names.
+    CodeBuildStart {
+        /// The execution the action belongs to.
+        execution_id: String,
+        /// The stage's index in the execution's plan.
+        stage: usize,
+        /// The action's index in that stage.
+        action: usize,
+        /// The project the action builds.
+        project_name: String,
+        /// The environment variables the action's configuration overrides the project's
+        /// with ([`EnvironmentOverrides`]).
+        environment_overrides: EnvironmentOverrides,
+    },
+    /// The same action's next step: read the build it started, and settle the action
+    /// once that build has reached a terminal status.
+    CodeBuildPoll {
+        /// The execution the action belongs to.
+        execution_id: String,
+        /// The stage's index in the execution's plan.
+        stage: usize,
+        /// The action's index in that stage.
+        action: usize,
+        /// The build the action is waiting for.
+        build_id: String,
+    },
 }
 
 impl Job {
@@ -866,6 +926,24 @@ impl Job {
                 ..
             }
             | Self::S3Deploy {
+                execution_id,
+                stage,
+                action,
+                ..
+            }
+            | Self::EcrSource {
+                execution_id,
+                stage,
+                action,
+                ..
+            }
+            | Self::CodeBuildStart {
+                execution_id,
+                stage,
+                action,
+                ..
+            }
+            | Self::CodeBuildPoll {
                 execution_id,
                 stage,
                 action,
@@ -898,5 +976,19 @@ pub enum JobOutcome {
         message: String,
         /// The id of the external run the work was attempted as, when it reached one.
         external_id: Option<String>,
+    },
+    /// The work was STARTED in another service and has not finished: the action stays
+    /// `InProgress`, and the run it is waiting for is read again when its next step falls
+    /// due ([`ACTION_STEP`]).
+    ///
+    /// Nothing about the action is claimed as done here — no artifact, no revision and no
+    /// status but the one it already reports — so an action in this state is one a client
+    /// sees running, exactly as it does while a custom action's job waits for its worker.
+    Running {
+        /// The run in the other service this action is now waiting for, which is both the
+        /// handle the next step reads it by and the external execution a client sees.
+        external_run: String,
+        /// What the action is doing, as the action's summary.
+        summary: String,
     },
 }

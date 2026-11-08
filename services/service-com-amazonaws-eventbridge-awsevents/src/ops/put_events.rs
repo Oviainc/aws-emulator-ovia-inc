@@ -2228,6 +2228,9 @@ enum TargetKind {
     /// a workflow run once the batch is complete
     /// ([`crate::state::GlueState::notify_workflow_event`]).
     Workflow,
+    /// A CodePipeline pipeline: `codepipeline:StartPipelineExecution`, which
+    /// starts one execution of that pipeline.
+    Pipeline,
 }
 
 /// The ARN namespace of Amazon SQS, whose queues a rule delivers to.
@@ -2242,6 +2245,8 @@ const STATES_ARN_NAMESPACE: &str = "states";
 const KINESIS_ARN_NAMESPACE: &str = "kinesis";
 /// The ARN namespace of AWS Glue, whose workflows a rule drives.
 const GLUE_ARN_NAMESPACE: &str = "glue";
+/// The ARN namespace of AWS CodePipeline, whose pipelines a rule starts.
+const CODEPIPELINE_ARN_NAMESPACE: &str = "codepipeline";
 
 /// The resource type a Lambda function ARN names.
 const FUNCTION_RESOURCE_TYPE: &str = "function";
@@ -2308,6 +2313,18 @@ impl TargetKind {
             {
                 Some(Self::Workflow)
             }
+            // A pipeline's ARN names the pipeline directly, the way a queue's and a
+            // topic's do (`arn:<partition>:codepipeline:<region>:<account>:<name>`): a
+            // resource field carrying a type separator addresses one of that service's
+            // compound resources (an action type, a webhook) rather than a pipeline, so
+            // no execution is started for it.
+            CODEPIPELINE_ARN_NAMESPACE
+                if !parsed.resource.is_empty()
+                    && !parsed.resource.contains('/')
+                    && !parsed.resource.contains(':') =>
+            {
+                Some(Self::Pipeline)
+            }
             _ => None,
         }
     }
@@ -2326,6 +2343,7 @@ impl TargetKind {
             // and the one no operation of the Glue model serves: the ingress
             // EventBridge notifies a workflow's EVENT trigger through.
             Self::Workflow => "glue:notifyEvent",
+            Self::Pipeline => "codepipeline:StartPipelineExecution",
         }
     }
 
@@ -2510,6 +2528,32 @@ impl TargetKind {
             // counted against the workflow's EVENT trigger where Glue's own
             // readers read it.
             Self::Workflow => notify_workflow(stores.glue, region, arn),
+            Self::Pipeline => {
+                // The pipeline is named by the resource segment of its ARN, which is
+                // what `StartPipelineExecution$name` takes.
+                let name = ::service_common::arn::parse(arn).map(|parsed| parsed.resource);
+                let Some(name) = name.filter(|name| !name.is_empty()) else {
+                    return crate::state::InvocationOutcome::NotAttempted(
+                        "the target ARN names no pipeline".to_string(),
+                    );
+                };
+                outcome(
+                    clients
+                        .codepipeline(callback, region)
+                        .start_pipeline_execution()
+                        .name(name)
+                        // `clientRequestToken` is "the system-generated unique ID used to
+                        // identify a unique execution request" and is an idempotency
+                        // token, so the delivery carries the one identifier of this
+                        // handover that is unique already — the event's id. One event
+                        // delivered twice is then one execution rather than two, which is
+                        // what makes the delivery idempotent (the state-machine target's
+                        // rule, in the member that service takes it in).
+                        .client_request_token(handover.event_id)
+                        .send()
+                        .await,
+                )
+            }
         }
     }
 
@@ -2523,6 +2567,7 @@ impl TargetKind {
             Self::Stream => KINESIS_ARN_NAMESPACE,
             Self::ApiDestination => crate::state::ARN_NAMESPACE,
             Self::Workflow => GLUE_ARN_NAMESPACE,
+            Self::Pipeline => CODEPIPELINE_ARN_NAMESPACE,
         }
     }
 
@@ -2543,8 +2588,14 @@ impl TargetKind {
             // EventBridge needs `events:InvokeApiDestination` on the
             // destination, and the `RoleArn` the target names is what carries
             // it — and so is a Glue workflow, which needs `glue:notifyEvent` on
-            // the workflow off that same role.
-            Self::StateMachine | Self::ApiDestination | Self::Stream | Self::Workflow => true,
+            // the workflow off that same role. A CodePipeline pipeline is in that
+            // same class: "the role used for this rule" is what EventBridge calls
+            // `codepipeline:StartPipelineExecution` under.
+            Self::StateMachine
+            | Self::ApiDestination
+            | Self::Stream
+            | Self::Workflow
+            | Self::Pipeline => true,
             Self::Queue | Self::Function | Self::Topic => false,
         }
     }
@@ -3480,6 +3531,7 @@ pub(crate) struct Clients {
     sns: Option<(String, ::aws_sdk_sns::Client)>,
     sfn: Option<(String, ::aws_sdk_sfn::Client)>,
     kinesis: Option<(String, ::aws_sdk_kinesis::Client)>,
+    codepipeline: Option<(String, ::aws_sdk_codepipeline::Client)>,
 }
 
 /// Build the five clients the same way: over the in-process callback into this
@@ -3532,6 +3584,7 @@ impl Clients {
     // Step Functions publishes its endpoint and signs under `states`.
     callback_client!(sfn, aws_sdk_sfn, "states");
     callback_client!(kinesis, aws_sdk_kinesis, "kinesis");
+    callback_client!(codepipeline, aws_sdk_codepipeline, "codepipeline");
 }
 
 #[cfg(test)]
@@ -3656,6 +3709,29 @@ mod tests {
             (
                 "a Lambda layer",
                 format!("arn:aws:lambda:eu-west-2:{account}:layer:shared"),
+                None,
+                None,
+                false,
+            ),
+            (
+                "a CodePipeline pipeline",
+                format!("arn:aws:codepipeline:eu-west-2:{account}:orders-pipeline"),
+                Some(TargetKind::Pipeline),
+                Some("codepipeline:StartPipelineExecution"),
+                true,
+            ),
+            // Resources of that same service that are NOT a pipeline: each is keyed by a
+            // compound resource field, so no execution is started for it.
+            (
+                "a CodePipeline webhook",
+                format!("arn:aws:codepipeline:eu-west-2:{account}:webhook:on-push"),
+                None,
+                None,
+                false,
+            ),
+            (
+                "a CodePipeline custom action type",
+                format!("arn:aws:codepipeline:eu-west-2:{account}:actiontype:Build/Custom/1"),
                 None,
                 None,
                 false,

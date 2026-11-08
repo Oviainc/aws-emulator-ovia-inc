@@ -196,7 +196,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
-        let _ = ctx;
+
+        // The Region this push is published to EventBridge in: the one the request was
+        // signed for, read before anything is stored.
+        let region = crate::state::request_region(ctx.parts());
 
         crate::state::check_registry(input.registry_id.as_ref()).map_err(fault_error)?;
 
@@ -223,6 +226,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let now = ::std::time::SystemTime::now();
+        // The store is written under its lock, which the helper below holds for its own
+        // body alone: the guard is not `Send`, and the publication that follows is awaited.
+        let (output, pushed) = Self::store_pushed_image(&state, &input, digest, now)?;
+        // The push STORED an image, so the registry publishes the image action it
+        // performed, with the store's lock released — EventBridge delivers the event to the
+        // rules that match it, and a target of one may call back into this service.
+        crate::state::image_events::publish(ctx.callback(), &region, &[pushed]).await;
+
+        Ok(output)
+    }
+}
+
+impl<Eng> PutImage<Eng> {
+    /// Store the pushed manifest and its tag, and answer both the response the push gives
+    /// its caller and the image action it performed.
+    ///
+    /// Everything this operation writes happens here, under the store's lock; the caller
+    /// publishes the action once that lock is gone.
+    fn store_pushed_image(
+        state: &::engine::ServiceState<
+            crate::state::ComAmazonawsEcrAmazonec2containerregistryV20150921State,
+        >,
+        input: &PutImageInput,
+        digest: String,
+        now: ::std::time::SystemTime,
+    ) -> Result<(PutImageOutput, crate::state::image_events::ImageAction), PutImageError> {
         let mut store = state.lock();
 
         // The repository the push addresses has to exist before anything is charged
@@ -408,7 +437,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        Ok(PutImageOutput {
+        let output = PutImageOutput {
             image: Some(Image {
                 registry_id: Some(repo.registry_id.clone()),
                 repository_name: Some(repo.name.clone()),
@@ -422,6 +451,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 // streams or verifies the document knows how much of it there is.
                 image_manifest_size: Some(stored.manifest_size()),
             }),
-        })
+        };
+        // The action this push performed, built from the record above — what the caller
+        // publishes to EventBridge once this lock is released.
+        let pushed = crate::state::image_events::ImageAction {
+            repository_name: repo.name.clone(),
+            action_type: crate::state::image_events::ACTION_TYPE_PUSH,
+            image_digest: digest.clone(),
+            image_tag: input.image_tag.clone(),
+            at: now,
+        };
+        Ok((output, pushed))
     }
 }

@@ -35,6 +35,12 @@ flate2 = "1"
 # `json_document::minified`: the one minification of a JSON document a service reports
 # back, which the lifecycle policy document goes through.
 service-common = { path = "../common" }
+# The AWS SDK for EventBridge, driven over the in-process callback
+# (`OperationContext::callback`): an image action on a repository — a push, a
+# delete — is published onto the account's default event bus
+# (`state::image_events`). Only the generated client is needed — the emulator
+# supplies the transport, so the SDK's own HTTPS stack and runtime are left out.
+aws-sdk-eventbridge = { version = "1", default-features = false }
 # Computes the query-string SigV4 signature a published layer download URL carries, and
 # the one the download plane verifies before serving a byte
 # (`state::presigned_layer_download_url`).

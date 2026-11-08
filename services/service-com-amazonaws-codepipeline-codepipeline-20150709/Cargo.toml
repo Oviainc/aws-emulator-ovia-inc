@@ -23,6 +23,15 @@ aws-sdk-iam = { version = "1", default-features = false, features = ["rt-tokio",
 aws-sdk-codecommit = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 # The Lambda client an invoke action performs its work with, over the same callback.
 aws-sdk-lambda = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The Amazon ECR client an ECR source action resolves the image it sources with, over the
+# same in-process callback (`state::driver::image_source`).
+aws-sdk-ecr = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# The CodeBuild client a Build action starts its build and reads that build with, over the
+# same in-process callback (`state::driver::build_action`).
+aws-sdk-codebuild = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# Renders the instant an image was pushed in the form the `imageDetail.json` document an
+# ECR source action produces carries it in, rather than formatting a date by hand.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 # The EventBridge client this service publishes its own state-change events with, over
 # the same in-process callback: a pipeline execution, each of its stages and each of
 # their actions publish one event per state change onto the account's default event bus
@@ -79,6 +88,12 @@ service-com-amazonaws-lambda-awsgirapiservice = { workspace = true }
 # nothing for the publication to reach.
 service-com-amazonaws-eventbridge-awsevents = { workspace = true }
 service-com-amazonaws-sqs-amazonsqs = { workspace = true }
+# Amazon ECR and CodeBuild are mounted beside codepipeline in the image-and-build suite,
+# because an ECR source action resolves its image in that registry and a CodeBuild action
+# starts its build in that service: without them mounted there is nothing for either
+# action's work to reach.
+service-com-amazonaws-ecr-amazonec2containerregistry-v20150921 = { workspace = true }
+service-com-amazonaws-codebuild-codebuild-20161006 = { workspace = true }
 zip = { version = "9", default-features = false, features = ["deflate"] }
 
 [lints]

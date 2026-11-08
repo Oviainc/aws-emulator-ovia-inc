@@ -49,6 +49,22 @@ pub(super) fn return_values(
             );
             (name.to_string(), attributes)
         }
+        // "Ref returns the project name"; Fn::GetAtt: Arn. The same position the report
+        // group above is in: `super::provisioning` creates the project in CodeBuild, which
+        // answers with the project's own ARN — the same ARN this computes, since both are
+        // built from the one account id this emulator mints and the project's name, which
+        // is how CodeBuild keys a project (`project_arn` in its own state module).
+        CODEBUILD_PROJECT => {
+            attributes.insert(
+                "Arn".to_string(),
+                ::emulator_server::emulator_arn(
+                    CODEBUILD_ARN_NAMESPACE,
+                    region,
+                    &format!("project/{name}"),
+                ),
+            );
+            (name.to_string(), attributes)
+        }
         // "Ref returns the topic ARN"; Fn::GetAtt: TopicArn, TopicName. This is the type
         // `super::provisioning` creates in Amazon SNS itself, which then answers with the
         // topic's own ARN — the same ARN this computes, since both are built from the one
@@ -1543,6 +1559,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
         "AWS::RUM::AppMonitor" => &["Id"],
         "AWS::CloudWatch::Alarm" => &["Arn"],
         CODEBUILD_REPORT_GROUP => &["Arn"],
+        CODEBUILD_PROJECT => &["Arn"],
         CLOUDWATCH_METRIC_STREAM => &["Arn"],
         CODEARTIFACT_DOMAIN => &["Arn", "Name", "Owner"],
         CODEARTIFACT_REPOSITORY => &["Arn", "DomainOwner", "Name"],
@@ -2065,6 +2082,21 @@ pub const ECR_REPOSITORY: &str = "AWS::ECR::Repository";
 /// mints, so the value computed here and the one the create answers with are the same
 /// ARN — the position [`SNS_TOPIC`] is in.
 pub const CODEBUILD_REPORT_GROUP: &str = "AWS::CodeBuild::ReportGroup";
+
+/// An AWS CodeBuild build project's resource type, under that same namespace. This is the
+/// type `super::provisioning` creates in CodeBuild itself, through that service's own
+/// `CreateProject`.
+///
+/// Its physical resource id is the project's NAME — that type's published return value
+/// ("Ref returns the project name"), which is also the `Name` property a declaration states
+/// it under ([`physical_name`]) and the one value `CreateProject` takes to key the project
+/// by, which is what every CodeBuild operation on a project (`StartBuild`,
+/// `BatchGetProjects`, `DeleteProject`) addresses it with. [`return_values`] carries its one
+/// published attribute, `Arn`: the ARN CodeBuild forms for a project is that service's own
+/// `project/<name>` path under the single account id this emulator mints, so the value
+/// computed here and the one the create answers with are the same ARN — the position
+/// [`CODEBUILD_REPORT_GROUP`] is in.
+pub const CODEBUILD_PROJECT: &str = "AWS::CodeBuild::Project";
 
 /// The ARN namespace of the CodeBuild service, from its model's `aws.api#service`
 /// `arnNamespace` — the service segment of every ARN it forms.

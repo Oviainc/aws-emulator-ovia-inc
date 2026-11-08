@@ -4202,19 +4202,13 @@ pub const SERVICE_PRINCIPAL: &str = "codebuild.amazonaws.com";
 /// build under, carried by the modelled `InvalidInputException`.
 ///
 /// Fixed text, under [`SANDBOX_NOT_FOUND_MESSAGE`]'s rule: CodeBuild names the pass it
-/// could not make — `sts:AssumeRole` on the service role — and then the conditions the
-/// caller has to check, rather than quoting the role the request named, so the sentence is
-/// the same whether this account holds no such role or the role's trust policy does not
-/// admit this service ([`SERVICE_PRINCIPAL`]). Those are exactly the two conditions
-/// `service_common::iam_role` asks IAM about, which is why they are the two the sentence
-/// states. Recorded behaviour — the model states no message for the error.
-///
-/// The prefix up to and including the first condition is the recorded text verbatim; the
-/// second condition is stated in the service's own terms, because the recording available
-/// here is clipped after the first. It is the one part of this sentence that may still
-/// differ from AWS's, and it is to be replaced the moment a full recording of this refusal
-/// is at hand.
+/// could not make — `sts:AssumeRole` on the service role — and then the THREE conditions
+/// the caller has to check, rather than quoting the role the request named, so the sentence
+/// is the same whether this account holds no such role, the name differs in case, or the
+/// role's trust policy does not admit this service ([`SERVICE_PRINCIPAL`]). Recorded
+/// behaviour, word for word — the model states no message for the error — so none of the
+/// three clauses is restated in this service's own terms and none is dropped.
 pub const UNASSUMABLE_SERVICE_ROLE_MESSAGE: &str =
     "CodeBuild is not authorized to perform: sts:AssumeRole on service role. Please verify \
-     that: 1) The provided service role exists, 2) The service role's trust policy allows \
-     codebuild.amazonaws.com to assume it.";
+     that: 1) The provided service role exists, 2) The role name is case-sensitive and \
+     matches exactly, and 3) The role has the necessary trust policy configured.";

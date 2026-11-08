@@ -354,6 +354,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 revision_summary: None,
                 revision_url: None,
             }],
+            // Which ARTIFACT that revision belongs to is the declaration's to say, and a
+            // revision report names an action rather than an artifact, so the execution
+            // reports the artifact's revision once the action has produced it.
+            source_artifact_revisions: ::std::collections::BTreeMap::new(),
             // A reported revision is not a source-revision OVERRIDE: it says which
             // revision the caller observed, not which object or version an action is to
             // read, so this execution's actions read the sources their configuration
