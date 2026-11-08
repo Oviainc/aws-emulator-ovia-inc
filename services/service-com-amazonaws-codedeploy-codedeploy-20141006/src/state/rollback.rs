@@ -21,12 +21,19 @@
 //! A deployment group whose FIRST deployment is the one being stopped has no
 //! revision to go back to, so no rollback deployment is created for it; the
 //! `RollbackInfo` then carries no `rollbackDeploymentId` and says why.
+//!
+//! What the rollback DOES, for a deployment that had already shifted traffic: it
+//! re-points the Lambda alias at the revision it redeploys — the version the
+//! stopped deployment started from — in ONE shift rather than in the increments
+//! that deployment was walking. A rollback is CodeDeploy's own remediation for a
+//! deployment that was stopped, so it puts the alias back rather than walking a
+//! window again (which is also why [`super::alarm_gate`] leaves it ungated).
 
 use crate::ops::types::RollbackInfo;
 
 use super::{
     deployment_completion_due, deployment_start_due, lambda_traffic_shift, revision_key,
-    termination_wait, ComAmazonawsCodedeployCodedeploy20141006State, Deployment,
+    termination_wait, traffic_shift, ComAmazonawsCodedeployCodedeploy20141006State, Deployment,
     DEPLOYMENT_CREATOR_ROLLBACK, DEPLOYMENT_STATUS_CREATED,
 };
 
@@ -152,6 +159,11 @@ pub fn record_rollback(
             instance_termination_wait_time_started: false,
             lambda_traffic_shift: declared_shift,
             traffic_shift: lambda_traffic_shift::TrafficShiftProgress::Declared,
+            // In ONE shift: a rollback undoes, so it re-points the alias at the
+            // revision it redeploys instead of walking the increments the
+            // deployment it rolls back was walking.
+            traffic_increments: traffic_shift::single_shift(),
+            traffic_increments_applied: 0,
         });
     }
 

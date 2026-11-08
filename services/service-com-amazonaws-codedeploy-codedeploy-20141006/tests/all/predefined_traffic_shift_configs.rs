@@ -21,14 +21,20 @@
 
 use serde_json::{json, Value};
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::codedeploy_lifecycle::{
-    error_code, s3_revision, terminal_deployment, Emulator, POLL_DEADLINE, POLL_INTERVAL,
+    error_code, s3_revision, terminal_deployment, terminal_deployment_within, Emulator,
+    POLL_DEADLINE, POLL_INTERVAL,
 };
 
 /// The IAM role every deployment group here is created with.
 const SERVICE_ROLE: &str = "arn:aws:iam::123456789012:role/CodeDeployRole";
+
+/// How long a canary deployment created here is given to walk its window and
+/// reach a terminal status: longer than the window the five-minute built-in
+/// below holds its first increment for.
+const CANARY_WINDOW_DEADLINE: Duration = Duration::from_secs(30);
 
 /// One predefined deployment configuration that shifts traffic over TIME, with
 /// the traffic-routing settings documented for it.
@@ -431,7 +437,17 @@ async fn continue_deployment_classifies_the_deployment_before_the_wait_type() {
         .as_str()
         .unwrap_or_default()
         .to_string();
-    terminal_deployment(&emulator, &lambda, "a finished canary deployment").await;
+    terminal_deployment_within(
+        &emulator,
+        &lambda,
+        "a finished canary deployment",
+        // A canary holds its first increment for the interval its configuration
+        // states before it cuts over, so this deployment is non-terminal for that
+        // whole window: the five-minute interval of the built-in above, on this
+        // emulator's own clock scale.
+        CANARY_WINDOW_DEADLINE,
+    )
+    .await;
 
     // A blue/green deployment whose group holds it open for a termination wait
     // far longer than this test, so it is neither complete nor of a type that

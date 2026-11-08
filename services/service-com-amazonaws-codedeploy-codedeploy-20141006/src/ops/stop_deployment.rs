@@ -247,6 +247,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
         })?;
         let rollback_info = outcome?;
+        // A rollback the stop created is a deployment of its own, in flight from
+        // here: it owes its own alias restoration and its terminal status whether
+        // or not anybody calls CodeDeploy again.
+        if rollback_info.is_some() {
+            crate::state::deployment_clock::drive_deployment_clock(&self.engine);
+        }
 
         // `StopStatus` is Pending | Succeeded
         // (`smithy_query(query="shape",shape="StopStatus")`), where Pending means

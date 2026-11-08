@@ -48,8 +48,15 @@ impl Emulator {
         Self::mounted(false, true)
     }
 
-    /// The one constructor behind all three: CodeDeploy, and CloudWatch or AWS
-    /// Lambda when asked for, on one shared engine.
+    /// One emulator with CloudWatch *and* AWS Lambda mounted beside CodeDeploy on
+    /// the SAME engine, for a suite about a shift an ALARM interrupts: the alarm
+    /// belongs to one of them and the alias to the other.
+    pub(crate) fn with_lambda_and_cloudwatch() -> Self {
+        Self::mounted(true, true)
+    }
+
+    /// The one constructor behind all of them: CodeDeploy, and each of CloudWatch
+    /// and AWS Lambda the caller asks for, on one shared engine.
     fn mounted(cloudwatch: bool, lambda: bool) -> Self {
         let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
         let mut router = MultiServiceRouter::new();
@@ -193,6 +200,25 @@ impl Emulator {
         };
         (status, parsed)
     }
+
+    /// One Lambda request that has to answer `expected`, answering its body; see
+    /// [`Emulator::lambda`].
+    pub(crate) async fn lambda_ok(
+        &self,
+        case: &str,
+        method: &str,
+        uri: &str,
+        body: Value,
+        expected: u16,
+    ) -> Value {
+        let (status, parsed) = self.lambda(method, uri, body).await;
+        assert_eq!(
+            status, expected,
+            "setup {case:?}: expected HTTP {expected} from {method} {uri}, got {status} with \
+             {parsed:?}"
+        );
+        parsed
+    }
 }
 
 /// The wire error code of a failure body: awsJson carries it in `__type`, either
@@ -257,7 +283,22 @@ pub(crate) async fn terminal_deployment(
     deployment_id: &str,
     case: &str,
 ) -> Value {
-    let deadline = Instant::now() + POLL_DEADLINE;
+    terminal_deployment_within(emulator, deployment_id, case, POLL_DEADLINE).await
+}
+
+/// [`terminal_deployment`] with the deadline the caller allows.
+///
+/// A deployment under a time-based traffic routing configuration is held open for
+/// the window its increments describe, which is longer than the span a deployment
+/// that cuts over in one step takes, so a suite that creates one says how long it
+/// is prepared to wait for its window to close.
+pub(crate) async fn terminal_deployment_within(
+    emulator: &Emulator,
+    deployment_id: &str,
+    case: &str,
+    deadline: Duration,
+) -> Value {
+    let deadline_at = Instant::now() + deadline;
     loop {
         let info = emulator
             .ok("GetDeployment", json!({"deploymentId": deployment_id}))
@@ -270,8 +311,8 @@ pub(crate) async fn terminal_deployment(
             return info;
         }
         assert!(
-            Instant::now() < deadline,
-            "case {case:?}: expected a terminal status within {POLL_DEADLINE:?}, got {:?}",
+            Instant::now() < deadline_at,
+            "case {case:?}: expected a terminal status within {deadline:?}, got {:?}",
             info["status"]
         );
         tokio::time::sleep(POLL_INTERVAL).await;

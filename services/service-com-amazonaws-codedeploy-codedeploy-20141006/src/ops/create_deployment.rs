@@ -468,6 +468,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 crate::state::normalized_auto_rollback_configuration(requested_auto_rollback);
 
             let create_time_ms = crate::state::now_ms();
+            // WHEN this deployment shifts traffic, and WHAT it shifts: the
+            // increments come from the resolved configuration's
+            // `trafficRoutingConfig`, and the alias they move from the revision's
+            // own AppSpec. A configuration that shifts in several increments holds
+            // the deployment open for the whole window rather than cutting over at
+            // once.
+            let traffic_routing = state
+                .deployment_configs
+                .get(&deployment_config_name)
+                .and_then(|config| config.traffic_routing_config.clone());
+            let increments = crate::state::traffic_shift::increments(traffic_routing.as_ref());
+            let starts_at_ms = crate::state::deployment_start_due(create_time_ms);
+            let traffic_routing_complete_at_ms =
+                crate::state::traffic_shift::traffic_routing_due_ms(
+                    create_time_ms,
+                    starts_at_ms,
+                    &increments,
+                );
             let deployment_id = state.mint_deployment_id();
             let used_revision = revision.clone();
             // The traffic shift this deployment performs: a Lambda deployment's
@@ -509,9 +527,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 create_time_ms,
                 start_time_ms: None,
                 complete_time_ms: None,
-                starts_at_ms: crate::state::deployment_start_due(create_time_ms),
-                completes_at_ms: crate::state::deployment_completion_due(create_time_ms)
-                    + termination_wait_millis,
+                starts_at_ms,
+                completes_at_ms: traffic_routing_complete_at_ms + termination_wait_millis,
                 // Nothing has failed, and no lifecycle event hook has reported
                 // yet: both are written as the deployment runs.
                 error_information: None,
@@ -521,9 +538,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 termination_wait_millis,
                 instance_termination_wait_time_started: false,
                 lambda_traffic_shift,
-                // Nothing has been shifted yet: the clock owes the shift at the
-                // instant it owes the deployment completed traffic routing.
+                // Nothing has been shifted yet: the clock owes each increment of
+                // the shift at the instant that increment falls due, and the last
+                // of them at the instant it owes the deployment completed traffic
+                // routing.
                 traffic_shift: crate::state::lambda_traffic_shift::TrafficShiftProgress::Declared,
+                traffic_increments: increments,
+                traffic_increments_applied: 0,
             });
             // Deploying a revision is also how CodeDeploy learns it: the
             // application's registry records this use, registering the revision
@@ -537,8 +558,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
         })?;
 
+        let deployment_id = outcome?;
+        // The deployment is now in flight, and what it owes next — its start, each
+        // traffic increment, the stop an alarm asks for, its terminal status — is
+        // owed whether or not anybody calls CodeDeploy again: a client watching the
+        // alias for the first increment makes no further call here.
+        crate::state::deployment_clock::drive_deployment_clock(&self.engine);
+
         Ok(CreateDeploymentOutput {
-            deployment_id: Some(outcome?),
+            deployment_id: Some(deployment_id),
         })
     }
 }

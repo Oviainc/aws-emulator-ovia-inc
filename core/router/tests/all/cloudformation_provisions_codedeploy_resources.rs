@@ -60,13 +60,17 @@ const PAST_STACK_SPAN: Duration = Duration::from_millis(900);
 /// with pattern `^[A-Za-z0-9+=,.@_-]*$` in that service's own Smithy model.
 const MAX_CODEDEPLOY_NAME: usize = 100;
 
-/// Long enough for a deployment's own clock-owed span (CodeDeploy's
-/// `DEPLOYMENT_COMPLETION_MILLIS`, 500 ms) to come due.
+/// Long enough for a deployment to reach a terminal status, and how often it is looked at.
 ///
-/// The stack's deletion waits past it because a deployment configuration a deployment is
+/// The stack's deletion waits for that, because a deployment configuration a deployment is
 /// still RUNNING under cannot be deleted — CodeDeploy's own rule, which a client deleting
-/// the same stack would meet the same way.
-const PAST_DEPLOYMENT_SPAN: Duration = Duration::from_millis(700);
+/// the same stack would meet the same way. It is a WAIT rather than a fixed span because a
+/// deployment under a time-based `trafficRoutingConfig` is held open for the window its
+/// traffic increments describe, which is longer than the span one that cuts over in a
+/// single step takes.
+const PAST_DEPLOYMENT_SPAN: Duration = Duration::from_secs(60);
+/// See [`PAST_DEPLOYMENT_SPAN`].
+const DEPLOYMENT_POLL: Duration = Duration::from_millis(50);
 
 /// A service-role ARN of the form `CreateDeploymentGroup.serviceRoleArn` takes, as a
 /// caller would hand one to a template.
@@ -152,6 +156,45 @@ async fn codedeploy(
     let status = response.status().as_u16();
     let payload: Value = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
     (status, payload)
+}
+
+/// Poll `GetDeployment` until `deployment_id` holds a terminal status.
+///
+/// The terminal statuses are the members of the model's `DeploymentStatus` enum that no
+/// further transition leaves (`smithy_query(query="shape",shape="DeploymentStatus")`).
+async fn deployment_settles(
+    router: &MultiServiceRouter,
+    region: &str,
+    deployment_id: &str,
+    case: &str,
+) {
+    let deadline = std::time::Instant::now() + PAST_DEPLOYMENT_SPAN;
+    loop {
+        let (status, read) = codedeploy(
+            router,
+            region,
+            "GetDeployment",
+            &json!({ "deploymentId": deployment_id }),
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected HTTP 200 from GetDeployment, got {status} with body {read}"
+        );
+        let reported = read["deploymentInfo"]["status"].as_str().map(str::to_string);
+        if matches!(
+            reported.as_deref(),
+            Some("Succeeded" | "Failed" | "Stopped")
+        ) {
+            return;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: deployment {deployment_id} did not reach a terminal status within \
+             {PAST_DEPLOYMENT_SPAN:?}, last {reported:?}"
+        );
+        ::tokio::time::sleep(DEPLOYMENT_POLL).await;
+    }
 }
 
 /// The physical resource id the stack reports for each of its logical ids.
@@ -697,6 +740,9 @@ async fn a_stack_provisions_the_codedeploy_resources_its_template_declares() {
         let case = row.case;
         let region = row.region;
         let stack_name = format!("codedeploy-stack-{index}");
+        // The deployments this row ran, which the stack's deletion waits for: a
+        // deployment configuration one of them is still running under cannot be deleted.
+        let mut ran: Vec<String> = Vec::new();
 
         let encoded: Vec<(String, String, String, String)> = row
             .parameters
@@ -892,6 +938,12 @@ async fn a_stack_provisions_the_codedeploy_resources_its_template_declares() {
                     .is_some_and(|id| !id.is_empty()),
                 "case {case:?}: expected the deployment to be given an id, got {deployed}"
             );
+            ran.push(
+                deployed["deploymentId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+            );
         }
 
         // The revision a group's `Deployment` property asks for was deployed to it, with
@@ -946,12 +998,18 @@ async fn a_stack_provisions_the_codedeploy_resources_its_template_declares() {
                 case,
                 "deploymentInfo",
             );
+            ran.push(deployment_id.to_string());
         }
 
-        // Deleting the stack deletes what it created in CodeDeploy — once the deployments
-        // this row ran have reached a terminal status, since a configuration one is still
-        // running under is not deletable.
-        tokio::time::sleep(PAST_DEPLOYMENT_SPAN).await;
+        // Deleting the stack deletes what it created in CodeDeploy — and where the stack
+        // declared a deployment configuration, once the deployments this row ran under it
+        // have reached a terminal status, since a configuration one is still running under
+        // is not deletable.
+        if configuration.is_some() {
+            for deployment_id in &ran {
+                deployment_settles(&router, region, deployment_id, case).await;
+            }
+        }
         let (status, body) =
             cloudformation(&router, region, "DeleteStack", &[("StackName", &stack_name)]).await;
         assert_eq!(

@@ -7,6 +7,10 @@ publish = false
 build = "build.rs"
 
 [dependencies]
+# `yaml_nesting`: the shared count of a caller-supplied YAML document's nesting
+# indicators, which is what bounds an AppSpec's nesting before a parser is handed
+# it (`state::appspec`).
+service-common = { path = "../common" }
 engine = { workspace = true }
 smithy-macros = { workspace = true }
 aws-smithy-schema = { workspace = true }
@@ -16,7 +20,7 @@ emulator-server = { workspace = true }
 emulator-telemetry = { workspace = true }
 aws-smithy-runtime-api = { workspace = true }
 aws-smithy-types = { workspace = true }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["time"] }
 bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }

@@ -8,7 +8,9 @@
 //! reach it through [`with_state`], which is also where the two things that must
 //! happen before ANY request is served happen: seeding the `CodeDeployDefault.*`
 //! built-in deployment configurations once, and materialising the deployment
-//! transitions the clock already owes.
+//! transitions the clock already owes — the stop a sounding alarm asks for, the
+//! traffic increment a shift in flight owes its alias, and the status a
+//! deployment has reached.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::OnceLock;
@@ -24,9 +26,27 @@ pub mod alarm_gate;
 /// linking the two records.
 pub mod rollback;
 
-/// The traffic shift an Lambda deployment performs: the one place a revision's
-/// AppSpec is read, and the one place the alias it names is moved.
+/// What a revision's AppSpec DECLARES a deployment deploys: the Lambda function,
+/// the alias traffic moves on and the two versions it moves between — the one
+/// place that document is read.
+pub mod appspec;
+
+/// The Lambda alias a deployment moves, written where that alias LIVES: the
+/// Lambda service's own function store.
+pub mod lambda_alias;
+
+/// The traffic INCREMENTS a deployment's resolved `trafficRoutingConfig`
+/// describes: how much traffic each one moves, and when it falls due.
+pub mod traffic_shift;
+
+/// The traffic shift an Lambda deployment performs: the one place a declared
+/// shift is carried out, increment by increment, and the one place a deployment
+/// that could not carry it out is failed.
 pub mod lambda_traffic_shift;
+
+/// The in-process task that drives a deployment in flight while nobody is calling
+/// this service.
+pub mod deployment_clock;
 
 use crate::ops::types::{
     AlarmConfiguration, AutoRollbackConfiguration, BlueGreenDeploymentConfiguration,
@@ -1365,12 +1385,19 @@ pub struct Deployment {
     pub instance_termination_wait_time_started: bool,
     /// The traffic shift this deployment performs, read ONCE out of its revision
     /// when the deployment was recorded; `None` for a deployment whose revision
-    /// declares none (see [`lambda_traffic_shift::declared_shift`]).
-    pub lambda_traffic_shift: Option<lambda_traffic_shift::LambdaTrafficShift>,
+    /// declares none (see [`appspec::declared_shift`]).
+    pub lambda_traffic_shift: Option<appspec::LambdaTrafficShift>,
     /// How far that shift has got, which is also what keeps the clock from
     /// settling a deployment whose shift has not happened yet; see
     /// [`lambda_traffic_shift::TrafficShiftProgress`].
     pub traffic_shift: lambda_traffic_shift::TrafficShiftProgress,
+    /// The increments that shift is carried out in, in the order they fall due:
+    /// what the deployment's resolved `trafficRoutingConfig` describes (see
+    /// [`traffic_shift::increments`]). The last of them is the whole move, so a
+    /// deployment that shifts all its traffic at once carries exactly one.
+    pub traffic_increments: Vec<traffic_shift::Increment>,
+    /// How many of those increments have been carried out on the alias.
+    pub traffic_increments_applied: usize,
 }
 
 /// The result a validation function reported for one of a deployment's
@@ -1669,6 +1696,9 @@ pub struct ComAmazonawsCodedeployCodedeploy20141006State {
     pub next_id: u64,
     /// Whether the `CodeDeployDefault.*` built-ins have been seeded.
     seeded: bool,
+    /// Which task, if any, is driving this store's deployments while nobody calls
+    /// this service; see [`deployment_clock`].
+    deployment_clock: deployment_clock::DeploymentClock,
 }
 
 /// One of the built-in deployment configurations CodeDeploy ships.
@@ -2121,6 +2151,12 @@ impl ComAmazonawsCodedeployCodedeploy20141006State {
             }
             deployment.complete_time_ms.is_none()
         });
+    }
+
+    /// Whether any deployment is still in flight, which is what the deployment
+    /// clock keeps ticking for ([`deployment_clock`]).
+    pub fn deployments_in_flight(&self) -> bool {
+        !self.pending_deployments.is_empty()
     }
 
     /// Record `deployment` as this store's newest, dropping the oldest history
@@ -3891,8 +3927,8 @@ pub fn with_state<Eng: Send + Sync + 'static, R>(
     // The traffic shift writes AWS Lambda's own function store, with this store
     // unlocked for the same reason, and runs after the gate and before the clock:
     // a deployment the alarms stopped shifts no traffic, and no deployment is
-    // given a successful outcome before the shift its revision described has
-    // happened.
+    // given a successful outcome before the increments its revision and its
+    // configuration described have happened.
     lambda_traffic_shift::apply_due_shifts(engine);
     let mut guard = state.lock();
     let now = now_ms();

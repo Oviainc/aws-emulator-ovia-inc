@@ -485,6 +485,10 @@ pub mod web_media_type;
 /// takes one as a caller-supplied string — so X-Ray and a service that merely carries a
 /// trace header cannot disagree about what counts as one.
 pub mod xray_trace;
+/// The ONE bound on how deeply a caller-supplied YAML document nests, taken before that
+/// document is handed to a parser — so how deeply a caller's text may nest is decided in
+/// one place rather than per service.
+pub mod yaml_nesting;
 pub use validation_message::aws_validation_refusal;
 
 use aws_smithy_runtime_api::http::Request as RuntimeApiRequest;

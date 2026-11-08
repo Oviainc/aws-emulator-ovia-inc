@@ -57,6 +57,8 @@ mod get_deployment_target;
 mod git_hub_account_token_names;
 #[path = "all/github_account_tokens.rs"]
 mod github_account_tokens;
+#[path = "all/lambda_traffic_shifting.rs"]
+mod lambda_traffic_shifting;
 #[path = "all/lambda_traffic_shift.rs"]
 mod lambda_traffic_shift;
 #[path = "all/lifecycle_event_hook_status.rs"]
