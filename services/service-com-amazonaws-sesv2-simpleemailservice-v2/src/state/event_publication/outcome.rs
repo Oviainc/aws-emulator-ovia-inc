@@ -26,11 +26,17 @@
 //!
 //! Every OTHER address is one no mail provider here answers for, so what it would really do
 //! with the message is not decidable in this emulator: it is reported as having taken the
-//! message, which is the outcome of an accepted send that nothing refused, and the reports
-//! carry nothing a delivery attempt would have produced
-//! ([`super::notification`] invents no processing time, reporting MTA or SMTP reply). An
-//! address a client wants a bounce or a complaint for is the simulator's own, which is what
-//! the simulator exists for.
+//! message, which is the outcome of an accepted send that nothing refused. An address a
+//! client wants a bounce or a complaint for is the simulator's own, which is what the
+//! simulator exists for.
+//!
+//! What a reaction REPORTS is what the side that produced it said: the SMTP reply the
+//! receiving side gave for a message it took, the reply and the enhanced status code it gave
+//! for one it refused, and the agent that wrote the feedback report for a complaint. Every
+//! one of those sides is this emulator's own — SES answers for the simulator's mailboxes and
+//! for a message it never handed on — so each value is the answer of the side that answered,
+//! and nothing is reported for a side that never answered: a failure SES produced from its
+//! own suppression list names no mail server, because none was asked.
 //!
 //! Nothing here reports a per-run value: a reaction is decided by the address and by the
 //! account's own stored preferences, and the identifier an entry carries is derived from
@@ -74,6 +80,16 @@ const STATUS_BAD_MAILBOX: &str = "5.1.1";
 /// gave, as a bounce reports it.
 const UNKNOWN_USER_DIAGNOSTIC_CODE: &str = "smtp; 550 5.1.1 user unknown";
 
+/// The SMTP reply the receiving side gives for a message it took, as a delivery report
+/// quotes it: RFC 5321's 250 completion reply, which is what the mailbox simulator answers
+/// a message it accepts with.
+const ACCEPTED_SMTP_RESPONSE: &str = "250 Ok";
+
+/// The agent a feedback report names as having written it, for a complaint the mailbox
+/// simulator produced: the complaint comes from SES's own simulator rather than from a
+/// recipient's mail provider, so the simulator is what reported it.
+const MAILBOX_SIMULATOR_USER_AGENT: &str = "Amazon SES Mailbox Simulator";
+
 /// The diagnostic a bounce carries when the suppression list, rather than a mail server,
 /// is why the message was not sent — the sentence SES words it with, which names what the
 /// sender has to do about it and carries no part of the message.
@@ -106,6 +122,12 @@ pub struct Bounce {
     /// take mail, which is what the list exists to remember. A bounce SES produced from
     /// the list itself teaches nothing new, so it adds nothing.
     pub suppresses: bool,
+    /// Whether a mail server answered for this failure at all.
+    ///
+    /// A failure the receiving side reported is reported BY that server, so the report
+    /// names it; one SES produced without handing the message on names no server, because
+    /// none was asked.
+    pub reported_by_mta: bool,
 }
 
 impl Bounce {
@@ -118,6 +140,7 @@ impl Bounce {
             status: STATUS_BAD_MAILBOX,
             diagnostic_code: UNKNOWN_USER_DIAGNOSTIC_CODE,
             suppresses: true,
+            reported_by_mta: true,
         }
     }
 
@@ -131,6 +154,7 @@ impl Bounce {
             status: STATUS_BAD_MAILBOX,
             diagnostic_code: ON_ACCOUNT_SUPPRESSION_LIST_DIAGNOSTIC_CODE,
             suppresses: false,
+            reported_by_mta: false,
         }
     }
 }
@@ -148,6 +172,12 @@ pub struct RecipientOutcome {
     pub complained: bool,
     /// `complaintFeedbackType`, for a recipient that complained.
     pub complaint_feedback_type: Option<&'static str>,
+    /// `smtpResponse`: the reply the receiving side gave for a message it took, for a
+    /// recipient it took the message for.
+    pub smtp_response: Option<&'static str>,
+    /// `userAgent`: the agent that wrote the feedback report, for a recipient that
+    /// complained.
+    pub complaint_user_agent: Option<&'static str>,
 }
 
 impl RecipientOutcome {
@@ -159,6 +189,8 @@ impl RecipientOutcome {
             bounce: None,
             complained: false,
             complaint_feedback_type: None,
+            smtp_response: Some(ACCEPTED_SMTP_RESPONSE),
+            complaint_user_agent: None,
         }
     }
 
@@ -170,6 +202,10 @@ impl RecipientOutcome {
             bounce: Some(bounce),
             complained: false,
             complaint_feedback_type: None,
+            // Nothing took the message for this recipient, so no receiving side replied
+            // with an acceptance to quote.
+            smtp_response: None,
+            complaint_user_agent: None,
         }
     }
 
@@ -182,6 +218,10 @@ impl RecipientOutcome {
             bounce: None,
             complained: true,
             complaint_feedback_type: Some(COMPLAINT_FEEDBACK_TYPE_ABUSE),
+            smtp_response: Some(ACCEPTED_SMTP_RESPONSE),
+            // The mailbox that reports the message is the simulator's own, so the report
+            // was written by the simulator.
+            complaint_user_agent: Some(MAILBOX_SIMULATOR_USER_AGENT),
         }
     }
 }

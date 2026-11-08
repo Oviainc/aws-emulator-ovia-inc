@@ -40,7 +40,7 @@ use crate::cloudwatch_alarm_action_reaches_its_subscribed_queue::{
 };
 
 /// The Region the whole wiring of these cases lives in.
-const REGION: &str = "us-west-2";
+pub(crate) const REGION: &str = "us-west-2";
 
 /// The domain identity that authorises every send below, and the sender it covers.
 const SENDER_DOMAIN: &str = "senders.example.com";
@@ -53,7 +53,7 @@ const DESTINATION: &str = "events";
 /// Every value of the SESv2 `EventType` enum, in the model's own order
 /// (`smithy_query(query="shape",shape="EventType")`), for the row that matches the whole
 /// published surface rather than the types one scenario happens to watch.
-const EVERY_EVENT_TYPE: &[&str] = &[
+pub(crate) const EVERY_EVENT_TYPE: &[&str] = &[
     "SEND",
     "REJECT",
     "BOUNCE",
@@ -78,7 +78,8 @@ const ON_SUPPRESSION_LIST_DIAGNOSTIC_CODE: &str =
 /// The whole emulator over one engine, exactly as the binary assembles it, with the engine
 /// kept so a case can bring the verification transition the clock owes an identity into the
 /// past instead of waiting out its span.
-fn router() -> (MultiServiceRouter, std::sync::Arc<aws_emulator_router::InMemoryEngine>) {
+pub(crate) fn router() -> (MultiServiceRouter, std::sync::Arc<aws_emulator_router::InMemoryEngine>)
+{
     let engine = aws_emulator_router::new_engine();
     let mut router = aws_emulator_router::build_router(std::sync::Arc::clone(&engine));
     // Signature verification is the front door's concern, not this suite's.
@@ -182,7 +183,7 @@ async fn sesv2_ok(
 }
 
 /// A verified sending domain, so every send below is authorised.
-async fn given_verified_sender(
+pub(crate) async fn given_verified_sender(
     router: &MultiServiceRouter,
     engine: &aws_emulator_router::InMemoryEngine,
     case: &str,
@@ -207,7 +208,7 @@ async fn given_verified_sender(
 }
 
 /// The configuration set `SET` with one SNS event destination publishing to `topic`.
-async fn given_configuration_set(
+pub(crate) async fn given_configuration_set(
     router: &MultiServiceRouter,
     case: &str,
     topic: &str,
@@ -240,7 +241,7 @@ async fn given_configuration_set(
 }
 
 /// `SendEmail` to `recipient` through the configuration set, answering the `MessageId`.
-async fn send(router: &MultiServiceRouter, case: &str, recipient: &str) -> String {
+pub(crate) async fn send(router: &MultiServiceRouter, case: &str, recipient: &str) -> String {
     let answered = sesv2_ok(
         router,
         case,
@@ -267,7 +268,7 @@ async fn send(router: &MultiServiceRouter, case: &str, recipient: &str) -> Strin
 }
 
 /// The one event of type `event_type` among `events`, which must be there exactly once.
-fn one_event<'a>(case: &str, events: &'a [Value], event_type: &str) -> &'a Value {
+pub(crate) fn one_event<'a>(case: &str, events: &'a [Value], event_type: &str) -> &'a Value {
     let matched: Vec<&Value> = events
         .iter()
         .filter(|event| event["eventType"].as_str() == Some(event_type))
@@ -281,7 +282,7 @@ fn one_event<'a>(case: &str, events: &'a [Value], event_type: &str) -> &'a Value
 }
 
 /// The event types among `events`, in the order they arrived.
-fn event_types(events: &[Value]) -> Vec<String> {
+pub(crate) fn event_types(events: &[Value]) -> Vec<String> {
     events
         .iter()
         .map(|event| event["eventType"].as_str().unwrap_or_default().to_string())

@@ -13,9 +13,12 @@
 //!
 //! The document is the published form of what this service already holds: the message as
 //! it was accepted (its id, its sender, its recipients and its headers) and what each
-//! recipient did with it ([`super::outcome`]). Nothing a delivery attempt would have
-//! reported and nothing this emulator ran is invented for it — no processing time, no
-//! reporting MTA and no SMTP reply, because no mail server answered one.
+//! recipient did with it ([`super::outcome`]). A reaction's own report carries what the side
+//! that produced it said and what this emulator measured of it: the reply the receiving side
+//! gave, the mail server that reported it, the agent that wrote a feedback report, and the
+//! time between the message being accepted and the event happening. Nothing is reported for
+//! a side that never answered — a failure SES produced from its own suppression list names
+//! no mail server, because none was asked.
 //!
 //! The destination kind served here is the SNS topic, which is the one this service reads
 //! and decides the publish for ([`super`]); every other kind an event destination may
@@ -51,6 +54,10 @@ const COMPLAINT: (&str, &str) = ("COMPLAINT", "Complaint");
 /// The header names whose values make up the `commonHeaders` of a published document,
 /// matched without regard to case the way a mail header name compares.
 const COMMON_HEADER_NAMES: [&str; 3] = ["Subject", "Message-ID", "Date"];
+
+/// The prefix a Reporting-MTA names its address type with in a delivery status report, as
+/// RFC 3464 writes the field: a bounce quotes the field, so it quotes the type too.
+const DELIVERY_STATUS_MTA_TYPE: &str = "dsn";
 
 /// One notification: the event type a destination has to match for it, and the document
 /// published to the destination.
@@ -121,6 +128,10 @@ impl PublishedSend {
     /// lists the recipients it is about: one `Bounce` per distinct failure, one `Delivery`
     /// for the recipients the message reached, one `Complaint` for those that reported it.
     fn notifications(&self) -> Vec<Notification> {
+        // When the reactions this send produced are reported, which is what their own
+        // timestamps are of and what the time SES spent on the message is measured to. The
+        // message's acceptance is stamped with when it was accepted, which the log holds.
+        let now = SystemTime::now();
         let mail = self.mail();
         let mut notifications = vec![Notification {
             event_type: SEND.0,
@@ -142,46 +153,59 @@ impl PublishedSend {
                 .iter()
                 .filter(|out| out.bounce.as_ref() == Some(bounce))
                 .collect();
+            let mut document = document(
+                BOUNCE.1,
+                &mail,
+                "bounce",
+                json!({
+                    "bounceType": bounce.bounce_type,
+                    "bounceSubType": bounce.bounce_sub_type,
+                    "bouncedRecipients": bounced
+                        .iter()
+                        .map(|out| json!({
+                            "emailAddress": out.address,
+                            "action": bounce.action,
+                            "status": bounce.status,
+                            "diagnosticCode": bounce.diagnostic_code,
+                        }))
+                        .collect::<Vec<Value>>(),
+                    "timestamp": stamp(now),
+                    "feedbackId": self.feedback_id(&bounced),
+                }),
+            );
+            // A failure a mail server reported names that server; one SES produced without
+            // asking a mail server names none.
+            if bounce.reported_by_mta {
+                document["bounce"]["reportingMTA"] =
+                    json!(format!("{DELIVERY_STATUS_MTA_TYPE}; {}", self.reporting_mta()));
+            }
             notifications.push(Notification {
                 event_type: BOUNCE.0,
-                document: document(
-                    BOUNCE.1,
-                    &mail,
-                    "bounce",
-                    json!({
-                        "bounceType": bounce.bounce_type,
-                        "bounceSubType": bounce.bounce_sub_type,
-                        "bouncedRecipients": bounced
-                            .iter()
-                            .map(|out| json!({
-                                "emailAddress": out.address,
-                                "action": bounce.action,
-                                "status": bounce.status,
-                                "diagnosticCode": bounce.diagnostic_code,
-                            }))
-                            .collect::<Vec<Value>>(),
-                        "timestamp": self.stamp(),
-                        "feedbackId": self.feedback_id(&bounced),
-                    }),
-                ),
+                document,
             });
         }
 
-        let delivered: Vec<&str> = self
-            .outcomes
-            .iter()
-            .filter(|out| out.delivered)
-            .map(|out| out.address.as_str())
-            .collect();
-        if !delivered.is_empty() {
+        let delivered: Vec<&RecipientOutcome> =
+            self.outcomes.iter().filter(|out| out.delivered).collect();
+        if let Some(first) = delivered.first() {
+            let mut delivery = json!({
+                "timestamp": stamp(now),
+                // How long SES held the message: from the instant it was accepted to the
+                // instant it reached the recipients, both of which this service measured.
+                "processingTimeMillis": self.processing_time_millis(now),
+                "recipients": delivered
+                    .iter()
+                    .map(|out| out.address.as_str())
+                    .collect::<Vec<&str>>(),
+                "reportingMTA": self.reporting_mta(),
+            });
+            // What the receiving side replied when it took the message.
+            if let Some(response) = first.smtp_response {
+                delivery["smtpResponse"] = json!(response);
+            }
             notifications.push(Notification {
                 event_type: DELIVERY.0,
-                document: document(
-                    DELIVERY.1,
-                    &mail,
-                    "delivery",
-                    json!({"timestamp": self.stamp(), "recipients": delivered}),
-                ),
+                document: document(DELIVERY.1, &mail, "delivery", delivery),
             });
         }
 
@@ -196,11 +220,18 @@ impl PublishedSend {
                     .iter()
                     .map(|out| json!({"emailAddress": out.address}))
                     .collect::<Vec<Value>>(),
-                "timestamp": self.stamp(),
+                "timestamp": stamp(now),
                 "feedbackId": self.feedback_id(&complained),
+                // When the message the report is about arrived at the recipient, which for
+                // a message a recipient complained about is when it took it.
+                "arrivalDate": self.stamp(),
             });
             if let Some(feedback_type) = first.complaint_feedback_type {
                 complaint["complaintFeedbackType"] = json!(feedback_type);
+            }
+            // Who wrote the feedback report this complaint came in.
+            if let Some(user_agent) = first.complaint_user_agent {
+                complaint["userAgent"] = json!(user_agent);
             }
             notifications.push(Notification {
                 event_type: COMPLAINT.0,
@@ -346,6 +377,23 @@ impl PublishedSend {
     /// When the message was accepted, as a published document stamps an instant.
     fn stamp(&self) -> String {
         stamp(self.message.sent_at)
+    }
+
+    /// `processingTimeMillis`: how long it was between the message being accepted and the
+    /// event being reported, measured over the instants this service holds for both.
+    fn processing_time_millis(&self, now: SystemTime) -> u64 {
+        let elapsed = now
+            .duration_since(self.message.sent_at)
+            .unwrap_or_default()
+            .as_millis();
+        u64::try_from(elapsed).unwrap_or(u64::MAX)
+    }
+
+    /// The mail server a report names as having reported it: this emulator answers for every
+    /// mailbox a send here reaches, so the server is its own SES SMTP interface in the
+    /// Region the send executed in.
+    fn reporting_mta(&self) -> String {
+        format!("email-smtp.{}.amazonaws.com", self.region)
     }
 
     /// The identifier of the report `about` — the feedback one message produced for its

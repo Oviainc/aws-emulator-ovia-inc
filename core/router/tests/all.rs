@@ -822,6 +822,10 @@ mod sesv2_sns_event_destination_topic_policy;
 mod ses_send_events_reach_a_subscribed_queue;
 #[path = "all/ses_bulk_send_entry_headers_override_the_template.rs"]
 mod ses_bulk_send_entry_headers_override_the_template;
+// Declared HERE, beside the sibling SESv2 suites above in this quiet span, for the same
+// reason as they are.
+#[path = "all/ses_send_event_reports_what_answered.rs"]
+mod ses_send_event_reports_what_answered;
 #[path = "all/shared_signing_name_routing.rs"]
 mod shared_signing_name_routing;
 #[path = "all/ssm_contacts_replication_set.rs"]
