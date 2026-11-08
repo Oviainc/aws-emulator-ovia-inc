@@ -16,7 +16,7 @@ use ::aws_smithy_types::DateTime;
 use crate::ops::types::{
     AccountInfo, ColumnGroup, ColumnLevelPermissionRule, CustomInstructions,
     DataPrepConfiguration, DataSet, DataSetSummary, DataSetUsageConfiguration, DataSource,
-    DataSourceErrorInfo, DataSourceParameters, DatasetParameter, FieldFolder, Folder,
+    DataSourceErrorInfo, DataSourceParameters, DatasetParameter, FieldFolder, Folder, Group,
     IAMPolicyAssignment, InputColumn, LogicalTable, NamespaceInfoV2, OutputColumn,
     PerformanceConfiguration, PhysicalTable, RefreshFrequency, RefreshSchedule,
     ResourcePermission,
@@ -64,6 +64,13 @@ pub struct ComAmazonawsQuicksightQuicksight20180401State {
     /// The name alone identifies a namespace inside its account: the model documents
     /// that a namespace must be unique within the Amazon Web Services account.
     pub namespaces: HashMap<(String, String), NamespaceRecord>,
+    /// Groups by `(AwsAccountId, Namespace, GroupName)`.
+    ///
+    /// A group belongs to one namespace and its name identifies it inside that
+    /// namespace, so the namespace is part of its key: two namespaces of the same
+    /// account can each hold a group of the same name, and neither is reached from
+    /// the other.
+    pub groups: HashMap<(String, String, String), GroupRecord>,
     /// The sign-up details `CreateAccountSubscription` stored, by `AwsAccountId`.
     ///
     /// An account with no entry here is still a QuickSight account — see
@@ -462,7 +469,86 @@ impl ComAmazonawsQuicksightQuicksight20180401State {
             .filter(|(account, _)| account == aws_account_id)
             .count()
     }
+
+    /// Whether `(aws_account_id, name)` addresses a namespace that exists — the
+    /// stored one a create put there, or the namespace every account already has.
+    pub fn namespace_exists(&self, aws_account_id: &str, name: &str) -> bool {
+        self.namespace(aws_account_id, name).is_some() || name == DEFAULT_NAMESPACE
+    }
+
+    /// The group `(aws_account_id, namespace)` holds under `group_name`, or `None`
+    /// when no create stored one — the record every group read answers from.
+    pub fn group(
+        &self,
+        aws_account_id: &str,
+        namespace: &str,
+        group_name: &str,
+    ) -> Option<&GroupRecord> {
+        self.groups.get(&(
+            aws_account_id.to_string(),
+            namespace.to_string(),
+            group_name.to_string(),
+        ))
+    }
+
+    /// How many groups `(aws_account_id, namespace)` holds — what
+    /// [`MAX_GROUPS_PER_NAMESPACE`] is checked against.
+    pub fn group_count(&self, aws_account_id: &str, namespace: &str) -> usize {
+        self.groups
+            .keys()
+            .filter(|(account, group_namespace, _)| {
+                account == aws_account_id && group_namespace == namespace
+            })
+            .count()
+    }
 }
+
+/// A stored group: what `CreateGroup` persisted, which is what every later group read
+/// reports.
+///
+/// The record carries no timestamps: the modelled `Group` structure declares none, so
+/// nothing is stored that no read can report.
+#[derive(Debug, Clone)]
+pub struct GroupRecord {
+    pub arn: String,
+    pub group_name: String,
+    /// The description the create submitted, if any. `GroupDescription` is optional,
+    /// so a group created without one reports none rather than an empty string.
+    pub description: Option<String>,
+    /// The service's own handle on this group, minted when it was created and stable
+    /// for as long as the group exists.
+    pub principal_id: String,
+}
+
+impl GroupRecord {
+    /// This group as the modelled `Group` structure every group read reports.
+    pub fn to_group(&self) -> Group {
+        Group {
+            arn: Some(self.arn.clone()),
+            group_name: Some(self.group_name.clone()),
+            description: self.description.clone(),
+            principal_id: Some(self.principal_id.clone()),
+        }
+    }
+}
+
+/// How many groups one namespace may hold before `CreateGroup` refuses with the
+/// modelled `LimitExceededException`: the ceiling `CreateGroup`'s own documentation
+/// states ("You can create up to 10,000 groups in a namespace").
+pub const MAX_GROUPS_PER_NAMESPACE: usize = 10_000;
+
+/// The TOTAL number of groups this emulator holds, across every account and
+/// namespace.
+///
+/// This is the bound that holds for the process, for the same reason as
+/// [`MAX_DATA_SOURCES`]: every part of the store key comes from the request — the
+/// account id and the namespace are both `@httpLabel`s the caller chooses — so the
+/// per-namespace ceiling alone would be reset by varying either.
+pub const MAX_GROUPS: usize = 100_000;
+
+/// The `ExceptionResourceType` a group's refusals report (model enum
+/// `com.amazonaws.quicksight#ExceptionResourceType`).
+pub const EXCEPTION_RESOURCE_TYPE_GROUP: &str = "GROUP";
 
 /// A stored namespace: what `CreateNamespace` persisted, which is what every later
 /// namespace read reports.
@@ -1228,6 +1314,21 @@ pub fn namespace_arn(region: &str, aws_account_id: &str, namespace: &str) -> Str
     quicksight_arn(region, aws_account_id, &format!("namespace/{namespace}"))
 }
 
+/// The ARN of a group: `.../group/<Namespace>/<GroupName>` — the resource
+/// `CreateGroup`'s documentation names (`arn:aws:quicksight:::group/default/`).
+pub fn group_arn(
+    region: &str,
+    aws_account_id: &str,
+    namespace: &str,
+    group_name: &str,
+) -> String {
+    quicksight_arn(
+        region,
+        aws_account_id,
+        &format!("group/{namespace}/{group_name}"),
+    )
+}
+
 /// The ARN of a folder: `.../folder/<FolderId>`.
 pub fn folder_arn(region: &str, aws_account_id: &str, folder_id: &str) -> String {
     quicksight_arn(region, aws_account_id, &format!("folder/{folder_id}"))
@@ -1289,6 +1390,12 @@ fn uuid_shaped(n: u64) -> String {
 
 /// The `RequestId` to report for one response.
 pub fn next_request_id() -> String {
+    uuid_shaped(next_minted_id())
+}
+
+/// The `PrincipalId` of a newly created group: the service's own handle on the group,
+/// which the request does not name, so the create mints it.
+pub fn next_group_principal_id() -> String {
     uuid_shaped(next_minted_id())
 }
 

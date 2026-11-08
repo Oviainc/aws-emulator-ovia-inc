@@ -33,3 +33,5 @@ mod theme_lifecycle;
 mod topic_lifecycle;
 #[path = "all/folder_lifecycle.rs"]
 mod folder_lifecycle;
+#[path = "all/group_lifecycle.rs"]
+mod group_lifecycle;

@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Reports the group `(AwsAccountId, Namespace, GroupName)` addresses, from the record
+//! `CreateGroup` stored — its ARN, its name, the description it was created with and
+//! the `PrincipalId` minted for it.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A name no group in that namespace is held under is refused with the modelled
+//! `ResourceNotFoundException`. This is a report on stored state: it writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +156,43 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeGroup"))
+        // A report on stored state: nothing here writes to the store.
+        let _ = ctx;
+        let request_id = crate::state::next_request_id();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(DescribeGroupErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        let store = state.lock();
+        let Some(record) = store.group(
+            &input.aws_account_id,
+            &input.namespace,
+            &input.group_name,
+        ) else {
+            return Err(DescribeGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Group {} not found in namespace {} in account {}.",
+                        input.group_name, input.namespace, input.aws_account_id
+                    )),
+                    resource_type: Some(crate::state::EXCEPTION_RESOURCE_TYPE_GROUP.to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        Ok(DescribeGroupOutput {
+            group: Some(record.to_group()),
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
 }

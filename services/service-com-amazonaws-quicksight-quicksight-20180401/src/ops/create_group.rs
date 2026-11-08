@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
+//! Creates a QuickSight group under `(AwsAccountId, Namespace, GroupName)` and
+//! persists it, so every later read of that name answers from the stored record.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! A group belongs to one namespace, so the namespace must exist for the create to
+//! have somewhere to put it, and a name that namespace already holds is refused with
+//! the modelled `ResourceExistsException` rather than overwriting the group holding
+//! it. The group's `PrincipalId` is the service's own handle on it: the request names
+//! only the group's name, so the create mints the id and every later read reports
+//! that same one.
 //!
 //! ## Shape of an operation
 //!
@@ -168,18 +168,115 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateGroup"))
+        let request_id = crate::state::next_request_id();
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(CreateGroupErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the QuickSight store is unavailable".to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        };
+
+        let region = crate::state::request_region(ctx.parts());
+        let arn = crate::state::group_arn(
+            &region,
+            &input.aws_account_id,
+            &input.namespace,
+            &input.group_name,
+        );
+
+        let mut store = state.lock();
+
+        // A group belongs to a namespace: one the account does not hold is no place to
+        // create a group in.
+        if !store.namespace_exists(&input.aws_account_id, &input.namespace) {
+            return Err(CreateGroupErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(format!(
+                        "Namespace {} not found in account {}.",
+                        input.namespace, input.aws_account_id
+                    )),
+                    resource_type: Some(
+                        crate::state::EXCEPTION_RESOURCE_TYPE_NAMESPACE.to_string(),
+                    ),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        let key = (
+            input.aws_account_id.clone(),
+            input.namespace.clone(),
+            input.group_name.clone(),
+        );
+        // The name identifies the group inside its namespace, so a name already in use
+        // there belongs to the group holding it.
+        if store.groups.contains_key(&key) {
+            return Err(CreateGroupErrorModeled::ResourceExistsException(
+                ResourceExistsException {
+                    message: Some(format!(
+                        "The group {} already exists in namespace {}.",
+                        input.group_name, input.namespace
+                    )),
+                    resource_type: Some(crate::state::EXCEPTION_RESOURCE_TYPE_GROUP.to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        // Every part of the store key comes from the request — the account id and the
+        // namespace are both `@httpLabel`s the caller chooses — so the total-records
+        // ceiling is what bounds this process and the per-namespace one is the limit
+        // this operation's own documentation states.
+        if store.groups.len() >= crate::state::MAX_GROUPS {
+            return Err(CreateGroupErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "This QuickSight emulator holds the maximum of {} groups.",
+                        crate::state::MAX_GROUPS
+                    )),
+                    resource_type: Some(crate::state::EXCEPTION_RESOURCE_TYPE_GROUP.to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+        if store.group_count(&input.aws_account_id, &input.namespace)
+            >= crate::state::MAX_GROUPS_PER_NAMESPACE
+        {
+            return Err(CreateGroupErrorModeled::LimitExceededException(
+                LimitExceededException {
+                    message: Some(format!(
+                        "The namespace already holds the maximum of {} groups.",
+                        crate::state::MAX_GROUPS_PER_NAMESPACE
+                    )),
+                    resource_type: Some(crate::state::EXCEPTION_RESOURCE_TYPE_GROUP.to_string()),
+                    request_id: Some(request_id),
+                },
+            )
+            .into());
+        }
+
+        let record = crate::state::GroupRecord {
+            arn,
+            group_name: input.group_name,
+            description: input.description,
+            principal_id: crate::state::next_group_principal_id(),
+        };
+        // The response reports the group that was just stored, so a caller sees exactly
+        // what the next read will answer with.
+        let group = record.to_group();
+        store.groups.insert(key, record);
+
+        Ok(CreateGroupOutput {
+            group: Some(group),
+            request_id: Some(request_id),
+            status: 200,
+        })
     }
 }
