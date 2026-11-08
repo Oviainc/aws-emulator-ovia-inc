@@ -111,8 +111,6 @@ mod vpc_internet_path;
 // VPC a request names, with the local route it comes with for each block that VPC has
 // associated, the tags it asked for, the client token that makes the create idempotent, and
 // the refusals and dry run that store nothing — each read back through `DescribeRouteTables`.
-// Declared beside `prefix_lists` for the reason the note above gives: the sorted
-// neighbourhood and the tail of this file are where every new ec2 suite inserts its lines.
 #[path = "all/create_route_table.rs"]
 mod create_route_table;
 // An account's internet gateways: what `CreateInternetGateway` stores and
@@ -1558,11 +1556,8 @@ mod deprovision_ipam_pool_cidr;
 // the options the request names, with every one it does not named left as it stands, the
 // `pending` the change is in until the clock carries it onto the instance, and the ids, hop
 // limits, instance states and dry run it refuses without writing. Declared at the tail of
-// this file, which is where every new ec2 suite inserts its lines.
 #[path = "all/modify_instance_metadata_options.rs"]
 mod modify_instance_metadata_options;
-// the note above gives: the sorted neighbourhood and the tail of this file are where every new
-// ec2 suite inserts its lines.
 // How a Capacity Reservation Fleet's floating-point members reach the ec2Query wire — the
 // decimal form AWS writes a double in, which is the response envelope's rule rather than
 // this shape's — and the priority every Capacity Reservation of a Fleet reports.
@@ -1592,3 +1587,8 @@ mod modify_security_group_rules;
 // at the tail of this file, which is where every new ec2 suite inserts its lines.
 #[path = "all/account_wide_read_authorization.rs"]
 mod account_wide_read_authorization;
+// Which launch template a `DeleteLaunchTemplate` resolves out of a store holding several of
+// them: one key, exactly the template that carries it, the template echoed as the readers
+// reported it, and every sibling left as resolvable as it was. Declared beside
+#[path = "all/delete_launch_template_resolution.rs"]
+mod delete_launch_template_resolution;

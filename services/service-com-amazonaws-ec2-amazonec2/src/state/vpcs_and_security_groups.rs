@@ -2720,8 +2720,6 @@ pub fn launch_template_ids_malformed<E>(ids: &[&str]) -> crate::scaffolded::Scaf
 
 /// Refuse a request that named a launch template name no launch template of the account
 /// carries: HTTP 400 `InvalidLaunchTemplateName.NotFoundException`.
-/// Refuse a request that named a launch template name no launch template of the account
-/// carries: HTTP 400 `InvalidLaunchTemplateName.NotFoundException`.
 ///
 /// The sentence is EC2's, and it is FIXED: `At least one of the launch templates specified
 /// in the request does not exist.` names neither the request's values nor how many of them
