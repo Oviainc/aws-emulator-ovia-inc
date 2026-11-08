@@ -57,6 +57,29 @@ const NETWORK_MIGRATION_DEFINITION_ID_BODY_LEN: usize = 17;
 /// `vpcProvisioningStrategy` is set to `USE_EXISTING`").
 pub const VPC_PROVISIONING_USE_EXISTING: &str = "USE_EXISTING";
 
+/// The `TargetDeployment` a network migration definition is maintained under when the
+/// request that created it named none.
+///
+/// The member is optional on the create
+/// (`smithy_query(query="operation",operation="CreateNetworkMigrationDefinition")`),
+/// but the service keeps a deployment target on every definition, and the one it
+/// resolves to is the narrower of the two values the model declares
+/// (`smithy_query(query="shape",shape="TargetDeployment")`: `SINGLE_ACCOUNT` |
+/// `MULTI_ACCOUNT`) — the single account the request was made for, since nothing in a
+/// request that names no target asks for a second account.
+pub const DEFAULT_TARGET_DEPLOYMENT: &str = "SINGLE_ACCOUNT";
+
+/// The `VpcProvisioningStrategy` a network migration definition is maintained under
+/// when the request that created it named none.
+///
+/// Optional on the create like [`DEFAULT_TARGET_DEPLOYMENT`], and resolved the same
+/// way: of the two values the model declares
+/// (`smithy_query(query="shape",shape="VpcProvisioningStrategy")`: `CREATE_NEW` |
+/// `USE_EXISTING`), `CREATE_NEW` is the one that needs nothing else on the record,
+/// while `USE_EXISTING` names VPCs of the target account the definition would have to
+/// carry CIDR mappings for.
+pub const DEFAULT_VPC_PROVISIONING_STRATEGY: &str = "CREATE_NEW";
+
 /// How many `[0-9a-zA-Z]` characters follow the prefix of a `SourceServerID`
 /// (model pattern `^s-[0-9a-zA-Z]{17}$`, length 19..19).
 const SOURCE_SERVER_ID_BODY_LEN: usize = 17;
@@ -871,10 +894,11 @@ pub struct NetworkMigrationDefinitionConfiguration {
     pub target_s3_configuration: TargetS3Configuration,
     pub target_network: TargetNetwork,
     /// One of the model's `TargetDeployment` values (`SINGLE_ACCOUNT`,
-    /// `MULTI_ACCOUNT`), or absent while the caller named none.
+    /// `MULTI_ACCOUNT`): what the caller named, or what
+    /// [`Self::with_service_defaults`] resolved for a request that named none.
     pub target_deployment: Option<String>,
     /// One of the model's `VpcProvisioningStrategy` values (`CREATE_NEW`,
-    /// `USE_EXISTING`), or absent while the caller named none.
+    /// `USE_EXISTING`), resolved the same way as [`Self::target_deployment`].
     pub vpc_provisioning_strategy: Option<String>,
     pub cidr_mappings: Vec<CidrMapping>,
     /// Stored sorted, so the tags a read reports are in one stable order.
@@ -884,6 +908,24 @@ pub struct NetworkMigrationDefinitionConfiguration {
 }
 
 impl NetworkMigrationDefinitionConfiguration {
+    /// This configuration with the settings the service maintains a value for resolved:
+    /// `targetDeployment` and `vpcProvisioningStrategy` are optional on the request, so
+    /// one the caller named none for takes the service's own value
+    /// ([`DEFAULT_TARGET_DEPLOYMENT`], [`DEFAULT_VPC_PROVISIONING_STRATEGY`]).
+    ///
+    /// Applied where a definition is CREATED, so the stored record carries the setting
+    /// the definition is maintained under rather than the absence the request left: every
+    /// later read reports it, an update that does not name it keeps it, and a create whose
+    /// members equal a stored definition's is recognised as the `@idempotent` replay it is
+    /// whether or not it spelled the resolved value out.
+    pub fn with_service_defaults(mut self) -> Self {
+        self.target_deployment
+            .get_or_insert_with(|| DEFAULT_TARGET_DEPLOYMENT.to_string());
+        self.vpc_provisioning_strategy
+            .get_or_insert_with(|| DEFAULT_VPC_PROVISIONING_STRATEGY.to_string());
+        self
+    }
+
     /// Whether two configurations carry the same members, member by member.
     ///
     /// The modelled shapes are generated without `PartialEq`, so the comparison is
@@ -959,9 +1001,22 @@ pub struct NetworkMigrationDefinition {
 }
 
 impl NetworkMigrationDefinition {
-    /// The `tags` member: the stored tags, or absent when the definition carries none.
+    /// The `tags` member: the definition's tag container.
+    ///
+    /// A definition is addressed by the service's tag API (`TagResource`,
+    /// `ListTagsForResource`, `UntagResource` all take its ARN), so the container is part
+    /// of the record whether or not it holds entries, and it is reported as the empty map
+    /// it then is — the same container `ListTagsForResource` reports for the definition.
+    /// `scopeTags` is a setting rather than that container, so it follows the rule every
+    /// other optional collection on the record does and stays absent while it is empty.
     pub fn tags_shape(&self) -> Option<std::collections::HashMap<String, String>> {
-        map_shape(&self.configuration.tags)
+        Some(
+            self.configuration
+                .tags
+                .iter()
+                .map(|(key, value)| (key.clone(), value.clone()))
+                .collect(),
+        )
     }
 
     /// The `scopeTags` member: the stored scope tags, or absent when it carries none.

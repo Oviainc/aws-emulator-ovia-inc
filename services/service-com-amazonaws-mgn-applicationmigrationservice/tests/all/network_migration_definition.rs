@@ -34,20 +34,50 @@ const CREATE: &str = "network-migration/CreateNetworkMigrationDefinition";
 const GET: &str = "network-migration/GetNetworkMigrationDefinition";
 
 /// Every member of the modelled `NetworkMigrationDefinition` output shape that a create
-/// request can set, so a row asserts the whole echoed surface rather than a few members.
+/// request can set and that the record reports back exactly as the request named it, so a
+/// row asserts the whole echoed surface rather than a few members. The three members the
+/// service maintains a value of its own for — `targetDeployment`,
+/// `vpcProvisioningStrategy` and the `tags` container — are asserted beside this list.
 /// Source: `smithy_query(query="shape",shape="NetworkMigrationDefinition")`.
-const CONFIGURED_MEMBERS: [&str; 10] = [
+const CONFIGURED_MEMBERS: [&str; 7] = [
     "name",
     "description",
     "sourceConfigurations",
     "targetS3Configuration",
     "targetNetwork",
-    "targetDeployment",
-    "vpcProvisioningStrategy",
     "cidrMappings",
-    "tags",
     "scopeTags",
 ];
+
+/// The `TargetDeployment` a definition created without one is maintained under.
+/// Source: the service's own constant, re-stated here from the SPEC side so the test
+/// pins a value rather than reading the implementation's.
+const MAINTAINED_TARGET_DEPLOYMENT: &str = "SINGLE_ACCOUNT";
+
+/// The `VpcProvisioningStrategy` a definition created without one is maintained under.
+const MAINTAINED_VPC_PROVISIONING_STRATEGY: &str = "CREATE_NEW";
+
+/// What the record must report for the two settings the service maintains and for the
+/// tag container, given the create `request`: the value the request named, the service's
+/// own value where it named none, and the tag container as the map it is — empty rather
+/// than absent — because the definition is a resource the tag API addresses.
+fn maintained_members(request: &Value) -> Value {
+    let value_or = |member: &str, maintained: &str| match request[member].clone() {
+        Value::Null => json!(maintained),
+        named => named,
+    };
+    json!({
+        "targetDeployment": value_or("targetDeployment", MAINTAINED_TARGET_DEPLOYMENT),
+        "vpcProvisioningStrategy": value_or(
+            "vpcProvisioningStrategy",
+            MAINTAINED_VPC_PROVISIONING_STRATEGY,
+        ),
+        "tags": match request["tags"].clone() {
+            Value::Null => json!({}),
+            named => named,
+        },
+    })
+}
 
 /// `^nmd-[0-9a-zA-Z]{17}$` — the model's `NetworkMigrationDefinitionID` pattern
 /// (length 21..21).
@@ -259,6 +289,16 @@ async fn a_network_migration_definition_is_created_and_read_back_from_state() {
             assert_eq!(
                 created[member], request[member],
                 "case {case:?}: {member} must be the stored request member, got {:?}",
+                created[member]
+            );
+        }
+        for (member, want) in maintained_members(&request)
+            .as_object()
+            .expect("an object of maintained members")
+        {
+            assert_eq!(
+                &created[member], want,
+                "case {case:?}: {member} must be reported as {want:?}, got {:?}",
                 created[member]
             );
         }

@@ -19,6 +19,8 @@ mod empty_output_success_status;
 mod network_migration_definition;
 #[path = "all/network_migration_definition_listing.rs"]
 mod network_migration_definition_listing;
+#[path = "all/network_migration_definition_representation.rs"]
+mod network_migration_definition_representation;
 #[path = "all/network_migration_definition_update.rs"]
 mod network_migration_definition_update;
 #[path = "all/network_migration_execution_listing.rs"]

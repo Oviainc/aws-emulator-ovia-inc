@@ -241,7 +241,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // Stored sorted, so the tags a read reports are in one stable order.
             tags: input.tags.unwrap_or_default().into_iter().collect(),
             scope_tags: input.scope_tags.unwrap_or_default().into_iter().collect(),
-        };
+        }
+        // `targetDeployment` and `vpcProvisioningStrategy` are optional on the wire but
+        // the service maintains one of each on every definition, so a request that named
+        // neither is stored under the values it resolves to rather than without them.
+        .with_service_defaults();
 
         let mut store = state.lock();
 
