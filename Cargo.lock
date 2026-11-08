@@ -9865,6 +9865,7 @@ dependencies = [
  "aws-smithy-schema 0.2.1",
  "aws-smithy-types",
  "bytes",
+ "chrono",
  "csv",
  "flate2",
  "hex",
@@ -9877,6 +9878,7 @@ dependencies = [
  "service-com-amazonaws-s3-amazons3",
  "service-common",
  "sha2 0.10.9",
+ "sqlparser",
  "tokio",
  "tracing",
 ]

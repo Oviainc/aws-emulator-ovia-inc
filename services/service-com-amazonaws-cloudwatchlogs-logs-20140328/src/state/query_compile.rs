@@ -62,11 +62,28 @@ pub struct QueryCompileFailure {
     pub end_char_offset: usize,
 }
 
+/// One stage of a compiled pipeline: the command it runs and the text it runs it over.
+///
+/// The commands of a pipeline decide whether a query COMPILES, which is all `StartQuery`
+/// asks; running one also needs the arguments each command was given, so a stage carries
+/// both and whoever EXECUTES the pipeline reads it here rather than splitting the query
+/// string a second time.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompiledStage {
+    /// The stage's command, lowercased — one of [`COMMANDS`] for a query that compiled.
+    pub command: String,
+    /// Everything after the command, exactly as the query string wrote it.
+    pub arguments: String,
+}
+
 /// What a query string compiled to: the facts `StartQuery` needs about an accepted query.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompiledQuery {
     /// The command of each stage of the pipeline, in order, lowercased.
     pub commands: Vec<String>,
+    /// The same stages, each with the arguments its command was given, for a caller that
+    /// RUNS the pipeline rather than only accepting it.
+    pub stages: Vec<CompiledStage>,
     /// The ephemeral fields the pipeline defines, in no particular order.
     pub defined_fields: BTreeSet<String>,
     /// The lookup tables the pipeline's `lookup` commands read, each named once and in the
@@ -237,6 +254,10 @@ pub fn compile(query: &str) -> Result<CompiledQuery, QueryCompileFailure> {
                 });
             }
         }
+        compiled.stages.push(CompiledStage {
+            command: lowercased.clone(),
+            arguments: arguments.to_string(),
+        });
         compiled.commands.push(lowercased);
     }
     Ok(compiled)
@@ -329,6 +350,13 @@ fn leading_blank_chars(text: &str) -> usize {
 /// which is no command of the language is then the query's own mistake, reported by
 /// [`unseparated_command`] against the stage it was left in.
 fn split_pipeline(query: &str) -> Vec<Stage> {
+    split_pipeline_of(query, &COMMANDS)
+}
+
+/// [`split_pipeline`] over the command vocabulary `commands`, which is what a pipeline's
+/// stage separators are recognised by. The Logs Insights QL commands are [`COMMANDS`];
+/// another pipelined query language passes its own.
+fn split_pipeline_of(query: &str, commands: &[&str]) -> Vec<Stage> {
     let characters: Vec<char> = query.chars().collect();
     let mut stages: Vec<Stage> = Vec::new();
     let mut current = String::new();
@@ -344,7 +372,7 @@ fn split_pipeline(query: &str) -> Vec<Stage> {
             index = next;
             continue;
         }
-        if character == '|' && command_follows(&characters, index + 1) {
+        if character == '|' && command_follows(&characters, index + 1, commands) {
             stages.push(Stage {
                 text: current.clone(),
                 start_char_offset: stage_start,
@@ -370,7 +398,7 @@ fn split_pipeline(query: &str) -> Vec<Stage> {
 
 /// Whether a command of the language begins at `from`, after any blank space: the test a `|`
 /// is a stage separator by.
-fn command_follows(characters: &[char], from: usize) -> bool {
+fn command_follows(characters: &[char], from: usize, commands: &[&str]) -> bool {
     let mut index = from;
     while characters.get(index).is_some_and(|character| character.is_whitespace()) {
         index += 1;
@@ -379,7 +407,41 @@ fn command_follows(characters: &[char], from: usize) -> bool {
         .iter()
         .take_while(|character| character.is_alphanumeric() || **character == '_')
         .collect();
-    COMMANDS.contains(&word.to_lowercase().as_str())
+    commands.contains(&word.to_lowercase().as_str())
+}
+
+/// The stages of a pipelined query written in the command vocabulary `commands`, each as
+/// the command it names and the arguments it was given — with nothing judged about either.
+///
+/// This is the reading an EXECUTOR needs for a query language whose syntax this service does
+/// not compile (the OpenSearch languages `StartQuery` also accepts, whose pipelines are
+/// separated by `|` the same way), so one splitter serves every pipeline and a `|` inside a
+/// quoted string or a regular-expression literal stays where it is in all of them.
+///
+/// A stage's command is a WORD, so it ends at the first character that is not part of one:
+/// `source=logGroups(…)` names the command `source` and is given the rest, whatever
+/// whitespace the query string left around the `=`. The command is lowercased, because a
+/// command names itself however it is cased; the arguments are handed on EXACTLY as written,
+/// because they carry names and values whose case is their own.
+pub fn split_stages(query: &str, commands: &[&str]) -> Vec<CompiledStage> {
+    split_pipeline_of(query, commands)
+        .into_iter()
+        .filter_map(|stage| {
+            let trimmed = stage.text.trim().to_string();
+            if trimmed.is_empty() {
+                return None;
+            }
+            let command: String = trimmed
+                .chars()
+                .take_while(|character| character.is_alphanumeric() || *character == '_')
+                .collect();
+            let arguments: String = trimmed.chars().skip(command.chars().count()).collect();
+            Some(CompiledStage {
+                command: command.to_lowercase(),
+                arguments,
+            })
+        })
+        .collect()
 }
 
 /// The `|` a stage still holds, and the word after it, when that word is no command of the

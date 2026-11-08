@@ -2,6 +2,37 @@
 
 use super::*;
 
+/// What identifies one vended-log delivery resource in this store: the Region it lives in,
+/// and the name — or the id — it is known by within that Region.
+///
+/// A delivery source, a delivery destination and a delivery are REGIONAL resources: each is
+/// created through one Region's endpoint, its ARN carries that Region
+/// ([`delivery_source_arn`], [`delivery_destination_arn`], [`delivery_arn`]), and the
+/// uniqueness each operation documents for a name ("This name must be unique for all delivery
+/// sources in your account") holds within that Region — so the same name in two Regions is two
+/// separate resources, and an endpoint resolves only the resources of its own Region. The
+/// Region comes first in the ordering, so one Region's resources enumerate in name order and a
+/// reporting operation's page token stays a position in that order.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct RegionalKey {
+    /// The Region the resource was created in — the one the creating request's credential
+    /// scope named ([`request_region`]).
+    pub region: String,
+    /// What identifies the resource within that Region: a delivery source's or destination's
+    /// name, or a delivery's id.
+    pub name: String,
+}
+
+impl RegionalKey {
+    /// The key of the resource `name` names in `region`.
+    pub fn new(region: &str, name: &str) -> Self {
+        Self {
+            region: region.to_string(),
+            name: name.to_string(),
+        }
+    }
+}
+
 /// One delivery — "a connection between a logical delivery source and a logical delivery
 /// destination" — as it is stored. Every member of the model's `Delivery` shape is
 /// reported from this record, so `DescribeDeliveries` answers from state alone.

@@ -2,6 +2,207 @@
 
 use super::*;
 
+/// Whether an ARN names an IAM role — what `OpenSearchResourceConfig$dataSourceRoleArn`
+/// must be ("Specify the ARN of an IAM role that CloudWatch Logs will use to create the
+/// integration"). An IAM ARN's resource part is `role/<path><name>`.
+pub fn is_iam_role_arn(arn: &str) -> bool {
+    arn_service_and_resource(arn)
+        .is_some_and(|(service, resource)| service == IAM_SERVICE && resource.starts_with("role/"))
+}
+
+/// Whether an ARN names a principal `OpenSearchResourceConfig$dashboardViewerPrincipals`
+/// admits: "the ARNs of IAM roles and IAM users who you want to grant permission to for
+/// viewing the dashboards".
+pub fn is_dashboard_viewer_principal_arn(arn: &str) -> bool {
+    arn_service_and_resource(arn).is_some_and(|(service, resource)| {
+        service == IAM_SERVICE && (resource.starts_with("role/") || resource.starts_with("user/"))
+    })
+}
+
+/// Whether an ARN names an OpenSearch Service application — what
+/// `OpenSearchResourceConfig$applicationArn` must be ("If you want to use an existing
+/// OpenSearch Service application for your integration [...] specify it here").
+pub fn is_opensearch_application_arn(arn: &str) -> bool {
+    arn_service_and_resource(arn).is_some_and(|(service, resource)| {
+        service == OPENSEARCH_SERVICE && resource.starts_with("application/")
+    })
+}
+
+/// Whether an ARN names a KMS key — what `OpenSearchResourceConfig$kmsKeyArn` must be
+/// ("specify the ARN of the KMS key that you want to use"). Unlike a log group's
+/// `kmsKeyId`, this member is modelled as an `Arn`, so a bare key id is not one of its
+/// values.
+pub fn is_kms_key_arn(arn: &str) -> bool {
+    arn_service_and_resource(arn)
+        .is_some_and(|(service, resource)| service == KMS_SERVICE && !resource.is_empty())
+}
+
+/// How many account-level policies of `policy_type` the account may hold IN TOTAL once a
+/// policy whose scoped-ness is `scoped` is added: each quota sentence is an either/or —
+/// "either one account-level metric extraction policy that applies to all log groups, or up
+/// to 5 policies that are each scoped to a subset of log groups with the selectionCriteria
+/// parameter" — so the number the account is held to is the one for the policy being put,
+/// and every policy of that type counts against it. Every number is one
+/// `PutAccountPolicy`'s own documentation states — see the constants it returns.
+pub fn max_account_policies(policy_type: &str, scoped: bool) -> usize {
+    if !scoped {
+        return MAX_UNSCOPED_ACCOUNT_POLICIES;
+    }
+    match policy_type {
+        POLICY_TYPE_TRANSFORMER | POLICY_TYPE_FIELD_INDEX => MAX_SCOPED_ACCOUNT_POLICIES,
+        POLICY_TYPE_METRIC_EXTRACTION => MAX_SCOPED_METRIC_EXTRACTION_ACCOUNT_POLICIES,
+        // A data protection policy and a subscription filter policy have no scoped half:
+        // the account holds one of each, whatever it is scoped to.
+        _ => MAX_UNSCOPED_ACCOUNT_POLICIES,
+    }
+}
+
+/// What an accepted account-level policy document says: the parts a handler acts on after
+/// [`check_account_policy_document`] accepts it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AccountPolicyShape {
+    /// The log groups a data protection policy's Audit action sends findings to, as
+    /// [`DataProtectionPolicyShape::findings_destination_log_groups`] reports them. Empty
+    /// for every other policy type, none of which names a destination log group.
+    pub findings_destination_log_groups: Vec<String>,
+}
+
+/// Judge a `PutAccountPolicy$policyDocument` against the rules that member's own
+/// documentation states for the `policyType` it is put with, answering the message to
+/// refuse it with, or what the accepted document says.
+///
+/// Every type's document is "the policy, in JSON" and can be "up to 30,720 characters
+/// long". Beyond that each type has its own documented shape, and only the rules the
+/// documentation states are enforced: which data identifiers, processors or fields exist
+/// is a catalogue that lives outside this service, and the grammar of `selectionCriteria`
+/// is judged by the caller of this function rather than here.
+pub fn check_account_policy_document(
+    policy_type: &str,
+    document: &str,
+) -> Result<AccountPolicyShape, String> {
+    if document.chars().count() > MAX_ACCOUNT_POLICY_DOCUMENT_CHARS {
+        return Err(format!(
+            "policyDocument can be up to {MAX_ACCOUNT_POLICY_DOCUMENT_CHARS} characters"
+        ));
+    }
+    match policy_type {
+        // "A data protection policy must include two JSON blocks" — the same document the
+        // log-group-level `PutDataProtectionPolicy` takes, so it is held to the same rule.
+        POLICY_TYPE_DATA_PROTECTION => {
+            let shape = check_data_protection_policy_document(document)?;
+            Ok(AccountPolicyShape {
+                findings_destination_log_groups: shape.findings_destination_log_groups,
+            })
+        }
+        POLICY_TYPE_SUBSCRIPTION_FILTER => {
+            check_subscription_filter_policy_document(document).map(|()| AccountPolicyShape::default())
+        }
+        POLICY_TYPE_FIELD_INDEX => {
+            check_field_index_policy_document(document).map(|_| AccountPolicyShape::default())
+        }
+        POLICY_TYPE_TRANSFORMER => {
+            check_transformer_policy_document(document).map(|()| AccountPolicyShape::default())
+        }
+        // A metric extraction policy "controls whether CloudWatch Metrics can be created
+        // through the Embedded Metrics Format (EMF)", and the one thing it can say is that
+        // EMF metric creation is off.
+        _ => check_metric_extraction_policy_document(document).map(|()| AccountPolicyShape::default()),
+    }
+}
+
+/// The document as the JSON object every policy type but a transformer policy is
+/// expressed as ("Specify the policy, in JSON").
+pub(super) fn policy_object(document: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
+    serde_json::from_str::<serde_json::Value>(document)
+        .ok()
+        .and_then(|parsed| match parsed {
+            serde_json::Value::Object(members) => Some(members),
+            _ => None,
+        })
+        .filter(|members| !members.is_empty())
+        .ok_or_else(|| "policyDocument must be the policy in JSON (a non-empty JSON object)".to_string())
+}
+
+/// Judge a `SUBSCRIPTION_FILTER_POLICY` document. The attributes are the ones
+/// `PutAccountPolicy$policyDocument` lists for one: "DestinationArn The ARN of the
+/// destination to deliver log events to", "RoleArn The ARN of an IAM role that grants
+/// CloudWatch Logs permissions to deliver ingested log events to the destination stream",
+/// "FilterPattern A filter pattern for subscribing to a filtered stream of log events" and
+/// "Distribution The method used to distribute log data to the destination". Each is held
+/// to the rule the log-group-level `PutSubscriptionFilter` holds the member of the same
+/// name to, so one destination is as acceptable account-wide as it is per group.
+pub(super) fn check_subscription_filter_policy_document(document: &str) -> Result<(), String> {
+    let members = policy_object(document)?;
+    let string = |name: &str| members.get(name).and_then(serde_json::Value::as_str);
+    let Some(destination_arn) = string("DestinationArn") else {
+        return Err(
+            "policyDocument for a subscription filter policy must include a DestinationArn"
+                .to_string(),
+        );
+    };
+    if let Some(message) = unparsable_arn_message("DestinationArn", destination_arn) {
+        return Err(message);
+    }
+    // The same ordering as `PutSubscriptionFilter`: a destination that needs a role is
+    // refused for the missing role before the kind of resource its ARN names is judged.
+    if string("RoleArn").is_none() {
+        if let Some(vendor) = subscription_role_required_vendor(destination_arn) {
+            return Err(format!(
+                "DestinationArn for vendor {vendor} cannot be used without RoleArn"
+            ));
+        }
+    }
+    if !is_subscription_destination_arn(destination_arn) {
+        return Err(format!(
+            "DestinationArn must be the ARN of a {} resource",
+            SUBSCRIPTION_DESTINATIONS
+                .iter()
+                .map(|(service, _)| *service)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(filter_pattern) = string("FilterPattern") {
+        validate_filter_pattern(filter_pattern)?;
+    }
+    // "the grouping can be set to Random for a more even distribution": the two values of
+    // the model's `Distribution` enum, which no boundary validator holds a JSON document
+    // to, listed in the one order this service states that enum's values in.
+    if let Some(distribution) = string("Distribution") {
+        if !crate::ops::types::DISTRIBUTION_VALUES.contains(&distribution) {
+            return Err(invalid_value_message(
+                "Distribution",
+                crate::service::enum_value_set(
+                    crate::ops::types::DISTRIBUTION_VALUES.iter().copied(),
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// One field index a field index policy document names: the field whose log event values
+/// are indexed, and the type the document gives it.
+///
+/// From `PutIndexPolicy$policyDocument`: "You can use FieldsV2 to specify the type for each
+/// field. Supported types are FIELD_INDEX and FACET." A name listed in the plain `Fields`
+/// array carries no type of its own, and that array is "The array of field indexes to
+/// create", so such a name is a field index ([`FIELDS_ARRAY_INDEX_TYPE`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedField {
+    /// The field whose values are indexed — what `FieldIndex$fieldIndexName` reports as
+    /// "the string that this field index matches".
+    pub name: String,
+    /// The field index's type, one of [`crate::ops::types::INDEX_TYPE_VALUES`].
+    pub index_type: String,
+}
+
+/// The `IndexType` of a field index named in a document's plain `Fields` array, which
+/// gives no type: that array is "The array of field indexes to create", so the index it
+/// creates is a field index rather than a facet. Spelled as the model's `IndexType` spells
+/// it ([`crate::ops::types::INDEX_TYPE_VALUES`]).
+pub const FIELDS_ARRAY_INDEX_TYPE: &str = "FIELD_INDEX";
+
 /// Judge a field index policy document, answering the message to refuse it with, or the
 /// field indexes it creates — `Fields` in the order the array lists them, then the
 /// `FieldsV2` names.

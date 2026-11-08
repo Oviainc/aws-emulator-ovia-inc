@@ -151,6 +151,14 @@ use std::collections::BTreeMap;
 /// `StartQuery` accepts one.
 pub mod query_compile;
 
+/// RUNNING a started query over the stored log events, which is what `GetQueryResults`
+/// reports.
+pub mod insights;
+
+pub use insights::{
+    log_record_pointer, log_record_pointer_parts, LogRecordPointer, MAX_PAGE_ITEMS,
+};
+
 /// Running a `filterPattern` over a log event message, which is what `TestMetricFilter`
 /// reports.
 pub mod filter_pattern;
@@ -189,8 +197,7 @@ pub mod transformer;
 /// The scheduled query CloudWatch manages on a log alarm's behalf.
 pub mod log_alarm_queries;
 
-/// The log anomaly detectors — and the lookup tables — this account holds, as they are
-/// stored.
+/// The log anomaly detectors this account holds, as they are stored.
 mod anomaly_detectors;
 pub use anomaly_detectors::*;
 
@@ -2091,6 +2098,11 @@ pub const QUERY_STATUS_COMPLETE: &str = "Complete";
 /// A query a caller stopped, from the model's `QueryStatus` enum.
 pub const QUERY_STATUS_CANCELLED: &str = "Cancelled";
 
+/// A query whose EXECUTION produced no results, from the model's `QueryStatus` enum: the
+/// status `GetQueryResults` reports for a query string this service cannot run over the
+/// events it holds ([`insights::ExecutionFailure`]).
+pub const QUERY_STATUS_FAILED: &str = "Failed";
+
 /// How long after it is started a query moves `Scheduled` -> `Running`, and how long after
 /// that it reaches `Complete`.
 ///
@@ -2301,42 +2313,16 @@ pub fn mint_export_task_id(seq: u64) -> String {
     mint_uuid_from_seq(seq)
 }
 
-/// What identifies one vended-log delivery resource in this store: the Region it lives in,
-/// and the name — or the id — it is known by within that Region.
-///
-/// A delivery source, a delivery destination and a delivery are REGIONAL resources: each is
-/// created through one Region's endpoint, its ARN carries that Region
-/// ([`delivery_source_arn`], [`delivery_destination_arn`], [`delivery_arn`]), and the
-/// uniqueness each operation documents for a name ("This name must be unique for all delivery
-/// sources in your account") holds within that Region — so the same name in two Regions is two
-/// separate resources, and an endpoint resolves only the resources of its own Region. The
-/// Region comes first in the ordering, so one Region's resources enumerate in name order and a
-/// reporting operation's page token stays a position in that order.
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-pub struct RegionalKey {
-    /// The Region the resource was created in — the one the creating request's credential
-    /// scope named ([`request_region`]).
-    pub region: String,
-    /// What identifies the resource within that Region: a delivery source's or destination's
-    /// name, or a delivery's id.
-    pub name: String,
-}
-
-impl RegionalKey {
-    /// The key of the resource `name` names in `region`.
-    pub fn new(region: &str, name: &str) -> Self {
-        Self {
-            region: region.to_string(),
-            name: name.to_string(),
-        }
-    }
-}
-
 /// The service-managed catalogue of vended-log delivery configuration templates, which
 /// `DescribeConfigurationTemplates` reports: the resources that can send vended logs, the log
 /// types each of them sends, the record schema of each log type, and how a template's
 /// packaging is derived from the destination type.
 pub mod vended_log_templates;
+
+/// The logical destinations this account holds — "a cross-account destination that receives
+/// subscription log events" — and the access policies that authorize writing to one.
+mod destinations;
+pub use destinations::*;
 
 pub use vended_log_templates::{
     configuration_template_key, configuration_template_output_formats, configuration_templates,
@@ -2469,496 +2455,6 @@ pub fn unsupported_log_type_region_message(
         format!("{operation} action is not supported for this LogType in region {request_region}")
     })
 }
-
-/// The number of logical destinations one account holds: CloudWatch Logs documents a quota
-/// of 500 destinations per account per Region ("Destinations: 500 per account per Region",
-/// CloudWatch Logs quotas), so a put that would create a 501st destination is refused. The
-/// ceiling also bounds this store, whose keys are caller-chosen (`DestinationName` is
-/// `@length(min: 1, max: 512)`, so distinct names are effectively unlimited) and whose
-/// records stay resident for as long as the process runs: a put that UPDATES a destination
-/// already stored is never refused by it, because it adds nothing.
-pub const MAX_DESTINATIONS: usize = 500;
-
-/// One logical destination — "a cross-account destination that receives subscription log
-/// events", which `PutDestination` creates or updates and `DescribeDestinations` reports —
-/// as it is stored. Every member of the model's `Destination` shape is reported from this
-/// record, so `DescribeDestinations` answers from state alone.
-#[derive(Debug, Clone)]
-pub struct DestinationRecord {
-    /// `Destination$destinationName` — "The name of the destination." Also the key the
-    /// store holds this destination under: it is the only thing `DeleteDestination` and
-    /// `PutDestinationPolicy` identify one by.
-    pub destination_name: String,
-    /// `Destination$arn` — "The ARN of this destination", as [`destination_arn`] builds it.
-    pub arn: String,
-    /// `Destination$targetArn` — "The Amazon Resource Name (ARN) of the physical target
-    /// where the log events are delivered (for example, a Kinesis stream)."
-    pub target_arn: String,
-    /// `Destination$roleArn` — "A role for impersonation, used when delivering log events
-    /// to the target."
-    pub role_arn: String,
-    /// `Destination$accessPolicy` — "An IAM policy document that governs which Amazon Web
-    /// Services accounts can create subscription filters against this destination." `None`
-    /// until `PutDestinationPolicy` sets one: "By default, PutDestination does not set any
-    /// access policy with the destination [...] the destination owner must call
-    /// PutDestinationPolicy after PutDestination."
-    pub access_policy: Option<String>,
-    /// `Destination$creationTime` — "The creation time of the destination, expressed as the
-    /// number of milliseconds after Jan 1, 1970 00:00:00 UTC." Stamped when the destination
-    /// is created and kept across later puts, which UPDATE that destination rather than
-    /// create one.
-    pub creation_time_ms: i64,
-    /// The tag set `PutDestination$tags` assigns to the destination — "An optional list of
-    /// key-value pairs to associate with the resource" — and the one every tagging
-    /// operation reads and writes through
-    /// [`ComAmazonawsCloudwatchlogsLogs20140328State::resource_tags`]. A `BTreeMap` so the
-    /// stored order is stable.
-    pub tags: BTreeMap<String, String>,
-}
-
-impl DestinationRecord {
-    /// A brand-new destination, with its ARN DERIVED from the request's Region and its own
-    /// name rather than taken from the caller, and no access policy: "By default,
-    /// PutDestination does not set any access policy with the destination."
-    pub fn new(
-        region: &str,
-        destination_name: &str,
-        target_arn: &str,
-        role_arn: &str,
-        creation_time_ms: i64,
-    ) -> Self {
-        Self {
-            destination_name: destination_name.to_string(),
-            arn: destination_arn(region, destination_name),
-            target_arn: target_arn.to_string(),
-            role_arn: role_arn.to_string(),
-            access_policy: None,
-            creation_time_ms,
-            tags: BTreeMap::new(),
-        }
-    }
-
-    /// This destination as the model's `Destination` structure, which is what
-    /// `PutDestination` and `DescribeDestinations` both report.
-    pub fn reported(&self) -> crate::ops::types::Destination {
-        crate::ops::types::Destination {
-            destination_name: Some(self.destination_name.clone()),
-            target_arn: Some(self.target_arn.clone()),
-            role_arn: Some(self.role_arn.clone()),
-            access_policy: self.access_policy.clone(),
-            arn: Some(self.arn.clone()),
-            creation_time: Some(self.creation_time_ms),
-        }
-    }
-}
-
-/// A logical destination's ARN, the form `TagResource$resourceArn` documents for one ("The
-/// ARN format of a destination is
-/// arn:aws:logs:Region:account-id:destination:destination-name"): a `destination` resource
-/// of this service, identified by the destination's own name.
-pub fn destination_arn(region: &str, name: &str) -> String {
-    ::engine::emulator_arn("logs", region, &format!("{DESTINATION_ARN_PREFIX}{name}"))
-}
-
-/// AWS's refusal for a `PutDestination` whose `roleArn` or `targetArn` is not an ARN: the
-/// service parses the destination's two ARNs together and reports the failure of either
-/// without naming which one failed.
-pub const DESTINATION_ARN_PARSE_FAILED: &str = "Error parsing ARN from given role or target";
-
-/// The size of the access policy one destination can carry:
-/// `PutDestinationPolicy$accessPolicy` is documented "This can be up to 5120 bytes", a ceiling
-/// the model's `AccessPolicy` shape does not express (`@length` min 1 only), so the handler
-/// holds the document to it. It bounds this store too, since the document is kept verbatim on
-/// the destination record.
-pub const MAX_ACCESS_POLICY_BYTES: usize = 5_120;
-
-/// The IAM condition key an access policy names an ORGANIZATION by, which is what
-/// `PutDestinationPolicy$forceUpdate` ("grant permission to an organization ID instead of
-/// granting permission to individual Amazon Web Services accounts") distinguishes a policy by.
-const ORGANIZATION_PRINCIPAL_CONDITION_KEY: &str = "aws:PrincipalOrgID";
-
-/// Whether an access policy grants permission to an organization rather than to individual
-/// accounts, read off the document itself: a policy names the organization through the
-/// [`ORGANIZATION_PRINCIPAL_CONDITION_KEY`] condition key.
-///
-/// The key is matched without regard to case, because IAM condition keys are
-/// case-insensitive, and wherever in the document it appears, because a condition can sit
-/// under any condition operator of any statement. The walk carries its own stack rather than
-/// recursing, so a deeply nested document costs heap instead of call frames. A document that
-/// is not JSON at all grants nothing: the handler refuses it before asking.
-pub fn access_policy_grants_organization(document: &str) -> bool {
-    let Ok(parsed) = serde_json::from_str::<serde_json::Value>(document) else {
-        return false;
-    };
-    let mut pending = vec![parsed];
-    while let Some(value) = pending.pop() {
-        match value {
-            serde_json::Value::Object(members) => {
-                for (key, nested) in members {
-                    if key.eq_ignore_ascii_case(ORGANIZATION_PRINCIPAL_CONDITION_KEY) {
-                        return true;
-                    }
-                    pending.push(nested);
-                }
-            }
-            serde_json::Value::Array(items) => pending.extend(items),
-            _ => {}
-        }
-    }
-    false
-}
-
-/// The refusal CloudWatch Logs answers an `accessPolicy` its IAM policy parser will not
-/// take: a document that is not an IAM policy document at all, and one whose statements do
-/// not identify the principals they grant to. The text is FIXED — it carries nothing from
-/// the request — so every such refusal reads identically.
-pub const ACCESS_POLICY_PARSE_FAILED: &str =
-    "Error occurred while parsing accessPolicy. Please check if the accessPolicy has been \
-     constructed correctly using IAM grammar.";
-
-/// The principal value that names EVERY principal rather than one: the IAM wildcard.
-const WILDCARD_PRINCIPAL: &str = "*";
-
-/// Whether an access policy ALLOWS every principal — a statement that allows the wildcard
-/// principal and narrows it with no condition.
-///
-/// An access policy "authorizes cross-account users to deliver their log events to the
-/// associated destination", so its statements have to identify who is authorized: either a
-/// concrete principal, or the wildcard narrowed by a condition, which is how a grant to an
-/// organization names its members (`PutDestinationPolicy$forceUpdate`, the
-/// [`ORGANIZATION_PRINCIPAL_CONDITION_KEY`] form). A statement allowing the wildcard with
-/// no condition at all identifies nobody, and the document is refused.
-///
-/// `Principal` is read in both of its IAM forms — the bare string and the map from
-/// principal type to one value or a list of them — and only an `Allow` statement is
-/// examined, since a `Deny` over the wildcard restricts rather than grants. A document
-/// that is not JSON allows nothing: the handler refuses it before asking.
-pub fn access_policy_allows_every_principal(document: &str) -> bool {
-    let Ok(serde_json::Value::Object(members)) =
-        serde_json::from_str::<serde_json::Value>(document)
-    else {
-        return false;
-    };
-    // "Statement" carries either one statement or a list of them.
-    let statements: Vec<&serde_json::Value> = match members.get("Statement") {
-        Some(serde_json::Value::Array(items)) => items.iter().collect(),
-        Some(statement) => vec![statement],
-        None => Vec::new(),
-    };
-    statements.into_iter().any(|statement| {
-        let allows = statement
-            .get("Effect")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|effect| effect.eq_ignore_ascii_case("Allow"));
-        let narrowed = statement
-            .get("Condition")
-            .and_then(serde_json::Value::as_object)
-            .is_some_and(|condition| !condition.is_empty());
-        allows && !narrowed && names_wildcard_principal(statement.get("Principal"))
-    })
-}
-
-/// Whether a statement's `Principal` is the wildcard, in either of the forms IAM writes it:
-/// the bare string, or a map from principal type to the wildcard (alone or among a list).
-fn names_wildcard_principal(principal: Option<&serde_json::Value>) -> bool {
-    let is_wildcard =
-        |value: &serde_json::Value| value.as_str() == Some(WILDCARD_PRINCIPAL);
-    match principal {
-        Some(serde_json::Value::Object(by_type)) => by_type.values().any(|named| match named {
-            serde_json::Value::Array(items) => items.iter().any(is_wildcard),
-            value => is_wildcard(value),
-        }),
-        Some(value) => is_wildcard(value),
-        None => false,
-    }
-}
-
-/// The IAM action registering a subscription filter is authorized as: this service's action
-/// namespace (`logs`, its `arnNamespace`) and the operation's own name. It is the action a
-/// destination's access policy has to authorize, since one "is used to authorize claims to
-/// register a subscription filter against a given destination" (`PutDestinationPolicy`).
-pub const PUT_SUBSCRIPTION_FILTER_ACTION: &str = "logs:PutSubscriptionFilter";
-
-/// AWS's refusal for a call nothing authorizes: the account the request was signed for, the
-/// action it asked for and the resource it asked for. Every variable part comes from the
-/// request and from this store — the caller's account id, the fully qualified action and the
-/// resource's own ARN — so the sentence states the rule rather than one call's values.
-pub fn not_authorized_message(account_id: &str, action: &str, resource_arn: &str) -> String {
-    format!(
-        "User with accountId: {account_id} is not authorized to perform: {action} on \
-         resource: {resource_arn}"
-    )
-}
-
-/// Whether the calling principal may take `action` on the logical destination `destination`.
-///
-/// The destination's ACCESS POLICY is the only thing that authorizes one: "Through an access
-/// policy, a destination controls what is written to it. By default, PutDestination does not
-/// set any access policy with the destination, which means a cross-account user cannot call
-/// PutSubscriptionFilter against this destination. To enable this, the destination owner must
-/// call PutDestinationPolicy after PutDestination" (`PutDestination`). So a destination
-/// carrying NO policy authorizes nobody — not even the account that owns it, which is what
-/// AWS answers such a call with — and a destination carrying one is decided by the tree's
-/// single evaluation of IAM documents ([`service_common::iam_authorization`]).
-///
-/// The destination's OWN account also reaches it through its identity-based policies, which
-/// is why an attached policy naming only another account does not revoke the owner; an
-/// explicit `Deny` about this request still refuses it, as IAM evaluates one.
-pub fn destination_authorizes(destination: &DestinationRecord, action: &str) -> bool {
-    let Some(document) = destination.access_policy.as_deref() else {
-        return false;
-    };
-    // Every spelling an access policy can name the caller by: the principal this emulator's
-    // credential speaks for, and the account that principal belongs to, which IAM lets a
-    // resource policy name in place of the principal itself.
-    let caller = ::service_common::caller_principal::ambient_user_arn();
-    let mut principals = vec![caller.clone()];
-    principals.extend(::service_common::iam_authorization::account_principals(
-        &caller,
-    ));
-    let stated = ::service_common::iam_authorization::resource_decision(
-        document,
-        &::service_common::iam_authorization::Request::new(action, &destination.arn, &principals),
-    );
-    let by_identity = if arn_account_id(&destination.arn) == arn_account_id(&caller) {
-        ::service_common::iam_authorization::Decision::Allowed
-    } else {
-        ::service_common::iam_authorization::Decision::NotStated
-    };
-    ::service_common::iam_authorization::is_allowed(by_identity, stated)
-}
-
-/// The refusal a request that would register a subscription filter against the destination
-/// `destination_arn` names is answered with, or `None` when the destination authorizes it.
-///
-/// `None` as well for an ARN that names no logical destination THIS account holds: a
-/// physical destination (a stream, a delivery stream, a function) carries no access policy,
-/// and a destination of another account is a resource whose policy this store does not hold
-/// — a refusal has to be grounded in a policy that was read, so neither is refused here.
-pub fn subscription_destination_refusal(
-    store: &ComAmazonawsCloudwatchlogsLogs20140328State,
-    destination_arn: &str,
-) -> Option<String> {
-    let destination = store.destination_by_arn(destination_arn)?;
-    (!destination_authorizes(destination, PUT_SUBSCRIPTION_FILTER_ACTION)).then(|| {
-        not_authorized_message(
-            ::engine::emulator_account_id(),
-            PUT_SUBSCRIPTION_FILTER_ACTION,
-            destination_arn,
-        )
-    })
-}
-
-/// The refusal CloudWatch Logs answers a `PutDestinationPolicy` that would replace a
-/// destination's account-granting access policy with one granting an organization without the
-/// `forceUpdate` affirmation that the senders' subscription filters have already been updated.
-/// The message names the parameter the caller has to set, so one request carries the whole
-/// rule; it says it per CLASS of update rather than per request value, so every such put is
-/// refused identically.
-pub const DESTINATION_POLICY_FORCE_UPDATE_REQUIRED: &str =
-    "forceUpdate must be true to update an existing destination policy to grant permission to \
-     an organization ID instead of individual accounts";
-
-/// Whether an ARN names an IAM role — what `OpenSearchResourceConfig$dataSourceRoleArn`
-/// must be ("Specify the ARN of an IAM role that CloudWatch Logs will use to create the
-/// integration"). An IAM ARN's resource part is `role/<path><name>`.
-pub fn is_iam_role_arn(arn: &str) -> bool {
-    arn_service_and_resource(arn)
-        .is_some_and(|(service, resource)| service == IAM_SERVICE && resource.starts_with("role/"))
-}
-
-/// Whether an ARN names a principal `OpenSearchResourceConfig$dashboardViewerPrincipals`
-/// admits: "the ARNs of IAM roles and IAM users who you want to grant permission to for
-/// viewing the dashboards".
-pub fn is_dashboard_viewer_principal_arn(arn: &str) -> bool {
-    arn_service_and_resource(arn).is_some_and(|(service, resource)| {
-        service == IAM_SERVICE && (resource.starts_with("role/") || resource.starts_with("user/"))
-    })
-}
-
-/// Whether an ARN names an OpenSearch Service application — what
-/// `OpenSearchResourceConfig$applicationArn` must be ("If you want to use an existing
-/// OpenSearch Service application for your integration [...] specify it here").
-pub fn is_opensearch_application_arn(arn: &str) -> bool {
-    arn_service_and_resource(arn).is_some_and(|(service, resource)| {
-        service == OPENSEARCH_SERVICE && resource.starts_with("application/")
-    })
-}
-
-/// Whether an ARN names a KMS key — what `OpenSearchResourceConfig$kmsKeyArn` must be
-/// ("specify the ARN of the KMS key that you want to use"). Unlike a log group's
-/// `kmsKeyId`, this member is modelled as an `Arn`, so a bare key id is not one of its
-/// values.
-pub fn is_kms_key_arn(arn: &str) -> bool {
-    arn_service_and_resource(arn)
-        .is_some_and(|(service, resource)| service == KMS_SERVICE && !resource.is_empty())
-}
-
-/// How many account-level policies of `policy_type` the account may hold IN TOTAL once a
-/// policy whose scoped-ness is `scoped` is added: each quota sentence is an either/or —
-/// "either one account-level metric extraction policy that applies to all log groups, or up
-/// to 5 policies that are each scoped to a subset of log groups with the selectionCriteria
-/// parameter" — so the number the account is held to is the one for the policy being put,
-/// and every policy of that type counts against it. Every number is one
-/// `PutAccountPolicy`'s own documentation states — see the constants it returns.
-pub fn max_account_policies(policy_type: &str, scoped: bool) -> usize {
-    if !scoped {
-        return MAX_UNSCOPED_ACCOUNT_POLICIES;
-    }
-    match policy_type {
-        POLICY_TYPE_TRANSFORMER | POLICY_TYPE_FIELD_INDEX => MAX_SCOPED_ACCOUNT_POLICIES,
-        POLICY_TYPE_METRIC_EXTRACTION => MAX_SCOPED_METRIC_EXTRACTION_ACCOUNT_POLICIES,
-        // A data protection policy and a subscription filter policy have no scoped half:
-        // the account holds one of each, whatever it is scoped to.
-        _ => MAX_UNSCOPED_ACCOUNT_POLICIES,
-    }
-}
-
-/// What an accepted account-level policy document says: the parts a handler acts on after
-/// [`check_account_policy_document`] accepts it.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct AccountPolicyShape {
-    /// The log groups a data protection policy's Audit action sends findings to, as
-    /// [`DataProtectionPolicyShape::findings_destination_log_groups`] reports them. Empty
-    /// for every other policy type, none of which names a destination log group.
-    pub findings_destination_log_groups: Vec<String>,
-}
-
-/// Judge a `PutAccountPolicy$policyDocument` against the rules that member's own
-/// documentation states for the `policyType` it is put with, answering the message to
-/// refuse it with, or what the accepted document says.
-///
-/// Every type's document is "the policy, in JSON" and can be "up to 30,720 characters
-/// long". Beyond that each type has its own documented shape, and only the rules the
-/// documentation states are enforced: which data identifiers, processors or fields exist
-/// is a catalogue that lives outside this service, and the grammar of `selectionCriteria`
-/// is judged by the caller of this function rather than here.
-pub fn check_account_policy_document(
-    policy_type: &str,
-    document: &str,
-) -> Result<AccountPolicyShape, String> {
-    if document.chars().count() > MAX_ACCOUNT_POLICY_DOCUMENT_CHARS {
-        return Err(format!(
-            "policyDocument can be up to {MAX_ACCOUNT_POLICY_DOCUMENT_CHARS} characters"
-        ));
-    }
-    match policy_type {
-        // "A data protection policy must include two JSON blocks" — the same document the
-        // log-group-level `PutDataProtectionPolicy` takes, so it is held to the same rule.
-        POLICY_TYPE_DATA_PROTECTION => {
-            let shape = check_data_protection_policy_document(document)?;
-            Ok(AccountPolicyShape {
-                findings_destination_log_groups: shape.findings_destination_log_groups,
-            })
-        }
-        POLICY_TYPE_SUBSCRIPTION_FILTER => {
-            check_subscription_filter_policy_document(document).map(|()| AccountPolicyShape::default())
-        }
-        POLICY_TYPE_FIELD_INDEX => {
-            check_field_index_policy_document(document).map(|_| AccountPolicyShape::default())
-        }
-        POLICY_TYPE_TRANSFORMER => {
-            check_transformer_policy_document(document).map(|()| AccountPolicyShape::default())
-        }
-        // A metric extraction policy "controls whether CloudWatch Metrics can be created
-        // through the Embedded Metrics Format (EMF)", and the one thing it can say is that
-        // EMF metric creation is off.
-        _ => check_metric_extraction_policy_document(document).map(|()| AccountPolicyShape::default()),
-    }
-}
-
-/// The document as the JSON object every policy type but a transformer policy is
-/// expressed as ("Specify the policy, in JSON").
-fn policy_object(document: &str) -> Result<serde_json::Map<String, serde_json::Value>, String> {
-    serde_json::from_str::<serde_json::Value>(document)
-        .ok()
-        .and_then(|parsed| match parsed {
-            serde_json::Value::Object(members) => Some(members),
-            _ => None,
-        })
-        .filter(|members| !members.is_empty())
-        .ok_or_else(|| "policyDocument must be the policy in JSON (a non-empty JSON object)".to_string())
-}
-
-/// Judge a `SUBSCRIPTION_FILTER_POLICY` document. The attributes are the ones
-/// `PutAccountPolicy$policyDocument` lists for one: "DestinationArn The ARN of the
-/// destination to deliver log events to", "RoleArn The ARN of an IAM role that grants
-/// CloudWatch Logs permissions to deliver ingested log events to the destination stream",
-/// "FilterPattern A filter pattern for subscribing to a filtered stream of log events" and
-/// "Distribution The method used to distribute log data to the destination". Each is held
-/// to the rule the log-group-level `PutSubscriptionFilter` holds the member of the same
-/// name to, so one destination is as acceptable account-wide as it is per group.
-fn check_subscription_filter_policy_document(document: &str) -> Result<(), String> {
-    let members = policy_object(document)?;
-    let string = |name: &str| members.get(name).and_then(serde_json::Value::as_str);
-    let Some(destination_arn) = string("DestinationArn") else {
-        return Err(
-            "policyDocument for a subscription filter policy must include a DestinationArn"
-                .to_string(),
-        );
-    };
-    if let Some(message) = unparsable_arn_message("DestinationArn", destination_arn) {
-        return Err(message);
-    }
-    // The same ordering as `PutSubscriptionFilter`: a destination that needs a role is
-    // refused for the missing role before the kind of resource its ARN names is judged.
-    if string("RoleArn").is_none() {
-        if let Some(vendor) = subscription_role_required_vendor(destination_arn) {
-            return Err(format!(
-                "DestinationArn for vendor {vendor} cannot be used without RoleArn"
-            ));
-        }
-    }
-    if !is_subscription_destination_arn(destination_arn) {
-        return Err(format!(
-            "DestinationArn must be the ARN of a {} resource",
-            SUBSCRIPTION_DESTINATIONS
-                .iter()
-                .map(|(service, _)| *service)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
-    }
-    if let Some(filter_pattern) = string("FilterPattern") {
-        validate_filter_pattern(filter_pattern)?;
-    }
-    // "the grouping can be set to Random for a more even distribution": the two values of
-    // the model's `Distribution` enum, which no boundary validator holds a JSON document
-    // to, listed in the one order this service states that enum's values in.
-    if let Some(distribution) = string("Distribution") {
-        if !crate::ops::types::DISTRIBUTION_VALUES.contains(&distribution) {
-            return Err(invalid_value_message(
-                "Distribution",
-                crate::service::enum_value_set(
-                    crate::ops::types::DISTRIBUTION_VALUES.iter().copied(),
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// One field index a field index policy document names: the field whose log event values
-/// are indexed, and the type the document gives it.
-///
-/// From `PutIndexPolicy$policyDocument`: "You can use FieldsV2 to specify the type for each
-/// field. Supported types are FIELD_INDEX and FACET." A name listed in the plain `Fields`
-/// array carries no type of its own, and that array is "The array of field indexes to
-/// create", so such a name is a field index ([`FIELDS_ARRAY_INDEX_TYPE`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct IndexedField {
-    /// The field whose values are indexed — what `FieldIndex$fieldIndexName` reports as
-    /// "the string that this field index matches".
-    pub name: String,
-    /// The field index's type, one of [`crate::ops::types::INDEX_TYPE_VALUES`].
-    pub index_type: String,
-}
-
-/// The `IndexType` of a field index named in a document's plain `Fields` array, which
-/// gives no type: that array is "The array of field indexes to create", so the index it
-/// creates is a field index rather than a facet. Spelled as the model's `IndexType` spells
-/// it ([`crate::ops::types::INDEX_TYPE_VALUES`]).
-pub const FIELDS_ARRAY_INDEX_TYPE: &str = "FIELD_INDEX";
 
 /// One created log group and everything stored under it.
 #[derive(Debug, Clone)]

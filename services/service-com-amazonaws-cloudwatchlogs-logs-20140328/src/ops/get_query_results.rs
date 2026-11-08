@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetQueryResults
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetQueryResults`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetQueryResults::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: runs the stored query over the log events of the log groups it reads and
+//! reports the rows it produced, the status the query has reached and the counts over the
+//! run. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -109,6 +103,15 @@
 //! * `InvalidParameterException` (HTTP 400) — A parameter is specified incorrectly.
 //! * `ResourceNotFoundException` (HTTP 400) — The specified resource does not exist.
 //! * `ServiceUnavailableException` (HTTP 500) — The service cannot complete the request.
+//!
+//! ## What this operation answers for a query that has not finished
+//!
+//! "GetQueryResults does not start running a query": the status it reports is the one the
+//! query has already reached on the clock ([`crate::state::QueryRecord`]), and only a query
+//! that is running or complete has results to report — "If the value of the Status field in
+//! the output is Running, this operation returns only partial results. If you see a value of
+//! Scheduled or Running for the status, you can retry the operation later to see the final
+//! results."
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -157,6 +160,52 @@ pub struct GetQueryResults<Eng> {
     engine: ::std::sync::Arc<Eng>,
 }
 
+/// Refuse the request with the error this operation models for a parameter that is
+/// "specified incorrectly".
+fn invalid_parameter(message: &str) -> GetQueryResultsError {
+    GetQueryResultsErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message.to_string()),
+    })
+    .into()
+}
+
+/// The kind tag this operation's pagination cursor carries, so a token minted by another
+/// paginated operation is refused rather than misread.
+const CURSOR_KIND: &str = "GetQueryResults";
+
+/// Where the next page of results resumes: the query the results belong to, and how many of
+/// its rows earlier pages already reported.
+///
+/// "Use the nextToken returned in the response to request additional pages of results": the
+/// token is a position within ONE query's results, so a token handed to a different query is
+/// refused rather than read as a position in that query's rows.
+#[derive(Debug, Clone)]
+struct Cursor {
+    query_id: String,
+    after: usize,
+}
+
+impl Cursor {
+    fn encode(&self) -> String {
+        crate::state::encode_token(&::serde_json::json!({
+            "kind": CURSOR_KIND,
+            "queryId": self.query_id,
+            "after": self.after,
+        }))
+    }
+
+    fn decode(token: &str) -> Option<Self> {
+        let value = crate::state::decode_token(token)?;
+        if value.get("kind")?.as_str()? != CURSOR_KIND {
+            return None;
+        }
+        Some(Self {
+            query_id: value.get("queryId")?.as_str()?.to_string(),
+            after: usize::try_from(value.get("after")?.as_u64()?).ok()?,
+        })
+    }
+}
+
 impl<Eng> GetQueryResults<Eng> {
     /// Construct the operation from the shared engine. INFALLIBLE — the engine is a
     /// construction-time dependency, so engine access is guaranteed by the time any
@@ -183,18 +232,150 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetQueryResults` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetQueryResultsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetQueryResults"))
+        // `ctx` carries only request metadata; the results are named by `queryId` and by
+        // nothing about the request.
+        let _ = ctx;
+
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetQueryResultsError::from(GetQueryResultsErrorModeled::ServiceUnavailableException(
+                ServiceUnavailableException {
+                    message: Some("the log store is unavailable".to_string()),
+                },
+            ))
+        })?;
+        // Everything the results are computed from is read out of the store HERE, while it
+        // is locked, and the query then runs with it released: reading one caller's results
+        // is bounded work over the records it read, and every other request of this service
+        // waits on the same store.
+        let (query, encryption_key, prepared) = {
+            let mut store = state.lock();
+
+            // A query advances on the CLOCK — a scheduled one starts running and a running
+            // one completes at the instants its start armed — so the status these results are
+            // reported under is the one that was already due at this instant, materialised
+            // before the read rather than moved on because a read happened to look.
+            store.materialize_due_query_transitions(crate::state::now_ms());
+
+            // "The ID number of the query": an id this account holds no query under names no
+            // query whose results could be returned, which is the missing resource this
+            // operation models — stated by naming the id that was rejected, the way
+            // `StopQuery` names it.
+            let Some(query) = store.queries.get(&input.query_id).cloned() else {
+                return Err(GetQueryResultsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: Some(crate::state::invalid_query_id_message(&input.query_id)),
+                    },
+                )
+                .into());
+            };
+
+            // "GetQueryResults does not start running a query": only a query that has
+            // started has results to report, so a query that is still `Scheduled`, or that
+            // was cancelled or timed out, is read for nothing.
+            let running = query.status == crate::state::QUERY_STATUS_RUNNING
+                || query.status == crate::state::QUERY_STATUS_COMPLETE;
+            let prepared = running.then(|| crate::state::insights::prepare(&store, &query));
+            // "If you associated an KMS key with the CloudWatch Logs Insights query results
+            // in this account, this field displays the ARN of the key that's used to encrypt
+            // the query results when StartQuery stores them."
+            (query, store.query_results_kms_key_id.clone(), prepared)
+        };
+
+        // "The token for the next set of items to return": a position inside THIS query's
+        // results, so a token of another enumeration is refused rather than misread.
+        let resume = match input.next_token.as_deref() {
+            Some(token) => {
+                let cursor =
+                    Cursor::decode(token).filter(|cursor| cursor.query_id == query.query_id);
+                let Some(cursor) = cursor else {
+                    return Err(invalid_parameter(crate::state::INVALID_NEXT_TOKEN_MESSAGE));
+                };
+                cursor.after
+            }
+            None => 0,
+        };
+
+        // A query whose string this service cannot run reports the `Failed` status of an
+        // execution that produced nothing.
+        let execution = match prepared {
+            Some(prepared) => crate::state::insights::run(prepared).await,
+            None => crate::state::insights::Execution::default(),
+        };
+        let status = match execution.failed.as_deref() {
+            Some(reason) => {
+                ::tracing::debug!(
+                    query_id = %query.query_id,
+                    reason = %reason,
+                    "the stored query could not be run"
+                );
+                crate::state::QUERY_STATUS_FAILED.to_string()
+            }
+            None => query.status.clone(),
+        };
+
+        // "The maximum number of log events to return in the response. The maximum is 10,000
+        // log events per request": `maxItems` is modelled `range 0..10000`, so the boundary
+        // validator has already refused a value outside it, and a request naming none gets
+        // the largest page the member admits.
+        let page_size = usize::try_from(
+            input
+                .max_items
+                .unwrap_or(crate::state::insights::MAX_PAGE_ITEMS),
+        )
+        .unwrap_or(0);
+        let total = execution.rows.len();
+        let first = resume.min(total);
+        let last = first.saturating_add(page_size).min(total);
+        let page: Vec<Vec<ResultField>> = execution.rows[first..last]
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .map(|(field, value)| ResultField {
+                        field: Some(field.clone()),
+                        value: Some(value.clone()),
+                    })
+                    .collect()
+            })
+            .collect();
+
+        // "If there are more log events remaining in the results, the response includes a
+        // nextToken … This is only supported for Logs Insights QL and is currently not
+        // supported for PPL and SQL query languages", so a query in one of those languages
+        // is answered with its one page and no token to continue from.
+        let paginates = query.query_language == crate::state::DEFAULT_QUERY_LANGUAGE;
+        let next_token = (paginates && last < total).then(|| {
+            Cursor {
+                query_id: query.query_id.clone(),
+                after: last,
+            }
+            .encode()
+        });
+
+        Ok(GetQueryResultsOutput {
+            // "The query language used for this query", which is the language the query was
+            // started with.
+            query_language: Some(query.query_language.clone()),
+            results: Some(page),
+            statistics: Some(QueryStatistics {
+                records_matched: execution.records_matched,
+                records_scanned: execution.records_scanned,
+                bytes_scanned: execution.bytes_scanned,
+                log_groups_scanned: execution.log_groups_scanned,
+                // The rows the query produced, which is what the results hold however many
+                // of them one page carries.
+                result_count: total as f64,
+                // "estimatedRecordsSkipped" / "estimatedBytesSkipped" count what an INDEX
+                // let the query skip: this store scans the events of the window itself and
+                // skips none, so neither is estimated at a number nothing measured.
+                estimated_records_skipped: 0.0,
+                estimated_bytes_skipped: 0.0,
+            }),
+            status: Some(status),
+            // "If you associated an KMS key with the CloudWatch Logs Insights query results
+            // in this account, this field displays the ARN of the key that's used to encrypt
+            // the query results when StartQuery stores them."
+            encryption_key,
+            next_token,
+        })
     }
 }

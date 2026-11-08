@@ -33,6 +33,13 @@ csv = "1.3"
 # Compiles the regular expression a Logs Insights `parse` command carries, so a query
 # string that does not compile is refused rather than accepted.
 regex = "1.12"
+# `chrono`: a query result carries `@timestamp` and `@ingestionTime` as the calendar instant
+# each stands for, so the epoch milliseconds a stored event keeps are rendered (and read
+# back for ordering) with it.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
+# `sqlparser`: the `SELECT` `StartQuery` accepts for the SQL query language is PARSED with
+# it, so what `GetQueryResults` runs is the structure of the caller's own statement.
+sqlparser = "0.59"
 # An ingested Embedded Metric Format log event publishes its metrics into the CloudWatch
 # emulator's own metric store, which is reached through the shared engine and needs the
 # owning service's state TYPE.

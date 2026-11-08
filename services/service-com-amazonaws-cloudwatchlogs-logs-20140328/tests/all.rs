@@ -185,6 +185,8 @@ mod query_cancellation;
 mod query_compilation;
 #[path = "all/query_definitions.rs"]
 mod query_definitions;
+#[path = "all/query_results.rs"]
+mod query_results;
 #[path = "all/query_window_refusal.rs"]
 mod query_window_refusal;
 #[path = "all/refusal_error_codes.rs"]
