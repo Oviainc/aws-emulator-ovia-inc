@@ -74,6 +74,10 @@ mod bootstrap;
 pub mod aws_api;
 pub use aws_api::AwsAccess;
 
+/// What an SDK client fills into a call's input itself: the members the called service's model
+/// marks as an idempotency token.
+mod idempotency_token;
+
 /// The HTTP seam a running handler reaches it through when it signs and sends a request of
 /// its own.
 pub mod guest_http;
@@ -105,6 +109,12 @@ pub use log_delivery::{log_target, LogEvent, LogGrants, LogTarget};
 
 /// The AWS SDK modules a node handler imports, reached through that same seam.
 mod node_sdk_guest;
+
+/// What a called service's own Smithy model states for an SDK client built against it: the
+/// names one client package exports, the error shapes an SDK's own exception classes are built
+/// from, and the input members a client fills in itself. It sits under the node client because
+/// that is the SDK that first read it; every SDK this runtime supplies reads the one reading.
+use node_sdk_guest::exports as sdk_model;
 
 /// How many LAYER archives one run reads.
 ///

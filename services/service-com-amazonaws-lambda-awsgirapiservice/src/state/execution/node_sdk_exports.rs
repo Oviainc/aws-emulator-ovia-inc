@@ -1,50 +1,35 @@
 // SPDX-License-Identifier: CC0-1.0
 
-//! The names one `@aws-sdk/client-*` package exports, read from the service's own Smithy
-//! model.
+//! What one service's own Smithy model states for an SDK CLIENT built against it: the names
+//! that service's client package exports, and the input members a client of it fills in itself.
 //!
 //! A package of the AWS SDK for JavaScript v3 exports a class per thing its service has: the
 //! client, a `<Operation>Command` for every operation the service binds, and one error class
 //! per error shape it declares. A handler written against the SDK binds those names — `import
 //! { SQSClient, GetQueueUrlCommand, QueueDoesNotExist } from '@aws-sdk/client-sqs'` — and an
 //! ES module's named imports are resolved when the module is LINKED, so the package has to
-//! state the names before any of them is read. That list is what this module computes.
+//! state the names before any of them is read. That list is what this module computes, along
+//! with the two other things a client reads out of the same file: which error shapes its
+//! exception classes are built from (`crate::state::execution::aws_sdk_guest`, the Python SDK,
+//! asks the same question) and which members it generates a value for when the caller leaves
+//! them out (`crate::state::execution::idempotency_token`).
 //!
-//! It states none of the names itself: they are read out of the target service's own Smithy
+//! It states none of those itself: they are read out of the target service's own Smithy
 //! model — the same file that service's emulator crate is generated from, embedded by
-//! [`crate::state::execution::aws_api`] — so a command or an error class this runtime supplies
-//! for a service is one that service really has, and neither can drift from the surface it
-//! serves.
+//! [`crate::state::execution::aws_api`] — so a command, an error class or a filled member this
+//! runtime supplies for a service is one that service really has, and none can drift from the
+//! surface it serves. Every question is answered from ONE reading of that model, held per
+//! service.
 
-use ::std::collections::BTreeSet;
+use ::std::collections::{BTreeMap, BTreeSet};
 use ::std::sync::{Arc, OnceLock};
 
 use ::serde_json::Value;
 
 use crate::state::execution::aws_api;
 
-/// The package this runtime supplies a client under, and the model whose names it exports.
-///
-/// One entry per service whose model this crate embeds ([`aws_api`]), under the token the SDK
-/// publishes that service's client package by — its SDK id, lower cased with its words
-/// hyphenated. A service `aws_api::APIS` lets a handler call that has no entry here is still
-/// reachable: its package exports the client alone, because this runtime holds no model to
-/// read the rest of the names out of. The test below holds every entry to being a service a
-/// call may be made to, so the table cannot name one no call reaches.
-const MODELS: &[(&str, &str)] = &[
-    ("sqs", aws_api::SQS_MODEL),
-    ("eventbridge", aws_api::EVENTBRIDGE_MODEL),
-    ("dynamodb", aws_api::DYNAMODB_MODEL),
-    ("cloudwatch-logs", aws_api::CLOUDWATCH_LOGS_MODEL),
-    ("secrets-manager", aws_api::SECRETSMANAGER_MODEL),
-    ("api-gateway", aws_api::APIGATEWAY_MODEL),
-    ("sesv2", aws_api::SESV2_MODEL),
-    ("s3", aws_api::S3_MODEL),
-    ("sfn", aws_api::SFN_MODEL),
-];
-
-/// The names one client package exports, beside the client and the base exception its own
-/// name gives ([`super`]).
+/// What one service's model states for a client of it, beside the client class and the base
+/// exception its own name gives ([`super`]).
 #[derive(Debug, Default)]
 pub struct ClientExports {
     /// The operations the service binds, each of which the package exports a
@@ -53,56 +38,40 @@ pub struct ClientExports {
     /// The error shapes the service declares, each of which the package exports a class of
     /// the shape's own name for.
     pub errors: Vec<String>,
+    /// The members of each operation's input that the model marks as an idempotency token,
+    /// keyed by the operation's own name — the members a client generates a value for. An
+    /// operation with none is not held at all.
+    pub idempotency_tokens: BTreeMap<String, Vec<String>>,
 }
 
-/// The names the `@aws-sdk/client-<token>` package exports, for a service whose model this
-/// emulator holds; an empty list for a service it holds none for, whose package therefore
-/// exports its client alone.
+/// What the model of the service `token` names states for a client of it, for a service whose
+/// model this emulator holds; nothing at all for a service it holds none for, whose package
+/// therefore exports its client alone.
 ///
-/// What is held between calls is one cell per entry of [`MODELS`], so the memory this holds and
-/// the number of models it parses are bounded by that fixed table and not by anything a run
-/// asks for: a token no entry of it answers to parses nothing and holds nothing, however many
-/// distinct ones a handler names.
+/// What is held between calls is one cell per entry of the reachable-services table
+/// (`aws_api::APIS`), so the memory this holds and the number of models it parses are bounded
+/// by that fixed table and not by anything a run asks for: a token no entry of it answers to
+/// parses nothing and holds nothing, however many distinct ones a handler names.
 #[must_use]
 pub fn client_exports(token: &str) -> Arc<ClientExports> {
     /// The answer for a service this emulator holds no model for — one value, shared.
     static NONE_HELD: OnceLock<Arc<ClientExports>> = OnceLock::new();
     let none_held = || Arc::clone(NONE_HELD.get_or_init(|| Arc::new(ClientExports::default())));
-    /// One cell per entry of that table, each filled on the first import of that service's
-    /// package and never again.
+    /// One cell per entry of that table, each filled on the first question asked about that
+    /// entry's service and never again.
     static CACHE: OnceLock<Vec<OnceLock<Arc<ClientExports>>>> = OnceLock::new();
-    let Some(at) = service_at(token) else {
+    let Some((at, model)) = aws_api::held_model(token) else {
         return none_held();
     };
-    let cache = CACHE.get_or_init(|| MODELS.iter().map(|_| OnceLock::new()).collect());
-    let Some((cell, (_token, model))) = cache.get(at).zip(MODELS.get(at)) else {
+    let cache = CACHE.get_or_init(|| aws_api::APIS.iter().map(|_| OnceLock::new()).collect());
+    let Some(cell) = cache.get(at) else {
         return none_held();
     };
     Arc::clone(cell.get_or_init(|| Arc::new(exports_of(model))))
 }
 
-/// Where in [`MODELS`] the service the package name's token names sits, or `None` when this
-/// runtime holds no model for it.
-fn service_at(token: &str) -> Option<usize> {
-    let wanted = compacted(token);
-    MODELS
-        .iter()
-        .position(|(named, _model)| compacted(named) == wanted)
-}
-
-/// A service token with its separators dropped.
-///
-/// One service is named by two spellings of the same token: the SDK publishes the client
-/// package under the service's SDK id with the words hyphenated
-/// (`@aws-sdk/client-cloudwatch-logs`) and an SDK client is built from that id with the words
-/// run together (`boto3.client("cloudwatchlogs")`). Dropping the separators is what makes the
-/// two the one token.
-fn compacted(token: &str) -> String {
-    token.chars().filter(|character| *character != '-').collect()
-}
-
-/// The names `model` states: every operation shape it declares, and every shape it marks as
-/// an error.
+/// What `model` states: every operation shape it declares, every shape it marks as an error,
+/// and the idempotency-token members of each operation's input.
 ///
 /// Reading the shapes rather than the service's own operation list takes in the operations a
 /// resource's lifecycle binds as well as the ones the service lists directly, which is the
@@ -116,6 +85,7 @@ fn exports_of(model: &str) -> ClientExports {
     };
     let mut operations = BTreeSet::new();
     let mut errors = BTreeSet::new();
+    let mut idempotency_tokens = BTreeMap::new();
     for (id, shape) in &shapes {
         let Some(name) = id.split('#').next_back().filter(|name| !name.is_empty()) else {
             continue;
@@ -123,6 +93,10 @@ fn exports_of(model: &str) -> ClientExports {
         match shape.get("type").and_then(Value::as_str) {
             Some("operation") => {
                 operations.insert(name.to_string());
+                let filled = idempotency_members(&shapes, shape);
+                if !filled.is_empty() {
+                    idempotency_tokens.insert(name.to_string(), filled);
+                }
             }
             Some("structure") if is_error(shape) => {
                 errors.insert(name.to_string());
@@ -133,16 +107,51 @@ fn exports_of(model: &str) -> ClientExports {
     ClientExports {
         operations: operations.into_iter().collect(),
         errors: errors.into_iter().collect(),
+        idempotency_tokens,
     }
+}
+
+/// The members of the input of the operation `operation` that the model marks as an idempotency
+/// token.
+fn idempotency_members(
+    shapes: &::serde_json::Map<String, Value>,
+    operation: &Value,
+) -> Vec<String> {
+    operation
+        .get("input")
+        .and_then(|input| input.get("target"))
+        .and_then(Value::as_str)
+        .and_then(|target| shapes.get(target))
+        .and_then(|input| input.get("members"))
+        .and_then(Value::as_object)
+        .map(|members| {
+            members
+                .iter()
+                .filter(|(_name, member)| is_idempotency_token(member))
+                .map(|(name, _member)| name.clone())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Whether `shape` is one the model marks as an error (`@error`), which is what makes the SDK
 /// export a class for it.
 fn is_error(shape: &Value) -> bool {
+    has_trait(shape, "smithy.api#error")
+}
+
+/// Whether `member` is one the model marks as an idempotency token (`@idempotencyToken`), which
+/// is what makes an SDK client generate a value for it.
+fn is_idempotency_token(member: &Value) -> bool {
+    has_trait(member, "smithy.api#idempotencyToken")
+}
+
+/// Whether `shape` carries the trait `trait_id`.
+fn has_trait(shape: &Value, trait_id: &str) -> bool {
     shape
         .get("traits")
         .and_then(Value::as_object)
-        .is_some_and(|traits| traits.contains_key("smithy.api#error"))
+        .is_some_and(|traits| traits.contains_key(trait_id))
 }
 
 #[cfg(test)]
@@ -194,22 +203,6 @@ mod tests {
                  no name of one, got {} operations and {} errors",
                 exports.operations.len(),
                 exports.errors.len()
-            );
-        }
-    }
-
-    /// Every service this runtime states the names of is a service a call may be made to: the
-    /// table holds a model for no service the seam does not reach.
-    #[test]
-    fn every_model_named_is_a_service_a_call_reaches() {
-        for (token, _model) in MODELS {
-            let wanted = compacted(token);
-            assert!(
-                aws_api::APIS
-                    .iter()
-                    .any(|api| compacted(api.sdk_token) == wanted),
-                "case {token:?}: expected a service a call may be made to, got a token no entry \
-                 of the reachable services answers to"
             );
         }
     }

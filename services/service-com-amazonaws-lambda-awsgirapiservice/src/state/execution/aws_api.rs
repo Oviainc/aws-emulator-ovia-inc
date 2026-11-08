@@ -30,6 +30,10 @@
 //! * Only the services in [`APIS`] are reachable, and only the operations their own models
 //!   bind. A token that is not in that table is REFUSED rather than guessed at: the guest
 //!   is told the service is unknown, and nothing is sent.
+//! * What an SDK CLIENT puts on a request of its own is put on it here, once for every SDK
+//!   this runtime supplies: the input members the called service's model marks as an
+//!   idempotency token are filled with a generated value when the guest left them out, which
+//!   is what every AWS SDK does before it signs (`super::idempotency_token`).
 //! * Every bound is the host's. The size of the document the guest may send, the size of
 //!   the answer it may read back and how long one call may take are all checked here and in
 //!   [`super::python`], against the run's own remaining deadline.
@@ -89,6 +93,15 @@ pub struct Api {
     pub endpoint_prefix: &'static str,
     /// The protocol its model declares, which is what a request to it is bound by.
     pub protocol: Protocol,
+    /// The service's own Smithy model, where this crate embeds one for it: the SAME file that
+    /// service's emulator crate is generated from, which is what every question answered out
+    /// of a called service's model is read from (`super::node_sdk_exports`). `None` for a
+    /// service this crate holds no model for — those questions simply have no answer for it.
+    ///
+    /// It is held on the ENTRY rather than in a table keyed by one spelling of the service's
+    /// token, so that every token that names ONE service answers with the same model: a call
+    /// made as `logs` reads the model a call made as `cloudwatchlogs` reads.
+    pub model: Option<&'static str>,
     /// The service's own model, read for the ANSWER: WHICH of its values carry bytes rather
     /// than text ([`super::blob_members`]), which only that model says. `None` for a service
     /// whose answers this seam reads some other way — Amazon S3, whose own client parses them
@@ -157,6 +170,7 @@ pub const APIS: &[Api] = &[
         sdk_token: "sqs",
         signing_name: "sqs",
         endpoint_prefix: "sqs",
+        model: Some(SQS_MODEL),
         protocol: Protocol::AwsJson {
             target_prefix: "AmazonSQS",
             json_version: "1.0",
@@ -170,6 +184,7 @@ pub const APIS: &[Api] = &[
         sdk_token: "events",
         signing_name: "events",
         endpoint_prefix: "events",
+        model: Some(EVENTBRIDGE_MODEL),
         protocol: Protocol::AwsJson {
             target_prefix: "AWSEvents",
             json_version: "1.1",
@@ -182,6 +197,7 @@ pub const APIS: &[Api] = &[
         sdk_token: "eventbridge",
         signing_name: "events",
         endpoint_prefix: "events",
+        model: Some(EVENTBRIDGE_MODEL),
         protocol: Protocol::AwsJson {
             target_prefix: "AWSEvents",
             json_version: "1.1",
@@ -195,6 +211,7 @@ pub const APIS: &[Api] = &[
         sdk_token: "dynamodb",
         signing_name: "dynamodb",
         endpoint_prefix: "dynamodb",
+        model: Some(DYNAMODB_MODEL),
         protocol: Protocol::AwsJson {
             target_prefix: "DynamoDB_20120810",
             json_version: "1.0",
@@ -210,6 +227,7 @@ pub const APIS: &[Api] = &[
         sdk_token: "logs",
         signing_name: "logs",
         endpoint_prefix: "logs",
+        model: Some(CLOUDWATCH_LOGS_MODEL),
         protocol: Protocol::AwsJson {
             target_prefix: "Logs_20140328",
             json_version: "1.1",
@@ -221,6 +239,7 @@ pub const APIS: &[Api] = &[
         sdk_token: "cloudwatchlogs",
         signing_name: "logs",
         endpoint_prefix: "logs",
+        model: Some(CLOUDWATCH_LOGS_MODEL),
         protocol: Protocol::AwsJson {
             target_prefix: "Logs_20140328",
             json_version: "1.1",
@@ -235,6 +254,7 @@ pub const APIS: &[Api] = &[
         sdk_token: "apigateway",
         signing_name: "apigateway",
         endpoint_prefix: "apigateway",
+        model: Some(APIGATEWAY_MODEL),
         protocol: Protocol::RestJson(&APIGATEWAY),
         answer_model: Some(&APIGATEWAY_ANSWERS),
     },
@@ -251,6 +271,7 @@ pub const APIS: &[Api] = &[
         sdk_token: "secretsmanager",
         signing_name: "secretsmanager",
         endpoint_prefix: "secretsmanager",
+        model: Some(SECRETSMANAGER_MODEL),
         protocol: Protocol::AwsJson {
             target_prefix: "secretsmanager",
             json_version: "1.1",
@@ -269,6 +290,9 @@ pub const APIS: &[Api] = &[
         sdk_token: "opensearch",
         signing_name: "es",
         endpoint_prefix: "es",
+        // The only question this seam answers out of OpenSearch's model is how a request to it
+        // is bound, which the protocol entry below carries ([`OPENSEARCH`]).
+        model: None,
         protocol: Protocol::RestJson(&OPENSEARCH),
         answer_model: Some(&OPENSEARCH_ANSWERS),
     },
@@ -278,6 +302,7 @@ pub const APIS: &[Api] = &[
         sdk_token: "es",
         signing_name: "es",
         endpoint_prefix: "es",
+        model: None,
         protocol: Protocol::RestJson(&OPENSEARCH),
         answer_model: Some(&OPENSEARCH_ANSWERS),
     },
@@ -298,6 +323,7 @@ pub const APIS: &[Api] = &[
         sdk_token: "stepfunctions",
         signing_name: "states",
         endpoint_prefix: "states",
+        model: Some(SFN_MODEL),
         protocol: Protocol::AwsJson {
             target_prefix: "AWSStepFunctions",
             json_version: "1.0",
@@ -310,6 +336,7 @@ pub const APIS: &[Api] = &[
         sdk_token: "sfn",
         signing_name: "states",
         endpoint_prefix: "states",
+        model: Some(SFN_MODEL),
         protocol: Protocol::AwsJson {
             target_prefix: "AWSStepFunctions",
             json_version: "1.0",
@@ -326,6 +353,7 @@ pub const APIS: &[Api] = &[
         sdk_token: "sesv2",
         signing_name: "ses",
         endpoint_prefix: "email",
+        model: Some(SESV2_MODEL),
         protocol: Protocol::RestJson(&SESV2),
         answer_model: Some(&SESV2_ANSWERS),
     },
@@ -338,6 +366,7 @@ pub const APIS: &[Api] = &[
         sdk_token: "s3",
         signing_name: "s3",
         endpoint_prefix: "s3",
+        model: Some(S3_MODEL),
         protocol: Protocol::S3Rest,
         answer_model: None,
     },
@@ -354,6 +383,9 @@ pub const APIS: &[Api] = &[
         sdk_token: "xray",
         signing_name: "xray",
         endpoint_prefix: "xray",
+        // As OpenSearch above: the one question asked out of X-Ray's model is how a request to
+        // it is bound, which [`XRAY`] carries.
+        model: None,
         protocol: Protocol::RestJson(&XRAY),
         answer_model: Some(&XRAY_ANSWERS),
     },
@@ -364,10 +396,11 @@ pub const APIS: &[Api] = &[
 /// drift from the surface that service serves. The include is a COMPILE-TIME read: a model
 /// that moves fails this crate's build rather than changing what a call does.
 ///
-/// Two things are read from these: the names the service's own SDK package exports, which an
-/// `import` of that package binds (`super::node_sdk_guest`'s `exports`, which holds the one
-/// table of which service each belongs to), and, for a `restJson1` service, where each member
-/// of a request belongs ([`super::rest_json`]).
+/// Which service each belongs to is stated on that service's own [`APIS`] entry
+/// ([`Api::model`]); what is read out of them is the names the service's own SDK package
+/// exports, which an `import` of that package binds, and the input members an SDK client fills
+/// in itself (`super::node_sdk_exports`, which answers both from one reading), and for a
+/// `restJson1` service where each member of a request belongs ([`super::rest_json`]).
 pub(super) const SQS_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-sqs-amazonsqs/smithy-model/\
      com-amazonaws-sqs-amazonsqs.json"
@@ -420,6 +453,33 @@ static XRAY: super::rest_json::RestApi = super::rest_json::RestApi {
     namespace: "com.amazonaws.xray",
     parsed: ::std::sync::OnceLock::new(),
 };
+
+/// The model this emulator holds for the service `token` names, and WHERE in [`APIS`] that
+/// service's entry sits — so a reader of these models holds what it read per ENTRY rather than
+/// per name asked for, and a token no entry answers to parses nothing and holds nothing,
+/// however many distinct ones a run names.
+///
+/// The token is matched as [`api_for`] matches it, and the model comes off the entry that
+/// answers, so every token that names ONE service answers with that service's model.
+/// `None` for a service this emulator holds no model for.
+pub(super) fn held_model(token: &str) -> Option<(usize, &'static str)> {
+    let wanted = compacted(token);
+    APIS.iter()
+        .enumerate()
+        .find(|(_at, api)| compacted(api.sdk_token) == wanted)
+        .and_then(|(at, api)| api.model.map(|model| (at, model)))
+}
+
+/// A service token with its separators dropped.
+///
+/// One service is named by two spellings of the same token: the SDK publishes the client
+/// package under the service's SDK id with the words hyphenated
+/// (`@aws-sdk/client-cloudwatch-logs`) and an SDK client is built from that id with the words
+/// run together (`boto3.client("cloudwatchlogs")`). Dropping the separators is what makes the
+/// two the one token.
+pub(super) fn compacted(token: &str) -> String {
+    token.chars().filter(|character| *character != '-').collect()
+}
 
 /// WHICH values of one service's answers carry BYTES, read out of that service's own model on
 /// the first call to it ([`super::blob_members`]).
@@ -507,6 +567,21 @@ static SESV2: super::rest_json::RestApi = super::rest_json::RestApi {
 #[must_use]
 pub fn reachable_services() -> Vec<&'static str> {
     APIS.iter().map(|api| api.sdk_token).collect()
+}
+
+/// The service a call naming `service` is made to, or `None` when no entry of [`APIS`] answers
+/// to that token.
+///
+/// The token is matched with its separators dropped ([`compacted`]), because ONE service is
+/// named by two spellings of its SDK id: an SDK client is built from that id with the words run
+/// together (`boto3.client("secretsmanager")`) and the AWS SDK for JavaScript publishes the
+/// same service's client package with them hyphenated (`@aws-sdk/client-secrets-manager`), whose
+/// token is what a handler importing it hands over. Both spell the same service, so both reach
+/// it; a token no entry answers to under either spelling is still refused.
+fn api_for(service: &str) -> Option<&'static Api> {
+    let wanted = compacted(service);
+    APIS.iter()
+        .find(|api| compacted(api.sdk_token) == wanted)
 }
 
 /// The CREDENTIAL one invocation's calls are signed with.
@@ -618,7 +693,7 @@ impl AwsAccess {
         body: &str,
         within: Duration,
     ) -> Result<Answer, Refusal> {
-        let Some(api) = APIS.iter().find(|api| api.sdk_token == service) else {
+        let Some(api) = api_for(service) else {
             return Err(Refusal::UnknownService);
         };
         if !well_formed_operation(operation) {
@@ -632,6 +707,12 @@ impl AwsAccess {
         } else {
             &self.region
         };
+        // Every AWS SDK client generates a value for an input member the service's model marks
+        // as an idempotency token when the caller left it out, and sends it with the request
+        // (`super::idempotency_token`) — so this seam, which is the lower half of every SDK
+        // this runtime supplies, fills one here, before the request is built and signed.
+        let filled = super::idempotency_token::filled(api.sdk_token, operation, body);
+        let body = filled.as_deref().unwrap_or(body);
         match ::tokio::time::timeout(within, self.dispatched(api, region, operation, body)).await
         {
             Ok(answer) => answer,
@@ -757,7 +838,7 @@ impl AwsAccess {
         body: &str,
         expires_in: Duration,
     ) -> Result<String, Refusal> {
-        let Some(api) = APIS.iter().find(|api| api.sdk_token == service) else {
+        let Some(api) = api_for(service) else {
             return Err(Refusal::UnknownService);
         };
         if !well_formed_operation(operation) {
@@ -1090,7 +1171,103 @@ fn well_formed_region(region: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{reachable_services, well_formed_operation, well_formed_region, APIS};
+    use super::{
+        api_for, held_model, reachable_services, well_formed_operation, well_formed_region, APIS,
+    };
+
+    /// RULE: a service is reached by either spelling of its SDK id — the words run together, as
+    /// an SDK client is built from it, and hyphenated, as the JavaScript SDK's client package is
+    /// published under it — and by no other token.
+    ///
+    /// The rows span the spellings a guest hands over: the table's own token, the hyphenated
+    /// package token of the services whose id is more than one word, and tokens no service
+    /// answers to. What a row names is the SERVICE the token must reach, by its signing name,
+    /// because that is what identifies a service whichever token names it.
+    #[test]
+    fn a_service_is_reached_by_either_spelling_of_its_token() {
+        // (case, the token a guest named, the signing name of the service it must reach)
+        let rows: &[(&str, &str, Option<&str>)] = &[
+            (
+                "the token the table states",
+                "secretsmanager",
+                Some("secretsmanager"),
+            ),
+            (
+                "the JavaScript package's token for it",
+                "secrets-manager",
+                Some("secretsmanager"),
+            ),
+            (
+                "the CloudWatch Logs package token",
+                "cloudwatch-logs",
+                Some("logs"),
+            ),
+            (
+                "the API Gateway package token",
+                "api-gateway",
+                Some("apigateway"),
+            ),
+            (
+                "the Step Functions package token",
+                "step-functions",
+                Some("states"),
+            ),
+            ("a single-word id", "s3", Some("s3")),
+            ("a service no entry answers to", "kinesis", None),
+            ("the empty token", "", None),
+        ];
+        for (case, named, expected) in rows {
+            let reached = api_for(named).map(|api| api.signing_name);
+            assert_eq!(
+                reached, *expected,
+                "case {case:?}: expected {named:?} to reach the service signing as {expected:?}, \
+                 got {reached:?}"
+            );
+        }
+    }
+
+    /// RULE: every token that names ONE service answers with that service's own model, so what
+    /// is read out of a model does not depend on which of its spellings a guest built its
+    /// client with.
+    ///
+    /// The rows are the services this table reaches under more than one token, plus a service
+    /// whose model this crate does not hold and one no entry answers to at all.
+    #[test]
+    fn both_tokens_of_a_service_answer_with_its_own_model() {
+        // (case, two tokens of one service, whether a model is held for it)
+        let rows: &[(&str, &str, &str, bool)] = &[
+            ("CloudWatch Logs", "logs", "cloudwatchlogs", true),
+            ("Step Functions", "stepfunctions", "sfn", true),
+            ("EventBridge", "events", "eventbridge", true),
+            ("Secrets Manager", "secretsmanager", "secrets-manager", true),
+            // The one question asked out of OpenSearch's model is how a request to it is
+            // bound, which its protocol entry carries, so no model is held on the entry.
+            ("OpenSearch", "opensearch", "es", false),
+            ("no service at all", "kinesis", "not-a-service", false),
+        ];
+        for (case, one, other, held) in rows {
+            let first = held_model(one).map(|(_at, model)| model);
+            let second = held_model(other).map(|(_at, model)| model);
+            assert_eq!(
+                first.is_some(),
+                *held,
+                "case {case:?}: expected a model to be held={held} for {one:?}, got \
+                 {}",
+                first.is_some()
+            );
+            assert_eq!(
+                first.map(str::len),
+                second.map(str::len),
+                "case {case:?}: expected {one:?} and {other:?} to answer with the one model"
+            );
+            assert!(
+                first.is_none()
+                    || first.zip(second).is_some_and(|(one, other)| ::std::ptr::eq(one, other)),
+                "case {case:?}: expected {one:?} and {other:?} to answer with the one model, \
+                 got two"
+            );
+        }
+    }
 
     /// Every entry of the table names ONE service's wire facts, and the two tokens that
     /// name EventBridge reach the same service: an SDK client is built with the service's

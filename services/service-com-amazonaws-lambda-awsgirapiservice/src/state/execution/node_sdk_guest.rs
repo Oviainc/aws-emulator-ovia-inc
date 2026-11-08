@@ -38,9 +38,11 @@ use super::package::PackageModule;
 /// The names one of these packages exports, read from the service's own model.
 ///
 /// It is a child of this module because the names are part of what a package IS; the file sits
-/// beside this one, which is what the path states.
+/// beside this one, which is what the path states. It is reachable from the rest of the
+/// execution tree (`super::sdk_model`) because the same reading of a service's model answers
+/// what the PYTHON SDK's exception classes are built from.
 #[path = "node_sdk_exports.rs"]
-mod exports;
+pub(super) mod exports;
 
 /// The prefix of the package names this runtime answers for, which is the one namespace the
 /// AWS SDK for JavaScript v3 publishes its service clients under.

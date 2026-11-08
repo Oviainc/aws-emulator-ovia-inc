@@ -205,8 +205,6 @@ mod handler_aws_sdk;
 mod handler_customer_key_access;
 #[path = "all/handler_db_auth_token.rs"]
 mod handler_db_auth_token;
-#[path = "all/handler_db_auth_token.rs"]
-mod handler_db_auth_token;
 #[path = "all/handler_logging_facility.rs"]
 mod handler_logging_facility;
 #[path = "all/handler_object_store_sdk.rs"]
@@ -225,6 +223,10 @@ mod handler_rest_api_sdk;
 mod handler_step_functions_sdk;
 #[path = "all/handler_s3_object_access.rs"]
 mod handler_s3_object_access;
+#[path = "all/handler_sdk_error_classes.rs"]
+mod handler_sdk_error_classes;
+#[path = "all/handler_sdk_idempotency_token.rs"]
+mod handler_sdk_idempotency_token;
 #[path = "all/handler_secret_sdk.rs"]
 mod handler_secret_sdk;
 #[path = "all/invocation_concurrency.rs"]
@@ -361,12 +363,6 @@ mod invoke_caller_authorization;
 mod invoke_log_delivery;
 #[path = "all/invocation_logs.rs"]
 mod invocation_logs;
-#[path = "all/invocation_run_capacity.rs"]
-mod invocation_run_capacity;
-#[path = "all/layer_region_scope.rs"]
-mod layer_region_scope;
-#[path = "all/update_window_outlasts_its_call.rs"]
-mod update_window_outlasts_its_call;
 #[path = "all/handler_eventbridge_publication.rs"]
 mod handler_eventbridge_publication;
 #[path = "all/sqs_event_source_record_attributes.rs"]
