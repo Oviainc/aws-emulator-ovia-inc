@@ -173,11 +173,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // Every modelled constraint on this input — the required `experimentTemplateId`,
         // `accountId` and `roleArn`, and the lengths and patterns on all four members —
-        // was already refused at the boundary. What the model cannot express is the
-        // RELATIONSHIP between the two members this configuration names: `roleArn` has to
-        // be a well-formed IAM role ARN AND the role it names has to belong to the account
-        // `accountId` names, so a role of any other account is refused here, before any
-        // state write.
+        // was already refused at the boundary. What the model cannot express is what the
+        // two members this configuration names MEAN: `accountId` has to be written as an
+        // AWS account number, and `roleArn` has to be a well-formed IAM role ARN naming a
+        // role of THAT account — so neither a value that names no account nor a role of
+        // another account is persisted.
+        if let Some(refusal) = crate::state::target_account_id_refusal(input.account_id.as_str()) {
+            return Err(
+                CreateTargetAccountConfigurationErrorModeled::ValidationException(refusal).into(),
+            );
+        }
         if let Some(refusal) = crate::state::target_account_role_arn_refusal(
             input.account_id.as_str(),
             Some(input.role_arn.as_str()),

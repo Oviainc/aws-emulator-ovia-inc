@@ -172,13 +172,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         crate::state::materialise_experiment_report(&*self.engine, ctx, &region, &input.id, now)
             .await;
 
+        // The states of the alarms this account's stop conditions name, read out of the
+        // CloudWatch store BEFORE this store's guard is taken, so the settle below judges
+        // the experiment's stop conditions against them with neither store waiting on the
+        // other (see [`crate::state::stop_conditions`]).
+        let breaches = crate::state::stop_conditions::AlarmBreaches::read(&*self.engine);
+
         // The guard is taken, spent and RELEASED inside this block: the log records the
         // settle produced — including anything the settle inside the report generation
         // above materialised — are written after it, so nothing is delivered while the
         // store is locked.
         let (experiment, deliveries) = {
             let mut store = state.lock();
-            let Some(record) = store.settled_experiment_mut(&input.id, now) else {
+            let Some(record) = store.settled_experiment_mut(&input.id, now, &breaches) else {
                 return Err(GetExperimentErrorModeled::ResourceNotFoundException(
                     crate::state::experiment_not_found(&input.id),
                 )

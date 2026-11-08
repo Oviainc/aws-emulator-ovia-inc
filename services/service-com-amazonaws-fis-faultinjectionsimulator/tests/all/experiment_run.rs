@@ -420,10 +420,17 @@ async fn two_experiments_from_one_template_run_independently() {
              got {experiment:?}"
         );
         // And the mode is more than an echo: it decides whether the run carries the action
-        // out at all, which the action's own state is what says.
+        // out at all, which the action's own state is what says — `skipped` for the action
+        // nothing carries out, and the start of the run's own progression for the one it
+        // does.
+        let expected_status = if actions_mode == "skip-all" {
+            "skipped"
+        } else {
+            "pending"
+        };
         assert_eq!(
             experiment["actions"]["fault"]["state"]["status"].as_str(),
-            (actions_mode == "skip-all").then_some("skipped"),
+            Some(expected_status),
             "case {case:?}: expected the action's state to say whether the run carries it \
              out, got {experiment:?}"
         );

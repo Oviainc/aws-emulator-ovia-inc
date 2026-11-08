@@ -197,12 +197,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartExperiment<E
                 Vec::new(),
             );
         };
+        let breaches = crate::state::stop_conditions::AlarmBreaches::read(&*self.engine);
         let mut store = state.lock();
 
         // Settle first: an experiment whose run already elapsed is no longer active, so
         // the quota below is taken against the experiments that are genuinely running
         // and not against ones the clock finished before this call.
-        store.settle_experiments(now);
+        store.settle_experiments(now, &breaches);
 
         let outcome = self.mint_under_guard(&mut store, input, actions_mode, region, now);
 
@@ -303,16 +304,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartExperiment<E
                 crate::state::STORE_UNAVAILABLE,
             ));
         };
-        // One guard for both things the IAM store is READ for here: whether the role's
-        // trust policy lets FIS assume it at all, and which policy documents are in force
-        // on it. Both are taken out of the guard as owned values, so the guard is dropped
-        // before anything is decided from them — the IAM store is not locked while this
-        // handler thinks.
-        let (trust_refusal, role_documents) = {
+        // One guard for both things the IAM store is READ for here: whether the TEMPLATE's
+        // role lets FIS assume it at all, and which policy documents are in force on each
+        // role the actions are performed under ([`acting_roles`] — the template's own role
+        // for a single-account run, and the role each targeted account's configuration
+        // names for a multi-account one). Everything is taken out of the guard as owned
+        // values, so the guard is dropped before anything is decided from them — the IAM
+        // store is not locked while this handler thinks.
+        let acting_roles = crate::state::action_permissions::acting_roles(&template);
+        let (trust_refusal, acting_documents) = {
             let iam = iam.lock();
+            let documents: Vec<(String, Option<Vec<String>>)> = acting_roles
+                .into_iter()
+                .map(|role_arn| {
+                    let documents =
+                        crate::state::action_permissions::role_documents(&role_arn, &iam);
+                    (role_arn, documents)
+                })
+                .collect();
             (
                 crate::state::role_trust_refusal(&template.role_arn, &iam),
-                crate::state::action_permissions::role_documents(&template.role_arn, &iam),
+                documents,
             )
         };
         if let Some(refusal) = trust_refusal {
@@ -335,7 +347,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartExperiment<E
             .into());
         }
 
-        // Whether those documents SHOW the role cannot perform an action's own API calls.
+        // The experiment's own name, minted once every refusal is behind us: the actions
+        // are decided against it as well as against the resources their targets name,
+        // because the FIS-namespaced grants of the inject-api family are scoped to the
+        // EXPERIMENT (see [`crate::state::action_permissions::action_resources`]).
+        let id = store.mint_experiment_id();
+        let arn = crate::state::experiment_arn(region, &id);
+
+        // Whether those documents SHOW a role cannot perform an action's own API calls.
         // Decided after the quotas above, so a start this service refuses outright pays
         // nothing for it, and from the documents already read rather than from the store.
         // It does NOT refuse the start — an experiment AWS starts under an
@@ -346,19 +365,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> StartExperiment<E
         // The question is asked about the actions this run CARRIES OUT and no others: an
         // action the experiment options skip is never run under the role, so nothing the
         // role may not do can be attributed to it. Under `actionsMode: skip-all` that is
-        // every action, so no permission failure is possible at all.
+        // every action, so no permission failure is possible at all. A role the account's
+        // IAM store shows nothing about leaves the run to go ahead, which is why a run is
+        // only failed for a role whose documents were read.
         let plan = crate::state::plan_run(&template, actions_mode);
-        let permission_failure = role_documents.and_then(|documents| {
-            crate::state::action_permissions::permission_failure(
-                &template.role_arn,
-                &plan.carried_out,
-                &template.targets,
-                &documents,
-            )
+        let permission_failure = acting_documents.into_iter().find_map(|(role_arn, documents)| {
+            documents.and_then(|documents| {
+                crate::state::action_permissions::permission_failure(
+                    &role_arn,
+                    &plan.carried_out,
+                    &template.targets,
+                    &arn,
+                    &documents,
+                )
+            })
         });
 
-        let id = store.mint_experiment_id();
-        let arn = crate::state::experiment_arn(region, &id);
         let record = crate::state::ExperimentRecord::from_template(
             id.clone(),
             arn,

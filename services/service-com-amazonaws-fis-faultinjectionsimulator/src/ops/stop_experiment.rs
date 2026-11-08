@@ -186,10 +186,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // record of a run this very call ended until some other operation happened to
         // drain the outbox.
         let (outcome, deliveries) = {
+            let breaches = crate::state::stop_conditions::AlarmBreaches::read(&*self.engine);
             let mut store = state.lock();
             // Settled first, so a stop lands on the status the clock already owed rather
             // than on a stale one.
-            let outcome = match store.settled_experiment_mut(&input.id, now) {
+            let outcome = match store.settled_experiment_mut(&input.id, now, &breaches) {
                 None => Err(StopExperimentError::from(
                     StopExperimentErrorModeled::ResourceNotFoundException(
                         crate::state::experiment_not_found(&input.id),

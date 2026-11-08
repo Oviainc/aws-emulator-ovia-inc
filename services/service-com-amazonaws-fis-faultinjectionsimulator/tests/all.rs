@@ -25,6 +25,8 @@ mod control_plane_rules;
 mod delete_target_account_configuration;
 #[path = "all/execution_role_is_one_lookup.rs"]
 mod execution_role_is_one_lookup;
+#[path = "all/experiment_action_state.rs"]
+mod experiment_action_state;
 // What a started experiment DOES to the resources its targets resolved to: the
 // `aws:ec2:reboot-instances` action carried out on the EC2 store of the same engine, and the
 // progress the action itself then reports.
@@ -92,6 +94,8 @@ mod start_experiment_replay;
 mod start_experiment_token_normalization;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
+#[path = "all/stop_condition_halts_the_run.rs"]
+mod stop_condition_halts_the_run;
 #[path = "all/tagging_refusal_error_shape.rs"]
 mod tagging_refusal_error_shape;
 #[path = "all/tagging_response_envelope.rs"]
@@ -108,6 +112,8 @@ mod target_account_configuration_page_walk;
 mod target_account_configuration_refusal_wording;
 #[path = "all/target_account_configurations.rs"]
 mod target_account_configurations;
+#[path = "all/target_account_id_is_an_account_number.rs"]
+mod target_account_id_is_an_account_number;
 #[path = "all/target_account_role_ownership.rs"]
 mod target_account_role_ownership;
 #[path = "all/template_admissibility_sequence.rs"]

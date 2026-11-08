@@ -61,6 +61,16 @@
 //! resolution. An action the run does not carry out spends none of its `duration`, earns
 //! no failure attributed to it, and reports the modelled `skipped` status.
 //!
+//! A started experiment also carries out its actions ON that run clock: the `startAfter`
+//! graph and the `duration` of each action it carries out are what the run span is computed
+//! from, so each action occupies a span of the run and reports where in it the run is —
+//! `ExperimentAction`'s `state`, `startTime` and `endTime`, materialised by the same settle
+//! from the schedule the start computed ([`action_progress`]). An experiment that is
+//! `running` while one of its stop conditions names a CloudWatch alarm that has gone into
+//! its alarming state is STOPPED by the service itself, with no `StopExperiment` call: the
+//! alarm's state is read out of the account's CloudWatch store in the same engine
+//! ([`stop_conditions`]).
+//!
 //! Two things that run means here, and does NOT:
 //!
 //! * `completed` is the status of a RUN that elapsed, not a claim that an action's effect
@@ -69,10 +79,9 @@
 //!   `aws:fis:inject-api-*` fault making the targeted role's calls to another service fail,
 //!   an instance stopping) happens in THAT service's responses, and this emulator does not
 //!   produce it. Nothing here reports such an effect as having happened: no injected fault
-//!   is announced, and the per-action `state`/`startTime`/`endTime` an experiment could
-//!   carry are left unset rather than filled in for work nothing performed — the one
-//!   exception being the action the run SKIPS, whose `state` is the decision the options
-//!   made and not a claim about work (see `experiment_action` and [`ActionSkip`]).
+//!   is announced, and an action's own `state` says where the RUN is and not that its effect
+//!   was produced — the action the run SKIPS reporting the decision the options made (see
+//!   `experiment_action` and [`ActionSkip`]).
 //! * the time members `startTime` and `endTime` bound the run on the COMPRESSED clock
 //!   ([`RUN_CLOCK_SCALE`]), so the span between them is shorter than the duration the
 //!   actions name — which is reported back verbatim, exactly as the template stored it.
@@ -155,11 +164,14 @@ use crate::ops::types::{
 
 pub mod action_execution;
 pub mod action_permissions;
+pub mod action_progress;
 pub mod experiment_logs;
+pub mod stop_conditions;
 mod catalog;
 mod experiment_reports;
 mod template_validation;
 pub use action_execution::*;
+pub use action_progress::*;
 pub use template_validation::*;
 pub use experiment_reports::*;
 pub use catalog::*;
@@ -612,6 +624,22 @@ pub const RUNNING_REASON: &str = "Experiment is running.";
 /// The `state.reason` an experiment carries when the account's safety lever was engaged
 /// while it was running. Chosen here for the same reason [`STOPPED_BY_REQUEST`] is.
 pub const STOPPED_BY_SAFETY_LEVER: &str = "Stopped by the safety lever";
+
+/// The `state.reason` an experiment carries once one of its STOP CONDITIONS halted it,
+/// followed by the ARN of the alarm that was in its alarming state.
+///
+/// FIS documents no wording for `ExperimentState$reason`, so — like
+/// [`STOPPED_BY_SAFETY_LEVER`] — the text is this emulator's own; what the contract
+/// requires is the terminal status `stopped` and a reason beside it that says which
+/// guardrail ended the run. The alarm comes from the experiment's own stop conditions, so
+/// a client can tell WHICH condition halted it.
+pub const STOPPED_BY_STOP_CONDITION: &str = "Stopped by the stop condition monitoring";
+
+/// The `state.reason` of a run one of its stop conditions halted: see
+/// [`STOPPED_BY_STOP_CONDITION`].
+pub fn stop_condition_reason(alarm_arn: &str) -> String {
+    clipped_reason(format!("{STOPPED_BY_STOP_CONDITION} {alarm_arn}"))
+}
 
 /// The resource segment of a safety lever's ARN
 /// (`arn:aws:fis:<region>:<account>:safety-lever/<id>`).
@@ -1703,6 +1731,9 @@ impl ExperimentRecord {
         // The run has begun, so its first records — the start and what the start resolved —
         // are true as of `now` and are produced here rather than by whoever looks next.
         record.log_run_started(now);
+        // What each action of the run reports before the run begins, from the same plan every
+        // later read advances.
+        record.settle_actions(now);
         record
     }
 
@@ -1850,6 +1881,34 @@ impl ExperimentRecord {
         self.log_event(log_type, at, details);
     }
 
+    /// Materialise everything the clock already owes this experiment at `now`: the
+    /// transition that has fallen due, and the STOP a breached stop condition owes a run
+    /// still going ([`stop_conditions`]).
+    ///
+    /// `breaches` is the alarm states the caller read out of the account's CloudWatch store
+    /// before it took this store's guard. An experiment that is still `running` once its
+    /// owed transitions are materialised, and one of whose stop conditions names an alarm
+    /// that snapshot reports in its alarming state, is STOPPED here: the alarm went into
+    /// that state at an instant of its own and FIS's watch of it was owed from then, so the
+    /// stop was owed at `now` whether or not anybody called. It goes through the same
+    /// `stopping` -> `stopped` span a `StopExperiment` puts an experiment on, under the
+    /// reason that names the condition ([`stop_condition_reason`]), so a caller sees the
+    /// transient status exactly as it would for a requested stop.
+    pub fn settle(&mut self, now: SystemTime, breaches: &stop_conditions::AlarmBreaches) {
+        self.settle_clock(now);
+        // Judged on the SETTLED record: a run whose own end had already fallen due ended
+        // then, before this read saw the alarm, so a breach observed now cannot reach back
+        // and take a terminal status away from it.
+        if self.status == ExperimentStatus::Running {
+            if let Some(alarm_arn) = breaches.breached_alarm(&self.stop_conditions) {
+                self.request_stop_for(now, &stop_condition_reason(alarm_arn));
+            }
+        }
+        // Each action's own state, from the run's plan and the status just settled, so one
+        // read reports the experiment and its actions as of the same instant.
+        self.settle_actions(now);
+    }
+
     /// Materialise the transition the clock already owes at `now`, if it is due.
     ///
     /// This is the one write a REPORTING operation performs, and it only makes a change
@@ -1863,7 +1922,7 @@ impl ExperimentRecord {
     /// The loop is what makes a single read materialise a CHAIN of transitions that all
     /// fell due before `now` — an experiment nobody polled for longer than its whole run
     /// reports the terminal status, not the `running` it passed through.
-    pub fn settle(&mut self, now: SystemTime) {
+    pub fn settle_clock(&mut self, now: SystemTime) {
         while let Some(due) = self.transition_due {
             if now < due {
                 // The experiment's own status is where it was, and its ACTIONS are still
@@ -2527,23 +2586,29 @@ impl ComAmazonawsFisFaultinjectionsimulatorState {
     }
 
     /// The experiment `id` names, with every transition the clock already owes at `now`
-    /// materialised. `None` when the store holds no such experiment.
+    /// materialised, and the stop a breached stop condition owes it
+    /// ([`ExperimentRecord::settle`]). `None` when the store holds no such experiment.
     pub fn settled_experiment_mut(
         &mut self,
         id: &str,
         now: SystemTime,
+        breaches: &stop_conditions::AlarmBreaches,
     ) -> Option<&mut ExperimentRecord> {
         let record = self.experiments.get_mut(id)?;
-        record.settle(now);
+        record.settle(now, breaches);
         Some(record)
     }
 
     /// Every experiment, with each one's owed transition materialised at `now`. This is
     /// what `ListExperiments` reports from, so a listed status agrees with the status
     /// `GetExperiment` reports for the same experiment at the same instant.
-    pub fn settle_experiments(&mut self, now: SystemTime) {
+    pub fn settle_experiments(
+        &mut self,
+        now: SystemTime,
+        breaches: &stop_conditions::AlarmBreaches,
+    ) {
         for record in self.experiments.values_mut() {
-            record.settle(now);
+            record.settle(now, breaches);
         }
     }
 
@@ -2639,7 +2704,10 @@ impl ComAmazonawsFisFaultinjectionsimulatorState {
     /// the experiments of this emulator are one collection and not one per Region.
     pub fn stop_experiments_for_safety_lever(&mut self, now: SystemTime) {
         for record in self.experiments.values_mut() {
-            record.settle(now);
+            // The clock alone: the lever stops every experiment that is still running
+            // whatever its stop conditions say, so the stop this sweep requests is the one
+            // the record ends under.
+            record.settle_clock(now);
             record.request_stop_for(now, STOPPED_BY_SAFETY_LEVER);
         }
     }
@@ -3630,6 +3698,40 @@ pub fn role_arn_refusal(member: &str, role_arn: Option<&str>) -> Option<Validati
 pub const TARGET_ACCOUNT_ROLE_NOT_OWNED: &str = "The roleArn parameter value is not valid. \
      The IAM role must belong to the account specified in the accountId parameter value.";
 
+/// The message FIS refuses an `accountId` that is not written as an AWS account number
+/// with.
+///
+/// `TargetAccountId` is modelled only as a string within `@length(12..48)`,
+/// `pattern ^[\S]+$`, so what an account id IS stays a server-side rule: the refusal names
+/// the parameter and says what to send instead, and carries no value of the request (the
+/// identical text is recorded for different values). See [`target_account_id_refusal`].
+pub const TARGET_ACCOUNT_ID_NOT_VALID: &str =
+    "The accountId parameter value is not valid. Specify a valid accountId.";
+
+/// `None` when `account_id` is written as an AWS account number; otherwise the
+/// `ValidationException` that refuses it.
+///
+/// An AWS account number is a decimal figure, so a `TargetAccountId` that satisfies the
+/// modelled bounds while carrying anything else names no Amazon Web Services account and
+/// is refused with a 400 `ValidationException` before anything is persisted.
+///
+/// The LENGTH of such a figure is not judged here, and does not have to be: the account
+/// field of an IAM role ARN is an account number ([`is_iam_role_arn`], which holds it to
+/// [`ACCOUNT_ID_DIGITS`]), so a figure of any other length is refused by the `roleArn` the
+/// same request offers for it — either because the role belongs to another account, or
+/// because an ARN whose account field is that figure is no role ARN at all. The two rules
+/// together therefore admit exactly the account ids a role can belong to, which is what
+/// keeps the recorded wording of each refusal with the member it is about: a value that is
+/// no figure is the `accountId`'s problem, and a figure no role can belong to is the
+/// `roleArn`'s.
+///
+/// Every member of this service that names the account a configuration is FOR goes through
+/// here (`CreateTargetAccountConfiguration` and `UpdateTargetAccountConfiguration`).
+pub fn target_account_id_refusal(account_id: &str) -> Option<ValidationException> {
+    let digits = !account_id.is_empty() && account_id.bytes().all(|byte| byte.is_ascii_digit());
+    (!digits).then(|| invalid_input(TARGET_ACCOUNT_ID_NOT_VALID))
+}
+
 /// `None` when `role_arn` is a role of the account `account_id` names; otherwise the
 /// `ValidationException` that refuses it.
 ///
@@ -3643,19 +3745,18 @@ pub const TARGET_ACCOUNT_ROLE_NOT_OWNED: &str = "The roleArn parameter value is 
 /// ([`role_arn_refusal`]) is checked with it, so a value that is no ARN at all — which
 /// names no account to compare — is still refused, by the rule that fits it.
 ///
-/// The ownership comparison is only MADE for an `accountId` that is an AWS account number:
-/// `TargetAccountId` is modelled `@length(12..48)`, so a value inside those bounds that is
-/// not an account id names no account for a role to belong to, and refusing THAT value is
-/// the business of the rule on `accountId` itself rather than of this one.
+/// The comparison is made for EVERY `accountId` the request can carry, whatever its
+/// length: the account field of an IAM role ARN is an account number, so an `accountId`
+/// that is not one names no account the role could belong to and is refused here as a role
+/// of another account is.
 pub fn target_account_role_arn_refusal(
     account_id: &str,
     role_arn: Option<&str>,
 ) -> Option<ValidationException> {
     let role_arn = role_arn?;
-    let configured_account = is_account_id(account_id);
     let named_account = ::service_common::arn::parse(role_arn).map(|arn| arn.account);
     if let Some(named_account) = named_account {
-        if configured_account && named_account != account_id {
+        if named_account != account_id {
             return Some(invalid_input(TARGET_ACCOUNT_ROLE_NOT_OWNED));
         }
     }
@@ -4118,127 +4219,6 @@ pub fn run_plan(
 /// run for, up to the ceiling.
 pub fn run_span(modelled: Duration) -> Duration {
     (modelled / RUN_CLOCK_SCALE).clamp(MIN_RUN_SPAN, MAX_RUN_SPAN)
-}
-
-/// The longest path through `actions`, where each action's own length is the `duration` it
-/// was asked for and an action that names none is instantaneous.
-///
-/// Walked ONCE per action, with each action's finish offset memoised and its own span
-/// parsed exactly once up front, so the whole computation costs O(actions + `startAfter`
-/// entries) — linear in the request, never in its square. A `startAfter` cycle, which no
-/// stored template carries because [`actions_cycle_refusal`] refuses one, is broken at the
-/// back edge rather than walked forever, so this terminates on any action map it is handed.
-fn critical_path(actions: &HashMap<String, ExperimentTemplateAction>) -> Duration {
-    // Parsed once per action, outside the walk.
-    let spans: HashMap<&str, Duration> = actions
-        .iter()
-        .map(|(name, action)| (name.as_str(), action_span(action)))
-        .collect();
-    let mut finish: HashMap<&str, Duration> = HashMap::with_capacity(actions.len());
-    let mut longest = Duration::ZERO;
-    for name in actions.keys() {
-        let offset = finish_offset(name.as_str(), actions, &spans, &mut finish);
-        longest = longest.max(offset);
-    }
-    longest
-}
-
-/// When `root` finishes, measured from the start of the run: the latest finish of the
-/// actions its `startAfter` names, plus its own span.
-///
-/// Resolved over an EXPLICIT stack rather than by recursion, so a long chain of
-/// `startAfter` links costs heap entries and not call frames: the walk uses a constant
-/// amount of stack whatever dependency chain the request declares. `finish` memoises the
-/// answer for every action already resolved — across roots, so no action is totalled twice
-/// — and `walking` holds the chain currently being resolved, so a back edge is answered as
-/// "no dependency" instead of being followed. See [`critical_path`] for the cost this
-/// keeps.
-fn finish_offset<'a>(
-    root: &'a str,
-    actions: &'a HashMap<String, ExperimentTemplateAction>,
-    spans: &HashMap<&'a str, Duration>,
-    finish: &mut HashMap<&'a str, Duration>,
-) -> Duration {
-    // Each entry is an action and whether the actions it waits for have been pushed yet:
-    // the SECOND visit of an action is the one that can total it, which is what taking the
-    // latest finish of its dependencies needs.
-    let mut stack: Vec<(&'a str, bool)> = vec![(root, false)];
-    let mut walking: Vec<&'a str> = Vec::new();
-    while let Some((name, dependencies_pushed)) = stack.pop() {
-        if finish.contains_key(name) {
-            continue;
-        }
-        if !dependencies_pushed {
-            if walking.contains(&name) {
-                continue;
-            }
-            walking.push(name);
-            stack.push((name, true));
-            for earlier in waits_for(name, actions) {
-                stack.push((earlier, false));
-            }
-            continue;
-        }
-        let mut start = Duration::ZERO;
-        for earlier in waits_for(name, actions) {
-            // An action still unresolved here is one the walk broke a back edge at, which
-            // contributes nothing.
-            start = start.max(finish.get(earlier).copied().unwrap_or(Duration::ZERO));
-        }
-        // SATURATING: a template may name a `duration` of its own choosing for any action
-        // other than `aws:fis:wait` (whose range `actions_refusal` checks), so a chain of
-        // them can add up past what a `Duration` holds. The sum is capped there rather
-        // than overflowing — a run that long is clamped to [`MAX_RUN_SPAN`] either way.
-        let total = start.saturating_add(spans.get(name).copied().unwrap_or(Duration::ZERO));
-        finish.insert(name, total);
-        if walking.last() == Some(&name) {
-            walking.pop();
-        }
-    }
-    finish.get(root).copied().unwrap_or(Duration::ZERO)
-}
-
-/// The actions `name` waits for: the entries of its `startAfter` the action map holds.
-///
-/// `startAfter` names an action the template declares (`actions_refusal`); a name the map
-/// does not hold contributes nothing rather than a guess.
-fn waits_for<'a>(
-    name: &str,
-    actions: &'a HashMap<String, ExperimentTemplateAction>,
-) -> impl Iterator<Item = &'a str> {
-    actions
-        .get(name)
-        .into_iter()
-        .flat_map(|action| action.start_after.iter().flatten())
-        .filter_map(|earlier| {
-            actions
-                .get_key_value(earlier.as_str())
-                .map(|(key, _)| key.as_str())
-        })
-}
-
-/// How long one action takes: the span its `duration` parameter names, and nothing at all
-/// for an action that carries none.
-///
-/// SOURCE: the AWS FIS actions reference, where `duration` is "the duration of the action"
-/// (in ISO 8601 format) for every built-in action that takes it — `aws:fis:wait`, the
-/// `aws:fis:inject-api-*` family, `aws:ebs:pause-volume-io`,
-/// `aws:network:disrupt-connectivity`, … — so the parameter is read by its documented
-/// meaning rather than for one action id. An action whose effect is a single API call
-/// (`aws:ec2:reboot-instances`) takes no `duration` and so names no span; a parameter that
-/// is some other span (`aws:ec2:stop-instances`' `startInstancesAfterDuration`) is not
-/// this one and is not read as it.
-///
-/// A value that is not an ISO 8601 duration contributes nothing rather than a made-up
-/// span: [`wait_duration`]'s own 1..720-minute range is NOT applied here, because that is
-/// the range documented for `aws:fis:wait` and each other action publishes its own.
-fn action_span(action: &ExperimentTemplateAction) -> Duration {
-    action
-        .parameters
-        .as_ref()
-        .and_then(|parameters| parameters.get(DURATION_PARAMETER))
-        .and_then(|duration| iso8601_span(duration))
-        .unwrap_or(Duration::ZERO)
 }
 
 /// The fixed span the ISO 8601 duration `value` names, or `None` when it names none —
@@ -4706,17 +4686,16 @@ fn experiment_target(target: &ExperimentTemplateTarget) -> ExperimentTarget {
 /// The experiment's copy of one of the template's actions, with the `state` the run's plan
 /// gives it: `skip` is `Some` exactly for an action the run does NOT carry out.
 ///
-/// `startTime` and `endTime` are left unset on purpose, and so is `state` for an action the
-/// run carries out: they report the progress of ONE action, and what this emulator models
-/// is the progress of the EXPERIMENT (its `ExperimentState` and the run span the actions it
-/// carries out add up to), not the effect each action has on another service — so no
-/// per-action status is claimed for work this emulator did not carry out. Reporting them is
-/// the business of whatever models those effects.
+/// For an action the run DOES carry out, the `state`, `startTime` and `endTime` are left
+/// for the settle to materialise from the schedule the run computed
+/// ([`action_progress::settle_actions`], called by the start before it answers), so one
+/// action's progress and the experiment's own are always the same reading of one instant.
 ///
 /// A SKIPPED action is the one action whose state is known without any work having been
 /// done: the experiment options decided it would not be carried out, which is what the
-/// modelled `skipped` status says ([`ActionSkip::to_state`]). Its `startTime` and `endTime`
-/// stay unset, because it never ran.
+/// modelled `skipped` status says ([`ActionSkip::to_state`]). It is in no schedule, so
+/// nothing overwrites that state, and its `startTime` and `endTime` stay unset because it
+/// never ran.
 fn experiment_action(
     action: &ExperimentTemplateAction,
     skip: Option<&ActionSkip>,

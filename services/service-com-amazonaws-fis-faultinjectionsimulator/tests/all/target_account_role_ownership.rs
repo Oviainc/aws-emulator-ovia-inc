@@ -401,26 +401,33 @@ async fn an_update_takes_only_a_role_of_the_account_the_configuration_names() {
     }
 }
 
-/// RULE (the complement): the ownership comparison is made against an `accountId` that IS
-/// an account number. `TargetAccountId` is modelled `@length(12..48)`, so a value inside
-/// those bounds that is no account id names no account for a role to belong to — refusing
-/// THAT value is the business of the rule on `accountId` itself — and such a request is
-/// decided by the ARN form alone.
+/// RULE (the other half of the agreement): a configuration names an Amazon Web Services
+/// ACCOUNT, so an `accountId` that is not written as an account number configures nothing.
+/// `TargetAccountId` is modelled only `@length(12..48)`, `pattern ^[\S]+$`, so a value
+/// inside those bounds that is no account number is refused server-side: one carrying
+/// anything but decimal digits is refused naming `accountId`, and a figure of any other
+/// length names no account the role offered for it could belong to, so the ownership rule
+/// refuses it. Either way HTTP 400 / `ValidationException`, and nothing is persisted.
 #[tokio::test]
-async fn an_account_id_that_is_no_account_number_is_not_compared_against() {
+async fn an_account_id_that_is_no_account_number_configures_nothing() {
     let router = emulator();
     let template_id = template(&router, "not-an-account").await;
 
-    // The rows differ along the shape of the `accountId`: an account id with extra digits,
-    // a non-numeric value, and a value at `TargetAccountId`'s published ceiling — each
-    // offered a well-formed role ARN of a DIFFERENT account, which the ownership rule
-    // cannot be applied to.
-    let rows: [(&str, String); 3] = [
-        ("thirteen-digits", "1111222233334".to_string()),
-        ("not-numeric-at-all", "an-account-alias".to_string()),
-        ("at-the-published-ceiling", "9".repeat(48)),
+    // The rows differ along the shape of the `accountId` — a figure with extra digits, a
+    // figure at `TargetAccountId`'s published ceiling, a value that is no figure at all,
+    // and digits broken by separators — each offered a well-formed role ARN of an account
+    // that EXISTS. The member each refusal names is the one the value is wrong about.
+    let rows: [(&str, String, &str); 4] = [
+        ("thirteen-digits", "1111222233334".to_string(), "roleArn"),
+        ("at-the-published-ceiling", "9".repeat(48), "roleArn"),
+        ("not-numeric-at-all", "an-account-alias".to_string(), "accountId"),
+        (
+            "digits-broken-by-separators",
+            "1111-2222-3333".to_string(),
+            "accountId",
+        ),
     ];
-    for (case, account_id) in rows {
+    for (case, account_id, member) in rows {
         let role_arn = format!("arn:aws:iam::{EMULATOR_ACCOUNT}:role/fis-unowned");
         let answer = create_configuration(
             &router,
@@ -430,45 +437,29 @@ async fn an_account_id_that_is_no_account_number_is_not_compared_against() {
         )
         .await;
         assert_eq!(
-            answer.status, 200,
-            "case {case:?}: expected the ARN form alone to decide the request, \
+            answer.status, 400,
+            "case {case:?}: expected HTTP 400 for an accountId that is no account number, \
              got {} with {:?}",
             answer.status, answer.body
         );
         assert_eq!(
-            answer.role_arn(),
-            role_arn,
-            "case {case:?}: expected the create to report the roleArn it carried, got {:?}",
-            answer.body
-        );
-
-        // And the ARN form still decides it: a value that is no ARN at all is refused by
-        // the rule that fits it, not by the ownership one.
-        let malformed = create_configuration(
-            &router,
-            &template_id,
-            &account_id,
-            create_body(
-                "this-is-not-a-valid-iam-role-arn-000000",
-                &format!("token-unowned-malformed-{case}"),
-            ),
-        )
-        .await;
-        assert_eq!(
-            malformed.status, 400,
-            "case {case:?}: expected HTTP 400 for a value that is no ARN, got {} with {:?}",
-            malformed.status, malformed.body
-        );
-        assert_eq!(
-            malformed.error_code(),
+            answer.error_code(),
             "ValidationException",
             "case {case:?}: expected ValidationException, got {:?}",
-            malformed.body
+            answer.body
         );
         assert!(
-            malformed.message().contains("roleArn"),
-            "case {case:?}: expected the refusal to name the member, got {:?}",
-            malformed.message()
+            answer.message().contains(member),
+            "case {case:?}: expected the refusal to name {member:?}, got {:?}",
+            answer.message()
+        );
+
+        // Nothing was persisted under the name the refused create named.
+        let fetched = get_configuration(&router, &template_id, &account_id).await;
+        assert_eq!(
+            fetched.status, 404,
+            "case {case:?}: a refused create must persist nothing, got {} with {:?}",
+            fetched.status, fetched.body
         );
     }
 }

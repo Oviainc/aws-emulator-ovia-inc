@@ -238,8 +238,9 @@ struct Row {
 /// their `accountId` order, so the order a page reports cannot be the insertion order by
 /// accident.
 ///
-/// A `roleArn` whose account segment differs from a twelve-digit `accountId` is refused by
-/// this service, so every row named by an account NUMBER names a role in that same account.
+/// A `roleArn` whose account segment differs from the `accountId` is refused by this
+/// service, and so is an `accountId` that is no account number, so every row names an
+/// account number and a role in that same account.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -255,9 +256,9 @@ fn rows() -> Vec<Row> {
             description: None,
         },
         Row {
-            case: "account-id-at-the-ceiling-description-at-the-ceiling",
-            account_id: account_id_of(9, ACCOUNT_ID_CEILING),
-            role_arn: "arn:aws:iam::000000000009:role/fis".to_string(),
+            case: "description-at-the-ceiling",
+            account_id: "999999999999".to_string(),
+            role_arn: "arn:aws:iam::999999999999:role/fis".to_string(),
             description: Some("d".repeat(DESCRIPTION_CEILING)),
         },
         Row {
@@ -279,16 +280,16 @@ fn rows() -> Vec<Row> {
             description: Some("an account reached through a role with a path".to_string()),
         },
         Row {
-            case: "account-id-one-under-the-ceiling",
-            account_id: account_id_of(2, ACCOUNT_ID_CEILING - 1),
+            case: "account-id-with-leading-zeros",
+            account_id: account_id_of(2, ACCOUNT_ID_FLOOR),
             role_arn: "arn:aws:iam::000000000002:role/FisPageWalk".to_string(),
-            description: Some("the account one under the published ceiling".to_string()),
+            description: Some("the account whose id carries leading zeros".to_string()),
         },
         Row {
-            case: "account-id-one-over-the-floor",
-            account_id: account_id_of(3, ACCOUNT_ID_FLOOR + 1),
-            role_arn: "arn:aws:iam::000000000003:role/fis-page-walk".to_string(),
-            description: Some("an account id one character over the published floor".to_string()),
+            case: "account-id-of-one-repeated-figure",
+            account_id: "777777777777".to_string(),
+            role_arn: "arn:aws:iam::777777777777:role/fis-page-walk".to_string(),
+            description: Some("an account id written as one repeated figure".to_string()),
         },
     ]
 }

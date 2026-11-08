@@ -1075,9 +1075,21 @@ async fn an_action_the_experiment_options_skip_earns_no_privilege_failure() {
             .as_str()
             .unwrap_or_default()
             .to_string();
+        // The action the options SKIP reports the modelled `skipped` status, which is the
+        // decision those options made. An action the run CARRIES OUT reports where the run
+        // is in its own span — at the start, the beginning of it — unless the start already
+        // showed a failure the run cannot get past, in which case nothing is carried out and
+        // no progress is claimed for it.
+        let expected_status = if must_skip {
+            Some("skipped")
+        } else if must_fail {
+            None
+        } else {
+            Some("pending")
+        };
         assert_eq!(
             started["experiment"]["actions"]["underTest"]["state"]["status"].as_str(),
-            must_skip.then_some("skipped"),
+            expected_status,
             "case {case:?}: expected the action's state at the start to say whether the run \
              carries it out, got {started}"
         );
@@ -1118,9 +1130,19 @@ async fn an_action_the_experiment_options_skip_earns_no_privilege_failure() {
                 "case {case:?}: a run that completed reports no error, got {state}"
             );
         }
+        // At the end of the run: the skipped action still reports the decision the options
+        // made, the action of a run that never got going claims no progress, and the one a
+        // run carried out reports that it was completed.
+        let expected_final = if must_skip {
+            Some("skipped")
+        } else if must_fail {
+            None
+        } else {
+            Some("completed")
+        };
         assert_eq!(
             experiment["actions"]["underTest"]["state"]["status"].as_str(),
-            must_skip.then_some("skipped"),
+            expected_final,
             "case {case:?}: expected the action's state to survive the run, got {experiment}"
         );
     }

@@ -990,7 +990,11 @@ fn an_experiment_runs_for_its_actions_durations_and_then_ends_at_the_status_they
             (span + Duration::from_secs(3_600), expected_terminal),
         ] {
             let mut settled = record.clone();
-            settled.settle(started + offset);
+            // No alarm is breached, so what the record reports is what the clock owed it.
+            settled.settle(
+                started + offset,
+                &service_com_amazonaws_fis_faultinjectionsimulator::state::stop_conditions::AlarmBreaches::none(),
+            );
             let reported = settled.to_state().status.unwrap_or_default();
             assert_eq!(
                 reported, expected,
@@ -1033,7 +1037,10 @@ fn an_experiment_runs_for_its_actions_durations_and_then_ends_at_the_status_they
             started,
             Some(failure.clone()),
         );
-        denied.settle(started + TRANSITION_DELAY + TRANSITION_DELAY);
+        denied.settle(
+            started + TRANSITION_DELAY + TRANSITION_DELAY,
+            &service_com_amazonaws_fis_faultinjectionsimulator::state::stop_conditions::AlarmBreaches::none(),
+        );
         let state = denied.to_state();
         assert_eq!(
             state.status.as_deref(),

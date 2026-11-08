@@ -205,18 +205,11 @@ fn create_body(account_id: &str, client_token: Option<&str>) -> Value {
     Value::Object(body)
 }
 
-/// A role of `account_id` wherever that value is an account NUMBER; for a wider
-/// `TargetAccountId` no role can belong to it, so the ownership rule does not apply and
-/// this emulator's own account carries the role.
+/// A role of `account_id`: a configuration's two members have to agree about which
+/// account the role belongs to, which is the rule `target_account_role_ownership.rs`
+/// asserts.
 fn role_arn(account_id: &str) -> String {
-    if account_id.len() == TARGET_ACCOUNT_ID_FLOOR && account_id.bytes().all(|b| b.is_ascii_digit())
-    {
-        return format!("arn:aws:iam::{account_id}:role/fis-wording-target");
-    }
-    format!(
-        "arn:aws:iam::{}:role/fis-wording-target",
-        engine::emulator_account_id()
-    )
+    format!("arn:aws:iam::{account_id}:role/fis-wording-target")
 }
 
 async fn create_configuration(
@@ -390,30 +383,29 @@ async fn a_duplicate_configuration_conflict_names_the_template_and_the_account()
     let first_template = multi_account_template(&router, "conflict-first").await;
     let second_template = multi_account_template(&router, "conflict-second").await;
 
-    // The rows differ along the template the pair names, the width of the account id
-    // within `TargetAccountId`'s published `@length(12..48)` (its floor, a value between
-    // the bounds, and its ceiling), and whether the second create carries a client token
-    // the store has never seen — all of which the conflict message either interpolates or
-    // must not vary with.
-    let wide_account = format!("5454545454{}", "5".repeat(20 - 10));
-    let ceiling_account = format!("5555555555{}", "5".repeat(TARGET_ACCOUNT_ID_CEILING - 10));
+    // The rows differ along the template the pair names, the digits of the account id the
+    // configuration is named by (an alternating figure, one repeated figure, leading
+    // zeros), and whether the second create carries a client token the store has never
+    // seen — all of which the conflict message either interpolates or must not vary with.
+    let repeated_account = "5".repeat(TARGET_ACCOUNT_ID_FLOOR);
+    let leading_zero_account = format!("00{}", "5".repeat(TARGET_ACCOUNT_ID_FLOOR - 2));
     let cases: [(&str, &str, &str, Option<&str>); 4] = [
         (
-            "floor-width-account",
+            "alternating-figure-account",
             &first_template,
             "505050505050",
             None,
         ),
         (
-            "account-between-the-bounds",
+            "account-of-one-repeated-figure",
             &first_template,
-            &wide_account,
+            &repeated_account,
             Some("conflict-fresh-token"),
         ),
         (
-            "account-id-at-the-ceiling",
+            "account-id-with-leading-zeros",
             &second_template,
-            &ceiling_account,
+            &leading_zero_account,
             None,
         ),
         (

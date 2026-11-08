@@ -11,8 +11,15 @@
 //!
 //! # What is carried out, and what is reported
 //!
-//! An action of the run's plan ([`super::RunActions::carried_out`]) falls into one of three
-//! classes, and only the first two are CARRIED OUT here:
+//! Every action of the run's plan ([`super::RunActions::carried_out`]) gets a RUN here, so
+//! every one of them reports its own progress — `ExperimentAction$state`, `startTime` and
+//! `endTime`, which is what a client reads `experiment.actions.<name>.state.status` for.
+//! What that progress says is where the RUN is in the action's own span, which this
+//! emulator knows because those spans are what the run's own window is computed from; it is
+//! not a claim about the action's effect on another service.
+//!
+//! The EFFECT is the separate question, and only two classes of action have one this
+//! emulator can carry out:
 //!
 //! * the action FIS performs by itself — `aws:fis:wait` "waits for the specified duration",
 //!   and the duration is the emulator's own run clock, so the wait genuinely elapses
@@ -20,17 +27,15 @@
 //! * an action whose whole documented effect is an API call this emulator can perform on
 //!   the service that OWNS the targeted resource: `aws:ec2:reboot-instances`, "reboot the
 //!   specified EC2 instances", which is carried out on the EC2 store of this same engine
-//!   ([`ActionEffect::RebootInstances`]);
-//! * every other published action, whose effect is on a resource or a control this emulator
-//!   does not hold. Nothing is carried out for one, so nothing is REPORTED for it either:
-//!   it gets no action run at all and its `ExperimentAction$state` stays absent, exactly as
-//!   it was before this module existed. A status claimed for work nothing did would be the
-//!   one thing worse than no status.
+//!   ([`ActionEffect::RebootInstances`]).
 //!
-//! An action that IS carried out reports its own progress — `pending` until it starts,
-//! `running` while it is being carried out, `completed` once it is done, with the
-//! `startTime` and `endTime` FIS reports beside them — because that progress is now backed
-//! by work this emulator really performed.
+//! Every other published action acts on a resource or a control this emulator does not
+//! hold, so NOTHING is carried out for one ([`ActionEffect`] is `None` and no effect is ever
+//! drained for it) and nothing here announces one: no injected fault, no instance stopped.
+//! Its progress is still reported, because the experiment's own status already reports that
+//! the run reached it — a run is `completed` once its actions' spans have elapsed — and AWS
+//! reports `state` for every action of an experiment, so withholding it would hide a member
+//! every client reads rather than withhold a claim.
 //!
 //! # The clock, not the call
 //!
@@ -190,8 +195,10 @@ impl ActionRun {
     }
 }
 
-/// The runs the experiment's plan gives the actions it CARRIES OUT, keyed by action name —
-/// and only those of them this emulator carries something out for (see the module docs).
+/// The runs the experiment's plan gives the actions it CARRIES OUT, keyed by action name.
+///
+/// One run per action of the plan: every one of them reports its own progress, and the
+/// `effect` an action has only where this emulator can carry one out (see the module docs).
 ///
 /// `run_started_at` is when the experiment becomes `running` and `run_span` is how long it
 /// is running for, both as the start computed them, so the actions are laid out across
@@ -199,6 +206,9 @@ impl ActionRun {
 /// ([`super::run_plan`] uses the same one) are compressed into that span, which keeps their
 /// ORDER (an action that waits for another starts no earlier than it finishes) and makes the
 /// last action end when the run does.
+///
+/// Empty for a run that ends `failed` without getting going: the caller passes no actions
+/// for one, because nothing is carried out and so nothing is claimed.
 ///
 /// Empty for a run that ends `failed` without getting going: the caller passes no actions
 /// for one, because nothing is carried out and so nothing is claimed.
@@ -229,10 +239,6 @@ pub fn plan_action_runs(
         .filter_map(|(name, (starts, ends))| {
             let action = carried_out.get(name)?;
             let effect = action_effect(action, targets, resolved);
-            // An action nothing is carried out for gets no run: see the module docs.
-            if effect.is_none() && action.action_id.as_deref() != Some(ACTION_ID_FIS_WAIT) {
-                return None;
-            }
             let start_due = run_started_at
                 .checked_add(compress(starts, modelled_span, run_span))
                 .unwrap_or(run_started_at);
@@ -504,9 +510,13 @@ pub fn materialise_action_effects<Eng: Send + Sync + 'static>(engine: &Eng, now:
     let Some(state) = super::service_state(engine) else {
         return;
     };
+    // The alarm states the experiments' stop conditions are judged against, read out of the
+    // CloudWatch store before this store's guard is taken, exactly as every other operation
+    // that settles reads them ([`super::stop_conditions`]).
+    let breaches = super::stop_conditions::AlarmBreaches::read(engine);
     let effects = {
         let mut store = state.lock();
-        store.settle_experiments(now);
+        store.settle_experiments(now, &breaches);
         store.take_pending_action_effects()
     };
     carry_out_action_effects(engine, &effects, now);

@@ -293,23 +293,13 @@ fn account_id_of(len: usize) -> String {
 /// expected of it.
 type UpdateBoundRow = (String, &'static str, Option<String>, Option<String>, u16);
 
-/// A `roleArn` the account `account_id` may be configured with: a role of THAT account
-/// when `account_id` is an account number, and a role of this emulator's own account when
-/// it is not.
+/// A `roleArn` the account `account_id` may be configured with: a role of THAT account.
 ///
 /// The account-ownership rule compares the ARN's account field with the `accountId` being
-/// configured, and an `accountId` that is no account number at all (a 48-character value,
-/// say, which `TargetAccountId`'s `@length(12..48)` still admits) names no account for a
-/// role to belong to — so such a row carries a well-formed role ARN of any account, and the
-/// bound it is really about is the one it is testing.
+/// configured, so every row's role is a role of its own account and what decides the row is
+/// the member it is really about.
 fn owned_role_arn(account_id: &str, role_name: &str) -> String {
-    let account = if account_id.len() == 12 && account_id.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        account_id
-    } else {
-        "000000000000"
-    };
-    format!("arn:aws:iam::{account}:role/{role_name}")
+    format!("arn:aws:iam::{account_id}:role/{role_name}")
 }
 
 /// An IAM role ARN of exactly `len` characters, in the account `account_id`, padded in the
@@ -345,12 +335,13 @@ struct Row {
 
 /// The rows the round-trip rule is asserted over.
 ///
-/// They differ along everything that rule generalises over: the length and shape of the
-/// `accountId` naming the configuration (both published bounds of `TargetAccountId`),
-/// the length and shape of the `roleArn` (the shortest WELL-FORMED ARN, a role with a
-/// path, a role at the published ceiling), whether a `description` is absent, empty, plain
-/// text, non-ASCII, or at `TargetAccountConfigurationDescription`'s published ceiling,
-/// and whether the request carries a `clientToken` at all.
+/// They differ along everything that rule generalises over: the `accountId` naming the
+/// configuration (every value an account number can take under `TargetAccountId`'s
+/// published floor, which is the length of an account number), the length and shape of the
+/// `roleArn` (the shortest WELL-FORMED ARN, a role with a path, another partition, a role
+/// at the published ceiling), whether a `description` is absent, empty, plain text,
+/// non-ASCII, or at `TargetAccountConfigurationDescription`'s published ceiling, and
+/// whether the request carries a `clientToken` at all.
 fn rows() -> Vec<Row> {
     vec![
         Row {
@@ -385,9 +376,9 @@ fn rows() -> Vec<Row> {
             client_token: Some("token-非ascii".to_string()),
         },
         Row {
-            case: "description-at-the-ceiling-account-id-at-the-ceiling",
-            account_id: account_id_of(ACCOUNT_ID_CEILING),
-            role_arn: role_arn_of("000000000000", ROLE_ARN_CEILING),
+            case: "description-at-the-ceiling-role-arn-at-the-ceiling",
+            account_id: "555555555555".to_string(),
+            role_arn: role_arn_of("555555555555", ROLE_ARN_CEILING),
             description: Some("d".repeat(DESCRIPTION_CEILING)),
             client_token: Some("token-ceiling".to_string()),
         },
@@ -799,11 +790,13 @@ async fn a_request_outside_a_modelled_bound_is_refused() {
             None,
             200,
         ),
+        // Inside `TargetAccountId`'s published length, and still no Amazon Web Services
+        // account number: the length bound admits it and the server does not.
         (
             format!("accountId at the ceiling ({ACCOUNT_ID_CEILING})"),
             account_id_of(ACCOUNT_ID_CEILING),
             None,
-            200,
+            400,
         ),
         (
             "accountId below the floor".to_string(),
@@ -1226,7 +1219,9 @@ async fn an_update_outside_a_modelled_bound_is_refused_and_persists_nothing() {
     // before the lookup, so it never reaches one.
     for (case, len, expected) in [
         ("accountId at the floor", ACCOUNT_ID_FLOOR, 200),
-        ("accountId at the ceiling", ACCOUNT_ID_CEILING, 200),
+        // A value at the published ceiling is inside the modelled length and is still no
+        // account number, so it names no configuration and is refused before the lookup.
+        ("accountId at the ceiling", ACCOUNT_ID_CEILING, 400),
         ("accountId below the floor", ACCOUNT_ID_FLOOR - 1, 400),
         ("accountId above the ceiling", ACCOUNT_ID_CEILING + 1, 400),
     ] {

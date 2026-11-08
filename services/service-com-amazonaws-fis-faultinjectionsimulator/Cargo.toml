@@ -29,6 +29,10 @@ service-common = { path = "../common" }
 # The IAM store StartExperiment resolves an experiment template's `roleArn` against, to
 # check the role's trust policy grants fis.amazonaws.com before an experiment is created.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The CloudWatch store an experiment's `aws:cloudwatch:alarm` stop conditions are judged
+# against while the experiment runs: the alarm states `PutMetricAlarm` / `SetAlarmState`
+# wrote are what the service halts a run on (`state::stop_conditions`).
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 # The EC2 store an experiment's EC2 actions are CARRIED OUT on: the built-in action
 # `aws:ec2:reboot-instances` reboots the instances its target resolved to, which is a write
 # to the very store the EC2 handlers read (see `src/state/action_execution.rs`). Reached

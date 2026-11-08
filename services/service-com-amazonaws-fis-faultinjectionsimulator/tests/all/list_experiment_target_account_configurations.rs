@@ -235,9 +235,9 @@ struct Row {
 
 /// The configurations the list rule is asserted over.
 ///
-/// They differ along everything that rule generalises over: the length of the `accountId`
-/// the configuration is named by (both published bounds of `TargetAccountId` and values
-/// between them), the shape of the `roleArn` (a plain role, a role with a path, a role in
+/// They differ along everything that rule generalises over: the digits of the `accountId`
+/// the configuration is named by (leading zeros, a repeated figure, an arbitrary one), the
+/// shape of the `roleArn` (a plain role, a role with a path, a role in
 /// another partition), and whether `description` is absent, empty, plain text, non-ASCII
 /// or at `TargetAccountConfigurationDescription`'s published ceiling. Their account ids
 /// are deliberately not created in sorted order, so the order a page reports cannot be
@@ -257,9 +257,9 @@ fn rows() -> Vec<Row> {
             description: None,
         },
         Row {
-            case: "account-id-at-the-ceiling-description-at-the-ceiling",
-            account_id: account_id_of(9, ACCOUNT_ID_CEILING),
-            role_arn: "arn:aws:iam::000000000009:role/fis".to_string(),
+            case: "description-at-the-ceiling",
+            account_id: "999999999999".to_string(),
+            role_arn: "arn:aws:iam::999999999999:role/fis".to_string(),
             description: Some("d".repeat(DESCRIPTION_CEILING)),
         },
         Row {
@@ -281,10 +281,10 @@ fn rows() -> Vec<Row> {
             description: Some("an account reached through a role with a path".to_string()),
         },
         Row {
-            case: "longest-account-id-digits-only",
-            account_id: account_id_of(2, ACCOUNT_ID_CEILING - 1),
+            case: "account-id-with-leading-zeros",
+            account_id: account_id_of(2, ACCOUNT_ID_FLOOR),
             role_arn: "arn:aws:iam::000000000002:role/FisTargetAccount".to_string(),
-            description: Some("the account one under the published ceiling".to_string()),
+            description: Some("the account whose id carries leading zeros".to_string()),
         },
     ]
 }
@@ -530,16 +530,15 @@ async fn pagination_enumerates_every_configuration_of_the_experiment_exactly_onc
     let mut expected = BTreeSet::new();
     for index in 0..PAST_THE_LARGEST_PAGE {
         let seed = u32::try_from(index).expect("the index fits a u32");
-        // The account id lengths cycle over the published range, so pagination is asserted
-        // over keys of differing length rather than one fixed width.
-        let len = ACCOUNT_ID_FLOOR + (index % (ACCOUNT_ID_CEILING - ACCOUNT_ID_FLOOR + 1));
-        let account_id = account_id_of(seed, len);
+        // Every key is an account number, which is what a configuration can be named by,
+        // so pagination is asserted over the account ids a client can actually configure.
+        let account_id = account_id_of(seed, ACCOUNT_ID_FLOOR);
         create_configuration(
             &router,
             &template_id,
             "pagination",
             &account_id,
-            &format!("arn:aws:iam::{seed:012}:role/fis-pagination"),
+            &format!("arn:aws:iam::{account_id}:role/fis-pagination"),
             (index % 3 == 0).then_some("configured for pagination"),
         )
         .await;

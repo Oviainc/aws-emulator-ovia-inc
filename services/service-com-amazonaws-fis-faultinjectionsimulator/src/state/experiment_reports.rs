@@ -258,8 +258,9 @@ pub async fn materialise_experiment_report<Eng: Send + Sync + 'static>(
         return;
     };
     let generation = {
+        let breaches = stop_conditions::AlarmBreaches::read(engine);
         let mut store = state.lock();
-        let Some(record) = store.settled_experiment_mut(id, now) else {
+        let Some(record) = store.settled_experiment_mut(id, now, &breaches) else {
             return;
         };
         match record.claim_report_generation(now) {
@@ -295,8 +296,9 @@ pub async fn materialise_experiment_reports<Eng: Send + Sync + 'static>(
         return;
     };
     let generations = {
+        let breaches = stop_conditions::AlarmBreaches::read(engine);
         let mut store = state.lock();
-        store.settle_experiments(now);
+        store.settle_experiments(now, &breaches);
         store.claim_report_generations(now)
     };
     for (id, generation) in generations {

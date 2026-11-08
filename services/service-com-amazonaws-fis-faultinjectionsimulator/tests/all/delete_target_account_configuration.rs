@@ -335,9 +335,9 @@ struct Row {
 
 /// The rows the delete rule is asserted over.
 ///
-/// They differ along everything that rule generalises over: the length and shape of the
-/// `accountId` naming the configuration being removed (both published bounds of
-/// `TargetAccountId`), the length and shape of the stored `roleArn` (the shortest
+/// They differ along everything that rule generalises over: the digits of the `accountId`
+/// naming the configuration being removed, the length and shape of the stored `roleArn`
+/// (the shortest
 /// well-formed ARN, a role with a path, a role at the published ceiling), whether the
 /// stored `description`
 /// is absent, empty, non-ASCII or at `TargetAccountConfigurationDescription`'s published
@@ -352,12 +352,9 @@ fn rows() -> Vec<Row> {
             client_token: None,
         },
         Row {
-            case: "account id at the published ceiling, role at the published ceiling",
-            account_id: account_id_of(ACCOUNT_ID_CEILING),
-            // An `accountId` at `TargetAccountId`'s ceiling is no account NUMBER, so it
-            // names no account for a role to belong to: any well-formed role ARN is
-            // admissible for it.
-            role_arn: role_arn_of("000000000000", ROLE_ARN_CEILING),
+            case: "role at the published ceiling",
+            account_id: "999999999999".to_string(),
+            role_arn: role_arn_of("999999999999", ROLE_ARN_CEILING),
             description: Some("the longest name this service accepts".to_string()),
             client_token: Some("token-ceiling".to_string()),
         },

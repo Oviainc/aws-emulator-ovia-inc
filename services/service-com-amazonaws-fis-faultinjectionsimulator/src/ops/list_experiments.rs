@@ -187,8 +187,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The guard is taken, spent and RELEASED inside this block, so the records the
         // settle produced are written after it rather than while the store is locked.
         let (page, deliveries) = {
+            let breaches = crate::state::stop_conditions::AlarmBreaches::read(&*self.engine);
             let mut store = state.lock();
-            store.settle_experiments(now);
+            store.settle_experiments(now, &breaches);
 
             // The page walk itself is the shared one over a collection keyed by minted
             // ids, so this operation and `ListExperimentTemplates` cut their pages and

@@ -47,8 +47,13 @@ pub struct ActionCatalogEntry {
     /// The target resource types the action supports, empty for an action that needs no
     /// target.
     pub targets: &'static [ActionCatalogTarget],
-    /// The IAM actions the experiment's execution role has to be allowed to perform for
-    /// this action to run, empty for an action that calls no other service's API.
+    /// The API calls the experiment's execution role has to be allowed to perform for this
+    /// action to run, empty for an action that calls no other service's API.
+    ///
+    /// One entry per CALL the action makes, and each entry holds the documented GRANTS that
+    /// authorize that call: a call is allowed when the role may perform ANY of them, because
+    /// a reference that documents two spellings of one grant documents two ways of allowing
+    /// the same action, not two requirements.
     ///
     /// NOT part of the `Action` shape — `GetAction` reports no permissions — but part of
     /// what running the action MEANS: FIS runs it under the template's `roleArn`, so an
@@ -56,7 +61,7 @@ pub struct ActionCatalogEntry {
     /// [`action_permissions`]). The primary API call of each action, as the FIS actions
     /// reference states it for that action; an action this table records no permission for
     /// is never failed for privileges.
-    pub permissions: &'static [&'static str],
+    pub permissions: &'static [&'static [&'static str]],
 }
 
 impl ActionCatalogEntry {
@@ -136,6 +141,35 @@ impl ActionCatalogEntry {
 /// request's condition context (see [`action_permissions`]), so a policy written the way
 /// the reference writes it grants the action it names and only that action.
 pub const EC2_INJECT_API_ERROR: &str = "ec2:InjectApiError";
+
+/// The FIS-NAMESPACED grant for `aws:fis:inject-api-internal-error`: the AWS Service
+/// Authorization Reference publishes one IAM action per fault the family injects
+/// (`fis:InjectApiInternalError`, `fis:InjectApiThrottleError`,
+/// `fis:InjectApiUnavailableError`), which is the other documented spelling of the grant
+/// [`EC2_INJECT_API_ERROR`] is one spelling of. A role allowed EITHER may perform the
+/// action, so the catalog states both and the gate is satisfied by one of them
+/// ([`ActionCatalogEntry::permissions`]).
+pub const FIS_INJECT_API_INTERNAL_ERROR: &str = "fis:InjectApiInternalError";
+
+/// See [`FIS_INJECT_API_INTERNAL_ERROR`] — the fault `aws:fis:inject-api-throttle-error`
+/// injects.
+pub const FIS_INJECT_API_THROTTLE_ERROR: &str = "fis:InjectApiThrottleError";
+
+/// See [`FIS_INJECT_API_INTERNAL_ERROR`] — the fault
+/// `aws:fis:inject-api-unavailable-error` injects.
+pub const FIS_INJECT_API_UNAVAILABLE_ERROR: &str = "fis:InjectApiUnavailableError";
+
+/// The grants that authorize `aws:fis:inject-api-internal-error`'s own call.
+const INJECT_API_INTERNAL_ERROR_GRANTS: &[&str] =
+    &[EC2_INJECT_API_ERROR, FIS_INJECT_API_INTERNAL_ERROR];
+
+/// The grants that authorize `aws:fis:inject-api-throttle-error`'s own call.
+const INJECT_API_THROTTLE_ERROR_GRANTS: &[&str] =
+    &[EC2_INJECT_API_ERROR, FIS_INJECT_API_THROTTLE_ERROR];
+
+/// The grants that authorize `aws:fis:inject-api-unavailable-error`'s own call.
+const INJECT_API_UNAVAILABLE_ERROR_GRANTS: &[&str] =
+    &[EC2_INJECT_API_ERROR, FIS_INJECT_API_UNAVAILABLE_ERROR];
 
 /// The condition key the documented `ec2:InjectApiError` grant is scoped by: "the FIS
 /// action id", which is the value the experiment's action carries.
@@ -221,7 +255,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             },
         ],
         targets: &[],
-        permissions: &["cloudwatch:DescribeAlarms"],
+        permissions: &[&["cloudwatch:DescribeAlarms"]],
     },
     ActionCatalogEntry {
         id: "aws:dynamodb:global-table-pause-replication",
@@ -236,7 +270,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Tables",
             resource_type: "aws:dynamodb:global-table",
         }],
-        permissions: &["dynamodb:PauseReplication"],
+        permissions: &[&["dynamodb:PauseReplication"]],
     },
     ActionCatalogEntry {
         id: "aws:ebs:pause-volume-io",
@@ -250,7 +284,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Volumes",
             resource_type: "aws:ec2:ebs-volume",
         }],
-        permissions: &["ec2:PauseVolumeIO"],
+        permissions: &[&["ec2:PauseVolumeIO"]],
     },
     ActionCatalogEntry {
         id: "aws:ec2:api-error",
@@ -282,7 +316,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Roles",
             resource_type: "aws:iam:role",
         }],
-        permissions: &[EC2_INJECT_API_ERROR],
+        permissions: &[&[EC2_INJECT_API_ERROR]],
     },
     ActionCatalogEntry {
         id: "aws:ec2:api-insufficient-instance-capacity-error",
@@ -309,7 +343,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Roles",
             resource_type: "aws:iam:role",
         }],
-        permissions: &[EC2_INJECT_API_ERROR],
+        permissions: &[&[EC2_INJECT_API_ERROR]],
     },
     ActionCatalogEntry {
         id: "aws:ec2:asg-insufficient-instance-capacity-error",
@@ -336,7 +370,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "AutoScalingGroups",
             resource_type: "aws:ec2:autoscaling-group",
         }],
-        permissions: &[EC2_INJECT_API_ERROR],
+        permissions: &[&[EC2_INJECT_API_ERROR]],
     },
     ActionCatalogEntry {
         id: "aws:ec2:reboot-instances",
@@ -346,7 +380,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Instances",
             resource_type: "aws:ec2:instance",
         }],
-        permissions: &["ec2:RebootInstances"],
+        permissions: &[&["ec2:RebootInstances"]],
     },
     ActionCatalogEntry {
         id: "aws:ec2:send-spot-instance-interruptions",
@@ -361,7 +395,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "SpotInstances",
             resource_type: "aws:ec2:spot-instance",
         }],
-        permissions: &["ec2:SendSpotInstanceInterruptions"],
+        permissions: &[&["ec2:SendSpotInstanceInterruptions"]],
     },
     ActionCatalogEntry {
         id: "aws:ec2:stop-instances",
@@ -384,7 +418,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Instances",
             resource_type: "aws:ec2:instance",
         }],
-        permissions: &["ec2:StopInstances"],
+        permissions: &[&["ec2:StopInstances"]],
     },
     ActionCatalogEntry {
         id: "aws:ec2:terminate-instances",
@@ -394,7 +428,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Instances",
             resource_type: "aws:ec2:instance",
         }],
-        permissions: &["ec2:TerminateInstances"],
+        permissions: &[&["ec2:TerminateInstances"]],
     },
     ActionCatalogEntry {
         id: "aws:ecs:drain-container-instances",
@@ -415,7 +449,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Clusters",
             resource_type: "aws:ecs:cluster",
         }],
-        permissions: &["ecs:UpdateContainerInstancesState"],
+        permissions: &[&["ecs:UpdateContainerInstancesState"]],
     },
     ActionCatalogEntry {
         id: "aws:ecs:stop-task",
@@ -425,7 +459,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Tasks",
             resource_type: "aws:ecs:task",
         }],
-        permissions: &["ecs:StopTask"],
+        permissions: &[&["ecs:StopTask"]],
     },
     ActionCatalogEntry {
         id: "aws:ecs:task-cpu-stress",
@@ -457,7 +491,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Tasks",
             resource_type: "aws:ecs:task",
         }],
-        permissions: &["ssm:SendCommand"],
+        permissions: &[&["ssm:SendCommand"]],
     },
     ActionCatalogEntry {
         id: "aws:ecs:task-io-stress",
@@ -489,7 +523,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Tasks",
             resource_type: "aws:ecs:task",
         }],
-        permissions: &["ssm:SendCommand"],
+        permissions: &[&["ssm:SendCommand"]],
     },
     ActionCatalogEntry {
         id: "aws:ecs:task-kill-process",
@@ -516,7 +550,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Tasks",
             resource_type: "aws:ecs:task",
         }],
-        permissions: &["ssm:SendCommand"],
+        permissions: &[&["ssm:SendCommand"]],
     },
     ActionCatalogEntry {
         id: "aws:ecs:task-network-blackhole-port",
@@ -554,7 +588,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Tasks",
             resource_type: "aws:ecs:task",
         }],
-        permissions: &["ssm:SendCommand"],
+        permissions: &[&["ssm:SendCommand"]],
     },
     ActionCatalogEntry {
         id: "aws:ecs:task-network-latency",
@@ -591,7 +625,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Tasks",
             resource_type: "aws:ecs:task",
         }],
-        permissions: &["ssm:SendCommand"],
+        permissions: &[&["ssm:SendCommand"]],
     },
     ActionCatalogEntry {
         id: "aws:ecs:task-network-packet-loss",
@@ -623,7 +657,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Tasks",
             resource_type: "aws:ecs:task",
         }],
-        permissions: &["ssm:SendCommand"],
+        permissions: &[&["ssm:SendCommand"]],
     },
     ActionCatalogEntry {
         id: "aws:eks:inject-kubernetes-custom-resource",
@@ -661,7 +695,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Cluster",
             resource_type: "aws:eks:cluster",
         }],
-        permissions: &["eks:DescribeCluster"],
+        permissions: &[&["eks:DescribeCluster"]],
     },
     ActionCatalogEntry {
         id: "aws:eks:pod-cpu-stress",
@@ -692,7 +726,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Pods",
             resource_type: "aws:eks:pod",
         }],
-        permissions: &["eks:DescribeCluster"],
+        permissions: &[&["eks:DescribeCluster"]],
     },
     ActionCatalogEntry {
         id: "aws:eks:pod-delete",
@@ -713,7 +747,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Pods",
             resource_type: "aws:eks:pod",
         }],
-        permissions: &["eks:DescribeCluster"],
+        permissions: &[&["eks:DescribeCluster"]],
     },
     ActionCatalogEntry {
         id: "aws:eks:pod-io-stress",
@@ -744,7 +778,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Pods",
             resource_type: "aws:eks:pod",
         }],
-        permissions: &["eks:DescribeCluster"],
+        permissions: &[&["eks:DescribeCluster"]],
     },
     ActionCatalogEntry {
         id: "aws:eks:pod-memory-stress",
@@ -775,7 +809,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Pods",
             resource_type: "aws:eks:pod",
         }],
-        permissions: &["eks:DescribeCluster"],
+        permissions: &[&["eks:DescribeCluster"]],
     },
     ActionCatalogEntry {
         id: "aws:eks:pod-network-blackhole-port",
@@ -812,7 +846,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Pods",
             resource_type: "aws:eks:pod",
         }],
-        permissions: &["eks:DescribeCluster"],
+        permissions: &[&["eks:DescribeCluster"]],
     },
     ActionCatalogEntry {
         id: "aws:eks:pod-network-latency",
@@ -848,7 +882,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Pods",
             resource_type: "aws:eks:pod",
         }],
-        permissions: &["eks:DescribeCluster"],
+        permissions: &[&["eks:DescribeCluster"]],
     },
     ActionCatalogEntry {
         id: "aws:eks:pod-network-packet-loss",
@@ -879,7 +913,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Pods",
             resource_type: "aws:eks:pod",
         }],
-        permissions: &["eks:DescribeCluster"],
+        permissions: &[&["eks:DescribeCluster"]],
     },
     ActionCatalogEntry {
         id: "aws:eks:terminate-nodegroup-instances",
@@ -893,7 +927,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Nodegroups",
             resource_type: "aws:eks:nodegroup",
         }],
-        permissions: &["ec2:TerminateInstances"],
+        permissions: &[&["ec2:TerminateInstances"]],
     },
     ActionCatalogEntry {
         id: "aws:elasticache:replicationgroup-interrupt-az-power",
@@ -908,7 +942,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "ReplicationGroups",
             resource_type: "aws:elasticache:replicationgroup",
         }],
-        permissions: &["elasticache:InterruptClusterAZPower"],
+        permissions: &[&["elasticache:InterruptClusterAZPower"]],
     },
     ActionCatalogEntry {
         id: "aws:fis:inject-api-internal-error",
@@ -940,7 +974,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Roles",
             resource_type: "aws:iam:role",
         }],
-        permissions: &[EC2_INJECT_API_ERROR],
+        permissions: &[INJECT_API_INTERNAL_ERROR_GRANTS],
     },
     ActionCatalogEntry {
         id: "aws:fis:inject-api-throttle-error",
@@ -971,7 +1005,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Roles",
             resource_type: "aws:iam:role",
         }],
-        permissions: &[EC2_INJECT_API_ERROR],
+        permissions: &[INJECT_API_THROTTLE_ERROR_GRANTS],
     },
     ActionCatalogEntry {
         id: "aws:fis:inject-api-unavailable-error",
@@ -1003,7 +1037,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Roles",
             resource_type: "aws:iam:role",
         }],
-        permissions: &[EC2_INJECT_API_ERROR],
+        permissions: &[INJECT_API_UNAVAILABLE_ERROR_GRANTS],
     },
     ActionCatalogEntry {
         id: "aws:fis:wait",
@@ -1137,7 +1171,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Subnets",
             resource_type: "aws:ec2:subnet",
         }],
-        permissions: &["ec2:CreateNetworkAcl"],
+        permissions: &[&["ec2:CreateNetworkAcl"]],
     },
     ActionCatalogEntry {
         id: "aws:network:route-table-disrupt-connectivity",
@@ -1195,7 +1229,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Clusters",
             resource_type: "aws:rds:cluster",
         }],
-        permissions: &["rds:FailoverDBCluster"],
+        permissions: &[&["rds:FailoverDBCluster"]],
     },
     ActionCatalogEntry {
         id: "aws:rds:reboot-db-instances",
@@ -1209,7 +1243,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "DBInstances",
             resource_type: "aws:rds:db",
         }],
-        permissions: &["rds:RebootDBInstance"],
+        permissions: &[&["rds:RebootDBInstance"]],
     },
     ActionCatalogEntry {
         id: "aws:s3:bucket-pause-replication",
@@ -1223,7 +1257,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Buckets",
             resource_type: "aws:s3:bucket",
         }],
-        permissions: &["s3:PauseReplication"],
+        permissions: &[&["s3:PauseReplication"]],
     },
     ActionCatalogEntry {
         id: "aws:ssm:send-command",
@@ -1254,7 +1288,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             name: "Instances",
             resource_type: "aws:ec2:instance",
         }],
-        permissions: &["ssm:SendCommand"],
+        permissions: &[&["ssm:SendCommand"]],
     },
     ActionCatalogEntry {
         id: "aws:ssm:start-automation-execution",
@@ -1288,7 +1322,7 @@ pub const ACTION_CATALOG: &[ActionCatalogEntry] = &[
             },
         ],
         targets: &[],
-        permissions: &["ssm:StartAutomationExecution"],
+        permissions: &[&["ssm:StartAutomationExecution"]],
     },
 ];
 

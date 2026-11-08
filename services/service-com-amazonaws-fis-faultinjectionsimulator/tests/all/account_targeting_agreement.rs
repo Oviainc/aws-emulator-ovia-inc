@@ -470,7 +470,7 @@ struct CreateRow {
     options: Value,
     account_id: &'static str,
     /// The role FIS would assume in that account. It belongs to the account the row
-    /// configures wherever that `accountId` is an account NUMBER, so the ownership rule
+    /// configures, so the ownership rule
     /// `target_account_role_ownership.rs` owns never decides a row here.
     role_arn: &'static str,
     description: Option<&'static str>,
@@ -526,11 +526,9 @@ fn create_rows() -> Vec<CreateRow> {
                 "accountTargeting": DEFAULT_TARGETING,
                 "emptyTargetResolutionMode": "skip"
             }),
-            // `TargetAccountId` is modelled `@length(12..48)`, so an account id longer
-            // than an account number is admitted at the boundary and this rule decides it
-            // just the same (no role can BELONG to such a value, so the ownership rule is
-            // not applied to it).
-            account_id: "6666666666666666",
+            // The two members of the configuration agree, so what decides this row is the
+            // targeting rule and not the account-ownership one.
+            account_id: "666666666666",
             role_arn: "arn:aws:iam::666666666666:role/fis-target",
             description: None,
             client_token: None,

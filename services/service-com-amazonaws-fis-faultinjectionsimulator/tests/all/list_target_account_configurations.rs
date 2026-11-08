@@ -193,9 +193,9 @@ struct Row {
 
 /// The configurations the list rule is asserted over.
 ///
-/// They differ along everything that rule generalises over: the length of the `accountId`
-/// the configuration is named by (both published bounds of `TargetAccountId` and a value
-/// between them), the shape of the `roleArn`, and whether `description` is absent, empty,
+/// They differ along everything that rule generalises over: the digits of the `accountId`
+/// the configuration is named by (leading zeros, a repeated figure, an arbitrary one), the
+/// shape of the `roleArn`, and whether `description` is absent, empty,
 /// plain text, non-ASCII or at `TargetAccountConfigurationDescription`'s published
 /// ceiling. Their account ids are deliberately not inserted in sorted order, so the order
 /// a page reports cannot be the insertion order by accident.
@@ -214,9 +214,9 @@ fn rows() -> Vec<Row> {
             description: None,
         },
         Row {
-            case: "account-id-at-the-ceiling-description-at-the-ceiling",
-            account_id: account_id_of(9, ACCOUNT_ID_CEILING),
-            role_arn: "arn:aws:iam::000000000009:role/fis".to_string(),
+            case: "description-at-the-ceiling",
+            account_id: "999999999999".to_string(),
+            role_arn: "arn:aws:iam::999999999999:role/fis".to_string(),
             description: Some("d".repeat(DESCRIPTION_CEILING)),
         },
         Row {
@@ -238,10 +238,10 @@ fn rows() -> Vec<Row> {
             description: Some("an account reached through a role with a path".to_string()),
         },
         Row {
-            case: "longest-account-id-digits-only",
-            account_id: account_id_of(2, ACCOUNT_ID_CEILING - 1),
+            case: "account-id-with-leading-zeros",
+            account_id: account_id_of(2, ACCOUNT_ID_FLOOR),
             role_arn: "arn:aws:iam::000000000002:role/FisTargetAccount".to_string(),
-            description: Some("the account one under the published ceiling".to_string()),
+            description: Some("the account whose id carries leading zeros".to_string()),
         },
     ]
 }

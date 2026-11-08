@@ -44,11 +44,12 @@
 //!
 //! This walk runs inside `StartExperiment`, so its cost is paid per call by whoever calls
 //! it. Every factor of it is bounded by a constant rather than by the size of what a
-//! caller stored: the actions of a template by
+//! caller stored: the ROLES one start reads documents for by [`MAX_ACTING_ROLES`], the
+//! actions of a template by
 //! [`MAX_ACTIONS_PER_TEMPLATE`](super::MAX_ACTIONS_PER_TEMPLATE) (20), the IAM actions one
 //! of them needs by its catalog entry, the resources one action is decided against by
 //! [`MAX_ACTION_RESOURCES`], the documents in force on a role by [`MAX_ROLE_DOCUMENTS`],
-//! and the decisions one start spends altogether by [`MAX_PERMISSION_DECISIONS`]. Each
+//! and the decisions one start spends per role by [`MAX_PERMISSION_DECISIONS`]. Each
 //! document is READ ONCE per start
 //! ([`::service_common::iam_authorization::prepare_documents`]) rather than once per
 //! decision, so a decision is a walk over statements already parsed; and the first grant
@@ -60,8 +61,48 @@ use std::collections::{BTreeMap, HashMap};
 use ::service_common::iam_authorization::{self as iam_policy, Decision, PreparedDocument};
 use service_com_amazonaws_iam_awsidentitymanagementv20100508::state as iam;
 
-use super::{action_catalog_entry, ExperimentFailure, IamState, FIS_ACTION_ID_CONDITION_KEY};
+use super::{
+    action_catalog_entry, targets_multiple_accounts, ExperimentFailure, ExperimentTemplateRecord,
+    IamState, FIS_ACTION_ID_CONDITION_KEY,
+};
 use crate::ops::types::{ExperimentTemplateAction, ExperimentTemplateTarget};
+
+/// The most roles ONE start reads documents for.
+///
+/// A multi-account run is decided against the role of each account it targets, and the
+/// configurations one template may hold are bounded only by
+/// [`MAX_TARGET_ACCOUNT_CONFIGURATIONS`](super::MAX_TARGET_ACCOUNT_CONFIGURATIONS) (1,000)
+/// — so this is what keeps the cost of the gate a constant rather than a function of how
+/// many accounts a caller configured. The roles past it are ones this gate does not finish
+/// reading, and an unread document might be the one that carries the grant, so nothing is
+/// shown about them and their accounts' actions go ahead (see the module docs). Taken in
+/// `accountId` order, so which roles a capped run is decided against does not depend on a
+/// map's iteration order.
+pub const MAX_ACTING_ROLES: usize = 16;
+
+/// The roles whose documents decide whether the actions of one run may be carried out: the
+/// roles FIS performs those actions UNDER, in a stable order and at most
+/// [`MAX_ACTING_ROLES`] of them.
+///
+/// A single-account experiment runs its actions under the template's own execution role. A
+/// MULTI-ACCOUNT one performs them in each account it targets, under the role that
+/// account's target account configuration names — FIS assumes the template's role and that
+/// role reaches the targeted accounts through theirs — so it is the target-account roles
+/// that have to be allowed to perform an action's own API calls, and the template role's
+/// own permissions decide nothing about them. In `accountId` order (the order the
+/// configurations are held in), so a run with two under-privileged accounts is attributed
+/// to the same one at every start.
+pub fn acting_roles(template: &ExperimentTemplateRecord) -> Vec<String> {
+    if targets_multiple_accounts(&template.experiment_options) {
+        return template
+            .target_account_configurations
+            .values()
+            .map(|configuration| configuration.role_arn.clone())
+            .take(MAX_ACTING_ROLES)
+            .collect();
+    }
+    vec![template.role_arn.clone()]
+}
 
 /// The `Resource` an action that names NO resource ARN at all is decided against.
 ///
@@ -94,13 +135,14 @@ pub const MAX_ACTION_RESOURCES: usize = 8;
 /// shown about such a role and its run goes ahead (see the module docs).
 pub const MAX_ROLE_DOCUMENTS: usize = 32;
 
-/// The most `(permission, resource)` decisions ONE start spends on this gate.
+/// The most `(permission, resource)` decisions ONE start spends on this gate, per acting
+/// role.
 ///
 /// The product of the factors above is already bounded, and this bounds the product
-/// itself, so no template can make a start pay more than a fixed amount of this work. A
-/// start that spends the budget stops deciding: the actions it did not reach are ones
-/// nothing was shown about, which is the same reading every other "cannot be shown" case
-/// here takes.
+/// itself, so no template can make a start pay more than a fixed amount of this work per
+/// role, and no run more than [`MAX_ACTING_ROLES`] times that. A start that spends the
+/// budget stops deciding: the actions it did not reach are ones nothing was shown about,
+/// which is the same reading every other "cannot be shown" case here takes.
 pub const MAX_PERMISSION_DECISIONS: usize = 32;
 
 /// The identity-based policy documents in force on the role `role_arn` names: its inline
@@ -153,6 +195,12 @@ pub fn role_documents(role_arn: &str, iam: &IamState) -> Option<Vec<String>> {
 /// as [`role_documents`] read them — show that role is not allowed to perform the API
 /// calls one of `actions` makes, and `None` when they show nothing of the kind.
 ///
+/// `experiment_arn` is the experiment the actions belong to, which is a resource the calls
+/// are decided against beside the resources an action's own targets name: the AWS Service
+/// Authorization Reference scopes the FIS-namespaced grants of the `aws:fis:inject-api-*`
+/// family to the EXPERIMENT, so a policy written that way is decided rather than left
+/// stating nothing (see [`action_resources`]).
+///
 /// The actions are examined in NAME order, so an experiment whose template has two
 /// under-privileged actions fails on the same one at every start rather than on whichever
 /// one a map iteration reached first. The work is bounded by the constants above.
@@ -160,6 +208,7 @@ pub fn permission_failure(
     role_arn: &str,
     actions: &HashMap<String, ExperimentTemplateAction>,
     targets: &HashMap<String, ExperimentTemplateTarget>,
+    experiment_arn: &str,
     documents: &[String],
 ) -> Option<ExperimentFailure> {
     // Read once per start, not once per decision.
@@ -179,7 +228,7 @@ pub fn permission_failure(
         if entry.permissions.is_empty() {
             continue;
         }
-        let resources = action_resources(action, targets);
+        let resources = action_resources(action, targets, experiment_arn);
         // The condition context the decision knows: the FIS action id, which is the key
         // the documented `ec2:InjectApiError` grant is scoped by
         // (`FIS_ACTION_ID_CONDITION_KEY`). A policy written the way the FIS actions
@@ -189,23 +238,53 @@ pub fn permission_failure(
             FIS_ACTION_ID_CONDITION_KEY.to_string(),
             action_id.to_string(),
         )];
-        for permission in entry.permissions {
-            match role_may_perform(&documents, permission, &resources, &context, &mut budget) {
-                // Nothing was shown against this permission, or the budget ran out before
+        for grants in entry.permissions {
+            match role_may_perform_any(&documents, grants, &resources, &context, &mut budget) {
+                // Nothing was shown against this call, or the budget ran out before
                 // anything could be: either way this gate shows nothing here.
                 Some(true) | None => {}
                 Some(false) => {
+                    // The call the role may not make, named by the grant the reference
+                    // states FIRST for it: the one spelling that is documented for every
+                    // action of the family is what a client is told to look for.
+                    let permission = grants.first().copied().unwrap_or_default();
                     return Some(ExperimentFailure::insufficient_privileges(
                         role_arn,
                         name,
                         action_id,
                         permission,
-                    ))
+                    ));
                 }
             }
         }
     }
     None
+}
+
+/// Whether `documents` allow ANY of the `grants` that authorize one call the action makes;
+/// `None` when the budget ran out before the question could be decided.
+///
+/// A reference that documents two spellings of one grant documents two ways of ALLOWING the
+/// same call, so a role holding either may make it: the walk stops at the first spelling
+/// the documents allow. Only a call no documented spelling allows is one the role may not
+/// make — and a spelling the budget ran out on is one nothing was shown about, which leaves
+/// the whole call undecided rather than refused.
+fn role_may_perform_any(
+    documents: &[PreparedDocument],
+    grants: &[&str],
+    resources: &[String],
+    context: &[(String, String)],
+    budget: &mut usize,
+) -> Option<bool> {
+    let mut decided = false;
+    for permission in grants {
+        match role_may_perform(documents, permission, resources, context, budget) {
+            Some(true) => return Some(true),
+            Some(false) => decided = true,
+            None => {}
+        }
+    }
+    decided.then_some(false)
 }
 
 /// Whether `documents` allow `permission` on at least one of the resources the action
@@ -252,20 +331,26 @@ fn role_may_perform(
     Some(false)
 }
 
-/// The resource ARNs one action NAMES, at most [`MAX_ACTION_RESOURCES`] of them: the
-/// resources of the targets it refers to, and the ARNs among its own parameter values.
+/// The resource ARNs one action is decided against, at most [`MAX_ACTION_RESOURCES`] of
+/// them: the resources of the targets it refers to, the ARNs among its own parameter
+/// values, and the EXPERIMENT the action belongs to.
 ///
 /// An action acts on its targets ("the targets for the action", by the name the template
 /// gave them) and, for an action that takes resources as parameters rather than as targets
 /// (`aws:cloudwatch:assert-alarm-state`'s `alarmArns`), on the resources those parameters
-/// name. A parameter value that is not an ARN names no resource and contributes none.
+/// name. A parameter value that is not an ARN names no resource and contributes none. The
+/// experiment comes LAST, because it is the resource of the grant rather than of the
+/// action's effect: the AWS Service Authorization Reference gives the FIS-namespaced
+/// `fis:InjectApi*Error` actions the `experiment` resource type, so a policy scoped that
+/// way states something about the call instead of nothing.
 ///
-/// The walk is in a STABLE order — the targets the action names and then its parameters,
-/// both by key — so the candidates a capped action is decided against are the same at
-/// every start rather than whichever ones a `HashMap` happened to yield first.
+/// The walk is in a STABLE order — the targets the action names, then its parameters (both
+/// by key), then the experiment — so the candidates a capped action is decided against are
+/// the same at every start rather than whichever ones a `HashMap` happened to yield first.
 fn action_resources(
     action: &ExperimentTemplateAction,
     targets: &HashMap<String, ExperimentTemplateTarget>,
+    experiment_arn: &str,
 ) -> Vec<String> {
     let mut resources: Vec<String> = Vec::new();
     let named_targets: BTreeMap<&str, &str> = action
@@ -298,6 +383,9 @@ fn action_resources(
                 return resources;
             }
         }
+    }
+    if !experiment_arn.is_empty() {
+        push_bounded(&mut resources, experiment_arn.to_string());
     }
     resources
 }

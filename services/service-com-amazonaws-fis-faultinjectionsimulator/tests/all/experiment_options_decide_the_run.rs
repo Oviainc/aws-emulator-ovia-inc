@@ -32,11 +32,13 @@
 //! service. `skipped` is the decision the options made about the action, which is known at
 //! start — not a report of work this emulator performed.
 //!
-//! What an action the run CARRIES OUT claims is the other half of that: its own progress,
-//! reported exactly for the actions whose work this emulator really performs (the `aws:fis`
-//! actions it carries out itself, and the ones whose effect it performs on the service that
-//! owns the targeted resource), and nothing at all for an action whose effect is on
-//! something this emulator does not hold.
+//! What an action the run CARRIES OUT claims is the other half of that: its own progress —
+//! where the RUN is in that action's own span, which every action of the plan reports,
+//! because the spans are what the run's own window is computed from. What stays the emulator's
+//! own distinction is the EFFECT: it is performed only for the actions whose work this
+//! emulator can really perform (the `aws:fis` actions it carries out itself, and the ones
+//! whose effect it performs on the service that owns the targeted resource), and nothing at
+//! all is announced for an action whose effect is on something this emulator does not hold.
 
 use std::time::Duration;
 
@@ -66,6 +68,21 @@ const FLOOR_SPAN_SECONDS: f64 = MIN_RUN_SPAN.as_secs_f64() + TRANSITION_DELAY.as
 /// and far below the seconds that separate a floor run from one that carried out
 /// [`LONG_DURATION`].
 const SPAN_SLACK: f64 = 0.25;
+
+/// `ExperimentActionStatus`'s published values
+/// (`smithy_query(query="shape",shape="ExperimentActionStatus")`), so an action's reported
+/// status is compared against the model's own catalog and not against one spelling.
+const ACTION_STATUS_VALUES: [&str; 9] = [
+    "pending",
+    "initiating",
+    "running",
+    "completed",
+    "cancelled",
+    "stopping",
+    "stopped",
+    "failed",
+    "skipped",
+];
 
 /// How long a row may take to reach its terminal status: the whole compressed window, the
 /// transitions around it and slack for a loaded machine.
@@ -137,12 +154,13 @@ struct Expected {
     /// its reason has to name — the option that skipped it, or the target that resolved to
     /// nothing.
     skipped: &'static [(&'static str, &'static str)],
-    /// The actions that must report NO state at all: the ones the run carries out whose own
-    /// work this emulator does not perform, so there is no progress of theirs to report.
+    /// The actions the run carries out whose EFFECT this emulator does not perform. They
+    /// report their own progress all the same: the status says where the RUN is in the
+    /// action's own span, not that its effect was produced.
     carried_out: &'static [&'static str],
-    /// The actions whose own progress the run DOES report, because this emulator carries
-    /// their work out: it reaches a terminal `completed` by the time the run has, with the
-    /// `startTime` and `endTime` of the window it was carried out in.
+    /// The actions whose work this emulator also carries out, so the progress they report
+    /// is backed by it: they reach a terminal `completed` by the time the run has, with the
+    /// `startTime` and `endTime` of the window they were carried out in.
     reported: &'static [&'static str],
     /// The terminal status the run must reach.
     terminal: &'static str,
@@ -416,21 +434,35 @@ fn assert_action_states(case: &str, where_from: &str, row: &Row, experiment: &Va
             );
         }
     }
-    for name in row.expected.carried_out {
-        assert!(
-            experiment["actions"][name]["state"].is_null(),
-            "case {case:?} ({where_from}): an action whose own work this emulator does not \
-             perform claims no per-action state, got {:?}",
-            experiment["actions"][name]
-        );
-    }
-    // An action whose work this emulator DOES carry out reports its own progress, so the
-    // status it shows depends on where the run has got: `pending` until the run reaches it,
-    // and `completed` once the run has ended.
+    // A run the resolution FAILED never got going, so nothing was carried out for any of
+    // its actions and none of them claims a progress; every other run reports where it has
+    // got in each action's own span — `pending` until the run reaches it, and `completed`
+    // once the run has ended.
+    let never_ran = row.expected.terminal == "failed";
     let final_read = where_from == "after the run";
-    for name in row.expected.reported {
+    for name in row
+        .expected
+        .carried_out
+        .iter()
+        .chain(row.expected.reported)
+        .copied()
+    {
         let state = &experiment["actions"][name]["state"];
+        if never_ran {
+            assert!(
+                state.is_null(),
+                "case {case:?} ({where_from}): an action of a run that never got going \
+                 claims no state, got {state:?}"
+            );
+            continue;
+        }
         let status = state["status"].as_str().unwrap_or_default();
+        // Never the `skipped` status the options stamp on an action nothing carries out.
+        assert!(
+            ACTION_STATUS_VALUES.contains(&status) && status != "skipped",
+            "case {case:?} ({where_from}): expected action {name:?} to report a modelled \
+             status other than skipped, got {state:?}"
+        );
         let allowed: &[&str] = if final_read {
             &["completed"]
         } else {
