@@ -118,7 +118,10 @@ async fn all_principals(emulator: &Emulator, domain: &str, case: &str) -> Vec<Va
 }
 
 /// The `Principal` of one reported `AuthorizedPrincipal`.
-fn principal_of(entry: &Value, case: &str) -> String {
+///
+/// `pub(crate)` because the sibling suites that read a listing answer name a principal
+/// through this one reader rather than growing a second copy of it.
+pub(crate) fn principal_of(entry: &Value, case: &str) -> String {
     entry["Principal"]
         .as_str()
         .unwrap_or_else(|| panic!("case {case}: expected a string Principal, got {entry:?}"))

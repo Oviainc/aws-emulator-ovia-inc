@@ -241,6 +241,8 @@ mod version_catalog;
 mod vpc_access_endpoints;
 #[path = "all/vpc_endpoint_access.rs"]
 mod vpc_endpoint_access;
+#[path = "all/vpc_endpoint_access_on_absent_domain.rs"]
+mod vpc_endpoint_access_on_absent_domain;
 #[path = "all/vpc_endpoint_access_revocation.rs"]
 mod vpc_endpoint_access_revocation;
 #[path = "all/vpc_endpoint_transient_statuses.rs"]

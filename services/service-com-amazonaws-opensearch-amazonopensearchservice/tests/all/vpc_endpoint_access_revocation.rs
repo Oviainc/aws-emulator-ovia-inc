@@ -30,7 +30,7 @@ use service_com_amazonaws_opensearch_amazonopensearchservice::state::PRINCIPAL_T
 
 use super::domain_lifecycle::{error_code, Answer, Emulator, PREFIX};
 use super::vpc_endpoint_access::{
-    authorize, created_domain, list, principal_list, service_principal,
+    authorize, created_domain, list, principal_list, principal_of, service_principal,
 };
 
 /// `RevokeVpcEndpointAccess`:
@@ -59,12 +59,7 @@ async fn authorized(emulator: &Emulator, domain: &str, case: &str) -> Vec<String
     );
     principal_list(&answer, case)
         .iter()
-        .map(|entry| {
-            entry["Principal"]
-                .as_str()
-                .unwrap_or_else(|| panic!("case {case}: expected a string Principal, got {entry:?}"))
-                .to_owned()
-        })
+        .map(|entry| principal_of(entry, case))
         .collect()
 }
 
