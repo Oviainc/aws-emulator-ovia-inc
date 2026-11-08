@@ -155,6 +155,8 @@ mod events;
 mod existence_and_parameter_guards;
 #[path = "all/export_tasks.rs"]
 mod export_tasks;
+#[path = "all/global_cluster_membership.rs"]
+mod global_cluster_membership;
 #[path = "all/global_cluster_modification.rs"]
 mod global_cluster_modification;
 #[path = "all/global_clusters.rs"]

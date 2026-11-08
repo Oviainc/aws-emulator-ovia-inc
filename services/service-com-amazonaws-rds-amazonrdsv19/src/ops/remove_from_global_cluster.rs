@@ -1,15 +1,18 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op RemoveFromGlobalCluster
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `RemoveFromGlobalCluster`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`RemoveFromGlobalCluster::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Detaching a member DB cluster from an Aurora global database is a change to the
+//! MEMBERSHIP both records carry: the global cluster's own member list
+//! ([`crate::state::GlobalClusterRecord::member_cluster_arns`]) and the member cluster's
+//! `DBCluster$GlobalClusterIdentifier`. Both are written under the one state lock here, so
+//! no later read of either can report a membership the other does not, which is also the
+//! invariant `CreateGlobalCluster`, `CreateDBCluster` and `DeleteDBCluster` keep when they
+//! add or drop a member.
+//!
+//! The detach is in force when this call answers — nothing is provisioned for it, the
+//! cluster keeps running — so the global database stays ready and a `DeleteGlobalCluster`
+//! of a global database this call emptied is accepted straight after it.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +154,167 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `RemoveFromGlobalCluster` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(RemoveFromGlobalClusterErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("RemoveFromGlobalCluster"))
+        // A global cluster is ACCOUNT-scoped, so the region the request was signed for does
+        // not scope which global database a member can be detached from. It is still read: a
+        // member named by its bare identifier is resolved in the region the call was signed
+        // for, as every other cluster-naming member of this service resolves one.
+        let region = crate::state::request_region(ctx)
+            .map_err(RemoveFromGlobalClusterError::validation)?;
+        // `CreateGlobalCluster` stores the identifier "as a lowercase string", so this
+        // lookup folds the name the way every other lookup of it does.
+        let identifier = input.global_cluster_identifier.to_ascii_lowercase();
+        // `DbClusterIdentifier` is "the Amazon Resource Name (ARN) identifying the cluster
+        // that was detached from the Aurora global database cluster": the ARN carries the
+        // member's own region, which is what makes a secondary in ANOTHER region
+        // addressable — a global database spans regions — while a bare identifier names a
+        // cluster of the region the request was signed for. Both fold to the key the store
+        // holds the cluster under.
+        let named = input.db_cluster_identifier.as_str();
+        let member_key: crate::state::RegionalKey = (
+            crate::state::arn_region(named)
+                .unwrap_or(region.as_str())
+                .to_string(),
+            crate::state::db_cluster_identifier_of(named).to_ascii_lowercase(),
+        );
+
+        // No store means this service was mounted on an engine it has no state in, so it
+        // cannot serve the operation at all. Unreachable with the engine the router builds;
+        // 501 is the honest answer, never a detach nothing performed.
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::scaffolded::Scaffolded::not_implemented(Self::NAME));
+        };
+        let mut store = state.lock();
+        // The transitions the clock has already made due — in the region the request was
+        // signed for and, when the ARN named one, in the member's own — so every
+        // precondition below is judged against the state the records are really in.
+        store.settle_due_transitions(&region);
+        if member_key.0 != region {
+            store.settle_due_transitions(&member_key.0);
+        }
+
+        // An identifier no create stored is the modelled 404, the same answer every other
+        // global-cluster lookup in this service gives it.
+        let Some(record) = store.global_clusters.get(&identifier) else {
+            return Err(
+                RemoveFromGlobalClusterErrorModeled::GlobalClusterNotFoundFault(
+                    GlobalClusterNotFoundFault {
+                        message: Some(format!("Global cluster '{identifier}' not found")),
+                    },
+                )
+                .into(),
+            );
+        };
+        // A global database with a change still being applied is not in a state this one
+        // can be taken in: `InvalidGlobalClusterStateFault` is "the global cluster is in an
+        // invalid state and can't perform the requested operation", which is what makes a
+        // detach during an engine upgrade wait for the upgrade rather than interleave with
+        // it (see `GlobalClusterRecord::begin_modifying`).
+        if !record.is_available() {
+            return Err(
+                RemoveFromGlobalClusterErrorModeled::InvalidGlobalClusterStateFault(
+                    InvalidGlobalClusterStateFault {
+                        message: Some(crate::state::global_cluster_not_available_message(
+                            &record.arn(),
+                            &record.status,
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        let members = record.member_cluster_arns.clone();
+
+        // The member the request names has to be a DB cluster this service holds: a value
+        // that resolves to none is the modelled `DBClusterNotFoundFault`
+        // ("DBClusterIdentifier doesn't refer to an existing DB cluster"), and nothing is
+        // detached for it.
+        let Some(cluster) = store.db_clusters.get(&member_key) else {
+            return Err(RemoveFromGlobalClusterErrorModeled::DBClusterNotFoundFault(
+                DBClusterNotFoundFault {
+                    message: Some(crate::state::db_cluster_not_found_message(named)),
+                },
+            )
+            .into());
+        };
+        let cluster_arn = cluster.arn();
+        // A cluster that is not a member of the global database the request named cannot be
+        // detached FROM it. Membership is the cluster's own state — `CreateGlobalCluster`
+        // refuses adopting a cluster that is already a member with the same fault — so the
+        // mirror refusal is the modelled `InvalidDBClusterStateFault`, naming the global
+        // database the request asked about.
+        if !members.contains(&cluster_arn) {
+            return Err(
+                RemoveFromGlobalClusterErrorModeled::InvalidDBClusterStateFault(
+                    InvalidDBClusterStateFault {
+                        message: Some(format!(
+                            "DB cluster {} is not a member of global cluster {identifier}",
+                            cluster.identifier
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+        // This operation "detaches an Aurora SECONDARY cluster": a global database's
+        // primary feeds every secondary, so it cannot be detached while secondaries are
+        // still attached — they would be left replicating from a cluster the global
+        // database no longer holds. The global database is in a state this detach can't be
+        // performed in, which is the same fault and the same reason `DeleteDBCluster`
+        // answers a delete of a primary that still has secondaries.
+        if members.first() == Some(&cluster_arn) && members.len() > 1 {
+            return Err(
+                RemoveFromGlobalClusterErrorModeled::InvalidGlobalClusterStateFault(
+                    InvalidGlobalClusterStateFault {
+                        message: Some(format!(
+                            "DB cluster {} is the primary cluster of global cluster \
+                             {identifier} and can't be detached while it still has {} \
+                             secondary cluster(s)",
+                            cluster.identifier,
+                            members.len() - 1
+                        )),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every refusal is behind us, so the detach is ACCEPTED from here, and both sides
+        // of the membership are written under this one lock. The global database loses the
+        // member — so its remaining members keep their order, and the primary stays the
+        // writer — and it stays `available`: nothing is provisioned for a detach, which is
+        // what lets the caller delete a global database this call emptied straight away.
+        let detached_from = {
+            let global = store
+                .global_clusters
+                .get_mut(&identifier)
+                .expect("the record was found above and the store is locked");
+            global
+                .member_cluster_arns
+                .retain(|member| *member != cluster_arn);
+            global.to_wire()
+        };
+        let cluster = store
+            .db_clusters
+            .get_mut(&member_key)
+            .expect("the cluster was found above and the store is locked");
+        // "The cluster becomes a standalone cluster with read-write capability instead of
+        // being read-only and receiving data from a primary cluster in a different Region":
+        // it belongs to no global database and it replicates from no other member of the
+        // one it left, so no stored record names a relationship this service no longer
+        // holds. What the request ASKED FOR is left as the caller set it — the write
+        // forwarding `CreateDBCluster$EnableGlobalWriteForwarding` requested is the
+        // cluster's own setting, and this call does not change settings.
+        cluster.global_cluster_identifier = None;
+        if cluster
+            .replication_source_arn
+            .as_ref()
+            .is_some_and(|source| members.contains(source))
+        {
+            cluster.replication_source_arn = None;
+        }
+
+        Ok(RemoveFromGlobalClusterOutput {
+            global_cluster: Some(detached_from),
+        })
     }
 }
