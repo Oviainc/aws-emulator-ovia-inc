@@ -267,7 +267,7 @@ async fn a_scheduled_snapshot_is_written_into_the_channels_bucket_and_reported_a
 
     for (case, prefix, expected_prefix) in cases {
         let emulator = Emulator::new();
-        emulator.create_bucket(DELIVERY_BUCKET, &[]).await;
+        emulator.create_delivery_bucket(DELIVERY_BUCKET).await;
         recording_through(&emulator, DELIVERY_BUCKET, prefix).await;
 
         // The resource the snapshot has to carry, created through its OWN service after
@@ -396,7 +396,7 @@ async fn every_scheduled_delivery_writes_its_own_object_and_keeps_the_ones_befor
     for scheduled in [1_usize, 2, 3] {
         let case = format!("{scheduled} deliveries");
         let emulator = Emulator::new();
-        emulator.create_bucket(DELIVERY_BUCKET, &[]).await;
+        emulator.create_delivery_bucket(DELIVERY_BUCKET).await;
         recording_through(&emulator, DELIVERY_BUCKET, None).await;
         emulator.create_bucket(OBSERVED_BUCKET, &[]).await;
         await_recorded_item(&case, &emulator, OBSERVED_BUCKET).await;

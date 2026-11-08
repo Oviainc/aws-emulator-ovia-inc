@@ -3215,6 +3215,170 @@ pub(super) async fn describe_bucket(
 }
 
 // ---------------------------------------------------------------------------
+// Amazon S3: AWS::S3::BucketPolicy
+// ---------------------------------------------------------------------------
+
+/// `AWS::S3::BucketPolicy`: not a resource of Amazon S3's own but the POLICY of the bucket
+/// it names — the sub-resource `PutBucketPolicy` writes, `GetBucketPolicy` reads and
+/// `DeleteBucketPolicy` removes.
+pub(super) const S3_BUCKET_POLICY: &str = "AWS::S3::BucketPolicy";
+
+/// The property naming the bucket whose policy this resource IS, which is the bucket every
+/// call of this arm addresses.
+pub(super) const S3_BUCKET_POLICY_BUCKET_PROPERTY: &str = "Bucket";
+
+/// The property carrying the policy itself. A template declares it as a JSON document
+/// where `PutBucketPolicy$Policy` takes "the bucket policy as a JSON document", so what
+/// reaches S3 is that document's TEXT ([`document_text`]).
+pub(super) const S3_BUCKET_POLICY_DOCUMENT_PROPERTY: &str = "PolicyDocument";
+
+/// Every property `AWS::S3::BucketPolicy` publishes, which is what this arm carries to
+/// Amazon S3: the bucket and the document. A declaration naming anything else is refused
+/// rather than deployed with the property dropped.
+pub(super) const S3_BUCKET_POLICY_PROPERTIES: &[&str] = &[
+    S3_BUCKET_POLICY_BUCKET_PROPERTY,
+    S3_BUCKET_POLICY_DOCUMENT_PROPERTY,
+];
+
+/// The code Amazon S3 answers for a bucket that carries no policy
+/// (`GetBucketPolicy`/`DeleteBucketPolicy` on a bucket with none).
+pub(super) const NO_SUCH_BUCKET_POLICY: &str = "NoSuchBucketPolicy";
+
+/// Attach the policy an `AWS::S3::BucketPolicy` declares to the bucket it names, so a
+/// client that deployed the stack — or another service of this emulator reading that
+/// bucket's policy, as AWS Config does before it will deliver into it — sees the document
+/// the template declared rather than a bucket carrying no policy at all.
+///
+/// The resource is the bucket's policy, so its identity is the BUCKET: every call of this
+/// arm addresses it by the declared `Bucket`, and the policy's own physical id is the one
+/// CloudFormation's naming rules computed for the resource.
+pub(super) async fn put_bucket_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Created, Refusal> {
+    let properties = match &resource.properties {
+        Value::Object(object) => object.clone(),
+        _ => Map::new(),
+    };
+    if let Some(unmapped) = unmapped_property(&properties, S3_BUCKET_POLICY_PROPERTIES) {
+        return Err(Refusal {
+            code: NOT_IMPLEMENTED.to_string(),
+            message: format!(
+                "this emulator does not carry the {unmapped} property of an \
+                 {S3_BUCKET_POLICY} to Amazon S3; the resource was not created."
+            ),
+        });
+    }
+    set_bucket_policy(ctx, region, &Value::Object(properties)).await
+}
+
+/// `PutBucketPolicy` with the bucket and the document `properties` declares — the call
+/// behind both this type's create and its update: "applies an Amazon S3 bucket policy to an
+/// Amazon S3 bucket", replacing any policy the bucket already carries, which is exactly
+/// what a changed declaration asks for.
+pub(super) async fn set_bucket_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    properties: &Value,
+) -> Result<Created, Refusal> {
+    let bucket = declared_bucket_of_policy(properties)?;
+    let document = properties
+        .get(S3_BUCKET_POLICY_DOCUMENT_PROPERTY)
+        .and_then(document_text)
+        .ok_or_else(|| Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!(
+                "an {S3_BUCKET_POLICY} declares the {S3_BUCKET_POLICY_DOCUMENT_PROPERTY} \
+                 the bucket is to carry."
+            ),
+        })?;
+    s3_client(ctx, region)
+        .put_bucket_policy()
+        .bucket(&bucket)
+        .policy(document)
+        .send()
+        .await
+        .map_err(|error| s3_refusal_of(&error))?;
+    Ok(Created::default())
+}
+
+/// Remove the policy a stack attached from the bucket it named. A bucket that carries no
+/// policy, and a bucket S3 no longer holds, are both already in the state the delete asks
+/// for.
+pub(super) async fn delete_bucket_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<(), Refusal> {
+    let bucket = declared_bucket_of_policy(&resource.properties)?;
+    match s3_client(ctx, region)
+        .delete_bucket_policy()
+        .bucket(&bucket)
+        .send()
+        .await
+    {
+        Ok(_) => Ok(()),
+        Err(error) => {
+            let refusal = s3_refusal_of(&error);
+            if refusal.code == NO_SUCH_BUCKET_POLICY || refusal.code == NO_SUCH_BUCKET {
+                return Ok(());
+            }
+            Err(refusal)
+        }
+    }
+}
+
+/// The policy the bucket carries NOW, for drift detection: the document `GetBucketPolicy`
+/// answers, reported under the property name the template spells it with. A bucket that
+/// carries no policy, or that S3 no longer holds, is a resource that is gone.
+pub(super) async fn describe_bucket_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    resource: &StoredResource,
+) -> Result<Option<Value>, Refusal> {
+    let bucket = declared_bucket_of_policy(&resource.properties)?;
+    let answered = match s3_client(ctx, region)
+        .get_bucket_policy()
+        .bucket(&bucket)
+        .send()
+        .await
+    {
+        Ok(answer) => answer,
+        Err(error) => {
+            let refusal = s3_refusal_of(&error);
+            if refusal.code == NO_SUCH_BUCKET_POLICY || refusal.code == NO_SUCH_BUCKET {
+                return Ok(None);
+            }
+            return Err(refusal);
+        }
+    };
+    let document: Value = answered
+        .policy
+        .as_deref()
+        .and_then(|text| serde_json::from_str(text).ok())
+        .unwrap_or(Value::Null);
+    Ok(Some(serde_json::json!({
+        S3_BUCKET_POLICY_BUCKET_PROPERTY: bucket,
+        S3_BUCKET_POLICY_DOCUMENT_PROPERTY: document,
+    })))
+}
+
+/// The bucket a declared bucket policy belongs to, or the refusal a declaration that names
+/// none earns: the policy IS that bucket's, so there is no resource to write without it.
+fn declared_bucket_of_policy(properties: &Value) -> Result<String, Refusal> {
+    declared_text(properties, S3_BUCKET_POLICY_BUCKET_PROPERTY)
+        .filter(|bucket| !bucket.is_empty())
+        .ok_or_else(|| Refusal {
+            code: MISSING_PROPERTY_CODE.to_string(),
+            message: format!(
+                "an {S3_BUCKET_POLICY} declares the {S3_BUCKET_POLICY_BUCKET_PROPERTY} whose \
+                 policy it is."
+            ),
+        })
+}
+
+// ---------------------------------------------------------------------------
 // Amazon EMR: AWS::EMR::Cluster
 // ---------------------------------------------------------------------------
 

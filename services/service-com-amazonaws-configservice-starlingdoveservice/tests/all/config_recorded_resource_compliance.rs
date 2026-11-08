@@ -292,6 +292,22 @@ impl Emulator {
             });
     }
 
+    /// Create `bucket` and attach the bucket policy a Config delivery channel requires of
+    /// the bucket it delivers into ([`config_delivery_bucket_policy`]), so
+    /// `PutDeliveryChannel` can be pointed at it.
+    pub(crate) async fn create_delivery_bucket(&self, bucket: &str) {
+        self.create_bucket(bucket, &[]).await;
+        self.s3()
+            .put_bucket_policy()
+            .bucket(bucket)
+            .policy(config_delivery_bucket_policy(bucket))
+            .send()
+            .await
+            .unwrap_or_else(|error| {
+                panic!("policying {bucket} for Config delivery must succeed, got {error:?}")
+            });
+    }
+
     /// Put the recorder and the delivery channel a rule needs, and start recording.
     pub(crate) async fn recording(&self) {
         self.config(
@@ -557,6 +573,50 @@ impl Emulator {
             .unwrap_or_else(|| format!("<no __type in {parsed}>"));
         (status, code)
     }
+}
+
+/// The bucket policy AWS documents for a Config delivery channel's bucket: the
+/// `AWSConfigBucketPermissionsCheck`, `AWSConfigBucketExistenceCheck` and
+/// `AWSConfigBucketDelivery` statements, each granting the Config service principal one of
+/// the S3 actions a delivery performs, conditioned on the delivering account the way the
+/// documented policy conditions them.
+///
+/// `PutDeliveryChannel` requires such a policy of the bucket it is pointed at, so a suite
+/// that points a channel at a bucket it created attaches this to it
+/// ([`Emulator::create_delivery_bucket`]).
+pub(crate) fn config_delivery_bucket_policy(bucket: &str) -> String {
+    let bucket_arn = format!("arn:aws:s3:::{bucket}");
+    let statement = |sid: &str, action: &str, resource: String| {
+        json!({
+            "Sid": sid,
+            "Effect": "Allow",
+            "Principal": { "Service": "config.amazonaws.com" },
+            "Action": action,
+            "Resource": resource,
+            "Condition": { "StringEquals": { "AWS:SourceAccount": ACCOUNT_ID } },
+        })
+    };
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [
+            statement(
+                "AWSConfigBucketPermissionsCheck",
+                "s3:GetBucketAcl",
+                bucket_arn.clone(),
+            ),
+            statement(
+                "AWSConfigBucketExistenceCheck",
+                "s3:ListBucket",
+                bucket_arn.clone(),
+            ),
+            statement(
+                "AWSConfigBucketDelivery",
+                "s3:PutObject",
+                format!("{bucket_arn}/*"),
+            ),
+        ],
+    })
+    .to_string()
 }
 
 /// The versioning status each configuration item in a `GetResourceConfigHistory`

@@ -358,7 +358,6 @@ fn snapshot_object_key(
     snapshot_id: &str,
 ) -> String {
     let fields = utc_fields(at);
-    let root = format!("{DELIVERED_LOG_ROOT}/{account_id}/{DELIVERED_LOG_SERVICE}/{region}");
     let day = format!(
         "{}/{}/{}",
         fields.year,
@@ -373,14 +372,55 @@ fn snapshot_object_key(
         "{account_id}_{DELIVERED_LOG_SERVICE}_{region}_{DELIVERED_SNAPSHOT_KIND}_{stamp}_\
          {snapshot_id}{DELIVERED_SNAPSHOT_SUFFIX}"
     );
-    let key = format!("{root}/{day}/{DELIVERED_SNAPSHOT_KIND}/{file}");
+    let root = delivered_root(prefix, account_id, region);
+    format!("{root}/{day}/{DELIVERED_SNAPSHOT_KIND}/{file}")
+}
+
+/// The key root every delivered Config object of one account and Region lives under:
+/// `AWSLogs/<account-id>/Config/<region>`, behind the channel's own `s3KeyPrefix` where it
+/// configures one, separated from it by one delimiter however the prefix itself ends.
+pub fn delivered_root(prefix: Option<&str>, account_id: &str, region: &str) -> String {
+    format!(
+        "{}/{region}",
+        delivered_account_root(prefix, account_id)
+    )
+}
+
+/// The key root this account's delivered Config objects and the writability check share:
+/// `AWSLogs/<account-id>/Config`, behind the channel's own prefix where it configures one.
+///
+/// The one place that path is written, so the delivery's own key
+/// ([`snapshot_object_key`]) and the key the delivery AUTHORIZATION asks the bucket's
+/// policy about ([`delivery_writability_check_key`]) cannot come to disagree about it.
+fn delivered_account_root(prefix: Option<&str>, account_id: &str) -> String {
+    let root = format!("{DELIVERED_LOG_ROOT}/{account_id}/{DELIVERED_LOG_SERVICE}");
     match prefix.map(str::trim).filter(|prefix| !prefix.is_empty()) {
         // "The prefix for the specified Amazon S3 bucket": the configured prefix stands
         // in front of the root, separated from it by one delimiter however the prefix
         // itself ends.
-        Some(prefix) => format!("{}/{key}", prefix.trim_end_matches('/')),
-        None => key,
+        Some(prefix) => format!("{}/{root}", prefix.trim_end_matches('/')),
+        None => root,
     }
+}
+
+/// The name of the object Config writes into a delivery channel's bucket to CHECK that it
+/// can deliver there (AWS Config Developer Guide, *Permissions for the Amazon S3 bucket*:
+/// Config "creates a file named `ConfigWritabilityCheckFile`" when it validates the
+/// bucket).
+const DELIVERY_WRITABILITY_CHECK_FILE: &str = "ConfigWritabilityCheckFile";
+
+/// The key of that check object: `[<prefix>/]AWSLogs/<account-id>/Config/` plus its name.
+///
+/// This is the key the delivery AUTHORIZATION asks the bucket's policy about
+/// ([`super::delivery_authorization`]) — the write Config itself performs before it will
+/// take a channel — rather than the root the delivered objects sit below, so a policy that
+/// grants the objects under that root is judged to allow the write and one that grants
+/// nothing there is not.
+pub fn delivery_writability_check_key(prefix: Option<&str>, account_id: &str) -> String {
+    format!(
+        "{}/{DELIVERY_WRITABILITY_CHECK_FILE}",
+        delivered_account_root(prefix, account_id)
+    )
 }
 
 /// `field` without the leading zero a calendar path does not carry: the day segments of a

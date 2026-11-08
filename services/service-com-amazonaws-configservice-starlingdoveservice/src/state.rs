@@ -2259,6 +2259,15 @@ impl ComAmazonawsConfigserviceStarlingdoveserviceState {
         self.customer_managed_recorders().next().is_some()
     }
 
+    /// The ARN of the customer managed configuration recorder a delivery is made FOR —
+    /// the source a delivery bucket's own policy may condition its grant on
+    /// ([`delivery_authorization`]) — or `None` while this account holds none.
+    pub fn customer_managed_recorder_arn(&self) -> Option<String> {
+        self.customer_managed_recorders()
+            .next()
+            .map(|recorder| recorder.arn.clone())
+    }
+
     /// Record `entry` as a remediation execution of the rule `config_rule_name`.
     ///
     /// This is the ONE place [`Self::remediation_executions`] GROWS, so the store
@@ -2785,6 +2794,12 @@ pub use remediation::*;
 // the modules above so a handler reaches its names as `crate::state::<name>`.
 pub mod snapshot_delivery;
 pub use snapshot_delivery::*;
+
+// Whether Config MAY deliver into the bucket a delivery channel names — what that
+// bucket's own policy says about the Config service principal — lives in
+// `state/delivery_authorization.rs`, re-exported here like the modules above.
+pub mod delivery_authorization;
+pub use delivery_authorization::*;
 
 // What a RECORDED configuration item is STREAMED as — the change notification the delivery
 // channel publishes to its Amazon SNS topic, carrying the item and the diff from the item

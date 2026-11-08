@@ -171,7 +171,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
             crate::scaffolded::Scaffolded::validation(crate::state::STATE_UNAVAILABLE)
         })?;
@@ -197,39 +196,84 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(name) => name.to_string(),
         };
 
+        // What the request says about the bucket, and the recorder the delivery would be
+        // made for, read while the guard is held; the guard is then RELEASED, because the
+        // bucket's own policy is read from S3 and no lock is held across that await.
+        let source_arn = {
+            let store = state.lock();
+
+            // A delivery channel needs a CUSTOMER MANAGED configuration recorder to
+            // deliver for: a service-linked recorder delivers to the service it is linked
+            // to, not to this account's channel.
+            if !store.has_customer_managed_recorder() {
+                return Err(
+                    PutDeliveryChannelErrorModeled::NoAvailableConfigurationRecorderException(
+                        NoAvailableConfigurationRecorderException {
+                            message: Some(
+                                crate::state::NO_RECORDER_TO_PUT_DELIVERY_CHANNEL.to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+
+            // One delivery channel per account per Region.
+            if !store.delivery_channels.contains_key(&name)
+                && !store.delivery_channels.is_empty()
+            {
+                return Err(
+                    PutDeliveryChannelErrorModeled::MaxNumberOfDeliveryChannelsExceededException(
+                        MaxNumberOfDeliveryChannelsExceededException {
+                            message: Some(
+                                "this account already has a delivery channel in this Region; \
+                                 only one can exist for each account for each Region"
+                                    .to_string(),
+                            ),
+                        },
+                    )
+                    .into(),
+                );
+            }
+            store.customer_managed_recorder_arn()
+        };
+
+        // Config delivers as its own service principal, so a channel is only usable if
+        // the policy in force on the bucket it names admits Config: the refusal this
+        // operation models for a bucket whose policy withholds the delivery.
+        if let Some(bucket) = requested.s3_bucket_name.as_deref() {
+            let prefix = requested.s3_key_prefix.as_deref();
+            let authorization = crate::state::delivery_authorization(
+                ctx.callback(),
+                &crate::state::request_region(ctx),
+                bucket,
+                prefix,
+                source_arn.as_deref(),
+            )
+            .await;
+            match authorization {
+                crate::state::DeliveryAuthorization::Denied(denied) => {
+                    return Err(
+                        PutDeliveryChannelErrorModeled::InsufficientDeliveryPolicyException(
+                            InsufficientDeliveryPolicyException {
+                                message: Some(
+                                    crate::state::insufficient_delivery_policy_message(
+                                        bucket, denied, prefix,
+                                    ),
+                                ),
+                            },
+                        )
+                        .into(),
+                    );
+                }
+                // The policy admits Config, or S3 established no policy at all — on which
+                // no refusal of this call can be grounded.
+                crate::state::DeliveryAuthorization::Permitted
+                | crate::state::DeliveryAuthorization::Unanswered => {}
+            }
+        }
+
         let mut store = state.lock();
-
-        // A delivery channel needs a CUSTOMER MANAGED configuration recorder to
-        // deliver for: a service-linked recorder delivers to the service it is linked
-        // to, not to this account's channel.
-        if !store.has_customer_managed_recorder() {
-            return Err(
-                PutDeliveryChannelErrorModeled::NoAvailableConfigurationRecorderException(
-                    NoAvailableConfigurationRecorderException {
-                        message: Some(
-                            crate::state::NO_RECORDER_TO_PUT_DELIVERY_CHANNEL.to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
-
-        // One delivery channel per account per Region.
-        if !store.delivery_channels.contains_key(&name) && !store.delivery_channels.is_empty() {
-            return Err(
-                PutDeliveryChannelErrorModeled::MaxNumberOfDeliveryChannelsExceededException(
-                    MaxNumberOfDeliveryChannelsExceededException {
-                        message: Some(
-                            "this account already has a delivery channel in this Region; only \
-                             one can exist for each account for each Region"
-                                .to_string(),
-                        ),
-                    },
-                )
-                .into(),
-            );
-        }
 
         // A channel this account already holds is UPDATED, so it keeps the creation
         // instant its delivery schedule is anchored at; a new one is anchored now.

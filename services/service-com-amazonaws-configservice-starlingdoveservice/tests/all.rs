@@ -187,3 +187,5 @@ mod refusals_that_share_an_error_code;
 mod config_refusal_class_and_wording;
 #[path = "all/config_snapshot_delivery.rs"]
 mod config_snapshot_delivery;
+#[path = "all/delivery_channel_bucket_policy.rs"]
+mod delivery_channel_bucket_policy;

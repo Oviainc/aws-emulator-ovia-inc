@@ -637,6 +637,11 @@ pub(super) enum Provisioner {
     /// `DeleteDomain` deletes it.
     OpenSearchServiceDomain,
     S3Bucket,
+    /// `AWS::S3::BucketPolicy`: not a resource of Amazon S3's own but the POLICY of the
+    /// bucket it names, which `PutBucketPolicy` writes and `DeleteBucketPolicy` removes —
+    /// the queue-policy pair's rule ([`Provisioner::SqsQueuePolicy`]) for the service that
+    /// holds a policy as a sub-resource of the bucket.
+    S3BucketPolicy,
     S3VectorsVectorBucket,
     S3VectorsIndex,
     EmrCluster,
@@ -823,6 +828,18 @@ pub(super) enum Provisioner {
     /// `DeleteSamplingRule` deletes. X-Ray mints the `RuleARN` that type's `Ref`
     /// returns and every call on a rule can address it by.
     XraySamplingRule,
+    /// `AWS::Config::ConfigurationRecorder`: the configuration recorder of AWS Config,
+    /// which `PutConfigurationRecorder` creates under the name the template states and
+    /// `DeleteConfigurationRecorder` deletes.
+    ConfigConfigurationRecorder,
+    /// `AWS::Config::DeliveryChannel`: the channel that recorder delivers through, which
+    /// `PutDeliveryChannel` creates and `DeleteDeliveryChannel` deletes.
+    ConfigDeliveryChannel,
+    /// `AWS::Config::ConfigRule`: a Config rule, which `PutConfigRule` creates under the
+    /// rule name the template states and `DeleteConfigRule` deletes. Config mints the ARN
+    /// and the rule id the type publishes, so both are read off that service's own read of
+    /// the rule.
+    ConfigConfigRule,
 }
 
 /// The provisioner that owns a template resource type, or `None` for a type this emulator
@@ -842,6 +859,7 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
         AOSS_SECURITY_POLICY => Some(Provisioner::OpenSearchServerlessSecurityPolicy),
         OPENSEARCH_DOMAIN => Some(Provisioner::OpenSearchServiceDomain),
         S3_BUCKET => Some(Provisioner::S3Bucket),
+        S3_BUCKET_POLICY => Some(Provisioner::S3BucketPolicy),
         S3VECTORS_VECTOR_BUCKET => Some(Provisioner::S3VectorsVectorBucket),
         S3VECTORS_INDEX => Some(Provisioner::S3VectorsIndex),
         EMR_CLUSTER => Some(Provisioner::EmrCluster),
@@ -950,6 +968,9 @@ pub(super) fn provisioner_for(resource_type: &str) -> Option<Provisioner> {
             Some(Provisioner::BedrockAgentCoreWorkloadIdentity)
         }
         XRAY_SAMPLING_RULE => Some(Provisioner::XraySamplingRule),
+        CONFIG_CONFIGURATION_RECORDER => Some(Provisioner::ConfigConfigurationRecorder),
+        CONFIG_DELIVERY_CHANNEL => Some(Provisioner::ConfigDeliveryChannel),
+        CONFIG_CONFIG_RULE => Some(Provisioner::ConfigConfigRule),
         _ => None,
     }
 }
@@ -1002,6 +1023,10 @@ impl Provisioner {
             }
             Self::Ec2Volume => create_ec2_volume(ctx, region, resource, propagated).await,
             Self::S3Bucket => create_bucket(ctx, region, resource, propagated).await,
+            // `AWS::S3::BucketPolicy` publishes `Bucket` and `PolicyDocument` and no
+            // `Tags`: a bucket's policy is no taggable resource, so no tags are
+            // propagated to one.
+            Self::S3BucketPolicy => put_bucket_policy(ctx, region, resource).await,
             Self::S3VectorsVectorBucket => {
                 create_vector_bucket(ctx, region, resource, propagated).await
             }
@@ -1371,6 +1396,14 @@ impl Provisioner {
             Self::XraySamplingRule => {
                 create_sampling_rule(ctx, region, resource, propagated).await
             }
+            // None of the three `AWS::Config::*` types publishes a `Tags` property — AWS
+            // Config holds tags on a recorder and on a rule through its own tagging call
+            // and takes none on either put — so no tags are propagated to one.
+            Self::ConfigConfigurationRecorder => {
+                put_configuration_recorder(ctx, region, resource).await
+            }
+            Self::ConfigDeliveryChannel => put_delivery_channel(ctx, region, resource).await,
+            Self::ConfigConfigRule => put_config_rule(ctx, region, resource).await,
         }
     }
 
@@ -1862,6 +1895,35 @@ impl Provisioner {
                     .await
                     .map(Some)
             }
+            // Each of the three AWS Config puts is documented to create OR update the
+            // resource it names, so the call that created the recorder, the channel or the
+            // rule is the call that applies a changed declaration to it — under the name
+            // the stack gave it, with the configuration the template now declares.
+            Self::ConfigConfigurationRecorder => put_recorder_configuration(
+                ctx,
+                region,
+                &resource.physical_resource_id,
+                declared,
+            )
+            .await
+            .map(Some),
+            Self::ConfigDeliveryChannel => put_channel_configuration(
+                ctx,
+                region,
+                &resource.physical_resource_id,
+                declared,
+            )
+            .await
+            .map(Some),
+            Self::ConfigConfigRule => {
+                put_config_rule_configuration(ctx, region, &resource.physical_resource_id, declared)
+                    .await
+                    .map(Some)
+            }
+            // `PutBucketPolicy` "applies an Amazon S3 bucket policy to an Amazon S3
+            // bucket", replacing the one the bucket carries, so the call that attached the
+            // policy is the call that applies a changed declaration to it.
+            Self::S3BucketPolicy => set_bucket_policy(ctx, region, declared).await.map(Some),
             // Every other type's in-place update is its own entry here, exactly as its
             // create and delete are: until one is written, nothing is asked of the owning
             // service and the deployment says so.
@@ -1997,6 +2059,9 @@ impl Provisioner {
                 delete_domain(ctx, region, physical_resource_id).await
             }
             Self::S3Bucket => delete_bucket(ctx, region, physical_resource_id).await,
+            // The policy is the named BUCKET's, and only the resource's own declaration
+            // says which bucket that is.
+            Self::S3BucketPolicy => delete_bucket_policy(ctx, region, resource).await,
             Self::S3VectorsVectorBucket => {
                 delete_vector_bucket(ctx, region, physical_resource_id).await
             }
@@ -2321,6 +2386,17 @@ impl Provisioner {
             // A rule is addressed by its name or by the ARN X-Ray minted — "either name
             // or ARN, but not both" — and the ARN is this resource's physical id.
             Self::XraySamplingRule => delete_sampling_rule(ctx, region, resource).await,
+            // Each of the three AWS Config types is addressed by its own name, which is
+            // this resource's physical id.
+            Self::ConfigConfigurationRecorder => {
+                delete_configuration_recorder(ctx, region, physical_resource_id).await
+            }
+            Self::ConfigDeliveryChannel => {
+                delete_delivery_channel(ctx, region, physical_resource_id).await
+            }
+            Self::ConfigConfigRule => {
+                delete_config_rule(ctx, region, physical_resource_id).await
+            }
         }
     }
 
@@ -2364,6 +2440,9 @@ impl Provisioner {
             }
             Self::Ec2Volume => describe_ec2_volume(ctx, region, physical_resource_id).await,
             Self::S3Bucket => describe_bucket(ctx, region, physical_resource_id).await,
+            // A policy resource's configuration is the document the named bucket carries
+            // now, read back from Amazon S3.
+            Self::S3BucketPolicy => describe_bucket_policy(ctx, region, resource).await,
             Self::S3VectorsVectorBucket => {
                 describe_vector_bucket(ctx, region, physical_resource_id).await
             }
@@ -2684,6 +2763,17 @@ impl Provisioner {
             // X-Ray publishes no read of ONE sampling rule, so the rule is read out of the
             // account's own listing, by the identity that service minted for it.
             Self::XraySamplingRule => describe_sampling_rule(ctx, region, resource).await,
+            // AWS Config's own reads of the three resources, each by the name it was
+            // created under.
+            Self::ConfigConfigurationRecorder => {
+                describe_configuration_recorder(ctx, region, physical_resource_id).await
+            }
+            Self::ConfigDeliveryChannel => {
+                describe_delivery_channel(ctx, region, physical_resource_id).await
+            }
+            Self::ConfigConfigRule => {
+                describe_config_rule(ctx, region, physical_resource_id).await
+            }
         }
     }
 }
@@ -2698,6 +2788,7 @@ impl Provisioner {
 // above dispatches to them. Re-exported into this module, which is the one path every caller
 // of an arm uses.
 mod tests;
+mod config_recording;
 mod data_and_storage;
 mod iam_identities;
 mod application_services;
@@ -2706,6 +2797,7 @@ mod network_and_delivery;
 pub(crate) use network_and_delivery::*;
 use platform_services::*;
 pub(crate) use application_services::*;
+use config_recording::*;
 use iam_identities::*;
 use data_and_storage::*;
 
