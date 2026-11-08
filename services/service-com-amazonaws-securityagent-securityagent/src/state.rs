@@ -29,8 +29,9 @@
 //! The security requirements a pack holds live beside the packs, keyed by the pair of
 //! the owning `packId` and the requirement's own name, so
 //! `BatchCreateSecurityRequirements` writes one record and
-//! `BatchGetSecurityRequirements` — and every requirement operation implemented after
-//! them — reads back THAT record rather than a second copy of it.
+//! `BatchGetSecurityRequirements` and `ListSecurityRequirements` — and every requirement
+//! operation implemented after them — read back THAT record rather than a second copy of
+//! it.
 //!
 //! The helpers below (identity minting, the IdC application ARN, the account's network,
 //! the modelled projections and the pagination cursor codec) are shared by those
@@ -45,7 +46,8 @@ use crate::ops::types::{
     AWSResources, AgentSpace, ApplicationSummary, Artifact,
     BatchCreateSecurityRequirementResult, BatchGetSecurityRequirementResult, CodeReviewSettings,
     DnsVerification, HttpVerification, IdCConfiguration, PrivateConnectionSummary,
-    SecurityRequirementPackSummary, TargetDomain, VerificationDetails,
+    SecurityRequirementPackSummary, SecurityRequirementSummary, TargetDomain,
+    VerificationDetails,
 };
 
 /// The region every value this service derives from the request's region carries when
@@ -418,6 +420,15 @@ const PACK_PAGE_TOKEN_PREFIX: &str = "pack-v1:";
 /// and a cursor taken from the wrong one is refused.
 const PRIVATE_CONNECTION_PAGE_TOKEN_PREFIX: &str = "privconn-v1:";
 
+/// The same, for `ListSecurityRequirements`: its cursor names the security requirement
+/// NAME the next page resumes at, within the pack the request names, so it is its own
+/// key space and carries its own prefix.
+const REQUIREMENT_PAGE_TOKEN_PREFIX: &str = "srq-v1:";
+
+/// What separates the pack from the requirement name inside a `ListSecurityRequirements`
+/// cursor: the ASCII unit separator, which no `packId` carries.
+const REQUIREMENT_CURSOR_SEPARATOR: char = '\u{1f}';
+
 /// The IAM Identity Center instance id an `idcInstanceArn` that names none falls back
 /// to, so the minted `idcApplicationArn` is always well formed.
 const FALLBACK_IDC_INSTANCE_ID: &str = "ssoins-emulator";
@@ -712,6 +723,17 @@ impl SecurityRequirementPack {
     }
 }
 
+/// The sentence every operation that fails to resolve a `packId` answers, for the pack
+/// the request named.
+///
+/// RECORDED, not modelled: the pack reads answer this wording for an id the account
+/// holds no pack for, and it is built here once so every operation that resolves a
+/// `packId` — the pack reads and the requirement listing inside a pack — states the
+/// same sentence rather than the documentation of the error class.
+pub fn pack_not_found_message(pack_id: &str) -> String {
+    format!("No security requirement pack found for ID: {pack_id}")
+}
+
 /// One stored security requirement: one rule inside a security requirement pack, as
 /// `BatchCreateSecurityRequirements` writes it and every other security requirement
 /// operation reads it.
@@ -758,6 +780,20 @@ impl SecurityRequirement {
             remediation,
             created_at: now,
             updated_at: now,
+        }
+    }
+
+    /// This requirement projected onto the `SecurityRequirementSummary` shape
+    /// `ListSecurityRequirements` returns: the STORED record's own fields, never request
+    /// input. The summary carries the pack, the name, the description and the stamps;
+    /// the domain, the evaluation and the remediation are the batch reads' to report.
+    pub fn summary(&self) -> SecurityRequirementSummary {
+        SecurityRequirementSummary {
+            pack_id: self.pack_id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
         }
     }
 
@@ -1494,8 +1530,25 @@ impl ComAmazonawsSecurityagentSecurityagentState {
         &'a self,
         pack_id: &'a str,
     ) -> impl Iterator<Item = &'a SecurityRequirement> {
+        self.security_requirements_from(pack_id, None)
+    }
+
+    /// The same walk, starting at the requirement `resume_from` names rather than at the
+    /// pack's first one: what one page of `ListSecurityRequirements` resumes at.
+    ///
+    /// One range serves both, so a paged read and a whole-pack read cannot disagree
+    /// about a pack's contents or their order.
+    pub fn security_requirements_from<'a>(
+        &'a self,
+        pack_id: &'a str,
+        resume_from: Option<&str>,
+    ) -> impl Iterator<Item = &'a SecurityRequirement> {
+        let start = (
+            pack_id.to_string(),
+            resume_from.unwrap_or_default().to_string(),
+        );
         self.security_requirements
-            .range((pack_id.to_string(), String::new())..)
+            .range(start..)
             .take_while(move |((pack, _), _)| pack == pack_id)
             .map(|(_, requirement)| requirement)
     }
@@ -1914,6 +1967,28 @@ pub fn encode_connection_page_token(name: &str) -> String {
 /// `None` when the token is not one this listing minted.
 pub fn decode_connection_page_token(token: &str) -> Option<String> {
     decode_cursor(PRIVATE_CONNECTION_PAGE_TOKEN_PREFIX, token)
+}
+
+/// Encode the pack and the security requirement name a `ListSecurityRequirements` page
+/// resumes at as an opaque `nextToken`, on [`encode_page_token`]'s resume-AT rule.
+///
+/// A requirement name is a resume point only INSIDE one pack — the same name names a
+/// different requirement in another pack — so the cursor carries the pack it was minted
+/// for and [`decode_requirement_page_token`] refuses it against any other.
+pub fn encode_requirement_page_token(pack_id: &str, name: &str) -> String {
+    encode_cursor(
+        REQUIREMENT_PAGE_TOKEN_PREFIX,
+        &format!("{pack_id}{REQUIREMENT_CURSOR_SEPARATOR}{name}"),
+    )
+}
+
+/// The security requirement name a `ListSecurityRequirements` `nextToken` resumes at
+/// inside `pack_id`, or `None` when the token is not one this listing minted FOR THAT
+/// PACK.
+pub fn decode_requirement_page_token(token: &str, pack_id: &str) -> Option<String> {
+    let body = decode_cursor(REQUIREMENT_PAGE_TOKEN_PREFIX, token)?;
+    let (minted_for, name) = body.split_once(REQUIREMENT_CURSOR_SEPARATOR)?;
+    (minted_for == pack_id && !name.is_empty()).then(|| name.to_string())
 }
 
 /// The region this request was signed for, from its SigV4 credential scope;

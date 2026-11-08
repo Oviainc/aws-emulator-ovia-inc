@@ -1,15 +1,15 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListSecurityRequirements
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListSecurityRequirements`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListSecurityRequirements::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Enumerates the security requirements stored inside ONE pack as
+//! `SecurityRequirementSummary` entries, in name order, a page at a time.
+//!
+//! The pack has to be one the account holds: an id it holds no pack for is a missing
+//! resource, not an empty pack. The cursor names the pack and the requirement NAME the
+//! next page resumes at rather than an offset, so deleting a requirement between two
+//! pages cannot make the next page skip or repeat one, and a cursor taken from another
+//! pack's listing is refused. The final page carries no `nextToken`.
 //!
 //! ## Shape of an operation
 //!
@@ -154,18 +154,125 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListSecurityRequirements` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListSecurityRequirementsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListSecurityRequirements"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListSecurityRequirementsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the security requirement pack store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // `packId` is `@required` but carries no `@length`, so an empty one reaches the
+        // handler. It names no pack and never could, so it is a bad request rather than
+        // a missing resource: refused with the modelled `ValidationException` (HTTP 400),
+        // exactly as the pack reads refuse it.
+        if input.pack_id.is_empty() {
+            return Err(ListSecurityRequirementsErrorModeled::ValidationException(
+                ValidationException {
+                    message: "packId must not be empty".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        path: "packId".to_string(),
+                        message: "must not be empty".to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // Where this page starts. An absent token starts at the pack's first
+        // requirement; a token this list minted FOR THIS PACK names the requirement name
+        // to resume at. Any other token — one it did not mint, or one it minted for
+        // another pack, where the same name names another requirement — is refused
+        // rather than read as a resume point.
+        let resume_from = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                match crate::state::decode_requirement_page_token(token, &input.pack_id) {
+                    Some(name) => Some(name),
+                    None => {
+                        return Err(ListSecurityRequirementsErrorModeled::ValidationException(
+                            ValidationException {
+                                message: "Member must be a nextToken returned by a previous \
+                                          ListSecurityRequirements call for the same packId: \
+                                          nextToken"
+                                    .to_string(),
+                                field_list: Some(vec![ValidationExceptionField {
+                                    path: "nextToken".to_string(),
+                                    message: "must be a nextToken returned by a previous \
+                                              ListSecurityRequirements call for the same \
+                                              packId"
+                                        .to_string(),
+                                }]),
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        // `MaxResults` carries no `@default` and no `@range` in the model, so an absent
+        // page size takes this service's own default. A non-positive one is refused
+        // rather than clamped: a zero-item page that still carried a cursor would be a
+        // client loop that never terminates. A page size above the service's ceiling is
+        // clamped rather than refused, so the caller still reaches every requirement —
+        // one page at a time — while the work and the response one call can demand stay
+        // bounded.
+        let requested = input.max_results.unwrap_or(crate::state::DEFAULT_MAX_RESULTS);
+        let page_size = match usize::try_from(requested) {
+            Ok(size) if size >= 1 => size.min(crate::state::MAX_PAGE_SIZE as usize),
+            _ => {
+                return Err(ListSecurityRequirementsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: format!(
+                            "Member must have value greater than or equal to 1: \
+                             maxResults {requested}"
+                        ),
+                        field_list: Some(vec![ValidationExceptionField {
+                            path: "maxResults".to_string(),
+                            message: "must have value greater than or equal to 1".to_string(),
+                        }]),
+                    },
+                )
+                .into())
+            }
+        };
+
+        // A read (`@readonly`): it walks the stored requirements of the named pack and
+        // writes nothing.
+        let state = state.lock();
+
+        // "Lists security requirements WITHIN A PACK": the pack has to be one the
+        // account holds. An id it holds none for is the modelled
+        // `ResourceNotFoundException` (HTTP 404) — the same refusal the pack reads give
+        // it — never an empty page, which would tell a client that a pack nobody created
+        // exists and holds nothing.
+        if !state.security_requirement_packs.contains_key(&input.pack_id) {
+            return Err(
+                ListSecurityRequirementsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: crate::state::pack_not_found_message(&input.pack_id),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        let mut selected = state.security_requirements_from(&input.pack_id, resume_from.as_deref());
+        let mut security_requirement_summaries = Vec::new();
+        for requirement in selected.by_ref().take(page_size) {
+            security_requirement_summaries.push(requirement.summary());
+        }
+        // The cursor is the first requirement of this pack AFTER this page, so
+        // `nextToken` is present exactly when one remains.
+        let next_token = selected.next().map(|requirement| {
+            crate::state::encode_requirement_page_token(&input.pack_id, &requirement.name)
+        });
+
+        Ok(ListSecurityRequirementsOutput {
+            security_requirement_summaries,
+            next_token,
+        })
     }
 }

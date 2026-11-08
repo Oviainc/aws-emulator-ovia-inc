@@ -181,10 +181,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DeleteSecurityRequirementPackErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "No security requirement pack found for ID: {}",
-                            input.pack_id
-                        ),
+                        message: crate::state::pack_not_found_message(&input.pack_id),
                     },
                 )
             })?;
@@ -211,6 +208,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The record is dropped, so every later read of this id — the single read, the
         // listing, a second delete — sees it gone.
         state.security_requirement_packs.remove(&input.pack_id);
+
+        // "Deletes a customer managed security requirement pack AND ALL ITS ASSOCIATED
+        // SECURITY REQUIREMENTS": the requirements the pack held go with it, so no
+        // requirement outlives the pack that holds it and a later read of this id
+        // reports none.
+        state
+            .security_requirements
+            .retain(|(pack_id, _), _| *pack_id != input.pack_id);
 
         Ok(DeleteSecurityRequirementPackOutput {})
     }

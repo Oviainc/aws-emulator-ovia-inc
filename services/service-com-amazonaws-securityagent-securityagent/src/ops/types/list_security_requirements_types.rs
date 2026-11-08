@@ -19,14 +19,44 @@ pub struct ListSecurityRequirementsInput {
     pub max_results: Option<i32>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#ListSecurityRequirementsOutput")]
+/// `ListSecurityRequirementsOutput`, with its schema and serializer written out because
+/// its ELEMENT shape is: the derive's read path for the list member demands a
+/// `DeserializableStruct` on [`SecurityRequirementSummary`], which an output-only shape
+/// has no caller for (see `super::wire_shape`). The wire form of this shape is
+/// otherwise exactly the model's.
 #[derive(Debug, Clone, Default)]
 pub struct ListSecurityRequirementsOutput {
     pub security_requirement_summaries: Vec<SecurityRequirementSummary>,
     pub next_token: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#SecurityRequirementSummary")]
+sa_schema_and_codec!(
+    ListSecurityRequirementsOutput,
+    LIST_SECURITY_REQUIREMENTS_OUTPUT_SCHEMA,
+    "com.amazonaws.securityagent#ListSecurityRequirementsOutput",
+    "com.amazonaws.securityagent",
+    "ListSecurityRequirementsOutput",
+    modelled: [
+        (
+            M_SECURITY_REQUIREMENT_SUMMARIES,
+            security_requirement_summaries,
+            "securityRequirementSummaries",
+            0,
+            req,
+            list_of_struct(SecurityRequirementSummary)
+        ),
+        (M_NEXT_TOKEN, next_token, "nextToken", 1, opt, string),
+    ],
+    recorded: [],
+);
+
+/// `SecurityRequirementSummary`, with its schema and serializer written out instead of
+/// derived: `createdAt` and `updatedAt` carry `@timestampFormat("date-time")`
+/// (`smithy_query(query="shape", shape="SecurityRequirementSummary",
+/// model_path="services/service-com-amazonaws-securityagent-securityagent/smithy-model/com-amazonaws-securityagent-securityagent.json")`),
+/// which the derive drops, so each one would go onto the wire as an epoch-second number
+/// where the model requires an RFC 3339 string. Same reason, same machinery as the
+/// other `date-time`-bearing shapes of this service — see `super::wire_shape`.
 #[derive(Debug, Clone)]
 pub struct SecurityRequirementSummary {
     pub pack_id: String,
@@ -35,4 +65,20 @@ pub struct SecurityRequirementSummary {
     pub created_at: ::aws_smithy_types::DateTime,
     pub updated_at: ::aws_smithy_types::DateTime,
 }
+
+sa_schema_and_codec!(
+    SecurityRequirementSummary,
+    SECURITY_REQUIREMENT_SUMMARY_SCHEMA,
+    "com.amazonaws.securityagent#SecurityRequirementSummary",
+    "com.amazonaws.securityagent",
+    "SecurityRequirementSummary",
+    modelled: [
+        (M_PACK_ID, pack_id, "packId", 0, req, string),
+        (M_NAME, name, "name", 1, req, string),
+        (M_DESCRIPTION, description, "description", 2, req, string),
+        (M_CREATED_AT, created_at, "createdAt", 3, req, date_time),
+        (M_UPDATED_AT, updated_at, "updatedAt", 4, req, date_time),
+    ],
+    recorded: [],
+);
 

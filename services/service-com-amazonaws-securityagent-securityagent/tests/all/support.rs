@@ -28,7 +28,13 @@ pub struct Answer {
 /// A router carrying only this service, over ONE shared engine — the same
 /// `EmulatedService::new(engine)` seam `core/router` mounts.
 pub fn emulator() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    emulator_on(Arc::new(engine::InMemoryEngine::new()))
+}
+
+/// [`emulator`] over an engine the CALLER holds, for a suite that has to reach the
+/// shared store itself — the state a listing reads when the operations that write it
+/// are still scaffolds.
+pub fn emulator_on(engine: Arc<engine::InMemoryEngine>) -> MultiServiceRouter {
     let mut router = MultiServiceRouter::new();
     // Signatures are the emulator front door's concern, not this service's; these
     // cases drive unsigned requests whose credential scope still names the service.

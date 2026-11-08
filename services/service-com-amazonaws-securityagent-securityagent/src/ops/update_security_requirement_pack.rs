@@ -203,10 +203,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 UpdateSecurityRequirementPackErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
-                        message: format!(
-                            "No security requirement pack found for ID: {}",
-                            input.pack_id
-                        ),
+                        message: crate::state::pack_not_found_message(&input.pack_id),
                     },
                 )
             })?;
