@@ -22,16 +22,22 @@
 //!   such profile in covers nothing, so the requested bounds are reported back as the
 //!   (empty) analysed span.
 //!
-//! `recommendations` and `anomalies` hold NO findings. This emulator stores an agent
-//! profile as the opaque payload `PostAgentProfile` uploaded (`GetProfile` hands the same
-//! bytes back byte-identical) and runs no anti-pattern matcher or anomaly detector over
-//! it: nothing here parses a profile, so there is no match and no anomaly to report.
-//! Inventing `Recommendation`/`Anomaly` entries would be output synthesised to look
-//! computed, so this handler hands the response the two lists EMPTY. How an empty one
-//! then reaches the body is not this handler's decision and is not restated here: the
+//! `recommendations` holds NO findings, and `anomalies` holds only what was recorded
+//! against the group. This emulator stores an agent profile as the opaque payload
+//! `PostAgentProfile` uploaded (`GetProfile` hands the same bytes back byte-identical) and
+//! runs no anti-pattern matcher or anomaly detector over it: nothing here parses a profile,
+//! so there is no match and no anomaly for an analysis of its own to report. Inventing
+//! `Recommendation`/`Anomaly` entries would be output synthesised to look computed, so
+//! this handler hands the response its `recommendations` list EMPTY, and reports as
+//! `anomalies` the anomalies the GROUP holds whose instances the requested period covers
+//! ([`crate::state::ProfilingGroup::anomalies_in`]) — the catalogue only
+//! [`crate::state::ComAmazonawsCodeguruprofilerCodeguruprofilerState::record_detected_anomaly`]
+//! writes, so a group no analysis was recorded against reports none. That catalogue is
+//! also what `SubmitFeedback` resolves an `anomalyInstanceId` against, and the feedback it
+//! filed is reported here on the instance it is about, as its `userFeedback`. How an empty
+//! list then reaches the body is not this handler's decision and is not restated here: the
 //! response codec declared on `GetRecommendationsOutput` states and implements that
-//! presence rule. When this service grows a real analysis it will persist its
-//! findings against the group, and this handler will report those.
+//! presence rule.
 //!
 //! ## Shape of an operation
 //!
@@ -264,12 +270,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             profiling_group_name: group.name.clone(),
             profile_start_time,
             profile_end_time,
-            // No anti-pattern matcher and no anomaly detector run over the stored agent
-            // profiles (see this module's header), so the analysis reports no findings
-            // rather than invented ones. The response codec for GetRecommendationsOutput
-            // decides what an empty list does on the wire.
+            // No anti-pattern matcher runs over the stored agent profiles (see this
+            // module's header), so the analysis reports no recommendation rather than an
+            // invented one. The response codec for GetRecommendationsOutput decides what
+            // an empty list does on the wire.
             recommendations: Vec::new(),
-            anomalies: Vec::new(),
+            // The anomalies this group's analysis holds whose instances the requested
+            // period covers, read from the group's own catalogue
+            // (`crate::state::ProfilingGroup::anomalies_in`) — the same catalogue
+            // `SubmitFeedback` resolves an `anomalyInstanceId` against, so the two agree
+            // about which instances exist. Nothing in this emulator detects an anomaly
+            // (see this module's header), so a group holds only what was recorded against
+            // it and the list is empty rather than invented.
+            anomalies: group.anomalies_in(input.start_time, input.end_time),
         })
     }
 }

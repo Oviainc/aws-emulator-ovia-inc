@@ -11,8 +11,9 @@ use std::time::Duration;
 use ::aws_smithy_types::DateTime;
 
 use crate::ops::types::{
-    AggregatedProfileTime, AgentOrchestrationConfig, Channel, FindingsReportSummary,
-    NotificationConfiguration, ProfilingGroupDescription, ProfilingStatus,
+    AggregatedProfileTime, AgentOrchestrationConfig, Anomaly, AnomalyInstance, Channel,
+    FindingsReportSummary, Metric, NotificationConfiguration, ProfilingGroupDescription,
+    ProfilingStatus, UserFeedback,
 };
 
 /// The region an ARN carries when the request is unsigned (so it has no SigV4
@@ -378,6 +379,13 @@ pub const DAILY_AGGREGATION_PERIOD: &str = "P1D";
 /// bounded the way the profile store is. Emulator-chosen, like
 /// [`MAX_RETAINED_PROFILES_PER_GROUP`]; the oldest analysed window is dropped first.
 pub const MAX_RETAINED_FINDINGS_REPORTS_PER_GROUP: usize = 64;
+
+/// How many detected anomalies one profiling group retains, so the anomaly catalogue is
+/// bounded the way the findings-report store is. Emulator-chosen, like
+/// [`MAX_RETAINED_FINDINGS_REPORTS_PER_GROUP`]; the oldest recorded anomaly is dropped
+/// first by
+/// [`ComAmazonawsCodeguruprofilerCodeguruprofilerState::record_detected_anomaly`].
+pub const MAX_RETAINED_ANOMALIES_PER_GROUP: usize = 64;
 
 /// How many `PostAgentProfile` idempotency tokens one group remembers. Emulator-chosen,
 /// and deliberately larger than [`MAX_RETAINED_PROFILES_PER_GROUP`] so every retained
@@ -928,6 +936,74 @@ pub struct AnomalyFeedback {
     pub submitted_at: DateTime,
 }
 
+/// One INSTANCE of a detected anomaly — "the specific duration in which the metric is
+/// flagged as anomalous", as the modelled `AnomalyInstance` documents it — as a group's
+/// anomaly catalogue holds it.
+///
+/// `id` is what `SubmitFeedback` addresses feedback to and what
+/// [`ProfilingGroup::anomaly_instance`] resolves that `anomalyInstanceId` against. The
+/// `userFeedback` the modelled instance reports is NOT held here but read from the group's
+/// own [`AnomalyFeedback`], so a submission and the instance it is about cannot drift
+/// apart.
+#[derive(Debug, Clone)]
+pub struct DetectedAnomalyInstance {
+    /// The instance's UUID: "The universally unique identifier (UUID) of an instance of an
+    /// anomaly in a metric", in the shape the `AnomalyInstanceId` a submission names
+    /// carries (`[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}`).
+    pub id: String,
+    /// Start of the period over which the metric was flagged as anomalous.
+    pub start_time: DateTime,
+    /// End of that period, or `None` while it has no recorded end (the modelled member is
+    /// optional).
+    pub end_time: Option<DateTime>,
+}
+
+impl DetectedAnomalyInstance {
+    /// Whether the period this instance covers overlaps the closed interval
+    /// `[start, end]` a `GetRecommendations` request asks the analysis about — the
+    /// "requested period" the modelled `Anomaly$instances` is documented to list the
+    /// instances "during".
+    ///
+    /// Both bound tests go through [`instant_key`], the way a findings report's window
+    /// test does ([`FindingsReport::overlaps`]); an instance with no recorded end is still
+    /// open, so it overlaps every interval that does not end before it began.
+    pub fn overlaps(&self, start: DateTime, end: DateTime) -> bool {
+        let ends_at_or_after_start = self
+            .end_time
+            .is_none_or(|at| instant_key(at) >= instant_key(start));
+        ends_at_or_after_start && instant_key(self.start_time) <= instant_key(end)
+    }
+}
+
+/// One anomaly a recommendation analysis detected in a profiling group's profiles, as that
+/// group's catalogue holds it: the metric it was detected in, why it was flagged, and the
+/// instances — the periods — it was anomalous over.
+///
+/// Anomalies are STORED, never derived from a request: this emulator runs no anomaly
+/// detector over the agent profiles it holds (see `crate::ops::get_recommendations`), so
+/// the only way one enters the store is
+/// [`ComAmazonawsCodeguruprofilerCodeguruprofilerState::record_detected_anomaly`] — a
+/// group no analysis has been recorded against holds none, which is why
+/// `GetRecommendations` answers it with an empty `anomalies` list instead of an invented
+/// finding, and why `SubmitFeedback` resolves an `anomalyInstanceId` against it rather
+/// than accepting whatever id arrives.
+#[derive(Debug, Clone)]
+pub struct DetectedAnomaly {
+    /// `Anomaly.metric.frameName`: "The name of the method that appears as a frame in any
+    /// stack in a profile."
+    pub frame_name: String,
+    /// `Anomaly.metric.type`, one of the modelled `MetricType` values
+    /// ([`crate::ops::types::METRIC_TYPE_VALUES`]).
+    pub metric_type: String,
+    /// `Anomaly.metric.threadStates`: the application runtime thread states the metric
+    /// value was calculated over.
+    pub thread_states: Vec<String>,
+    /// `Anomaly.reason`: "The reason for which metric was flagged as anomalous."
+    pub reason: String,
+    /// The periods this anomaly was detected over, earliest recorded FIRST.
+    pub instances: Vec<DetectedAnomalyInstance>,
+}
+
 /// One recommendation ("findings") report: the result of analysing ONE profile window
 /// of one group, which `ListFindingsReports` and `GetFindingsReportAccountSummary`
 /// summarise as a `FindingsReportSummary`.
@@ -1046,6 +1122,16 @@ pub struct ProfilingGroup {
     /// [`ComAmazonawsCodeguruprofilerCodeguruprofilerState::record_findings_report`],
     /// which is the only writer.
     pub findings_reports: VecDeque<FindingsReport>,
+    /// The anomalies a recommendation analysis has detected in this group's profiles,
+    /// oldest recorded FIRST. Bounded at [`MAX_RETAINED_ANOMALIES_PER_GROUP`] by
+    /// [`ComAmazonawsCodeguruprofilerCodeguruprofilerState::record_detected_anomaly`],
+    /// which is the only writer. It is the catalogue `GetRecommendations` reports from
+    /// ([`ProfilingGroup::anomalies_in`]) and the one `SubmitFeedback` resolves an
+    /// `anomalyInstanceId` against ([`ProfilingGroup::anomaly_instance`]), so those two
+    /// operations agree about which anomaly instances exist. It lives ON the group — an
+    /// anomaly is detected in THIS group's profiles — so deleting the group takes its
+    /// anomalies with it and a re-created group starts with none.
+    pub detected_anomalies: VecDeque<DetectedAnomaly>,
     /// The anomaly feedback submitted against this group, least recently submitted
     /// FIRST and at most one entry per anomaly instance. Bounded at
     /// [`MAX_RETAINED_ANOMALY_FEEDBACK_PER_GROUP`] by
@@ -1316,14 +1402,68 @@ impl ProfilingGroup {
         self.notification_channels.len() != before
     }
 
+    /// The anomaly instance this group's catalogue holds under `anomaly_instance_id`, or
+    /// `None` when no anomaly detected in this group has an instance with that id.
+    ///
+    /// This is the lookup `SubmitFeedback` resolves its `anomalyInstanceId` against: an
+    /// id the group's analysis does not know names no instance to file feedback about,
+    /// whatever period a reader asked about, because feedback is submitted about the
+    /// INSTANCE and not about a window.
+    pub fn anomaly_instance(&self, anomaly_instance_id: &str) -> Option<&DetectedAnomalyInstance> {
+        self.detected_anomalies
+            .iter()
+            .flat_map(|anomaly| anomaly.instances.iter())
+            .find(|instance| instance.id == anomaly_instance_id)
+    }
+
+    /// The anomalies of this group's analysis that the closed interval `[start, end]`
+    /// covers, as the modelled `Anomaly` `GetRecommendations` reports them, oldest
+    /// recorded first.
+    ///
+    /// An anomaly is reported with exactly the instances whose own period overlaps the
+    /// requested one — `Anomaly$instances` is "a list of the instances of the detected
+    /// anomalies during the requested period" — so an anomaly none of whose instances the
+    /// interval covers is not reported at all. Each reported instance carries the
+    /// `userFeedback` this group holds about it ([`Self::feedback_about`]), which is where
+    /// a `SubmitFeedback` submission becomes readable.
+    pub fn anomalies_in(&self, start: DateTime, end: DateTime) -> Vec<Anomaly> {
+        self.detected_anomalies
+            .iter()
+            .filter_map(|anomaly| {
+                let instances: Vec<AnomalyInstance> = anomaly
+                    .instances
+                    .iter()
+                    .filter(|instance| instance.overlaps(start, end))
+                    .map(|instance| AnomalyInstance {
+                        id: instance.id.clone(),
+                        start_time: instance.start_time,
+                        end_time: instance.end_time,
+                        user_feedback: self.feedback_about(&instance.id).map(|feedback| {
+                            UserFeedback {
+                                r#type: feedback.feedback_type.clone(),
+                            }
+                        }),
+                    })
+                    .collect();
+                (!instances.is_empty()).then(|| Anomaly {
+                    metric: Metric {
+                        frame_name: anomaly.frame_name.clone(),
+                        r#type: anomaly.metric_type.clone(),
+                        thread_states: anomaly.thread_states.clone(),
+                    },
+                    reason: anomaly.reason.clone(),
+                    instances,
+                })
+            })
+            .collect()
+    }
+
     /// The feedback this group holds about one anomaly instance, or `None` when none has
     /// been submitted about it (or the submission has since been evicted).
     ///
-    /// No operation reports stored feedback yet: the modelled `UserFeedback` is reported on
-    /// an `AnomalyInstance`, and this emulator detects no anomalies (see
-    /// `crate::ops::get_recommendations`), so this is the store's reader for inspecting
-    /// what a submission left behind and the seam such reporting would read — not a handler
-    /// anyone forgot to write.
+    /// What reports it back is [`Self::anomalies_in`], which carries it on the modelled
+    /// `AnomalyInstance`'s `userFeedback` — so a submission about an instance of an
+    /// anomaly recorded against this group is read back through `GetRecommendations`.
     pub fn feedback_about(&self, anomaly_instance_id: &str) -> Option<&AnomalyFeedback> {
         self.anomaly_feedback
             .iter()
@@ -2032,6 +2172,27 @@ impl ComAmazonawsCodeguruprofilerCodeguruprofilerState {
         true
     }
 
+    /// Record one detected anomaly against `group_name`, within
+    /// [`MAX_RETAINED_ANOMALIES_PER_GROUP`] (the oldest recorded anomaly is dropped
+    /// first, so the catalogue cannot grow without limit). `false` when there is no such
+    /// group.
+    ///
+    /// The ONLY way an anomaly enters this store. The emulator runs no anomaly detector
+    /// over the profiles it holds — nothing in it invents a finding — so a group holds
+    /// anomalies only where an analysis was recorded for it, which is why
+    /// `GetRecommendations` answers a group that has had none with an empty `anomalies`
+    /// list and `SubmitFeedback` refuses every `anomalyInstanceId` submitted against it.
+    pub fn record_detected_anomaly(&mut self, group_name: &str, anomaly: DetectedAnomaly) -> bool {
+        let Some(group) = self.groups.get_mut(group_name) else {
+            return false;
+        };
+        while group.detected_anomalies.len() >= MAX_RETAINED_ANOMALIES_PER_GROUP {
+            group.detected_anomalies.pop_front();
+        }
+        group.detected_anomalies.push_back(anomaly);
+        true
+    }
+
     /// Profile bytes retained across every group — what
     /// [`MAX_RETAINED_PROFILE_BYTES`] bounds.
     pub fn retained_profile_bytes(&self) -> usize {
@@ -2248,6 +2409,39 @@ pub fn notification_channel_not_found_message(channel_id: &str, group_name: &str
     format!(
         "Channel not found with channelId: {channel_id}, profilingGroupName: {group_name} \
          and AccountId: {}",
+        ::engine::emulator_account_id()
+    )
+}
+
+/// How the NOTIFICATION surface refuses a channel `uri` that is not an Amazon SNS topic
+/// ARN: it states that channel validation failed and names the topic ARN it could not
+/// read, exactly as the request sent it.
+///
+/// `Channel$uri`'s doc fixes what a channel uri must be — "Unique arn of the resource to
+/// be used for notifications. We support a valid SNS topic arn as a channel uri" — and
+/// anything else is the operation's `ValidationException` (400), refused by
+/// [`is_sns_topic_arn`]. The rejected uri is the only variable part: the sentence names
+/// neither the member path it arrived in nor a grammar, so a client reads the value it
+/// sent back out of it and nothing else.
+pub fn invalid_channel_uri_message(uri: &str) -> String {
+    format!("Channel Validation failed: Invalid topic ARN: {uri}")
+}
+
+/// How the ANALYSIS surface says that the `anomalyInstanceId` a `SubmitFeedback` request
+/// names is not an anomaly instance of the caller's account: it states the lookup it
+/// performed — the id asked about and the account the anomalies were looked for in.
+///
+/// Feedback is submitted about an anomaly instance of an analysis, so an id no anomaly of
+/// the named group has is an invalid parameter value — the operation's
+/// `ValidationException` (400), "The parameter is not valid." —  while
+/// `ResourceNotFoundException` (404) stays reserved for the profiling group itself not
+/// existing ([`group_not_found_message`]).
+///
+/// The account is this emulator's own ([`::engine::emulator_account_id`]), which is the
+/// account every resource it mints lives in — the same one the group's ARN carries.
+pub fn anomaly_instance_not_found_message(anomaly_instance_id: &str) -> String {
+    format!(
+        "Anomaly with id: {anomaly_instance_id} not found for accountId: {}",
         ::engine::emulator_account_id()
     )
 }

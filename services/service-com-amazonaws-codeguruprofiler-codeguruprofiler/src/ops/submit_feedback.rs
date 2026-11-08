@@ -10,6 +10,13 @@
 //! * the group must exist, or the operation answers its modelled
 //!   `ResourceNotFoundException` (HTTP 404) in the sentence every operation ON a group
 //!   states for a name it cannot resolve ([`crate::state::group_not_found_message`]);
+//! * the `anomalyInstanceId` must name an instance of an anomaly that group's analysis
+//!   detected ([`crate::state::ProfilingGroup::anomaly_instance`]), or the operation
+//!   answers its modelled `ValidationException` (HTTP 400) stating the lookup that found
+//!   nothing ([`crate::state::anomaly_instance_not_found_message`]) — the group is the
+//!   resource this request addresses, so an id it holds no anomaly instance for is an
+//!   invalid PARAMETER, not a missing resource, and it is refused before anything is
+//!   written;
 //! * the submission is stored on that group as a [`crate::state::AnomalyFeedback`] — the
 //!   anomaly instance it is about, the `FeedbackType` submitted, the optional comment as
 //!   sent, and the instant it was filed — keyed by the anomaly instance, so the latest
@@ -22,13 +29,15 @@
 //! used under two groups files two independent submissions, and deleting a group takes the
 //! feedback submitted against it with it.
 //!
-//! Why the anomaly instance itself is NOT looked up: an `AnomalyInstance` reaches a caller
-//! only through the analysis `GetRecommendations` reports, and this emulator runs no
-//! anomaly detector over the agent profiles it stores (see that operation's module docs),
-//! so there is no stored catalogue of anomaly instances to resolve the id against —
-//! inventing one to refuse against would be fabricated state. The id's shape is the
-//! model's (`AnomalyInstanceId`'s UUID pattern), already enforced by the boundary walk,
-//! and the 404 is the answer about the resource this store does hold: the profiling group.
+//! Where a stored submission is read back: `GetRecommendations` reports it on the anomaly
+//! instance it is about, as that instance's `userFeedback`
+//! ([`crate::state::ProfilingGroup::anomalies_in`]) — the same catalogue the id is
+//! resolved against here. This emulator runs no anomaly detector over the agent profiles
+//! it stores (see that operation's module docs), so a group holds an anomaly only where
+//! one was recorded against it
+//! ([`crate::state::ComAmazonawsCodeguruprofilerCodeguruprofilerState::record_detected_anomaly`]),
+//! and feedback about any other id is refused rather than filed where no read could ever
+//! show it.
 //!
 //! The model marks this operation `@readonly`, which its own documentation contradicts —
 //! "Sends feedback to CodeGuru Profiler", over `POST` and with no output members: what the
@@ -186,6 +195,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     message: crate::state::group_not_found_message(&input.profiling_group_name),
                 })
             })?;
+
+        // The RESOURCE this request addresses is the profiling group, resolved above;
+        // `anomalyInstanceId` is a parameter of the request, naming an instance of an
+        // anomaly that group's analysis detected. So a well-formed id the group's anomaly
+        // catalogue does not hold is an invalid parameter value — the operation's
+        // ValidationException (400), "The parameter is not valid." — and
+        // ResourceNotFoundException (404) stays reserved for the group itself not
+        // existing. It is refused BEFORE anything is written, so feedback is never filed
+        // against an instance that does not exist and could never be read back.
+        if group.anomaly_instance(&input.anomaly_instance_id).is_none() {
+            return Err(SubmitFeedbackErrorModeled::ValidationException(
+                ValidationException {
+                    message: crate::state::anomaly_instance_not_found_message(
+                        &input.anomaly_instance_id,
+                    ),
+                },
+            )
+            .into());
+        }
 
         // One anomaly instance carries one feedback, so a submission about an instance the
         // group already holds feedback about supersedes it. The submitted members are MOVED

@@ -53,6 +53,8 @@ mod instant_comparison_resolution;
 mod interval_resolution;
 #[path = "all/interval_validation.rs"]
 mod interval_validation;
+#[path = "all/invalid_channel_uri_refusal.rs"]
+mod invalid_channel_uri_refusal;
 #[path = "all/last_statement_removal_deletes_the_policy.rs"]
 mod last_statement_removal_deletes_the_policy;
 #[path = "all/latest_aggregated_profile.rs"]

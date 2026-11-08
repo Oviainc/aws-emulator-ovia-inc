@@ -204,15 +204,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `ChannelUri` is an `@arnReference` whose doc says "Currently we only
             // support SNS channels and thus required to be an ARN" — a constraint the
             // model cannot express, so it is refused here rather than stored as a uri
-            // no notification could ever be published to.
+            // no notification could ever be published to. HOW that refusal is worded is
+            // `crate::state`'s rule, not this handler's: see
+            // [`crate::state::invalid_channel_uri_message`].
             if !crate::state::is_sns_topic_arn(&channel.uri) {
                 return Err(AddNotificationChannelsErrorModeled::ValidationException(
                     ValidationException {
-                        message: format!(
-                            "channels[{index}].uri must be an Amazon SNS topic ARN \
-                             (arn:<partition>:sns:<region>:<account>:<topic>), got {}",
-                            channel.uri
-                        ),
+                        message: crate::state::invalid_channel_uri_message(&channel.uri),
                     },
                 )
                 .into());

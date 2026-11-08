@@ -281,6 +281,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // A new group has had no recommendation analysis recorded against it, so it
             // holds no findings reports: `ListFindingsReports` reports the empty list.
             findings_reports: ::std::collections::VecDeque::new(),
+            // No analysis has detected an anomaly in a group whose profiles nobody has
+            // posted yet, so it holds no anomaly instance to submit feedback about.
+            detected_anomalies: ::std::collections::VecDeque::new(),
             // Nobody has given feedback about an anomaly of a group that is only now
             // coming into existence: `SubmitFeedback` is what files the first one.
             anomaly_feedback: ::std::collections::VecDeque::new(),
