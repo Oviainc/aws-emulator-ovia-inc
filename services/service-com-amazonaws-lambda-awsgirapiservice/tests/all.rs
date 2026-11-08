@@ -318,6 +318,8 @@ mod runtime_management_config;
 mod signing_name_routing;
 #[path = "all/sqs_event_source_handler_run.rs"]
 mod sqs_event_source_handler_run;
+#[path = "all/sqs_event_source_record_attributes.rs"]
+mod sqs_event_source_record_attributes;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/stream_mapping_iterator_age_series.rs"]

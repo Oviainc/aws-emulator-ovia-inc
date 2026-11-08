@@ -165,13 +165,15 @@ pub(super) fn number_value_refusal(name: &str, value: &str) -> Option<String> {
 }
 
 /// Store every `Number` attribute's value in the plain decimal form Amazon SQS keeps it
-/// in, so a value written with an exponent comes back as the number it names and both
-/// digests cover what the queue actually holds.
+/// in, so a value written with an exponent, with leading zeros or with insignificant
+/// trailing ones comes back as the number it names and both digests cover what the queue
+/// actually holds.
 ///
 /// A `Number` attribute carries a NUMBER, not the text of one, so the value a receive
-/// reports is that number written out plainly — `1e3` is the number one thousand, and
-/// that is what comes back. Every other data type is text or bytes and is kept exactly
-/// as sent. Applied after validation, which reports the value as the request wrote it.
+/// reports is that number written out plainly — `1e3` is the number one thousand and
+/// `0042.50` is forty-two and a half, and that is what comes back. Every other data type
+/// is text or bytes and is kept exactly as sent. Applied after validation, which reports
+/// the value as the request wrote it.
 pub fn store_message_attributes_canonically(
     attributes: &mut BTreeMap<String, MessageAttributeValue>,
 ) {
@@ -249,8 +251,10 @@ impl DecimalNumber {
         self.digits.trim_start_matches('0').len()
     }
 
-    /// The value in plain decimal notation: no exponent, no leading `+`, and no leading
-    /// zero before another digit — `1e3` is `1000`, `007` is `7` and `1e-3` is `0.001`.
+    /// The value in plain decimal notation, carrying only the digits that are part of the
+    /// number: no exponent, no leading `+`, no leading zero before another digit and no
+    /// trailing zero after the last significant one in the fraction — `1e3` is `1000`,
+    /// `007` is `7`, `1e-3` is `0.001`, `0042.50` is `42.5` and `0.00` is `0`.
     ///
     /// Call it only on a value inside [`NUMBER_DECIMAL_POINT_RANGE`], which is what
     /// bounds how many zeros writing it out plainly takes.
@@ -275,7 +279,16 @@ impl DecimalNumber {
         };
         let trimmed = integral.trim_start_matches('0');
         let integral = if trimmed.is_empty() { "0" } else { trimmed };
-        let sign = if self.negative { "-" } else { "" };
+        // And a zero in the fraction standing after every significant digit is no part of
+        // the number either: it names the same number without it, which is why the
+        // trailing zeros of a fraction go the way the leading zeros of the integer part
+        // do. A zero in the INTEGER part stays: it carries the magnitude.
+        let fraction = fraction
+            .map(|fraction| fraction.trim_end_matches('0'))
+            .filter(|fraction| !fraction.is_empty());
+        // Zero is zero, however many digits and whichever sign it was written with.
+        let zero = integral == "0" && fraction.is_none();
+        let sign = if self.negative && !zero { "-" } else { "" };
         match fraction {
             Some(fraction) => format!("{sign}{integral}.{fraction}"),
             None => format!("{sign}{integral}"),

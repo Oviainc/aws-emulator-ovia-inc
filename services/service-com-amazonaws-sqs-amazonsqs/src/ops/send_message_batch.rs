@@ -824,6 +824,10 @@ fn prepare(
     {
         return Err(refused(entry, INVALID_PARAMETER_VALUE, reason));
     }
+    // `MD5OfMessageAttributes` is the digest a sender compares against its OWN digest of
+    // the attributes it sent, so it covers what this ENTRY carried — taken before the
+    // queue puts any value of it into the form it keeps, exactly as `SendMessage` takes it.
+    let md5_of_attributes = sqs::md5_of_message_attributes(&attributes);
     // A `Number` attribute carries a number, and the queue holds the number rather than
     // the text the entry wrote it as — exactly as `SendMessage` holds it.
     sqs::store_message_attributes_canonically(&mut attributes);
@@ -846,7 +850,7 @@ fn prepare(
     Ok(Prepared {
         id: entry.id.clone(),
         md5_of_body: sqs::md5_hex(entry.message_body.as_bytes()),
-        md5_of_attributes: sqs::md5_of_message_attributes(&attributes),
+        md5_of_attributes,
         md5_of_system_attributes: sqs::md5_of_message_system_attributes(&system_attributes),
         body: entry.message_body.clone(),
         attributes,

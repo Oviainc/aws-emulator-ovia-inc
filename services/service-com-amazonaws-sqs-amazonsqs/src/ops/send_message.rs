@@ -440,9 +440,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(Scaffolded::invalid_parameter_value(reason));
         }
+        // `MD5OfMessageAttributes` is "an MD5 digest of the non-URL-encoded message
+        // attribute string", which a sender compares against its OWN digest of the
+        // attributes it sent to "verify that Amazon SQS received the message correctly": it
+        // is therefore the digest of what the REQUEST carried, taken before the queue puts
+        // any value of it into the form it keeps.
+        let md5_of_message_attributes = sqs::md5_of_message_attributes(&message_attributes);
         // A `Number` attribute carries a number, and the queue holds the number rather
-        // than the text the request wrote it as; from here on the message is measured,
-        // digested and stored in that form.
+        // than the text the request wrote it as; from here on the message is measured and
+        // stored in that form, so a CONSUMER's digest covers the attributes as delivered.
         sqs::store_message_attributes_canonically(&mut message_attributes);
 
         // Everything the message carries counts toward the queue's MaximumMessageSize:
@@ -463,7 +469,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .saturating_add(sqs::message_system_attribute_bytes(&message_system_attributes));
 
         let md5_of_body = sqs::md5_hex(input.message_body.as_bytes());
-        let md5_of_message_attributes = sqs::md5_of_message_attributes(&message_attributes);
         let md5_of_message_system_attributes =
             sqs::md5_of_message_system_attributes(&message_system_attributes);
 

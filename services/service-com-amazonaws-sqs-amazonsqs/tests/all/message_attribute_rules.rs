@@ -14,6 +14,10 @@
 //!   names and holding at least one byte; and a `Number`'s value a number — and a
 //!   request breaking any of them is refused with HTTP 400 `InvalidParameterValue` with
 //!   nothing enqueued;
+//! * a `Number` attribute's value is stored as the NUMBER it names rather than as the
+//!   text of one, so what a consumer reads is that number's canonical plain decimal, and
+//!   each digest covers the attribute set its own reader has — the send's the ones the
+//!   request carried, a receive's the ones it hands over;
 //! * `MessageSystemAttributes` takes the one name its key shape publishes
 //!   (`AWSTraceHeader`) with a non-empty `String` value, is digested into
 //!   `MD5OfMessageSystemAttributes`, comes back on a receive that selects it, and does
@@ -175,8 +179,21 @@ async fn a_number_attribute_is_bounded_by_its_published_precision_and_range() {
 }
 
 /// A `Number` attribute carries a NUMBER, so the queue holds the number the value names
-/// rather than the text it was written as: the value comes back in plain decimal
-/// notation, and the digest the send reports covers that same form.
+/// rather than the text it was written as: the value comes back as that number's
+/// canonical plain decimal — no exponent, no redundant `+`, none of the leading zeros of
+/// the integer part and none of the insignificant trailing zeros of the fraction.
+///
+/// The two digests are therefore of two different attribute sets, and each is of the one
+/// its own reader has: `MD5OfMessageAttributes` on the SEND is "an MD5 digest of the
+/// non-URL-encoded message attribute string" a sender compares against its own digest to
+/// "verify that Amazon SQS received the message correctly", so it covers the attributes the
+/// REQUEST carried; the one a RECEIVE reports covers the attributes it is handing over.
+///
+/// The rows differ along how the same number can be spelled: in exponent form in either
+/// casing and with either sign of exponent, with a redundant sign, with leading zeros,
+/// with insignificant trailing zeros in the fraction, with both at once, as a zero written
+/// several ways, and as a value already canonical (which must be left alone, including the
+/// trailing zeros of an INTEGER, which carry its magnitude).
 #[tokio::test]
 async fn a_number_attribute_is_stored_as_the_number_it_names() {
     let router = emulator();
@@ -190,14 +207,22 @@ async fn a_number_attribute_is_stored_as_the_number_it_names() {
         ("+7", "7"),
         ("007", "7"),
         ("-12.5", "-12.5"),
-        ("1.50", "1.50"),
+        ("1.50", "1.5"),
+        ("0042.50", "42.5"),
+        ("1.2300", "1.23"),
+        ("-12.500", "-12.5"),
+        ("0.00", "0"),
+        ("-0.0", "0"),
+        ("7.0", "7"),
+        ("1200", "1200"),
         ("0.000001", "0.000001"),
         ("42", "42"),
     ];
 
     for (index, (sent, stored)) in rows.iter().enumerate() {
         let url = create_ok(&router, &format!("number-form-{index}"), &json!({})).await;
-        let expected_digest = hex::encode(Md5::digest(string_attribute_encoding(
+        let sent_digest = hex::encode(Md5::digest(string_attribute_encoding("N", "Number", sent)));
+        let stored_digest = hex::encode(Md5::digest(string_attribute_encoding(
             "N", "Number", stored,
         )));
         let answer = ok(
@@ -212,8 +237,9 @@ async fn a_number_attribute_is_stored_as_the_number_it_names() {
         .await;
         assert_eq!(
             answer["MD5OfMessageAttributes"].as_str(),
-            Some(expected_digest.as_str()),
-            "case {sent}: the digest must cover the stored value {stored}, got {answer}"
+            Some(sent_digest.as_str()),
+            "case {sent}: the send's digest must cover the attributes the request carried \
+             ({sent}), got {answer}"
         );
 
         let received = messages(
@@ -234,6 +260,13 @@ async fn a_number_attribute_is_stored_as_the_number_it_names() {
             actual,
             Some(*stored),
             "case {sent}: expected the queue to hold {stored:?}, got {actual:?}"
+        );
+        assert_eq!(
+            received[0]["MD5OfMessageAttributes"].as_str(),
+            Some(stored_digest.as_str()),
+            "case {sent}: the receive's digest must cover the attributes it handed over \
+             ({stored}), got {:?}",
+            received[0]
         );
     }
 }
