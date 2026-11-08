@@ -28,8 +28,87 @@
 //!
 //! A request no record answers for is an ordinary caller: the reserved name is refused as
 //! the malformed name it is, and a reserved tag key is refused as a caller's to write.
+//!
+//! The same record is what decides a request that CHANGES such a secret. A secret another
+//! service manages is that service's to change: "The secret is managed by another service,
+//! and you must use that service to update it" is one of the documented causes of
+//! `InvalidRequestException` (this service's Smithy model), so every operation that changes
+//! a secret's value, its versions, its configuration or its existence asks
+//! [`refusing_owner`] whose secret it is before it changes anything, and a request that is
+//! not the owning service's is refused with that error, carrying the sentence AWS words for
+//! what was asked: [`managed_by_another_service_message`] for a change to the secret, and
+//! [`not_allowed_on_owned_secret_message`] for a change to whether it exists at all.
 
 use super::RESERVED_TAG_PREFIX;
+
+/// Where AWS documents what may and may not be done to a secret another service manages:
+/// the page `InvalidRequestException` itself links for this cause ("For more information,
+/// see Secrets managed by other Amazon Web Services services", this service's Smithy model).
+const SERVICE_LINKED_SECRETS_DOC: &str =
+    "https://docs.aws.amazon.com/secretsmanager/latest/userguide/service-linked-secrets.html";
+
+/// The name AWS publishes for each service that creates and manages secrets of its own,
+/// by the service id such a secret reports as its `OwningService`.
+///
+/// The ids and the names are the ones the "Secrets managed by other Amazon Web Services
+/// services" page above lists for the managing services, each of which names its secrets
+/// under its own id ([`claimed_owner`]). A service this catalog does not name is still
+/// reported by its id, which is the identity `DescribeSecret` publishes for it.
+const OWNING_SERVICE_NAMES: &[(&str, &str)] = &[
+    ("rds", "Amazon RDS"),
+    ("redshift", "Amazon Redshift"),
+    ("events", "Amazon EventBridge"),
+];
+
+/// How AWS names the service whose id is `service_id` in the sentence below.
+#[must_use]
+fn owning_service_name(service_id: &str) -> &str {
+    OWNING_SERVICE_NAMES
+        .iter()
+        .find(|(id, _)| *id == service_id)
+        .map_or(service_id, |(_, name)| *name)
+}
+
+/// The sentence a change TO a secret another service manages is refused with: fixed text
+/// naming the service that owns the secret, by the name AWS publishes for it and by the id
+/// the secret reports as its `OwningService`.
+#[must_use]
+pub fn managed_by_another_service_message(service_id: &str) -> String {
+    format!(
+        "This secret is managed by {name} (service ID: {service_id}), and you must use that \
+         service to update it. For more information, see {SERVICE_LINKED_SECRETS_DOC}.",
+        name = owning_service_name(service_id)
+    )
+}
+
+/// The sentence a change to the EXISTENCE of such a secret is refused with — deleting it, or
+/// taking it back out of the deletion its owning service scheduled.
+///
+/// Fixed text naming the owning service by the id the secret reports: the lifecycle of the
+/// secret belongs to that service, so the refusal states whose secret it is rather than
+/// which call to make instead.
+#[must_use]
+pub fn not_allowed_on_owned_secret_message(service_id: &str) -> String {
+    format!("Operation is not allowed on secret owned by {service_id}")
+}
+
+/// The service that owns the secret whose `OwningService` is `stored_owner`, for a request
+/// that may NOT change it — `None` when the request may proceed.
+///
+/// A secret no service owns is the account's own and is changed by whoever IAM allows. A
+/// secret a service owns is changed only by THAT service — a request made as its own service
+/// principal ([`requesting_owner`]) — so every other caller, including another owning
+/// service, is refused and changes nothing. The caller reports the refusal with the sentence
+/// AWS words for what it asked.
+#[must_use]
+pub fn refusing_owner<'a>(
+    stored_owner: Option<&'a str>,
+    requesting: Option<&OwningService>,
+) -> Option<&'a str> {
+    let owner = stored_owner?;
+    let by_the_owner = requesting.is_some_and(|requesting| requesting.service_id == owner);
+    (!by_the_owner).then_some(owner)
+}
 
 /// The character AWS joins a service's id to the rest of a service-owned secret's name
 /// with: `rds!db-…`, `events!connection/…`.
@@ -186,6 +265,91 @@ mod tests {
                 owner.may_tag(key),
                 expected,
                 "case {case:?}: expected may_tag({key:?}) == {expected}"
+            );
+        }
+    }
+
+    /// A change is refused for every requester but the owning service itself, and each
+    /// sentence names that service: the rows differ along whether the secret is owned at
+    /// all, which service is asking, and whether the owner is one AWS publishes a name for.
+    #[test]
+    fn only_the_owning_service_may_change_a_secret_it_manages() {
+        let asking = |service_id: &str| OwningService {
+            service_id: service_id.to_string(),
+        };
+        for (case, stored, requesting, expected) in [
+            ("a caller's own secret, asked by a caller", None, None, None),
+            (
+                "a caller's own secret, asked by a service",
+                None,
+                Some(asking("rds")),
+                None,
+            ),
+            (
+                "an owned secret, asked by its owner",
+                Some("rds"),
+                Some(asking("rds")),
+                None,
+            ),
+            ("an owned secret, asked by a caller", Some("rds"), None, Some("rds")),
+            (
+                "an owned secret, asked by another service",
+                Some("redshift"),
+                Some(asking("rds")),
+                Some("redshift"),
+            ),
+        ] {
+            let refusing = refusing_owner(stored, requesting.as_ref());
+            assert_eq!(
+                refusing, expected,
+                "case {case:?}: expected {expected:?}, got {refusing:?}"
+            );
+        }
+    }
+
+    /// Each sentence is AWS's wording for what was asked, with the owning service named by
+    /// the display name AWS publishes for it and by the id the secret reports: the rows
+    /// differ along the owner, including one this catalog publishes no name for.
+    #[test]
+    fn the_refusal_names_the_owning_service() {
+        let doc = SERVICE_LINKED_SECRETS_DOC;
+        for (case, service_id, expected_change) in [
+            (
+                "the service the catalog names",
+                "rds",
+                format!(
+                    "This secret is managed by Amazon RDS (service ID: rds), and you must use \
+                     that service to update it. For more information, see {doc}."
+                ),
+            ),
+            (
+                "another service the catalog names",
+                "redshift",
+                format!(
+                    "This secret is managed by Amazon Redshift (service ID: redshift), and you \
+                     must use that service to update it. For more information, see {doc}."
+                ),
+            ),
+            (
+                "an owner this catalog does not name",
+                "some-other-service",
+                format!(
+                    "This secret is managed by some-other-service (service ID: \
+                     some-other-service), and you must use that service to update it. For more \
+                     information, see {doc}."
+                ),
+            ),
+        ] {
+            let change = managed_by_another_service_message(service_id);
+            assert_eq!(
+                change, expected_change,
+                "case {case:?}: expected {expected_change:?}, got {change:?}"
+            );
+            let lifecycle = not_allowed_on_owned_secret_message(service_id);
+            let expected_lifecycle = format!("Operation is not allowed on secret owned by {service_id}");
+            assert_eq!(
+                lifecycle, expected_lifecycle,
+                "case {case:?}: expected {expected_lifecycle:?}, got {lifecycle:?}"
             );
         }
     }

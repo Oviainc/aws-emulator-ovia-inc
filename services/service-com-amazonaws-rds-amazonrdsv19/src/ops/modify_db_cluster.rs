@@ -753,9 +753,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 generated_master_user_password = Some(minted.password);
             }
             (Some(false), Some(secret)) => {
-                crate::state::release_master_user_secret(ctx, &region, &secret.secret_arn)
-                    .await
-                    .map_err(ModifyDBClusterError::internal_failure)?;
+                crate::state::release_master_user_secret(
+                    &*self.engine,
+                    ctx,
+                    &region,
+                    &crate::state::db_cluster_arn(&region, &identifier),
+                    &secret.secret_arn,
+                )
+                .await
+                .map_err(ModifyDBClusterError::internal_failure)?;
                 released_master_user_secret = true;
             }
             _ => {}
@@ -764,8 +770,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(secret) = &accepted.current_master_user_secret {
                 generated_master_user_password = Some(
                     crate::state::rotate_master_user_secret(
+                        &*self.engine,
                         ctx,
                         &region,
+                        &crate::state::db_cluster_arn(&region, &identifier),
                         &secret.secret_arn,
                         accepted.master_username.as_deref(),
                         &accepted.engine,
@@ -789,8 +797,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         if gone {
             if let Some(secret) = &minted_master_user_secret {
-                crate::state::release_orphaned_master_user_secret(ctx, &region, &secret.secret_arn)
-                    .await;
+                crate::state::release_orphaned_master_user_secret(
+                    &*self.engine,
+                    ctx,
+                    &region,
+                    &crate::state::db_cluster_arn(&region, &identifier),
+                    &secret.secret_arn,
+                )
+                .await;
             }
             return Err(ModifyDBClusterErrorModeled::DBClusterNotFoundFault(
                 DBClusterNotFoundFault {

@@ -911,8 +911,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         if taken {
             if let Some(secret) = &record.master_user_secret {
-                crate::state::release_orphaned_master_user_secret(ctx, &region, &secret.secret_arn)
-                    .await;
+                crate::state::release_orphaned_master_user_secret(
+                    &*self.engine,
+                    ctx,
+                    &region,
+                    &crate::state::db_instance_arn(&region, &record.identifier),
+                    &secret.secret_arn,
+                )
+                .await;
             }
             return Err(CreateDBInstanceErrorModeled::DBInstanceAlreadyExistsFault(
                 DBInstanceAlreadyExistsFault {

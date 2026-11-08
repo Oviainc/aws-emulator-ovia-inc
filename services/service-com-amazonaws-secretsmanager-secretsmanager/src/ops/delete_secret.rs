@@ -234,6 +234,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // request names is looked for in — the namespace of a secret name is one
         // Region's.
         let region = crate::state::request_region(ctx.parts());
+        // Which service, if any, is making this delete as its OWN service principal,
+        // resolved before the store's guard is taken: a secret another service manages
+        // is that service's to delete ([`crate::state::service_owned`]).
+        let requesting_owner =
+            crate::state::service_owned::requesting_owner(&*self.engine, ctx);
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
         let mut store = state.lock();
         let now = ::std::time::SystemTime::now();
@@ -279,6 +284,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(invalid_parameter(
                 crate::state::NOT_PERMITTED_ON_REPLICA_MESSAGE,
             ));
+        }
+        // "The secret is managed by another service, and you must use that service
+        // to update it" (`InvalidRequestException`, this service's Smithy model):
+        // a secret another service manages leaves service when that service
+        // releases it, so a caller's delete of one is refused — stating whose
+        // secret it is — and nothing about the secret changes. The owning service's
+        // own delete goes through ([`crate::state::service_owned`]).
+        if let Some(owner) = crate::state::service_owned::refusing_owner(
+            secret.owning_service.as_deref(),
+            requesting_owner.as_ref(),
+        ) {
+            return Err(DeleteSecretErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        crate::state::service_owned::not_allowed_on_owned_secret_message(owner),
+                    ),
+                },
+            )
+            .into());
         }
         if !secret.replicas.is_empty() {
             return Err(invalid_parameter(

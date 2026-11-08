@@ -159,6 +159,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Some(input.secret_id.as_str()),
         )?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
+        // Which service, if any, is making this call as its OWN service principal,
+        // resolved before the store's guard is taken: the deletion of a secret another
+        // service manages is that service's to schedule and to cancel
+        // ([`crate::state::service_owned`]).
+        let requesting_owner =
+            crate::state::service_owned::requesting_owner(&*self.engine, ctx);
         let mut store = state.lock();
         let now = ::std::time::SystemTime::now();
         // The permanent removal the clock has already made due, materialised
@@ -172,6 +178,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(not_found());
         };
+
+        // The deletion of a secret another service manages is that service's, so
+        // taking one back out of it is refused the same way the delete is, stating
+        // whose secret it is ([`crate::state::service_owned`]).
+        if let Some(owner) = crate::state::service_owned::refusing_owner(
+            secret.owning_service.as_deref(),
+            requesting_owner.as_ref(),
+        ) {
+            return Err(RestoreSecretErrorModeled::InvalidRequestException(
+                InvalidRequestException {
+                    message: Some(
+                        crate::state::service_owned::not_allowed_on_owned_secret_message(owner),
+                    ),
+                },
+            )
+            .into());
+        }
 
         // "Cancels the scheduled deletion of a secret by removing the
         // DeletedDate time stamp", while its deletion date is still ahead. Past

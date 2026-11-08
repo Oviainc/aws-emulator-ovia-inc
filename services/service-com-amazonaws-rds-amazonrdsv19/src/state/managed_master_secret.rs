@@ -241,7 +241,7 @@ pub async fn mint_master_user_secret<Eng: Send + Sync + 'static>(
     // failing to create the secret rather than quietly creating an ordinary one of the
     // account under a name a caller could mint.
     let acting = ServicePrincipalCall::begin(engine, ctx, asked.owner.arn)
-        .ok_or_else(|| unactable_principal(asked.owner.arn))?;
+        .ok_or_else(|| unactable_principal("created", asked.owner.arn))?;
     let secrets = acting.secrets_manager_client(ctx, region)?;
     let created = secrets
         .create_secret()
@@ -280,19 +280,29 @@ pub async fn mint_master_user_secret<Eng: Send + Sync + 'static>(
 /// Rotate a managed secret: generate another password and stake it as the secret's
 /// current value, so the credentials the secret holds are the new ones from now on.
 ///
+/// The write is made as RDS's OWN service principal acting for the resource the secret
+/// belongs to ([`ServicePrincipalCall`]), exactly as the create is: the secret is one RDS
+/// owns, and such a secret is only written by the service that manages it — a caller's own
+/// `PutSecretValue` on it is refused.
+///
 /// Returns the new password, for the same reason [`MintedMasterSecret::password`] carries
 /// one. `Err` carries the sentence to report the failure with, as in
 /// [`mint_master_user_secret`].
-pub async fn rotate_master_user_secret(
+pub async fn rotate_master_user_secret<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
+    owner_arn: &str,
     secret_arn: &str,
     username: Option<&str>,
-    engine: &str,
+    db_engine: &str,
 ) -> Result<String, String> {
     let secrets = secrets_manager_client(ctx, region).ok_or_else(unaskable_region)?;
-    let password = generated_password(&secrets, engine).await?;
-    secrets
+    let password = generated_password(&secrets, db_engine).await?;
+    let acting = ServicePrincipalCall::begin(engine, ctx, owner_arn)
+        .ok_or_else(|| unactable_principal("rotated", owner_arn))?;
+    acting
+        .secrets_manager_client(ctx, region)?
         .put_secret_value()
         .secret_id(secret_arn)
         .client_request_token(fresh_version_token())
@@ -314,17 +324,30 @@ pub async fn rotate_master_user_secret(
 ///
 /// The delete goes through Secrets Manager's own `DeleteSecret`, which is what owns the
 /// secret's lifecycle — so the secret leaves service exactly as any other deleted secret
-/// does, and nothing of this service's own pretends it is gone. `Err` carries the sentence
-/// to report the failure with, as in [`mint_master_user_secret`].
-pub async fn release_master_user_secret(
+/// does, and nothing of this service's own pretends it is gone. It is made as RDS's own
+/// service principal acting for the resource the secret belongs to, for the same reason the
+/// create and the rotation are: the lifecycle of a secret RDS owns is RDS's, and a caller's
+/// own `DeleteSecret` on it is refused. `Err` carries the sentence to report the failure
+/// with, as in [`mint_master_user_secret`].
+pub async fn release_master_user_secret<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
+    owner_arn: &str,
     secret_arn: &str,
 ) -> Result<(), String> {
-    secrets_manager_client(ctx, region)
-        .ok_or_else(unaskable_region)?
+    let acting = ServicePrincipalCall::begin(engine, ctx, owner_arn)
+        .ok_or_else(|| unactable_principal("deleted", owner_arn))?;
+    acting
+        .secrets_manager_client(ctx, region)?
         .delete_secret()
         .secret_id(secret_arn)
+        // The secret goes with the resource rather than into a recovery window: it is RDS's
+        // own, so nobody but RDS could take it back out of one, and its NAME is the
+        // resource's ([`instance_master_user_secret_name`] and its siblings) — so a request
+        // that turns the management back on for that same resource has to be able to mint
+        // it again, which a secret still occupying the name would refuse.
+        .force_delete_without_recovery(true)
         .send()
         .await
         .map_err(|error| {
@@ -343,12 +366,15 @@ pub async fn release_master_user_secret(
 /// Best effort by design: the answer to the caller is the refusal that made the secret an
 /// orphan, so a Secrets Manager call that fails here cannot change it — it is recorded and
 /// the refusal stands.
-pub async fn release_orphaned_master_user_secret(
+pub async fn release_orphaned_master_user_secret<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
+    owner_arn: &str,
     secret_arn: &str,
 ) {
-    if let Err(message) = release_master_user_secret(ctx, region, secret_arn).await {
+    if let Err(message) = release_master_user_secret(engine, ctx, region, owner_arn, secret_arn).await
+    {
         ::tracing::debug!(
             secret = secret_arn,
             %message,
@@ -521,16 +547,18 @@ pub(super) fn unaskable_region_message() -> String {
         .to_string()
 }
 
-/// The sentence reported when this emulator could not make the create AS the RDS service
+/// The sentence reported when this emulator could not make the call AS the RDS service
 /// principal acting for `owner` ([`ServicePrincipalCall::begin`]).
 ///
-/// Such a secret is RDS's own — its name and its tags are not a caller's to write — so a
-/// call that cannot be made as that principal creates nothing: this is a failure of the
-/// emulator to do what RDS does, like the other failures here, never anything the request
-/// carried.
-fn unactable_principal(owner: &str) -> String {
+/// Such a secret is RDS's own — its name and its tags are not a caller's to write, and
+/// neither its value nor its lifecycle is a caller's to change — so a call that cannot be
+/// made as that principal does nothing: this is a failure of the emulator to do what RDS
+/// does, like the other failures here, never anything the request carried. `action` is what
+/// could not be done to the secret ("created", "rotated", "deleted"), so one sentence serves
+/// every call made as that principal.
+fn unactable_principal(action: &str, owner: &str) -> String {
     format!(
-        "the master user secret could not be created in Amazon Web Services Secrets Manager: \
+        "the master user secret could not be {action} in Amazon Web Services Secrets Manager: \
          this emulator could not make the call as the Amazon RDS service principal acting for \
          {owner}, which is the identity that owns the secret"
     )

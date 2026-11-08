@@ -285,6 +285,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
         let region = crate::state::request_region(ctx.parts());
+        // Which service, if any, is making this write as its OWN service principal: a
+        // secret another service manages is that service's to write
+        // ([`crate::state::service_owned`]).
+        let requesting_owner =
+            crate::state::service_owned::requesting_owner(&*self.engine, ctx);
 
         // "If you don't include VersionStages, then Secrets Manager automatically
         // moves the staging label AWSCURRENT to this version."
@@ -308,6 +313,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &version_id,
                 &stages,
                 &value,
+                requesting_owner.as_ref(),
             )? {
                 Admission::Replay(answer) => return Ok(answer),
                 Admission::Store { arn, kms_key_id } => (arn, kms_key_id),
@@ -340,6 +346,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &version_id,
             &stages,
             &value,
+            requesting_owner.as_ref(),
         )? {
             Admission::Replay(answer) => return Ok(answer),
             Admission::Store { .. } => {}
@@ -394,6 +401,7 @@ fn admit(
     version_id: &str,
     stages: &[String],
     value: &crate::state::envelope::SecretValue,
+    requesting_owner: Option<&crate::state::service_owned::OwningService>,
 ) -> Result<Admission, PutSecretValueError> {
     let Some(secret) = secret else {
         return Err(no_such_secret());
@@ -402,6 +410,24 @@ fn admit(
         return Err(PutSecretValueErrorModeled::InvalidRequestException(
             InvalidRequestException {
                 message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
+            },
+        )
+        .into());
+    }
+    // "The secret is managed by another service, and you must use that service to
+    // update it" (`InvalidRequestException`, this service's Smithy model): a secret
+    // another service manages holds that service's own credentials, so only that
+    // service writes a version of it. The refusal is decided before anything is
+    // encrypted or stored, so no version is staked and no staging label moves.
+    if let Some(owner) = crate::state::service_owned::refusing_owner(
+        secret.owning_service.as_deref(),
+        requesting_owner,
+    ) {
+        return Err(PutSecretValueErrorModeled::InvalidRequestException(
+            InvalidRequestException {
+                message: Some(
+                    crate::state::service_owned::managed_by_another_service_message(owner),
+                ),
             },
         )
         .into());

@@ -226,6 +226,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
         let region = crate::state::request_region(ctx.parts());
+        // Which service, if any, is making this call as its OWN service principal: the
+        // rotation of a secret another service manages is that service's to configure
+        // and to start ([`crate::state::service_owned`]).
+        let requesting_owner =
+            crate::state::service_owned::requesting_owner(&*self.engine, ctx);
         let now = ::std::time::SystemTime::now();
 
         // What this call is refused for, and what the rotation it starts will be driven
@@ -236,7 +241,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut store = state.lock();
             store.expire_due(now);
             store.settle_replicas_due(now);
-            plan(&mut store, &region, &input)?
+            plan(&mut store, &region, &input, requesting_owner.as_ref())?
         };
 
         // "You also need lambda:InvokeFunction permissions on the rotation function": a
@@ -262,7 +267,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // refusals are decided again against what the store holds NOW: a concurrent
         // delete, or a rotation another call started in the meantime, refuses this one
         // rather than overwriting what it did.
-        let planned = plan(&mut store, &region, &input)?;
+        let planned = plan(&mut store, &region, &input, requesting_owner.as_ref())?;
         let Some(secret) = store.get_mut(&region, &input.secret_id) else {
             return Err(RotateSecretErrorModeled::ResourceNotFoundException(
                 ResourceNotFoundException {
@@ -365,6 +370,7 @@ fn plan(
     store: &mut crate::state::ComAmazonawsSecretsmanagerSecretsmanagerState,
     region: &str,
     input: &RotateSecretInput,
+    requesting_owner: Option<&crate::state::service_owned::OwningService>,
 ) -> Result<Planned, RotateSecretError> {
     // "A unique identifier for the new version of the secret. ... If you use
     // the Amazon Web Services CLI or one of the Amazon Web Services SDKs to
@@ -417,11 +423,13 @@ fn plan(
             crate::state::NOT_PERMITTED_ON_REPLICA_MESSAGE.to_string(),
         ));
     }
-    if let Some(owner) = secret.owning_service.clone() {
-        return Err(invalid_request(format!(
-            "You can't perform this operation on the secret because it is managed by \
-             {owner}, and you must use that service to update it."
-        )));
+    if let Some(owner) = crate::state::service_owned::refusing_owner(
+        secret.owning_service.as_deref(),
+        requesting_owner,
+    ) {
+        return Err(invalid_request(
+            crate::state::service_owned::managed_by_another_service_message(owner),
+        ));
     }
     // "For secrets that use a Lambda rotation function to rotate, the ARN of
     // the Lambda rotation function. For secrets that use managed rotation,

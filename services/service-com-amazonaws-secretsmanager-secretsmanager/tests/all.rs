@@ -61,6 +61,8 @@ mod secret_rotation;
 mod secret_rotation_cancel;
 #[path = "all/secret_rotation_driver.rs"]
 mod secret_rotation_driver;
+#[path = "all/secret_service_owned_writes.rs"]
+mod secret_service_owned_writes;
 #[path = "all/secret_stop_replication_refusal.rs"]
 mod secret_stop_replication_refusal;
 #[path = "all/secret_tags_and_replication.rs"]

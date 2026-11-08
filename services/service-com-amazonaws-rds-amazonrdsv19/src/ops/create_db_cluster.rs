@@ -1108,8 +1108,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         if taken {
             if let Some(secret) = &master_user_secret {
-                crate::state::release_orphaned_master_user_secret(ctx, &region, &secret.secret_arn)
-                    .await;
+                crate::state::release_orphaned_master_user_secret(
+                    &*self.engine,
+                    ctx,
+                    &region,
+                    &crate::state::db_cluster_arn(&region, &input.db_cluster_identifier),
+                    &secret.secret_arn,
+                )
+                .await;
             }
             return Err(CreateDBClusterErrorModeled::DBClusterAlreadyExistsFault(
                 DBClusterAlreadyExistsFault {
@@ -1330,8 +1336,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     Err(error) => {
                         if let Some(secret) = &record.master_user_secret {
                             crate::state::release_orphaned_master_user_secret(
+                                &*self.engine,
                                 ctx,
                                 &region,
+                                &crate::state::db_cluster_arn(&region, &identifier),
                                 &secret.secret_arn,
                             )
                             .await;
@@ -1424,7 +1432,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let Some(db_cluster) = created else {
             if let Some(secret) = &minted_secret_arn {
-                crate::state::release_orphaned_master_user_secret(ctx, &region, secret).await;
+                crate::state::release_orphaned_master_user_secret(
+                    &*self.engine,
+                    ctx,
+                    &region,
+                    &crate::state::db_cluster_arn(&region, &identifier),
+                    secret,
+                )
+                .await;
             }
             return Err(CreateDBClusterErrorModeled::DBClusterAlreadyExistsFault(
                 DBClusterAlreadyExistsFault {

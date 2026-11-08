@@ -311,6 +311,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // stored under, decided under the store's guard; sealing that value is a
         // call to KMS, which cannot be made while the guard is held.
         let region = crate::state::request_region(ctx.parts());
+        // Which service, if any, is making this update as its OWN service principal: a
+        // secret another service manages is that service's to change
+        // ([`crate::state::service_owned`]).
+        let requesting_owner =
+            crate::state::service_owned::requesting_owner(&*self.engine, ctx);
         let (target, staged) = {
             let mut store = state.lock();
             let now = ::std::time::SystemTime::now();
@@ -328,6 +333,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &version_id,
                 value.as_ref(),
                 input.kms_key_id.as_deref(),
+                requesting_owner.as_ref(),
             )?;
             // The versions a key change moves to the new key, carried out of the
             // guard with the values they are held as: re-encrypting one is a pair
@@ -386,6 +392,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &version_id,
             value.as_ref(),
             input.kms_key_id.as_deref(),
+            requesting_owner.as_ref(),
         )?;
         // A token that now names a version already holding exactly this value is
         // the same request again: the version it stored stands, and this call only
@@ -475,6 +482,7 @@ fn admit(
     version_id: &str,
     value: Option<&crate::state::envelope::SecretValue>,
     requested_kms_key_id: Option<&str>,
+    requesting_owner: Option<&crate::state::service_owned::OwningService>,
 ) -> Result<Target, UpdateSecretError> {
     let Some(secret) = secret else {
         return Err(UpdateSecretErrorModeled::ResourceNotFoundException(
@@ -491,6 +499,23 @@ fn admit(
         return Err(UpdateSecretErrorModeled::InvalidRequestException(
             InvalidRequestException {
                 message: Some(crate::state::MARKED_FOR_DELETION_MESSAGE.to_string()),
+            },
+        )
+        .into());
+    }
+    // "The secret is managed by another service, and you must use that service to
+    // update it" (`InvalidRequestException`, this service's Smithy model): the
+    // details and the value of a secret another service manages are that service's,
+    // so a caller's update of one is refused before anything is sealed or stored.
+    if let Some(owner) = crate::state::service_owned::refusing_owner(
+        secret.owning_service.as_deref(),
+        requesting_owner,
+    ) {
+        return Err(UpdateSecretErrorModeled::InvalidRequestException(
+            InvalidRequestException {
+                message: Some(
+                    crate::state::service_owned::managed_by_another_service_message(owner),
+                ),
             },
         )
         .into());

@@ -460,7 +460,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // when the secret cannot be deleted: that failure is recorded and the instance
         // still goes ([`crate::state::release_orphaned_master_user_secret`]).
         if let Some(secret_arn) = managed_secret {
-            crate::state::release_orphaned_master_user_secret(ctx, &region, &secret_arn).await;
+            crate::state::release_orphaned_master_user_secret(
+                &*self.engine,
+                ctx,
+                &region,
+                &crate::state::db_instance_arn(&region, &identifier),
+                &secret_arn,
+            )
+            .await;
         }
 
         Ok(DeleteDBInstanceOutput {

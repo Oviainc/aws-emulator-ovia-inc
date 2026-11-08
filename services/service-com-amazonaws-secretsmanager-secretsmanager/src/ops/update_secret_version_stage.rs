@@ -209,6 +209,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
         let region = crate::state::request_region(ctx.parts());
+        // Which service, if any, is making this change as its OWN service principal,
+        // resolved before the store's guard is taken: the staging labels of a secret
+        // another service manages are that service's to move
+        // ([`crate::state::service_owned`]).
+        let requesting_owner =
+            crate::state::service_owned::requesting_owner(&*self.engine, ctx);
         let mut store = state.lock();
         let now = ::std::time::SystemTime::now();
         // The permanent removal the clock has already made due, materialised
@@ -230,6 +236,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // deletion." (`InvalidRequestException`, this service's Smithy model.)
         if secret.scheduled_for_deletion() {
             return Err(marked_for_deletion());
+        }
+        // "The secret is managed by another service, and you must use that service to
+        // update it" (`InvalidRequestException`, this service's Smithy model): which
+        // version of such a secret a staging label names is that service's to decide,
+        // so a caller's change is refused and no label moves.
+        if let Some(owner) = crate::state::service_owned::refusing_owner(
+            secret.owning_service.as_deref(),
+            requesting_owner.as_ref(),
+        ) {
+            return Err(
+                UpdateSecretVersionStageErrorModeled::InvalidRequestException(
+                    InvalidRequestException {
+                        message: Some(
+                            crate::state::service_owned::managed_by_another_service_message(owner),
+                        ),
+                    },
+                )
+                .into(),
+            );
         }
         // A replica tracks its primary: the staging labels of its versions are
         // the primary's, so they are moved there and reach the replica from

@@ -180,6 +180,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )?;
         let state = crate::state::service_state(&*self.engine).ok_or_else(state_unavailable)?;
         let region = crate::state::request_region(ctx.parts());
+        // Which service, if any, is making this call as its OWN service principal,
+        // resolved before the store's guard is taken: the rotation of a secret another
+        // service manages is that service's to cancel ([`crate::state::service_owned`]).
+        let requesting_owner =
+            crate::state::service_owned::requesting_owner(&*self.engine, ctx);
         let mut store = state.lock();
         let now = ::std::time::SystemTime::now();
         store.expire_due(now);
@@ -202,11 +207,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if secret.scheduled_for_deletion() {
             return Err(invalid_request(crate::state::MARKED_FOR_DELETION_MESSAGE));
         }
-        if let Some(owner) = secret.owning_service.clone() {
-            return Err(invalid_request(format!(
-                "You can't perform this operation on the secret because it is managed by \
-                 {owner}, and you must use that service to update it."
-            )));
+        if let Some(owner) = crate::state::service_owned::refusing_owner(
+            secret.owning_service.as_deref(),
+            requesting_owner.as_ref(),
+        ) {
+            return Err(invalid_request(
+                crate::state::service_owned::managed_by_another_service_message(owner),
+            ));
         }
         // A replica tracks its primary, so the rotation of the secret is
         // configured — and cancelled — on the primary.
