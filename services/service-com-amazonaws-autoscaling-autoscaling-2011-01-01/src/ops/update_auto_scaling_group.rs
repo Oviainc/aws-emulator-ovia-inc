@@ -426,7 +426,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // group name keep doing so in their own handlers.
         let Some(group) = state.groups.get(&name) else {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                "AutoScalingGroup name not found - null",
+                crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
             ));
         };
 
@@ -441,10 +441,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         if max_size < min_size {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "The MinSize must be less than or equal to the MaxSize, but MinSize is \
-                 {min_size} and MaxSize is {max_size}"
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::max_below_min_message(max_size, min_size),
+            ));
         }
         if let Some(desired_capacity) = input.desired_capacity {
             if desired_capacity < min_size || desired_capacity > max_size {

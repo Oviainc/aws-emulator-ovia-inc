@@ -437,9 +437,7 @@ async fn an_unacceptable_capacity_is_refused_within_the_model() {
             case: "a group the account does not hold",
             group: "no-such-group",
             desired_capacity: "1",
-            message: "AutoScalingGroup name not found - AutoScalingGroup: no-such-group \
-                      not found"
-                .to_string(),
+            message: "AutoScalingGroup name not found - null".to_string(),
         },
     ];
 

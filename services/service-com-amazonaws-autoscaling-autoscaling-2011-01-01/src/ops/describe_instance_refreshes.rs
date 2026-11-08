@@ -174,6 +174,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         };
 
+        let name = input.auto_scaling_group_name;
+        let wanted = input.instance_refresh_ids.unwrap_or_default();
+
+        let mut state = state.lock();
+        state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
+
+        // `AutoScalingGroupName` is required, and the group it names is what this
+        // read reports from: it is resolved BEFORE any other member of the request
+        // is read, so a request naming no stored group is refused for the group
+        // whatever else it carries — a cursor included.
+        if !state.groups.contains_key(&name) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::absent_group_message(&name),
+            ));
+        }
+
         // The requested cursor: the offset it decodes to, and the token itself, kept so
         // a later refusal can name the token the caller actually submitted.
         let (offset, token) = match input.next_token.clone() {
@@ -193,21 +209,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `MaxRecords` has a documented range; a page size outside it is refused,
         // not quietly reshaped.
         if let Some(max_records) = crate::state::max_records_out_of_range(input.max_records) {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "The MaxRecords value {max_records} is not valid: it must be between 1 and {}",
-                crate::state::MAX_MAX_RECORDS
-            )));
-        }
-
-        let name = input.auto_scaling_group_name;
-        let wanted = input.instance_refresh_ids.unwrap_or_default();
-
-        let mut state = state.lock();
-        state.materialize_due(&*self.engine, ::std::time::SystemTime::now());
-
-        if !state.groups.contains_key(&name) {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::absent_group_message(&name),
+                crate::state::max_records_violation_message(max_records),
             ));
         }
 

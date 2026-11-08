@@ -166,10 +166,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `MaxRecords` has a documented range; a page size outside it is refused,
         // not quietly reshaped.
         if let Some(max_records) = crate::state::max_records_out_of_range(input.max_records) {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "The MaxRecords value {max_records} is not valid: it must be between 1 and {}",
-                crate::state::MAX_MAX_RECORDS
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::max_records_violation_message(max_records),
+            ));
         }
         if wanted.len() > crate::state::max_filter_names(input.max_records) {
             return Err(crate::scaffolded::Scaffolded::validation_error(format!(

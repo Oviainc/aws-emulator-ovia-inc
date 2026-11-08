@@ -450,8 +450,9 @@ async fn a_group_with_no_refresh_in_progress_has_nothing_to_cancel() {
             "ValidationError",
             "case {name:?}: expected the ValidationError code, got {body}"
         );
-        let expected =
-            format!("AutoScalingGroup name not found - AutoScalingGroup: {name} not found");
+        let expected = format!(
+            "AutoScalingGroup name not found - Auto Scaling group with name {name} not found"
+        );
         assert_eq!(
             xml_unescape(&tag_value(&body, "Message")),
             expected,

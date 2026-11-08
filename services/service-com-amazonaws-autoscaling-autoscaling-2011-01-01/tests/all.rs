@@ -19,6 +19,8 @@ mod account_level_reads_publish_service_data;
 mod auto_scaling_group_lifecycle;
 #[path = "all/cancel_instance_refresh.rs"]
 mod cancel_instance_refresh;
+#[path = "all/client_error_refusal_wording.rs"]
+mod client_error_refusal_wording;
 #[path = "all/error_envelope.rs"]
 mod error_envelope;
 #[path = "all/instance_refresh_lifecycle.rs"]

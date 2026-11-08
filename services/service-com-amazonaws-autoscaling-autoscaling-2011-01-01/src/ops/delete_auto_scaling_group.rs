@@ -194,8 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &name,
                 "refused: no such group",
             );
+            // The detail THIS operation reports after the fixed text quotes the name it
+            // was asked for.
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::absent_group_message(&name),
+                crate::state::absent_group_message_quoting_name(&name),
             ));
         };
         let arn = group.arn.clone();
@@ -220,9 +222,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 &name,
                 "refused: deletion protection",
             );
+            // The two sentences Amazon EC2 Auto Scaling states for this refusal: the
+            // first names the protection setting that forbids the delete, which is the
+            // only part filled from the group's own state, and the second is the
+            // remediation it tells the caller to perform. The group's name is not part
+            // of it.
             return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "Cannot delete AutoScalingGroup {name} because its DeletionProtection is set to \
-                 {protection}"
+                "You cannot delete this group because its deletion protection is set to \
+                 {protection}. If you are sure that you want to delete this group, remove \
+                 deletion protection for the group and try again."
             )));
         }
 

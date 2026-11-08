@@ -191,27 +191,55 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // `MaxRecords` has a documented range; a page size outside it is refused,
         // not quietly reshaped.
         if let Some(max_records) = crate::state::max_records_out_of_range(input.max_records) {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "The MaxRecords value {max_records} is not valid: it must be between 1 and {}",
-                crate::state::MAX_MAX_RECORDS
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::max_records_violation_message(max_records),
+            ));
         }
 
+        // Every filter is checked BEFORE a single group is matched, and each refusal is
+        // the sentence the service states for THAT unusable criterion: the four below are
+        // four different refusals, each with its own fixed text, and none of them quotes
+        // anything from the request.
         let filters = input.filters.unwrap_or_default();
-        for filter in &filters {
-            let name = filter.name.as_deref().unwrap_or_default();
-            if !(name == FILTER_TAG_KEY
-                || name == FILTER_TAG_VALUE
-                || name.starts_with(FILTER_TAG_PREFIX))
-            {
-                return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                    "The filter '{name}' is not valid: valid filter names are {FILTER_TAG_KEY}, \
-                     {FILTER_TAG_VALUE} and {FILTER_TAG_PREFIX}<key>"
-                )));
-            }
+        // A filter entry that does not carry a Name at all says nothing about WHICH
+        // criterion it applies, so the attribute is required rather than defaulted.
+        if filters.iter().any(|filter| filter.name.is_none()) {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "The filter criteria isn't valid. The Name attribute is required to specify the \
+                 type of filter being applied.",
+            ));
+        }
+        if filters
+            .iter()
+            .any(|filter| !is_valid_filter_name(filter.name.as_deref().unwrap_or_default()))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
+                "The filter criteria isn't valid. Valid filter types for the Name attribute of \
+                 filters are: {FILTER_TAG_KEY}, {FILTER_TAG_VALUE} and {FILTER_TAG_PREFIX}<key>."
+            )));
+        }
+        // A filter selects by the values it carries, so one carrying none selects
+        // nothing and cannot be applied: the values are required, not ignored.
+        if filters
+            .iter()
+            .any(|filter| filter.values.as_ref().is_none_or(|values| values.is_empty()))
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "The filter criteria isn't valid. The Values attribute and one or more filter \
+                 values are required.",
+            ));
         }
 
         let wanted = input.auto_scaling_group_names.unwrap_or_default();
+        // The documented filter types all select on TAGS, so a request that filters and
+        // also names the groups it wants asks for a criterion on the group's own name,
+        // which is not one of them.
+        if !filters.is_empty() && !wanted.is_empty() {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "The filter criteria isn't valid. Filtering Auto Scaling groups by group name \
+                 isn't supported.",
+            ));
+        }
         if wanted.len() > crate::state::max_filter_names(input.max_records) {
             return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                 "The AutoScalingGroupNames value names {} groups, more than the {} this request \
@@ -261,17 +289,29 @@ const FILTER_TAG_KEY: &str = "tag-key";
 const FILTER_TAG_VALUE: &str = "tag-value";
 const FILTER_TAG_PREFIX: &str = "tag:";
 
+/// Whether a filter names one of the filter types this operation documents: exactly
+/// `tag-key`, exactly `tag-value`, or `tag:` followed by the tag key the filter
+/// selects on.
+///
+/// A name that merely starts like one of them names no filter type: `tag:` with no
+/// key after it selects on nothing, and neither does a name the request left out
+/// altogether, one that differs in case, or one carrying surrounding space.
+fn is_valid_filter_name(name: &str) -> bool {
+    name == FILTER_TAG_KEY
+        || name == FILTER_TAG_VALUE
+        || name
+            .strip_prefix(FILTER_TAG_PREFIX)
+            .is_some_and(|key| !key.is_empty())
+}
+
 /// Whether a group matches one tag filter. A filter's values are joined with OR;
 /// the caller joins the filters themselves with AND, as the model documents.
+///
+/// Every filter reaching here names a documented filter type and carries at least one
+/// value: the handler refuses the others before any group is matched.
 fn matches_filter(group: &crate::state::StoredGroup, filter: &Filter) -> bool {
     let name = filter.name.as_deref().unwrap_or_default();
     let values = filter.values.clone().unwrap_or_default();
-    if values.is_empty() {
-        // A filter carrying no values selects nothing and excludes nothing: the
-        // model gives no rule for the empty list, and refusing it or matching
-        // nothing would both be guesses, so such a filter is ignored.
-        return true;
-    }
     group.tags.iter().any(|tag| {
         let value = tag.value.clone().unwrap_or_default();
         if name == FILTER_TAG_KEY {

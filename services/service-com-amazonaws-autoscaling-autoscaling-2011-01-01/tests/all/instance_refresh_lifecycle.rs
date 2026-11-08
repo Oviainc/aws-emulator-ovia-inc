@@ -548,6 +548,9 @@ async fn an_absent_group_is_refused_by_both_operations() {
         "グループ-ünïcode",
     ];
 
+    // Each operation answers the absent-group refusal in the form IT serves: the read
+    // fills the detail field after the dash with the group it was asked for, while the
+    // refresh leaves that field unfilled.
     for action in ["StartInstanceRefresh", "DescribeInstanceRefreshes"] {
         for name in names {
             let (status, body) = query(&router, action, &[("AutoScalingGroupName", name)]).await;
@@ -560,8 +563,11 @@ async fn an_absent_group_is_refused_by_both_operations() {
                 "ValidationError",
                 "case {action} {name:?}: expected the ValidationError code, got {body}"
             );
-            let expected =
-                format!("AutoScalingGroup name not found - AutoScalingGroup: {name} not found");
+            let expected = if action == "DescribeInstanceRefreshes" {
+                format!("AutoScalingGroup name not found - AutoScalingGroup {name} not found")
+            } else {
+                "AutoScalingGroup name not found - null".to_string()
+            };
             assert_eq!(
                 xml_unescape(&tag_value(&body, "Message")),
                 expected,

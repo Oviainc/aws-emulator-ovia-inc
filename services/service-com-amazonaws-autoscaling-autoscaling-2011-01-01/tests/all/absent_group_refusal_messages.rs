@@ -8,7 +8,8 @@
 //! `UpdateAutoScalingGroup`'s absent-group `ValidationError` message is one constant
 //! sentence whose trailing detail field is the unfilled token, identical for every
 //! group name and every set of members the update carries, while the sibling mutations
-//! that DO name the group in that field keep naming it.
+//! that DO name the group in that field keep naming it (each in the detail form IT
+//! serves — see `client_error_refusal_wording.rs` for the whole set).
 //!
 //! The tables below therefore span what the rule generalises over — the name's length,
 //! character set, case and spelling (including a name spelled like the message's own
@@ -227,7 +228,7 @@ async fn a_stored_group_updates_and_its_deleted_name_is_refused() {
 async fn the_sibling_mutations_still_name_the_missing_group() {
     let router = router_with(new_engine());
 
-    let siblings: [SiblingCase<'_>; 3] = [
+    let siblings: [SiblingCase<'_>; 2] = [
         (
             "a delete naming no such group",
             "DeleteAutoScalingGroup",
@@ -237,11 +238,6 @@ async fn the_sibling_mutations_still_name_the_missing_group() {
             "a forced delete naming no such group",
             "DeleteAutoScalingGroup",
             vec![("ForceDelete", "true")],
-        ),
-        (
-            "a capacity change naming no such group",
-            "SetDesiredCapacity",
-            vec![("DesiredCapacity", "1")],
         ),
     ];
 
@@ -265,7 +261,7 @@ async fn the_sibling_mutations_still_name_the_missing_group() {
             // sentence would satisfy a `contains` check even against a handler that had
             // stopped naming the group.
             let expected =
-                format!("AutoScalingGroup name not found - AutoScalingGroup: {name} not found");
+                format!("AutoScalingGroup name not found - AutoScalingGroup '{name}' not found");
             assert_eq!(
                 message, expected,
                 "case {case:?}: expected the message {expected:?}, got {message:?}"

@@ -184,9 +184,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut state = state.lock();
         state.materialize_due(&*self.engine, now);
 
+        // A name no group answers to is refused with the wording THIS operation
+        // answers with: the detail field after the dash is left unfilled, so the
+        // message carries no part of the request and is the same for every name.
         let Some(group) = state.groups.get(&name) else {
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::absent_group_message(&name),
+                crate::state::ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL,
             ));
         };
         let (min_size, max_size, current) = (group.min_size, group.max_size, group.desired_capacity);

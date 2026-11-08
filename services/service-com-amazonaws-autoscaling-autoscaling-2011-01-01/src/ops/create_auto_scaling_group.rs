@@ -429,15 +429,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )));
             }
         }
-        if input.launch_configuration_name.is_none()
-            && input.launch_template.is_none()
-            && input.mixed_instances_policy.is_none()
-        {
-            return Err(crate::scaffolded::Scaffolded::validation_error(
-                "Valid requests must contain either LaunchTemplate, LaunchConfigurationName, \
-                 InstanceId or MixedInstancesPolicy parameter.",
-            ));
-        }
+        // The group's own size bounds are checked BEFORE the request is checked for a
+        // launch source: a request whose bounds cannot describe a group is refused for
+        // the bounds, whatever else it carries.
         if input.min_size < 0 {
             return Err(crate::scaffolded::Scaffolded::validation_error(format!(
                 "The MinSize must not be negative, but it is {}",
@@ -445,11 +439,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         if input.max_size < input.min_size {
-            return Err(crate::scaffolded::Scaffolded::validation_error(format!(
-                "The MinSize must be less than or equal to the MaxSize, but MinSize is {} and \
-                 MaxSize is {}",
-                input.min_size, input.max_size
-            )));
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                crate::state::max_below_min_message(input.max_size, input.min_size),
+            ));
         }
         let desired_capacity = input.desired_capacity.unwrap_or(input.min_size);
         if desired_capacity < input.min_size || desired_capacity > input.max_size {
@@ -458,6 +450,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                  DesiredCapacity is {desired_capacity} and the range is [{}, {}]",
                 input.min_size, input.max_size
             )));
+        }
+        if input.launch_configuration_name.is_none()
+            && input.launch_template.is_none()
+            && input.mixed_instances_policy.is_none()
+        {
+            return Err(crate::scaffolded::Scaffolded::validation_error(
+                "Valid requests must contain either LaunchTemplate, LaunchConfigurationName, \
+                 InstanceId or MixedInstancesPolicy parameter.",
+            ));
         }
         // The checks above are all RELATIVE, so none of them bounds the absolute
         // size: every unit of capacity is a stored instance, and the service has a

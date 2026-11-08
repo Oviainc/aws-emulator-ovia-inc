@@ -1457,6 +1457,13 @@ pub fn is_valid_max_instance_lifetime(seconds: i32) -> bool {
     seconds == 0 || seconds >= MIN_MAX_INSTANCE_LIFETIME
 }
 
+/// The message the service refuses a request whose maximum group size is below its
+/// minimum with, shared by every operation that sets a group's bounds: the two bounds
+/// in the order it reports them, and nothing else from the request.
+pub fn max_below_min_message(max_size: i32, min_size: i32) -> String {
+    format!("Max bound, {max_size}, must be greater than or equal to min bound, {min_size}")
+}
+
 /// The first of `sizes` past [`MAX_GROUP_CAPACITY`], if any.
 ///
 /// Every operation that sets a group's sizes checks them through this, so one
@@ -1529,11 +1536,35 @@ pub fn group_arn(region: &str, resource_id: &str, name: &str) -> String {
     )
 }
 
-/// The message Amazon EC2 Auto Scaling refuses a request naming a group it does not
-/// hold with, whose detail field names the group that was asked for.
+/// The fixed text every refusal of a request naming a group this service does not hold
+/// starts with. What follows it is the DETAIL the operation reports, which is that
+/// operation's own.
+const ABSENT_GROUP_PREFIX: &str = "AutoScalingGroup name not found - ";
+
+/// The absent-group refusal whose detail names the group as the resource and the name
+/// it was asked for, unquoted.
+///
+/// The name is the only part taken from the request; the rest of the sentence,
+/// punctuation included, is fixed text.
 pub fn absent_group_message(name: &str) -> String {
-    format!("AutoScalingGroup name not found - AutoScalingGroup: {name} not found")
+    format!("{ABSENT_GROUP_PREFIX}AutoScalingGroup {name} not found")
 }
+
+/// The absent-group refusal whose detail QUOTES the name it was asked for.
+pub fn absent_group_message_quoting_name(name: &str) -> String {
+    format!("{ABSENT_GROUP_PREFIX}AutoScalingGroup '{name}' not found")
+}
+
+/// The absent-group refusal whose detail spells the resource out as the service's own
+/// prose name for it.
+pub fn absent_group_message_in_prose(name: &str) -> String {
+    format!("{ABSENT_GROUP_PREFIX}Auto Scaling group with name {name} not found")
+}
+
+/// The absent-group refusal whose detail field the operation leaves unfilled, so it
+/// travels as the literal token `null`: the whole message is fixed text and no part of
+/// the request appears in it.
+pub const ABSENT_GROUP_MESSAGE_WITHOUT_DETAIL: &str = "AutoScalingGroup name not found - null";
 
 /// The launch template specification a launch source names: the one it carries
 /// directly, or the one its mixed instances policy carries.
@@ -1634,6 +1665,21 @@ pub fn max_records_out_of_range(max_records: Option<i32>) -> Option<i32> {
     max_records.filter(|value| *value < 1 || usize::try_from(*value).unwrap_or(usize::MAX) > MAX_MAX_RECORDS)
 }
 
+/// The message a paginated read refuses a `MaxRecords` outside that range with: the
+/// standard sentence the service states for a member value outside its bounds, naming
+/// the member as the wire names it and the bound the value missed.
+pub fn max_records_violation_message(max_records: i32) -> String {
+    let constraint = if max_records < MIN_MAX_RECORDS {
+        format!("Member must have value greater than or equal to {MIN_MAX_RECORDS}")
+    } else {
+        format!("Member must have value less than or equal to {MAX_MAX_RECORDS}")
+    };
+    format!(
+        "1 validation error detected: Value '{max_records}' at 'maxRecords' failed to satisfy \
+         constraint: {constraint}"
+    )
+}
+
 /// The most names a describe may filter by, which the model documents on
 /// `AutoScalingGroupNames`: "By default, you can only specify up to 50 names. You
 /// can optionally increase this limit using the MaxRecords property."
@@ -1652,3 +1698,7 @@ pub const DEFAULT_MAX_RECORDS: usize = 50;
 
 /// The largest `MaxRecords` the service honours (same documentation).
 pub const MAX_MAX_RECORDS: usize = 100;
+
+/// The smallest `MaxRecords` a request may ask for: a page holds items, so it holds at
+/// least one.
+pub const MIN_MAX_RECORDS: i32 = 1;

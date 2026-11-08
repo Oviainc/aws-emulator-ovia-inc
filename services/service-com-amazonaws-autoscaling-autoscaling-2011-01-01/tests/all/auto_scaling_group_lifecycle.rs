@@ -1116,13 +1116,6 @@ async fn tag_filters_select_the_groups_that_carry_the_tags() {
             ],
             vec![],
         ),
-        (
-            // The model gives no rule for a filter with no values, so such a
-            // filter neither selects nor excludes: it is ignored.
-            "a filter carrying no values is ignored",
-            vec![("Filters.member.1.Name", "tag-key")],
-            vec!["tagged-prod", "tagged-team", "tagged-test"],
-        ),
     ];
 
     for (case, params, expected) in cases {

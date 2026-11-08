@@ -179,8 +179,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         state.materialize_due(&*self.engine, now);
 
         if !state.groups.contains_key(&name) {
+            // The detail THIS operation reports after the fixed text names the resource
+            // in the service's own prose.
             return Err(crate::scaffolded::Scaffolded::validation_error(
-                crate::state::absent_group_message(&name),
+                crate::state::absent_group_message_in_prose(&name),
             ));
         }
 
