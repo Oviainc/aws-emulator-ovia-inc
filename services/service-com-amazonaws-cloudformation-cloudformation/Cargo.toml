@@ -137,6 +137,12 @@ service-com-amazonaws-iot-awsiotservice = { workspace = true }
 # invoke a function behind it — must have its owning service mounted beside CloudFormation,
 # or the create is refused and the stack fails.
 service-com-amazonaws-apigatewayv2-apigatewayv2 = { workspace = true }
+# Amazon API Gateway, for the `AWS::ApiGateway::RestApi` and the resources, methods,
+# deployment and stage of it a stack really creates there
+# (`state::provisioning::apigateway_rest_api`): a suite that deploys a REST API — including
+# the one the AWS SAM transform synthesizes — must have its owning service mounted beside
+# CloudFormation, or the create is refused and the stack fails.
+service-com-amazonaws-apigateway-backplanecontrolservice = { workspace = true }
 # Amazon Kinesis, for the data stream an `AWS::DynamoDB::Table`'s
 # `KinesisStreamSpecification` replicates its changes to: DynamoDB resolves that ARN against
 # the Kinesis service's own stream registry, so a suite that declares one must create the

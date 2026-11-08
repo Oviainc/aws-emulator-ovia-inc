@@ -9537,6 +9537,7 @@ dependencies = [
  "quick-xml",
  "regex",
  "serde_json",
+ "service-com-amazonaws-apigateway-backplanecontrolservice",
  "service-com-amazonaws-apigatewayv2-apigatewayv2",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-codepipeline-codepipeline-20150709",

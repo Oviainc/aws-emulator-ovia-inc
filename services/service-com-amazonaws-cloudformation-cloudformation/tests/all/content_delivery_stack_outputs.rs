@@ -34,9 +34,13 @@ use service_com_amazonaws_cloudformation_cloudformation::state::status;
 /// E74FTE3AJFJ256A").
 const CLOUDFRONT_ID_BODY: usize = 13;
 
-/// How many characters an API Gateway-assigned identifier carries: the width of the
-/// `RestApi`, `Resource` and `Deployment` ids API Gateway mints.
+/// How many characters an API Gateway-assigned identifier carries: ten for an identifier of
+/// the ACCOUNT — a `RestApi`'s own id, and the root resource that create mints beside it —
+/// and six for one of a record created INSIDE an api, a `Resource` or a `Deployment`. These
+/// are the widths that service mints, which are the identifiers in force: a stack creates the
+/// api in API Gateway, and what `Ref` returns is the id that service assigned.
 const APIGATEWAY_ID_LEN: usize = 10;
+const APIGATEWAY_SUB_RESOURCE_ID_LEN: usize = 6;
 
 /// How many lowercase hexadecimal characters an Amazon S3 canonical user id carries.
 const CANONICAL_USER_ID_LEN: usize = 64;
@@ -61,9 +65,24 @@ fn is_cloudfront_domain_name(value: &str) -> bool {
         .is_some_and(|label| is_lower_hex(label, CLOUDFRONT_ID_BODY))
 }
 
-/// Whether `value` is an identifier of the shape API Gateway assigns one in.
+/// Whether `value` is an identifier of the shape API Gateway assigns one in: `width`
+/// lowercase alphanumeric characters.
+fn is_apigateway_id_of(value: &str, width: usize) -> bool {
+    value.chars().count() == width
+        && value
+            .chars()
+            .all(|c| c.is_ascii_digit() || c.is_ascii_lowercase())
+}
+
+/// Whether `value` is an identifier of the shape API Gateway assigns a record of the ACCOUNT.
 fn is_apigateway_id(value: &str) -> bool {
-    is_lower_hex(value, APIGATEWAY_ID_LEN)
+    is_apigateway_id_of(value, APIGATEWAY_ID_LEN)
+}
+
+/// Whether `value` is an identifier of the shape API Gateway assigns a record created INSIDE
+/// one api.
+fn is_apigateway_sub_resource_id(value: &str) -> bool {
+    is_apigateway_id_of(value, APIGATEWAY_SUB_RESOURCE_ID_LEN)
 }
 
 /// Whether `value` is a canonical UUID with the version-4 and RFC 4122 variant bits set,
@@ -282,7 +301,13 @@ fn cases() -> Vec<Case> {
                    "Properties":{"RestApiId":{"Ref":"Api"},
                      "ParentId":{"Fn::GetAtt":["Api","RootResourceId"]},
                      "PathPart":"items"}},
+                 "Method":{"Type":"AWS::ApiGateway::Method",
+                   "Properties":{"RestApiId":{"Ref":"Api"},
+                     "ResourceId":{"Ref":"Resource"},"HttpMethod":"GET",
+                     "AuthorizationType":"NONE",
+                     "Integration":{"Type":"MOCK"}}},
                  "Deployment":{"Type":"AWS::ApiGateway::Deployment",
+                   "DependsOn":["Method"],
                    "Properties":{"RestApiId":{"Ref":"Api"}}},
                  "Stage":{"Type":"AWS::ApiGateway::Stage",
                    "Properties":{"RestApiId":{"Ref":"Api"},"StageName":"prod",
@@ -311,19 +336,19 @@ fn cases() -> Vec<Case> {
                 ),
                 (
                     "ResourceRef",
-                    form("10 lowercase characters", is_apigateway_id),
+                    form("6 lowercase characters", is_apigateway_sub_resource_id),
                 ),
                 (
                     "ResourceId",
-                    form("10 lowercase characters", is_apigateway_id),
+                    form("6 lowercase characters", is_apigateway_sub_resource_id),
                 ),
                 (
                     "DeploymentRef",
-                    form("10 lowercase characters", is_apigateway_id),
+                    form("6 lowercase characters", is_apigateway_sub_resource_id),
                 ),
                 (
                     "DeploymentId",
-                    form("10 lowercase characters", is_apigateway_id),
+                    form("6 lowercase characters", is_apigateway_sub_resource_id),
                 ),
                 // "Ref returns the stage name" — the one this type's template states.
                 ("StageRef", Expect::Exact("prod".to_string())),

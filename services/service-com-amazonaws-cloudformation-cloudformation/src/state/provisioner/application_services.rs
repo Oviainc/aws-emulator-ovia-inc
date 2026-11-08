@@ -1392,7 +1392,7 @@ pub(super) fn rolled_back(refusal: Refusal, removal: Result<(), Refusal>, noun: 
 /// keys re-cased too, and no property of the type above carries one.
 ///
 /// `depth` is how many levels are already above this one, as in [`camel_cased`].
-pub(super) fn lower_camel_members(value: &Value, depth: usize) -> Result<Value, Refusal> {
+pub(crate) fn lower_camel_members(value: &Value, depth: usize) -> Result<Value, Refusal> {
     // No member of these types is spelled anything but the property with its initial
     // letter lower-cased, so the walk carries no exceptions.
     renamed_members(value, depth, &[])
@@ -1752,7 +1752,7 @@ pub(super) fn queue_attributes(properties: &Value) -> Map<String, Value> {
 /// other member whose value a template may declare as a document while the called operation
 /// takes its TEXT — an api's inline OpenAPI definition among them
 /// ([`import_apigatewayv2_api`]).
-pub(super) fn attribute_text(value: &Value) -> String {
+pub(crate) fn attribute_text(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         other => other.to_string(),
@@ -2088,7 +2088,7 @@ pub(super) fn tags_as_list(tags: &[(String, String)], members: (&str, &str)) -> 
 
 /// A tag set as the MAP of tag key to value a creating API that takes one takes (Amazon
 /// SQS's `tags`, AWS FIS's `tags`).
-pub(super) fn tags_as_map(tags: &[(String, String)]) -> Map<String, Value> {
+pub(crate) fn tags_as_map(tags: &[(String, String)]) -> Map<String, Value> {
     tags.iter()
         .map(|(key, value)| (key.clone(), Value::String(value.clone())))
         .collect()

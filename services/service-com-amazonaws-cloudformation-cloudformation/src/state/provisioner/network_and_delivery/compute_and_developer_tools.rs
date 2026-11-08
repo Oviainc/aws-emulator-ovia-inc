@@ -1126,7 +1126,7 @@ pub(crate) async fn import_apigatewayv2_api(
 /// is this resource's identity, and the `ApiEndpoint` it serves the api on, which is the
 /// attribute the type publishes. One spelling for both calls, which answer the same api.
 pub(crate) fn apigatewayv2_api_created(answered: &Value, operation: &str) -> Result<Created, Refusal> {
-    let api_id = apigatewayv2_answered(answered, "apiId", operation)?;
+    let api_id = api_gateway_answered(answered, "apiId", operation)?;
     let mut attributes = BTreeMap::new();
     if let Some(endpoint) = answered.get("apiEndpoint").and_then(Value::as_str) {
         attributes.insert("ApiEndpoint".to_string(), endpoint.to_string());
@@ -1348,7 +1348,7 @@ pub(crate) async fn create_apigatewayv2_api_mapping(
         Some(&request),
     )
     .await?;
-    let api_mapping_id = apigatewayv2_answered(&answered, "apiMappingId", "CreateApiMapping")?;
+    let api_mapping_id = api_gateway_answered(&answered, "apiMappingId", "CreateApiMapping")?;
     let mut attributes = BTreeMap::new();
     attributes.insert("ApiMappingId".to_string(), api_mapping_id.clone());
     Ok(Created {
@@ -1651,7 +1651,7 @@ pub(crate) async fn create_apigatewayv2_child(
         return Ok(Created::attributes(BTreeMap::new()));
     };
     Ok(Created {
-        physical_resource_id: Some(apigatewayv2_answered(&answered, member, operation)?),
+        physical_resource_id: Some(api_gateway_answered(&answered, member, operation)?),
         attributes: BTreeMap::new(),
     })
 }
@@ -1812,10 +1812,14 @@ pub(crate) fn api_gateway_request(
     Ok(Value::Object(request))
 }
 
-/// One identifier an API Gateway v2 create answered, or the failure a create that answered
-/// 2xx WITHOUT it is reported as: nothing addresses the resource without that id, so it is
-/// never recorded with a physical id nothing minted.
-pub(crate) fn apigatewayv2_answered(
+/// One identifier an API Gateway create answered, or the failure a create that answered 2xx
+/// WITHOUT it is reported as: nothing addresses the resource without that id, so it is never
+/// recorded with a physical id nothing minted.
+///
+/// Shared by both API Gateway control planes, which each answer the id they assigned under a
+/// member of their own ([`apigatewayv2_api_created`],
+/// [`crate::state::provisioning::apigateway_rest_api`]).
+pub(crate) fn api_gateway_answered(
     answered: &Value,
     member: &str,
     operation: &str,
@@ -1827,7 +1831,7 @@ pub(crate) fn apigatewayv2_answered(
         .map(ToString::to_string)
         .ok_or_else(|| Refusal {
             code: UNIDENTIFIED_FAILURE.to_string(),
-            message: format!("API Gateway v2 answered {operation} without a {member}"),
+            message: format!("API Gateway answered {operation} without a {member}"),
         })
 }
 

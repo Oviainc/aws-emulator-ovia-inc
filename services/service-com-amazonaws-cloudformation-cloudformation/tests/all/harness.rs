@@ -123,6 +123,15 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
             &engine,
         )),
     );
+    // Amazon API Gateway, for the `AWS::ApiGateway::RestApi` a stack really creates there —
+    // including the one the AWS SAM transform synthesizes — and for the resources, methods,
+    // deployment and stage of it, so a suite that deploys a REST API reads the api back
+    // through that service's own wire.
+    router.register_service(
+        service_com_amazonaws_apigateway_backplanecontrolservice::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
     // Amazon Kinesis, for the data stream an `AWS::DynamoDB::Table`'s
     // `KinesisStreamSpecification` names: DynamoDB resolves that ARN against this service's
     // own stream registry when it starts replicating, so a suite that declares one creates

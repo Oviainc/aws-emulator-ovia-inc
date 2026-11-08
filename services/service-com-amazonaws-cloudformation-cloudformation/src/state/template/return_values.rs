@@ -1658,6 +1658,20 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
 /// the record name", which is the `Name` its own declaration states.)
 pub fn identity_is_service_assigned(resource_type: &str) -> bool {
     resource_type == APIGATEWAYV2_API
+        // A REST API, a resource of one and a deployment of it are three more, for the same
+        // reason the API Gateway v2 types below are: `CreateRestApi`, `CreateResource` and
+        // `CreateDeployment` each take no identifier for the resource they make and answer
+        // the `id` that service assigned, and each type's `Ref` returns that id — the `Name`
+        // an api declares is only what the api is called, a resource declares only its path
+        // segment and a deployment declares no name at all, and every call on one takes the
+        // minted id (`GetRestApi$restApiId`, `PutMethod$resourceId`,
+        // `Stage$deploymentId`). (An `AWS::ApiGateway::Stage` is NOT one of them: "Ref
+        // returns the stage name", which its own declaration states, and neither is an
+        // `AWS::ApiGateway::Method`, which API Gateway addresses by the api, the resource and
+        // the verb rather than by an id of its own.)
+        || resource_type == APIGATEWAY_REST_API
+        || resource_type == APIGATEWAY_RESOURCE
+        || resource_type == APIGATEWAY_DEPLOYMENT
         // An Amazon EKS pod identity association is one more: that create takes no
         // identifier and answers the ARN and the id Amazon EKS minted for the association,
         // and "Ref returns the association ARN" — a template declares the cluster, the

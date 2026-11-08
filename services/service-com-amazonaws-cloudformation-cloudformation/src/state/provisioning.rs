@@ -198,6 +198,7 @@ use serde_json::Value;
 use super::provisioner::{provisioner_for, Provisioner};
 use super::StoredResource;
 
+mod apigateway_rest_api;
 mod cognito_identity_pool;
 /// `AWS::DynamoDB::Table`: visible to the rest of this service's state because the type's
 /// own NAME lives here, beside the arm that provisions it, and more than one module answers
@@ -672,6 +673,11 @@ pub(super) enum Owner {
     /// `AWS::StepFunctions::StateMachine`, whose arms are
     /// [`step_functions_state_machine`]'s.
     StepFunctionsStateMachine,
+    /// One of the five `AWS::ApiGateway::*` types a REST API is built out of, which
+    /// [`apigateway_rest_api`] creates in Amazon API Gateway: the api, a resource of it, a
+    /// method on that resource, a deployment of them and the stage that serves it. Which of
+    /// them it is travels with the owner, as it does for the Amazon EC2 types above.
+    ApiGatewayRestApi(apigateway_rest_api::Kind),
 }
 
 /// The owner of a template resource type, or `None` for a type this emulator leaves
@@ -718,6 +724,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if resource_type == step_functions_state_machine::STEP_FUNCTIONS_STATE_MACHINE {
         return Some(Owner::StepFunctionsStateMachine);
+    }
+    if let Some(kind) = apigateway_rest_api::kind_of(resource_type) {
+        return Some(Owner::ApiGatewayRestApi(kind));
     }
     provisioner_for(resource_type).map(Owner::Builtin)
 }
@@ -806,6 +815,9 @@ impl Owner {
             Self::StepFunctionsStateMachine => {
                 step_functions_state_machine::create(ctx, region, resource, propagated).await
             }
+            Self::ApiGatewayRestApi(kind) => {
+                apigateway_rest_api::create(ctx, region, kind, resource, propagated).await
+            }
         }
     }
 
@@ -867,6 +879,11 @@ impl Owner {
                 Box::pin(nested_stack::readiness(ctx, region, physical_resource_id)).await
             }
             Self::StepFunctionsStateMachine => Ok(step_functions_state_machine::readiness()),
+            // Each of these resources EXISTS from the moment its create answers: API Gateway
+            // reports no state an api, a resource, a method, a deployment or a stage is still
+            // coming up in — a stage serves the deployment it points at as soon as the create
+            // that made it has answered.
+            Self::ApiGatewayRestApi(_) => Ok(Readiness::Ready),
         }
     }
 
@@ -923,6 +940,10 @@ impl Owner {
             // A state machine's `Arn` and `Name` are the ones its own create answered with,
             // so there is nothing left to read once the resource is up.
             Self::StepFunctionsStateMachine => Ok(BTreeMap::new()),
+            // An api's id and its root resource, and the id of a resource or a deployment, are
+            // the ones their own creates answered with, so there is nothing left to read once
+            // the resource is up.
+            Self::ApiGatewayRestApi(_) => Ok(BTreeMap::new()),
         }
     }
 
@@ -981,6 +1002,10 @@ impl Owner {
             Self::StepFunctionsStateMachine => {
                 step_functions_state_machine::removal(ctx, region, physical_resource_id).await
             }
+            // Every API Gateway delete here takes the resource away as it answers: that
+            // service reports no state a deleted api, resource, method, deployment or stage is
+            // still being removed in.
+            Self::ApiGatewayRestApi(_) => Ok(Removal::Gone),
         }
     }
 
@@ -1071,6 +1096,12 @@ impl Owner {
                 step_functions_state_machine::update(ctx, region, resource, declared, propagated)
                     .await
             }
+            // A CHANGED declaration of one of these is applied by no arm here yet: API Gateway
+            // changes an api, a method and a stage through its own PATCH calls, which this
+            // module makes only for the settings a create could not carry — so a changed
+            // declaration is reported as NOT applied rather than as a success that dropped the
+            // caller's change.
+            Self::ApiGatewayRestApi(_) => Ok(None),
         }
     }
 
@@ -1139,6 +1170,9 @@ impl Owner {
             // The tags of a state machine that already exists are reconciled by no arm here
             // yet ([`Provisioner::retag`]'s own default), so nothing is asked about them.
             Self::StepFunctionsStateMachine => Ok(()),
+            // Nor are the tags of an api or a stage that already exists ([`Provisioner::retag`]'s
+            // own default), so nothing is asked about those either.
+            Self::ApiGatewayRestApi(_) => Ok(()),
         }
     }
 
@@ -1218,6 +1252,12 @@ impl Owner {
             Self::StepFunctionsStateMachine => {
                 step_functions_state_machine::delete(ctx, region, resource).await
             }
+            // API Gateway takes no snapshot of an api, a resource, a method, a deployment or a
+            // stage on the way out: there is no such call, so a `Snapshot` deletion policy on
+            // one of them deletes the resource with no snapshot invented for it.
+            Self::ApiGatewayRestApi(kind) => {
+                apigateway_rest_api::delete(ctx, region, kind, resource).await
+            }
         }
     }
 
@@ -1293,6 +1333,9 @@ impl Owner {
                 )
                 .await
             }
+            Self::ApiGatewayRestApi(kind) => {
+                apigateway_rest_api::actual_configuration(ctx, region, kind, resource).await
+            }
         }
     }
 
@@ -1323,6 +1366,8 @@ impl Owner {
             Self::NestedStack => message.to_string(),
             // AWS Step Functions' does the same.
             Self::StepFunctionsStateMachine => message.to_string(),
+            // Amazon API Gateway's does the same.
+            Self::ApiGatewayRestApi(_) => message.to_string(),
         }
     }
 }
@@ -4110,6 +4155,37 @@ pub(super) async fn call_rest_json(
         None => Vec::new(),
     };
     let headers = vec![("content-type", REST_JSON.to_string())];
+    let (status, answer) = dispatch(ctx, signing_name, region, method, uri, headers, payload)
+        .await
+        .map_err(|message| Refusal {
+            code: "InternalFailure".to_string(),
+            message,
+        })?;
+    let document: Value = serde_json::from_slice(&answer).unwrap_or(Value::Null);
+    if (200..300).contains(&status) {
+        return Ok(document);
+    }
+    Err(refusal_of(signing_name, status, &document))
+}
+
+/// [`call_rest_json`] for an operation whose input is an `@httpPayload`: the bytes the
+/// caller passes ARE the request's body, under the media type that payload is sent as.
+///
+/// A REST operation that binds a member as its payload takes that member's bytes alone —
+/// API Gateway's `ImportRestApi` takes an OpenAPI document that way — so the request cannot
+/// be written as a JSON envelope of members. What comes back is the operation's own answer
+/// document, read exactly as [`call_rest_json`] reads one, and a refusal is that service's
+/// own.
+pub(super) async fn call_rest_payload(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    signing_name: &str,
+    region: &str,
+    method: &'static str,
+    uri: &str,
+    media_type: &str,
+    payload: Vec<u8>,
+) -> Result<Value, Refusal> {
+    let headers = vec![("content-type", media_type.to_string())];
     let (status, answer) = dispatch(ctx, signing_name, region, method, uri, headers, payload)
         .await
         .map_err(|message| Refusal {
