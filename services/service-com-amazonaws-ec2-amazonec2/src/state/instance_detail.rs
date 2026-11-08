@@ -285,25 +285,19 @@ impl InstanceDetail {
         )?
         .or(defaults.instance_metadata_tags)
         .unwrap_or(METADATA_TAGS_DISABLED);
-        let http_put_response_hop_limit =
-            match metadata.and_then(|options| options.http_put_response_hop_limit) {
-                Some(hop_limit)
-                    if !(MIN_METADATA_HOP_LIMIT..=MAX_METADATA_HOP_LIMIT).contains(&hop_limit) =>
-                {
-                    return Err(invalid_parameter_value(format!(
-                        "Value ({hop_limit}) for parameter HttpPutResponseHopLimit is \
-                         invalid. Expecting {MIN_METADATA_HOP_LIMIT}-{MAX_METADATA_HOP_LIMIT}."
-                    )));
-                }
-                Some(hop_limit) => hop_limit,
-                None => defaults
-                    .http_put_response_hop_limit
-                    .unwrap_or(if imds_v2_only {
-                        IMDS_V2_METADATA_HOP_LIMIT
-                    } else {
-                        DEFAULT_METADATA_HOP_LIMIT
-                    }),
-            };
+        let http_put_response_hop_limit = match requested_metadata_hop_limit(
+            metadata.and_then(|options| options.http_put_response_hop_limit),
+            launch_hop_limit_out_of_range,
+        )? {
+            Some(hop_limit) => hop_limit,
+            None => defaults
+                .http_put_response_hop_limit
+                .unwrap_or(if imds_v2_only {
+                    IMDS_V2_METADATA_HOP_LIMIT
+                } else {
+                    DEFAULT_METADATA_HOP_LIMIT
+                }),
+        };
         Ok(Self {
             http_tokens,
             http_put_response_hop_limit,
@@ -376,6 +370,71 @@ impl InstanceDetail {
             METADATA_OPTIONS_STATE_PENDING
         }
     }
+
+    /// These metadata options as the modelled response shape reports them at `now`.
+    ///
+    /// The ONE reading of the stored options, so the instance report and the answer a
+    /// modify of them gives cannot disagree about one instance: both the `Instance` view
+    /// ([`ComAmazonawsEc2Amazonec2State::report_instance_detail`]) and
+    /// `ModifyInstanceMetadataOptions` report them from here.
+    pub fn metadata_options_at(&self, now: Instant) -> InstanceMetadataOptionsResponse {
+        InstanceMetadataOptionsResponse {
+            state: Some(self.metadata_options_state_at(now).to_string()),
+            http_tokens: Some(self.http_tokens.to_string()),
+            http_put_response_hop_limit: Some(self.http_put_response_hop_limit),
+            http_endpoint: Some(self.http_endpoint.to_string()),
+            http_protocol_ipv6: Some(self.http_protocol_ipv6.to_string()),
+            instance_metadata_tags: Some(self.instance_metadata_tags.to_string()),
+        }
+    }
+
+    /// Start the move the clock owes a CHANGE of these options: they are `pending`, "being
+    /// updated and the instance is not ready to process metadata traffic with the new
+    /// selection" (`InstanceMetadataOptionsResponse$State`), until the span every
+    /// clock-owed move of this crate takes ([`TRANSITION_DELAY`]) has passed, and `applied`
+    /// from that instant on. The due instant is stored; nothing sleeps for it.
+    pub fn metadata_options_changed(&mut self) {
+        self.metadata_applied_at = due_instant(TRANSITION_DELAY);
+    }
+}
+
+/// The `HttpPutResponseHopLimit` a request asks for, or `None` when it asked for none —
+/// and the refusal `out_of_range` words for a hop count outside the range the member
+/// publishes.
+///
+/// "Possible values: Integers from `1` to `64`"
+/// (`InstanceMetadataOptionsRequest$HttpPutResponseHopLimit`, carried here as
+/// [`MIN_METADATA_HOP_LIMIT`] and [`MAX_METADATA_HOP_LIMIT`]): the member targets a plain
+/// `Integer` with no modelled `@range`, so this is the only place that range is enforced,
+/// and it is shared by every operation that accepts the member — a launch
+/// ([`InstanceDetail::launched`]) and a modify of one instance's options alike — so they
+/// cannot state different limits.
+///
+/// The SENTENCE is the caller's, the way [`require_instance_record_worded`]'s is: EC2 does
+/// not word this refusal the same way on every operation that carries the member, and which
+/// wording an operation answers is a fact of that operation, recorded by its caller. The
+/// RULE is one, so it lives here once.
+pub fn requested_metadata_hop_limit<E>(
+    requested: Option<i32>,
+    out_of_range: impl Fn(i32) -> Scaffolded<E>,
+) -> Result<Option<i32>, Scaffolded<E>> {
+    match requested {
+        Some(hop_limit)
+            if !(MIN_METADATA_HOP_LIMIT..=MAX_METADATA_HOP_LIMIT).contains(&hop_limit) =>
+        {
+            Err(out_of_range(hop_limit))
+        }
+        requested => Ok(requested),
+    }
+}
+
+/// The hop-limit refusal a LAUNCH answers: `InvalidParameterValue` in the wording EC2's
+/// parameter layer gives a member's invalid value, naming the value and the range.
+pub fn launch_hop_limit_out_of_range<E>(hop_limit: i32) -> Scaffolded<E> {
+    invalid_parameter_value(format!(
+        "Value ({hop_limit}) for parameter HttpPutResponseHopLimit is invalid. \
+         Expecting {MIN_METADATA_HOP_LIMIT}-{MAX_METADATA_HOP_LIMIT}."
+    ))
 }
 
 /// What one launch asks the instance detail to be, as the handler serving that launch reads
@@ -420,7 +479,11 @@ pub struct InstanceDetailSpec<'request> {
 /// way EC2 words a member's invalid value, with the caller's own value bounded by the one
 /// echo every refusal of this crate quotes a request value through
 /// ([`echoed_resource_id`]).
-fn requested_word<E>(
+///
+/// Shared with the handlers that accept one of those words on a MODIFY of what a launch
+/// chose, so a value outside a member's catalog is refused the same way wherever it
+/// arrives.
+pub fn requested_word<E>(
     member: &str,
     requested: Option<&str>,
     catalog: &'static [&'static str],
@@ -607,15 +670,9 @@ impl ComAmazonawsEc2Amazonec2State {
             spread_domain: None,
         });
 
-        // The option sets the launch chose, reported back from the record that stored them.
-        view.metadata_options = Some(InstanceMetadataOptionsResponse {
-            state: Some(detail.metadata_options_state_at(now).to_string()),
-            http_tokens: Some(detail.http_tokens.to_string()),
-            http_put_response_hop_limit: Some(detail.http_put_response_hop_limit),
-            http_endpoint: Some(detail.http_endpoint.to_string()),
-            http_protocol_ipv6: Some(detail.http_protocol_ipv6.to_string()),
-            instance_metadata_tags: Some(detail.instance_metadata_tags.to_string()),
-        });
+        // The option sets the launch chose (and a modify of them since), reported back
+        // from the record that stored them.
+        view.metadata_options = Some(detail.metadata_options_at(now));
         view.enclave_options = Some(EnclaveOptions {
             enabled: Some(detail.enclave_enabled),
         });

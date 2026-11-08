@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ModifyInstanceMetadataOptions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ModifyInstanceMetadataOptions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ModifyInstanceMetadataOptions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Modifies the instance metadata service (IMDS) options of ONE instance
+//! ([`crate::state::InstanceDetail`], the settings part of that instance's record), where
+//! `DescribeInstances` reports them back as `Instance$MetadataOptions`.
+//!
+//! Each member of the request names one option: a value from that member's own catalog
+//! sets it, and a member the request leaves out leaves that option exactly as it stands
+//! ("if this parameter is not specified, the existing state is maintained"). A change the
+//! request asks for is `pending` until the clock carries it onto the instance, and
+//! `applied` from then on ([`crate::state::InstanceDetail::metadata_options_changed`]).
 //!
 //! ## Shape of an operation
 //!
@@ -97,6 +98,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+use crate::scaffolded::Scaffolded;
+use crate::state;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -148,6 +151,26 @@ impl<Eng> ModifyInstanceMetadataOptions<Eng> {
     }
 }
 
+/// Refuse a hop limit outside the range `HttpPutResponseHopLimit` publishes, in the wording
+/// this operation answers: HTTP 400 `InvalidParameterValue` naming the value the request
+/// sent and the range it has to be inside, and asking the caller to try again.
+///
+/// EC2 does not word this refusal the same way on every operation that carries the member —
+/// a launch answers the parameter layer's own sentence
+/// ([`state::launch_hop_limit_out_of_range`]) — so the sentence lives with the operation
+/// that answers it while the RANGE stays in the one helper both enforce it with
+/// ([`state::requested_metadata_hop_limit`]), and the bounds are interpolated from
+/// [`state::MIN_METADATA_HOP_LIMIT`] and [`state::MAX_METADATA_HOP_LIMIT`] rather than
+/// written into the text, so the message and the check can never state different limits.
+fn invalid_hop_limit<E>(hop_limit: i32) -> crate::scaffolded::Scaffolded<E> {
+    state::invalid_parameter_value(format!(
+        "A value of '{hop_limit}' is not valid for HttpPutResponseHopLimit. Specify a value \
+         between {min} and {max} and try again.",
+        min = state::MIN_METADATA_HOP_LIMIT,
+        max = state::MAX_METADATA_HOP_LIMIT,
+    ))
+}
+
 impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_runtime::Operation
     for ModifyInstanceMetadataOptions<Eng>
 {
@@ -165,18 +188,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ModifyInstanceMetadataOptions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ModifyInstanceMetadataOptionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ModifyInstanceMetadataOptions"))
+        // Which instance's options change is a fact of the id the request names, and the
+        // options themselves come off the request: nothing here depends on the request's
+        // headers or URI.
+        let _ = ctx;
+
+        // Every option the request asks for, resolved against the catalog of that member's
+        // own modelled enum — so what reaches the store is a catalog member, never the
+        // request's own text. `None` is "the request left this member out", which asks for
+        // no change: "if this parameter is not specified, the existing state is
+        // maintained" (`$HttpEndpoint`, `$HttpPutResponseHopLimit`, `$HttpTokens`).
+        let http_tokens = state::requested_word(
+            "HttpTokens",
+            input.http_tokens.as_deref(),
+            HTTP_TOKENS_STATE_VALUES,
+        )?;
+        let http_endpoint = state::requested_word(
+            "HttpEndpoint",
+            input.http_endpoint.as_deref(),
+            INSTANCE_METADATA_ENDPOINT_STATE_VALUES,
+        )?;
+        let http_protocol_ipv6 = state::requested_word(
+            "HttpProtocolIpv6",
+            input.http_protocol_ipv6.as_deref(),
+            INSTANCE_METADATA_PROTOCOL_STATE_VALUES,
+        )?;
+        let instance_metadata_tags = state::requested_word(
+            "InstanceMetadataTags",
+            input.instance_metadata_tags.as_deref(),
+            INSTANCE_METADATA_TAGS_STATE_VALUES,
+        )?;
+        // The published range of the member, enforced by the one helper a launch enforces
+        // it with, so the two cannot state different limits, in this operation's own
+        // wording of the refusal.
+        let hop_limit = state::requested_metadata_hop_limit(
+            input.http_put_response_hop_limit,
+            invalid_hop_limit,
+        )?;
+
+        let service_state = state::require_service_state(&*self.engine)?;
+        let mut store = service_state.lock();
+        // Which state an instance is in is a fact of where the clock stands, so every move
+        // it already owed is materialised before one is read: the refusal below is answered
+        // from the state the instance is in now, not the one it was left in.
+        store.materialize_due_transitions();
+
+        // Malformed before unknown, the order this service resolves an instance id in.
+        let instance = state::require_instance_record(&store, &input.instance_id)?;
+        // "Modify the instance metadata parameters on a RUNNING OR STOPPED instance": an
+        // instance on its way to `terminated`, or already there, has no metadata service
+        // left to configure, while `pending` and `stopping` are transient states on their
+        // way to exactly `running` and `stopped`, so this service's own lifecycle spans
+        // never refuse a modify.
+        if instance.state.is_terminating() {
+            return Err(Scaffolded::incorrect_instance_state(
+                &input.instance_id,
+                "modified",
+            ));
+        }
+        // The id is read back off the record the lookup resolved, so the answer reports the
+        // stored instance rather than the request's text.
+        let instance_id = instance.instance_id.clone();
+
+        // DryRun sits after every refusal above and before the one write: "if you have the
+        // required permissions, the error response is DryRunOperation" (`$DryRun`), so a
+        // request that would have been refused is refused with that reason instead, and one
+        // that would have succeeded leaves the instance's options exactly where they were.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        let Some(instance) = store.instances.get_mut(&instance_id) else {
+            return Err(Scaffolded::invalid_instance_id_not_found(&instance_id));
+        };
+        let detail = &mut instance.detail;
+        // Exactly the options the request named are written; every other one is left as it
+        // stands.
+        if let Some(value) = http_tokens {
+            detail.http_tokens = value;
+        }
+        if let Some(value) = hop_limit {
+            detail.http_put_response_hop_limit = value;
+        }
+        if let Some(value) = http_endpoint {
+            detail.http_endpoint = value;
+        }
+        if let Some(value) = http_protocol_ipv6 {
+            detail.http_protocol_ipv6 = value;
+        }
+        if let Some(value) = instance_metadata_tags {
+            detail.instance_metadata_tags = value;
+        }
+        // "When you modify the parameters on a running instance, the API responds with a
+        // state of `pending`. After the parameter modifications are successfully applied to
+        // the instance, the state of the modifications changes from `pending` to `applied`
+        // in subsequent describe-instances API calls": a request that named at least one
+        // option has a change to carry onto the instance, so the clock owes that move; one
+        // that named none maintains every option, and leaves the state they are in.
+        if http_tokens.is_some()
+            || hop_limit.is_some()
+            || http_endpoint.is_some()
+            || http_protocol_ipv6.is_some()
+            || instance_metadata_tags.is_some()
+        {
+            detail.metadata_options_changed();
+        }
+
+        // "The metadata options for the instance" (`$InstanceMetadataOptions`), read back
+        // off the record just written through the one reading `DescribeInstances` reports
+        // them with.
+        let options = detail.metadata_options_at(::std::time::Instant::now());
+        Ok(ModifyInstanceMetadataOptionsOutput {
+            instance_id: Some(instance_id),
+            instance_metadata_options: Some(options),
+        })
     }
 }

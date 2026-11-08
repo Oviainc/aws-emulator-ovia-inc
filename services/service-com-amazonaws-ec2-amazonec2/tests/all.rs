@@ -1539,6 +1539,13 @@ mod delete_network_insights_access_scope_analysis;
 // this file, which is where every new ec2 suite inserts its lines.
 #[path = "all/deprovision_ipam_pool_cidr.rs"]
 mod deprovision_ipam_pool_cidr;
+// What `ModifyInstanceMetadataOptions` writes onto ONE instance's metadata options: exactly
+// the options the request names, with every one it does not named left as it stands, the
+// `pending` the change is in until the clock carries it onto the instance, and the ids, hop
+// limits, instance states and dry run it refuses without writing. Declared at the tail of
+// this file, which is where every new ec2 suite inserts its lines.
+#[path = "all/modify_instance_metadata_options.rs"]
+mod modify_instance_metadata_options;
 // the note above gives: the sorted neighbourhood and the tail of this file are where every new
 // ec2 suite inserts its lines.
 // How a Capacity Reservation Fleet's floating-point members reach the ec2Query wire — the
