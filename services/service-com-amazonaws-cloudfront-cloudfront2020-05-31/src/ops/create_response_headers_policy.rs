@@ -14,13 +14,16 @@
 //! * a `Name` another policy already holds — "The name must be unique for response
 //!   headers policies in this Amazon Web Services account", so the second create under a
 //!   name is `ResponseHeadersPolicyAlreadyExists` rather than a second policy;
+//! * a `Content-Security-Policy` header value past CloudFront's published quota on its
+//!   length ([`crate::state::MAX_CSP_IN_RESPONSE_HEADERS_POLICY`]) —
+//!   `TooLongCSPInResponseHeadersPolicy`;
 //! * more policies than this emulator holds
 //!   ([`crate::state::MAX_RESPONSE_HEADERS_POLICIES`]) —
 //!   `TooManyResponseHeadersPolicies`.
 //!
-//! The model declares three more refusals whose maximum is an account quota CloudFront
+//! The model declares two more refusals whose maximum is an account quota CloudFront
 //! can raise and neither the model nor the shape documentation states a number for
-//! (`TooLongCSPInResponseHeadersPolicy`, `TooManyCustomHeadersInResponseHeadersPolicy`,
+//! (`TooManyCustomHeadersInResponseHeadersPolicy`,
 //! `TooManyRemoveHeadersInResponseHeadersPolicy`). Nothing here refuses on them: a bound
 //! invented for them would refuse configurations the service accepts, which is a worse
 //! answer than accepting them.
@@ -226,6 +229,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     InconsistentQuantities {
                         message: Some(message),
                     },
+                )
+                .into(),
+            );
+        }
+
+        // CloudFront's published quota on the length of the `Content-Security-Policy` header
+        // value a policy sets: a longer value describes no policy the service stores, so it
+        // is refused before anything is minted, on this payload and on the update's alike.
+        if crate::state::response_headers_policy_csp_too_long(&config) {
+            return Err(
+                CreateResponseHeadersPolicyErrorModeled::TooLongCSPInResponseHeadersPolicy(
+                    crate::state::too_long_csp_in_response_headers_policy(),
                 )
                 .into(),
             );

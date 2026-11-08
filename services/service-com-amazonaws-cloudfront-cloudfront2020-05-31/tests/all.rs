@@ -159,6 +159,8 @@ mod function_update;
 mod invalidation_list;
 #[path = "all/key_group_config_read.rs"]
 mod key_group_config_read;
+#[path = "all/key_group_delete.rs"]
+mod key_group_delete;
 #[path = "all/key_group_lifecycle.rs"]
 mod key_group_lifecycle;
 #[path = "all/key_group_update.rs"]
@@ -251,12 +253,16 @@ mod resource_policy_delete;
 mod resource_policy_lifecycle;
 #[path = "all/response_headers_policy_config_read.rs"]
 mod response_headers_policy_config_read;
+#[path = "all/response_headers_policy_delete.rs"]
+mod response_headers_policy_delete;
 #[path = "all/response_headers_policy_lifecycle.rs"]
 mod response_headers_policy_lifecycle;
 #[path = "all/response_headers_policy_refusal_message.rs"]
 mod response_headers_policy_refusal_message;
 #[path = "all/response_headers_policy_security_headers.rs"]
 mod response_headers_policy_security_headers;
+#[path = "all/response_headers_policy_update.rs"]
+mod response_headers_policy_update;
 #[path = "all/server_supplied_config_members.rs"]
 mod server_supplied_config_members;
 #[path = "all/staging_config_promotion.rs"]

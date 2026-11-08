@@ -620,6 +620,27 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             .find(|policy| policy.config.name == name)
     }
 
+    /// The distribution that attaches the response headers policy `id` to one of its cache
+    /// behaviours, or `None` when no stored distribution does.
+    ///
+    /// `ResponseHeadersPolicyInUse` is documented as "Cannot delete the response headers
+    /// policy because it is attached to one or more cache behaviors in a CloudFront
+    /// distribution", and a behaviour attaches a policy through its
+    /// `ResponseHeadersPolicyId` — so what makes a policy in use is a stored behaviour
+    /// naming it, which is the rule [`references_response_headers_policy`] states for the
+    /// whole configuration. The SAME rule
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::distribution_using_cache_policy`]
+    /// states for the other policies a cache behaviour attaches, over the same bounded
+    /// collections.
+    pub fn distribution_using_response_headers_policy(
+        &self,
+        id: &str,
+    ) -> Option<&StoredDistribution> {
+        self.distributions
+            .values()
+            .find(|distribution| references_response_headers_policy(&distribution.config, id))
+    }
+
     /// The origin access control `id` names, or `None` when the store holds none.
     pub fn origin_access_control(&self, id: &str) -> Option<&StoredOriginAccessControl> {
         self.origin_access_controls.get(id)
@@ -882,6 +903,24 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     /// The key group `id` names, or `None` when the store holds none.
     pub fn key_group(&self, id: &str) -> Option<&StoredKeyGroup> {
         self.key_groups.get(id)
+    }
+
+    /// The distribution that references the key group `id` from one of its cache
+    /// behaviours, or `None` when no stored distribution does.
+    ///
+    /// "You cannot delete a key group that is referenced in a cache behavior", and a
+    /// behaviour references a group through its `TrustedKeyGroups` list — so what makes a
+    /// group in use is a stored behaviour naming it, which is the rule
+    /// [`references_key_group`] states for the whole configuration. The SAME rule
+    /// [`ComAmazonawsCloudfrontCloudfront20200531State::distribution_using_cache_policy`]
+    /// states for a policy a cache behaviour attaches. The scan reads the STORED
+    /// configurations rather than a second index beside them, so it cannot drift out of step
+    /// with what a read of those distributions reports; both collections are bounded
+    /// ([`MAX_DISTRIBUTIONS`] distributions, each with a bounded behaviour list).
+    pub fn distribution_using_key_group(&self, id: &str) -> Option<&StoredDistribution> {
+        self.distributions
+            .values()
+            .find(|distribution| references_key_group(&distribution.config, id))
     }
 
     /// The key group whose STORED configuration carries `name`, or `None`.
@@ -2058,6 +2097,39 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         // Stored RESOLVED, exactly as the create stores it: the members CloudFront supplies
         // for the ones this payload left out ([`resolve_cache_policy_config`]).
         stored.config = resolve_cache_policy_config(config);
+        stored.last_modified_time = now;
+        stored.etag = etag;
+        Some(stored)
+    }
+
+    /// Replace the configuration of the response headers policy `id` names, and report the
+    /// record as it now stands.
+    ///
+    /// The same write [`Self::apply_cache_policy_config`] performs for the cache policy, on
+    /// the response headers policy record: `UpdateResponseHeadersPolicy` replaces the
+    /// configuration WHOLE — "When you update a response headers policy, the entire policy is
+    /// replaced. You cannot update some policy fields independent of others." — so the stored
+    /// configuration becomes the one submitted, down to the members the request left out;
+    /// `LastModifiedTime` becomes `now` ("the date and time when the response headers policy
+    /// was last modified"), and the version token is freshly minted, so the token the caller
+    /// matched on no longer satisfies an `If-Match` against this policy. Nothing else about a
+    /// response headers policy changes: the id is the one it was created under, and a policy
+    /// carries no status and no propagation deadline.
+    ///
+    /// `None` when the store holds no such policy, checked BEFORE the mint so a version token
+    /// is never spent on a policy that is not there.
+    pub fn apply_response_headers_policy_config(
+        &mut self,
+        id: &str,
+        config: ResponseHeadersPolicyConfig,
+        now: SystemTime,
+    ) -> Option<&StoredResponseHeadersPolicy> {
+        if !self.response_headers_policies.contains_key(id) {
+            return None;
+        }
+        let etag = self.next_etag();
+        let stored = self.response_headers_policies.get_mut(id)?;
+        stored.config = config;
         stored.last_modified_time = now;
         stored.etag = etag;
         Some(stored)

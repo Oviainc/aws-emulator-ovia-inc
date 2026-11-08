@@ -1,15 +1,14 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteResponseHeadersPolicy
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteResponseHeadersPolicy`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteResponseHeadersPolicy::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Deletes a response headers policy." The delete REMOVES the one stored record every read
+//! of that policy answered from, so afterwards the id names no policy of this account and
+//! the listing stops reporting it, and it is gated on the policy belonging to this account
+//! at all (a policy AWS published is `IllegalDelete`), on the policy's own version token
+//! (`If-Match`) and on nothing in the store still attaching it — a cache behaviour's
+//! `ResponseHeadersPolicyId` — which is `ResponseHeadersPolicyInUse`. This is the ONLY file
+//! to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -78,6 +77,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::IfMatch;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -176,18 +177,96 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteResponseHeadersPolicy` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteResponseHeadersPolicyErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteResponseHeadersPolicy"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes the rest of the store before this call
+        // reads it: whether a cache behaviour still attaches this policy is decided against
+        // the distributions as they stand at this instant.
+        store.settle(::std::time::SystemTime::now());
+
+        // A policy AWS published is readable in this account but belongs to AWS: no call
+        // here creates, changes or removes one, so a delete aimed at one is refused for what
+        // the REQUEST asked for — deletion of a service-owned resource — rather than answered
+        // "does not exist", and the policy stays readable afterwards. Decided before the
+        // precondition, because no version of it can make the delete legal. The SAME rule
+        // `DeleteCachePolicy` and `DeleteOriginRequestPolicy` answer for their own managed
+        // catalogues.
+        if crate::state::managed_response_headers_policy(&input.id).is_some() {
+            return Err(DeleteResponseHeadersPolicyErrorModeled::IllegalDelete(
+                crate::state::illegal_delete_managed_policy(),
+            )
+            .into());
+        }
+
+        // "The identifier for the response headers policy that you are deleting": the
+        // policy is resolved against the policies this account OWNS, since those are the
+        // only ones a mutation addresses, so every refusal below is about the record this id
+        // names and nothing is removed for an id the store does not hold. The identifier's
+        // shape is examined the way the reader of this resource examines it, because this
+        // operation addresses the policy resource itself by that id.
+        let Some(current_etag) = store
+            .response_headers_policy(&input.id)
+            .map(|stored| stored.etag.clone())
+        else {
+            return Err(
+                DeleteResponseHeadersPolicyErrorModeled::NoSuchResponseHeadersPolicy(
+                    crate::state::unresolved_response_headers_policy_id(&input.id),
+                )
+                .into(),
+            );
+        };
+
+        // "The version of the response headers policy that you are deleting. The version is
+        // the response headers policy's ETag value." The precondition is checked against the
+        // STORED version, the way HTTP evaluates one: a caller holding a version that is no
+        // longer current is told that before anything about what the policy is attached to.
+        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(
+                    DeleteResponseHeadersPolicyErrorModeled::InvalidIfMatchVersion(
+                        crate::state::invalid_if_match_version(),
+                    )
+                    .into(),
+                );
+            }
+            IfMatch::Stale => {
+                return Err(
+                    DeleteResponseHeadersPolicyErrorModeled::PreconditionFailed(
+                        // CloudFront words this refusal per API family: the policy surface
+                        // reports the unmet precondition of the OPERATION rather than of the
+                        // request's header fields.
+                        crate::state::precondition_failed_for_this_operation(),
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        // "You cannot delete a response headers policy if it's attached to a cache behavior.
+        // First update your distributions to remove the response headers policy from all
+        // cache behaviors, then delete the response headers policy." So a policy any stored
+        // cache behaviour still attaches is refused here and stays readable.
+        if store
+            .distribution_using_response_headers_policy(&input.id)
+            .is_some()
+        {
+            return Err(
+                DeleteResponseHeadersPolicyErrorModeled::ResponseHeadersPolicyInUse(
+                    crate::state::response_headers_policy_in_use(),
+                )
+                .into(),
+            );
+        }
+
+        // Gone means gone: the record every read answered from is removed, so the id names
+        // no policy of this account, the listing stops reporting it, and the name it held is
+        // free for a later create to claim.
+        store.response_headers_policies.remove(&input.id);
+
+        Ok(DeleteResponseHeadersPolicyOutput)
     }
 }

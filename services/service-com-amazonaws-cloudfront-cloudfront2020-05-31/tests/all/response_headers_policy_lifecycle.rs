@@ -114,18 +114,22 @@ pub(crate) struct Hsts {
 
 /// `ResponseHeadersPolicySecurityHeadersConfig`: every sub-structure optional, so a row
 /// may carry any subset of them.
+///
+/// Its fields are `pub(crate)` so a sibling suite that has to state ONE security header —
+/// the content security policy whose length CloudFront bounds — builds the same document
+/// rather than growing a copy of it.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Security {
-    xss: Option<Xss>,
+    pub(crate) xss: Option<Xss>,
     /// `(Override, FrameOption)`, a value of `FrameOptionsList`.
-    frame: Option<(bool, String)>,
+    pub(crate) frame: Option<(bool, String)>,
     /// `(Override, ReferrerPolicy)`, a value of `ReferrerPolicyList`.
-    referrer: Option<(bool, String)>,
+    pub(crate) referrer: Option<(bool, String)>,
     /// `(Override, ContentSecurityPolicy)`.
-    csp: Option<(bool, String)>,
+    pub(crate) csp: Option<(bool, String)>,
     /// `ContentTypeOptions.Override`.
-    content_type: Option<bool>,
-    hsts: Option<Hsts>,
+    pub(crate) content_type: Option<bool>,
+    pub(crate) hsts: Option<Hsts>,
 }
 
 /// `ResponseHeadersPolicyServerTimingHeadersConfig`.

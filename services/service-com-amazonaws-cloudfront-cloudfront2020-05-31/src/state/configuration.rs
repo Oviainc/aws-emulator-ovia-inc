@@ -702,6 +702,63 @@ pub fn response_headers_policy_quantity_mismatch(
         .find_map(|(label, quantity, len)| quantity_disagreement(label, *quantity, *len))
 }
 
+/// The most characters a response headers policy's `Content-Security-Policy` header value
+/// may carry, over which the policy is refused with the modelled
+/// `TooLongCSPInResponseHeadersPolicy`.
+///
+/// CloudFront's published quota for "Maximum number of characters in the
+/// Content-Security-Policy header value" is 1,783, and the error itself points at that quota
+/// page ("For more information, see Quotas … in the Amazon CloudFront Developer Guide"), so
+/// the bound is that number rather than one chosen here. It is a property of the
+/// CONFIGURATION, so every payload that states one is held to it: the create and the update
+/// of a policy refuse the same value.
+pub const MAX_CSP_IN_RESPONSE_HEADERS_POLICY: usize = 1783;
+
+/// Whether `config` states a `Content-Security-Policy` header value past
+/// [`MAX_CSP_IN_RESPONSE_HEADERS_POLICY`].
+///
+/// The value is the one `ResponseHeadersPolicyContentSecurityPolicy$ContentSecurityPolicy`
+/// carries — "The policy directives and their values that CloudFront includes as values for
+/// the Content-Security-Policy HTTP response header" — and a configuration that names no
+/// security headers section, or one whose section sets no content security policy, states no
+/// value at all and so is within the bound. Measured in CHARACTERS, as the quota states its
+/// maximum.
+pub fn response_headers_policy_csp_too_long(config: &ResponseHeadersPolicyConfig) -> bool {
+    config
+        .security_headers_config
+        .as_ref()
+        .and_then(|section| section.content_security_policy.as_ref())
+        .is_some_and(|csp| {
+            csp.content_security_policy.chars().count() > MAX_CSP_IN_RESPONSE_HEADERS_POLICY
+        })
+}
+
+/// The modelled `TooLongCSPInResponseHeadersPolicy` (HTTP 400) for a configuration whose
+/// `Content-Security-Policy` value is past the published quota
+/// ([`MAX_CSP_IN_RESPONSE_HEADERS_POLICY`]).
+///
+/// The sentence states the CONDITION — the request carries a longer value than is allowed —
+/// so nothing from the request belongs in it, neither the value nor its length, and every
+/// refusal of this condition reads the same.
+pub fn too_long_csp_in_response_headers_policy(
+) -> crate::ops::types::TooLongCSPInResponseHeadersPolicy {
+    crate::ops::types::TooLongCSPInResponseHeadersPolicy {
+        message: Some(TOO_LONG_CSP_IN_RESPONSE_HEADERS_POLICY_MESSAGE.to_string()),
+    }
+}
+
+/// `TooLongCSPInResponseHeadersPolicy`'s message, on the wire.
+///
+/// The WIRE text — what the recorded service answers this code with, and what this emulator
+/// therefore serves. It differs from the sentence the MODEL's documentation of the shape uses
+/// for the same condition ("The length of the Content-Security-Policy header value in the
+/// response headers policy exceeds the maximum. For more information, see Quotas …"): that
+/// one documents the condition and points at the quota page, this one is served. Do not
+/// "correct" this constant to the documentation sentence.
+pub const TOO_LONG_CSP_IN_RESPONSE_HEADERS_POLICY_MESSAGE: &str =
+    "Your request contains longer Content Security Policy value in the Response Headers \
+     Policy than is allowed.";
+
 /// The modelled `InconsistentQuantities` message for the first list wrapper in an origin
 /// request policy configuration whose `Quantity` disagrees with the length of its `Items`,
 /// or `None` when every wrapper agrees.
@@ -2790,6 +2847,34 @@ pub const ORIGIN_REQUEST_POLICY_IN_USE_MESSAGE: &str =
     "The specified origin request policy is currently associated with a cache behavior. \
      Please disassociate the policy before deleting.";
 
+/// The modelled `ResponseHeadersPolicyInUse` (HTTP 409) for a delete of a policy a cache
+/// behaviour still attaches.
+///
+/// The SAME rule [`cache_policy_in_use`] states for the other policies a cache behaviour
+/// attaches: the sentence is a property of the CONDITION rather than of the request — the
+/// policy is associated with a cache behaviour, and the caller is told to disassociate it
+/// first — so nothing from the request or from the store belongs in it, and every refusal of
+/// this condition reads the same.
+pub fn response_headers_policy_in_use() -> crate::ops::types::ResponseHeadersPolicyInUse {
+    crate::ops::types::ResponseHeadersPolicyInUse {
+        message: Some(RESPONSE_HEADERS_POLICY_IN_USE_MESSAGE.to_string()),
+    }
+}
+
+/// `ResponseHeadersPolicyInUse`'s message: what CloudFront answers a delete of a response
+/// headers policy that a cache behaviour still associates, worded as
+/// [`CACHE_POLICY_IN_USE_MESSAGE`] words the same condition for the other policies a cache
+/// behaviour attaches.
+///
+/// The WIRE family of this surface, not the sentence the MODEL's documentation of the shape
+/// uses for the same condition ("Cannot delete the response headers policy because it is
+/// attached to one or more cache behaviors in a CloudFront distribution."): that one
+/// documents the condition, this one is served — the same split
+/// [`CACHE_POLICY_IN_USE_MESSAGE`] records for its own shape.
+pub const RESPONSE_HEADERS_POLICY_IN_USE_MESSAGE: &str =
+    "The specified response headers policy is currently associated with a cache behavior. \
+     Please disassociate the policy before deleting.";
+
 /// The modelled `IllegalDelete` (HTTP 400) for a delete whose target is a policy AWS
 /// published rather than one this account created.
 ///
@@ -3417,6 +3502,29 @@ pub fn no_such_key_group() -> NoSuchResource {
 /// missing named resource with — "The specified <resource> does not exist.", as
 /// [`NO_SUCH_ORIGIN_REQUEST_POLICY_MESSAGE`] and [`NO_SUCH_CACHE_POLICY_MESSAGE`] carry it.
 pub const NO_SUCH_KEY_GROUP_MESSAGE: &str = "The specified key group does not exist.";
+
+/// The modelled `ResourceInUse` (HTTP 409) for a delete of a key group a cache behaviour
+/// still references.
+///
+/// `ResourceInUse` is the one conflict shape the key group surface models, and CloudFront
+/// words a refusal of this surface for the resource the operation ADDRESSES — a key group,
+/// here — the way [`no_such_key_group`] words the absent-resource one. The sentence states
+/// the CONDITION, so nothing from the request or from the store belongs in it — not the
+/// group, and not the distribution that holds the reference — and every refusal of this
+/// condition reads the same, as [`CACHE_POLICY_IN_USE_MESSAGE`] does for the other
+/// configuration objects a cache behaviour names.
+pub fn key_group_in_use() -> crate::ops::types::ResourceInUse {
+    crate::ops::types::ResourceInUse {
+        message: Some(KEY_GROUP_IN_USE_MESSAGE.to_string()),
+    }
+}
+
+/// `ResourceInUse`'s message on the key group surface: what CloudFront answers a delete of a
+/// key group a cache behaviour still references, worded as [`CACHE_POLICY_IN_USE_MESSAGE`]
+/// words the same condition for the other configuration objects a cache behaviour names.
+pub const KEY_GROUP_IN_USE_MESSAGE: &str =
+    "The specified key group is currently associated with a cache behavior. Please \
+     disassociate the key group before deleting.";
 
 /// The modelled `TooManyKeyGroups` (HTTP 400) for a create that would take the store past
 /// [`MAX_KEY_GROUPS`].

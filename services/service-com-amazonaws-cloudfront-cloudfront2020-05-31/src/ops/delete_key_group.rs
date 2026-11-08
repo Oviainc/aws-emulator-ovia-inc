@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DeleteKeyGroup
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DeleteKeyGroup`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DeleteKeyGroup::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! "Deletes a key group." The delete REMOVES the one stored record every read of that group
+//! answered from, so afterwards the id names no key group and the listing stops reporting
+//! it, and it is gated on the group's own version token (`If-Match`) and on nothing in the
+//! store still referencing the group — a cache behaviour's trusted key groups — which is
+//! `ResourceInUse`. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -72,6 +69,8 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+
+use crate::state::IfMatch;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -168,18 +167,70 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DeleteKeyGroup` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DeleteKeyGroupErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DeleteKeyGroup"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(crate::state::store_unavailable());
+        };
+        let _ = ctx;
+        let mut store = state.lock();
+        // Materialise whatever the clock already owes the rest of the store before this call
+        // reads it, as every handler here does: whether a cache behaviour still references
+        // this group is decided against the distributions as they stand at this instant. A
+        // key group itself has no transition owed — the model gives it no status.
+        store.settle(::std::time::SystemTime::now());
+
+        // "The identifier of the key group that you are deleting": the group is resolved
+        // first, so every refusal below is about the record this id names and nothing is
+        // removed for an id the store does not hold. An id no group carries is the
+        // absent-group sentence whatever shape it has, as `UpdateKeyGroup` — the other
+        // mutation of this record — answers it.
+        let Some(current_etag) = store.key_group(&input.id).map(|stored| stored.etag.clone())
+        else {
+            return Err(DeleteKeyGroupErrorModeled::NoSuchResource(
+                crate::state::no_such_key_group(),
+            )
+            .into());
+        };
+
+        // "The version of the key group that you are deleting. The version is the key
+        // group's ETag value." The precondition is checked against the STORED version, the
+        // way HTTP evaluates one: a caller holding a version that is no longer current is
+        // told that before anything about what the group is referenced by.
+        match crate::state::check_if_match(&current_etag, input.if_match.as_deref()) {
+            IfMatch::Current => {}
+            IfMatch::Invalid => {
+                return Err(DeleteKeyGroupErrorModeled::InvalidIfMatchVersion(
+                    crate::state::invalid_if_match_version(),
+                )
+                .into());
+            }
+            IfMatch::Stale => {
+                return Err(DeleteKeyGroupErrorModeled::PreconditionFailed(
+                    // CloudFront words this refusal per API family: the key group surface
+                    // reports the unmet precondition of the OPERATION rather than of the
+                    // request's header fields, the same wording `UpdateKeyGroup` answers.
+                    crate::state::precondition_failed_for_this_operation(),
+                )
+                .into());
+            }
+        }
+
+        // "You cannot delete a key group that is referenced in a cache behavior. First
+        // update your distributions to remove the key group from all cache behaviors, then
+        // delete the key group." So a group any stored cache behaviour still lists among
+        // its trusted key groups is refused here and stays readable, and the same delete
+        // lands once every distribution has let go of it.
+        if store.distribution_using_key_group(&input.id).is_some() {
+            return Err(DeleteKeyGroupErrorModeled::ResourceInUse(
+                crate::state::key_group_in_use(),
+            )
+            .into());
+        }
+
+        // Gone means gone: the record every read answered from is removed, so the id names
+        // no key group, the listing stops reporting it, the name it held is free for a later
+        // create to claim, and the public keys it listed are no longer in use by it.
+        store.key_groups.remove(&input.id);
+
+        Ok(DeleteKeyGroupOutput)
     }
 }

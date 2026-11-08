@@ -45,12 +45,15 @@ const NO_SUCH_KEY_GROUP_MESSAGE: &str = "The specified key group does not exist.
 /// `TrustedKeyGroups` wrapper it submits is `Enabled`. An index is into the key groups
 /// [`create_groups`] creates, in order; an empty slice is a behaviour that submits no
 /// `TrustedKeyGroups` wrapper at all.
+///
+/// `pub(crate)` with [`config_xml`] so a sibling suite that needs a distribution trusting a
+/// given key group builds the same document rather than growing a copy of it.
 #[derive(Debug, Clone, Copy)]
-struct Row {
-    case: &'static str,
-    default_groups: &'static [usize],
-    ordered: &'static [&'static [usize]],
-    enabled: bool,
+pub(crate) struct Row {
+    pub(crate) case: &'static str,
+    pub(crate) default_groups: &'static [usize],
+    pub(crate) ordered: &'static [&'static [usize]],
+    pub(crate) enabled: bool,
 }
 
 impl Row {
@@ -205,7 +208,7 @@ fn trusted_xml(enabled: bool, groups: &[usize], ids: &[String]) -> String {
 
 /// The `DistributionConfig` a row submits: one origin, a default cache behaviour and the
 /// row's ordered cache behaviours, each trusting the key groups the row names.
-fn config_xml(caller_reference: &str, row: &Row, groups: &[String]) -> String {
+pub(crate) fn config_xml(caller_reference: &str, row: &Row, groups: &[String]) -> String {
     let mut behaviors = format!("<Quantity>{}</Quantity>", row.ordered.len());
     if !row.ordered.is_empty() {
         behaviors.push_str("<Items>");

@@ -65,7 +65,15 @@ type Spelling = fn(&str) -> String;
 
 /// `DELETE /2020-05-31/public-key/{Id}` under the version token `if_match` — the route and
 /// the header the model binds this operation to (`IfMatch` travels in `If-Match`).
-async fn delete_key(router: &MultiServiceRouter, id: &str, if_match: Option<&str>) -> Answer {
+///
+/// `pub(crate)` so a sibling suite that has to release a public key — the key group delete
+/// suite, whose rule is that a group's removal frees the keys it listed — goes over the same
+/// wire path rather than growing a copy of this.
+pub(crate) async fn delete_key(
+    router: &MultiServiceRouter,
+    id: &str,
+    if_match: Option<&str>,
+) -> Answer {
     call(
         router,
         "DELETE",
