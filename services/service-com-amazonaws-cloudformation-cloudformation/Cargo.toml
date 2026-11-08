@@ -148,6 +148,15 @@ service-com-amazonaws-apigateway-backplanecontrolservice = { workspace = true }
 # the Kinesis service's own stream registry, so a suite that declares one must create the
 # stream there first or the destination never replicates.
 service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
+# Application Auto Scaling, for the `AWS::ApplicationAutoScaling::ScalableTarget` and
+# `AWS::ApplicationAutoScaling::ScalingPolicy` a stack really registers there
+# (`state::provisioning::application_auto_scaling`): a suite that deploys one must have its
+# owning service mounted beside CloudFormation, or the create is refused and the stack fails.
+service-com-amazonaws-applicationautoscaling-anyscalefrontendservice = { workspace = true }
+# Amazon CloudWatch, which a target-tracking scaling policy's alarms are created in: the
+# policy's own put writes them there, so the service that owns them is mounted beside the
+# rest.
+service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
 
 [lints]
 workspace = true

@@ -104,6 +104,20 @@ fn request(target: &Value, name: &str) -> Value {
     request
 }
 
+/// A `DescribeScalableTargets` filter naming exactly `target`.
+///
+/// `DescribeScalableTargets` narrows by `ResourceIds` rather than by the single `ResourceId`
+/// the identity carries, and a dimension filter sent with no resource id at all is refused —
+/// a dimension names a capacity property of ONE resource — so the identity is spelled into
+/// the members that operation reads.
+fn describe_filter(target: &Value) -> Value {
+    json!({
+        "ServiceNamespace": target["ServiceNamespace"].clone(),
+        "ResourceIds": [target["ResourceId"].clone()],
+        "ScalableDimension": target["ScalableDimension"].clone(),
+    })
+}
+
 /// Store a scheduled action called `name` on `target`.
 async fn put(emulator: &Emulator, target: &Value, name: &str, schedule: &str, case: &str) {
     let mut body = request(target, name);
@@ -457,7 +471,7 @@ async fn an_occurrence_already_due_is_applied_before_the_action_is_removed() {
     );
 
     let (status, response) = emulator
-        .call("DescribeScalableTargets", target.clone())
+        .call("DescribeScalableTargets", describe_filter(&target))
         .await;
     assert_eq!(
         status, 200,
@@ -519,7 +533,7 @@ async fn a_deleted_action_never_fires_an_occurrence_that_was_still_ahead() {
         ("the action that was deleted", &deleted_from, 1),
     ] {
         let (status, response) = emulator
-            .call("DescribeScalableTargets", target.clone())
+            .call("DescribeScalableTargets", describe_filter(target))
             .await;
         assert_eq!(
             status, 200,

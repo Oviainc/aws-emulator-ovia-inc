@@ -33,6 +33,10 @@ use crate::ops::types::{
 /// the resource it moves and the activity it records.
 pub mod policy_execution;
 
+/// The Amazon Keyspaces table a `cassandra` scalable target names, resolved in the service
+/// that owns it.
+pub mod keyspaces_tables;
+
 /// The refusals whose wire identity this service's own error list does not express, and the
 /// error channel that carries them.
 pub mod wire_refusals;
@@ -729,6 +733,39 @@ pub fn service_linked_role_arn(service_namespace: &str) -> String {
     )
 }
 
+/// The role a registered target is SCALED THROUGH, which is the one it reports: the
+/// namespace's service-linked role wherever this service scales that namespace through one,
+/// and the role the request named only where it does not.
+///
+/// `RoleARN` "is required for services that do not support service-linked roles ... If the
+/// service supports service-linked roles, Application Auto Scaling uses a service-linked
+/// role, which it creates if it does not yet exist" — so for a namespace that HAS one the
+/// supplied role has no effect on who scales the resource, and reporting it would name a
+/// principal that does not. Which namespaces have one is [`SERVICE_LINKED_ROLE_SUFFIXES`],
+/// the published catalog, so this rule is read off that catalog rather than from a second
+/// list.
+///
+/// Every namespace the model declares has a row there, and a namespace outside the enum is
+/// refused by each handler before it reaches here — so the last arm, a namespace with no row
+/// whose request named no role either, is only what makes this function total: it answers the
+/// unsuffixed base role [`service_linked_role_name`] falls back to, which is what this
+/// service already reported for such a registration.
+pub fn effective_role_arn(service_namespace: &str, requested: Option<&str>) -> String {
+    if has_service_linked_role(service_namespace) {
+        return service_linked_role_arn(service_namespace);
+    }
+    requested.map_or_else(
+        || service_linked_role_arn(service_namespace),
+        ToString::to_string,
+    )
+}
+
+/// Whether Application Auto Scaling scales `service_namespace` through a service-linked role
+/// of its own — a row of the published catalog ([`SERVICE_LINKED_ROLE_SUFFIXES`]).
+pub fn has_service_linked_role(service_namespace: &str) -> bool {
+    service_linked_role_suffix(service_namespace).is_some()
+}
+
 /// The service principal a namespace's scalable targets are scaled through: the namespace's
 /// own label in front of Application Auto Scaling's principal, which is the form every row of
 /// IAM's published service-linked-role catalog takes for this service.
@@ -970,6 +1007,36 @@ pub fn scheduled_action_not_found_message(
 /// that provisions no throughput being the one this emulator can resolve.
 pub fn scalable_target_validation_failed(reason: &str) -> String {
     format!("Validation failed for scalable target. Reason: {reason}")
+}
+
+/// How this service refuses a registration that carries `Tags` for a target it already
+/// holds.
+///
+/// `Tags` tags the target "when it is created", and "to tag an existing scalable target, use
+/// the TagResource operation" — so the call asks for something this operation does not do,
+/// and the refusal says which operation does. The sentence is fixed: the rule is about the
+/// combination of a registered target and a tag, so there is no value of the request to echo.
+pub const TAGGED_TARGET_ALREADY_EXISTS: &str =
+    "The scalable target that you tried to tag already exists. To update tags on an existing \
+     scalable target, use the TagResource API.";
+
+/// How this service refuses a registration whose RESOURCE cannot carry the target the
+/// request asked for: the resource and the dimension the request named, and the reason that
+/// resource's own state states.
+///
+/// The envelope is fixed and the reason is the variable part, so every such refusal reads
+/// the same way whichever property of the resource made it unscalable. It is the
+/// resource-naming sibling of [`scalable_target_validation_failed`], which states a reason
+/// about the TARGET and so has no resource of its own to name.
+pub fn resource_validation_failed(
+    resource_id: &str,
+    scalable_dimension: &str,
+    reason: &str,
+) -> String {
+    format!(
+        "Validation failed for resource: {resource_id}, scalable dimension: \
+         {scalable_dimension}. Reason: {reason}"
+    )
 }
 
 /// `len` lowercase hex characters derived from `seed`, clamped to the 64 characters a
@@ -1327,6 +1394,30 @@ pub fn check_dimension_requires_resource_id(
 /// no one offending value to echo.
 pub const DIMENSION_WITHOUT_RESOURCE_ID: &str =
     "Scalable dimension cannot be provided without a resource ID.";
+
+/// The same rule for an operation whose resource filter is a LIST of resource ids.
+///
+/// `DescribeScalableTargets` narrows by `ResourceIds` rather than by one `ResourceId`, and
+/// the model states the rule on that member too ("If you specify a scalable dimension, you
+/// must also specify a resource ID"). An absent list and an EMPTY one each name no resource,
+/// so a dimension filter sent with either is a filter with no subject — the same refusal as
+/// its single-id siblings ([`check_dimension_requires_resource_id`]), worded for the member
+/// that operation reads ([`DIMENSION_WITHOUT_RESOURCE_IDS`]).
+pub fn check_dimension_requires_resource_ids(
+    resource_ids: Option<&[String]>,
+    scalable_dimension: Option<&str>,
+) -> Result<(), String> {
+    let named = resource_ids.and_then(|ids| ids.first()).map(String::as_str);
+    match (named, scalable_dimension) {
+        (None, Some(_)) => Err(DIMENSION_WITHOUT_RESOURCE_IDS.to_string()),
+        _ => Ok(()),
+    }
+}
+
+/// How that refusal is worded for the member a LIST-filtering operation reads: the same
+/// sentence, naming `ResourceIds` the way the plural member is named.
+pub const DIMENSION_WITHOUT_RESOURCE_IDS: &str =
+    "Scalable dimension cannot be provided without resource IDs.";
 
 /// `Ok` when `scalable_dimension` belongs to `service_namespace`.
 ///
@@ -2052,6 +2143,24 @@ pub fn predefined_metric_dimensions(metric_type: &str) -> Option<&'static [&'sta
 /// one. See [`PredefinedMetric::target_range`].
 pub fn predefined_metric_target_range(metric_type: &str) -> Option<(f64, f64)> {
     predefined_metric(metric_type).and_then(|metric| metric.target_range)
+}
+
+/// How this service refuses a target value outside the window its predefined metric
+/// publishes: the metric type, both bounds of that window and the value the request offered,
+/// every one of them read off the request and the catalog.
+///
+/// The bounds and the offered value are written as the DOUBLES they are — the member is a
+/// double, so a whole number is stated with its fractional part — which is how the service
+/// words this refusal.
+pub fn target_value_outside_range_message(
+    metric_type: &str,
+    (low, high): (f64, f64),
+    offered: f64,
+) -> String {
+    format!(
+        "For predefined metric type {metric_type}, target value must be between '{low:?}' and \
+         '{high:?}', but was '{offered:?}'."
+    )
 }
 
 /// Every `PredefinedMetricType` published FOR `scalable_dimension`, in the order the

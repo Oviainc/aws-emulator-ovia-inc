@@ -41,6 +41,10 @@ service-com-amazonaws-ecs-amazonec2containerservicev20141113 = { workspace = tru
 # role in the IAM emulator's own role store, which needs IAM's state TYPE and the
 # helpers that spell a service-linked role's path, trust policy and ARN.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# Whether IAM lets a request perform the action it names is decided against the calling
+# principal's own policies, which needs the principal the credential speaks for (AWS STS's
+# own session store) beside the documents in force on it.
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 # Parses the `cron(...)` schedule a scheduled action carries (and `chrono`, which it
 # is built on, parses an `at(...)` expression's date and time).
 cron = "0.15"
@@ -51,6 +55,15 @@ chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# Amazon Keyspaces, for the `cassandra` scalable target whose TABLE lives there: a
+# registration resolves that table by calling the owning service, so the suite that pins
+# that rule mounts it beside this service on one engine. A DEV dependency, because the
+# resolution is made over the wire rather than against that crate's state type — Amazon
+# Keyspaces' own auto scaling is implemented on top of this service, so its crate already
+# depends on this one.
+service-com-amazonaws-keyspaces-keyspacesservice = { workspace = true }
 
 [lints]
 workspace = true

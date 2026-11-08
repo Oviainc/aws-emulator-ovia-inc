@@ -56,6 +56,10 @@ use std::sync::Arc;
 /// without the other is worse than neither.
 const VALIDATION_EXCEPTION: &str = "ValidationException";
 
+/// Whether IAM lets a request perform the action it names — the decision taken ahead of
+/// every operation of this service.
+mod authorization;
+
 /// The `com-amazonaws-applicationautoscaling-anyscalefrontendservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -80,6 +84,7 @@ macro_rules! wrap_operations {
                 stringify!($operation),
                 ::std::boxed::Box::new(WithSubmittedValues::new(
                     crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                    ::std::sync::Arc::clone(&$engine),
                 )) as ::std::boxed::Box<dyn ErasedOperation>,
             );
         )+
@@ -143,8 +148,13 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
 /// telemetry and every modelled error. The cost is DELIBERATE: a valid request's body is
 /// read twice, once here and once in the operation's own sequence, because the framework
 /// hands no already-built input to an operation.
-struct WithSubmittedValues<O> {
+struct WithSubmittedValues<O, Eng> {
     operation: O,
+    /// The shared engine, so the authorization gate can read the IAM and STS stores the
+    /// decision is made from, and this service's own store for the target a request
+    /// addresses. The framework hands `run` the SERVICE, which holds the engine behind an
+    /// engine-erased accessor, so the gate reaches it through here.
+    engine: Arc<Eng>,
 }
 
 /// `violation` with a `@pattern` requirement quoting the expression this service PUBLISHES,
@@ -169,16 +179,17 @@ fn as_published(violation: &constraints::Violation) -> constraints::Violation {
     }
 }
 
-impl<O> WithSubmittedValues<O> {
+impl<O, Eng> WithSubmittedValues<O, Eng> {
     /// Wrap one operation, already constructed from the shared engine.
-    fn new(operation: O) -> Self {
-        Self { operation }
+    fn new(operation: O, engine: Arc<Eng>) -> Self {
+        Self { operation, engine }
     }
 }
 
-impl<O> ErasedOperation for WithSubmittedValues<O>
+impl<O, Eng> ErasedOperation for WithSubmittedValues<O, Eng>
 where
     O: Operation + ErasedOperation,
+    Eng: Send + Sync + 'static,
 {
     fn run<'r>(
         &'r self,
@@ -206,6 +217,15 @@ where
                     req,
                 );
             }
+            // The authorization gate, ahead of the handler: whether the caller may perform
+            // the action at all is a fact of the CREDENTIAL the request presented and the IAM
+            // policies in force on the principal it speaks for, not of the store the handler
+            // would read ([`authorization::authorize`]). It is asked AFTER the request has
+            // been read, because the condition keys IAM decides a grant by are members OF
+            // that request.
+            if let Some(denied) = authorization_refusal(&*self.engine, svc, req, ctx, O::NAME) {
+                return denied;
+            }
             self.operation.run(svc, req, ctx).await
         })
     }
@@ -215,6 +235,44 @@ where
     fn auth_schemes(&self) -> Option<&'static [&'static str]> {
         self.operation.auth_schemes()
     }
+}
+
+/// This service's `AccessDeniedException` response for a request whose caller the IAM
+/// policies in force do not permit to perform the action it named, or `None` when they do.
+///
+/// `operation` is the operation's own name ([`Operation::NAME`]), which is the action the
+/// request asked for; the request DOCUMENT is read for the members IAM's condition keys come
+/// from — an awsJson request carries them in its body, and a body that is no object carries
+/// none, which is decided as a request that names neither a namespace nor a dimension.
+///
+/// The code and the status are this service's own, held once for every refusal about the
+/// caller's ACCESS ([`crate::state::wire_refusals::ACCESS_DENIED_CODE`] and its status), and
+/// the sentence is IAM's ([`authorization::Denied::message`]). The envelope is the
+/// protocol's, so this refusal is rendered exactly like every other pre-dispatch one: the
+/// code and the message the renderer would otherwise pick are REPLACED, and it is rendered
+/// from an empty violation list because an authorization refusal names no member of the
+/// request.
+fn authorization_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    svc: &dyn Service,
+    req: &RtRequest,
+    ctx: &OperationContext<'_>,
+    operation: &str,
+) -> Option<RtResponse> {
+    let document = req
+        .body()
+        .bytes()
+        .and_then(|body| serde_json::from_slice::<serde_json::Value>(body).ok())
+        .unwrap_or(serde_json::Value::Null);
+    let refusal = authorization::authorize(engine, ctx, operation, &document).err()?;
+    Some(svc.definition().refusal_response(
+        ProtocolError::Invalid(Vec::new()),
+        Some(Refused {
+            code: crate::state::wire_refusals::ACCESS_DENIED_CODE.to_string(),
+            message: refusal.message(),
+        }),
+        req,
+    ))
 }
 
 impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {

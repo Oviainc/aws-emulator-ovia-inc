@@ -999,6 +999,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // ([`crate::state::StoredStack::fail_transition_superseded`]).
                     if stack.disable_rollback {
                         stack.fail_transition(failed_at, status::CREATE_FAILED, failure);
+                        // The failed state is KEPT, so what the create DID make is what the
+                        // stack goes on reporting, each resource in the status the walk left
+                        // it ([`crate::state::StoredStack::keep_failed_resources`]).
+                        stack.keep_failed_resources(&materialised.transitions, failed_at);
                         None
                     } else {
                         stack.fail_transition_superseded(

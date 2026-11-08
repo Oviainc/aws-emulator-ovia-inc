@@ -1726,6 +1726,21 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // An Amazon SNS subscription's identity is the ARN `Subscribe` answers with: it
         // carries an id SNS mints per subscription, which no naming rule could compute.
         || resource_type == SNS_SUBSCRIPTION
+        // The two Application Auto Scaling types are the same case from the other side: a
+        // scalable target's physical id is the
+        // `<ResourceId>|<ScalableDimension>|<ServiceNamespace>` composite that service
+        // identifies the target by ("scalable targets are uniquely identified by the
+        // combination of resource ID, scalable dimension, and namespace"), and a scaling
+        // policy's is the `PolicyARN` its own `PutScalingPolicy` answers — neither type
+        // declares a name for the naming rules to compute an identifier from, so the id in
+        // force is the one its create answered
+        // ([`crate::state::provisioning::application_auto_scaling`]). A policy that names its
+        // target by `Ref` therefore resolves to that composite, which is what
+        // `ScalingTargetId` takes.
+        || resource_type
+            == crate::state::provisioning::application_auto_scaling::APPLICATION_AUTO_SCALING_SCALABLE_TARGET
+        || resource_type
+            == crate::state::provisioning::application_auto_scaling::APPLICATION_AUTO_SCALING_SCALING_POLICY
         || resource_type == FIS_EXPERIMENT_TEMPLATE
         || resource_type == WAF_REGIONAL_IP_SET
         || resource_type == WAFV2_WEB_ACL

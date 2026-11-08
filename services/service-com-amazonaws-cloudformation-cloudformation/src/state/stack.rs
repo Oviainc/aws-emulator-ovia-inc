@@ -2786,6 +2786,51 @@ impl StoredStack {
         );
     }
 
+    /// Install the resources a FAILED create made, for a create whose failed state the
+    /// caller asked to keep (`OnFailure=DO_NOTHING`, which `DisableRollback` also spells).
+    ///
+    /// A create that failed is not a create that did nothing: CloudFormation reports every
+    /// resource whose creation it STARTED, each in the status the walk left it — the ones
+    /// their owning services created as `CREATE_COMPLETE`, and the one a service refused as
+    /// `CREATE_FAILED` — which is what a client reads to see how far the deployment got and
+    /// which resource stopped it. A create that is ROLLED BACK instead installs nothing,
+    /// because the rollback removes what it had made, so this is only called where the failed
+    /// state stays.
+    ///
+    /// Each resource's status is the LAST transition the walk recorded for it
+    /// ([`provisioning::ResourceTransition`]), so no status is decided here; a declaration the
+    /// walk never reached has no transition and is not reported at all, exactly as
+    /// CloudFormation reports a resource only once its creation has started. The pending
+    /// deployment itself is LEFT in place, since it is also what the stack's own deletion
+    /// deletes ([`Self::current_resources`]).
+    pub fn keep_failed_resources(
+        &mut self,
+        transitions: &[provisioning::ResourceTransition],
+        now: SystemTime,
+    ) {
+        let Some(deployment) = self.pending_deployment.as_ref() else {
+            return;
+        };
+        let finished_at = self.resource_finished_instants();
+        let installed: Vec<DeployedResource> = deployment
+            .resources
+            .iter()
+            .filter_map(|resource| {
+                let status = transitions
+                    .iter()
+                    .rev()
+                    .find(|transition| transition.logical_id == resource.logical_id)?;
+                let at = finished_at
+                    .get(&resource.logical_id)
+                    .copied()
+                    .unwrap_or(now);
+                Some(DeployedResource::new(resource.clone(), &status.status, at))
+            })
+            .collect();
+        self.resources = installed;
+        self.reevaluate_outputs();
+    }
+
     /// Open the ROLLBACK a failed create owes: the stack moves to `ROLLBACK_IN_PROGRESS`
     /// carrying the reason the create failed, and `ROLLBACK_COMPLETE` becomes due one
     /// [`STATUS_TRANSITION_DELAY`] later.

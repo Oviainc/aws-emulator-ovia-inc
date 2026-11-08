@@ -54,8 +54,11 @@ enum Through {
     /// Amazon Keyspaces' own `autoScalingSpecification`, which only a table in
     /// provisioned capacity mode accepts.
     Keyspaces,
-    /// Application Auto Scaling's `RegisterScalableTarget` + `PutScalingPolicy`, which a
-    /// caller may use whatever mode the table is in.
+    /// Application Auto Scaling's `RegisterScalableTarget` + `PutScalingPolicy`, which
+    /// registers a target on the table's provisioned throughput — so, like the
+    /// specification above, it only applies to a table in provisioned capacity mode: a table
+    /// in on-demand mode has no provisioned throughput for a target to scale, and that
+    /// service refuses to register one on it.
     ApplicationAutoScaling,
 }
 
@@ -243,17 +246,19 @@ async fn update_table_retires_auto_scaling_only_on_a_move_out_of_provisioned_mod
             table: "ledger",
             created_in: None,
             through: Through::ApplicationAutoScaling,
-            windows: vec![(read, 5, 50, 60.0)],
+            // A table in on-demand mode holds no scalable target: there is no provisioned
+            // throughput for one to scale, so registering one on it is refused.
+            windows: vec![],
             requested: pay_per_request,
             units: 0,
         },
         Row {
-            case: "re-set an explicit PAY_PER_REQUEST, both capacities scaled",
+            case: "re-set an explicit PAY_PER_REQUEST, which holds no target",
             keyspace: "re_set_on_demand_ks9",
             table: "orders_by_customer_1",
             created_in: Some(pay_per_request),
             through: Through::ApplicationAutoScaling,
-            windows: vec![(read, 3, 30, 40.0), (write, 7, 70, 80.5)],
+            windows: vec![],
             requested: pay_per_request,
             units: 0,
         },
@@ -268,12 +273,12 @@ async fn update_table_retires_auto_scaling_only_on_a_move_out_of_provisioned_mod
             units: 11,
         },
         Row {
-            case: "move INTO provisioned mode with a target already registered",
+            case: "move INTO provisioned mode from a table that holds no target",
             keyspace: "move_in_ks",
             table: "Mixed_Case_9",
             created_in: Some(pay_per_request),
             through: Through::ApplicationAutoScaling,
-            windows: vec![(write, 6, 66, 30.0)],
+            windows: vec![],
             requested: provisioned,
             units: 8,
         },

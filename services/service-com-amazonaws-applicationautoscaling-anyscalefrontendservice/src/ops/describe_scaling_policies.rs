@@ -212,6 +212,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(validation)?;
             check_dimension_namespace(&input.service_namespace, dimension).map_err(validation)?;
         }
+        // "If you specify a scalable dimension, you must also specify a resource ID": a
+        // dimension names a capacity property of ONE resource, so a dimension filter sent
+        // with no resource id is a filter with no subject — the same rule, and the same
+        // sentence, every `Describe` of this service answers it with
+        // ([`crate::state::check_dimension_requires_resource_id`]).
+        crate::state::check_dimension_requires_resource_id(
+            input.resource_id.as_deref(),
+            input.scalable_dimension.as_deref(),
+        )
+        .map_err(validation)?;
         let page_size = page_size(input.max_results).map_err(validation)?;
 
         // Only the policies of THIS Region's scalable targets: the service is regional, so

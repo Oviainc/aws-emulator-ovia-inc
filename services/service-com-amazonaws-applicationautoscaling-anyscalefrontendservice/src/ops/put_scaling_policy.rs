@@ -622,10 +622,13 @@ fn check_tracked_metric(
     }
     if let Some((low, high)) = crate::state::predefined_metric_target_range(metric_type) {
         if config.target_value < low || config.target_value > high {
-            return Err(validation(format!(
-                "Target value must be between {low} and {high} for predefined metric type \
-                 {metric_type}"
-            )));
+            return Err(validation(
+                crate::state::target_value_outside_range_message(
+                    metric_type,
+                    (low, high),
+                    config.target_value,
+                ),
+            ));
         }
     }
     Ok(())

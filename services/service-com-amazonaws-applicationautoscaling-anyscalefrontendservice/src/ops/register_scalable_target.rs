@@ -234,7 +234,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
             check_dimension_namespace, check_enum, check_resource_id_form, scalable_target_arn,
-            service_linked_role_arn, CapacityBound, ScalableTargetRecord, TargetKey,
+            CapacityBound, ScalableTargetRecord, TargetKey,
         };
 
         let Some(self_state) = crate::state::service_state(&*self.engine) else {
@@ -354,6 +354,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let resolved_capacity =
             crate::state::resolve_target_resource(&*self.engine, &key).map_err(validation)?;
+        // The one namespace whose resource is resolved by CALLING the service that owns it
+        // rather than by reading its store: see `crate::state::keyspaces_tables`. Asked with
+        // this service's store NOT held, exactly as the store-reading resolvers are.
+        if key.service_namespace == "cassandra" {
+            crate::state::keyspaces_tables::resolve_cassandra_table(
+                ctx,
+                &region,
+                &key.resource_id,
+                &key.scalable_dimension,
+            )
+            .await
+            .map_err(validation)?;
+        }
 
         let now = ::std::time::SystemTime::now();
         let mut guard = state.lock();
@@ -365,6 +378,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // Any parameters that you don't specify are not changed by this update request."
         let arn = match state.targets.get(&key) {
             Some(existing) => {
+                // `Tags` is CREATE-TIME only: "Use this parameter to tag the scalable target
+                // when it is created. To tag an existing scalable target, use the TagResource
+                // operation." A call that carries tags for a target that is already
+                // registered is therefore not an update with tags — it is a tagging the
+                // operation cannot perform — so it is refused before any member of it is
+                // applied, which is what leaves the registered window untouched.
+                if input.tags.as_ref().is_some_and(|tags| !tags.is_empty()) {
+                    return Err(validation(crate::state::TAGGED_TARGET_ALREADY_EXISTS));
+                }
                 let mut updated = existing.clone();
                 if let Some(min) = input.min_capacity {
                     updated.min_capacity = min;
@@ -372,16 +394,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 if let Some(max) = input.max_capacity {
                     updated.max_capacity = max;
                 }
-                if let Some(role_arn) = input.role_arn.clone() {
-                    updated.role_arn = role_arn;
-                }
+                // The role a target is scaled through is the namespace's own wherever this
+                // service has one, whatever role the request names ([`effective_role_arn`]).
+                updated.role_arn = crate::state::effective_role_arn(
+                    &key.service_namespace,
+                    input.role_arn.as_deref().or(Some(&updated.role_arn)),
+                );
                 if let Some(requested) = input.suspended_state.clone() {
                     updated.suspended_state =
                         Some(merge_suspended_state(updated.suspended_state, requested));
                 }
-                // `Tags` is create-time only: "Use this parameter to tag the scalable
-                // target when it is created. To tag an existing scalable target, use the
-                // TagResource operation."
                 check_capacity_range(updated.min_capacity, updated.max_capacity)?;
                 let arn = updated.arn.clone();
                 state.targets.insert(key.clone(), updated);
@@ -425,10 +447,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     // cannot read is reported at. See
                     // `ScalableTargetRecord::current_capacity`.
                     current_capacity: min_capacity,
-                    role_arn: input
-                        .role_arn
-                        .clone()
-                        .unwrap_or_else(|| service_linked_role_arn(&input.service_namespace)),
+                    role_arn: crate::state::effective_role_arn(
+                        &input.service_namespace,
+                        input.role_arn.as_deref(),
+                    ),
                     creation_time: now,
                     suspended_state: input.suspended_state.clone(),
                     tags: input

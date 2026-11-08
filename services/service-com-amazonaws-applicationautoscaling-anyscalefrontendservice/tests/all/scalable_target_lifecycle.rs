@@ -191,15 +191,15 @@ async fn a_registered_target_is_described_from_what_was_persisted() {
             "case {case:?}: expected Describe to return the ARN Register minted, got {target:?}"
         );
 
-        // An omitted RoleARN resolves to the service-linked role for the namespace, whose
-        // name carries the resource type that namespace scales.
-        let expected_role = row.role.map(ToString::to_string).unwrap_or_else(|| {
-            format!(
-                "arn:aws:iam::{ACCOUNT}:role/aws-service-role/{}.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_{}",
-                row.namespace,
-                service_linked_role_suffix(row.namespace)
-            )
-        });
+        // An omitted and a supplied RoleARN alike resolve to the service-linked role for
+        // the namespace, whose name carries the resource type that namespace scales: this
+        // service scales every modelled namespace through a role of its own, so the role a
+        // request names has no effect on who scales the resource.
+        let expected_role = format!(
+            "arn:aws:iam::{ACCOUNT}:role/aws-service-role/{}.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_{}",
+            row.namespace,
+            service_linked_role_suffix(row.namespace)
+        );
         assert_eq!(
             target["RoleARN"],
             json!(expected_role),
@@ -224,7 +224,8 @@ async fn a_registered_target_is_described_from_what_was_persisted() {
 }
 
 /// The roles the upsert suite registers with, as consts so a table row's closure stays
-/// non-capturing.
+/// non-capturing. Neither is the role the target REPORTS: this service scales a `dynamodb`
+/// target through its own service-linked role, so a supplied `RoleARN` has no effect.
 const FIRST_ROLE: &str = "arn:aws:iam::000000000000:role/aas-first";
 /// See [`FIRST_ROLE`].
 const SECOND_ROLE: &str = "arn:aws:iam::000000000000:role/aas-second";
@@ -235,7 +236,6 @@ struct UpdateRow {
     patch: fn() -> Value,
     min: i64,
     max: i64,
-    role: &'static str,
     suspended: fn() -> Value,
 }
 
@@ -246,7 +246,12 @@ async fn register_updates_only_the_members_the_request_names() {
     let resource_id = "table/my-table";
     let dimension = "dynamodb:table:ReadCapacityUnits";
     let first_role = FIRST_ROLE;
-    let second_role = SECOND_ROLE;
+    // Whatever role a registration names, the target is scaled through — and reports — the
+    // namespace's own service-linked role.
+    let expected_role = format!(
+        "arn:aws:iam::{ACCOUNT}:role/aws-service-role/{namespace}.application-autoscaling.amazonaws.com/AWSServiceRoleForApplicationAutoScaling_{}",
+        service_linked_role_suffix(namespace)
+    );
 
     let (status, body) = emulator
         .call(
@@ -275,7 +280,6 @@ async fn register_updates_only_the_members_the_request_names() {
             patch: || json!({"MinCapacity": 4}),
             min: 4,
             max: 10,
-            role: first_role,
             suspended: || json!({"DynamicScalingInSuspended": false, "DynamicScalingOutSuspended": false, "ScheduledScalingSuspended": false}),
         },
         UpdateRow {
@@ -283,7 +287,6 @@ async fn register_updates_only_the_members_the_request_names() {
             patch: || json!({"MaxCapacity": 40}),
             min: 4,
             max: 40,
-            role: first_role,
             suspended: || json!({"DynamicScalingInSuspended": false, "DynamicScalingOutSuspended": false, "ScheduledScalingSuspended": false}),
         },
         UpdateRow {
@@ -291,7 +294,6 @@ async fn register_updates_only_the_members_the_request_names() {
             patch: || json!({"RoleARN": SECOND_ROLE}),
             min: 4,
             max: 40,
-            role: second_role,
             suspended: || json!({"DynamicScalingInSuspended": false, "DynamicScalingOutSuspended": false, "ScheduledScalingSuspended": false}),
         },
         UpdateRow {
@@ -299,7 +301,6 @@ async fn register_updates_only_the_members_the_request_names() {
             patch: || json!({"SuspendedState": {"DynamicScalingInSuspended": true}}),
             min: 4,
             max: 40,
-            role: second_role,
             suspended: || json!({"DynamicScalingInSuspended": true, "DynamicScalingOutSuspended": false, "ScheduledScalingSuspended": false}),
         },
         UpdateRow {
@@ -307,7 +308,6 @@ async fn register_updates_only_the_members_the_request_names() {
             patch: || json!({"SuspendedState": {"ScheduledScalingSuspended": true}}),
             min: 4,
             max: 40,
-            role: second_role,
             suspended: || {
                 json!({"DynamicScalingInSuspended": true, "DynamicScalingOutSuspended": false, "ScheduledScalingSuspended": true})
             },
@@ -317,7 +317,6 @@ async fn register_updates_only_the_members_the_request_names() {
             patch: || json!({}),
             min: 4,
             max: 40,
-            role: second_role,
             suspended: || {
                 json!({"DynamicScalingInSuspended": true, "DynamicScalingOutSuspended": false, "ScheduledScalingSuspended": true})
             },
@@ -360,9 +359,8 @@ async fn register_updates_only_the_members_the_request_names() {
         );
         assert_eq!(
             target["RoleARN"],
-            json!(row.role),
-            "case {case:?}: expected RoleARN {:?}, got {target:?}",
-            row.role
+            json!(expected_role),
+            "case {case:?}: expected RoleARN {expected_role:?}, got {target:?}"
         );
         let expected_suspended = (row.suspended)();
         let actual_suspended = target
@@ -1064,9 +1062,15 @@ async fn describe_policies_pages_and_filters_by_resource_and_dimension() {
         ("no filter", json!({}), 8),
         ("by resource id", json!({"ResourceId": "table/alpha"}), 4),
         (
-            "by dimension",
-            json!({"ScalableDimension": "dynamodb:table:WriteCapacityUnits"}),
-            4,
+            // A dimension names a capacity property of ONE resource, so this service refuses
+            // a dimension filter sent with no resource id: the dimension narrows WITHIN a
+            // resource, which is what this row selects.
+            "by dimension inside a resource",
+            json!({
+                "ResourceId": "table/alpha",
+                "ScalableDimension": "dynamodb:table:WriteCapacityUnits",
+            }),
+            2,
         ),
         (
             "by resource id and dimension",

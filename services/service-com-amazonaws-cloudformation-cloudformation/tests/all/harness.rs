@@ -139,6 +139,21 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
     router.register_service(
         service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService::new(Arc::clone(&engine)),
     );
+    // Application Auto Scaling, for the `AWS::ApplicationAutoScaling::ScalableTarget` and the
+    // `AWS::ApplicationAutoScaling::ScalingPolicy` a stack really registers there, so a suite
+    // that deploys one reads the target and the policy back through that service's own wire —
+    // with Amazon CloudWatch beside it, since a target-tracking policy's alarms are created
+    // there.
+    router.register_service(
+        service_com_amazonaws_applicationautoscaling_anyscalefrontendservice::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(
+        service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
     (router, engine)
 }
 

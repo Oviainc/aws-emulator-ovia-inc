@@ -201,6 +201,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .map_err(validation)?;
             check_dimension_namespace(&input.service_namespace, dimension).map_err(validation)?;
         }
+        // A dimension names a capacity property of ONE resource, so "if you specify a
+        // scalable dimension, you must also specify a resource ID": a dimension filter sent
+        // with no resource id is a filter with no subject, and is refused here rather than
+        // read as a namespace-wide listing. The same rule, in the same words, the sibling
+        // `Describe` operations answer it with
+        // ([`crate::state::check_dimension_requires_resource_ids`]).
+        crate::state::check_dimension_requires_resource_ids(
+            input.resource_ids.as_deref(),
+            input.scalable_dimension.as_deref(),
+        )
+        .map_err(validation)?;
         let page_size = page_size(input.max_results).map_err(validation)?;
 
         // A scaling policy whose alarm is in ALARM was owed its execution from the instant

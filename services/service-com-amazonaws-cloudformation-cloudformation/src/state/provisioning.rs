@@ -199,6 +199,11 @@ use super::provisioner::{provisioner_for, Provisioner};
 use super::StoredResource;
 
 mod apigateway_rest_api;
+/// The two `AWS::ApplicationAutoScaling::*` types a stack declares — the scalable target and
+/// the policy that steers it: visible to the rest of this service's state because the types'
+/// own NAMES live here, beside the arms that provision them
+/// ([`super::template::return_values`] names the two whose identity their create answers).
+pub(super) mod application_auto_scaling;
 mod cognito_identity_pool;
 /// `AWS::DynamoDB::Table`: visible to the rest of this service's state because the type's
 /// own NAME lives here, beside the arm that provisions it, and more than one module answers
@@ -235,6 +240,11 @@ mod step_functions_state_machine;
 /// request CloudFormation sends it on every stack operation touching the resource, and the
 /// answer the provider PUTs to the `ResponseURL` the request carries.
 pub mod custom_resource;
+/// Calling another emulated service in-process: the wires a resource provider reaches an
+/// owning service's own handlers over, and how a refusal it answers is read
+/// ([`in_process_calls`]).
+mod in_process_calls;
+pub use in_process_calls::*;
 
 /// AWS's reserved tag-key namespace: "the `aws:` prefix is reserved for AWS use". Matched
 /// case-insensitively, as the services that refuse it match it.
@@ -685,6 +695,11 @@ pub(super) enum Owner {
     /// method on that resource, a deployment of them and the stage that serves it. Which of
     /// them it is travels with the owner, as it does for the Amazon EC2 types above.
     ApiGatewayRestApi(apigateway_rest_api::Kind),
+    /// One of the two `AWS::ApplicationAutoScaling::*` types
+    /// [`application_auto_scaling`] registers in Application Auto Scaling: the scalable
+    /// target, and the scaling policy that steers one. Which of them it is travels with the
+    /// owner, as it does for the types above.
+    ApplicationAutoScaling(application_auto_scaling::Kind),
 }
 
 /// The owner of a template resource type, or `None` for a type this emulator leaves
@@ -737,6 +752,9 @@ pub(super) fn owner_for(resource_type: &str) -> Option<Owner> {
     }
     if let Some(kind) = apigateway_rest_api::kind_of(resource_type) {
         return Some(Owner::ApiGatewayRestApi(kind));
+    }
+    if let Some(kind) = application_auto_scaling::kind_of(resource_type) {
+        return Some(Owner::ApplicationAutoScaling(kind));
     }
     provisioner_for(resource_type).map(Owner::Builtin)
 }
@@ -831,6 +849,11 @@ impl Owner {
             Self::ApiGatewayRestApi(kind) => {
                 apigateway_rest_api::create(ctx, region, kind, resource, propagated).await
             }
+            // Neither of these types publishes a `Tags` property, so CloudFormation
+            // propagates no tag to one: there is no call that could carry one.
+            Self::ApplicationAutoScaling(kind) => {
+                application_auto_scaling::create(ctx, region, kind, resource).await
+            }
         }
     }
 
@@ -903,6 +926,9 @@ impl Owner {
             // coming up in — a stage serves the deployment it points at as soon as the create
             // that made it has answered.
             Self::ApiGatewayRestApi(_) => Ok(Readiness::Ready),
+            // A target is registered, and a policy is in force, from the moment the owning
+            // service's own call answers.
+            Self::ApplicationAutoScaling(_) => Ok(application_auto_scaling::ready()),
         }
     }
 
@@ -969,6 +995,9 @@ impl Owner {
             // the ones their own creates answered with, so there is nothing left to read once
             // the resource is up.
             Self::ApiGatewayRestApi(_) => Ok(BTreeMap::new()),
+            // A target publishes no attribute at all, and a policy's `Arn` is the one its own
+            // put answered with, so there is nothing left to read once either is up.
+            Self::ApplicationAutoScaling(_) => Ok(BTreeMap::new()),
         }
     }
 
@@ -1036,6 +1065,10 @@ impl Owner {
             // service reports no state a deleted api, resource, method, deployment or stage is
             // still being removed in.
             Self::ApiGatewayRestApi(_) => Ok(Removal::Gone),
+            // Deregistering a target and deleting a policy each take the resource away as the
+            // call answers: Application Auto Scaling reports no state a deleted one is still
+            // being removed in.
+            Self::ApplicationAutoScaling(_) => Ok(Removal::Gone),
         }
     }
 
@@ -1137,6 +1170,9 @@ impl Owner {
             // declaration is reported as NOT applied rather than as a success that dropped the
             // caller's change.
             Self::ApiGatewayRestApi(_) => Ok(None),
+            Self::ApplicationAutoScaling(kind) => {
+                application_auto_scaling::update(ctx, region, kind, resource, declared).await
+            }
         }
     }
 
@@ -1208,6 +1244,8 @@ impl Owner {
             // Nor are the tags of an api or a stage that already exists ([`Provisioner::retag`]'s
             // own default), so nothing is asked about those either.
             Self::ApiGatewayRestApi(_) => Ok(()),
+            // Neither of these types is taggable, so nothing is asked about their tags.
+            Self::ApplicationAutoScaling(_) => Ok(()),
         }
     }
 
@@ -1297,6 +1335,12 @@ impl Owner {
             Self::ApiGatewayRestApi(kind) => {
                 apigateway_rest_api::delete(ctx, region, kind, resource).await
             }
+            // Application Auto Scaling takes no snapshot of a target or a policy on the way
+            // out: there is no such call, so a `Snapshot` deletion policy on one of them
+            // deletes the resource with no snapshot invented for it.
+            Self::ApplicationAutoScaling(kind) => {
+                application_auto_scaling::delete(ctx, region, kind, resource).await
+            }
         }
     }
 
@@ -1377,6 +1421,10 @@ impl Owner {
             Self::ApiGatewayRestApi(kind) => {
                 apigateway_rest_api::actual_configuration(ctx, region, kind, resource).await
             }
+            // A target and a policy report no configuration of their own to compare yet: this
+            // arm reads nothing back for drift detection, so nothing of either is reported as
+            // drifted rather than guessed at.
+            Self::ApplicationAutoScaling(_) => Ok(None),
         }
     }
 
@@ -1409,6 +1457,8 @@ impl Owner {
             Self::StepFunctionsStateMachine => message.to_string(),
             // Amazon API Gateway's does the same.
             Self::ApiGatewayRestApi(_) => message.to_string(),
+            // Application Auto Scaling's does the same.
+            Self::ApplicationAutoScaling(_) => message.to_string(),
         }
     }
 }
@@ -3724,6 +3774,10 @@ const UNNAMED_CODE_PREFIX: &str = "HTTP ";
 /// One entry per service whose reported wording this emulator pins; a service with no entry
 /// has its message reported exactly as it worded it, with no diagnostic invented for it.
 const SDK_SERVICE_NAMES: &[(&str, &str)] = &[
+    // Application Auto Scaling's SDK names it by its `sdkId` without the spaces, which is
+    // also the `cloudFormationName` the type names of its resources carry
+    // (`smithy_query(query="service_info")`).
+    ("application-autoscaling", "ApplicationAutoScaling"),
     ("es", "OpenSearch"),
     ("iam", "Iam"),
     ("lambda", "Lambda"),
@@ -4022,771 +4076,6 @@ fn denied_by_the_service_role(signing_name: &str, operation: Option<&str>) -> Op
         code: super::service_role::ACCESS_DENIED.to_string(),
         message,
     })
-}
-
-/// Call one awsJson operation of another emulated service in-process and read its
-/// answer document. `Err(refusal)` is the service's own refusal: its code, and the message
-/// it worded.
-///
-/// `content_type` is the awsJson version that service's model declares
-/// ([`AWS_JSON_1_0`] / [`AWS_JSON_1_1`]), which is what its answers are rendered in.
-///
-/// A 501 — the owning operation is still one of this emulator's stubs — is a refusal like
-/// any other, so a resource of a type this emulator DOES provision is never passed off as
-/// created when nothing created it; the type's own entry in [`owner_for`] is what decides
-/// whether a create is attempted at all.
-pub(super) async fn call_json_rpc(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    signing_name: &str,
-    region: &str,
-    content_type: &str,
-    target: &str,
-    request: &Value,
-) -> Result<Value, Refusal> {
-    // The call is made under the stack's service role, so what that role is DENIED is not
-    // made at all: the operation an awsJson request invokes is the part of its `X-Amz-Target`
-    // after the service shape's name ([`super::service_role::refusal`]).
-    if let Some(denied) = denied_by_the_service_role(signing_name, target.rsplit('.').next())
-    {
-        return Err(denied);
-    }
-    let body = serde_json::to_vec(request).map_err(|error| Refusal {
-        code: "SerializationException".to_string(),
-        message: error.to_string(),
-    })?;
-    let headers = vec![
-        ("content-type", content_type.to_string()),
-        ("x-amz-target", target.to_string()),
-    ];
-    let (status, payload) = dispatch(ctx, signing_name, region, "POST", "/", headers, body)
-        .await
-        .map_err(|message| Refusal {
-            code: "InternalFailure".to_string(),
-            message,
-        })?;
-    let document: Value = serde_json::from_slice(&payload).unwrap_or(Value::Null);
-    if (200..300).contains(&status) {
-        return Ok(document);
-    }
-    Err(refusal_of(signing_name, status, &document))
-}
-
-/// The media type an awsQuery request carries: its parameters are a form body, not a
-/// document ("the request is sent as `application/x-www-form-urlencoded`"). Read only by
-/// [`call_query`], which is the one place this module writes such a body.
-const FORM_URLENCODED: &str = "application/x-www-form-urlencoded";
-
-/// Call one awsQuery operation of another emulated service in-process and read the XML
-/// document it answers with. `Err(refusal)` is the service's own refusal: the
-/// `awsQueryError` code it carries, and the message it worded.
-///
-/// `version` is the API version that service's model declares (`2010-03-31` for Amazon
-/// SNS), which an awsQuery request names beside the action. `parameters` are the request's
-/// members in the awsQuery spelling — `Attributes.entry.<n>.key`, `Tags.member.<n>.Key` —
-/// percent-encoded here, so a value carrying `&` or `=` cannot be read as a second
-/// parameter.
-///
-/// A 501 is a refusal like any other, exactly as it is for [`call_json_rpc`]: the
-/// difference between the two is only the wire the called service publishes.
-pub(super) async fn call_query(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    signing_name: &str,
-    region: &str,
-    version: &str,
-    action: &str,
-    parameters: &[(String, String)],
-) -> Result<String, Refusal> {
-    call_query_carrying(ctx, signing_name, region, version, action, parameters, Vec::new())
-        .await
-}
-
-/// [`call_query`], with HEADERS the caller adds to the request beside the ones the wire needs.
-///
-/// For a call whose CHAIN matters: the nested-stack provider carries the deployment a call is
-/// already inside on the request, because each level is a request of its own and the bound on
-/// that chain has to travel with it ([`nested_stack`]). Everything else is [`call_query`]'s.
-pub(super) async fn call_query_carrying(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    signing_name: &str,
-    region: &str,
-    version: &str,
-    action: &str,
-    parameters: &[(String, String)],
-    carried: Vec<(&'static str, String)>,
-) -> Result<String, Refusal> {
-    // Under the stack's service role, exactly as [`call_json_rpc`] is: an awsQuery request
-    // names the operation it invokes in its `Action` parameter.
-    if let Some(denied) = denied_by_the_service_role(signing_name, Some(action)) {
-        return Err(denied);
-    }
-    let mut body = format!("Action={action}&Version={version}");
-    for (name, value) in parameters {
-        body.push('&');
-        body.push_str(&percent_encoded(name));
-        body.push('=');
-        body.push_str(&percent_encoded(value));
-    }
-    let mut headers = vec![("content-type", FORM_URLENCODED.to_string())];
-    headers.extend(carried);
-    let (status, payload) =
-        dispatch(ctx, signing_name, region, "POST", "/", headers, body.into_bytes())
-        .await
-        .map_err(|message| Refusal {
-            code: "InternalFailure".to_string(),
-            message,
-        })?;
-    let document = String::from_utf8_lossy(&payload).into_owned();
-    if (200..300).contains(&status) {
-        return Ok(document);
-    }
-    // An awsQuery error answer is `<ErrorResponse><Error><Code/><Message/></Error>…`, and
-    // the code is the one the model's `awsQueryError` trait fixes for that error shape
-    // (`NotFoundException` -> `NotFound`), which is what a client branches on.
-    let code = xml_element(&document, "Code")
-        .unwrap_or_else(|| format!("{UNNAMED_CODE_PREFIX}{status}"));
-    Err(Refusal {
-        message: sdk_message(
-            signing_name,
-            status,
-            &code,
-            &xml_element(&document, "Message").unwrap_or_default(),
-        ),
-        code,
-    })
-}
-
-/// One value as a single form component, URI path segment or query value: everything
-/// outside RFC 3986's unreserved set escaped ([`FORM_VALUE`]), which is what an AWS SDK
-/// sends for an awsQuery parameter or a non-greedy `@httpLabel` and what the SigV4
-/// canonical request assumes.
-///
-/// The ONE spelling of that encoding here, so a parameter of an awsQuery call
-/// ([`call_query`]) and a name written into a REST URI are escaped identically.
-///
-/// A value that comes from the TEMPLATE — the name a declaration asks for — therefore
-/// reaches the called operation as one value rather than as extra URI structure, so a name
-/// outside the called model's own pattern is refused by that operation's validation instead
-/// of addressing a different one.
-pub(super) fn percent_encoded(value: &str) -> String {
-    ::percent_encoding::utf8_percent_encode(value, FORM_VALUE).to_string()
-}
-
-/// Call one REST-JSON operation of another emulated service in-process and read its answer
-/// document. `Err(refusal)` is that service's own refusal, exactly as for
-/// [`call_json_rpc`].
-///
-/// A `restJson1` service binds each operation to an HTTP method and a URI rather than to an
-/// `X-Amz-Target` header (AWS FIS: `POST /experimentTemplates`,
-/// `DELETE /experimentTemplates/{id}`), so the caller passes the binding the called
-/// operation's model declares and this writes the request on it. `body` is `None` for an
-/// operation whose input is entirely in the URI.
-pub(super) async fn call_rest_json(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    signing_name: &str,
-    region: &str,
-    method: &'static str,
-    uri: &str,
-    body: Option<&Value>,
-) -> Result<Value, Refusal> {
-    let payload = match body {
-        Some(document) => serde_json::to_vec(document).map_err(|error| Refusal {
-            code: "SerializationException".to_string(),
-            message: error.to_string(),
-        })?,
-        None => Vec::new(),
-    };
-    let headers = vec![("content-type", REST_JSON.to_string())];
-    let (status, answer) = dispatch(ctx, signing_name, region, method, uri, headers, payload)
-        .await
-        .map_err(|message| Refusal {
-            code: "InternalFailure".to_string(),
-            message,
-        })?;
-    let document: Value = serde_json::from_slice(&answer).unwrap_or(Value::Null);
-    if (200..300).contains(&status) {
-        return Ok(document);
-    }
-    Err(refusal_of(signing_name, status, &document))
-}
-
-/// [`call_rest_json`] for an operation whose input is an `@httpPayload`: the bytes the
-/// caller passes ARE the request's body, under the media type that payload is sent as.
-///
-/// A REST operation that binds a member as its payload takes that member's bytes alone —
-/// API Gateway's `ImportRestApi` takes an OpenAPI document that way — so the request cannot
-/// be written as a JSON envelope of members. What comes back is the operation's own answer
-/// document, read exactly as [`call_rest_json`] reads one, and a refusal is that service's
-/// own.
-pub(super) async fn call_rest_payload(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    signing_name: &str,
-    region: &str,
-    method: &'static str,
-    uri: &str,
-    media_type: &str,
-    payload: Vec<u8>,
-) -> Result<Value, Refusal> {
-    let headers = vec![("content-type", media_type.to_string())];
-    let (status, answer) = dispatch(ctx, signing_name, region, method, uri, headers, payload)
-        .await
-        .map_err(|message| Refusal {
-            code: "InternalFailure".to_string(),
-            message,
-        })?;
-    let document: Value = serde_json::from_slice(&answer).unwrap_or(Value::Null);
-    if (200..300).contains(&status) {
-        return Ok(document);
-    }
-    Err(refusal_of(signing_name, status, &document))
-}
-
-/// Call one REST-XML operation of another emulated service in-process and read the XML
-/// document it answers with. `Err(refusal)` is that service's own refusal: the error CODE
-/// it carries, and the message it worded.
-///
-/// A `restXml` service (Amazon Route 53) binds each operation to a method and a URI like a
-/// REST-JSON one, and takes an XML document rather than a JSON one — so the caller passes
-/// the binding the called operation's model declares and the body it writes, and what comes
-/// back is the answer's text, read with [`xml_element`] and [`xml_scalar_children`].
-/// `body` is `None` for an operation whose input is entirely in the URI.
-///
-/// A 501 is a refusal like any other, exactly as it is for [`call_json_rpc`]: the
-/// difference between the two is only the wire the called service publishes.
-pub(super) async fn call_rest_xml(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    signing_name: &str,
-    region: &str,
-    method: &'static str,
-    uri: &str,
-    body: Option<&str>,
-) -> Result<String, Refusal> {
-    let payload = body.map(str::as_bytes).unwrap_or_default().to_vec();
-    let headers = vec![("content-type", REST_XML.to_string())];
-    let (status, answer) = dispatch(ctx, signing_name, region, method, uri, headers, payload)
-        .await
-        .map_err(|message| Refusal {
-            code: "InternalFailure".to_string(),
-            message,
-        })?;
-    let document = String::from_utf8_lossy(&answer).into_owned();
-    if (200..300).contains(&status) {
-        return Ok(document);
-    }
-    // A restXml error answer is `<ErrorResponse><Error><Type/><Code/><Message/></Error>…`,
-    // and the code is the one the model's error shape carries (`NoSuchHostedZone`), which is
-    // what a client branches on.
-    let code = xml_element(&document, "Code")
-        .unwrap_or_else(|| format!("{UNNAMED_CODE_PREFIX}{status}"));
-    Err(Refusal {
-        message: sdk_message(
-            signing_name,
-            status,
-            &code,
-            &xml_element(&document, "Message").unwrap_or_default(),
-        ),
-        code,
-    })
-}
-
-/// One element carrying TEXT, as a restXml request body spells a scalar member:
-/// `<Name>value</Name>`, with the five predefined entities escaped by the same maintained
-/// XML implementation that reads the answers back ([`xml_element`]) — so a value carrying
-/// `&` or `<` reaches the called operation as the text it is rather than as markup.
-///
-/// The element NAME is the called model's own member name, never caller text.
-pub(super) fn xml_leaf(name: &str, value: &str) -> String {
-    format!("<{name}>{}</{name}>", ::quick_xml::escape::escape(value))
-}
-
-/// What an awsQuery parameter name or value is percent-encoded against: everything
-/// outside the UNRESERVED set of RFC 3986 (`A-Z a-z 0-9 - _ . ~`) is escaped, which is
-/// what an AWS SDK sends and what the SigV4 canonical request assumes.
-const FORM_VALUE: &::percent_encoding::AsciiSet = &::percent_encoding::NON_ALPHANUMERIC
-    .remove(b'-')
-    .remove(b'_')
-    .remove(b'.')
-    .remove(b'~');
-
-/// The text one ENTITY REFERENCE stands for, as the reader hands it over.
-///
-/// The XML reader BREAKS a text run at a reference and reports `&amp;`, `&lt;`, `&gt;`,
-/// `&quot;` and `&apos;` as events of their own, so a reader that handles only text events
-/// drops the character every one of them escapes — and an answering service's own message
-/// quoting a value (`Invalid value 'x' for …`) reaches the wire with two of them. Resolved by
-/// the parser's own escaping rules rather than by a table here; a reference that stands for
-/// nothing is read as no text at all, which is what it contributes.
-fn referenced_text(reference: &::quick_xml::events::BytesRef<'_>) -> String {
-    let Ok(name) = reference.decode() else {
-        return String::new();
-    };
-    ::quick_xml::escape::unescape(&format!("&{name};"))
-        .map(::std::borrow::Cow::into_owned)
-        .unwrap_or_default()
-}
-
-/// The text of the first `<tag>` element of an XML document, with its entities decoded, or
-/// `None` where the document carries no such element.
-///
-/// A LEAF element's text: the character data between that element's own tags, concatenated,
-/// which is what the members read through it are (`<TopicArn>`, `<Code>`, `<Message>`).
-/// It keeps no element depth, so reading a member that HOLDS other elements — or one whose
-/// name repeats inside itself — needs a depth-aware reader rather than this helper.
-///
-/// Read with the same XML reader the emulator's own restXml services use, so an escaped
-/// value (`&amp;`, `&lt;`) comes back as the text the answering service wrote rather than
-/// as its escaping.
-pub(super) fn xml_element(document: &str, tag: &str) -> Option<String> {
-    use ::quick_xml::events::Event;
-
-    let mut reader = ::quick_xml::Reader::from_str(document);
-    reader.config_mut().trim_text(false);
-    let mut inside = false;
-    let mut text = String::new();
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(start)) if start.local_name().as_ref() == tag.as_bytes() => {
-                inside = true;
-            }
-            Ok(Event::Text(found)) if inside => {
-                text.push_str(&found.xml10_content().unwrap_or_default());
-            }
-            Ok(Event::GeneralRef(reference)) if inside => {
-                text.push_str(&referenced_text(&reference));
-            }
-            Ok(Event::End(end)) if inside && end.local_name().as_ref() == tag.as_bytes() => {
-                return Some(text);
-            }
-            // An empty element (`<TopicArn/>`) is the empty value of that element.
-            Ok(Event::Empty(empty)) if empty.local_name().as_ref() == tag.as_bytes() => {
-                return Some(String::new());
-            }
-            Ok(Event::Eof) | Err(_) => return None,
-            Ok(_) => {}
-        }
-    }
-}
-
-/// The text of EVERY `<tag>` element of an XML document, in document order, with their
-/// entities decoded.
-///
-/// [`xml_element`] reads the first one; a LIST member of an awsQuery answer repeats its
-/// element once per entry (`<Tags><member><Key/><Value/></member>…`), so a reader of one
-/// such member reads them all. Two members of the same list are read as PARALLEL lists and
-/// zipped, which is sound exactly where the answering service reports both on every entry.
-pub(super) fn xml_elements(document: &str, tag: &str) -> Vec<String> {
-    use ::quick_xml::events::Event;
-
-    let mut reader = ::quick_xml::Reader::from_str(document);
-    reader.config_mut().trim_text(false);
-    let mut found = Vec::new();
-    let mut reading: Option<String> = None;
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(start)) if start.local_name().as_ref() == tag.as_bytes() => {
-                reading = Some(String::new());
-            }
-            Ok(Event::Text(text)) => {
-                if let Some(held) = reading.as_mut() {
-                    held.push_str(&text.xml10_content().unwrap_or_default());
-                }
-            }
-            Ok(Event::GeneralRef(reference)) => {
-                if let Some(held) = reading.as_mut() {
-                    held.push_str(&referenced_text(&reference));
-                }
-            }
-            Ok(Event::End(end)) if end.local_name().as_ref() == tag.as_bytes() => {
-                if let Some(held) = reading.take() {
-                    found.push(held);
-                }
-            }
-            // An empty element (`<Value/>`) is the empty value of that element.
-            Ok(Event::Empty(empty)) if empty.local_name().as_ref() == tag.as_bytes() => {
-                found.push(String::new());
-            }
-            Ok(Event::Eof) | Err(_) => return found,
-            Ok(_) => {}
-        }
-    }
-}
-
-/// The map an awsQuery answer carries under `parent`, as the JSON object the rest of this
-/// module compares: one entry per `<entry><key>…</key><value>…</value></entry>`, which is
-/// how the query protocol serializes a map member (`Attributes` on
-/// `GetTopicAttributes`).
-///
-/// Only the entries of THAT parent element: the walk starts at its start tag and stops at
-/// its end tag, so a second map elsewhere in the document is not folded into this one. An
-/// entry with no `<key>` is not an entry and is skipped; a `<value>` the answer leaves
-/// empty is the empty string, which is what the answering service reported.
-pub(super) fn xml_entry_map(document: &str, parent: &str) -> ::serde_json::Map<String, Value> {
-    use ::quick_xml::events::Event;
-
-    const ENTRY: &[u8] = b"entry";
-    const KEY: &[u8] = b"key";
-    const VALUE: &[u8] = b"value";
-
-    let mut reader = ::quick_xml::Reader::from_str(document);
-    reader.config_mut().trim_text(false);
-    let mut entries = ::serde_json::Map::new();
-    let mut inside = false;
-    // The entry being read: its key and its value, each `Some` once its element opened.
-    let mut key: Option<String> = None;
-    let mut value: Option<String> = None;
-    let mut reading: Option<&[u8]> = None;
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(start)) => match start.local_name().as_ref() {
-                name if name == parent.as_bytes() => inside = true,
-                ENTRY if inside => {
-                    key = None;
-                    value = None;
-                }
-                KEY if inside => {
-                    key = Some(String::new());
-                    reading = Some(KEY);
-                }
-                VALUE if inside => {
-                    value = Some(String::new());
-                    reading = Some(VALUE);
-                }
-                _ => {}
-            },
-            Ok(Event::Text(found)) if reading.is_some() => {
-                let text = found.xml10_content().unwrap_or_default();
-                let held = match reading {
-                    Some(KEY) => key.as_mut(),
-                    Some(VALUE) => value.as_mut(),
-                    _ => None,
-                };
-                if let Some(held) = held {
-                    held.push_str(&text);
-                }
-            }
-            Ok(Event::GeneralRef(reference)) if reading.is_some() => {
-                let text = referenced_text(&reference);
-                let held = match reading {
-                    Some(KEY) => key.as_mut(),
-                    Some(VALUE) => value.as_mut(),
-                    _ => None,
-                };
-                if let Some(held) = held {
-                    held.push_str(&text);
-                }
-            }
-            Ok(Event::End(end)) => match end.local_name().as_ref() {
-                name if name == parent.as_bytes() => return entries,
-                ENTRY if inside => {
-                    if let Some(key) = key.take() {
-                        entries.insert(key, Value::String(value.take().unwrap_or_default()));
-                    }
-                }
-                KEY | VALUE => reading = None,
-                _ => {}
-            },
-            Ok(Event::Eof) | Err(_) => return entries,
-            Ok(_) => {}
-        }
-    }
-}
-
-/// Each DIRECT child element of `parent` that holds TEXT, as the JSON object the rest of
-/// this module compares: one entry per such element, keyed by its own name.
-///
-/// This is how an awsQuery answer carries a resource's scalar members — Amazon RDS reports
-/// a DB instance as `<DBInstance><DBInstanceClass>db.t3.micro</DBInstanceClass>…` — so it
-/// is the reader for a service whose answer is a STRUCTURE rather than the entry map
-/// [`xml_entry_map`] reads.
-///
-/// Only the first `parent` element, and only its own children: the walk starts at that
-/// element's start tag and stops at its end tag, so a second structure elsewhere in the
-/// document (the next DB instance of a list) is not folded into this one. A child that
-/// HOLDS other elements is not a scalar and is left out entirely rather than reported as
-/// the concatenation of its descendants' text; an empty element (`<Iops/>`) is the empty
-/// value of that member, which is what the answering service reported.
-pub(super) fn xml_scalar_children(
-    document: &str,
-    parent: &str,
-) -> ::serde_json::Map<String, Value> {
-    use ::quick_xml::events::Event;
-
-    let mut reader = ::quick_xml::Reader::from_str(document);
-    reader.config_mut().trim_text(false);
-    let mut members = ::serde_json::Map::new();
-    let mut inside = false;
-    // How many elements are open BELOW `parent`: a direct child opens at 0, and only a
-    // child read at that level is one of this structure's own members.
-    let mut depth = 0usize;
-    // The direct child being read, while it is still a candidate scalar, and its text.
-    let mut member: Option<String> = None;
-    let mut text = String::new();
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(start)) => {
-                let name = String::from_utf8_lossy(start.local_name().as_ref()).into_owned();
-                if !inside {
-                    inside = name == parent;
-                    continue;
-                }
-                if depth == 0 {
-                    member = Some(name);
-                    text.clear();
-                } else {
-                    // The child this is nested in holds elements, so it is not a scalar.
-                    member = None;
-                }
-                depth += 1;
-            }
-            Ok(Event::Text(found)) if inside && depth == 1 => {
-                text.push_str(&found.xml10_content().unwrap_or_default());
-            }
-            Ok(Event::GeneralRef(reference)) if inside && depth == 1 => {
-                text.push_str(&referenced_text(&reference));
-            }
-            Ok(Event::Empty(empty)) if inside && depth == 0 => {
-                let name = String::from_utf8_lossy(empty.local_name().as_ref()).into_owned();
-                members.insert(name, Value::String(String::new()));
-            }
-            Ok(Event::End(end)) if inside => {
-                let name = String::from_utf8_lossy(end.local_name().as_ref()).into_owned();
-                if depth == 0 {
-                    if name == parent {
-                        return members;
-                    }
-                    continue;
-                }
-                if depth == 1 {
-                    if let Some(read) = member.take() {
-                        if read == name {
-                            members.insert(read, Value::String(::std::mem::take(&mut text)));
-                        }
-                    }
-                }
-                depth -= 1;
-            }
-            Ok(Event::Eof) | Err(_) => return members,
-            Ok(_) => {}
-        }
-    }
-}
-
-/// A service's error answer as the code it carries and the message it worded. The code is
-/// the last segment of the awsJson `__type`
-/// (`com.amazonaws.firehose#ResourceInUseException` -> `ResourceInUseException`), which is
-/// what a client branches on.
-///
-/// The message is the one an SDK of that service would raise ([`sdk_message`]), because what
-/// a resource provider reports is what its own SDK call raised.
-fn refusal_of(signing_name: &str, status: u16, document: &Value) -> Refusal {
-    let code = document
-        .get("__type")
-        .or_else(|| document.get("code"))
-        .or_else(|| document.get("Code"))
-        .and_then(Value::as_str)
-        .map(|code| code.rsplit('#').next().unwrap_or(code).to_string())
-        .unwrap_or_else(|| format!("{UNNAMED_CODE_PREFIX}{status}"));
-    let message = document
-        .get("message")
-        .or_else(|| document.get("Message"))
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-    Refusal {
-        message: sdk_message(signing_name, status, &code, message),
-        code,
-    }
-}
-
-/// Sign a request with the emulator's own credentials and dispatch it in-process to the
-/// service its credential scope names.
-///
-/// The request is signed because the emulator verifies every request signature when
-/// authentication is on; the credential scope is also what routes it, so the service that
-/// owns the resource is the one that serves the call.
-///
-/// `method` and `uri` are the called operation's own HTTP binding: an RPC protocol binds
-/// every operation to `POST /` and names what it acts on in its document — or, for
-/// awsQuery, in its form body — while a REST protocol binds each operation to its own
-/// method and path.
-///
-/// The call itself is served on a TASK of its own. It reaches the called service's whole
-/// deserialize → handle → serialize chain, and for a type whose owning service is
-/// CloudFormation itself — a nested stack — that chain deploys a stack, which provisions its
-/// own resources through this same function: a chain of calls would otherwise pile every
-/// level's frames onto the stack of the ONE request that started it, and the emulator's worker
-/// stack is a fixed size. A task starts from the top of a worker's stack, so one call costs
-/// one level however deeply a template nests. The answer is awaited right here, so the call is
-/// still synchronous to the walk that made it.
-async fn dispatch(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-    signing_name: &str,
-    region: &str,
-    method: &'static str,
-    uri: &str,
-    headers: Vec<(&'static str, String)>,
-    body: Vec<u8>,
-) -> Result<(u16, Vec<u8>), String> {
-    let host = format!("{signing_name}.{region}.amazonaws.com");
-    let mut request = ::http::Request::builder()
-        .method(method)
-        .uri(uri)
-        .header("host", host);
-    for (name, value) in &headers {
-        request = request.header(*name, value);
-    }
-    let mut request = request.body(body).map_err(|error| error.to_string())?;
-
-    let (access_key_id, secret_access_key) = callback_credentials(ctx).await?;
-    sign_callback_request(
-        &mut request,
-        signing_name,
-        region,
-        &access_key_id,
-        &secret_access_key,
-    )?;
-
-    let (parts, body) = request.into_parts();
-    let request = ::http::Request::from_parts(
-        parts,
-        ::aws_smithy_types::body::SdkBody::from(::bytes::Bytes::from(body)),
-    );
-    let request = ::aws_smithy_runtime_api::http::Request::try_from(request)
-        .map_err(|error| error.to_string())?;
-    // The connector is a cloneable handle to the router, so the task owns everything it
-    // needs and borrows nothing of this request's context. It is taken from the CALLBACK, so
-    // the chain's recursion depth is stamped on the request exactly as it is for a call made
-    // here (`smithy_server_runtime::CallbackRecursionDepth`).
-    let connector = ctx.callback().http_connector();
-    // ABORTED WITH THE CALLER: the task's handle is held in a guard that aborts it when
-    // dropped, so a request that goes away — a client that disconnected, a wait that ran out
-    // — takes the work it started with it instead of leaving it running (and spawning
-    // further levels of its own).
-    let mut served = AbortedWithTheCaller(::tokio::spawn(async move {
-        ::aws_smithy_runtime_api::client::http::HttpConnector::call(&connector, request).await
-    }));
-    let response = served
-        .answered()
-        .await
-        // The task was cancelled or panicked: nothing answered, which is what the caller is
-        // told. A panic in another service's handler is that service's own fault and is not
-        // swallowed — it is reported as the failure of this call.
-        .map_err(|error| error.to_string())?
-        .map_err(|error| error.to_string())?;
-    let status = response.status().as_u16();
-    let payload = response
-        .body()
-        .bytes()
-        .ok_or("the in-process answer carried a streaming body")?
-        .to_vec();
-    Ok((status, payload))
-}
-
-/// One in-process call's task, held so that dropping this guard ABORTS it.
-///
-/// `tokio::spawn` detaches: dropping a `JoinHandle` leaves the task running, and for a call
-/// that re-enters this walk that means a request nobody is waiting for any more goes on
-/// deploying (and spawning further levels). The guard makes the task's lifetime the caller's:
-/// the awaiting future owns it, and whatever drops that future — a disconnected client, a
-/// ceiling that ran out, a cancelled operation — stops the work it set off.
-struct AbortedWithTheCaller<T>(::tokio::task::JoinHandle<T>);
-
-impl<T> AbortedWithTheCaller<T> {
-    /// What the task answered, awaited through the handle the guard holds (a `JoinHandle` is
-    /// `Unpin`, so it is polled in place and the guard keeps ownership until the answer or the
-    /// cancellation).
-    async fn answered(&mut self) -> Result<T, ::tokio::task::JoinError> {
-        (&mut self.0).await
-    }
-}
-
-impl<T> Drop for AbortedWithTheCaller<T> {
-    fn drop(&mut self) {
-        // A task that has already answered is finished, and aborting a finished task does
-        // nothing — so this is the cancellation path only.
-        self.0.abort();
-    }
-}
-
-/// SigV4-sign one in-process request to another emulated service, in place.
-///
-/// The settings are the ones the emulator's own verifier re-signs with
-/// (`vendor/server/src/request_authentication.rs`), so the signature this produces is the
-/// one that verifier computes over the same request — which is what lets a stack create a
-/// resource with request authentication ON. Public so a test can hold it to exactly that
-/// (`tests/all/callback_signature.rs`).
-pub fn sign_callback_request(
-    request: &mut ::http::Request<Vec<u8>>,
-    signing_name: &str,
-    region: &str,
-    access_key_id: &str,
-    secret_access_key: &str,
-) -> Result<(), String> {
-    use ::aws_sigv4::http_request::{
-        sign, PayloadChecksumKind, SignableBody, SignableRequest, SigningSettings,
-    };
-
-    let identity: ::aws_smithy_runtime_api::client::identity::Identity =
-        ::aws_credential_types::Credentials::builder()
-            .provider_name("aws-emulator-cloudformation")
-            .access_key_id(access_key_id)
-            .secret_access_key(secret_access_key)
-            .build()
-            .into();
-    let mut settings = SigningSettings::default();
-    settings.payload_checksum_kind = PayloadChecksumKind::NoHeader;
-    settings.excluded_headers = None;
-    let params = ::aws_sigv4::sign::v4::SigningParams::builder()
-        .identity(&identity)
-        .region(region)
-        .name(signing_name)
-        .settings(settings)
-        .time(SystemTime::now())
-        .build()
-        .map_err(|error| error.to_string())?;
-    let body = request.body().clone();
-    let signable_headers: Vec<(String, String)> = request
-        .headers()
-        .iter()
-        .map(|(name, value)| {
-            (
-                name.as_str().to_string(),
-                value.to_str().unwrap_or_default().to_string(),
-            )
-        })
-        .collect();
-    let signable = SignableRequest::new(
-        request.method().as_str(),
-        request.uri().to_string(),
-        signable_headers
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str())),
-        SignableBody::Bytes(&body),
-    )
-    .map_err(|error| error.to_string())?;
-    let (instructions, _signature) = sign(signable, &params.into())
-        .map_err(|error| error.to_string())?
-        .into_parts();
-    instructions.apply_to_request_http1x(request);
-    Ok(())
-}
-
-/// The credentials a callback signs with: the emulator's own, through the provider the
-/// framework hands every handler — which falls back to its placeholder pair when the
-/// router vends none (request authentication off, where nothing verifies a signature).
-async fn callback_credentials(
-    ctx: &smithy_server_runtime::OperationContext<'_>,
-) -> Result<(String, String), String> {
-    use ::aws_credential_types::provider::ProvideCredentials;
-
-    let credentials = ctx
-        .callback()
-        .aws_credentials_provider()
-        .provide_credentials()
-        .await
-        .map_err(|error| error.to_string())?;
-    Ok((
-        credentials.access_key_id().to_string(),
-        credentials.secret_access_key().to_string(),
-    ))
 }
 
 #[cfg(test)]

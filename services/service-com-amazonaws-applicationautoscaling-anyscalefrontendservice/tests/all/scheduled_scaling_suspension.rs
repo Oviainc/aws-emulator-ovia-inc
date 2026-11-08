@@ -126,7 +126,7 @@ async fn a_scheduled_occurrence_is_initiated_only_while_scheduled_scaling_runs()
     for (row, emulator, target) in rows {
         let case = row.case;
         if row.fires {
-            let reported = scalable_target(&emulator, case).await;
+            let reported = scalable_target(&emulator, case, &target).await;
             assert_eq!(
                 reported["MinCapacity"],
                 json!(SCHEDULED_MIN),
@@ -152,7 +152,7 @@ async fn a_scheduled_occurrence_is_initiated_only_while_scheduled_scaling_runs()
                 status, 200,
                 "case {case:?}: expected the resume to answer 200, got {status} {body:?}"
             );
-            let reported = scalable_target(&emulator, case).await;
+            let reported = scalable_target(&emulator, case, &target).await;
             assert_eq!(
                 reported["MinCapacity"],
                 json!(REGISTERED_MIN),
@@ -173,7 +173,7 @@ async fn a_scheduled_occurrence_is_initiated_only_while_scheduled_scaling_runs()
         // The upsert changed only the flags it named: a flag the row set stays set, and one
         // it never named is reported as the `false` it is — except the one the resume above
         // deliberately cleared.
-        let reported = scalable_target(&emulator, case).await;
+        let reported = scalable_target(&emulator, case, &target).await;
         for member in [
             "DynamicScalingInSuspended",
             "DynamicScalingOutSuspended",
@@ -207,11 +207,19 @@ fn suspended_state(flags: &[(&str, bool)]) -> Value {
 }
 
 /// The one scalable target the suite registers, as `DescribeScalableTargets` reports it.
-async fn scalable_target(emulator: &Emulator, case: &str) -> Value {
+///
+/// The report is narrowed by the target's own `ResourceId` beside its dimension: a dimension
+/// names a capacity property of ONE resource, so this service refuses a dimension filter
+/// sent with no resource id.
+async fn scalable_target(emulator: &Emulator, case: &str, target: &Value) -> Value {
     let (status, body) = emulator
         .call(
             "DescribeScalableTargets",
-            json!({"ServiceNamespace": NAMESPACE, "ScalableDimension": DIMENSION}),
+            json!({
+                "ServiceNamespace": NAMESPACE,
+                "ResourceIds": [target["ResourceId"].clone()],
+                "ScalableDimension": DIMENSION,
+            }),
         )
         .await;
     assert_eq!(

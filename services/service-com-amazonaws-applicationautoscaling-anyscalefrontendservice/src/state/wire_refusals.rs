@@ -39,14 +39,18 @@ const TARGET_NOT_FOUND_STATUS: u16 = 400;
 /// branches on the code.
 const RESOURCE_NOT_FOUND_CODE: &str = "ResourceNotFoundException";
 
-/// The `__type` an operation that is not offered is refused with, as the AWS "Common Errors"
-/// table names it (`AccessDeniedException` — "You do not have sufficient access to perform
-/// this action"): the action is not available to the caller at all, which is not a statement
-/// about the request it sent.
-const NOT_SUPPORTED_CODE: &str = "AccessDeniedException";
+/// The `__type` an access-denied refusal is named by, as the AWS "Common Errors" table names
+/// it (`AccessDeniedException` — "You do not have sufficient access to perform this action").
+///
+/// Read by every refusal of this service that is about the caller's ACCESS rather than about
+/// the request it sent: an operation this service does not offer for the resource addressed
+/// ([`WireRefusal::NotSupported`]), and a request the IAM policies in force do not permit
+/// ([`crate::service::authorization`]) — so the two cannot answer one condition under two
+/// codes.
+pub const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
 
-/// The status of that refusal, as the same table publishes it: "HTTP Status Code: 400".
-const NOT_SUPPORTED_STATUS: u16 = 400;
+/// The status of such a refusal, as the same table publishes it: "HTTP Status Code: 400".
+pub const ACCESS_DENIED_STATUS: u16 = 400;
 
 /// How this service states that one of its operations is not offered for the resource
 /// addressed: the operation's own name, and nothing else from the request.
@@ -158,7 +162,7 @@ impl WireRefusal {
     fn error_code(&self) -> &'static str {
         match self {
             Self::ScalableTargetNotFound(_) => RESOURCE_NOT_FOUND_CODE,
-            Self::NotSupported(_) => NOT_SUPPORTED_CODE,
+            Self::NotSupported(_) => ACCESS_DENIED_CODE,
         }
     }
 
@@ -166,7 +170,7 @@ impl WireRefusal {
     fn http_status(&self) -> u16 {
         match self {
             Self::ScalableTargetNotFound(_) => TARGET_NOT_FOUND_STATUS,
-            Self::NotSupported(_) => NOT_SUPPORTED_STATUS,
+            Self::NotSupported(_) => ACCESS_DENIED_STATUS,
         }
     }
 

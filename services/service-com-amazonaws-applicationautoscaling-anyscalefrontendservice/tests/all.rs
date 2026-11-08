@@ -23,6 +23,8 @@ mod control_plane_rules;
 mod customized_metric_alarms;
 #[path = "all/emulator.rs"]
 mod emulator;
+#[path = "all/keyspaces_table_resolution.rs"]
+mod keyspaces_table_resolution;
 #[path = "all/policy_alarm_association.rs"]
 mod policy_alarm_association;
 #[path = "all/policy_refusal_sentences.rs"]
@@ -37,6 +39,10 @@ mod recorded_refusal_wording;
 mod refusal_messages;
 #[path = "all/refusal_texts.rs"]
 mod refusal_texts;
+#[path = "all/registration_preconditions.rs"]
+mod registration_preconditions;
+#[path = "all/request_authorization.rs"]
+mod request_authorization;
 #[path = "all/regional_scalable_targets.rs"]
 mod regional_scalable_targets;
 #[path = "all/resource_tags.rs"]
