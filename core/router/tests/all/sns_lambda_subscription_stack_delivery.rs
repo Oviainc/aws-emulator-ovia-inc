@@ -24,8 +24,8 @@ use smithy_server_runtime::MultiServiceRouter;
 
 use crate::query_wire::{element, outputs_of};
 use crate::sns_lambda_subscription_permission_boundary::{
-    build_router, cloudformation, drain, iam, sns, template, trust_policy, CREATE_COMPLETE,
-    DELIVERY_BUDGET, LOOK_INTERVAL, ROLE_NAME,
+    build_router, cloudformation, drain, execution_role, sns, template, CREATE_COMPLETE,
+    DELIVERY_BUDGET, LOOK_INTERVAL,
 };
 
 use crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status;
@@ -57,15 +57,7 @@ async fn a_deployed_subscription_invokes_its_function_once_per_published_message
     let stack = "sns-lambda-multiplicity";
 
     // The execution role the template names, created where that service holds it.
-    iam(
-        &router,
-        "CreateRole",
-        &[
-            ("RoleName", ROLE_NAME),
-            ("AssumeRolePolicyDocument", &trust_policy()),
-        ],
-    )
-    .await;
+    execution_role(&router).await;
 
     // The permitted estate: topic, function, subscription and the grant, as the sibling
     // suite's template declares them.

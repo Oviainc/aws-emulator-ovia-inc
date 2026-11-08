@@ -85,6 +85,12 @@ uuid = { version = "1", features = ["v4"] }
 aws-sdk-kinesis = { version = "1", default-features = false }
 aws-sdk-dynamodbstreams = { version = "1", default-features = false }
 aws-sdk-lambda = { version = "1", default-features = false }
+# Amazon S3 binds every operation to a method, a path, a query and headers of its own
+# rather than carrying an input document in the body, so a handler's `boto3.client("s3")`
+# call cannot be built by the AWS JSON path the other reachable services share: this is the
+# client that builds, signs and parses it (`state::execution::aws_s3`), over the same
+# in-process callback.
+aws-sdk-s3 = { version = "1", default-features = false }
 # A function whose environment variables are encrypted with a customer managed key can
 # only be invoked while that key can decrypt them, and the key's state belongs to the key
 # service: it is asked over the same in-process callback
@@ -212,6 +218,11 @@ service-com-amazonaws-sesv2-simpleemailservice-v2 = { workspace = true }
 service-com-amazonaws-dynamodb-dynamodb-20120810 = { workspace = true }
 service-com-amazonaws-dynamodbstreams-dynamodbstreams-20120810 = { workspace = true }
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }
+# The bucket a handler's own S3 call reads and writes, mounted beside lambda on ONE engine
+# in the SDK tests: an object a handler reads is asserted where a client reads it, and the
+# bucket policy and the role policies that decide such a read are written with S3's and
+# IAM's own operations.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

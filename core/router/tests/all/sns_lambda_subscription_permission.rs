@@ -22,8 +22,8 @@
 use crate::cloudformation_firehose_stream_stabilisation::wait_for_stack_status;
 use crate::query_wire::{element, outputs_of};
 use crate::sns_lambda_subscription_permission_boundary::{
-    build_router, cloudformation, iam, sns, stayed_quiet, template, trust_policy, wait_for,
-    CREATE_COMPLETE, ROLE_NAME,
+    build_router, cloudformation, execution_role, sns, stayed_quiet, template, wait_for,
+    CREATE_COMPLETE,
 };
 
 /// One leg: the case, the stack it deploys, whether that stack's template declares the grant,
@@ -38,15 +38,7 @@ async fn two_separately_deployed_stacks_differ_only_in_whether_the_function_is_i
     let router = build_router();
 
     // The execution role both templates name, created where that service holds it.
-    iam(
-        &router,
-        "CreateRole",
-        &[
-            ("RoleName", ROLE_NAME),
-            ("AssumeRolePolicyDocument", &trust_policy()),
-        ],
-    )
-    .await;
+    execution_role(&router).await;
 
     let legs: &[Leg] = &[
         (

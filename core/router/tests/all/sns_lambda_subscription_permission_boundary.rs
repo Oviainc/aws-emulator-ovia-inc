@@ -228,6 +228,46 @@ pub(crate) fn trust_policy() -> String {
     .to_string()
 }
 
+/// The identity policy that same role has to carry for its FUNCTION's own calls to be
+/// served: a handler calls another service with temporary credentials for its execution
+/// role, so each call it makes — resolving the sink's URL by name, and the write itself — is
+/// judged against the policies in force on that role.
+fn forwarding_policy() -> String {
+    json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": ["sqs:GetQueueUrl", "sqs:SendMessage"],
+            "Resource": "*",
+        }],
+    })
+    .to_string()
+}
+
+/// Create the execution role the templates of these suites name, where IAM holds it:
+/// trusted by Lambda, and granting the forward its handler makes.
+pub(crate) async fn execution_role(router: &MultiServiceRouter) {
+    iam(
+        router,
+        "CreateRole",
+        &[
+            ("RoleName", ROLE_NAME),
+            ("AssumeRolePolicyDocument", &trust_policy()),
+        ],
+    )
+    .await;
+    iam(
+        router,
+        "PutRolePolicy",
+        &[
+            ("RoleName", ROLE_NAME),
+            ("PolicyName", "forward-to-the-sink"),
+            ("PolicyDocument", &forwarding_policy()),
+        ],
+    )
+    .await;
+}
+
 /// The handler the stack declares inline: it forwards the message of every SNS record it is
 /// handed to the queue the stack also declares, which is where the delivery is observed.
 ///
@@ -356,15 +396,7 @@ async fn a_stack_deployed_sns_lambda_subscription_invokes_the_function_only_when
     let stack = "sns-lambda-boundary";
 
     // The execution role the template names, created where that service holds it.
-    iam(
-        &router,
-        "CreateRole",
-        &[
-            ("RoleName", ROLE_NAME),
-            ("AssumeRolePolicyDocument", &trust_policy()),
-        ],
-    )
-    .await;
+    execution_role(&router).await;
 
     // The stack WITHOUT the grant: the subscription is wired, and nothing may invoke the
     // function.

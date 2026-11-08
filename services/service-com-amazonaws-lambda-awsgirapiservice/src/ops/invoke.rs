@@ -702,8 +702,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         crate::state::execution_slot::INITIALIZATION_TYPE_ON_DEMAND,
                     // The AWS SDK this runtime supplies the handler reaches the rest of
                     // this emulator through, built from the callback the framework handed
-                    // THIS request — the same seam a synchronous invocation's run gets.
-                    aws: crate::state::AwsAccess::new(ctx.callback().clone(), &region),
+                    // THIS request and signing as the session of the function's own
+                    // execution role — the same seam a synchronous invocation's run gets.
+                    aws: crate::state::function_sdk_access(
+                        &*self.engine,
+                        ctx,
+                        &region,
+                        &resolved_config.role,
+                        &function_name,
+                    ),
                     // Where the run's log is delivered, and what the function's execution
                     // role may do there (`crate::state::execution::log_delivery`).
                     logs: Some(crate::state::log_target(
@@ -798,8 +805,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             request_id: crate::service::request_id_header::starting_invocation(),
             initialization_type: admitted.initialization_type,
             // The AWS SDK this runtime supplies the handler reaches the rest of this
-            // emulator through the callback the framework handed THIS request.
-            aws: crate::state::AwsAccess::new(ctx.callback().clone(), &region),
+            // emulator through the callback the framework handed THIS request, signing
+            // every call the handler makes as the session of the function's own execution
+            // role (`crate::state::execution_role_session`).
+            aws: crate::state::function_sdk_access(
+                &*self.engine,
+                ctx,
+                &region,
+                &resolved_config.role,
+                &function_name,
+            ),
             // Where the run's log is delivered, and what the function's execution role may
             // do there (`crate::state::execution::log_delivery`).
             logs: Some(crate::state::log_target(

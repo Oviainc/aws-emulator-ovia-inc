@@ -94,6 +94,15 @@ pub fn python_modules(zip_bytes: Option<&[u8]>) -> Result<Vec<PackageModule>, Pa
     source_modules(zip_bytes, PYTHON_SUFFIXES, &mut ReadBudget::default())
 }
 
+/// The same, spending `budget` — the read of one archive of an invocation that reads several
+/// ([`ReadBudget`]), which is how a RUN reads its mounts whichever language they are in.
+pub fn python_modules_within(
+    zip_bytes: Option<&[u8]>,
+    budget: &mut ReadBudget,
+) -> Result<Vec<PackageModule>, PackageFault> {
+    source_modules(zip_bytes, PYTHON_SUFFIXES, budget)
+}
+
 /// Every JavaScript (and JSON) module `zip_bytes` holds, in the archive's own order.
 ///
 /// `Ok(vec![])` is a readable archive with no loadable module in it, which is a package

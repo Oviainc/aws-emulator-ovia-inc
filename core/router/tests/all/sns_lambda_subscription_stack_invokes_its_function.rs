@@ -230,7 +230,25 @@ fn template_of(row: &Row) -> Value {
         "Role": {
             "Type": "AWS::IAM::Role",
             "Properties": with_name(
-                json!({ "AssumeRolePolicyDocument": lambda_trust_policy() }),
+                json!({
+                    "AssumeRolePolicyDocument": lambda_trust_policy(),
+                    // A function calls another service with temporary credentials for its
+                    // execution role, so the role GRANTS the forward its handler makes:
+                    // without the grant the handler's own `sqs:SendMessage` is refused,
+                    // which is a different rule than the permission boundary these rows
+                    // read.
+                    "Policies": [{
+                        "PolicyName": "forward-to-the-sink",
+                        "PolicyDocument": {
+                            "Version": "2012-10-17",
+                            "Statement": [{
+                                "Effect": "Allow",
+                                "Action": "sqs:SendMessage",
+                                "Resource": "*",
+                            }],
+                        },
+                    }],
+                }),
                 "RoleName",
                 row.declared_names.map(|names| names.role),
             ),

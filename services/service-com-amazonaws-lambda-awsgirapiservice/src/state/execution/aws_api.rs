@@ -19,10 +19,14 @@
 //!   supplies is resolved and no socket is opened, so no call can leave the process. The
 //!   framework's own callback recursion limit bounds a chain of self-invocations.
 //! * The guest never sees a credential. The signature is put on the request by host code
-//!   with the credential the framework hands this emulator's handlers, exactly as every
+//!   with the credential the invocation was given — the session of the function's own
+//!   EXECUTION ROLE ([`super::execution_role_session`]), or the credential the framework
+//!   hands this emulator's handlers where no session could be minted — exactly as every
 //!   other in-process call between two emulated services is signed
 //!   ([`::service_common::in_process_sigv4`]); nothing of it is returned to the guest, and
-//!   the guest cannot ask for a call to be signed as anything else.
+//!   the guest cannot ask for a call to be signed as anything else. So the service that
+//!   SERVES the call judges it against the policies in force on that role, which is what
+//!   "the function runs as its execution role" means on the wire.
 //! * Only the services in [`APIS`] are reachable, and only the operations their own models
 //!   bind. A token that is not in that table is REFUSED rather than guessed at: the guest
 //!   is told the service is unknown, and nothing is sent.
@@ -47,6 +51,10 @@ const ERROR_TYPE_HEADER: &str = "x-amzn-errortype";
 
 /// The header an AWS answer carries the id of the request it answers in.
 const REQUEST_ID_HEADER: &str = "x-amzn-requestid";
+
+/// The header a request made with a TEMPORARY credential carries that credential's session
+/// token in, which is what a created session credential is served only with.
+const SESSION_TOKEN_HEADER: &str = "x-amz-security-token";
 
 /// The largest input document one call may carry.
 ///
@@ -101,6 +109,11 @@ pub enum Protocol {
     /// a body, member by member, so the request is built from the service's own model
     /// ([`super::rest_json`]).
     RestJson(&'static super::rest_json::RestApi),
+    /// Amazon S3's `restXml`: each operation binds its input to a method, a path, a query
+    /// and headers of its own and answers an XML document or the object's own bytes, so the
+    /// request is built, signed and parsed by the S3 client this crate holds
+    /// ([`super::aws_s3`]) rather than by either path above.
+    S3Rest,
 }
 
 impl Api {
@@ -115,7 +128,7 @@ impl Api {
             Protocol::AwsJson { json_version, .. } => {
                 format!("application/x-amz-json-{json_version}")
             }
-            Protocol::RestJson(_) => "application/json".to_string(),
+            Protocol::RestJson(_) | Protocol::S3Rest => "application/json".to_string(),
         }
     }
 }
@@ -243,6 +256,17 @@ pub const APIS: &[Api] = &[
         endpoint_prefix: "email",
         protocol: Protocol::RestJson(&SESV2),
     },
+    // `services/service-com-amazonaws-s3-amazons3/smithy-model/
+    // com-amazonaws-s3-amazons3.json`: restXml, sigv4Name `s3`, endpointPrefix `s3`, sdkId
+    // `S3`. Its operations bind their input to a path, a query and headers rather than to a
+    // document, and answer XML or an object's own bytes, so the request is built by
+    // [`super::aws_s3`].
+    Api {
+        sdk_token: "s3",
+        signing_name: "s3",
+        endpoint_prefix: "s3",
+        protocol: Protocol::S3Rest,
+    },
 ];
 
 /// Amazon API Gateway's own model, which a call to it is bound by.
@@ -281,6 +305,30 @@ pub fn reachable_services() -> Vec<&'static str> {
     APIS.iter().map(|api| api.sdk_token).collect()
 }
 
+/// The CREDENTIAL one invocation's calls are signed with.
+///
+/// Held by the host and never reachable from guest code: it reaches the request's
+/// `Authorization` and `x-amz-security-token` headers and nothing else — no response, no
+/// log and no environment variable of the run ([`super::runtime_environment`] puts no
+/// credential in a run's environment).
+#[derive(Clone)]
+pub struct CallerIdentity {
+    /// The access key id, which is where the service serving a call reads WHO made it.
+    pub access_key_id: String,
+    /// Its secret, used to sign and nowhere else.
+    pub secret_access_key: String,
+    /// The session token a temporary credential is served only with.
+    pub session_token: String,
+}
+
+/// Prints no field at all, so neither the key nor its secret can reach a log through a
+/// debug form of this type or of anything holding one.
+impl ::std::fmt::Debug for CallerIdentity {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter<'_>) -> ::std::fmt::Result {
+        f.debug_struct("CallerIdentity").finish_non_exhaustive()
+    }
+}
+
 /// What a running handler reaches the rest of this emulator through.
 ///
 /// Built from the operation context of the call that started the run, so the callback it
@@ -297,6 +345,10 @@ pub struct AwsAccess {
     runtime: ::tokio::runtime::Handle,
     /// The Region a call is made in unless the SDK client the guest built names another.
     region: String,
+    /// The credential every call is signed with: the session of the function's execution
+    /// role, or `None` where no session could be minted for it, in which case the call is
+    /// signed with the credential the framework hands this emulator's handlers.
+    identity: Option<CallerIdentity>,
 }
 
 impl AwsAccess {
@@ -309,7 +361,20 @@ impl AwsAccess {
             callback,
             runtime,
             region: region.to_string(),
+            identity: None,
         })
+    }
+
+    /// The same access, signing every call it makes as `identity` — the session of the
+    /// function's own execution role ([`super::execution_role_session`]).
+    ///
+    /// `None` leaves it signing with the framework's own credential, which is the position
+    /// an invocation whose execution role this emulator holds no record of is in: nothing
+    /// is known about that role, so nothing is claimed about it.
+    #[must_use]
+    pub fn signing_as(mut self, identity: Option<CallerIdentity>) -> Self {
+        self.identity = identity;
+        self
     }
 
     /// The Region a call with no Region of its own is made in.
@@ -363,11 +428,35 @@ impl AwsAccess {
         } else {
             &self.region
         };
-        match ::tokio::time::timeout(within, dispatch(&self.callback, api, region, operation, body))
-            .await
+        match ::tokio::time::timeout(within, self.dispatched(api, region, operation, body)).await
         {
             Ok(answer) => answer,
             Err(_elapsed) => Err(Refusal::TimedOut),
+        }
+    }
+
+    /// One call, built the way the called service's own protocol binds it.
+    async fn dispatched(
+        &self,
+        api: &Api,
+        region: &str,
+        operation: &str,
+        body: &str,
+    ) -> Result<Answer, Refusal> {
+        match api.protocol {
+            Protocol::AwsJson { .. } | Protocol::RestJson(_) => {
+                dispatch(&self.callback, api, region, operation, body, self.identity.as_ref()).await
+            }
+            Protocol::S3Rest => {
+                super::aws_s3::call(
+                    &self.callback,
+                    self.identity.as_ref(),
+                    region,
+                    operation,
+                    body,
+                )
+                .await
+            }
         }
     }
 }
@@ -403,6 +492,13 @@ pub struct Answer {
     pub error_type: Option<String>,
     /// The id it gave the request it answered.
     pub request_id: Option<String>,
+    /// The output members of [`Self::body`] that carry BYTES rather than text, as the
+    /// base64 the answer's document carries them as — an object's own payload, say. The
+    /// SDK the guest calls hands each of them over as the stream its own client answers
+    /// with ([`super::aws_sdk_guest`]), so a handler reads bytes where it reads bytes on a
+    /// managed runtime. Empty for every answer whose members are all text, which is every
+    /// AWS JSON one.
+    pub streams: Vec<String>,
 }
 
 /// Build, sign and dispatch one AWS JSON request, and read the answer back.
@@ -412,8 +508,9 @@ async fn dispatch(
     region: &str,
     operation: &str,
     body: &str,
+    identity: Option<&CallerIdentity>,
 ) -> Result<Answer, Refusal> {
-    sent(callback, api, region, operation, body)
+    sent(callback, api, region, operation, body, identity)
         .await
         .map_err(|detail| match detail {
             Sent::TooLarge => Refusal::ResponseTooLarge,
@@ -436,6 +533,7 @@ async fn sent(
     region: &str,
     operation: &str,
     body: &str,
+    identity: Option<&CallerIdentity>,
 ) -> Result<Answer, Sent> {
     let host = api.host(region);
     let mut builder = ::http::Request::builder().header("host", host.clone());
@@ -465,18 +563,22 @@ async fn sent(
             }
             bound.body.into_bytes()
         }
+        // Amazon S3's own protocol is bound by the client [`super::aws_s3`] holds, which is
+        // where a call to it is dispatched ([`AwsAccess::dispatched`]): no request to it is
+        // built here.
+        Protocol::S3Rest => {
+            return Err(Sent::NotMade(format!(
+                "{} binds its requests with its own protocol rather than with a JSON one",
+                api.sdk_token
+            )))
+        }
     };
     let mut request = builder
         .body(sent_body)
         .map_err(|error| Sent::NotMade(error.to_string()))?;
-    ::service_common::in_process_sigv4::sign_callback_request(
-        &mut request,
-        api.signing_name,
-        region,
-        callback,
-    )
-    .await
-    .map_err(Sent::NotMade)?;
+    signed(&mut request, api.signing_name, region, callback, identity)
+        .await
+        .map_err(Sent::NotMade)?;
     let (parts, body) = request.into_parts();
     let request = ::http::Request::from_parts(
         parts,
@@ -520,7 +622,45 @@ async fn sent(
         body,
         error_type,
         request_id,
+        streams: Vec::new(),
     })
+}
+
+/// SigV4-sign one in-process request, as the identity the invocation was given.
+///
+/// The session of the function's execution role when one was minted for it — whose token
+/// travels in the header a temporary credential is served with, put on the request BEFORE
+/// the signature so it is signed with the rest — and otherwise the credential the framework
+/// hands this emulator's handlers, which is what every other in-process call presents.
+pub(super) async fn signed(
+    request: &mut ::http::Request<Vec<u8>>,
+    signing_name: &str,
+    region: &str,
+    callback: &EmbeddedEmulator,
+    identity: Option<&CallerIdentity>,
+) -> Result<(), String> {
+    let Some(identity) = identity else {
+        return ::service_common::in_process_sigv4::sign_callback_request(
+            request,
+            signing_name,
+            region,
+            callback,
+        )
+        .await;
+    };
+    request.headers_mut().insert(
+        SESSION_TOKEN_HEADER,
+        ::http::HeaderValue::from_str(&identity.session_token)
+            .map_err(|error| error.to_string())?,
+    );
+    ::service_common::in_process_sigv4::sign_in_process_request_as(
+        request,
+        signing_name,
+        region,
+        &identity.access_key_id,
+        &identity.secret_access_key,
+    )
+    .await
 }
 
 /// The headers of one answer, as the REST reading above reads them.
@@ -622,6 +762,13 @@ mod tests {
                         api.sdk_token
                     );
                 }
+                // S3's own protocol binds each operation itself; the binding and its bounds
+                // are `super::super::aws_s3`'s, tested there.
+                super::Protocol::S3Rest => assert_eq!(
+                    api.signing_name, "s3",
+                    "case {:?}: expected S3's own signing name on the S3 protocol entry",
+                    api.sdk_token
+                ),
             }
         }
         let tokens = reachable_services();

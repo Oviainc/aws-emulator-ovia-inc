@@ -201,10 +201,14 @@ mod function_versions_by_capacity_provider;
 mod functions_by_code_signing_config;
 #[path = "all/handler_aws_sdk.rs"]
 mod handler_aws_sdk;
+#[path = "all/handler_email_sdk.rs"]
+mod handler_email_sdk;
 #[path = "all/handler_dynamodb_resource.rs"]
 mod handler_dynamodb_resource;
 #[path = "all/handler_rest_api_sdk.rs"]
 mod handler_rest_api_sdk;
+#[path = "all/handler_s3_object_access.rs"]
+mod handler_s3_object_access;
 #[path = "all/invocation_concurrency.rs"]
 mod invocation_concurrency;
 #[path = "all/invocation_count_series.rs"]
@@ -327,7 +331,5 @@ mod invoke_caller_authorization;
 mod invoke_log_delivery;
 #[path = "all/invocation_logs.rs"]
 mod invocation_logs;
-#[path = "all/handler_email_sdk.rs"]
-mod handler_email_sdk;
 #[path = "all/invocation_run_capacity.rs"]
 mod invocation_run_capacity;

@@ -717,6 +717,7 @@ fn call_answer(answered: &Result<super::aws_api::Answer, Refusal>) -> String {
             "body": answer.body,
             "errorType": answer.error_type,
             "requestId": answer.request_id,
+            "streams": answer.streams,
         }),
         Err(Refusal::UnknownService) => {
             return refusal_answer(

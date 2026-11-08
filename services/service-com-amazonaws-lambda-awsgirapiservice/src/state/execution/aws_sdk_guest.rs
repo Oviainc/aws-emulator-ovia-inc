@@ -36,6 +36,10 @@
 //! * There is no paginator: `client.get_paginator(...)` raises rather than pretending to
 //!   serve one. A blob member travels as the base64 text an AWS JSON protocol carries it
 //!   as, in both directions, and `bytes` a handler passes are encoded to it.
+//! * A member of an ANSWER that carries an object's own bytes — `GetObject`'s `Body` — is
+//!   handed over as `botocore.response.StreamingBody`, the stream the SDK's own client
+//!   answers with, so a handler reads it with `read()`; which members those are is named by
+//!   the answer itself ([`super::aws_api::Answer::streams`]).
 //! * Nothing here is the containment. The services that can be reached, the bounds on a
 //!   call and the signature it carries are all host code's ([`super::aws_api`],
 //!   [`super::python`]); a handler that rebinds or deletes a name in these modules changes
@@ -57,6 +61,7 @@ pub fn runtime_modules() -> Vec<PackageModule> {
     [
         ("botocore/__init__.py", BOTOCORE_SOURCE),
         ("botocore/exceptions.py", BOTOCORE_EXCEPTIONS_SOURCE),
+        ("botocore/response.py", BOTOCORE_RESPONSE_SOURCE),
         ("botocore/client.py", BOTOCORE_CLIENT_SOURCE),
         ("boto3/__init__.py", BOTO3_SOURCE),
         ("boto3/session.py", BOTO3_SESSION_SOURCE),
@@ -164,6 +169,64 @@ class ClientError(Exception):
         self.operation_name = operation_name
 "#;
 
+/// `botocore.response`: the body of an answer that carries BYTES rather than text.
+///
+/// An object read answers with the object's own payload, which the SDK's client hands over
+/// as a stream (`GetObject`'s `Body`), so a handler reads it with `read()`, iterates its
+/// lines or uses it as a context manager. The bytes are already here — the whole answer
+/// crossed the runtime's own call seam before the client returned — so no read of one waits
+/// on anything.
+const BOTOCORE_RESPONSE_SOURCE: &str = r#"
+"""The body of an answer carrying bytes, as this runtime's SDK hands one over."""
+
+
+class StreamingBody:
+    """The bytes one answer carried, read as the stream a client answers with."""
+
+    def __init__(self, data, content_length=None):
+        self._data = bytes(data)
+        self._position = 0
+        self.content_length = (
+            len(self._data) if content_length is None else content_length
+        )
+
+    def read(self, amt=None):
+        """The next `amt` bytes, or everything that is left."""
+        if amt is None:
+            chunk = self._data[self._position:]
+        else:
+            chunk = self._data[self._position:self._position + max(int(amt), 0)]
+        self._position += len(chunk)
+        return chunk
+
+    def close(self):
+        self._position = len(self._data)
+
+    def tell(self):
+        return self._position
+
+    def iter_chunks(self, chunk_size=1024):
+        while True:
+            chunk = self.read(chunk_size)
+            if not chunk:
+                return
+            yield chunk
+
+    def iter_lines(self, chunk_size=1024, keepends=False):
+        for line in self.read().splitlines(keepends):
+            yield line
+
+    def __iter__(self):
+        return self.iter_lines()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exception):
+        self.close()
+        return False
+"#;
+
 /// `botocore.client`: the client itself, and the one host call behind every method.
 const BOTOCORE_CLIENT_SOURCE: &str = r##"
 """One AWS SDK client: a method per operation, over the runtime's own call seam."""
@@ -173,12 +236,21 @@ import json
 
 from botocore.exceptions import (
     ClientError,
+    ParamValidationError,
     ReadTimeoutError,
     SdkCallNotMade,
     UnknownServiceError,
 )
+from botocore.response import StreamingBody
 
 _host = __import__("_lambda_host")
+
+# The input members a call carries BYTES in, by service. Every protocol this SDK speaks
+# carries a blob as base64 text, so the bytes a handler passes in one of these are encoded
+# before the call is made; a `str` is encoded as UTF-8 first, which is what a client does
+# with a text body. The members of the ANSWER that carry bytes are named by the answer
+# itself, so nothing about them is listed here.
+_BLOB_PARAMETERS = {"s3": ("Body",)}
 
 
 def _operation_name(method):
@@ -300,7 +372,7 @@ class Client:
                 self._service_name,
                 operation_name,
                 self._region_name,
-                json.dumps(parameters, default=_encoded),
+                json.dumps(self._sent(parameters), default=_encoded),
             )
         )
         refused = answered.get("refused")
@@ -320,6 +392,12 @@ class Client:
             "RetryAttempts": 0,
         }
         if 200 <= status < 300:
+            # The members the ANSWER says carry bytes are handed over as the stream a
+            # client answers one with, decoded from the base64 they travelled as.
+            for member in answered.get("streams") or ():
+                carried = document.get(member)
+                if isinstance(carried, str):
+                    document[member] = StreamingBody(base64.b64decode(carried))
             document["ResponseMetadata"] = metadata
             return document
         code = _error_code(answered.get("errorType"), document)
@@ -328,6 +406,26 @@ class Client:
             "ResponseMetadata": metadata,
         }
         raise self.exceptions.from_code(code)(response, operation_name)
+
+    def _sent(self, parameters):
+        """The call's parameters, with every byte-carrying member encoded as base64."""
+        members = _BLOB_PARAMETERS.get(self._service_name, ())
+        if not members:
+            return parameters
+        sent = dict(parameters)
+        for member in members:
+            if member not in sent:
+                continue
+            value = sent[member]
+            if isinstance(value, str):
+                value = value.encode("utf-8")
+            if not isinstance(value, (bytes, bytearray)):
+                raise ParamValidationError(
+                    report="Invalid type for parameter %s: this SDK carries it as bytes "
+                    "or as a string" % (member,)
+                )
+            sent[member] = base64.b64encode(bytes(value)).decode("ascii")
+        return sent
 
     def _raise_refusal(self, refused, answered, operation_name):
         detail = answered.get("detail") or ""

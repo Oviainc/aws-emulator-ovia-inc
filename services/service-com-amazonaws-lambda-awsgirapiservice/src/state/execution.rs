@@ -74,8 +74,16 @@ mod bootstrap;
 pub mod aws_api;
 pub use aws_api::AwsAccess;
 
+/// The Amazon S3 half of that seam, whose own protocol binds a request per operation.
+mod aws_s3;
+
 /// Binding one of those calls to HTTP for a service whose protocol is `restJson1`.
 pub mod rest_json;
+
+/// The credential a running handler's own calls are made with: a session of the function's
+/// execution role.
+pub mod execution_role_session;
+pub use execution_role_session::{function_sdk_access, ExecutionRoleSessions};
 
 /// The AWS SDK modules a Python handler imports, which that seam is reached through.
 mod aws_sdk_guest;
@@ -151,6 +159,22 @@ pub const PERMIT_WAIT: Duration = HOST_WAIT_CEILING.saturating_add(ABANDON_GRACE
 /// more runs than this fit in the envelope however small the functions are — which is also
 /// what bounds the run threads and the stacks they hold ([`RUN_STACK_BYTES`]).
 pub const MAX_CONCURRENT_RUNS: u32 = MAX_CONCURRENT_RUN_MEMORY_MB / (MIN_MEMORY_SIZE_MB as u32);
+
+/// How many invocations may hold their mounts INFLATED at once: as many as the run envelope
+/// admits runs of the smallest function ([`MAX_CONCURRENT_RUNS`]).
+///
+/// A deployment package and the layers beside it are the caller's own bytes, expanded in
+/// memory before the handler can be loaded ([`package`]), so the number of invocations doing
+/// that at one instant is the host's to decide and not the caller's. Each read is itself
+/// bounded by [`package::ReadBudget`], so this bounds the product: at most this many
+/// invocations × that budget is inflated at once. The permit is held only for the READ,
+/// which is why it is a pool of its own rather than a claim on the run envelope: an
+/// invocation whose package this emulator cannot read is answered as that without ever
+/// waiting for memory it would never use.
+#[must_use]
+pub fn max_concurrent_mount_reads() -> usize {
+    usize::try_from(MAX_CONCURRENT_RUNS).unwrap_or(usize::MAX)
+}
 
 /// How much of that envelope one invocation of a function configured for `memory_size` MB
 /// holds while it runs: the memory its engine is really given ([`run_heap_bytes`]), in MB, and
@@ -422,14 +446,39 @@ pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnabl
     let Some(handler) = invocation.handler.clone() else {
         return Err(Unrunnable::NoHandler);
     };
+
+    // The archives this invocation reads are INFLATED here, under a pool of its own: the
+    // package and layer bytes are the caller's, so how many of them this process holds
+    // expanded at once is bounded by [`max_concurrent_mount_reads`] rather than by how fast
+    // invocations arrive. The permit is held only for the read — it is no claim on the run
+    // envelope, so a package this emulator cannot read at all is answered as that without
+    // ever waiting for memory it would never use — and each archive is itself read under
+    // [`package::ReadBudget`]'s entry and byte ceilings.
+    let reading = ::tokio::time::timeout(
+        PERMIT_WAIT,
+        Arc::clone(mount_readers()).acquire_owned(),
+    )
+    .await
+    .map_err(|_| {
+        Unrunnable::Overloaded(
+            "Too many invocations are reading their deployment packages in this emulator. \
+             Retry the request."
+                .to_string(),
+        )
+    })?
+    .map_err(|error| Unrunnable::Internal(format!("the mount readers are gone: {error}")))?;
+
     // Each engine imports the sources of its own language: the entries a package holds for
     // the other one are not modules this run could load. One budget is spent across every
-    // mount this invocation reads ([`package::ReadBudget`]), which is what bounds this read.
-    // It happens BEFORE any capacity is claimed, so a package this emulator cannot run at all
-    // is answered as that at once rather than after a wait for memory it will never use.
+    // mount this invocation reads ([`package::ReadBudget`]), whichever engine reads them,
+    // which is what bounds this read. It happens BEFORE any capacity is claimed, so a
+    // package this emulator cannot run at all is answered as that at once rather than after
+    // a wait for memory it will never use.
     let mut read_budget = package::ReadBudget::default();
     let read = match engine {
-        Engine::Python => package::python_modules(invocation.zip_bytes.as_deref()),
+        Engine::Python => {
+            package::python_modules_within(invocation.zip_bytes.as_deref(), &mut read_budget)
+        }
         Engine::Node => package::javascript_modules_within(
             invocation.zip_bytes.as_deref(),
             &mut read_budget,
@@ -464,6 +513,8 @@ pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnabl
     if engine == Engine::Node {
         modules.extend(node_sdk_guest::runtime_modules());
     }
+    // Every archive is read: the next invocation may inflate its own.
+    drop(reading);
 
     if abandoned_runs() >= MAX_ABANDONED_RUNS {
         // The capacity that is full is this host's, which stands in for the account's
@@ -1104,6 +1155,15 @@ fn run_memory() -> &'static Arc<::tokio::sync::Semaphore> {
         Arc::new(::tokio::sync::Semaphore::new(
             MAX_CONCURRENT_RUN_MEMORY_MB as usize,
         ))
+    })
+}
+
+/// The mount-reading permits, shared by every invocation this process serves: how many of
+/// them may hold their archives INFLATED at one instant ([`max_concurrent_mount_reads`]).
+fn mount_readers() -> &'static Arc<::tokio::sync::Semaphore> {
+    static READERS: OnceLock<Arc<::tokio::sync::Semaphore>> = OnceLock::new();
+    READERS.get_or_init(|| {
+        Arc::new(::tokio::sync::Semaphore::new(max_concurrent_mount_reads()))
     })
 }
 

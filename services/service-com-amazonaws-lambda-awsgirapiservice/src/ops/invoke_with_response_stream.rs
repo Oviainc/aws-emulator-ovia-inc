@@ -445,8 +445,16 @@ impl<Eng: Send + Sync + 'static> InvokeWithResponseStream<Eng> {
             // nothing has been admitted while the store guard is still held.
             initialization_type: crate::state::execution_slot::INITIALIZATION_TYPE_ON_DEMAND,
             // The AWS SDK this runtime supplies the handler reaches the rest of this
-            // emulator through the callback the framework handed THIS request.
-            aws: crate::state::AwsAccess::new(ctx.callback().clone(), &region),
+            // emulator through the callback the framework handed THIS request, signing
+            // every call the handler makes as the session of the function's own execution
+            // role (`crate::state::execution_role_session`).
+            aws: crate::state::function_sdk_access(
+                &*self.engine,
+                ctx,
+                &region,
+                &resolved_config.role,
+                &function_name,
+            ),
             // Where the run's log is delivered, and what the function's execution role may
             // do there (`crate::state::execution::log_delivery`).
             logs: Some(crate::state::log_target(

@@ -181,6 +181,48 @@ function serviceError(answered) {
     return error;
 }
 
+// The input members a call carries BYTES in, by service: every protocol this SDK speaks
+// carries a blob as base64 text, so the bytes a handler passes in one of these are encoded
+// before the call is made. A string is encoded as UTF-8 first, which is what a client does
+// with a text body.
+var BLOB_PARAMETERS = { s3: ['Body'] };
+
+function sentInput(input) {
+    var members = BLOB_PARAMETERS[SERVICE];
+    if (members === undefined || input === null || typeof input !== 'object') {
+        return input;
+    }
+    var sent = {};
+    Object.keys(input).forEach(function (name) { sent[name] = input[name]; });
+    members.forEach(function (member) {
+        if (sent[member] === undefined || sent[member] === null) {
+            return;
+        }
+        var value = sent[member];
+        if (typeof value === 'string') {
+            value = globalThis.Buffer.from(value, 'utf8');
+        }
+        sent[member] = globalThis.Buffer.from(value).toString('base64');
+    });
+    return sent;
+}
+
+// A member of an answer that carries BYTES is handed over the way a v3 client hands over a
+// streamed body: the bytes are already here, so the two transforms resolve at once.
+function streamedBody(base64Text) {
+    var bytes = new Uint8Array(globalThis.Buffer.from(base64Text, 'base64'));
+    return {
+        transformToByteArray: function () { return Promise.resolve(bytes); },
+        transformToString: function (encoding) {
+            return Promise.resolve(
+                globalThis.Buffer.from(bytes).toString(
+                    encoding === undefined ? 'utf8' : encoding
+                )
+            );
+        }
+    };
+}
+
 function notMade(answered) {
     var error = new Error(answered.detail === undefined || answered.detail === null
         ? 'The request was not made: ' + answered.outcome
@@ -218,7 +260,7 @@ Client.prototype.send = function (command) {
                 SERVICE,
                 operation,
                 region,
-                JSON.stringify(command.input === undefined ? {} : command.input)
+                JSON.stringify(sentInput(command.input === undefined ? {} : command.input))
             ));
         } catch (error) {
             reject(error);
@@ -238,6 +280,14 @@ Client.prototype.send = function (command) {
         } catch (error) {
             document = {};
         }
+        var streams = answered.streams === undefined || answered.streams === null
+            ? []
+            : answered.streams;
+        streams.forEach(function (member) {
+            if (typeof document[member] === 'string') {
+                document[member] = streamedBody(document[member]);
+            }
+        });
         document.$metadata = {
             httpStatusCode: answered.status,
             requestId: answered.requestId === undefined ? undefined : answered.requestId

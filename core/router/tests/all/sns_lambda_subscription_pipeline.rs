@@ -260,7 +260,24 @@ fn template(row: &Row, queue_url: &str) -> String {
         "ExecRole".to_string(),
         json!({
             "Type": "AWS::IAM::Role",
-            "Properties": { "AssumeRolePolicyDocument": trust_policy() },
+            "Properties": {
+                "AssumeRolePolicyDocument": trust_policy(),
+                // A function calls another service with temporary credentials for this
+                // role, so the role has to GRANT the write its handler makes: without the
+                // grant the handler's own `sqs:SendMessage` is refused, which is a
+                // different rule than the one these rows are about.
+                "Policies": [{
+                    "PolicyName": "forward-to-the-sink",
+                    "PolicyDocument": {
+                        "Version": "2012-10-17",
+                        "Statement": [{
+                            "Effect": "Allow",
+                            "Action": "sqs:SendMessage",
+                            "Resource": "*",
+                        }],
+                    },
+                }],
+            },
         }),
     );
     resources.insert(
