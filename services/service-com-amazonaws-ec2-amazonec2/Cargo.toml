@@ -32,8 +32,15 @@ font8x8 = "0.3"
 # `GetConsoleScreenshotResult$ImageData` carries the image as base64 text.
 base64 = "0.22"
 # The shared XML rendering of a floating-point member, which AWS writes as a decimal
-# carrying a fractional part where Rust's own rendering drops it.
+# carrying a fractional part where Rust's own rendering drops it, and the ONE
+# evaluation of IAM policy documents the authorization gate decides a request with.
 service-common = { path = "../common" }
+# The IAM store holds the identity-based policies of the principal a request speaks
+# for, and the STS store resolves which principal that is: the authorization gate
+# reads both services' OWN state accessors rather than keeping a second copy of
+# either fact.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

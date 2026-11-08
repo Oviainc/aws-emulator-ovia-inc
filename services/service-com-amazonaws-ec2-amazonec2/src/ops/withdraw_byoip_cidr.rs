@@ -24,13 +24,16 @@
 //! recorded contract for this operation answers `DryRunOperation` for a range the account
 //! has not provisioned. So the probe never depends on the registry, and never writes to it.
 //!
-//! A KNOWN FIDELITY GAP, for the same reason every `DryRun` in this crate has it: the probe
-//! always answers `DryRunOperation`, never the `UnauthorizedOperation` of "otherwise, it is
-//! UnauthorizedOperation" (`DryRun`). This emulator has no principal or policy model — a
-//! request's signature is verified by the framework and nothing here can say which actions
-//! a caller may take — so a passing dry run means "this request is well formed and the
-//! range is addressable", not "this caller is authorised". When a caller model lands, the
-//! `UnauthorizedOperation` branch belongs in exactly this spot.
+//! A KNOWN FIDELITY GAP, for the same reason every `DryRun` of a RESOURCE-LEVEL action in
+//! this crate has it: the probe always answers `DryRunOperation`, never the
+//! `UnauthorizedOperation` of "otherwise, it is UnauthorizedOperation" (`DryRun`). The
+//! service-wide gate that decides whether a caller holds an action
+//! ([`crate::service::authorization`]) decides the actions IAM judges over every resource —
+//! the `Describe` family — and this operation's action is judged against the ARNs of the
+//! ranges the request addresses, which that gate does not resolve. So a passing dry run
+//! here means "this request is well formed and the range is addressable", not "this caller
+//! is authorised"; when the decision learns the resources this action addresses, it covers
+//! this operation too and the branch needs no code here.
 //!
 //! "You can perform this operation at most once every 10 seconds, even if you specify
 //! different address ranges each time" is a request-RATE limit of the real service. This

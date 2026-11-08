@@ -165,8 +165,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "Checks whether you have the required permissions for the action, without
         // actually making the request, and provides an error response. If you have the
         // required permissions, the error response is DryRunOperation"
-        // (`DescribeVpcsRequest$DryRun`). Every caller of this emulator is permitted, so a
-        // dry run reports that outcome and reads nothing.
+        // (`DescribeVpcsRequest$DryRun`). A request that reaches this handler is one the
+        // service-wide authorization gate admitted ([`crate::service::authorization`]), so
+        // the caller DOES hold `ec2:DescribeVpcs`: it is answered the permitted side of the
+        // probe, and reads nothing. A caller the policies in force do not allow is refused
+        // `UnauthorizedOperation` — the other side of that same probe — before this runs.
         if input.dry_run.unwrap_or(false) {
             return Err(crate::state::dry_run_operation());
         }

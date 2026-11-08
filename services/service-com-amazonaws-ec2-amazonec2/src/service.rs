@@ -67,6 +67,12 @@ use smithy_server_runtime::{
 use service_common::query_decimal_floats::DecimalFloatsRef;
 use std::sync::Arc;
 
+/// Whether IAM lets a request perform the EC2 action it names: the decision
+/// [`FinishedEnvelope::run`] takes ahead of the account-wide reads, beside the Region
+/// gate, because it is a fact of the request's CREDENTIAL rather than of any one
+/// operation's input.
+pub mod authorization;
+
 /// The `com-amazonaws-ec2-amazonec2` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -80,10 +86,11 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     protocol: Ec2QueryEnvelope,
     /// The decorator every modelled operation is served through
     /// ([`Service::override_operation`]), so the one response the protocol above
-    /// cannot reach carries the same envelope as every other. Carries no state of
-    /// its own: it resolves the operation it runs from the service the framework
-    /// hands it.
-    envelope: FinishedEnvelope,
+    /// cannot reach carries the same envelope as every other. Holds the shared
+    /// engine, because the authorization gate it runs ahead of the operation
+    /// reads the IAM and STS stores of that engine; the operation it runs is
+    /// still resolved from the service the framework hands it.
+    envelope: FinishedEnvelope<Eng>,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -92,10 +99,10 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
         Self {
-            entry: crate::ServiceDefinition::new(engine),
+            entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             // Built once, per `override_protocol`'s contract: never per request.
             protocol: Ec2QueryEnvelope::new(),
-            envelope: FinishedEnvelope,
+            envelope: FinishedEnvelope { engine },
         }
     }
 }
@@ -673,7 +680,8 @@ fn member_is_named(member: &Schema, name: &str) -> bool {
 /// borrows the service for exactly as long as the future it returns and so cannot be
 /// handed the first result. The lookup is the protocol's own routing-key resolution over a
 /// body already in memory, which is what the router itself does a third time to read the
-/// operation's auth schemes.
+/// operation's auth schemes — and what [`authorization_refusal`] does to learn WHICH
+/// action the request asked for.
 fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dyn ErasedOperation> {
     let key = svc.definition().protocol().routing_key(req).ok()?;
     svc.definition().routing_table().get(key)
@@ -691,12 +699,18 @@ fn modeled_operation<'s>(svc: &'s dyn Service, req: &RtRequest) -> Option<&'s dy
 /// runs the operation and finishes WHATEVER it answered with the same envelope
 /// ([`stamp_envelope`]), which is idempotent for a response already finished.
 ///
-/// Stateless: the operation to run is resolved from the service the framework hands
-/// `run`, so one value serves every operation and nothing is built per request.
+/// Stateless but for the shared engine the authorization gate reads: the operation to run
+/// is resolved from the service the framework hands `run`, so one value serves every
+/// operation and nothing is built per request.
 #[derive(Debug)]
-struct FinishedEnvelope;
+struct FinishedEnvelope<Eng> {
+    /// The shared engine, so the authorization gate can read the IAM and STS stores the
+    /// decision is made from. The framework hands `run` the SERVICE, which holds the
+    /// engine behind an engine-erased accessor, so the gate reaches it through here.
+    engine: Arc<Eng>,
+}
 
-impl ErasedOperation for FinishedEnvelope {
+impl<Eng: Send + Sync + 'static> ErasedOperation for FinishedEnvelope<Eng> {
     fn run<'r>(
         &'r self,
         svc: &'r dyn Service,
@@ -712,6 +726,14 @@ impl ErasedOperation for FinishedEnvelope {
             // any one handler because it is a fact of the ENDPOINT the request reached, not
             // of the operation it named ([`crate::state::region_is_enabled_for_account`]).
             if let Some(mut response) = region_refusal(ctx) {
+                stamp_envelope(&mut response);
+                return response;
+            }
+            // The authorization gate, for the same reason: whether the caller may perform
+            // the action at all is a fact of the CREDENTIAL the request presented and the
+            // IAM policies in force on the principal it speaks for, not of the input the
+            // operation reads ([`authorization::authorize`]).
+            if let Some(mut response) = authorization_refusal(&*self.engine, svc, req, ctx) {
                 stamp_envelope(&mut response);
                 return response;
             }
@@ -761,6 +783,45 @@ fn region_refusal(ctx: &smithy_server_runtime::OperationContext<'_>) -> Option<R
         Some(Refused {
             code: crate::state::AUTH_FAILURE.to_string(),
             message: crate::state::REGION_NOT_ENABLED_MESSAGE.to_string(),
+        }),
+    ))
+}
+
+/// EC2's `UnauthorizedOperation` response for a request whose caller the IAM policies in
+/// force do not permit to perform the action it named, or `None` when they do — and for
+/// every operation whose action this gate does not decide
+/// ([`authorization::judged_over_every_resource`]).
+///
+/// The action asked about is the operation's own name, taken from the request's routing key
+/// and only when the routing table SERVES that key: so it is always a modelled operation's
+/// name, never an arbitrary value the body carried, and a request naming no operation of
+/// this service still reaches the routing failure rather than an authorization decision
+/// about a name nothing serves.
+///
+/// The code and the sentence are EC2's own ([`crate::state::UNAUTHORIZED_OPERATION`],
+/// [`authorization::Denied::message`]); the status is the 403 the framework's own
+/// pre-dispatch renderer answers an authorization refusal with, and the envelope is the
+/// protocol's, so this refusal is rendered exactly like every other pre-dispatch one. The
+/// code and message the renderer would otherwise pick are replaced rather than a second
+/// envelope being written here, which is how the Region gate above states EC2's words too.
+fn authorization_refusal<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    svc: &dyn Service,
+    req: &RtRequest,
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+) -> Option<RtResponse> {
+    let operation = svc.definition().protocol().routing_key(req).ok()?;
+    svc.definition().routing_table().get(operation)?;
+    let refusal = authorization::authorize(engine, ctx, operation).err()?;
+    Some(smithy_server_runtime::protocol_error_response_with(
+        smithy_server_runtime::PreDispatchProtocol::Query { ec2: true },
+        ProtocolError::Unauthenticated {
+            code: crate::state::UNAUTHORIZED_OPERATION,
+            message: authorization::NOT_AUTHORIZED_SENTENCE,
+        },
+        Some(Refused {
+            code: crate::state::UNAUTHORIZED_OPERATION.to_string(),
+            message: refusal.message(),
         }),
     ))
 }

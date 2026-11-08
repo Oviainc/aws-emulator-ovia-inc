@@ -1041,9 +1041,14 @@ pub fn internal_error<E>(message: impl Into<String>) -> crate::scaffolded::Scaff
     crate::scaffolded::Scaffolded::service_error(INTERNAL_ERROR, 500, message)
 }
 
-/// Answer a `DryRun` request the way EC2 does for a caller that holds the action's
-/// permissions — which every caller of this emulator does: HTTP 412
-/// `DryRunOperation`, and the action itself is not performed.
+/// Answer a `DryRun` request the way EC2 does for a caller that HOLDS the action's
+/// permissions: HTTP 412 `DryRunOperation`, and the action itself is not performed.
+///
+/// A handler reaches this for a caller the service-wide authorization gate has already
+/// admitted ([`crate::service::authorization`]), which is what makes the answer the
+/// permitted side of the probe rather than a claim that every caller is permitted: a
+/// request the policies in force do not allow is refused `UnauthorizedOperation` before any
+/// handler runs, for the actions that gate decides.
 pub fn dry_run_operation<E>() -> crate::scaffolded::Scaffolded<E> {
     crate::scaffolded::Scaffolded::service_error(
         DRY_RUN_OPERATION,

@@ -1575,3 +1575,9 @@ mod verified_access_trust_provider_attachment;
 // `DescribeSecurityGroupRules` and the group's aggregated permissions. Declared beside
 #[path = "all/modify_security_group_rules.rs"]
 mod modify_security_group_rules;
+// WHO may drive EC2's account-wide `Describe` reads: the identity-based IAM policies in
+// force on the principal a request's credential speaks for, decided over every resource —
+// the gate the CDK context providers' lookup role is served and refused through. Declared
+// at the tail of this file, which is where every new ec2 suite inserts its lines.
+#[path = "all/account_wide_read_authorization.rs"]
+mod account_wide_read_authorization;
