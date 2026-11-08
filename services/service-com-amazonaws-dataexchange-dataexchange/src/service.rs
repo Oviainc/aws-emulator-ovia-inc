@@ -64,9 +64,40 @@
 //! the ones the job's declared MD5 describes are refused — HTTP's own `Content-MD5`, if
 //! the client sent one, is checked against the same digest. The job's own execution
 //! then reads those bytes (`crate::ops::start_job`).
+//!
+//! ## How an answer that carries no content is framed
+//!
+//! A sixth seam, `override_protocol`, is one this service DOES take, for one framing
+//! decision no handler can make. Eight of this service's operations have an empty
+//! (`smithy.api#Unit`) output and answer the no-content status: `CancelJob`, the five
+//! deletes (`DeleteAsset`, `DeleteDataGrant`, `DeleteDataSet`, `DeleteEventAction`,
+//! `DeleteRevision`) and the two tag mutations (`TagResource`, `UntagResource`). An answer
+//! that carries no body still has a LENGTH, and AWS states it: such a response carries
+//! `content-length: 0`. The protocol's serializer leaves that header off and the transport
+//! does not frame a no-content status either, so a client, a proxy or a contract check that
+//! keys on an explicit zero-length body reads the emulator's reply differently from the
+//! service's.
+//!
+//! [`Service::override_protocol`] therefore serves a protocol that is the model's own in
+//! every respect except one: a response at the no-content status carries no body and states
+//! the length it has (`service_common::no_content_responses`, the SHARED reading of that
+//! framing). Every response that carries content — every reader's, every create's and every
+//! modelled refusal's — is left exactly as the model's protocol renders it, framed from the
+//! body it carries. It is done at the one place every response of a modelled operation
+//! passes through rather than per operation.
+//!
+//! That framing is what this service states, and it is what the in-process front door
+//! delivers. An answer served over HTTP/1.1 reaches a client without it: the HTTP writer the
+//! vendored transport uses removes `content-length` from a `204` (RFC 9110 §15.3.5 forbids a
+//! body there), which is below anything this crate decides.
+//! `tests/all/no_content_framing.rs` pins what this service states, and
+//! `tests/all/no_content_wire_probe.rs` pins what a socket then delivers.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
+use aws_smithy_schema::Schema;
+use aws_smithy_schema_server::{ProtocolError, ServerProtocol};
 use aws_smithy_types::body::SdkBody;
+use service_common::no_content_responses::without_content;
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service,
 };
@@ -97,6 +128,96 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             engine,
         }
+    }
+}
+
+/// The protocol this service answers modelled requests in: the model's own, with the one
+/// framing correction the module docs state.
+///
+/// Implemented on the service itself because the model-derived protocol it delegates to is
+/// owned by the generated entry and reached by reference (`self.entry.protocol()`), and
+/// [`Service::override_protocol`] hands back a borrow of `&self` — so there is one protocol
+/// instance, the generated one, and no second routing table to drift from the model.
+impl<Eng: Send + Sync + 'static> ServerProtocol for EmulatedService<Eng> {
+    type Request = RtRequest;
+    type Response = RtResponse;
+
+    fn protocol_id(&self) -> &aws_smithy_schema::ShapeId {
+        self.entry.protocol().protocol_id()
+    }
+
+    fn routing_key<'a>(&self, request: &'a RtRequest) -> Result<&'a str, ProtocolError> {
+        self.entry.protocol().routing_key(request)
+    }
+
+    fn deserialize_input<'a>(
+        &self,
+        request: &'a RtRequest,
+        input_schema: &Schema,
+    ) -> Result<Box<dyn aws_smithy_schema::serde::ShapeDeserializer + 'a>, ProtocolError> {
+        self.entry
+            .protocol()
+            .deserialize_input(request, input_schema)
+    }
+
+    fn serialize_output(
+        &self,
+        output: &dyn aws_smithy_schema::serde::SerializableStruct,
+        output_schema: &Schema,
+        operation_name: &str,
+        success_status: u16,
+    ) -> Result<RtResponse, ProtocolError> {
+        let response = self.entry.protocol().serialize_output(
+            output,
+            output_schema,
+            operation_name,
+            success_status,
+        )?;
+        // The status and every other header are the protocol's: only an answer that carries
+        // no content is emptied of whatever was rendered for it and states its length.
+        Ok(without_content(response))
+    }
+
+    fn serialize_error(
+        &self,
+        error: &dyn aws_smithy_schema::serde::SerializableStruct,
+        error_schema: &Schema,
+        error_code: &str,
+        http_status: u16,
+    ) -> Result<RtResponse, ProtocolError> {
+        let response = self
+            .entry
+            .protocol()
+            .serialize_error(error, error_schema, error_code, http_status)?;
+        // Every modelled failure of this service carries its error envelope at a 4xx or a
+        // 5xx, so nothing here is emptied; the same call is made on both paths rather than
+        // leaving one of them to answer differently.
+        Ok(without_content(response))
+    }
+
+    fn serialize_event_stream_message(
+        &self,
+        event_type: &str,
+        is_exception: bool,
+        event: &dyn aws_smithy_schema::serde::SerializableStruct,
+        event_schema: &Schema,
+    ) -> Result<RtResponse, ProtocolError> {
+        self.entry.protocol().serialize_event_stream_message(
+            event_type,
+            is_exception,
+            event,
+            event_schema,
+        )
+    }
+}
+
+/// `ServerProtocol` requires `Debug`; the generated entry is not `Debug`, so this names the
+/// protocol being served rather than the service's internals.
+impl<Eng: Send + Sync + 'static> std::fmt::Debug for EmulatedService<Eng> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EmulatedService")
+            .field("protocol", &self.entry.protocol().protocol_id())
+            .finish()
     }
 }
 
@@ -151,6 +272,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // leaving both alone.
         let _ = refusal;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // Every response a modelled operation of this service produces is serialized by the
+        // protocol returned here. See the module docs: it is the model's own protocol, with
+        // one correction — an answer that carries no content states `content-length: 0`
+        // instead of leaving the framing header off.
+        Some(self)
     }
 
     fn override_routing_error(

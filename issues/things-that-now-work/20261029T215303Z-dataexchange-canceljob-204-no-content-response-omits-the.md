@@ -44,3 +44,23 @@ Smithy: CancelJob http { method: DELETE, uri: "/v1/jobs/{JobId}", code: 204 }, o
 3. Call CancelJob: DELETE /v1/jobs/{JobId} on that job, before StartJob.
 4. Inspect the RAW response headers, not the parsed SDK result: the status is 204 and the body is empty, but there is no content-length header. AWS's recorded response for the same call includes 'content-length: 0'.
 5. Confirm it is not request-specific by repeating against a second cancellable job (as dataexchange-job-error-paths#task#8 does) — the header is absent every time.
+
+## Resolution
+
+The rule, one level above the cited call: an answer that carries no content carries no body
+and STATES the length it has (`content-length: 0`), rather than leaving the framing header
+off. It is now served at the one seam every response of a modelled operation passes
+through (`Service::override_protocol` in
+`services/service-com-amazonaws-dataexchange-dataexchange/src/service.rs`, delegating to
+the shared `service_common::no_content_responses::without_content`), so it holds for every
+operation of this service whose modelled output is empty — `CancelJob`, the five deletes and
+the two tag mutations — and not only for the recorded cancel. A response that carries
+content keeps its body and its own framing.
+
+CAVEAT: a client reached over HTTP/1.1 still does not see the header, because the HTTP
+writer the vendored transport uses removes `content-length` from a `204` (RFC 9110 §15.3.5
+forbids a body there). That writer is under the read-only vendored tree, so the wire-level
+half of this cause is a platform limitation rather than something this service can state its
+way out of; `tests/all/no_content_wire_probe.rs` pins what the socket really delivers, and
+`tests/all/no_content_framing.rs` pins the framing the service itself states, which the
+in-process front door delivers.

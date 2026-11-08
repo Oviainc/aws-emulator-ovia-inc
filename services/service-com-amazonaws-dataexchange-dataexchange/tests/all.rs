@@ -29,6 +29,10 @@ mod job_lifecycle;
 mod job_state_conflict_message;
 #[path = "all/jobs.rs"]
 mod jobs;
+#[path = "all/no_content_framing.rs"]
+mod no_content_framing;
+#[path = "all/no_content_wire_probe.rs"]
+mod no_content_wire_probe;
 #[path = "all/not_found_message.rs"]
 mod not_found_message;
 #[path = "all/optional_page_size.rs"]
