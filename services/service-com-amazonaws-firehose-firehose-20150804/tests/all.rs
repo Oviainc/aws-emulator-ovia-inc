@@ -15,6 +15,8 @@
 mod argument_validation;
 #[path = "all/clock_owed_transition_span.rs"]
 mod clock_owed_transition_span;
+#[path = "all/cloudwatch_logs_pipeline_delivery.rs"]
+mod cloudwatch_logs_pipeline_delivery;
 #[path = "all/cloudwatch_logs_source_gate.rs"]
 mod cloudwatch_logs_source_gate;
 #[path = "all/constraint_refusal_precedes_state.rs"]

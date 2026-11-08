@@ -21,7 +21,9 @@
 use std::collections::BTreeMap;
 use std::time::{Duration, SystemTime};
 
+pub mod cloudwatch_logs_pipeline;
 pub mod delivery;
+pub mod producer;
 
 use crate::ops::types::{
     AmazonOpenSearchServerlessDestinationConfiguration,
@@ -773,8 +775,9 @@ impl ComAmazonawsFirehoseFirehose20150804State {
         name: &str,
         data: Vec<u8>,
         now: SystemTime,
+        producer: producer::Producer,
     ) -> Result<(Option<String>, bool), StreamRefusal> {
-        let (stream, counter, buffered_bytes) = self.stream_accepting_records(name)?;
+        let (stream, counter, buffered_bytes) = self.stream_accepting_records(name, producer)?;
         let encrypted = stream.is_encrypted();
         let record_id = push_record(stream, counter, buffered_bytes, data, now);
         Ok((record_id, encrypted))
@@ -788,8 +791,9 @@ impl ComAmazonawsFirehoseFirehose20150804State {
         name: &str,
         records: Vec<Vec<u8>>,
         now: SystemTime,
+        producer: producer::Producer,
     ) -> Result<(Vec<Option<String>>, bool), StreamRefusal> {
-        let (stream, counter, buffered_bytes) = self.stream_accepting_records(name)?;
+        let (stream, counter, buffered_bytes) = self.stream_accepting_records(name, producer)?;
         let encrypted = stream.is_encrypted();
         let record_ids = records
             .into_iter()
@@ -798,7 +802,7 @@ impl ComAmazonawsFirehoseFirehose20150804State {
         Ok((record_ids, encrypted))
     }
 
-    /// The stream `name` names, if it exists and is accepting data.
+    /// The stream `name` names, if it exists and is accepting data from `producer`.
     ///
     /// Hands back the record counter and the service-wide buffered-byte total beside it
     /// (disjoint field borrows) so a put resolves the stream ONCE and mints an id only for
@@ -806,6 +810,7 @@ impl ComAmazonawsFirehoseFirehose20150804State {
     fn stream_accepting_records(
         &mut self,
         name: &str,
+        producer: producer::Producer,
     ) -> Result<(&mut DeliveryStream, &mut u64, &mut usize), StreamRefusal> {
         let counter = &mut self.record_counter;
         let buffered_bytes = &mut self.buffered_bytes;
@@ -824,8 +829,8 @@ impl ComAmazonawsFirehoseFirehose20150804State {
             return Err(StreamRefusal::SourceNotDirectPut(stream.stream_type.clone()));
         }
         // A stream configured for the CloudWatch Logs decompression pipeline takes data
-        // from CloudWatch Logs only; an API put is by definition not that producer.
-        if stream.takes_cloudwatch_logs_only() {
+        // from CloudWatch Logs only; a put from any other producer is not that producer.
+        if stream.takes_cloudwatch_logs_only() && producer != producer::Producer::CloudWatchLogs {
             return Err(StreamRefusal::SourceNotCloudWatchLogs);
         }
         Ok((stream, counter, buffered_bytes))
@@ -848,8 +853,8 @@ pub enum StreamRefusal {
     /// (`crate::service::not_active_message`).
     NotActive,
     /// The stream only takes data from CloudWatch Logs
-    /// ([`DeliveryStream::takes_cloudwatch_logs_only`]), and an API put is not that
-    /// producer: the modelled `InvalidSourceException`.
+    /// ([`DeliveryStream::takes_cloudwatch_logs_only`]), and the producer this put came
+    /// from ([`producer::producer_of`]) is not it: the modelled `InvalidSourceException`.
     SourceNotCloudWatchLogs,
     /// The stream's data comes from a configured source rather than from direct puts
     /// ([`DeliveryStream::takes_a_configured_source`]), so the direct-put ingestion

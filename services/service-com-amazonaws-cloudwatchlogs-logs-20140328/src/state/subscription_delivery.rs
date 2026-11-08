@@ -44,6 +44,14 @@
 //! ([`smithy_server_runtime::OperationContext::callback`]), so nothing here opens a socket
 //! or leaves the host and this crate names no other service crate.
 //!
+//! A delivery is also made AS THIS SERVICE'S OWN SERVICE PRINCIPAL, acting for the log group
+//! the events were ingested into ([`as_the_service_principal`]), because one destination
+//! asks who is calling: a Firehose delivery stream whose destination enables the CloudWatch
+//! Logs pipeline takes records from CloudWatch Logs and from no other producer ("Only
+//! requests from CloudWatch Logs are supported when CloudWatch Logs decompression is
+//! enabled"), and the credential a call presents is what says whose call it is
+//! ([`::service_common::service_principal_calls`]).
+//!
 //! Every write to a destination is made UNDER A ROLE where the filter's configuration names
 //! one, and is authorized against that role before it is attempted
 //! ([`withheld_by_delivery_role`]). `PutSubscriptionFilter$roleArn` is "the ARN of an IAM role
@@ -618,7 +626,7 @@ pub async fn deliver<Eng: Send + Sync + 'static>(
         if ::service_common::arn::parse(&delivery.destination_arn).is_none() {
             continue;
         }
-        let failure = hand_over(ctx, fallback_region, &delivery).await;
+        let failure = hand_over(engine, ctx, fallback_region, &delivery).await;
         let at_ms = super::now_ms();
         match failure {
             None => datapoints.push(delivery.datapoint(
@@ -659,12 +667,13 @@ pub async fn deliver<Eng: Send + Sync + 'static>(
 /// take the check has forwarded no event and lost none, and the next ingested batch is
 /// attempted against it exactly as it would have been. What a destination that refuses
 /// leaves behind is the warning below, and the absence of the record a client polls for.
-pub async fn deliver_health_check(
+pub async fn deliver_health_check<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     fallback_region: &str,
     health_check: Delivery,
 ) {
-    if let Some(failure) = hand_over(ctx, fallback_region, &health_check).await {
+    if let Some(failure) = hand_over(engine, ctx, fallback_region, &health_check).await {
         ::tracing::warn!(
             filter_name = %health_check.filter_name,
             destination_arn = %health_check.destination_arn,
@@ -682,7 +691,8 @@ pub async fn deliver_health_check(
 /// in ([`service_common::arn::region_label`]) before it is put in an endpoint, so no value
 /// a request carried can name a host. `fallback_region` is the Region the calling request
 /// was signed for, used only for a destination ARN that names no Region of its own.
-async fn hand_over(
+async fn hand_over<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     fallback_region: &str,
     delivery: &Delivery,
@@ -710,7 +720,7 @@ async fn hand_over(
     if vendor == KINESIS_STREAM.0 {
         deliver_to_kinesis(ctx, &region, delivery).await
     } else if vendor == FIREHOSE_DELIVERY_STREAM.0 {
-        deliver_to_firehose(ctx, &region, delivery).await
+        deliver_to_firehose(engine, ctx, &region, fallback_region, delivery).await
     } else if vendor == LAMBDA_FUNCTION.0 {
         deliver_to_lambda(ctx, &region, delivery).await
     } else {
@@ -814,16 +824,48 @@ async fn deliver_to_kinesis(
 }
 
 /// Deliver one envelope to a Firehose delivery stream, as one record.
-async fn deliver_to_firehose(
+///
+/// Made AS THIS SERVICE'S OWN SERVICE PRINCIPAL, acting for the log group the events were
+/// ingested into ([`as_the_service_principal`]): a delivery stream whose destination enables
+/// the CloudWatch Logs pipeline takes records from CloudWatch Logs and from no other
+/// producer ("Only requests from CloudWatch Logs are supported when CloudWatch Logs
+/// decompression is enabled"), and the credential the call presents is what says whose call
+/// it is. A call that cannot be made as that principal is made the ordinary way — as the
+/// in-process caller — which is what every destination that does not ask who is calling
+/// takes.
+async fn deliver_to_firehose<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
+    log_group_region: &str,
     delivery: &Delivery,
 ) -> Option<String> {
     let stream_name = ::service_common::arn::resource_id_of_type(
         &delivery.destination_arn,
         FIREHOSE_DELIVERY_STREAM.1,
     )?;
-    let client = callback_client!(aws_sdk_firehose, ctx.callback(), "firehose", region);
+    let in_flight = as_the_service_principal(engine, ctx, log_group_region, delivery);
+    let client = match &in_flight {
+        // The credential this ONE call was minted, in place of the callback's own: the
+        // macro applies a trailing setting after the credentials provider it configures
+        // itself, so this is the provider the client signs with, and the call then carries
+        // the access key id the directory of in-flight service-principal calls holds its
+        // record under.
+        Some(in_flight) => callback_client!(
+            aws_sdk_firehose,
+            ctx.callback(),
+            "firehose",
+            region,
+            credentials_provider(::aws_sdk_firehose::config::Credentials::new(
+                in_flight.access_key_id.clone(),
+                in_flight.secret_access_key.clone(),
+                None,
+                None,
+                SERVICE_PRINCIPAL,
+            )),
+        ),
+        None => callback_client!(aws_sdk_firehose, ctx.callback(), "firehose", region),
+    };
     let record = ::aws_sdk_firehose::types::Record::builder()
         .data(::aws_sdk_firehose::primitives::Blob::new(
             delivery.payload.clone(),
@@ -840,6 +882,109 @@ async fn deliver_to_firehose(
             .map(|error| why(&error)),
         Err(error) => Some(why(&error)),
     }
+}
+
+/// The service principal this service forwards a subscription filter's log events as, which
+/// is the principal a filter's delivery role trusts (`PutSubscriptionFilter$roleArn`, "an IAM
+/// role that grants CloudWatch Logs permissions to deliver ingested log events to the
+/// destination stream").
+const SERVICE_PRINCIPAL: &str = "logs.amazonaws.com";
+
+/// How long a record of one in-flight delivery stays readable.
+///
+/// What ENDS a record is the guard being dropped, which happens on every path out of the
+/// delivery; the deadline is the floor that bounds a record nothing dropped (see
+/// [`::service_common::service_principal_calls`]). It sits well past one in-process call, so
+/// a record can never expire while the destination's own handler is still deciding the call.
+const IN_FLIGHT_RECORD_SLACK: ::std::time::Duration = ::std::time::Duration::from_secs(60);
+
+/// Mint the credential one delivery is made under and record, under its access key id, that
+/// this is a call of [`SERVICE_PRINCIPAL`] acting for the log group the events came from.
+///
+/// The service SERVING the delivery reads that record for the access key id the call presents
+/// and so decides it for this service principal rather than for whoever the in-process
+/// credential speaks for. `None` where the call cannot be made as the principal at all — an
+/// engine carrying no such directory, a store that minted no secret, a directory already
+/// holding as many in-flight calls as it records — in which case the caller makes the
+/// ordinary in-process call instead: the narrowest identity available, and the one every
+/// destination that does not ask who is calling already took.
+fn as_the_service_principal<'e, Eng: Send + Sync + 'static>(
+    engine: &'e Eng,
+    ctx: &'e smithy_server_runtime::OperationContext<'_>,
+    log_group_region: &str,
+    delivery: &Delivery,
+) -> Option<InFlightDelivery<'e, Eng>> {
+    let directory = in_flight_calls(engine)?;
+    let minted = ctx
+        .credential_store()
+        .create(&::emulator_server::aws_credentials::AWS_ACCESS_KEY);
+    let secret_access_key = minted
+        .secret(::emulator_server::aws_credentials::SECRET_ACCESS_KEY)
+        .map(str::to_string);
+    let now = ::std::time::SystemTime::now();
+    let recorded = secret_access_key.is_some()
+        && directory.lock().remember(
+            minted.id.clone(),
+            ::service_common::service_principal_calls::ServicePrincipalCall {
+                principal: SERVICE_PRINCIPAL.to_string(),
+                // The resource the forwarding is made ON BEHALF OF: the log group whose
+                // ingested events this envelope carries.
+                source_arn: super::log_group_arn(log_group_region, &delivery.log_group_name, false),
+                source_account: ::engine::emulator_account_id().to_string(),
+                expires_at: now + IN_FLIGHT_RECORD_SLACK,
+            },
+            now,
+        );
+    match secret_access_key.filter(|_| recorded) {
+        Some(secret_access_key) => Some(InFlightDelivery {
+            engine,
+            credentials: ctx.credential_store(),
+            access_key_id: minted.id.clone(),
+            secret_access_key,
+        }),
+        None => {
+            let _ = ctx.credential_store().delete(&minted.id);
+            None
+        }
+    }
+}
+
+/// One delivery's own credential and in-flight record, held for as long as that delivery is
+/// being made.
+///
+/// Dropping it forgets the record and DELETES the credential, so the identity the call was
+/// made under exists only while the destination is answering it: a credential nothing holds
+/// can sign nothing, and a record nothing holds decides nothing.
+struct InFlightDelivery<'e, Eng: Send + Sync + 'static> {
+    engine: &'e Eng,
+    credentials: &'e ::emulator_server::CredentialStore,
+    access_key_id: String,
+    secret_access_key: String,
+}
+
+impl<Eng: Send + Sync + 'static> Drop for InFlightDelivery<'_, Eng> {
+    fn drop(&mut self) {
+        if let Some(directory) = in_flight_calls(self.engine) {
+            directory.lock().forget(&self.access_key_id);
+        }
+        let _ = self.credentials.delete(&self.access_key_id);
+    }
+}
+
+/// The shared directory of in-flight service-principal calls, in the one shared engine:
+/// written here and read by the service serving the delivery.
+fn in_flight_calls<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<
+    ::engine::ServiceState<::service_common::service_principal_calls::ServicePrincipalCalls>,
+> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(
+            ::engine::InMemoryEngine::state::<
+                ::service_common::service_principal_calls::ServicePrincipalCalls,
+            >,
+        )
 }
 
 /// Deliver one envelope to a Lambda function, as the `awslogs` document a subscription

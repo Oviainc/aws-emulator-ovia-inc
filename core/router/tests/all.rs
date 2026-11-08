@@ -969,6 +969,11 @@ mod apigateway_account_cloudwatch_role;
 // Service control plane and its data plane over one engine.
 #[path = "all/ds_data_plane_access_and_realm.rs"]
 mod ds_data_plane_access_and_realm;
+// Declared here, in this quiet span rather than in the contended tail: a log group's
+// subscription filter, the Firehose stream it forwards to and the object that stream
+// delivers.
+#[path = "all/logs_subscription_filter_to_firehose_s3.rs"]
+mod logs_subscription_filter_to_firehose_s3;
 #[path = "all/zz_probe_whole_emulator.rs"]
 mod zz_probe_whole_emulator;
 #[path = "all/cloudformation_provisions_cognito_identity_pools.rs"]

@@ -240,8 +240,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // to it, before any log event of this filter exists
         // ([`crate::state::subscription_delivery::health_check`]).
         if let Some(health_check) = health_check {
-            crate::state::subscription_delivery::deliver_health_check(ctx, &region, health_check)
-                .await;
+            crate::state::subscription_delivery::deliver_health_check(
+                &*self.engine,
+                ctx,
+                &region,
+                health_check,
+            )
+            .await;
         }
         Ok(PutSubscriptionFilterOutput)
     }

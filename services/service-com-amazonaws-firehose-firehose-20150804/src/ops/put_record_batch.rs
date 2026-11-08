@@ -240,10 +240,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into_iter()
             .map(|record| record.data)
             .collect();
+        // WHICH producer this put came from decides whether a stream that takes data from
+        // CloudWatch Logs only takes these records (`crate::state::producer`). Resolved
+        // before the store is locked: it reads the shared directory of in-flight
+        // service-principal calls, not this service's own store.
+        let producer = crate::state::producer::producer_of(&*self.engine, ctx);
         let ingested = {
             let mut store = state.lock();
             store.materialise_due(now);
-            store.ingest_records(&input.delivery_stream_name, records, now)
+            store.ingest_records(&input.delivery_stream_name, records, now, producer)
         };
         let (record_ids, encrypted) = match ingested {
             Ok(stored) => stored,
@@ -332,14 +337,15 @@ fn stream_not_active(name: &str) -> PutRecordBatchError {
     .into()
 }
 
-/// The stream takes data from CloudWatch Logs only, and this put is an API call.
+/// The stream takes data from CloudWatch Logs only, and this put came from another
+/// producer.
 ///
 /// "Only requests from CloudWatch Logs are supported when CloudWatch Logs decompression is
 /// enabled" (`InvalidSourceException`), which this operation models as a client error with
-/// HTTP 400. The gate is a property of the stream's processing configuration
-/// (`crate::state::DeliveryStream::takes_cloudwatch_logs_only`) and not of any payload, so
-/// it refuses the WHOLE batch rather than reporting per record: there is no record the
-/// stream would have taken.
+/// HTTP 400. The gate is the pair of the stream's processing configuration
+/// (`crate::state::DeliveryStream::takes_cloudwatch_logs_only`) and the producer the request
+/// came from (`crate::state::producer`), and not of any payload, so it refuses the WHOLE
+/// batch rather than reporting per record: there is no record the stream would have taken.
 ///
 /// `Code` is left unset: the model documents no rule for this exception's `Code` member
 /// (unlike `InvalidKMSResourceException`, whose `Code` relays the KMS exception type), and

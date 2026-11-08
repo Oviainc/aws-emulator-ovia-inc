@@ -197,6 +197,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         let now = ::std::time::SystemTime::now();
+        // WHICH producer this put came from decides whether a stream that takes data from
+        // CloudWatch Logs only takes this record (`crate::state::producer`). Resolved
+        // before the store is locked: it reads the shared directory of in-flight
+        // service-principal calls, not this service's own store.
+        let producer = crate::state::producer::producer_of(&*self.engine, ctx);
         // One lookup resolves the stream, refuses it if it is not accepting data, and
         // mints the id the record is stored under — so no id is ever handed out for a
         // record that was not stored. The guard lives in this block alone: the delivery
@@ -204,7 +209,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let ingested = {
             let mut store = state.lock();
             store.materialise_due(now);
-            store.ingest_record(&input.delivery_stream_name, input.record.data, now)
+            store.ingest_record(
+                &input.delivery_stream_name,
+                input.record.data,
+                now,
+                producer,
+            )
         };
         let (record_id, encrypted) = match ingested {
             Ok(stored) => stored,
@@ -276,13 +286,15 @@ fn stream_not_active(name: &str) -> PutRecordError {
     .into()
 }
 
-/// The stream takes data from CloudWatch Logs only, and this put is an API call.
+/// The stream takes data from CloudWatch Logs only, and this put came from another
+/// producer.
 ///
 /// "Only requests from CloudWatch Logs are supported when CloudWatch Logs decompression is
 /// enabled" (`InvalidSourceException`), which this operation models as a client error with
-/// HTTP 400. The gate is a property of the stream's processing configuration
-/// (`crate::state::DeliveryStream::takes_cloudwatch_logs_only`), not of the payload, so it
-/// refuses the whole call before any record is stored.
+/// HTTP 400. The gate is the pair of the stream's processing configuration
+/// (`crate::state::DeliveryStream::takes_cloudwatch_logs_only`) and the producer the request
+/// came from (`crate::state::producer`), not of the payload, so it refuses the whole call
+/// before any record is stored.
 ///
 /// `Code` is left unset: the model documents no rule for this exception's `Code` member
 /// (unlike `InvalidKMSResourceException`, whose `Code` relays the KMS exception type), and

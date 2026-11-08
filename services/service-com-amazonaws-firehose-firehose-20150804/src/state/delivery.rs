@@ -73,6 +73,7 @@ use ::aws_smithy_runtime_api::client::http::{HttpConnector, SharedHttpConnector}
 use crate::ops::types::{
     BufferingHints, EncryptionConfiguration, ProcessingConfiguration, S3DestinationConfiguration,
 };
+use crate::state::cloudwatch_logs_pipeline::{CloudWatchLogsPipeline, Processed};
 use crate::state::{
     service_state, ComAmazonawsFirehoseFirehose20150804State, DeliveryStream,
     DestinationConfigKind, StoredRecord,
@@ -386,6 +387,21 @@ const METADATA_EXTRACTION_FAILED: DeliveryFailure = DeliveryFailure {
 /// no `ErrorOutputPrefix`.
 const HTTP_ENDPOINT_FAILED_OUTPUT_TYPE: &str = "http-endpoint-failed";
 
+/// The failure of a record the destination's own DATA PROCESSING could not read: a record
+/// that is not framed in the format an enabled `Decompression` processor inflates, or whose
+/// inflated bytes are not the document an enabled `CloudWatchLogProcessing` processor
+/// extracts the log events out of ([`crate::state::cloudwatch_logs_pipeline`]).
+///
+/// "Enables or disables data processing" (`ProcessingConfiguration$Enabled`) is what puts
+/// those processors in force, so this failure exists only for a destination that enabled
+/// them; a record of one is not dropped either way, since the error output carries it with
+/// its own bytes.
+const PROCESSING_FAILED: DeliveryFailure = DeliveryFailure {
+    output_type: "processing-failed",
+    error_code: "DataProcessing.ProcessingFailed",
+    error_message: "this record is not what the destination's data processing reads",
+};
+
 /// The failure of a buffer the HTTP endpoint ANSWERED, but not with a success status — the
 /// destination raised rather than acknowledged the delivery.
 const HTTP_ENDPOINT_DESTINATION_EXCEPTION: DeliveryFailure = DeliveryFailure {
@@ -480,6 +496,10 @@ pub struct S3Target {
     /// Whether the records of one object are separated by [`RECORD_DELIMITER`], which the
     /// `AppendDelimiterToRecord` processor asks for.
     pub append_delimiter: bool,
+    /// What the destination's enabled data processing leaves of each record on the way here
+    /// ([`crate::state::cloudwatch_logs_pipeline`]). The default — nothing enabled — leaves
+    /// every record exactly as the producer sent it.
+    pub cloudwatch_logs: CloudWatchLogsPipeline,
     /// The key an object written here is encrypted at rest with: the `AWSKMSKeyARN` of the
     /// destination's `EncryptionConfiguration` ([`kms_key_arn`]), and `None` when the
     /// configuration names none.
@@ -606,7 +626,14 @@ pub(crate) fn bucket_name(bucket_arn: &str) -> Option<&str> {
     (!name.is_empty()).then_some(name)
 }
 
-/// The Amazon S3 location a plain `S3DestinationConfiguration` names.
+/// The Amazon S3 location a plain `S3DestinationConfiguration` names, taking every record
+/// as the producer sent it.
+///
+/// A plain `S3DestinationConfiguration` carries no `ProcessingConfiguration` of its own, and
+/// where one appears as another destination's BACKUP it is the source records that are
+/// parked there, not the processed ones — so a location read through here runs no pipeline.
+/// [`processing_target`] is the primary location of a destination whose own data processing
+/// is in force.
 fn plain_target(config: &S3DestinationConfiguration) -> Option<S3Target> {
     Some(S3Target {
         bucket: bucket_name(&config.bucket_arn)?.to_string(),
@@ -617,7 +644,21 @@ fn plain_target(config: &S3DestinationConfiguration) -> Option<S3Target> {
         file_extension: None,
         metadata_extraction_query: None,
         append_delimiter: false,
+        cloudwatch_logs: CloudWatchLogsPipeline::default(),
         kms_key_arn: kms_key_arn(config.encryption_configuration.as_ref()),
+    })
+}
+
+/// The same location, with the data processing `processing` configures in force: the records
+/// written here are what that destination's enabled processors leave behind.
+fn processing_target(
+    config: &S3DestinationConfiguration,
+    processing: Option<&ProcessingConfiguration>,
+) -> Option<S3Target> {
+    Some(S3Target {
+        append_delimiter: appends_delimiter(processing),
+        cloudwatch_logs: CloudWatchLogsPipeline::of(processing),
+        ..plain_target(config)?
     })
 }
 
@@ -720,6 +761,9 @@ pub fn s3_targets(config: &DestinationConfigKind) -> Vec<S3Target> {
                         config.processing_configuration.as_ref(),
                     ),
                     append_delimiter: appends_delimiter(config.processing_configuration.as_ref()),
+                    cloudwatch_logs: CloudWatchLogsPipeline::of(
+                        config.processing_configuration.as_ref(),
+                    ),
                     kms_key_arn: kms_key_arn(config.encryption_configuration.as_ref()),
                 });
             }
@@ -728,7 +772,13 @@ pub fn s3_targets(config: &DestinationConfigKind) -> Vec<S3Target> {
             }
         }
         DestinationConfigKind::Redshift(config) => {
-            targets.extend(plain_target(&config.s3_configuration));
+            // Amazon Redshift's own Amazon S3 location is on the DELIVERY path — "Firehose
+            // first delivers data to the S3 bucket and then issues an Amazon Redshift COPY
+            // command" — so what lands there is what this destination's processing left.
+            targets.extend(processing_target(
+                &config.s3_configuration,
+                config.processing_configuration.as_ref(),
+            ));
             if backs_up_all_records(config.s3_backup_mode.as_ref()) {
                 targets.extend(config.s3_backup_configuration.as_ref().and_then(plain_target));
             }
@@ -1908,6 +1958,11 @@ fn write_objects<Eng: Send + Sync + 'static>(engine: &Eng, objects: Vec<Delivere
 /// (see [`grouped`]), so the caller puts it back rather than writing part of it.
 async fn objects_of(delivery: &PendingDelivery, now: SystemTime) -> Option<Vec<DeliveredObject>> {
     let mut objects = Vec::new();
+    // What the records of THIS delivery may inflate to, over every location they go to:
+    // charged down as they are processed, so one flush cannot hold more than the budget
+    // whatever its records' compression ratio is.
+    let mut inflation_budget =
+        crate::state::cloudwatch_logs_pipeline::MAX_INFLATED_BYTES_PER_DELIVERY;
     for target in &delivery.targets {
         // The prefix each object of this location is written under, with the records that
         // go in it. A group whose own prefix cannot be resolved — the prefix names a
@@ -1929,12 +1984,24 @@ async fn objects_of(delivery: &PendingDelivery, now: SystemTime) -> Option<Vec<D
             }
         }
         // Each object of this location, with the bytes it carries: a delivered one holds
-        // its records' data, and an error-output one holds the error document of each
-        // record that could not be placed.
-        let mut bodies: Vec<(String, Vec<u8>)> = writing
-            .into_iter()
-            .map(|(prefix, records)| (prefix, payload(&records, target)))
-            .collect();
+        // what the destination's processing left of its records' data, and an error-output
+        // one holds the error document of each record that could not be placed — including
+        // one the processing itself could not read.
+        let mut bodies: Vec<(String, Vec<u8>)> = Vec::with_capacity(writing.len());
+        for (prefix, records) in writing {
+            let (body, unprocessable) = payload(&records, target, &mut inflation_budget).await;
+            if !unprocessable.is_empty() {
+                failed
+                    .entry(PROCESSING_FAILED)
+                    .or_default()
+                    .extend(unprocessable);
+            }
+            // A group whose every record the processing dropped or could not read leaves no
+            // object behind: an empty object is not something a delivery writes.
+            if !body.is_empty() {
+                bodies.push((prefix, body));
+            }
+        }
         for (failure, records) in failed {
             // An error output prefix this emulator cannot resolve is not a record it
             // drops: nothing of the delivery is written and the whole of it is owed
@@ -2538,17 +2605,50 @@ fn scalar_object(value: &::serde_json::Value) -> Option<BTreeMap<String, String>
     Some(keys)
 }
 
-/// The data one object carries: its records' blobs in arrival order, with the delimiter
-/// the destination's processing asks for between them.
-fn payload(records: &[&StoredRecord], target: &S3Target) -> Vec<u8> {
+/// The data one object carries: its records in arrival order, each as the destination's
+/// data processing left it ([`crate::state::cloudwatch_logs_pipeline`]), with the delimiter
+/// that processing asks for between them — and, beside it, the records the processing could
+/// not read, which the caller writes to the error output instead.
+///
+/// A record the processing DROPPED (an envelope carrying no log event of the account) is in
+/// neither: it was processed, and what processing it left is nothing.
+///
+/// `budget` is the inflated bytes the rest of this DELIVERY may still hold, charged down as
+/// the records are processed, so the sum of what the records of one flush inflate to is
+/// bounded and not only each record on its own
+/// ([`crate::state::cloudwatch_logs_pipeline::MAX_INFLATED_BYTES_PER_DELIVERY`]).
+///
+/// ASYNC because processing is the one CPU-bound step of a delivery: the loop hands the
+/// runtime back between records, so a timeout or a cancellation can land while a long buffer
+/// is being processed instead of the whole run holding the worker.
+async fn payload<'r>(
+    records: &[&'r StoredRecord],
+    target: &S3Target,
+    budget: &mut u64,
+) -> (Vec<u8>, Vec<&'r StoredRecord>) {
     let mut body = Vec::new();
+    let mut unprocessable = Vec::new();
+    let processing = target.cloudwatch_logs.runs();
     for record in records {
-        body.extend_from_slice(&record.data);
-        if target.append_delimiter {
-            body.extend_from_slice(RECORD_DELIMITER);
+        if processing {
+            ::tokio::task::yield_now().await;
+        }
+        match crate::state::cloudwatch_logs_pipeline::process(
+            &record.data,
+            target.cloudwatch_logs,
+            budget,
+        ) {
+            Processed::Record(data) => {
+                body.extend_from_slice(&data);
+                if target.append_delimiter {
+                    body.extend_from_slice(RECORD_DELIMITER);
+                }
+            }
+            Processed::Dropped => {}
+            Processed::Failed => unprocessable.push(*record),
         }
     }
-    body
+    (body, unprocessable)
 }
 
 /// The data an ERROR OUTPUT object carries: the error-output document of each record that
