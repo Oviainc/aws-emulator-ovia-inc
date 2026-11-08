@@ -275,7 +275,7 @@ pub use data_plane::{
     open_engine_endpoint, wire_session::SessionTarget, DbEngineEndpoint, EngineWire,
     ServedEndpoint,
 };
-pub use ec2_subnets::{subnet_zones, SubnetZones};
+pub use ec2_subnets::{invalid_subnets_message, subnet_zones, SubnetZones};
 pub use ec2_security_groups::{invalid_security_group_message, unresolved_vpc_security_groups};
 
 /// Per-service state for com-amazonaws-rds-amazonrdsv19. A handler reaches it through [`service_state`].
@@ -1832,6 +1832,13 @@ pub struct DbSubnetGroupRecord {
     /// where EC2 is not mounted) is simply absent: the group then reports no zone for that
     /// subnet rather than one this service chose.
     pub subnet_zones: BTreeMap<String, String>,
+    /// The VPC that OWNS [`Self::subnet_ids`], as Amazon EC2 reported it when the group was
+    /// created or last modified: a subnet belongs to one VPC, and that VPC is the group's.
+    ///
+    /// `None` where the owner of subnets answered no VPC for them at all (a deployment EC2
+    /// is not mounted in), in which case the group reports the VPC its region resolves into
+    /// ([`region_vpc_id`]) rather than claiming a VPC EC2 never named.
+    pub vpc_id: Option<String>,
     pub tags: Vec<Tag>,
 }
 
@@ -1847,6 +1854,7 @@ impl DbSubnetGroupRecord {
             description: DEFAULT_DB_SUBNET_GROUP.to_string(),
             subnet_ids: Vec::new(),
             subnet_zones: BTreeMap::new(),
+            vpc_id: None,
             tags: Vec::new(),
         }
     }
@@ -1896,8 +1904,14 @@ impl DbSubnetGroupRecord {
             }),
             db_subnet_group_arn: Some(self.arn()),
             // The VPC the group's subnets belong to, and the network protocols those
-            // subnets carry: both read off the subnets, as RDS reads them.
-            vpc_id: Some(region_vpc_id(&self.region)),
+            // subnets carry: both read off the subnets, as RDS reads them. The VPC is the
+            // one the owner of subnets answered with for this group's own subnets; where it
+            // answered none, the VPC the region resolves into stands in.
+            vpc_id: Some(
+                self.vpc_id
+                    .clone()
+                    .unwrap_or_else(|| region_vpc_id(&self.region)),
+            ),
             supported_network_types: Some(
                 SUBNET_GROUP_NETWORK_TYPES
                     .iter()
@@ -2418,6 +2432,14 @@ pub enum SubnetListRejection {
     /// The named subnets cover fewer Availability Zones than a group must —
     /// `DBSubnetGroupDoesNotCoverEnoughAZs`.
     NotEnoughAvailabilityZones(String),
+    /// An identifier the request named that cannot make up this group: one the account
+    /// holds no subnet for, or one of a VPC other than the group's. Either way the VALUE
+    /// the request carried is the thing that cannot be used, which is the query protocol's
+    /// common `InvalidParameterValue`.
+    UnusableSubnets(String),
+    /// The named subnets are not all in one VPC, so they make up no DB subnet group —
+    /// `InvalidSubnet`, whose documented condition this is.
+    NotInOneVpc(String),
 }
 
 /// Refuse a `SubnetIds` list THE REQUEST ALONE settles cannot make up a DB subnet group: a
@@ -2450,6 +2472,81 @@ pub fn check_db_subnet_group_subnet_list(
         check_subnet_id(subnet_id).map_err(SubnetListRejection::NotASubnet)?;
     }
     Ok(())
+}
+
+/// Refuse a `SubnetIds` list naming identifiers the account holds no subnet for, whichever
+/// operation carries it.
+///
+/// A subnet is Amazon EC2's resource, so whether one EXISTS is EC2's answer, read off the
+/// records the owner of subnets returned for the request's own identifiers ([`subnet_zones`]):
+/// an identifier it answered for no subnet names no subnet of the account, and the list
+/// cannot make up a group however many Availability Zones it might otherwise have covered.
+///
+/// Comes BEFORE [`check_db_subnet_group_zone_coverage`], the way RDS resolves the identifiers
+/// before it evaluates coverage: coverage is a statement about subnets, and an identifier
+/// that names none contributes no zone to count.
+///
+/// A hop the owner of subnets never answered refuses nothing: the identifiers are then
+/// unknown rather than absent (see [`SubnetZones::absent`]).
+pub fn check_db_subnet_group_subnets_exist(
+    subnet_ids: &[String],
+    zones: &SubnetZones,
+) -> Result<(), SubnetListRejection> {
+    let absent = zones.absent(subnet_ids);
+    if absent.is_empty() {
+        return Ok(());
+    }
+    Err(SubnetListRejection::UnusableSubnets(
+        invalid_subnets_message(&absent),
+    ))
+}
+
+/// Refuse a `SubnetIds` list whose subnets do not all lie in ONE VPC, whichever operation
+/// carries it: `InvalidSubnet` is the fault for exactly that — the model documents it as "The
+/// requested subnet is invalid, or multiple subnets were requested that are not all in a
+/// common VPC" — and a DB subnet group is a set of subnets of one VPC, which is the VPC the
+/// group reports.
+///
+/// The VPC of each subnet is Amazon EC2's answer for the request's own identifiers
+/// ([`subnet_zones`]), so a list asked about where the owner of subnets could not be reached
+/// names no VPC at all and is refused on nothing.
+pub fn check_db_subnet_group_common_vpc(
+    subnet_ids: &[String],
+    zones: &SubnetZones,
+) -> Result<(), SubnetListRejection> {
+    if zones.vpcs(subnet_ids.iter().map(String::as_str)).len() < 2 {
+        return Ok(());
+    }
+    Err(SubnetListRejection::NotInOneVpc(
+        SUBNETS_NOT_IN_ONE_VPC_MESSAGE.to_string(),
+    ))
+}
+
+/// What a `SubnetIds` list whose subnets lie in more than one VPC is refused with: the
+/// sentence the `InvalidSubnet` fault states for that condition itself.
+pub const SUBNETS_NOT_IN_ONE_VPC_MESSAGE: &str =
+    "The requested subnet is invalid, or multiple subnets were requested that are not all \
+     in a common VPC.";
+
+/// Refuse a `SubnetIds` list naming subnets of a VPC OTHER than `vpc_id`, the VPC the DB
+/// subnet group a modification addresses is in.
+///
+/// A DB subnet group belongs to the VPC its subnets are in, and a modification changes which
+/// subnets OF THAT VPC it holds: an identifier naming a subnet of another VPC is not one this
+/// group can be made of, so it is reported invalid the way an identifier the account holds no
+/// subnet for is ([`invalid_subnets_message`]).
+pub fn check_db_subnet_group_subnets_in_vpc(
+    subnet_ids: &[String],
+    zones: &SubnetZones,
+    vpc_id: &str,
+) -> Result<(), SubnetListRejection> {
+    let outside = zones.outside_vpc(subnet_ids, vpc_id);
+    if outside.is_empty() {
+        return Ok(());
+    }
+    Err(SubnetListRejection::UnusableSubnets(
+        invalid_subnets_message(&outside),
+    ))
 }
 
 /// Refuse a `SubnetIds` list whose subnets cover fewer Availability Zones than a DB subnet

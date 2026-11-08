@@ -187,6 +187,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // owns subnets: it is read off EC2's records here, before anything is stored, and
         // never derived from the identifiers (`crate::state::ec2_subnets`).
         let zones = crate::state::subnet_zones(ctx, &region, &input.subnet_ids).await;
+        // WHETHER each subnet exists at all is the same service's answer, and RDS resolves
+        // the identifiers before it counts the zones they cover: an identifier EC2 holds no
+        // subnet for names no subnet of the account, so it can make up no group.
+        crate::state::check_db_subnet_group_subnets_exist(&input.subnet_ids, &zones)
+            .map_err(subnet_list_refusal)?;
+        // A DB subnet group is a set of subnets of ONE VPC — the VPC it reports — so a list
+        // whose subnets lie in several makes up no group.
+        crate::state::check_db_subnet_group_common_vpc(&input.subnet_ids, &zones)
+            .map_err(subnet_list_refusal)?;
         crate::state::check_db_subnet_group_zone_coverage(&input.subnet_ids, &zones)
             .map_err(subnet_list_refusal)?;
 
@@ -243,10 +252,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             name,
             region,
             description: input.db_subnet_group_description,
-            subnet_ids: input.subnet_ids,
             // The zones the group reports are the ones EC2 answered with for its own
             // subnets, kept with the group so every later read reports what the owner of
-            // subnets said rather than something computed afresh.
+            // subnets said rather than something computed afresh. Its VPC is the one those
+            // same records name as the subnets' owner.
+            vpc_id: zones.vpc_of(input.subnet_ids.iter().map(String::as_str)),
+            subnet_ids: input.subnet_ids,
             subnet_zones: zones.into_zones_by_subnet(),
             tags: input.tags.unwrap_or_default(),
         };
@@ -260,12 +271,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// How this operation ANSWERS a `SubnetIds` list it cannot make a group of: each rejection
-/// `crate::state` raises, mapped onto the modelled fault of this operation.
+/// `crate::state` raises, mapped onto the fault of this operation that carries it.
 ///
-/// One mapping for both gates — the one over what the request alone settles
-/// (`check_db_subnet_group_subnet_list`) and the one over the zones the named subnets cover
-/// (`check_db_subnet_group_zone_coverage`) — so a refusal cannot be worded one way by the
-/// first and another way by the second.
+/// One mapping for every gate — the one over what the request alone settles
+/// (`check_db_subnet_group_subnet_list`), the one over whether the named subnets exist at all
+/// (`check_db_subnet_group_subnets_exist`) and the one over the zones they cover
+/// (`check_db_subnet_group_zone_coverage`) — so a refusal cannot be worded one way by one
+/// gate and another way by the next.
 fn subnet_list_refusal(rejection: crate::state::SubnetListRejection) -> CreateDBSubnetGroupError {
     match rejection {
         crate::state::SubnetListRejection::TooManySubnets(message) => {
@@ -290,6 +302,18 @@ fn subnet_list_refusal(rejection: crate::state::SubnetListRejection) -> CreateDB
                     message: Some(message),
                 },
             )
+        }
+        // An identifier the account holds no subnet for is a VALUE the request carried that
+        // cannot be used, which is the query protocol's common client error rather than any
+        // of this operation's modelled faults: `InvalidSubnet` is what RDS answers for a
+        // subnet that exists and cannot be used, not for one that is not there.
+        crate::state::SubnetListRejection::UnusableSubnets(message) => {
+            return CreateDBSubnetGroupError::invalid_parameter_value(message)
+        }
+        crate::state::SubnetListRejection::NotInOneVpc(message) => {
+            CreateDBSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
+                message: Some(message),
+            })
         }
     }
     .into()

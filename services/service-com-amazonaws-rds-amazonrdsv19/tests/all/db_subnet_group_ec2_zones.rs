@@ -14,8 +14,9 @@
 //!   `DBSubnetGroupDoesNotCoverEnoughAZs`, whose message names the coverage THOSE subnets
 //!   add up to; the coverage is counted in ZONES, so two subnets of one zone cover one zone
 //!   and are refused, and two subnets of two zones are served;
-//! * an identifier the account has no subnet for has no zone this service knows, so the
-//!   group reports none for it rather than one of its own choosing;
+//! * a group keeps the zone EC2 answered with for a subnet the account later removed, while
+//!   a NEW group naming that identifier is refused (the suite
+//!   `db_subnet_group_subnet_existence` spans that refusal);
 //! * the zones a STORED group covers are what a cluster-placement precondition counts: a
 //!   Multi-AZ DB cluster create against a group covering fewer than three zones is refused
 //!   with the zones of the Region that group does not cover yet.
@@ -32,14 +33,7 @@ use service_com_amazonaws_rds_amazonrdsv19::EmulatedService;
 use smithy_server_runtime::{EmbeddedEmulator, MultiServiceRouter};
 
 use crate::db_instances::{call_in, expect_error, expect_ok, subtrees, text, REGION};
-
-/// A well-formed EC2 subnet identifier the account has no subnet for: EC2 mints none in this
-/// suite's network, so it resolves to nothing however often it is named.
-const ABSENT_SUBNET: &str = "subnet-00000000deadbeef0";
-
-/// The other published identifier form — `subnet-` and 8 hexadecimal characters — also
-/// naming no subnet of the account.
-const SHORT_ABSENT_SUBNET: &str = "subnet-0000beef";
+use crate::db_subnet_group_subnet_existence::invalid_subnets_message;
 
 /// The CIDR block of the VPC this suite builds its own subnets in, outside the default VPC's
 /// own block so both can exist.
@@ -91,7 +85,7 @@ impl Account {
 
     /// The zones of [`REGION`] the ACCOUNT has, as EC2 reports them — asked, never assumed,
     /// so a case places a subnet in a zone the Region really has.
-    async fn zones(&self) -> Vec<String> {
+    pub(crate) async fn zones(&self) -> Vec<String> {
         let reported = self
             .ec2
             .describe_availability_zones()
@@ -114,7 +108,7 @@ impl Account {
     }
 
     /// The VPC `ec2:CreateVpc` mints for `cidr_block`, as the id EC2 reported.
-    async fn create_vpc(&self, cidr_block: &str) -> String {
+    pub(crate) async fn create_vpc(&self, cidr_block: &str) -> String {
         self.ec2
             .create_vpc()
             .cidr_block(cidr_block)
@@ -128,7 +122,7 @@ impl Account {
     }
 
     /// The subnet `ec2:CreateSubnet` mints in `vpc_id`, in `zone`, as the id EC2 reported.
-    async fn create_subnet(&self, vpc_id: &str, cidr: &str, zone: &str) -> String {
+    pub(crate) async fn create_subnet(&self, vpc_id: &str, cidr: &str, zone: &str) -> String {
         self.ec2
             .create_subnet()
             .vpc_id(vpc_id)
@@ -214,9 +208,9 @@ pub(crate) fn subnet_members(subnets: &[String]) -> Vec<(String, String)> {
 pub(crate) struct Network {
     pub(crate) account: Account,
     /// The Region's zones, as EC2 reports them.
-    zones: Vec<String>,
+    pub(crate) zones: Vec<String>,
     /// The VPC EC2 minted this network's subnets in.
-    vpc: String,
+    pub(crate) vpc: String,
     /// Two subnets of the FIRST zone, so a list can name two subnets and cover one zone.
     pub(crate) first_zone: [String; 2],
     /// One subnet of the SECOND zone.
@@ -485,74 +479,23 @@ async fn the_coverage_refusal_names_the_zones_the_requests_own_subnets_cover() {
     );
 }
 
-/// RULE: a subnet the account has no record of has no zone this service knows, so the group
-/// reports NO `SubnetAvailabilityZone` for it — never one of this service's own choosing —
-/// and the zone it DOES report for a subnet EC2 answered for is the one EC2 answered with,
-/// kept with the group from then on.
+/// RULE: the zone a group reports for one of its subnets is the one the owner of subnets
+/// answered with when the group was written, kept with the group from then on — while a
+/// subnet the account holds no record of can make up no new group at all, since the
+/// identifiers a `SubnetIds` list names have to be subnets the account holds (the suite
+/// `db_subnet_group_subnet_existence` spans that refusal).
 #[tokio::test]
-async fn a_subnet_the_account_has_no_record_of_is_reported_with_no_zone() {
+async fn a_group_keeps_the_zone_of_a_subnet_the_account_no_longer_holds() {
     let network = Network::build().await;
-
-    // Rows spanning where in the list the unknown identifier sits, how many there are and
-    // which published identifier form it takes (8 and 17 hexadecimal characters).
-    let rows: [(&str, Vec<String>, Vec<&str>); 3] = [
-        (
-            "an identifier EC2 minted no subnet for, named first",
-            vec![ABSENT_SUBNET.to_string(), network.second_zone.clone()],
-            vec![ABSENT_SUBNET],
-        ),
-        (
-            "the same identifier after a subnet the account does have",
-            vec![network.first_zone[0].clone(), ABSENT_SUBNET.to_string()],
-            vec![ABSENT_SUBNET],
-        ),
-        (
-            "two identifiers the account has no subnet for",
-            vec![ABSENT_SUBNET.to_string(), SHORT_ABSENT_SUBNET.to_string()],
-            vec![ABSENT_SUBNET, SHORT_ABSENT_SUBNET],
-        ),
-    ];
-
-    for (index, (case, subnets, unknown)) in rows.into_iter().enumerate() {
-        let name = format!("emu-ec2zone-absent-{index}");
-        // Nothing is known about the zone of an identifier the account has no subnet for,
-        // which is not evidence that the list covers too few zones: the group is created,
-        // and it reports the zone of the subnets EC2 did answer for and none for the rest.
-        let created = expect_ok(case, network.account.create_group(&name, &subnets).await);
-        let reported = subtrees(&created, "Subnet");
-        assert_eq!(
-            reported.len(),
-            subnets.len(),
-            "case {case:?}: expected {} subnet(s), got {reported:?}",
-            subnets.len()
-        );
-        for (subnet, identifier) in reported.iter().zip(&subnets) {
-            let zone = subtrees(subnet, "SubnetAvailabilityZone");
-            if unknown.contains(&identifier.as_str()) {
-                assert!(
-                    zone.is_empty(),
-                    "case {case:?}: no zone is known for {identifier:?}, so none may be \
-                     reported, got {zone:?}"
-                );
-            } else {
-                let expected = network.account.zone_of(identifier).await;
-                let reported_zone = text(subnet, "Name");
-                assert_eq!(
-                    reported_zone, expected,
-                    "case {case:?}: expected the zone EC2 reports for {identifier:?}, got \
-                     {reported_zone:?}"
-                );
-            }
-        }
-    }
 
     // A subnet the account HELD and holds no longer: the group created while it existed
     // keeps reporting the zone EC2 answered with for it — that is the zone it was placed in
-    // — while a group created after the subnet was removed knows no zone for it.
-    let vpc = network.account.create_vpc("10.53.0.0/16").await;
+    // — while a group created after the subnet was removed names an identifier the account
+    // has no subnet for. It is minted in this network's own VPC, since the subnets of one
+    // group all lie in one VPC.
     let doomed = network
         .account
-        .create_subnet(&vpc, "10.53.1.0/24", &network.zones[0])
+        .create_subnet(&network.vpc, "10.52.9.0/24", &network.zones[0])
         .await;
     let case = "a subnet EC2 minted and then deleted";
     let before = [doomed.clone(), network.second_zone.clone()];
@@ -580,22 +523,23 @@ async fn a_subnet_the_account_has_no_record_of_is_reported_with_no_zone() {
         &before,
         &zones_before,
     );
-    let created_after = expect_ok(
+    // A NEW group over the same list is refused instead: the account has no such subnet any
+    // more, so the list names an identifier that is not a subnet of it.
+    let body = expect_error(
         case,
         network
             .account
             .create_group("emu-ec2zone-deleted-2", &before)
             .await,
+        400,
+        "InvalidParameterValue",
     );
-    let reported = subtrees(&created_after, "Subnet");
-    let zone = subtrees(
-        reported.first().expect("the group reports its subnets"),
-        "SubnetAvailabilityZone",
-    );
-    assert!(
-        zone.is_empty(),
-        "case {case:?}: the account has no subnet {doomed} any more, so no zone may be \
-         reported for it, got {zone:?}"
+    let message = text(&body, "Message");
+    let expected = invalid_subnets_message(&[doomed.as_str()]);
+    assert_eq!(
+        message, expected,
+        "case {case:?}: the account has no subnet {doomed} any more, so the list naming it \
+         must be refused with {expected:?}, got {message:?}"
     );
 }
 

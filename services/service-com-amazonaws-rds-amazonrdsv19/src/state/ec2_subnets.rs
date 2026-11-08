@@ -13,15 +13,22 @@
 //! service's crate and nothing leaves the process.
 //!
 //! What a DB subnet group reports about its subnets — the zone each one lies in, and so the
-//! zones the group COVERS — is read off the records EC2 answered with, never built from the
-//! identifiers themselves: a subnet's zone is EC2's fact, and a client cross-checking
-//! `DescribeDBSubnetGroups` against `ec2:DescribeSubnets` must see one answer, not two.
+//! zones the group COVERS, and the VPC that owns them, which is the group's own — is read off
+//! the records EC2 answered with, never built from the identifiers themselves: a subnet's
+//! zone and VPC are EC2's facts, and a client cross-checking `DescribeDBSubnetGroups` against
+//! `ec2:DescribeSubnets` must see one answer, not two.
+//!
+//! An identifier EC2 ANSWERED it holds no subnet for names no subnet of the account, and a
+//! request carrying one is refused: the subnets a DB subnet group would hold have to be
+//! subnets, and a later `ec2:DescribeSubnets` could agree with no group built on an
+//! identifier nobody minted.
 //!
 //! A hop that could not be made at all (no EC2 in this process, an answer that could not be
 //! read) is evidence of nothing: the zone of the identifiers it would have answered for
 //! stays UNKNOWN, which this service reports as no zone rather than as a zone of its own
-//! choosing, and which no refusal is assumed from (`services/common/src/network.rs` states
-//! which reading belongs to which kind of service).
+//! choosing, and which neither a refusal nor a zone is assumed from
+//! (`services/common/src/network.rs` states which reading belongs to which kind of
+//! service).
 //!
 //! Nothing is cached: a subnet created a moment ago resolves at once, and one that was
 //! deleted stops resolving at once.
@@ -44,6 +51,19 @@ const SUBNET_ID_FILTER: &str = "subnet-id";
 /// subnet group holds at most [`super::MAX_SUBNETS_PER_DB_SUBNET_GROUP`] subnets, so a
 /// create normally fits in one hop.
 const SUBNET_IDS_PER_HOP: usize = 64;
+
+/// What a request naming subnets that cannot make up a DB subnet group — ones the account
+/// does not hold, or ones outside the group's VPC — is refused with.
+///
+/// Amazon RDS states the identifiers it could not use inside the brackets, comma-separated
+/// and in the order the request named them, and leaves the fixed text around them, whose
+/// spacing (the space before the colon, none after it) is AWS's own.
+pub fn invalid_subnets_message(subnet_ids: &[String]) -> String {
+    format!(
+        "Some input subnets in :[{}] are invalid.",
+        subnet_ids.join(", ")
+    )
+}
 
 /// An AWS SDK client for EC2 over the in-process callback into this same emulator.
 ///
@@ -95,6 +115,17 @@ pub(super) fn ec2(
 pub struct SubnetZones {
     /// `subnet-id` -> the `AvailabilityZone` EC2 reports for it.
     by_id: BTreeMap<String, String>,
+    /// `subnet-id` -> the `VpcId` EC2 reports the subnet belongs to.
+    vpc_by_id: BTreeMap<String, String>,
+    /// Every identifier EC2 ANSWERED with a subnet for, whichever of that subnet's own
+    /// members the record carried: whether the account HOLDS the subnet is its own fact,
+    /// never inferred from the zone or the VPC the record happened to name.
+    held: BTreeSet<String>,
+    /// Whether the owner of subnets ANSWERED every question asked of it. `false` where no
+    /// hop could be made at all, which is the one case an absent entry says nothing about
+    /// whether the account holds the subnet — so it defaults to `false`, and nothing is
+    /// refused on a hop that was never answered.
+    answered: bool,
 }
 
 impl SubnetZones {
@@ -126,6 +157,69 @@ impl SubnetZones {
             .into_iter()
             .filter(|subnet_id| self.zone_of(subnet_id).is_none())
             .count()
+    }
+
+    /// The identifiers among `subnet_ids` that EC2 ANSWERED it holds no subnet for, in the
+    /// order the request named them and without repetition.
+    ///
+    /// EMPTY where the hop could not be made or the owner answered with an error: this
+    /// service then knows nothing about the subnets, and a request is refused on what EC2
+    /// said rather than on silence.
+    #[must_use]
+    pub fn absent(&self, subnet_ids: &[String]) -> Vec<String> {
+        if !self.answered {
+            return Vec::new();
+        }
+        let mut named: BTreeSet<&str> = BTreeSet::new();
+        subnet_ids
+            .iter()
+            .filter(|subnet_id| !self.held.contains(subnet_id.as_str()))
+            .filter(|subnet_id| named.insert(subnet_id.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// The identifiers among `subnet_ids` EC2 reports in a VPC OTHER than `vpc_id`, in the
+    /// order the request named them and without repetition.
+    ///
+    /// An identifier EC2 named no VPC for is not among them: a subnet this service knows no
+    /// VPC for is no evidence of a subnet in the wrong one.
+    #[must_use]
+    pub fn outside_vpc(&self, subnet_ids: &[String], vpc_id: &str) -> Vec<String> {
+        let mut named: BTreeSet<&str> = BTreeSet::new();
+        subnet_ids
+            .iter()
+            .filter(|subnet_id| {
+                self.vpc_by_id
+                    .get(subnet_id.as_str())
+                    .is_some_and(|owner| owner != vpc_id)
+            })
+            .filter(|subnet_id| named.insert(subnet_id.as_str()))
+            .cloned()
+            .collect()
+    }
+
+    /// The distinct VPCs EC2 reported for `subnet_ids`, in id order.
+    #[must_use]
+    pub fn vpcs<'ids>(&self, subnet_ids: impl IntoIterator<Item = &'ids str>) -> BTreeSet<String> {
+        subnet_ids
+            .into_iter()
+            .filter_map(|subnet_id| self.vpc_by_id.get(subnet_id).cloned())
+            .collect()
+    }
+
+    /// The VPC that owns `subnet_ids`: the one EC2 reported for every one of them.
+    ///
+    /// `None` where it reported none, or reported more than one — a group whose subnets lie
+    /// in different VPCs has no VPC of its own, and neither has one asked about where the
+    /// owner of subnets could not be reached.
+    #[must_use]
+    pub fn vpc_of<'ids>(&self, subnet_ids: impl IntoIterator<Item = &'ids str>) -> Option<String> {
+        let mut owners = self.vpcs(subnet_ids).into_iter();
+        match (owners.next(), owners.next()) {
+            (Some(vpc_id), None) => Some(vpc_id),
+            _ => None,
+        }
     }
 
     /// The zones, by subnet identifier, a DB subnet group KEEPS for the subnets it was
@@ -160,6 +254,9 @@ pub async fn subnet_zones(
         ::tracing::warn!("the request names no Region label, so EC2 cannot be asked");
         return zones;
     };
+    // Every hop below has to be answered for an absent entry to mean "the account holds no
+    // such subnet"; one that fails takes this back off.
+    zones.answered = true;
     let distinct: Vec<&str> = subnet_ids
         .iter()
         .map(String::as_str)
@@ -174,14 +271,25 @@ pub async fn subnet_zones(
         match client.describe_subnets().filters(by_id).send().await {
             Ok(output) => {
                 for subnet in output.subnets() {
-                    let (Some(subnet_id), Some(zone)) =
-                        (subnet.subnet_id(), subnet.availability_zone())
-                    else {
+                    let Some(subnet_id) = subnet.subnet_id() else {
                         continue;
                     };
-                    zones
-                        .by_id
-                        .insert(subnet_id.to_string(), zone.to_string());
+                    // The account HOLDS this subnet: recorded on its own, so an id EC2
+                    // answered for is never reported absent because the record named no
+                    // zone or no VPC.
+                    zones.held.insert(subnet_id.to_string());
+                    if let Some(zone) = subnet.availability_zone() {
+                        zones
+                            .by_id
+                            .insert(subnet_id.to_string(), zone.to_string());
+                    }
+                    // The VPC the subnet belongs to comes off the same record, for the same
+                    // reason: it is the owner of subnets' fact, and it is the group's own VPC.
+                    if let Some(vpc_id) = subnet.vpc_id() {
+                        zones
+                            .vpc_by_id
+                            .insert(subnet_id.to_string(), vpc_id.to_string());
+                    }
                 }
             }
             Err(error) => {
@@ -194,6 +302,7 @@ pub async fn subnet_zones(
                     error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                     "the subnets a request named could not be resolved against EC2"
                 );
+                zones.answered = false;
             }
         }
     }

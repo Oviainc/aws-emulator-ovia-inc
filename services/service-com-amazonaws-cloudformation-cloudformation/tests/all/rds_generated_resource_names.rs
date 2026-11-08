@@ -111,17 +111,34 @@ const RDS_NAMED: &[RdsNamed] = &[
 /// placed in the subnet group and the parameter group the same stack declares — so the
 /// names those two `Ref`s resolve to have to be names Amazon RDS accepts.
 ///
-/// The subnet ids are literal EC2 ids, as `rds_stack_resources.rs` declares them: what is
-/// under test here is the NAME of the group, not where its subnets came from.
+/// The subnet ids are the ones the stack's own `AWS::EC2::Subnet` resources resolve to, since
+/// Amazon RDS resolves every entry of `SubnetIds` against the subnets the account holds: what
+/// is under test here is the NAME of the group, not where its subnets came from.
 const TEMPLATE: &str = concat!(
     "Resources:\n",
+    "  Vpc:\n",
+    "    Type: AWS::EC2::VPC\n",
+    "    Properties:\n",
+    "      CidrBlock: 10.6.0.0/16\n",
+    "  SubnetA:\n",
+    "    Type: AWS::EC2::Subnet\n",
+    "    Properties:\n",
+    "      VpcId: !Ref Vpc\n",
+    "      CidrBlock: 10.6.1.0/24\n",
+    "      AvailabilityZone: !Select [0, !GetAZs \"\"]\n",
+    "  SubnetB:\n",
+    "    Type: AWS::EC2::Subnet\n",
+    "    Properties:\n",
+    "      VpcId: !Ref Vpc\n",
+    "      CidrBlock: 10.6.2.0/24\n",
+    "      AvailabilityZone: !Select [1, !GetAZs \"\"]\n",
     "  SubnetGroup:\n",
     "    Type: AWS::RDS::DBSubnetGroup\n",
     "    Properties:\n",
     "      DBSubnetGroupDescription: the generated-name stack's subnets\n",
     "      SubnetIds:\n",
-    "        - subnet-0123456789abcdef0\n",
-    "        - subnet-0fedcba987654321f\n",
+    "        - !Ref SubnetA\n",
+    "        - !Ref SubnetB\n",
     "  Pg:\n",
     "    Type: AWS::RDS::DBParameterGroup\n",
     "    Properties:\n",

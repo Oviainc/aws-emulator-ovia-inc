@@ -205,7 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // and the call changes it — the same helper `DeleteDBSubnetGroup` uses, not the
         // lookup wording the report and the resource-placement paths share.
         let key = (region.clone(), name.clone());
-        if !store.db_subnet_groups.contains_key(&key) {
+        let Some(held) = store.db_subnet_groups.get(&key) else {
             return Err(
                 ModifyDBSubnetGroupErrorModeled::DBSubnetGroupNotFoundFault(
                     DBSubnetGroupNotFoundFault {
@@ -214,10 +214,29 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into(),
             );
-        }
+        };
         // The subnets the modified group would cover are the same list
-        // `CreateDBSubnetGroup` takes, held to the one coverage rule in `crate::state` and
-        // mapped onto THIS operation's modelled faults.
+        // `CreateDBSubnetGroup` takes, held to the one existence, VPC and coverage rule in
+        // `crate::state` and mapped onto THIS operation's faults.
+        crate::state::check_db_subnet_group_subnets_exist(&input.subnet_ids, &zones)
+            .map_err(subnet_list_refusal)?;
+        // A DB subnet group belongs to the VPC its subnets are in, and this call changes
+        // which subnets OF THAT VPC it holds: an identifier naming a subnet of another VPC
+        // is not one this group can be made of. A group whose VPC this service never learnt
+        // (one stored where the owner of subnets could not be asked) constrains nothing, so
+        // the list is then only held to lying in one VPC of its own.
+        //
+        // This gate comes BEFORE the common-VPC one on purpose: where the group's VPC is
+        // known it is the narrower statement — a list straddling VPCs then necessarily names
+        // a subnet outside the group's — and naming the identifiers the group cannot be made
+        // of is what RDS answers a modification with. `CreateDBSubnetGroup` has no group VPC
+        // to compare against, so there only the common-VPC rule applies.
+        if let Some(vpc_id) = held.vpc_id.clone() {
+            crate::state::check_db_subnet_group_subnets_in_vpc(&input.subnet_ids, &zones, &vpc_id)
+                .map_err(subnet_list_refusal)?;
+        }
+        crate::state::check_db_subnet_group_common_vpc(&input.subnet_ids, &zones)
+            .map_err(subnet_list_refusal)?;
         crate::state::check_db_subnet_group_zone_coverage(&input.subnet_ids, &zones)
             .map_err(subnet_list_refusal)?;
 
@@ -226,9 +245,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // required: a request carrying none leaves the stored description where it was
         // rather than blanking a value the caller said nothing about.
         if let Some(record) = store.db_subnet_groups.get_mut(&key) {
-            record.subnet_ids = input.subnet_ids;
             // The zones go with the subnets they belong to: the group reports the zones EC2
-            // answered with for the list this modification leaves it holding.
+            // answered with for the list this modification leaves it holding, and the VPC
+            // those same records name as their owner.
+            record.vpc_id = zones.vpc_of(input.subnet_ids.iter().map(String::as_str));
+            record.subnet_ids = input.subnet_ids;
             record.subnet_zones = zones.into_zones_by_subnet();
             if let Some(description) = input.db_subnet_group_description {
                 record.description = description;
@@ -253,12 +274,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// How this operation ANSWERS a `SubnetIds` list it cannot leave the group holding: each
-/// rejection `crate::state` raises, mapped onto the modelled fault of this operation.
+/// rejection `crate::state` raises, mapped onto the fault of this operation that carries it.
 ///
-/// One mapping for both gates — the one over what the request alone settles
-/// (`check_db_subnet_group_subnet_list`) and the one over the zones the named subnets cover
-/// (`check_db_subnet_group_zone_coverage`) — so a refusal cannot be worded one way by the
-/// first and another way by the second.
+/// One mapping for every gate — the one over what the request alone settles
+/// (`check_db_subnet_group_subnet_list`), the one over whether the named subnets exist at all
+/// (`check_db_subnet_group_subnets_exist`) and the one over the zones they cover
+/// (`check_db_subnet_group_zone_coverage`) — so a refusal cannot be worded one way by one
+/// gate and another way by the next.
 fn subnet_list_refusal(rejection: crate::state::SubnetListRejection) -> ModifyDBSubnetGroupError {
     match rejection {
         crate::state::SubnetListRejection::TooManySubnets(message) => {
@@ -279,6 +301,18 @@ fn subnet_list_refusal(rejection: crate::state::SubnetListRejection) -> ModifyDB
                     message: Some(message),
                 },
             )
+        }
+        // An identifier the account holds no subnet for is a VALUE the request carried that
+        // cannot be used, which is the query protocol's common client error rather than any
+        // of this operation's modelled faults: `InvalidSubnet` is what RDS answers for a
+        // subnet that exists and cannot be used, not for one that is not there.
+        crate::state::SubnetListRejection::UnusableSubnets(message) => {
+            return ModifyDBSubnetGroupError::invalid_parameter_value(message)
+        }
+        crate::state::SubnetListRejection::NotInOneVpc(message) => {
+            ModifyDBSubnetGroupErrorModeled::InvalidSubnet(InvalidSubnet {
+                message: Some(message),
+            })
         }
     }
     .into()
