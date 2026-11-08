@@ -105,6 +105,7 @@ pub(crate) fn config_xml(caller_reference: &str, attached: Option<&str>) -> Stri
          <DefaultCacheBehavior><TargetOriginId>primary</TargetOriginId>\
          <ViewerProtocolPolicy>allow-all</ViewerProtocolPolicy></DefaultCacheBehavior>\
          <Comment>{caller_reference}</Comment>\
+         <PriceClass>PriceClass_All</PriceClass>\
          <Enabled>true</Enabled>{association}\
          </DistributionConfig>"
     )
@@ -540,7 +541,6 @@ async fn an_unusable_page_size_or_marker_is_refused() {
     let fixture = fixture(&router).await;
 
     let refusals: &[(&str, &str)] = &[
-        ("&MaxItems=0", "a page size of zero"),
         ("&MaxItems=-7", "a negative page size"),
         ("&MaxItems=not-a-number", "a page size that is no integer"),
         ("&Marker=not-an-id", "a marker that is no distribution id"),

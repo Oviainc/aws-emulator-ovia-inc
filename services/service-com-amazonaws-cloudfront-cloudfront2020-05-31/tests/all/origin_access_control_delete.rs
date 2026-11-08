@@ -540,6 +540,7 @@ fn distribution_xml(reference: &str, origins: &[(&str, Option<&str>)]) -> String
          <DefaultCacheBehavior><TargetOriginId>{}</TargetOriginId>\
          <ViewerProtocolPolicy>https-only</ViewerProtocolPolicy></DefaultCacheBehavior>\
          <Comment>a distribution naming an origin access control</Comment>\
+         <PriceClass>PriceClass_All</PriceClass>\
          <Enabled>true</Enabled></DistributionConfig>",
         origins.first().map(|(id, _)| *id).unwrap_or_default()
     ));

@@ -758,9 +758,9 @@ async fn a_request_that_names_no_page_is_refused() {
     let created = create_every_tenant(&router).await;
     let web_acl = WEB_ACLS[0].1;
 
-    // One past each end of the admissible `MaxItems` range: a page holds at least one item,
-    // so zero and anything below it name no page at all.
-    for (case, max_items) in [("zero", 0), ("negative", -1), ("far negative", i32::MIN)] {
+    // Below the admissible `MaxItems` range: the member bounds the page, so a negative count
+    // bounds nothing and names no page at all.
+    for (case, max_items) in [("negative", -1), ("far negative", i32::MIN)] {
         let answer =
             list_by_customization(&router, &body_for(Kind::WebAcl, web_acl, None, Some(max_items)))
                 .await;

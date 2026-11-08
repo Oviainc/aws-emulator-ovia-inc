@@ -666,8 +666,19 @@ async fn every_payload_reports_the_resolved_configuration() {
 
         // Re-submitting the SAME configuration resolves it to the same thing: the
         // resolution is idempotent, so a read-modify-write round trip neither loses the
-        // service-applied members nor changes them.
-        let updated = update_distribution(&router, &id, &row.config, Some(&etag)).await;
+        // service-applied members nor changes them. An update submits the configuration
+        // WHOLE, so where the create's document left the price class to the service the
+        // update states the class the create resolved — a document that leaves it out is no
+        // complete configuration for an update.
+        let submitted = if row.config.contains("<PriceClass>") {
+            row.config.to_string()
+        } else {
+            row.config.replace(
+                "<Enabled>",
+                &format!("<PriceClass>{DEFAULT_PRICE_CLASS}</PriceClass><Enabled>"),
+            )
+        };
+        let updated = update_distribution(&router, &id, &submitted, Some(&etag)).await;
         assert_eq!(
             updated.status, 200,
             "case {case}: expected the update to be accepted, got {} ({})",

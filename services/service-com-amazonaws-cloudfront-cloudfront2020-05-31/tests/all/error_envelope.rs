@@ -382,13 +382,13 @@ async fn a_max_items_the_page_size_cannot_take_is_invalid_argument() {
     create(&router, "max-items-row").await;
 
     // `MaxItems` is an `integer` `@httpQuery` member (the model's list operations), and
-    // a page size is a positive integer: the rows differ in TYPE (no integer at all, a
-    // decimal, an empty value), in VALUE (zero, negative) and in SIZE (past i32), and the
-    // usable rows differ in value and in whether another parameter travels with them.
+    // a page size is a non-negative integer: the rows differ in TYPE (no integer at all, a
+    // decimal, an empty value), in VALUE (negative) and in SIZE (past i32), and the
+    // usable rows differ in value — zero included, which bounds the page at no items — and
+    // in whether another parameter travels with them.
     let unusable = [
         "not-a-number",
         "",
-        "0",
         "-1",
         "3.5",
         "99999999999",
@@ -433,7 +433,7 @@ async fn a_max_items_the_page_size_cannot_take_is_invalid_argument() {
         );
     }
 
-    for value in ["1", "100", "2147483647"] {
+    for value in ["0", "1", "100", "2147483647"] {
         let answer = call(
             &router,
             "GET",
@@ -444,7 +444,7 @@ async fn a_max_items_the_page_size_cannot_take_is_invalid_argument() {
         .await;
         assert_eq!(
             answer.status, 200,
-            "case MaxItems={value:?}: a positive integer page size is usable, got {} {}",
+            "case MaxItems={value:?}: a non-negative integer page size is usable, got {} {}",
             answer.status, answer.raw
         );
     }

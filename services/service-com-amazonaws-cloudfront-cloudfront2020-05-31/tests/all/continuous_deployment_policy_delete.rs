@@ -303,7 +303,7 @@ async fn a_policy_a_distribution_names_cannot_be_deleted() {
         let attached = update_distribution(
             &router,
             &distribution_id,
-            &row.xml().replace(
+            &row.update_xml().replace(
                 "</DistributionConfig>",
                 &format!(
                     "<ContinuousDeploymentPolicyId>{id}</ContinuousDeploymentPolicyId>\
@@ -346,7 +346,7 @@ async fn a_policy_a_distribution_names_cannot_be_deleted() {
         let detached = update_distribution(
             &router,
             &distribution_id,
-            &row.xml(),
+            &row.update_xml(),
             Some(&attached_etag),
         )
         .await;

@@ -526,6 +526,21 @@ impl Config {
         out
     }
 
+    /// The `DistributionConfig` XML a client sends to UPDATE a distribution to this
+    /// configuration.
+    ///
+    /// An update submits the configuration WHOLE, so the document states the price class
+    /// even where the row leaves the member out of the create: a configuration that names
+    /// none is complete for a create, which resolves it, and incomplete for an update, which
+    /// is refused.
+    pub(crate) fn update_xml(&self) -> String {
+        Config {
+            price_class: Some(self.price_class.unwrap_or(DEFAULT_PRICE_CLASS)),
+            ..self.clone()
+        }
+        .xml()
+    }
+
     /// Assert that `config` — a `DistributionConfig` element the emulator answered with
     /// — is the configuration this row submitted.
     pub(crate) fn assert_matches(&self, config: &Node, context: &str) {
@@ -1002,7 +1017,7 @@ async fn each_mutation_mints_a_version_and_if_match_governs_it() {
             ..row.clone()
         };
         for (label, if_match, status, code) in refusals {
-            let refused = update_distribution(&router, &id, &changed.xml(), *if_match).await;
+            let refused = update_distribution(&router, &id, &changed.update_xml(), *if_match).await;
             assert_eq!(
                 refused.status, *status,
                 "case {case}/{label}: expected HTTP {status}, got {} with {}",
@@ -1030,7 +1045,8 @@ async fn each_mutation_mints_a_version_and_if_match_governs_it() {
         }
 
         // The current version lets the update land, and mints a new one.
-        let updated = update_distribution(&router, &id, &changed.xml(), Some(&first_etag)).await;
+        let updated =
+            update_distribution(&router, &id, &changed.update_xml(), Some(&first_etag)).await;
         assert_eq!(
             updated.status, 200,
             "case {case}: expected HTTP 200, got {} with {}",
@@ -1070,7 +1086,8 @@ async fn each_mutation_mints_a_version_and_if_match_governs_it() {
         );
 
         // And the version it replaced no longer satisfies the precondition.
-        let stale = update_distribution(&router, &id, &changed.xml(), Some(&first_etag)).await;
+        let stale =
+            update_distribution(&router, &id, &changed.update_xml(), Some(&first_etag)).await;
         assert_eq!(
             stale.status, 412,
             "case {case}: expected HTTP 412 for the replaced version, got {} with {}",
@@ -1103,7 +1120,7 @@ async fn update_refuses_a_renamed_caller_reference_and_an_unknown_id() {
         caller_reference: "ref-renamed".to_string(),
         ..row.clone()
     };
-    let refused = update_distribution(&router, &id, &renamed.xml(), Some(&etag)).await;
+    let refused = update_distribution(&router, &id, &renamed.update_xml(), Some(&etag)).await;
     assert_eq!(
         refused.status, 400,
         "case renamed-reference: expected HTTP 400, got {} with {}",
@@ -1116,7 +1133,8 @@ async fn update_refuses_a_renamed_caller_reference_and_an_unknown_id() {
         refused.error_code()
     );
 
-    let missing = update_distribution(&router, "E00000000000X", &row.xml(), Some(&etag)).await;
+    let missing =
+        update_distribution(&router, "E00000000000X", &row.update_xml(), Some(&etag)).await;
     assert_eq!(
         missing.status, 404,
         "case unknown-id: expected HTTP 404, got {} with {}",
@@ -1270,7 +1288,6 @@ async fn list_pages_at_max_items_and_resumes_from_the_marker() {
     // refused as invalid arguments.
     let refusals: &[(&str, &str)] = &[
         ("?Marker=not-an-id", "a marker that is no distribution id"),
-        ("?MaxItems=0", "a page size of zero"),
         ("?MaxItems=-3", "a negative page size"),
     ];
     for (query, description) in refusals {
@@ -1287,6 +1304,27 @@ async fn list_pages_at_max_items_and_resumes_from_the_marker() {
             answer.error_code()
         );
     }
+
+    // `MaxItems` bounds the page rather than demanding one, so a page size of zero is a
+    // page: an empty one, reported as truncated because distributions remain.
+    let answer = list_distributions(&router, "?MaxItems=0").await;
+    assert_eq!(
+        answer.status, 200,
+        "case a page size of zero: expected HTTP 200, got {} with {}",
+        answer.status, answer.raw
+    );
+    assert_eq!(
+        answer.root().text_at("Quantity"),
+        Some("0"),
+        "case a page size of zero: expected an empty page, got {}",
+        answer.raw
+    );
+    assert_eq!(
+        answer.root().text_at("IsTruncated"),
+        Some("true"),
+        "case a page size of zero: expected a truncated page, got {}",
+        answer.raw
+    );
 }
 
 /// A page is bounded by the SERVER's own ceiling, whatever `MaxItems` a caller asks
@@ -1429,7 +1467,7 @@ async fn delete_requires_a_disabled_distribution_at_its_current_version() {
         ..row.clone()
     };
     let updated =
-        update_distribution(&router, &id, &disabled.xml(), Some(&enabled_etag)).await;
+        update_distribution(&router, &id, &disabled.update_xml(), Some(&enabled_etag)).await;
     assert_eq!(
         updated.status, 200,
         "case disable: expected HTTP 200, got {} with {}",
@@ -2021,7 +2059,8 @@ async fn the_clock_settles_propagation_and_invalidation() {
         ..row.clone()
     };
     let updated =
-        update_distribution(&router, &id, &changed.xml(), Some(settled.header("etag"))).await;
+        update_distribution(&router, &id, &changed.update_xml(), Some(settled.header("etag")))
+            .await;
     assert_eq!(
         updated.root().text_at("Status"),
         Some("InProgress"),

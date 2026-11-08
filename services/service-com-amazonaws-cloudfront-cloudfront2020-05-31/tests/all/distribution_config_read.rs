@@ -261,7 +261,7 @@ async fn the_config_read_reports_the_stored_configuration_and_its_version() {
         // After an update the config read follows the stored record: the new
         // configuration under the new version token.
         let next = updated(&row);
-        let update = update_distribution(&router, &id, &next.xml(), Some(&created_etag)).await;
+        let update = update_distribution(&router, &id, &next.update_xml(), Some(&created_etag)).await;
         assert_eq!(
             update.status, 200,
             "case {case}: expected the update to be accepted, got {} ({})",

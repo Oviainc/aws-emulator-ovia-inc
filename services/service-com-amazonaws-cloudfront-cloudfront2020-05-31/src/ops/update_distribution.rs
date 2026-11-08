@@ -445,6 +445,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A CloudFront function runs on a VIEWER event, so an update cannot leave a
+        // behaviour carrying a function association CloudFront could not invoke either: the
+        // value is outside the set the member admits, which is the same defect the request
+        // boundary refuses a value outside a SCHEMA-carried set with, and it is reported in
+        // the same sentence (see `crate::service::envelope` for the code it is answered
+        // under).
+        if let Some(message) =
+            crate::state::function_association_event_refusal(&input.distribution_config)
+        {
+            return Err(UpdateDistributionErrorModeled::InvalidArgument(InvalidArgument {
+                message: Some(message),
+            })
+            .into());
+        }
+
         // The same rule the create path applies: a Lambda@Edge association invokes ONE
         // published version of a function, so an update cannot leave a distribution
         // carrying an association that names no version either.
@@ -493,6 +508,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.distribution_config.caller_reference != current_caller_reference {
             return Err(UpdateDistributionErrorModeled::IllegalUpdate(
                 crate::state::illegal_update_distribution_caller_reference(),
+            )
+            .into());
+        }
+
+        // An update submits the configuration the distribution is to hold WHOLE, so a
+        // member the resource carries and the submitted document leaves out is a
+        // modification CloudFront does not allow rather than a value the service supplies:
+        // the price class is missing from the configuration being written. `PriceClass`
+        // "only supports standard distributions. You can't specify this field for
+        // multi-tenant distributions", so it is demanded of exactly the configurations that
+        // serve traffic directly; a multi-tenant one carries none and is complete without it.
+        if input.distribution_config.price_class.is_none()
+            && !crate::state::is_multi_tenant(&input.distribution_config)
+        {
+            return Err(UpdateDistributionErrorModeled::IllegalUpdate(
+                crate::state::illegal_update_missing_price_class(),
             )
             .into());
         }

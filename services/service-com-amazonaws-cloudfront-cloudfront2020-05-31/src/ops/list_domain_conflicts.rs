@@ -244,10 +244,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::store_unavailable());
         };
 
-        // "The maximum number of domain conflicts to return" — a page holds at least one
-        // item, so a non-positive size names no page at all. The size served is bounded
-        // above by this emulator's own page ceiling, the same one every listing of this
-        // service is bounded by.
+        // "The maximum number of domain conflicts to return" — the member BOUNDS the page
+        // rather than demanding one, so only a negative size names no page at all. The size
+        // served is bounded above by this emulator's own page ceiling, the same one every
+        // listing of this service is bounded by.
         let Some(page_size) = crate::state::page_size(input.max_items) else {
             return Err(ListDomainConflictsErrorModeled::InvalidArgument(
                 crate::state::invalid_max_items(),

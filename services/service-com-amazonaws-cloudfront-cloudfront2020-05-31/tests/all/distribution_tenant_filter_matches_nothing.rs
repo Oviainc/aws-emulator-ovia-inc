@@ -14,13 +14,14 @@
 //! no tenant is associated with does.
 //!
 //! The rows differ along everything that rule generalises over: which member carries the
-//! value (each alone and both together), whether the named resource is absent or stored but
-//! associated with no tenant, the FORM of an absent value (this service's own id shape,
-//! another resource's id shape, free text, a value far longer than any id), and the page
-//! size the request asks for. Three positive rows name the resources the fixture's tenant
-//! IS associated with, so an empty page is only ever the filter matching nothing, and a
-//! second case pins that the refusals this listing really has — a `MaxItems` naming no page
-//! and a `Marker` this service never handed out — are untouched by that.
+//! value (each one alone — exactly one of them is what the listing admits), whether the
+//! named resource is absent or stored but associated with no tenant, the FORM of an absent
+//! value (this service's own id shape, another resource's id shape, free text, a value far
+//! longer than any id), and the page size the request asks for. Two positive rows name the
+//! resources the fixture's tenant IS associated with, so an empty page is only ever the
+//! filter matching nothing, and a second case pins that the refusals this listing really has
+//! — a filter that does not name exactly one association, a `MaxItems` naming no page and a
+//! `Marker` this service never handed out — are untouched by that.
 //!
 //! The wire harness is the one [`crate::distribution_lifecycle`] builds, the request helpers
 //! are [`crate::distribution_tenants_list`]'s, and the fixture is created through
@@ -176,13 +177,14 @@ fn by_group(case: &'static str, id: &str, expected: Vec<String>) -> Row {
     }
 }
 
-/// A row naming both members at once.
-fn by_both(case: &'static str, distribution: &str, group: &str, expected: Vec<String>) -> Row {
+/// A row naming both members at once — a filter the listing does not admit, since exactly
+/// one association is what it filters by.
+fn by_both(case: &'static str, distribution: &str, group: &str) -> Row {
     Row {
         case,
         distribution_id: Some(distribution.to_string()),
         connection_group_id: Some(group.to_string()),
-        expected,
+        expected: Vec::new(),
     }
 }
 
@@ -238,24 +240,6 @@ fn rows(fixture: &Fixture) -> Vec<Row> {
             &fixture.group,
             Vec::new(),
         ),
-        by_both(
-            "both members naming resources this account holds none of",
-            ABSENT_DISTRIBUTION,
-            ABSENT_GROUP,
-            Vec::new(),
-        ),
-        by_both(
-            "a stored distribution beside an absent connection group",
-            &fixture.distribution,
-            ABSENT_GROUP,
-            Vec::new(),
-        ),
-        by_both(
-            "an absent distribution beside the stored connection group",
-            ABSENT_DISTRIBUTION,
-            &fixture.group,
-            Vec::new(),
-        ),
         by_distribution(
             "the distribution the tenant was created under",
             &fixture.distribution,
@@ -266,11 +250,38 @@ fn rows(fixture: &Fixture) -> Vec<Row> {
             &fixture.group,
             vec![fixture.tenant.clone()],
         ),
+    ]
+}
+
+/// Every filter the listing does NOT admit: it filters by exactly one association, so a
+/// request naming neither member, or both at once, names no single association to filter by.
+fn unadmitted_filters(fixture: &Fixture) -> Vec<Row> {
+    vec![
+        Row {
+            case: "a filter naming neither member",
+            distribution_id: None,
+            connection_group_id: None,
+            expected: Vec::new(),
+        },
+        by_both(
+            "both members naming resources this account holds none of",
+            ABSENT_DISTRIBUTION,
+            ABSENT_GROUP,
+        ),
+        by_both(
+            "a stored distribution beside an absent connection group",
+            &fixture.distribution,
+            ABSENT_GROUP,
+        ),
+        by_both(
+            "an absent distribution beside the stored connection group",
+            ABSENT_DISTRIBUTION,
+            &fixture.group,
+        ),
         by_both(
             "both resources the tenant's record names",
             &fixture.distribution,
             &fixture.group,
-            vec![fixture.tenant.clone()],
         ),
     ]
 }
@@ -330,13 +341,59 @@ async fn a_filter_value_matching_no_tenant_serves_an_empty_page() {
 
     // A listing reports; it stores nothing. After every call above, the account still holds
     // exactly the one tenant the fixture created.
-    let answer = list_tenants(&router, &list_body(None, None, None)).await;
+    let answer = list_tenants(
+        &router,
+        &list_body(Some((Some(&fixture.distribution), None)), None, None),
+    )
+    .await;
     assert_eq!(
         summary_ids(&answer),
         vec![fixture.tenant.clone()],
         "case after every filtered listing: expected the one stored tenant, got {}",
         answer.raw
     );
+}
+
+/// The listing filters by exactly ONE association, so a request that names neither member,
+/// or both at once, is refused with the modelled `InvalidArgument` (400) and the sentence
+/// that states the rule.
+#[tokio::test]
+async fn a_filter_that_names_no_single_association_is_refused() {
+    let router = emulator();
+    let fixture = fixture(&router).await;
+
+    let mut cases: Vec<(&str, String)> = vec![(
+        "no filter element at all",
+        list_body(None, None, None),
+    )];
+    for row in unadmitted_filters(&fixture) {
+        cases.push((row.case, row.body(None)));
+    }
+    for (case, body) in cases {
+        let answer = list_tenants(&router, &body).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case}: expected HTTP 400, got {} with {}",
+            answer.status, answer.raw
+        );
+        assert_eq!(
+            answer.error_code(),
+            "InvalidArgument",
+            "case {case}: expected InvalidArgument, got {}",
+            answer.raw
+        );
+        assert_eq!(
+            answer.root().find_text("Message"),
+            Some("Exactly one association filter must be set."),
+            "case {case}: expected the rule's own sentence, got {}",
+            answer.raw
+        );
+        assert!(
+            summaries(&answer).is_empty(),
+            "case {case}: a refusal carries no listing, got {}",
+            answer.raw
+        );
+    }
 }
 
 /// The refusals this listing really has are untouched by that: a `MaxItems` that names no
@@ -348,7 +405,7 @@ async fn the_page_and_marker_refusals_survive_a_filter_that_matches_nothing() {
     let fixture = fixture(&router).await;
     let unresolvable = Some((None, Some(ABSENT_GROUP)));
 
-    for (case, max_items) in [("zero", 0), ("negative", -1), ("far negative", i32::MIN)] {
+    for (case, max_items) in [("negative", -1), ("far negative", i32::MIN)] {
         let answer = list_tenants(&router, &list_body(unresolvable, None, Some(max_items))).await;
         assert_eq!(
             answer.status, 400,

@@ -234,6 +234,7 @@ pub(crate) fn config_xml(caller_reference: &str, row: &Row, groups: &[String]) -
          </DefaultCacheBehavior>\
          <CacheBehaviors>{behaviors}</CacheBehaviors>\
          <Comment>{caller_reference}</Comment>\
+         <PriceClass>PriceClass_All</PriceClass>\
          <Enabled>true</Enabled>\
          </DistributionConfig>",
         trusted_xml(row.enabled, row.default_groups, groups)
@@ -578,7 +579,6 @@ async fn an_unusable_page_size_or_marker_is_refused() {
     let (groups, _) = seed(&router).await;
 
     let refusals: &[(&str, &str)] = &[
-        ("?MaxItems=0", "a page size of zero"),
         ("?MaxItems=-7", "a negative page size"),
         ("?MaxItems=not-a-number", "a page size that is no integer"),
         ("?Marker=not-an-id", "a marker that is no distribution id"),

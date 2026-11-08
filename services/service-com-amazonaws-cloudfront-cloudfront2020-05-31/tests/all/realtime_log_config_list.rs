@@ -362,11 +362,10 @@ async fn an_unusable_page_size_or_marker_is_refused() {
     let before = listed_names(list_configs(&router, "").await.root());
     let last = before.last().cloned().expect("the table created rows");
 
-    // Rows: every form a page size can be unusable in (zero, negative, no integer at all,
+    // Rows: every form a page size can be unusable in (negative, no integer at all,
     // past what the member can hold), plus an unusable size beside a usable marker, where
     // the size is what is refused.
     let page_size_rows: &[(&str, String)] = &[
-        ("a page of no items", "?MaxItems=0".to_string()),
         ("a negative page size", "?MaxItems=-1".to_string()),
         (
             "a page size that is no integer",
@@ -378,7 +377,7 @@ async fn an_unusable_page_size_or_marker_is_refused() {
         ),
         (
             "an unusable page size beside a usable marker",
-            format!("?MaxItems=0&Marker={}", encode_query(&last)),
+            format!("?MaxItems=-1&Marker={}", encode_query(&last)),
         ),
     ];
     for (case, query) in page_size_rows {

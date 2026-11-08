@@ -156,6 +156,12 @@ const TENANT_CONFIG: &str = "<TenantConfig><ParameterDefinitions>\
 /// A `DistributionConfig` with one origin and a default cache behaviour, plus whatever
 /// `extra` the caller adds at the configuration level.
 fn distribution_config_xml(caller_reference: &str, extra: &str) -> String {
+    enabled_distribution_config_xml(caller_reference, extra, true)
+}
+
+/// The same configuration under either value of `Enabled` — "from this field, you can
+/// enable or disable the selected distribution".
+fn enabled_distribution_config_xml(caller_reference: &str, extra: &str, enabled: bool) -> String {
     format!(
         "<DistributionConfig xmlns=\"http://cloudfront.amazonaws.com/doc/{API_VERSION}/\">\
          <CallerReference>{caller_reference}</CallerReference>\
@@ -165,9 +171,36 @@ fn distribution_config_xml(caller_reference: &str, extra: &str) -> String {
          <DefaultCacheBehavior><TargetOriginId>primary</TargetOriginId>\
          <ViewerProtocolPolicy>allow-all</ViewerProtocolPolicy></DefaultCacheBehavior>\
          <Comment>{caller_reference}</Comment>\
-         <Enabled>true</Enabled>{extra}\
+         <Enabled>{enabled}</Enabled>{extra}\
          </DistributionConfig>"
     )
+}
+
+/// Create a multi-tenant distribution that is DISABLED, and answer its id.
+///
+/// `pub(crate)` so the sibling suite that asserts what a disabled distribution admits
+/// creates one over this same wire path rather than growing a copy of it.
+pub(crate) async fn disabled_multi_tenant_distribution(
+    router: &MultiServiceRouter,
+    caller_reference: &str,
+) -> String {
+    let body = enabled_distribution_config_xml(
+        caller_reference,
+        &format!("<ConnectionMode>tenant-only</ConnectionMode>{TENANT_CONFIG}"),
+        false,
+    );
+    let created = create_distribution(router, &body).await;
+    assert_eq!(
+        created.status, 201,
+        "case {caller_reference}: expected the disabled multi-tenant distribution to be created, \
+         got {} with {}",
+        created.status, created.raw
+    );
+    created
+        .root()
+        .text_at("Id")
+        .unwrap_or_else(|| panic!("case {caller_reference}: the create carries no Id"))
+        .to_string()
 }
 
 /// Create the MULTI-TENANT distribution every tenant below is created under, and answer

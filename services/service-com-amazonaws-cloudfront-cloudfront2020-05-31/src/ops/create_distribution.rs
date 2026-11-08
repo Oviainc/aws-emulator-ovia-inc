@@ -391,6 +391,11 @@ fn create_refusal(refusal: crate::state::CreateRefusal) -> CreateDistributionErr
                 },
             )
         }
+        crate::state::CreateRefusal::InvalidArgument(message) => {
+            CreateDistributionErrorModeled::InvalidArgument(InvalidArgument {
+                message: Some(message),
+            })
+        }
     }
     .into()
 }

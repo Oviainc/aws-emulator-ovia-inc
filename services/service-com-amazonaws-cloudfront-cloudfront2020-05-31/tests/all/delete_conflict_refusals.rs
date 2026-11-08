@@ -223,6 +223,7 @@ impl Holder {
         }
         out.push_str(&format!(
             "<Comment>a distribution under the delete-conflict rules</Comment>\
+             <PriceClass>PriceClass_All</PriceClass>\
              <Enabled>{}</Enabled></DistributionConfig>",
             self.enabled
         ));

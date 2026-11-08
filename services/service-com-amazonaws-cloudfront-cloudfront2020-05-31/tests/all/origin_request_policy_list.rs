@@ -473,14 +473,13 @@ async fn an_unusable_page_size_or_marker_is_refused() {
     let created = create_all(&router, &policy_table()[..3]).await;
     let before = listed_ids(list_policies(&router, "").await.root());
 
-    // Rows: every form a page size can be unusable in (zero, negative, no integer at all,
+    // Rows: every form a page size can be unusable in (negative, no integer at all,
     // past what the member can hold), and every form a marker can fail the id shape in (no
     // id at all, too short, too long, upper-case hex, another namespace's token,
     // characters outside hex) — plus an unusable size beside a usable marker, where the
     // size is what is refused.
     let last = before.last().cloned().expect("the fixture created policies");
     let rows: &[(&str, String, bool)] = &[
-        ("a page of no items", "?MaxItems=0".to_string(), false),
         ("a negative page size", "?MaxItems=-1".to_string(), false),
         (
             "a page size that is no integer",
@@ -520,7 +519,7 @@ async fn an_unusable_page_size_or_marker_is_refused() {
         ),
         (
             "an unusable page size beside a usable marker",
-            format!("?MaxItems=0&Marker={last}"),
+            format!("?MaxItems=-1&Marker={last}"),
             false,
         ),
     ];

@@ -13,6 +13,8 @@
 // points it into `tests/all/`.
 #[path = "all/absent_identifier_namespaces.rs"]
 mod absent_identifier_namespaces;
+#[path = "all/admission_preconditions.rs"]
+mod admission_preconditions;
 #[path = "all/alias_viewer_certificate.rs"]
 mod alias_viewer_certificate;
 #[path = "all/anycast_ip_list_lifecycle.rs"]

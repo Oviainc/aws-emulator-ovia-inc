@@ -5,11 +5,11 @@
 //! `MaxItems` is the page size, `Marker` is the tenant id the previous page ended at, and
 //! `NextMarker` arrives exactly when tenants remain.
 //!
-//! `AssociationFilter` narrows the listing to the tenants ASSOCIATED with the resources it
-//! names — "the distribution ID to filter by" and "the ID of the connection group to
-//! filter by" — so every summary, and the filter decision behind it, is read from the
-//! record the create or the last update persisted rather than from the request being
-//! served.
+//! `AssociationFilter` narrows the listing to the tenants ASSOCIATED with ONE resource —
+//! "the distribution ID to filter by" or "the ID of the connection group to filter by" —
+//! and exactly one of the two has to be set, so a request naming neither or both is
+//! refused. Every summary, and the filter decision behind it, is read from the record the
+//! create or the last update persisted rather than from the request being served.
 //!
 //! ## Shape of an operation
 //!
@@ -112,6 +112,20 @@ impl From<ListDistributionTenantsErrorModeled> for ListDistributionTenantsError 
     }
 }
 
+/// The sentence CloudFront answers a request that does not name exactly one association to
+/// filter the tenants by: the rule itself, stating the condition and echoing no part of the
+/// request.
+const ONE_ASSOCIATION_FILTER_REQUIRED_MESSAGE: &str =
+    "Exactly one association filter must be set.";
+
+/// The ONE resource a request asks for the tenants associated with.
+enum Association<'a> {
+    /// "The distribution ID to filter by."
+    Distribution(&'a str),
+    /// "The ID of the connection group to filter by."
+    ConnectionGroup(&'a str),
+}
+
 /// The `ListDistributionTenants` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -152,10 +166,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(crate::state::store_unavailable());
         };
 
-        // "The maximum number of distribution tenants to return" — a page holds at least one
-        // item, so a non-positive size names no page at all. The size served is bounded
-        // above by this emulator's own page ceiling, the same one every listing of this
-        // service is bounded by.
+        // "The maximum number of distribution tenants to return" — `MaxItems` bounds the
+        // page rather than demanding one, so only a negative size names no page at all. The
+        // size served is bounded above by this emulator's own page ceiling, the same one
+        // every listing of this service is bounded by.
         let Some(page_size) = crate::state::page_size(input.max_items) else {
             return Err(ListDistributionTenantsErrorModeled::InvalidArgument(
                 crate::state::invalid_max_items(),
@@ -163,17 +177,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
 
-        // "Filter by the associated distribution ID or connection group ID": each member the
-        // filter names is a resource a tenant is associated with, and a member carrying no
-        // value names no resource, so it narrows nothing.
+        // "Filter by the associated distribution ID or connection group ID": the listing is
+        // about the tenants associated with ONE resource, so a request that names neither
+        // describes no association to filter by and one that names both describes two — the
+        // same rule, and the same refusal, as the customization listing beside this one. A
+        // member carrying no value names no resource, so it names no association either, and
+        // a request carrying no filter element at all names none.
         //
         // Both members are unconstrained strings the model requires nothing more of than
         // naming "the distribution ID to filter by" and "the ID of the connection group to
-        // filter by", so each is a MATCH PREDICATE over the stored tenants and never a
-        // precondition on the resource it names: a value naming no resource this account
-        // holds matches no tenant, which is the ordinary empty page the walk below computes.
-        // Whether that resource exists is the business of the operations that associate a
-        // tenant with it, not of this listing.
+        // filter by", so the one named is a MATCH PREDICATE over the stored tenants and
+        // never a precondition on the resource it names: a value naming no resource this
+        // account holds matches no tenant, which is the ordinary empty page the walk below
+        // computes. Whether that resource exists is the business of the operations that
+        // associate a tenant with it, not of this listing.
         let association_filter = input.association_filter.as_ref();
         let distribution_filter = association_filter
             .and_then(|filter| filter.distribution_id.as_deref())
@@ -181,6 +198,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let connection_group_filter = association_filter
             .and_then(|filter| filter.connection_group_id.as_deref())
             .filter(|id| !id.is_empty());
+        let association = match (distribution_filter, connection_group_filter) {
+            (Some(distribution_id), None) => Association::Distribution(distribution_id),
+            (None, Some(connection_group_id)) => Association::ConnectionGroup(connection_group_id),
+            _ => {
+                return Err(ListDistributionTenantsErrorModeled::InvalidArgument(
+                    InvalidArgument {
+                        message: Some(ONE_ASSOCIATION_FILTER_REQUIRED_MESSAGE.to_string()),
+                    },
+                )
+                .into());
+            }
+        };
 
         let mut store = state.lock();
         // Materialise the propagation the clock already owes, so no summary this listing
@@ -225,14 +254,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .distribution_tenants
             .range::<str, _>((start, Bound::Unbounded))
         {
-            // A tenant is part of this listing when its OWN record names every resource the
-            // filter names: each member the filter carries narrows the listing to the
-            // tenants associated with that one resource, so a tenant created under another
-            // distribution, or routed through another connection group, is not part of it.
-            if distribution_filter.is_some_and(|wanted| stored.distribution_id != wanted)
-                || connection_group_filter
-                    .is_some_and(|wanted| stored.connection_group_id != wanted)
-            {
+            // A tenant is part of this listing when its OWN record names the resource the
+            // filter names: the filter narrows the listing to the tenants associated with
+            // that one resource, so a tenant created under another distribution, or routed
+            // through another connection group, is not part of it.
+            let associated = match association {
+                Association::Distribution(wanted) => stored.distribution_id == wanted,
+                Association::ConnectionGroup(wanted) => stored.connection_group_id == wanted,
+            };
+            if !associated {
                 continue;
             }
             if tenants.len() >= page_size {

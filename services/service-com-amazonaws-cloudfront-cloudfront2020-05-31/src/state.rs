@@ -202,6 +202,178 @@ pub const MAX_ITEMS_CLOUD_FRONT_ORIGIN_ACCESS_IDENTITIES: i32 = 200;
 /// [`MAX_ITEMS_ORIGIN_ACCESS_CONTROLS`] states.
 pub const MAX_ITEMS_REALTIME_LOG_CONFIGS: i32 = 150;
 
+/// The number of summaries one `ListDistributions` response serves: the `MaxItems` the
+/// request named, or [`MAX_ITEMS`] when it named none, bounded above by [`MAX_ITEMS`].
+///
+/// `None` when the request named a count no page can hold, which the caller answers with
+/// the modelled `InvalidArgument`.
+pub fn page_size(max_items: Option<i32>) -> Option<usize> {
+    page_size_at(max_items, MAX_ITEMS)
+}
+
+/// The number of items one page of a listing whose own default page size is `default`
+/// serves: the `MaxItems` the request named, or `default` when it named none, bounded above
+/// by that same default — the default and the ceiling are one number per listing, so the
+/// size served can never drift past the size the response echoes, and a request asking for
+/// more than the ceiling is served the ceiling rather than the number it asked for.
+///
+/// This is the ONE place this service decides a page size, which is what keeps a refusal
+/// made at the request boundary (`crate::service::envelope`) and one made by a list handler
+/// from disagreeing about which values a page size can take, and what bounds the size of
+/// every response this service serves: it lives here, beside the ceilings it clamps to.
+///
+/// `MaxItems` is "the maximum number of items you want in the response", so it is a BOUND
+/// on the page rather than a demand for one: a request that asks for none of them asks for
+/// an empty page, which the listing serves, reporting it as truncated while items remain —
+/// the page walk already follows from the size, so a caller whose own limit is already
+/// satisfied reads the end of the listing rather than a refusal.
+///
+/// `None` only when the request named a count no page can hold — a NEGATIVE one, which
+/// bounds nothing — which the caller answers with the modelled `InvalidArgument`.
+pub fn page_size_at(max_items: Option<i32>, default: i32) -> Option<usize> {
+    let requested = max_items.unwrap_or(default);
+    if requested < 0 {
+        return None;
+    }
+    // The clamp: whatever the request asked for, the size served is at most this listing's
+    // own ceiling, so one response cannot grow with the number a caller writes.
+    usize::try_from(requested.min(default)).ok()
+}
+
+// ---------------------------------------------------------------------------
+// Which requests this service ADMITS: the preconditions decided from a submitted
+// configuration, or from the state of the resource a request would associate one with,
+// before anything is stored.
+// ---------------------------------------------------------------------------
+
+/// The sentence CloudFront refuses an association with a multi-tenant distribution that is
+/// not enabled with, on the wire.
+///
+/// A property of the DISTRIBUTION's own configuration rather than of the request, so nothing
+/// from the request belongs in it and every refusal of it reads the same.
+pub const MULTI_TENANT_DISTRIBUTION_DISABLED_MESSAGE: &str =
+    "The specified multi-tenant distribution is disabled.";
+
+/// The modelled `InvalidAssociation` (HTTP 409) for a call that would associate a
+/// distribution tenant with a multi-tenant distribution whose configuration is disabled.
+///
+/// A disabled distribution serves no traffic, so it serves no tenant of its own either:
+/// "the specified CloudFront resource can't be associated", which is what the 409 states,
+/// and it is decided from the distribution's stored configuration BEFORE the tenant's own
+/// parameters are read — a tenant parameter the caller could fix is no answer to a
+/// distribution that cannot carry the tenant at all.
+pub fn multi_tenant_distribution_disabled() -> crate::ops::types::InvalidAssociation {
+    crate::ops::types::InvalidAssociation {
+        message: Some(MULTI_TENANT_DISTRIBUTION_DISABLED_MESSAGE.to_string()),
+    }
+}
+
+/// The sentence CloudFront refuses an update whose distribution configuration leaves out the
+/// price class with, on the wire.
+///
+/// The missing member is named by the sentence and nothing else of the request is, so every
+/// refusal of it reads the same.
+pub const ILLEGAL_UPDATE_MISSING_PRICE_CLASS_MESSAGE: &str =
+    "Price class is missing for the resource";
+
+/// The modelled `IllegalUpdate` (HTTP 400) for an update whose `DistributionConfig` states
+/// no `PriceClass`.
+///
+/// An update submits the configuration the distribution is to hold WHOLE — "the distribution
+/// configuration information for your distribution", read back member for member by
+/// `GetDistributionConfig` — so a member the resource carries and the submitted document
+/// does not is a modification CloudFront does not allow rather than a value it supplies.
+/// `PriceClass` "only supports standard distributions. You can't specify this field for
+/// multi-tenant distributions", so it is a member of exactly the configurations that serve
+/// traffic directly.
+pub fn illegal_update_missing_price_class() -> crate::ops::types::IllegalUpdate {
+    crate::ops::types::IllegalUpdate {
+        message: Some(ILLEGAL_UPDATE_MISSING_PRICE_CLASS_MESSAGE.to_string()),
+    }
+}
+
+/// The event types a CloudFront FUNCTION association may name.
+///
+/// `FunctionAssociation$EventType` states the rule: "The event type of the function, either
+/// `viewer-request` or `viewer-response`. You cannot use origin-facing event types
+/// (`origin-request` and `origin-response`) with a CloudFront function." — so the set a
+/// function association admits is the VIEWER half of the model's `EventType` enum, whose
+/// other half belongs to the Lambda@Edge associations beside it.
+pub const FUNCTION_ASSOCIATION_EVENT_TYPES: &[&str] = &["viewer-request", "viewer-response"];
+
+/// The validation sentence a configuration whose CloudFront function association names an
+/// event type no function runs on is refused with, or `None` when every association it
+/// carries names a viewer event.
+///
+/// The sentence names the member path of the FIRST association that breaks the rule, read in
+/// the order the configuration states them — the default cache behaviour, then the ordered
+/// ones — the value that association submitted, and the set the member admits
+/// ([`FUNCTION_ASSOCIATION_EVENT_TYPES`]): the same sentence, in the same shape, the request
+/// boundary states for a value outside a set the SCHEMA carries, since what this reports is
+/// the same kind of defect in the same member. Which is also why it is answered under the
+/// one code an unreadable request document is answered with rather than under a code of its
+/// own.
+///
+/// Every value it reads comes from the submitted document through `Option` combinators and
+/// an iterator: nothing is indexed, sliced, parsed or unwrapped, and the only arithmetic is
+/// the one-based position of a list entry.
+///
+/// Checked on the way IN, on every path that stores a `DistributionConfig`, so no stored
+/// behaviour ever carries a function association CloudFront could not invoke.
+pub fn function_association_event_refusal(config: &DistributionConfig) -> Option<String> {
+    for (label, behavior) in labelled_behavior_views(config) {
+        let associations = behavior
+            .function_associations
+            .and_then(|wrapper| wrapper.items.as_deref())
+            .unwrap_or_default();
+        for (position, association) in associations.iter().enumerate() {
+            if FUNCTION_ASSOCIATION_EVENT_TYPES.contains(&association.event_type.as_str()) {
+                continue;
+            }
+            // The member path the validation sentence states is the request document's own,
+            // written as the boundary writes one: the lowerCamelCase member names of the
+            // path down to the offending member, with each list entry addressed by its
+            // ONE-BASED position and the `member` the entry travels in.
+            return Some(format!(
+                "1 validation errors detected: Value '{}' at \
+                 'distributionConfig.{label}.functionAssociations.items.{}.member.eventType' \
+                 failed to satisfy constraint: Member must satisfy enum value set: [{}]",
+                association.event_type,
+                position + 1,
+                FUNCTION_ASSOCIATION_EVENT_TYPES.join(", ")
+            ));
+        }
+    }
+    None
+}
+
+/// Every cache behaviour of `config` beside the member path the request document addresses
+/// it by: the default cache behaviour first, then each ordered one at its one-based
+/// position.
+fn labelled_behavior_views(
+    config: &DistributionConfig,
+) -> Vec<(String, configuration::BehaviorLists<'_>)> {
+    let mut out = vec![(
+        "defaultCacheBehavior".to_string(),
+        configuration::BehaviorLists::from(&config.default_cache_behavior),
+    )];
+    if let Some(behaviors) = &config.cache_behaviors {
+        for (position, behavior) in behaviors
+            .items
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+        {
+            out.push((
+                format!("cacheBehaviors.items.{}.member", position + 1),
+                configuration::BehaviorLists::from(behavior),
+            ));
+        }
+    }
+    out
+}
+
 /// The most distributions this emulator holds.
 ///
 /// The store lives for the process's lifetime and grows only on a create, and a
@@ -3547,6 +3719,11 @@ macro_rules! resolve_behavior_members {
 /// The unit tests of the records and helpers this module holds.
 #[cfg(test)]
 mod tests;
+
+/// The unit tests of the page-size clamp above ([`page_size_at`]), in their own file
+/// because that clamp is what bounds the size of every response this service serves.
+#[cfg(test)]
+mod paging;
 
 /// Resolving a SUBMITTED configuration into the one the service stores — every member
 /// CloudFront materialises when a request leaves it out — and the admission rules a

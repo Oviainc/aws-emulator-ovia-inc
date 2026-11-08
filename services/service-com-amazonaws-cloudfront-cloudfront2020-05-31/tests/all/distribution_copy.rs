@@ -367,7 +367,8 @@ async fn a_copy_under_if_match_lands_only_on_the_version_the_caller_read() {
         comment: "changed comment".to_string(),
         ..row.clone()
     };
-    let updated = update_distribution(&router, &primary_id, &changed.xml(), Some(&first_etag)).await;
+    let updated =
+        update_distribution(&router, &primary_id, &changed.update_xml(), Some(&first_etag)).await;
     assert_eq!(
         updated.status,
         200,

@@ -163,6 +163,7 @@ fn config(caller_reference: &str, origin: &str, cache_policy: &str) -> String {
          <CachePolicyId>{cache_policy}</CachePolicyId>\
          </CacheBehavior></Items></CacheBehaviors>\
          <Comment>edge data plane</Comment>\
+         <PriceClass>PriceClass_All</PriceClass>\
          <Enabled>true</Enabled>\
          </DistributionConfig>"
     )

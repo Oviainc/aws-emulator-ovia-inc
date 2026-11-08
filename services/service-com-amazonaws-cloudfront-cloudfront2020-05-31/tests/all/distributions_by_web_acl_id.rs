@@ -511,7 +511,6 @@ async fn an_unusable_page_size_or_marker_is_refused() {
     seed(&router).await;
 
     let refusals: &[(&str, &str, bool)] = &[
-        ("?MaxItems=0", "a page size of zero", true),
         ("?MaxItems=-7", "a negative page size", true),
         ("?MaxItems=not-a-number", "a page size that is no integer", true),
         ("?Marker=not-an-id", "a marker that is no distribution id", false),

@@ -157,8 +157,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         // "MaxItems: the maximum number of invalidations to return for the distribution
-        // tenant" — a page holds at least one item, so a non-positive size names no page
-        // at all, and the size served is bounded above by this emulator's own page
+        // tenant" — the member BOUNDS the page rather than demanding one, so only a negative
+        // size names no page at all, and the size served is bounded above by this
+        // emulator's own page
         // ceiling. The refusal is the one sentence this service states the constraint in,
         // wherever the unusable value was read.
         let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);

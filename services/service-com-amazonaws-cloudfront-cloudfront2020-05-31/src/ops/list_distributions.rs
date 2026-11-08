@@ -142,8 +142,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
-        // "MaxItems: the maximum number of distributions you want in the response" — a
-        // page holds at least one item, so a non-positive size names no page at all.
+        // "MaxItems: the maximum number of distributions you want in the response" — the
+        // member BOUNDS the page rather than demanding one, so a request asking for none of
+        // them asks for an empty page and only a negative size names no page at all.
         // The size served is bounded above by this emulator's own page ceiling, so one
         // request cannot serve the whole store in a single response. A value the
         // parameter cannot take is refused with the one sentence CloudFront states the

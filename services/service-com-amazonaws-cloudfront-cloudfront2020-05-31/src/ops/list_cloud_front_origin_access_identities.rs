@@ -146,8 +146,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         // "MaxItems: the maximum number of origin access identities you want in the
-        // response body" — a page holds at least one item, so a non-positive size names
-        // no page at all. A request that names no size is served this listing's OWN
+        // response body" — the member BOUNDS the page rather than demanding one, so only a
+        // negative size names no page at all. A request that names no size is served this
+        // listing's OWN
         // default page size, which is also the ceiling it serves at, so one request cannot
         // serve the whole store in a single response. A value the parameter cannot take is
         // refused with the one sentence this service states the constraint in, whether it

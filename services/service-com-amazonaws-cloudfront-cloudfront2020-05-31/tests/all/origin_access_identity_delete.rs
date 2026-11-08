@@ -574,6 +574,7 @@ fn distribution_xml(caller_reference: &str, origins: &[(&str, Option<String>)]) 
          <DefaultCacheBehavior><TargetOriginId>{}</TargetOriginId>\
          <ViewerProtocolPolicy>https-only</ViewerProtocolPolicy></DefaultCacheBehavior>\
          <Comment>a distribution naming an origin access identity</Comment>\
+         <PriceClass>PriceClass_All</PriceClass>\
          <Enabled>true</Enabled></DistributionConfig>",
         origins.first().map(|(id, _)| *id).unwrap_or_default()
     ));

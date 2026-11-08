@@ -9,17 +9,18 @@
 //! * `ListDistributionTenants` reports the distribution tenants this account's store holds,
 //!   each summary read from the record its create persisted, so a listing and a read of the
 //!   same tenant can never disagree;
-//! * `AssociationFilter` narrows the listing to the tenants ASSOCIATED with the resources it
-//!   names — "the distribution ID to filter by" and "the ID of the connection group to
-//!   filter by" — so every member the filter carries narrows it to the tenants whose own
-//!   record names that one resource, and a filter that names nothing narrows nothing;
+//! * `AssociationFilter` narrows the listing to the tenants ASSOCIATED with ONE resource —
+//!   "the distribution ID to filter by" or "the ID of the connection group to filter by" —
+//!   so the member it names narrows it to the tenants whose own record names that one
+//!   resource, and exactly one of the two has to be named;
 //! * the listing reports the tenants in ONE stable total order, cut to at most `MaxItems`
 //!   entries beginning after the `Marker` id, and carries a `NextMarker` exactly when
 //!   tenants remain — so walking the pages at ANY admissible page size enumerates them
 //!   exactly once;
-//! * a `MaxItems` that names no page, and a `Marker` this service never handed out, are
-//!   refused; a well-formed marker naming no stored tenant is an entity that does not
-//!   exist; and a filter member carrying no value narrows nothing.
+//! * a `MaxItems` that names no page, a `Marker` this service never handed out, and a filter
+//!   that names neither or both of its members, are refused; a well-formed marker naming no
+//!   stored tenant is an entity that does not exist; and a filter member carrying no value
+//!   names no resource, so it is as good as absent.
 //!
 //! What a filter member naming a resource this account holds none of answers is the rule
 //! [`crate::distribution_tenant_filter_matches_nothing`] is about.
@@ -444,8 +445,8 @@ fn parts_of(filter: Option<&Filter>) -> (Option<&str>, Option<&str>) {
     filter.map(Filter::parts).unwrap_or((None, None))
 }
 
-/// Every filter the cases below run: naming neither member, each one alone, both together,
-/// and a pair of resources that shares no tenant.
+/// Every filter the cases below run: each member alone, over each resource the fixture
+/// stored — which is what the listing admits, exactly one association to filter by.
 fn filters(fixture: &Fixture) -> Vec<(String, Option<Filter>)> {
     let first_distribution = fixture.distributions[0].clone();
     let second_distribution = fixture.distributions[1].clone();
@@ -453,11 +454,6 @@ fn filters(fixture: &Fixture) -> Vec<(String, Option<Filter>)> {
     let first_group = fixture.group_id(Group::First);
     let second_group = fixture.group_id(Group::Second);
     vec![
-        ("no filter element at all".to_string(), None),
-        (
-            "a filter element naming neither member".to_string(),
-            Some(Filter::default()),
-        ),
         (
             "the first distribution".to_string(),
             Some(Filter::distribution(&first_distribution)),
@@ -478,14 +474,6 @@ fn filters(fixture: &Fixture) -> Vec<(String, Option<Filter>)> {
             "a connection group one tenant is routed through".to_string(),
             Some(Filter::connection_group(&second_group)),
         ),
-        (
-            "one distribution and one connection group together".to_string(),
-            Some(Filter::both(&first_distribution, &first_group)),
-        ),
-        (
-            "a distribution and a connection group that share no tenant".to_string(),
-            Some(Filter::both(&second_distribution, &second_group)),
-        ),
     ]
 }
 
@@ -498,8 +486,8 @@ fn body_for(filter: Option<&Filter>, marker: Option<&str>, max_items: Option<i32
 // The listing, and its filter
 // ---------------------------------------------------------------------------
 
-/// Each filter reports exactly the tenants whose own record names every resource it names,
-/// and a filter that names nothing reports every tenant the account holds.
+/// Each filter reports exactly the tenants whose own record names the resource it names, and
+/// the two distributions between them account for every tenant the fixture stored.
 #[tokio::test]
 async fn each_filter_reports_the_tenants_whose_record_names_those_resources() {
     let router = emulator();
@@ -525,9 +513,16 @@ async fn each_filter_reports_the_tenants_whose_record_names_those_resources() {
         assert_absent(answer.root(), "NextMarker", &case, "the only page");
     }
 
-    // The unfiltered listing is every tenant the fixture stored: a listing narrows only by
-    // what the filter names.
-    let answer = list_tenants(&router, &list_body(None, None, None)).await;
+    // Every tenant the fixture stored belongs to one of the two distributions, so the two
+    // listings between them report the whole stored set: a listing narrows only by what the
+    // filter names.
+    let mut listed: Vec<String> = Vec::new();
+    for distribution in &fixture.distributions {
+        let filter = Filter::distribution(distribution);
+        let answer = list_tenants(&router, &body_for(Some(&filter), None, None)).await;
+        listed.extend(summary_ids(&answer));
+    }
+    listed.sort();
     let mut all: Vec<String> = fixture
         .created
         .iter()
@@ -535,27 +530,8 @@ async fn each_filter_reports_the_tenants_whose_record_names_those_resources() {
         .collect();
     all.sort();
     assert_eq!(
-        summary_ids(&answer),
-        all,
-        "case the unfiltered listing: expected every stored tenant, got {}",
-        answer.raw
-    );
-
-    // A pair of resources no tenant is associated with at once is an EMPTY page, not a
-    // refusal: both ids resolve, and nothing the store holds names both.
-    let crossed = body_for(
-        Some(&Filter::both(
-            &fixture.distributions[1],
-            &fixture.group_id(Group::Second),
-        )),
-        None,
-        None,
-    );
-    let answer = list_tenants(&router, &crossed).await;
-    assert!(
-        summaries(&answer).is_empty(),
-        "case a distribution and a group that share no tenant: expected an empty page, got {}",
-        answer.raw
+        listed, all,
+        "case the two distributions together: expected every stored tenant, got {listed:?}"
     );
 }
 
@@ -581,64 +557,85 @@ async fn each_summary_reports_what_a_read_of_the_same_tenant_reports() {
         "LastModifiedTime",
     ];
 
-    let answer = list_tenants(&router, &list_body(None, None, None)).await;
-    assert_eq!(
-        answer.status, 200,
-        "case the unfiltered listing: expected HTTP 200, got {} with {}",
-        answer.status, answer.raw
-    );
-    for summary in summaries(&answer) {
-        let id = text(summary, "Id", "a summary", "the listing", &answer.raw);
-        let created = fixture
-            .created
-            .iter()
-            .find(|created| created.id == id)
-            .unwrap_or_else(|| panic!("case a summary: the listing reported an unknown id {id}"));
-        let case = created.row.case;
-        let read = get_tenant(&router, &id).await;
+    // The listing filters by exactly one association, so the whole stored set is read
+    // through one listing per distribution: every tenant belongs to one of the two.
+    let mut listings: Vec<Answer> = Vec::new();
+    for distribution in &fixture.distributions {
+        let filter = Filter::distribution(distribution);
+        let answer = list_tenants(&router, &body_for(Some(&filter), None, None)).await;
         assert_eq!(
-            read.status, 200,
-            "case {case}: expected HTTP 200 from GetDistributionTenant, got {} with {}",
-            read.status, read.raw
+            answer.status, 200,
+            "case the listing of one distribution: expected HTTP 200, got {} with {}",
+            answer.status, answer.raw
         );
-        for path in shared {
+        listings.push(answer);
+    }
+
+    let mut seen = 0usize;
+    for answer in &listings {
+        for summary in summaries(answer) {
+            seen += 1;
+            let id = text(summary, "Id", "a summary", "the listing", &answer.raw);
+            let created = fixture
+                .created
+                .iter()
+                .find(|created| created.id == id)
+                .unwrap_or_else(|| {
+                    panic!("case a summary: the listing reported an unknown id {id}")
+                });
+            let case = created.row.case;
+            let read = get_tenant(&router, &id).await;
             assert_eq!(
-                summary.text_at(path),
-                read.root().text_at(path),
-                "case {case}: the summary and the read disagree about {path}: {} against {}",
-                answer.raw,
+                read.status, 200,
+                "case {case}: expected HTTP 200 from GetDistributionTenant, got {} with {}",
+                read.status, read.raw
+            );
+            for path in shared {
+                assert_eq!(
+                    summary.text_at(path),
+                    read.root().text_at(path),
+                    "case {case}: the summary and the read disagree about {path}: {} against {}",
+                    answer.raw,
+                    read.raw
+                );
+            }
+            assert_eq!(
+                domains_of(summary),
+                domains_of(read.root()),
+                "case {case}: the summary and the read disagree about Domains: {}",
+                answer.raw
+            );
+            // `DistributionTenantSummary$ETag` is "the current version of the distribution
+            // tenant": the token the create handed back, which the read reports as its
+            // header.
+            assert_eq!(
+                summary.text_at("ETag"),
+                Some(created.etag.as_str()),
+                "case {case}: expected the tenant's current version in the summary, got {}",
+                answer.raw
+            );
+            assert_eq!(
+                read.header("etag"),
+                created.etag,
+                "case {case}: expected the read to report the same version, got {}",
+                read.raw
+            );
+            // The summary shape declares no `Parameters`, so the parameter values a tenant
+            // holds are reached through a read of the tenant itself.
+            assert_absent(summary, "Parameters", case, "a summary");
+            assert!(
+                read.root().at("Parameters").is_some(),
+                "case {case}: the read carries the tenant's parameters, got {}",
                 read.raw
             );
         }
-        assert_eq!(
-            domains_of(summary),
-            domains_of(read.root()),
-            "case {case}: the summary and the read disagree about Domains: {}",
-            answer.raw
-        );
-        // `DistributionTenantSummary$ETag` is "the current version of the distribution
-        // tenant": the token the create handed back, which the read reports as its header.
-        assert_eq!(
-            summary.text_at("ETag"),
-            Some(created.etag.as_str()),
-            "case {case}: expected the tenant's current version in the summary, got {}",
-            answer.raw
-        );
-        assert_eq!(
-            read.header("etag"),
-            created.etag,
-            "case {case}: expected the read to report the same version, got {}",
-            read.raw
-        );
-        // The summary shape declares no `Parameters`, so the parameter values a tenant holds
-        // are reached through a read of the tenant itself.
-        assert_absent(summary, "Parameters", case, "a summary");
-        assert!(
-            read.root().at("Parameters").is_some(),
-            "case {case}: the read carries the tenant's parameters, got {}",
-            read.raw
-        );
     }
+    assert_eq!(
+        seen,
+        fixture.created.len(),
+        "case every stored tenant: expected a summary for each of the {} tenants, saw {seen}",
+        fixture.created.len()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -753,22 +750,18 @@ async fn the_listing_pages_and_resumes_from_the_marker() {
 }
 
 // ---------------------------------------------------------------------------
-// A filter member that names nothing
+// A filter that names no single association
 // ---------------------------------------------------------------------------
 
-/// A filter member carrying NO value names no resource, so it narrows nothing: the listing
-/// is every stored tenant, whichever member is empty and however many of them are.
+/// A filter member carrying NO value names no resource, so it is as good as absent: the
+/// listing admits exactly ONE named association, so a request whose only named member is
+/// empty names none and is refused, while an empty member BESIDE a named one leaves exactly
+/// one and is served.
 #[tokio::test]
-async fn a_filter_member_carrying_no_value_narrows_nothing() {
+async fn a_filter_member_carrying_no_value_names_no_association() {
     let router = emulator();
     let fixture = fixture(&router).await;
 
-    let mut all: Vec<String> = fixture
-        .created
-        .iter()
-        .map(|created| created.id.clone())
-        .collect();
-    all.sort();
     for (case, filter) in [
         ("an empty distribution element", Filter::distribution("")),
         (
@@ -776,6 +769,44 @@ async fn a_filter_member_carrying_no_value_narrows_nothing() {
             Filter::connection_group(""),
         ),
         ("both members empty", Filter::both("", "")),
+        (
+            "both members named",
+            Filter::both(
+                &fixture.distributions[0],
+                &fixture.group_id(Group::First),
+            ),
+        ),
+    ] {
+        let answer = list_tenants(&router, &body_for(Some(&filter), None, None)).await;
+        assert_eq!(
+            answer.status, 400,
+            "case {case}: expected HTTP 400, got {} with {}",
+            answer.status, answer.raw
+        );
+        assert_eq!(
+            answer.error_code(),
+            "InvalidArgument",
+            "case {case}: expected InvalidArgument, got {}",
+            answer.raw
+        );
+        assert!(
+            summaries(&answer).is_empty(),
+            "case {case}: a refusal carries no listing, got {}",
+            answer.raw
+        );
+    }
+
+    // An empty member beside a named one: exactly one association is named, so the listing
+    // is the named resource's own.
+    for (case, filter) in [
+        (
+            "a named distribution beside an empty connection group element",
+            Filter::both(&fixture.distributions[0], ""),
+        ),
+        (
+            "a named connection group beside an empty distribution element",
+            Filter::both("", &fixture.group_id(Group::First)),
+        ),
     ] {
         let answer = list_tenants(&router, &body_for(Some(&filter), None, None)).await;
         assert_eq!(
@@ -783,10 +814,15 @@ async fn a_filter_member_carrying_no_value_narrows_nothing() {
             "case {case}: expected HTTP 200, got {} with {}",
             answer.status, answer.raw
         );
+        let (distribution, group) = filter.parts();
+        let expected = fixture.expected(
+            distribution.filter(|id| !id.is_empty()),
+            group.filter(|id| !id.is_empty()),
+        );
         assert_eq!(
             summary_ids(&answer),
-            all,
-            "case {case}: expected every stored tenant, got {}",
+            expected,
+            "case {case}: expected the named resource's tenants, got {}",
             answer.raw
         );
     }
@@ -803,11 +839,14 @@ async fn a_filter_member_carrying_no_value_narrows_nothing() {
 async fn a_request_that_names_no_page_or_no_resume_point_is_refused() {
     let router = emulator();
     let fixture = fixture(&router).await;
+    // Every request below filters by one association, which is what the listing admits.
+    let filter = Filter::distribution(&fixture.distributions[0]);
 
-    // One past each end of the admissible `MaxItems` range: a page holds at least one item,
-    // so zero and anything below it name no page at all.
-    for (case, max_items) in [("zero", 0), ("negative", -1), ("far negative", i32::MIN)] {
-        let answer = list_tenants(&router, &list_body(None, None, Some(max_items))).await;
+    // Below the admissible `MaxItems` range: the member bounds the page, so a negative count
+    // bounds nothing and names no page at all.
+    for (case, max_items) in [("negative", -1), ("far negative", i32::MIN)] {
+        let answer =
+            list_tenants(&router, &body_for(Some(&filter), None, Some(max_items))).await;
         assert_eq!(
             answer.status, 400,
             "case MaxItems {case}: expected HTTP 400, got {} with {}",
@@ -822,7 +861,7 @@ async fn a_request_that_names_no_page_or_no_resume_point_is_refused() {
     }
 
     // The smallest admissible page size is served.
-    let answer = list_tenants(&router, &list_body(None, None, Some(1))).await;
+    let answer = list_tenants(&router, &body_for(Some(&filter), None, Some(1))).await;
     assert_eq!(
         answer.status, 200,
         "case MaxItems one: expected HTTP 200, got {} with {}",
@@ -844,7 +883,7 @@ async fn a_request_that_names_no_page_or_no_resume_point_is_refused() {
         ("a lowercase body", "dt_abcdefghijklm"),
         ("a tenant name", "alpha-default-one"),
     ] {
-        let answer = list_tenants(&router, &list_body(None, Some(marker), None)).await;
+        let answer = list_tenants(&router, &body_for(Some(&filter), Some(marker), None)).await;
         assert_eq!(
             answer.status, 400,
             "case marker {case}: expected HTTP 400, got {} with {}",
@@ -865,7 +904,7 @@ async fn a_request_that_names_no_page_or_no_resume_point_is_refused() {
         !fixture.created.iter().any(|created| created.id == absent),
         "case an absent marker: the fixture must not hold {absent}"
     );
-    let answer = list_tenants(&router, &list_body(None, Some(&absent), None)).await;
+    let answer = list_tenants(&router, &body_for(Some(&filter), Some(&absent), None)).await;
     assert_eq!(
         answer.status, 404,
         "case an absent marker: expected HTTP 404, got {} with {}",

@@ -26,30 +26,6 @@ pub fn service_state<Eng: Send + Sync + 'static>(
         .map(::engine::InMemoryEngine::state::<ComAmazonawsCloudfrontCloudfront20200531State>)
 }
 
-/// The number of summaries one `ListDistributions` response serves: the `MaxItems` the
-/// request named, or [`MAX_ITEMS`] when it named none, bounded above by [`MAX_ITEMS`].
-///
-/// `None` when the request named a size that is no page at all (zero or negative), which
-/// the caller answers with the modelled `InvalidArgument`.
-pub fn page_size(max_items: Option<i32>) -> Option<usize> {
-    page_size_at(max_items, MAX_ITEMS)
-}
-
-/// The number of items one page of a listing whose own default page size is `default`
-/// serves: the `MaxItems` the request named, or `default` when it named none, bounded above
-/// by that same default — the default and the ceiling are one number per listing, so the
-/// size served can never drift past the size the response echoes.
-///
-/// `None` when the request named a size that is no page at all (zero or negative), which
-/// the caller answers with the modelled `InvalidArgument`.
-pub fn page_size_at(max_items: Option<i32>, default: i32) -> Option<usize> {
-    let requested = max_items.unwrap_or(default);
-    if requested < 1 {
-        return None;
-    }
-    usize::try_from(requested.min(default)).ok()
-}
-
 /// The ARN of a distribution. CloudFront is a GLOBAL service (`arnNamespace`
 /// `cloudfront`, no regional endpoint), so the ARN's region segment is empty:
 /// `arn:aws:cloudfront::<account>:distribution/<Id>`.

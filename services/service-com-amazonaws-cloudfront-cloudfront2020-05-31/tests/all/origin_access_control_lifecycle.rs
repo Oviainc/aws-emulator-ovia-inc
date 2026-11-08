@@ -700,7 +700,6 @@ async fn a_page_size_or_marker_that_names_no_page_is_refused() {
     };
 
     let rows = [
-        ("a page of no items", "?MaxItems=0"),
         ("a negative page size", "?MaxItems=-1"),
         ("a page size that is no integer", "?MaxItems=not-a-number"),
         ("a page size past what the member can hold", "?MaxItems=99999999999"),
@@ -710,7 +709,7 @@ async fn a_page_size_or_marker_that_names_no_page_is_refused() {
         ("a marker too long to be an id", "?Marker=E1AAAAAAAAAAAAAAAA"),
         (
             "an unusable page size beside a usable marker",
-            "?MaxItems=0&Marker=E1AAAAAAAAAAAA",
+            "?MaxItems=-1&Marker=E1AAAAAAAAAAAA",
         ),
     ];
     for (case, query) in rows {

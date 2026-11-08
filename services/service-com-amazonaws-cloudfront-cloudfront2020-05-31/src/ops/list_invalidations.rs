@@ -154,8 +154,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         // "MaxItems: the maximum number of invalidation batches that you want in the
-        // response body" - a page holds at least one item, so a non-positive size names
-        // no page at all, and the size served is bounded above by this emulator's own
+        // response body" - the member BOUNDS the page rather than demanding one, so a
+        // request asking for none of them asks for an empty page and only a negative size
+        // names no page at all, and the size served is bounded above by this emulator's own
         // page ceiling. The refusal is the one sentence this service states the
         // constraint in, wherever the unusable value was read (see
         // `crate::service::envelope` for the same value refused at the request boundary).

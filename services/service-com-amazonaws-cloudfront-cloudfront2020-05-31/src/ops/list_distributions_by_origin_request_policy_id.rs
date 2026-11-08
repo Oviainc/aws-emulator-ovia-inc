@@ -159,7 +159,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         // "MaxItems: the maximum number of distribution IDs that you want in the
-        // response" — a page holds at least one item, so a non-positive size names no page
+        // response" — the member BOUNDS the page rather than demanding one, so only a
+        // negative size names no page
         // at all, and the size served is bounded above by this emulator's own page
         // ceiling. The same parameter, the same constraint and the same refusal as
         // `ListDistributions`.

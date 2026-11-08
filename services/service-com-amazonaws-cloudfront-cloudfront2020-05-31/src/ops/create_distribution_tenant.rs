@@ -281,6 +281,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // "From this field, you can enable or disable the selected distribution": a
+        // distribution that is disabled serves no traffic, so it serves no tenant of its own
+        // either and the tenant cannot be associated with it ("the specified CloudFront
+        // resource can't be associated", HTTP 409). The distribution's own state is read
+        // BEFORE the tenant's parameters, domains and names are measured against it: a
+        // parameter the caller could supply is no answer to a distribution that cannot carry
+        // the tenant at all.
+        if !distribution.config.enabled {
+            return Err(CreateDistributionTenantErrorModeled::InvalidAssociation(
+                crate::state::multi_tenant_distribution_disabled(),
+            )
+            .into());
+        }
         // Whether anything this call has to hand carries a certificate for the domains the
         // tenant claims, which is what decides WHICH refusal an unproven domain is answered
         // with below. Read while the distribution record is in hand.

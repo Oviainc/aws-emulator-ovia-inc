@@ -1295,6 +1295,13 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             return Err(CreateRefusal::InvalidViewerCertificate(message));
         }
 
+        // A CloudFront function runs on a VIEWER event, so a configuration whose function
+        // association names an origin-facing one is refused before any distribution is
+        // created carrying an association CloudFront could not invoke.
+        if let Some(message) = function_association_event_refusal(&config) {
+            return Err(CreateRefusal::InvalidArgument(message));
+        }
+
         // A Lambda@Edge association invokes ONE published version of a function, so a
         // configuration whose association names no version is refused before any
         // distribution is created carrying it.

@@ -152,8 +152,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "The maximum number of Anycast static IP lists that you want returned in the
-        // response" — a page holds at least one item, so a non-positive size names no page
-        // at all. The size served is bounded above by this emulator's own page ceiling, the
+        // response" — the member BOUNDS the page rather than demanding one, so only a
+        // negative size names no page at all. The size served is bounded above by this
+        // emulator's own page ceiling, the
         // same one every listing of this service is bounded by, while the answer echoes the
         // size ASKED FOR.
         let max_items = input.max_items.unwrap_or(crate::state::MAX_ITEMS);

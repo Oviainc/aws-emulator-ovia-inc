@@ -477,7 +477,7 @@ async fn a_max_items_no_page_size_can_be_taken_from_is_refused() {
     let router = emulator();
     let seeded = seed(&router, "connection-function-max-items-store").await;
 
-    for (case, value) in [("zero", 0), ("a negative page size", -1)] {
+    for (case, value) in [("a negative page size", -1), ("far negative", i32::MIN)] {
         let answer = list_connection_functions(&router, &list_body(Some(value), None, None)).await;
         assert_eq!(
             answer.status, 400,

@@ -46,6 +46,10 @@ pub enum CreateRefusal {
     /// an edge association naming no published function version (see
     /// [`lambda_association_without_version`]).
     InvalidLambdaFunctionAssociation(String),
+    /// An argument of the submitted configuration CloudFront cannot read: a cache
+    /// behaviour's function association names an event type no CloudFront function runs on
+    /// (see [`function_association_event_refusal`]).
+    InvalidArgument(String),
 }
 
 /// What a create hands back: the new record's id and version token, and the

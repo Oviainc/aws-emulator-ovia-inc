@@ -898,7 +898,7 @@ async fn an_unusable_page_size_or_marker_is_refused() {
     let wildcard = format!("*.{ZONE}");
     let resource = Resource::Distribution(&fixture.wildcard_distribution);
 
-    for (case, max_items) in [("zero", 0), ("negative", -1)] {
+    for (case, max_items) in [("negative", -1), ("far negative", i32::MIN)] {
         let answer =
             list_domain_conflicts(&router, &wildcard, resource, Some(max_items), None).await;
         assert_eq!(

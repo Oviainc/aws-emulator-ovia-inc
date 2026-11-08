@@ -754,13 +754,12 @@ async fn a_page_size_or_marker_that_names_no_page_is_refused() {
     let created = create_all(&router, &table()[..3]).await;
     let before: Vec<String> = page_ids(&list_streaming_distributions(&router, "").await);
 
-    // Rows: every form a page size can be unusable in (zero, negative, no integer at all,
+    // Rows: every form a page size can be unusable in (negative, no integer at all,
     // past what the member holds), and every form a marker can fail the id shape in (no id
     // at all, too short, too long, the wrong case, another namespace's token, characters
     // outside the id alphabet) — plus an unusable size beside a usable marker, where the
     // size is what is refused.
     let rows = [
-        ("a page of no items", "?MaxItems=0", false),
         ("a negative page size", "?MaxItems=-1", false),
         (
             "a page size that is no integer",
@@ -792,7 +791,7 @@ async fn a_page_size_or_marker_that_names_no_page_is_refused() {
         ),
         (
             "an unusable page size beside a usable marker",
-            "?MaxItems=0&Marker=E1AAAAAAAAAAAA",
+            "?MaxItems=-1&Marker=E1AAAAAAAAAAAA",
             false,
         ),
     ];
@@ -810,7 +809,7 @@ async fn a_page_size_or_marker_that_names_no_page_is_refused() {
             answer.raw
         );
         // What each refusal states is the CONSTRAINT on the parameter — a marker is a
-        // streaming distribution id, a page size is a non-zero positive integer — so every
+        // streaming distribution id, a page size is an integer that bounds a page — so every
         // unusable value is refused with that one sentence rather than with text quoted out
         // of the request.
         let expected_message = if over_marker {

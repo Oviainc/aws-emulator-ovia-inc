@@ -167,6 +167,7 @@ fn distribution_config_xml(
          </DefaultCacheBehavior>\
          <CacheBehaviors>{behaviors}</CacheBehaviors>\
          <Comment>{caller_reference}</Comment>\
+         <PriceClass>PriceClass_All</PriceClass>\
          <Enabled>true</Enabled>\
          </DistributionConfig>",
         attachment(default_uses)

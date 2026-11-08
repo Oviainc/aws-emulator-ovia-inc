@@ -178,7 +178,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         // "You can optionally specify the maximum number of items to receive in the
-        // response" — a page holds at least one item, so a non-positive size names no page
+        // response" — the member BOUNDS the page rather than demanding one, so only a
+        // negative size names no page
         // at all. The size served is bounded above by this emulator's own page ceiling, the
         // same one every listing of this service is bounded by, so one request cannot serve
         // the whole store in a single response. A value the parameter cannot take is

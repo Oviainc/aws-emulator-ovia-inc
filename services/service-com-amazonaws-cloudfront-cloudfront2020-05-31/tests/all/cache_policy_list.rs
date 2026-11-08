@@ -521,8 +521,7 @@ async fn a_page_size_or_marker_that_names_no_resume_point_is_refused() {
     // Every form a page size can be unusable in, and every form a marker can fail the id
     // shape in (no id at all, too short, too long, the wrong case, another namespace's
     // token, characters outside the id alphabet).
-    let rows: [(&str, &str, &str); 11] = [
-        ("a page of no items", "?MaxItems=0", MAX_ITEMS_INVALID_MESSAGE),
+    let rows: [(&str, &str, &str); 10] = [
         ("a negative page size", "?MaxItems=-1", MAX_ITEMS_INVALID_MESSAGE),
         (
             "a page size that is no integer",
@@ -536,7 +535,7 @@ async fn a_page_size_or_marker_that_names_no_resume_point_is_refused() {
         ),
         (
             "an unusable page size beside a usable marker",
-            "?MaxItems=0&Marker=658327ea-f89d-4fab-a63d-7e88639e58f6",
+            "?MaxItems=-1&Marker=658327ea-f89d-4fab-a63d-7e88639e58f6",
             MAX_ITEMS_INVALID_MESSAGE,
         ),
         (
@@ -584,7 +583,7 @@ async fn a_page_size_or_marker_that_names_no_resume_point_is_refused() {
             answer.raw
         );
         // What each refusal states is the CONSTRAINT on the parameter — a marker is a cache
-        // policy id, a page size is a non-zero positive integer — rather than text quoted
+        // policy id, a page size is an integer that bounds a page — rather than text quoted
         // out of the request.
         assert_eq!(
             answer.root().find_text("Message").unwrap_or_default(),

@@ -397,7 +397,7 @@ async fn a_max_items_no_page_size_can_be_taken_from_is_refused() {
     let router = emulator();
     let table = seed(&router, "function_max_items_store").await;
 
-    for (case, value) in [("zero", "0"), ("a negative page size", "-1")] {
+    for (case, value) in [("a negative page size", "-1"), ("far negative", "-2147483648")] {
         let answer = list_functions(&router, &format!("?MaxItems={value}")).await;
         assert_eq!(
             answer.status, 400,

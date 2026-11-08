@@ -410,7 +410,6 @@ async fn an_unusable_page_size_or_marker_is_refused() {
     create_rows(&router).await;
 
     let refusals: &[(&str, &str)] = &[
-        ("?MaxItems=0", "a page size of zero"),
         ("?MaxItems=-7", "a negative page size"),
         ("?MaxItems=not-a-number", "a page size that is no integer"),
         ("?Marker=not-an-id", "a marker that is no distribution id"),

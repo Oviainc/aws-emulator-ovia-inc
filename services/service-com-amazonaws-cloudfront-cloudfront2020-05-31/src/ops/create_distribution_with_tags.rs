@@ -373,6 +373,11 @@ fn create_refusal(refusal: crate::state::CreateRefusal) -> CreateDistributionWit
                 },
             )
         }
+        crate::state::CreateRefusal::InvalidArgument(message) => {
+            CreateDistributionWithTagsErrorModeled::InvalidArgument(InvalidArgument {
+                message: Some(message),
+            })
+        }
     }
     .into()
 }

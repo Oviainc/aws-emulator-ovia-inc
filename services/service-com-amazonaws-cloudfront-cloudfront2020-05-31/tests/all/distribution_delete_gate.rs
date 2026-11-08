@@ -61,7 +61,7 @@ async fn set_enabled(
         enabled,
         ..row.clone()
     };
-    let updated = update_distribution(router, id, &changed.xml(), Some(if_match)).await;
+    let updated = update_distribution(router, id, &changed.update_xml(), Some(if_match)).await;
     assert_eq!(
         updated.status,
         200,

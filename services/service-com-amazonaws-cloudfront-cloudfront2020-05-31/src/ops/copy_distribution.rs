@@ -386,6 +386,14 @@ fn create_refusal(refusal: crate::state::CreateRefusal) -> CopyDistributionError
                 message: Some(message),
             })
         }
+        // Likewise unreachable from a copy, and for the same reason: the create and the
+        // update refuse a function association naming an origin-facing event type, so no
+        // stored configuration carries one.
+        crate::state::CreateRefusal::InvalidArgument(message) => {
+            CopyDistributionErrorModeled::InvalidArgument(InvalidArgument {
+                message: Some(message),
+            })
+        }
     }
     .into()
 }

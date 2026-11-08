@@ -560,9 +560,8 @@ async fn an_unusable_page_size_or_marker_is_refused() {
     create_stores(&router, &table).await;
     let order = expected_names(&table);
 
-    // Rows: a page size of no items at all, and negative ones of two magnitudes — every
-    // value no page can be taken from.
-    for size in ["0", "-1", "-100"] {
+    // Rows: negative page sizes of two magnitudes — every value no page can be taken from.
+    for size in ["-1", "-100"] {
         let answer = list_stores(&router, &format!("?MaxItems={size}")).await;
         assert_eq!(
             answer.status, 400,

@@ -49,6 +49,7 @@ fn config_xml(caller_reference: &str, behavior_extra: &str, config_extra: &str) 
          <ViewerProtocolPolicy>allow-all</ViewerProtocolPolicy>{behavior_extra}\
          </DefaultCacheBehavior>\
          <Comment>{caller_reference}</Comment>\
+         <PriceClass>PriceClass_All</PriceClass>\
          <Enabled>true</Enabled>{config_extra}\
          </DistributionConfig>"
     )

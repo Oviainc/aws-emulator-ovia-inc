@@ -582,6 +582,7 @@ fn distribution_xml(reference: &str, arn: &str, attachment: Attachment) -> Strin
          </DefaultCacheBehavior>\
          <CacheBehaviors>{behaviors}</CacheBehaviors>\
          <Comment>{reference}</Comment>\
+         <PriceClass>PriceClass_All</PriceClass>\
          <Enabled>true</Enabled>\
          </DistributionConfig>"
     )

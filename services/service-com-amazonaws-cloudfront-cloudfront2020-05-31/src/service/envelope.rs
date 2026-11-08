@@ -54,7 +54,10 @@
 //!   set it broke. The BINDING the value travelled in does not change that — a query
 //!   parameter, a member of the request's document and a member nested inside its payload
 //!   are all the same schema — so the condition reads the constraint the refusal reports
-//!   and nothing else. The value set that sentence lists is a property of the ENUM, so it
+//!   and nothing else. Neither does the LAYER that read the set: a set the model documents
+//!   in prose but declares nowhere (the event types a function association admits) is
+//!   checked by the operation, which states the same sentence, and the same code answers
+//!   it. The value set that sentence lists is a property of the ENUM, so it
 //!   is listed in the order this service publishes that enum's values
 //!   ([`STATED_VALUE_ORDERS`]);
 //! * a body-bearing request that carries NO body cannot have a payload at all, so the
@@ -63,9 +66,9 @@
 //!   naming that payload member. A refusal naming a member nested in nothing is about a
 //!   member bound outside the body, and keeps the boundary's own wording.
 //!
-//! All three leave every other refusal exactly as the framework rendered it: the
-//! restatement runs only when the boundary actually refused the request, so a request the
-//! boundary read is never second-guessed here.
+//! All of them leave every other refusal exactly as the layer that made it rendered it: a
+//! request the boundary read, and an operation's refusal that reports another rule, are
+//! never second-guessed here.
 
 use aws_smithy_runtime_api::http::{Request as RtRequest, Response as RtResponse, StatusCode};
 use aws_smithy_schema_server::{missing_member_message, xml_escape};
@@ -286,10 +289,10 @@ fn coercion_markers(value: &str) -> [String; 2] {
 /// value.
 ///
 /// The second half matters because a request can carry an unusable `MaxItems` and be
-/// refused for something else entirely (a value the boundary reads happily, such as a
-/// zero, beside an absent member) — restating that refusal as an argument error would
-/// hide the cause the caller has to fix, and a value echoed into some other refusal's
-/// text cannot stand in for the coercion that never happened.
+/// refused for something else entirely (a value the boundary reads happily beside an
+/// absent member) — restating that refusal as an argument error would hide the cause the
+/// caller has to fix, and a value echoed into some other refusal's text cannot stand in
+/// for the coercion that never happened.
 fn refused_over_max_items(req: &RtRequest, refusal: &str) -> bool {
     let Some(value) = requested_max_items(req) else {
         return false;
@@ -396,9 +399,9 @@ fn is_same_value_set(stated: &[&str], values: &[&str]) -> bool {
 /// already states the member and the constraint it broke, which is the rule the refusal is
 /// built from, so rewriting it would say less rather than more. Rewriting the element
 /// in place is also what keeps the text's escaping as the renderer produced it.
-fn recoded(refusal: &str, code: &str) -> RtResponse {
+fn recoded(refusal: &str, from: &str, code: &str) -> RtResponse {
     let body = refusal.replacen(
-        &format!("<Code>{FRAMEWORK_REFUSAL_CODE}</Code>"),
+        &format!("<Code>{from}</Code>"),
         &format!("<Code>{code}</Code>"),
         1,
     );
@@ -441,6 +444,17 @@ fn framework_refusal(resp: &RtResponse) -> Option<&str> {
     (element_text(body, "Code")? == FRAMEWORK_REFUSAL_CODE).then_some(body)
 }
 
+/// `resp`'s body and its code when `resp` is a refusal an OPERATION of this service wrote —
+/// a 400 under a code this model declares — and `None` for anything else.
+fn operation_refusal(resp: &RtResponse) -> Option<(&str, &str)> {
+    if resp.status().as_u16() != REFUSED {
+        return None;
+    }
+    let body = body_text(resp)?;
+    let code = element_text(body, "Code")?;
+    (code != FRAMEWORK_REFUSAL_CODE).then_some((body, code))
+}
+
 /// This service's own answer to a refusal the boundary stated in the framework's
 /// vocabulary, or `None` to keep the framework's rendering.
 ///
@@ -449,6 +463,19 @@ fn framework_refusal(resp: &RtResponse) -> Option<&str> {
 /// refusal reports, and whether the request carries a body at all), so they hold for every
 /// operation that binds them rather than for a list of operations named here.
 fn restated(req: &RtRequest, resp: &RtResponse) -> Option<RtResponse> {
+    // A value outside the set its member admits is no value of that member at all,
+    // whichever layer read the set: the boundary refuses one outside a set the SCHEMA
+    // carries, and an operation refuses one outside a set the model documents in prose but
+    // declares nowhere (a function association's event type). Both report the same defect in
+    // the same sentence, so both are answered under `MalformedXML` — the code this API
+    // answers a request document it cannot read with.
+    if let Some((refusal, code)) = operation_refusal(resp) {
+        if refused_over_enum_value(refusal) {
+            return Some(recoded(&with_stated_enum_values(refusal), code, MALFORMED_XML));
+        }
+        return None;
+    }
+
     let refusal = framework_refusal(resp)?;
 
     // "An argument is invalid": the page size the request asks for is not one.
@@ -469,7 +496,11 @@ fn restated(req: &RtRequest, resp: &RtResponse) -> Option<RtResponse> {
     // stands — except for the ORDER the value set is listed in, which belongs to the enum and
     // is this service's own for it.
     if refused_over_enum_value(refusal) {
-        return Some(recoded(&with_stated_enum_values(refusal), MALFORMED_XML));
+        return Some(recoded(
+            &with_stated_enum_values(refusal),
+            FRAMEWORK_REFUSAL_CODE,
+            MALFORMED_XML,
+        ));
     }
 
     // A request with a body to give carried none, so the whole payload is null. The
@@ -750,13 +781,14 @@ mod tests {
     }
 
     #[test]
-    fn max_items_is_usable_only_as_a_positive_integer() {
+    fn max_items_is_usable_only_as_a_non_negative_integer() {
         // (query, the decoded value, whether it is a page size) — the class is "what the
-        // integer page size can take", read as the boundary reads a query value.
+        // integer page size can take", read as the boundary reads a query value. A zero
+        // bounds the page at no items, which is a page this service serves.
         let cases = [
             ("MaxItems=not-a-number", Some("not-a-number"), false),
             ("MaxItems=", Some(""), false),
-            ("MaxItems=0", Some("0"), false),
+            ("MaxItems=0", Some("0"), true),
             ("MaxItems=-1", Some("-1"), false),
             ("MaxItems=3.5", Some("3.5"), false),
             ("MaxItems=99999999999", Some("99999999999"), false),
@@ -791,8 +823,7 @@ mod tests {
     #[test]
     fn only_a_refusal_over_max_items_is_restated_as_an_argument_error() {
         // The boundary refuses an unreadable value by showing it; a request carrying a
-        // value the boundary READS happily (a zero, refused later by the handler) beside
-        // a different refusal keeps that refusal.
+        // value the boundary READS happily beside a different refusal keeps that refusal.
         let coercion = "<ErrorResponse><Error><Code>ValidationException</Code>\
              <Message>invalid i32 `not-a-number`: invalid digit found in string</Message>\
              </Error></ErrorResponse>"

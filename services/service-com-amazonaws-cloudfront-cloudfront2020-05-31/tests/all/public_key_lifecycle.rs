@@ -711,7 +711,6 @@ async fn a_page_size_or_marker_that_names_no_page_is_refused() {
     let before: Vec<String> = page_ids(&list_keys(&router, "").await);
 
     let rows = [
-        ("a page of no items", "?MaxItems=0", false),
         ("a negative page size", "?MaxItems=-1", false),
         ("a page size that is no integer", "?MaxItems=not-a-number", false),
         (
@@ -739,7 +738,7 @@ async fn a_page_size_or_marker_that_names_no_page_is_refused() {
         ),
         (
             "an unusable page size beside a usable marker",
-            "?MaxItems=0&Marker=K1AAAAAAAAAAAA",
+            "?MaxItems=-1&Marker=K1AAAAAAAAAAAA",
             false,
         ),
     ];

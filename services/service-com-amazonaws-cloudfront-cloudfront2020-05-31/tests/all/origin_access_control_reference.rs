@@ -234,6 +234,7 @@ fn config_xml(
          <ViewerProtocolPolicy>https-only</ViewerProtocolPolicy>\
          <CachePolicyId>{CACHING_OPTIMIZED}</CachePolicyId></DefaultCacheBehavior>\
          <Comment>{comment}</Comment>\
+         <PriceClass>PriceClass_All</PriceClass>\
          <Enabled>false</Enabled></DistributionConfig>",
         origins
             .first()

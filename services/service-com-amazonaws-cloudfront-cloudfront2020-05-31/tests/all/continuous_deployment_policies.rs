@@ -827,7 +827,6 @@ async fn unusable_list_arguments_are_refused() {
     // Rows: a page size that is no page, one that is no integer, and markers of every
     // shape that is not a policy id this listing issued.
     for (case, query) in [
-        ("a page size of zero", "?MaxItems=0"),
         ("a negative page size", "?MaxItems=-3"),
         ("a page size that is no integer", "?MaxItems=not-a-number"),
         ("a marker that is no policy id", "?Marker=not-an-id"),

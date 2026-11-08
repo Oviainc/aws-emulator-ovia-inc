@@ -652,9 +652,8 @@ async fn a_page_size_that_names_no_page_is_refused() {
     let table = create_table();
     let created = create_all(&router, &table).await;
 
-    // Rows: a page of no items at all, and negative sizes of two magnitudes — every value
-    // no page can be taken from.
-    for size in ["0", "-1", "-100"] {
+    // Rows: negative sizes of two magnitudes — every value no page can be taken from.
+    for size in ["-1", "-100"] {
         let answer = list_anycast_ip_lists(&router, &format!("?MaxItems={size}")).await;
         assert_eq!(
             answer.status, 400,

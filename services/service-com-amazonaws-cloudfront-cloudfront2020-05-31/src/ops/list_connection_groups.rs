@@ -153,10 +153,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
         let _ = ctx;
 
-        // "The maximum number of connection groups to return" — a page holds at least one
-        // item, so a non-positive size names no page at all. The size served is bounded
-        // above by this emulator's own page ceiling, the same one every listing of this
-        // service is bounded by.
+        // "The maximum number of connection groups to return" — the member BOUNDS the page
+        // rather than demanding one, so only a negative size names no page at all. The size
+        // served is bounded above by this emulator's own page ceiling, the same one every
+        // listing of this service is bounded by.
         let Some(page_size) = crate::state::page_size(input.max_items) else {
             return Err(ListConnectionGroupsErrorModeled::InvalidArgument(
                 crate::state::invalid_max_items(),

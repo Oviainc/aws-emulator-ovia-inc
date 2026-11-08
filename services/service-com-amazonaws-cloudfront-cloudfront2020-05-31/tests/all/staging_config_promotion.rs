@@ -75,7 +75,7 @@ async fn promote(
 /// `DistributionConfig` declares (`smithy_query(query="shape",shape="DistributionConfig")`),
 /// so appending them to the row's document states them in the order the model declares.
 fn with_members(row: &Config, extra: &str) -> String {
-    row.xml()
+    row.update_xml()
         .replace("</DistributionConfig>", &format!("{extra}</DistributionConfig>"))
 }
 

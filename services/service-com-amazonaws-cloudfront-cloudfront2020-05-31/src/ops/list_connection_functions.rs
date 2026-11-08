@@ -151,8 +151,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // "The maximum number of connection functions that you want returned in the
-        // response" — a page holds at least one item, so a non-positive size names no page
-        // at all. The size served is bounded above by this emulator's own page ceiling, the
+        // response" — the member BOUNDS the page rather than demanding one, so only a
+        // negative size names no page at all. The size served is bounded above by this
+        // emulator's own page ceiling, the
         // same one every listing of this service is bounded by, so one request cannot serve
         // the whole store in a single response.
         let Some(page_size) = crate::state::page_size(input.max_items) else {

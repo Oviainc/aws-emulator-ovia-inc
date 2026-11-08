@@ -345,6 +345,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+            // "From this field, you can enable or disable the selected distribution": a
+            // distribution that is disabled serves no traffic, so it serves no tenant of its
+            // own either and no tenant can be associated with it ("the specified CloudFront
+            // resource can't be associated", HTTP 409) — the same rule the create of a
+            // tenant runs. The association is what the rule is about, so it is demanded of
+            // the request that STATES one: an update that names no distribution leaves the
+            // tenant where its create put it and asks for no association at all.
+            if input.distribution_id.is_some() && !distribution.config.enabled {
+                return Err(UpdateDistributionTenantErrorModeled::InvalidAssociation(
+                    crate::state::multi_tenant_distribution_disabled(),
+                )
+                .into());
+            }
             let definitions = distribution
                 .config
                 .tenant_config

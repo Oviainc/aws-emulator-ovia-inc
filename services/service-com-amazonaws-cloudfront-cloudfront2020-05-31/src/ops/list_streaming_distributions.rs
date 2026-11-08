@@ -140,8 +140,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let _ = ctx;
 
         // "MaxItems: the value that you provided for the MaxItems request parameter" — the
-        // maximum number of streaming distributions one response carries, so a page holds
-        // at least one item and a non-positive size names no page at all. The size served
+        // maximum number of streaming distributions one response carries, so the member
+        // BOUNDS the page rather than demanding one and only a negative size names no page
+        // at all. The size served
         // is bounded above by this emulator's own page ceiling, so one request cannot serve
         // the whole store in a single response. A value the parameter cannot take is
         // refused with the one sentence this service states the constraint in, whether it

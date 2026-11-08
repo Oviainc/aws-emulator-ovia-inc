@@ -507,7 +507,6 @@ async fn unusable_arguments_and_unknown_distributions_are_refused() {
 
     // Each row: the query, what it is, and the modelled refusal it earns.
     let refusals: &[(&str, &str)] = &[
-        ("?MaxItems=0", "a page size of zero"),
         ("?MaxItems=-3", "a negative page size"),
         ("?MaxItems=not-a-number", "a page size that is no integer"),
         ("?Marker=not-an-id", "a marker that is no invalidation id"),

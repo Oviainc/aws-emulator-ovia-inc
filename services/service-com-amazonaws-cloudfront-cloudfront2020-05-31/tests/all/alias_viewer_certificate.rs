@@ -110,6 +110,9 @@ fn config_xml(reference: &str, aliases: &[&str], certificate: Option<Certificate
          </DefaultCacheBehavior>",
     );
     out.push_str(&format!("<Comment>for {reference}</Comment>"));
+    // An update submits the configuration WHOLE, including the price class, so the document
+    // states it: a config that leaves it out is refused as an incomplete update.
+    out.push_str("<PriceClass>PriceClass_All</PriceClass>");
     out.push_str("<Enabled>true</Enabled>");
     if let Some(certificate) = certificate {
         out.push_str(&certificate.xml());

@@ -151,7 +151,10 @@ pub(crate) fn config_xml_per_behavior(
         out.push_str("</CacheBehavior></Items></CacheBehaviors>");
     }
     out.push_str(&format!("<Comment>for {reference}</Comment>"));
-    out.push_str("<Enabled>true</Enabled></DistributionConfig>");
+    out.push_str(
+        "<PriceClass>PriceClass_All</PriceClass>\
+         <Enabled>true</Enabled></DistributionConfig>",
+    );
     out
 }
 

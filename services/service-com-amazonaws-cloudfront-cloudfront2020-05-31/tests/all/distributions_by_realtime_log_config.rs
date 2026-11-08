@@ -238,6 +238,7 @@ fn config_xml(caller_reference: &str, row: &Row, configs: &[(String, String)]) -
          </DefaultCacheBehavior>\
          <CacheBehaviors>{behaviors}</CacheBehaviors>\
          <Comment>{caller_reference}</Comment>\
+         <PriceClass>PriceClass_All</PriceClass>\
          <Enabled>true</Enabled>\
          </DistributionConfig>",
         attachment(row.default_config)
@@ -647,8 +648,7 @@ async fn an_unusable_page_size_or_marker_is_refused() {
     let router = emulator();
     let (configs, _) = seed(&router).await;
 
-    let refusals: [(&str, Option<&str>, Option<i32>); 4] = [
-        ("a page size of zero", None, Some(0)),
+    let refusals: [(&str, Option<&str>, Option<i32>); 3] = [
         ("a negative page size", None, Some(-7)),
         ("a marker that is no distribution id", Some("not-an-id"), None),
         (
