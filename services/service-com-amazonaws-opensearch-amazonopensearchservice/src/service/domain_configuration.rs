@@ -372,8 +372,8 @@ pub fn ebs_performance_refusal(ebs: Option<&EBSOptions>) -> Option<ValidationExc
 /// This domain as `DomainStatus` — what `CreateDomain`, `DescribeDomain`,
 /// `DescribeDomains` and `DeleteDomain` answer with: the stored record's own
 /// projection, with the members only the instant of the read decides.
-pub fn reported_status(domain: &Domain, local_endpoint: Option<&str>) -> DomainStatus {
-    let mut status = domain.to_status(local_endpoint);
+pub fn reported_status(domain: &Domain) -> DomainStatus {
+    let mut status = domain.to_status();
     status.change_progress_details = reported_change_progress_details(domain);
     status.modifying_properties = Some(reported_modifying_properties(domain));
     status.service_software_options = Some(reported_service_software(domain));

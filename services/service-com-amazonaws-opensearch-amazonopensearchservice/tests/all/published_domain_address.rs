@@ -4,15 +4,17 @@
 //!
 //! Three rules, each over a SET of inputs rather than one recorded call:
 //!
-//! * **every address a control-plane answer publishes for a domain's data plane is one this
-//!   emulator SERVES from the endpoint the reading request reached.** `DomainStatus$Endpoint`
-//!   is the "domain-specific endpoint used to submit index, search, and data upload
-//!   requests" and `Endpoints`/`EndpointV2` are the same thing for a domain reached inside a
-//!   VPC or over both address families — so a caller that reached this emulator at its own
-//!   endpoint, which resolves none of AWS's hosts, is told that endpoint with the path this
-//!   service's data plane serves the domain at, while a caller that addressed the service's
-//!   AWS host is told the host AWS publishes. The rows span every access mode a domain
-//!   publishes an address for and every reader that publishes one;
+//! * **every address a control-plane answer publishes for a domain's data plane is the HOST
+//!   this service publishes that address as, whoever is reading, and this emulator SERVES
+//!   that host.** `DomainStatus$Endpoint` is the "domain-specific endpoint used to submit
+//!   index, search, and data upload requests" and `Endpoints`/`EndpointV2` are the same
+//!   thing for a domain reached inside a VPC or over both address families — all of them
+//!   hosts, so what is published is a host and nothing else: a client carries the value it
+//!   was told in the `Host` header of the request it SIGNS and sends there, and a value
+//!   carrying anything besides a host (an authority with a path) makes the host it signs
+//!   differ from the host it sends, so the signature cannot verify and the request never
+//!   reaches the domain. The rows span every access mode a domain publishes an address for
+//!   and every reader that publishes one;
 //! * **a domain's access policy decides each principal its statements NAME, and a statement
 //!   naming an IAM role is about every session of that role** — because a resource policy is
 //!   written with the identity a client created, which for a role is the role's own ARN. An
@@ -162,18 +164,9 @@ fn published_addresses(status: &Value, case: &str) -> Vec<(String, String)> {
     addresses
 }
 
-/// The host and request URI a client reaches `path` of a domain at, from the ADDRESS the
-/// control plane published: an address that carries a path (the emulator's own endpoint with
-/// the data plane's reserved path) keeps it ahead of the request path, and a bare host is
-/// addressed as it stands.
-fn addressed(address: &str, path: &str) -> (String, String) {
-    match address.split_once('/') {
-        Some((host, prefix)) => (host.to_string(), format!("/{prefix}{path}")),
-        None => (address.to_string(), path.to_string()),
-    }
-}
-
-/// One data-plane request to the ADDRESS the control plane published for a domain.
+/// One data-plane request to the ADDRESS the control plane published for a domain: that
+/// address is a HOST, so it is carried in the `Host` header exactly as it was published and
+/// the request path is the client's own.
 async fn at_address(
     emulator: &Emulator,
     address: &str,
@@ -182,8 +175,7 @@ async fn at_address(
     path: &str,
     body: Option<Value>,
 ) -> Answer {
-    let (host, uri) = addressed(address, path);
-    dispatch(emulator, &host, access_key_id, method, &uri, body).await
+    dispatch(emulator, address, access_key_id, method, path, body).await
 }
 
 /// The `error.type` a refused data-plane answer carries.
@@ -273,17 +265,16 @@ fn create_body(row: &AccessRow) -> Value {
     body
 }
 
-/// RULE: every address a control-plane answer publishes for a domain's data plane is one
-/// this emulator serves THAT domain at, from the endpoint the reading request reached — the
-/// emulator's own endpoint with this plane's reserved path for a caller that reached it
-/// there, and the host AWS publishes for a caller that addressed the service's AWS host.
+/// RULE: every address a control-plane answer publishes for a domain's data plane is the
+/// HOST this service publishes that address as — the same value whichever endpoint the
+/// reading request reached — and this emulator serves THAT domain at that host.
 ///
 /// Each row is checked on every reader that publishes such an address (the create's own
 /// answer, the single-domain read and the batch read), on every member it publishes one in,
 /// and by USING it: the banner it answers names that domain's cluster, and a document
 /// written through it reads back through it.
 #[tokio::test]
-async fn every_published_domain_address_is_served_from_the_endpoint_that_read_it() {
+async fn every_published_domain_address_is_a_host_this_emulator_serves_that_domain_at() {
     let emulator = Emulator::new();
     let account = ::engine::emulator_account_id();
 
@@ -318,13 +309,39 @@ async fn every_published_domain_address_is_served_from_the_endpoint_that_read_it
             row.members
         );
 
-        // The address a local caller is told is the endpoint it is already talking to, with
-        // the path this plane serves THIS domain at — not a host it resolves nowhere.
-        let expected_local = format!("{LOCAL_ENDPOINT}/_aws/es/{}", row.domain);
+        // Every published address is a HOST, and the host this service mints for that
+        // member: a client puts the value in the `Host` header of the request it signs, so
+        // an authority with a path would make the host it signs differ from the one it
+        // sends. The shapes are the ones `DomainStatus`' own examples name — the `search-`
+        // host for a public endpoint and the `vpc-endpoint-` one for a VPC-access host,
+        // under the Region's `es` endpoint prefix over IPv4 and under the service's
+        // dual-stack domain for a version 2 endpoint.
         for (member, address) in &addresses {
-            assert_eq!(
-                address, &expected_local,
-                "case {case:?}: expected {member} to publish {expected_local:?}, got {address:?}"
+            let (prefix, tail) = match member.as_str() {
+                "Endpoint" => (
+                    format!("search-{}-", row.domain),
+                    format!(".{REGION}.es.amazonaws.com"),
+                ),
+                "EndpointV2" => (
+                    format!("search-{}-", row.domain),
+                    format!(".aos.{REGION}.on.aws"),
+                ),
+                "Endpoints.vpc" => (
+                    "vpc-endpoint-".to_string(),
+                    format!(".{REGION}.es.amazonaws.com"),
+                ),
+                "Endpoints.vpcv2" => (
+                    "vpc-endpoint-".to_string(),
+                    format!(".aos.{REGION}.on.aws"),
+                ),
+                other => panic!("case {case:?}: no shape is stated for the member {other:?}"),
+            };
+            assert!(
+                !address.contains('/')
+                    && address.starts_with(&prefix)
+                    && address.ends_with(&tail),
+                "case {case:?}: expected {member} to publish the host {prefix}<suffix>{tail}, \
+                 got {address:?}"
             );
         }
 
@@ -402,31 +419,17 @@ async fn every_published_domain_address_is_served_from_the_endpoint_that_read_it
             );
         }
 
-        // A caller that addressed the service's AWS host resolves AWS's own hosts, so it is
-        // told the host AWS publishes: a bare host, never the emulator's endpoint.
+        // And the address does not depend on WHICH endpoint read it: a caller that addressed
+        // the service's AWS host is told the same host, member for member, so two callers
+        // sharing a domain name address the same cluster.
         let aws = describe_at(&emulator, SERVICE_HOST, row.domain).await;
-        let aws_addresses = published_addresses(&aws.body["DomainStatus"], case);
-        let aws_members: Vec<String> = aws_addresses
-            .iter()
-            .map(|(member, _)| member.clone())
-            .collect();
         assert_eq!(
-            aws_members, row.members,
-            "case {case:?}: expected the same members to publish an AWS host, got \
-             {aws_addresses:?}"
+            published_addresses(&aws.body["DomainStatus"], case),
+            addresses,
+            "case {case:?}: expected the same addresses whichever endpoint read them, got \
+             {:?}",
+            aws.body["DomainStatus"]
         );
-        for (member, host) in &aws_addresses {
-            assert!(
-                !host.contains('/')
-                    && (host.ends_with(".amazonaws.com") || host.ends_with(".on.aws")),
-                "case {case:?} ({member}): expected the host AWS publishes, got {host:?}"
-            );
-            assert_ne!(
-                host, &expected_local,
-                "case {case:?} ({member}): expected the AWS host to differ from the emulator's \
-                 own endpoint"
-            );
-        }
     }
 }
 

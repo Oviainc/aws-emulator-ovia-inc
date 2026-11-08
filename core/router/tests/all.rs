@@ -1009,3 +1009,7 @@ mod cloudfront_edge_cache_refresh;
 // delivers.
 #[path = "all/logs_subscription_filter_to_firehose_s3.rs"]
 mod logs_subscription_filter_to_firehose_s3;
+#[path = "all/zz_opensearch_fgac_probe.rs"]
+mod zz_opensearch_fgac_probe;
+#[path = "all/cloudformation_asset_bucket_publishing_role.rs"]
+mod cloudformation_asset_bucket_publishing_role;

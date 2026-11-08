@@ -21,12 +21,18 @@
 //!
 //! # What a request addresses
 //!
-//! A client on the machine this emulator runs on resolves a domain's endpoint host
-//! nowhere at all, so two addressings resolve:
+//! A client on the machine this emulator runs on resolves a domain's endpoint host nowhere
+//! at all, so it reaches the emulator and carries what it was told; two addressings
+//! resolve:
 //!
-//! * HOST-STYLE, the addressing `DomainStatus$Endpoint` publishes: the request's host IS
-//!   the endpoint of a domain this store holds (or one of the VPC-access hosts
-//!   `DomainStatus$Endpoints` publishes), and the whole path is the request path;
+//! * HOST-STYLE, the addressing `DomainStatus$Endpoint` publishes: the request's host IS a
+//!   host some domain of this store publishes — its public endpoint, the dual-stack host
+//!   `DomainStatus$EndpointV2` reports beside it, or one of the VPC-access hosts
+//!   `DomainStatus$Endpoints` reports — and the whole path is the request path. This is the
+//!   addressing a client of a published endpoint uses, because that member's value is a
+//!   HOST: the client puts it in the `Host` header of the request it signs and sends, so
+//!   every host the control plane publishes is resolved here and the published value
+//!   carries nothing besides a host (see `crate::state::domain_endpoint`);
 //! * PREFIXED PATH-STYLE: the data plane is named by the reserved namespace segment
 //!   (`service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE`) and
 //!   [`DATA_PLANE_SEGMENT`], then the domain's name or its endpoint host, then the request
@@ -334,10 +340,22 @@ fn resolve<Eng: Send + Sync + 'static>(engine: &Eng, addressed: &Addressed<'_>) 
     })
 }
 
-/// Whether `domain` publishes `host`: its public endpoint, or one of the VPC-access hosts
+/// Whether `domain` publishes `host`: its public endpoint, the dual-stack public host
+/// beside it (`DomainStatus$EndpointV2`), or one of the VPC-access hosts
 /// `DomainStatus$Endpoints` reports for a domain provisioned inside a VPC.
+///
+/// Every host the control plane publishes for the domain's data plane is here, because
+/// each of them is an address a client was told to send index and search requests to:
+/// a published address this plane did not resolve would be one the service announced and
+/// then did not serve.
 fn publishes_host(domain: &Domain, host: &str) -> bool {
     if domain.endpoint == host {
+        return true;
+    }
+    if domain
+        .public_endpoint_v2()
+        .is_some_and(|published| published == host)
+    {
         return true;
     }
     domain

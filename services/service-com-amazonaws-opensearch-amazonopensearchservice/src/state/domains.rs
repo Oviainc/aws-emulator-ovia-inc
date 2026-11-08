@@ -832,31 +832,18 @@ impl Domain {
     /// This domain as `DomainStatus` — what `CreateDomain`, `DescribeDomain` and
     /// `DeleteDomain` answer with.
     ///
-    /// `local_endpoint` is the emulator's own endpoint the READING request reached, when it
-    /// reached that rather than one of AWS's service hosts
-    /// ([`local_endpoint_host`]): every address this status publishes for the domain's data
-    /// plane is then that endpoint with the path this service serves the domain at
-    /// ([`announced_domain_endpoint`]), because a caller that resolves nothing but the
-    /// emulator's endpoint cannot reach an AWS-shaped host. It is read per CALL rather than
-    /// stored, so a domain created by one caller (a resource provisioner reaching this
-    /// service in-process, say) publishes to each reader the address that reader can use.
-    pub fn to_status(&self, local_endpoint: Option<&str>) -> DomainStatus {
+    /// Every address it publishes for the domain's data plane is the HOST this service
+    /// publishes that address as ([`domain_endpoint`] and the VPC-access hosts beside it),
+    /// whoever is reading: those members are hosts, and a client carries the one it was
+    /// told in the `Host` header of the request it signs and sends there — so a value
+    /// carrying anything besides a host is one no client can use. What makes that host
+    /// reachable from a client on this machine is the data plane's own host-style claim;
+    /// see [`domain_endpoint`].
+    pub fn to_status(&self) -> DomainStatus {
         // Where this domain is reachable decides which endpoint members it reports:
         // the map is present exactly for a VPC-access domain, and the public endpoint
         // exactly for the domain that has one.
-        let vpc_access_endpoints = self.vpc_access_endpoints().map(|endpoints| {
-            endpoints
-                .into_iter()
-                .map(|(key, host)| {
-                    (
-                        key,
-                        announced_domain_endpoint(&host, &self.domain_name, local_endpoint),
-                    )
-                })
-                .collect::<BTreeMap<String, String>>()
-        });
-        let announced =
-            |host: &str| announced_domain_endpoint(host, &self.domain_name, local_endpoint);
+        let vpc_access_endpoints = self.vpc_access_endpoints();
         // Whether this domain publishes an ADDRESS for its data plane at all. `Endpoint` is
         // "the domain-specific endpoint used to submit index, search, and data upload
         // requests", and `Endpoints`/`EndpointV2` are that same address for a domain reached
@@ -879,7 +866,7 @@ impl Domain {
             // provisioned inside a VPC does not have: it is reached on the hosts
             // `Endpoints` below carries instead.
             endpoint: (publishes_address && vpc_access_endpoints.is_none())
-                .then(|| announced(&self.endpoint)),
+                .then(|| self.endpoint.clone()),
             // `EndpointV2` is the dual-stack PUBLIC endpoint, which a domain whose
             // `IPAddressType` is `dualstack` is provisioned beside its IPv4 one
             // ([`Self::public_endpoint_v2`]); a VPC-access domain has no public host of
@@ -887,8 +874,7 @@ impl Domain {
             // under `vpcv2`.
             endpoint_v2: publishes_address
                 .then(|| self.public_endpoint_v2())
-                .flatten()
-                .map(|host| announced(&host)),
+                .flatten(),
             // "The key-value pair that exists if the OpenSearch Service domain uses VPC
             // endpoints": present for a VPC-access domain and absent for a public one.
             // A service-managed VPC endpoint is a resource of its own, reported by

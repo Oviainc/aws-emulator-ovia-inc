@@ -113,6 +113,8 @@ mod dry_run_progress;
 mod ebs_volume_size_limit;
 #[path = "all/engine_version_resolution.rs"]
 mod engine_version_resolution;
+#[path = "all/fgac_master_role_probe.rs"]
+mod fgac_master_role_probe;
 #[path = "all/fixed_sentence_refusals.rs"]
 mod fixed_sentence_refusals;
 #[path = "all/inbound_connection_acceptance.rs"]

@@ -356,6 +356,18 @@ pub fn json_from_document(document: &::aws_smithy_types::Document) -> ::serde_js
 /// `search-imdb-movies-oopcnjfn6ugo.eu-west-1.es.amazonaws.com`: the `search-`
 /// prefix, the domain name, an opaque per-domain suffix, then the Region and this
 /// service's endpoint prefix.
+///
+/// This is a HOST, and it is published as one to every reader: `DomainStatus$Endpoint` is
+/// "the domain-specific endpoint used to submit index, search, and data upload requests",
+/// so a client carries the value it was told in the `Host` header of the request it SIGNS
+/// and sends there. A value carrying anything besides a host — an authority with a path —
+/// is a value no such client can use: the host it signs and the host it sends then differ,
+/// so the signature the emulator verifies cannot match and the request is refused before it
+/// reaches any domain. What makes this host reachable from a client on this machine is the
+/// data plane's HOST-STYLE claim ([`crate::service::domain_rest`]): a request is resolved
+/// to the domain whose published host it carries, whatever address it was dialled at. Such
+/// a client may also address the plane by the path that names the domain, which that module
+/// resolves too.
 pub fn domain_endpoint(domain_name: &str, suffix: &str, region: &str) -> String {
     format!("search-{domain_name}-{suffix}.{region}.{ARN_NAMESPACE}.amazonaws.com")
 }
@@ -405,51 +417,4 @@ pub(super) fn dual_stack_host(label: &str, region: &str) -> String {
 /// one a domain's own endpoint carries, so the two are never mistaken for each other.
 pub fn vpc_endpoint_host(domain_name: &str, suffix: &str, region: &str) -> String {
     format!("vpc-{domain_name}-{suffix}.{region}.{ARN_NAMESPACE}.amazonaws.com")
-}
-
-/// The endpoint a request REACHED this emulator at when that endpoint is the EMULATOR'S
-/// OWN — a loopback address, an IP literal or any other host that names no service — and
-/// `None` when the host names a service, which is a client that resolves AWS's own hosts.
-///
-/// Both readings it composes are `services/common`'s, so no second rule for "which host is
-/// a service's" or "which host did this request address" is written here:
-/// `data_plane_addressing::addressed_host` (the `Host` header, else an absolute URI's
-/// authority) and `data_plane_addressing::names_a_service`, which defers to the front
-/// door's own host reader.
-///
-/// What it decides is the ADDRESS a domain publishes for its data plane
-/// ([`announced_domain_endpoint`]): a caller that reached this emulator at its own endpoint
-/// resolves nothing else, so an AWS-shaped host told to it names no address it can reach.
-pub fn local_endpoint_host(parts: &::http::request::Parts) -> Option<String> {
-    let host = ::service_common::data_plane_addressing::addressed_host(
-        &parts.uri.to_string(),
-        parts
-            .headers
-            .get(::http::header::HOST)
-            .and_then(|value| value.to_str().ok()),
-    )?;
-    (!::service_common::data_plane_addressing::names_a_service(&host)).then_some(host)
-}
-
-/// The address a domain of this service PUBLISHES for index, search and data-upload
-/// requests, as announced to a caller that reached this emulator at `local_endpoint`: that
-/// same endpoint, with the reserved path this service's data plane serves the domain at
-/// (`<endpoint>/_aws/es/<domain>`, the addressing `crate::service::domain_rest` resolves).
-///
-/// `aws_host` is the host AWS publishes for that domain ([`domain_endpoint`] and the
-/// VPC-access hosts beside it), which is what a caller that resolves AWS's own hosts is
-/// told — so one reading decides every endpoint member of a domain's status, and a member
-/// that names an address the caller cannot reach is never published.
-pub fn announced_domain_endpoint(
-    aws_host: &str,
-    domain_name: &str,
-    local_endpoint: Option<&str>,
-) -> String {
-    match local_endpoint {
-        Some(endpoint) => format!(
-            "{endpoint}/{}/{ARN_NAMESPACE}/{domain_name}",
-            ::service_common::data_plane_addressing::EMULATOR_PATH_NAMESPACE
-        ),
-        None => aws_host.to_string(),
-    }
 }

@@ -47,14 +47,14 @@ const DELIVERY_ROLE: &str = "firehose-delivery";
 const SESSION: &str = "delivery-session";
 
 /// The access key id of that session's credentials.
-const SESSION_KEY_ID: &str = "ASIAEXAMPLEDELIVERY1";
+pub(crate) const SESSION_KEY_ID: &str = "ASIAEXAMPLEDELIVERY1";
 
 /// How long the seeded session lasts: an hour, STS's own default.
 const SESSION_SECONDS: i32 = 3_600;
 
 /// The ARN of the IAM role the seeded session speaks for — the identity a role mapping
 /// names as a `backend_role`.
-fn delivery_role_arn() -> String {
+pub(crate) fn delivery_role_arn() -> String {
     format!(
         "arn:aws:iam::{}:role/{DELIVERY_ROLE}",
         ::engine::emulator_account_id()
@@ -71,7 +71,7 @@ fn master_user_arn() -> String {
 /// The ARN of the SESSION that credential speaks for — the principal
 /// `sts:GetCallerIdentity` reports for it, which is the name the cluster knows the caller
 /// by.
-fn delivery_session_arn() -> String {
+pub(crate) fn delivery_session_arn() -> String {
     format!(
         "arn:aws:sts::{}:assumed-role/{DELIVERY_ROLE}/{SESSION}",
         ::engine::emulator_account_id()
@@ -80,7 +80,7 @@ fn delivery_session_arn() -> String {
 
 /// Record the assumed-role session [`SESSION_KEY_ID`] speaks for, as `sts:AssumeRole`
 /// records one.
-fn given_session(emulator: &Emulator) {
+pub(crate) fn given_session(emulator: &Emulator) {
     let now = SystemTime::now();
     let account = ::engine::emulator_account_id();
     let role_arn = delivery_role_arn();
@@ -106,7 +106,7 @@ fn given_session(emulator: &Emulator) {
 /// Give the delivery role an inline policy allowing this service's data-plane actions on
 /// every domain — the IAM grant a Firehose delivery role carries, so what is left to
 /// decide is fine-grained access control alone.
-fn given_data_plane_policy(emulator: &Emulator) {
+pub(crate) fn given_data_plane_policy(emulator: &Emulator) {
     let document = json!({
         "Version": "2012-10-17",
         "Statement": [{ "Effect": "Allow", "Action": "es:ESHttp*", "Resource": "*" }]
@@ -126,7 +126,7 @@ fn given_data_plane_policy(emulator: &Emulator) {
 }
 
 /// The endpoint host a domain published, read out of the store the create wrote it to.
-fn endpoint_of(emulator: &Emulator, domain: &str) -> String {
+pub(crate) fn endpoint_of(emulator: &Emulator, domain: &str) -> String {
     let store = emulator.store();
     let guard = store.lock();
     guard
@@ -151,7 +151,7 @@ fn arn_of(emulator: &Emulator, domain: &str) -> String {
 
 /// One REST request to the HOST a domain published — the addressing
 /// `DomainStatus$Endpoint` publishes.
-async fn rest(
+pub(crate) async fn rest(
     emulator: &Emulator,
     access_key_id: &str,
     host: &str,
@@ -183,7 +183,7 @@ pub(crate) async fn rest_prefixed(
 }
 
 /// Build and answer one signed data-plane request.
-async fn dispatch_rest(
+pub(crate) async fn dispatch_rest(
     emulator: &Emulator,
     access_key_id: &str,
     host: &str,

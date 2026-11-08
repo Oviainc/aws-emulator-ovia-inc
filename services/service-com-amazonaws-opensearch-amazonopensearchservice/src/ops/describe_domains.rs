@@ -137,11 +137,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     async fn handle(
         &self,
         input: Self::Input,
-        ctx: &smithy_server_runtime::OperationContext<'_>,
+        _ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The address this answer publishes each domain's data plane at follows the endpoint
-        // THIS request reached (`Domain::to_status`), read before the store is locked.
-        let local_endpoint = crate::state::local_endpoint_host(ctx.parts());
         let state =
             crate::state::service_state(&*self.engine).ok_or_else(crate::state::state_unavailable)?;
 
@@ -167,7 +164,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if let Some(domain) = store.settled_mut(name, now) {
                 domain_status_list.push(crate::service::domain_configuration::reported_status(
                     domain,
-                    local_endpoint.as_deref(),
                 ));
             }
         }

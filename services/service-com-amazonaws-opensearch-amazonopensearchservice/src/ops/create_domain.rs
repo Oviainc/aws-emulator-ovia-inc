@@ -646,7 +646,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         Ok(CreateDomainOutput {
             domain_status: Some(crate::service::domain_configuration::reported_status(
                 stored,
-                crate::state::local_endpoint_host(ctx.parts()).as_deref(),
             )),
         })
     }
