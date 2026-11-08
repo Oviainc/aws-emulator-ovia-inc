@@ -21,9 +21,11 @@
 //! line, several lines, an exception), which group the function logs to (the default, and one
 //! its configuration names), how many invocations were made (so two runs take two streams),
 //! which RUNTIME ran (the rule is the host's, so the rows that do not assert a runtime's own
-//! output run on the cheaper engine and the one that does names python), and which of the
+//! output run on the cheaper engine and the one that does names python), which of the
 //! three log writes the execution role allows (all of them, none, everything but the put, and
-//! a put denied beside a wildcard grant).
+//! a put denied beside a wildcard grant), and which INVOCATION SURFACE ran the function (the
+//! synchronous `Invoke`, the asynchronous `Event` one whose run happens off the response
+//! path, and the dry run, which runs nothing and so logs nothing).
 //!
 //! Every test here RUNS handlers, so each takes the target's one invocation stream
 //! ([`crate::invoke_request_id::one_invocation_stream_at_a_time`]): this emulator serves at
@@ -31,6 +33,7 @@
 //! keeps several of those slots busy starves every other suite's runs.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -287,21 +290,7 @@ pub(crate) async fn create_function(router: &MultiServiceRouter, function: &Crea
 ///
 /// `pub(crate)` for the reason [`emulator`] is.
 pub(crate) async fn invoke(router: &MultiServiceRouter, case: &str, name: &str) -> (String, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("{FUNCTIONS_URI}/{name}/invocations"))
-        .header("host", format!("lambda.{REGION}.amazonaws.com"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=emulator-test-key/20260101/{REGION}/lambda/\
-                 aws4_request, SignedHeaders=host, Signature=not-verified"
-            ),
-        )
-        .header("content-type", "application/json")
-        .header("x-amz-log-type", "Tail")
-        .body(bytes::Bytes::from_static(b"{}"))
-        .expect("the test request is well formed");
+    let request = invocation_request(name, &[("x-amz-log-type", "Tail")]);
     let response = router.dispatch(request).await;
     let (parts, body) = response.into_parts();
     assert_eq!(
@@ -327,6 +316,30 @@ pub(crate) async fn invoke(router: &MultiServiceRouter, case: &str, name: &str) 
         serde_json::from_slice(&body).unwrap_or(Value::Null)
     };
     (log, payload)
+}
+
+/// ONE `Invoke` request on the function `name`, signed for this suite's Region and carrying
+/// `headers` on top of the ones every invocation of it carries. The signing and host details
+/// live here, so every invocation this suite makes is the same request but for those headers.
+fn invocation_request(name: &str, headers: &[(&str, &str)]) -> http::Request<bytes::Bytes> {
+    let mut builder = http::Request::builder()
+        .method("POST")
+        .uri(format!("{FUNCTIONS_URI}/{name}/invocations"))
+        .header("host", format!("lambda.{REGION}.amazonaws.com"))
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 Credential=emulator-test-key/20260101/{REGION}/lambda/\
+                 aws4_request, SignedHeaders=host, Signature=not-verified"
+            ),
+        )
+        .header("content-type", "application/json");
+    for (header, value) in headers {
+        builder = builder.header(*header, *value);
+    }
+    builder
+        .body(bytes::Bytes::from_static(b"{}"))
+        .expect("the test request is well formed")
 }
 
 /// One row of the delivery table: what the handler writes, and how many of its own lines that
@@ -753,5 +766,148 @@ async fn a_handler_that_raises_logs_its_runtimes_error_report() {
     assert!(
         lines.iter().any(|line| line.contains("lambda_function.py")),
         "case {case:?}: expected the handler's own frame in the traceback, got {lines:?}"
+    );
+}
+
+/// The request header `Invoke$InvocationType` is bound to, and the two values the invocation
+/// surfaces below are driven with (`Event | RequestResponse | DryRun` is the model's enum).
+const INVOCATION_TYPE_HEADER: &str = "x-amz-invocation-type";
+/// See [`INVOCATION_TYPE_HEADER`]: "Invoke the function asynchronously […] The API response
+/// only includes a status code", so the run happens off the response path.
+const EVENT_TYPE: &str = "Event";
+/// See [`INVOCATION_TYPE_HEADER`]: "Validate parameter values and verify that the user or
+/// role has permission to invoke the function", which runs no function code at all.
+const DRY_RUN_TYPE: &str = "DryRun";
+
+/// How long the asynchronous case waits for the queued event to be delivered and run before
+/// giving up, and how often it looks. The delivery is owed by the CLOCK a short span after the
+/// accepting call, so the test POLLS for it rather than sleeping out a fixed span: it reads as
+/// soon as the run has landed and fails only once the deadline has passed.
+const ASYNC_DEADLINE: Duration = Duration::from_secs(10);
+/// See [`ASYNC_DEADLINE`].
+const ASYNC_POLL: Duration = Duration::from_millis(100);
+
+/// `Invoke` the function `name` with the `InvocationType` `invocation_type`, answering the
+/// status it was accepted with — which the caller states its expectation of. Neither type
+/// carries a log tail — an asynchronous invocation is answered before its run and the dry run
+/// runs nothing — so what the group holds is the only statement of what was logged.
+async fn invoke_as(router: &MultiServiceRouter, name: &str, invocation_type: &str) -> u16 {
+    let response = router
+        .dispatch(invocation_request(
+            name,
+            &[(INVOCATION_TYPE_HEADER, invocation_type)],
+        ))
+        .await;
+    response.status().as_u16()
+}
+
+/// The group's streams and the LINES the one of them holds, once the delivery has put them
+/// there, looked for until [`ASYNC_DEADLINE`] passes.
+///
+/// A delivery made off the response path has not necessarily happened when the accepting call
+/// is answered, and it opens the stream before it writes to it, so this reads until the
+/// EVENTS are there rather than until the stream is — which is what a client polling for a
+/// run's output does.
+async fn delivery_to(
+    router: &MultiServiceRouter,
+    case: &str,
+    group: &str,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let deadline = std::time::Instant::now() + ASYNC_DEADLINE;
+    loop {
+        let found = groups(router, case, group).await;
+        if !found.is_empty() {
+            let held = streams(router, case, group).await;
+            if let Some(stream) = held.first() {
+                let (lines, _) = delivered(router, case, group, stream).await;
+                if !lines.is_empty() {
+                    return (found, held, lines);
+                }
+            }
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "case {case:?}: the queued invocation's log never reached {group:?} within \
+             {ASYNC_DEADLINE:?}"
+        );
+        tokio::time::sleep(ASYNC_POLL).await;
+    }
+}
+
+/// An ASYNCHRONOUS invocation's run is logged like any other: the accepting call says nothing
+/// about the run, so the group is where a client reads what the handler wrote — and a DRY RUN,
+/// which runs no function code, logs nothing at all.
+///
+/// Both surfaces are driven against ONE function, so the two answers differ only in what the
+/// surface did: one ran the handler and one did not.
+#[tokio::test]
+async fn an_asynchronous_run_is_logged_and_a_dry_run_is_not() {
+    let _stream = crate::invoke_request_id::one_invocation_stream_at_a_time().await;
+    let case = "an asynchronous invocation beside a dry run";
+    let router = emulator();
+    create_function(
+        &router,
+        &Created {
+            case,
+            name: "log-queued",
+            source: "exports.handler = async () => {\n    console.log('a queued run');\n    \
+                     return { ok: true };\n};",
+            runtime: NODE_RUNTIME,
+            role: UNKNOWN_ROLE,
+            log_group: None,
+        },
+    )
+    .await;
+    let group = "/aws/lambda/log-queued";
+
+    // The dry run FIRST: it "validate[s] parameter values" and invokes nothing, so it leaves
+    // the group that does not exist yet still not existing.
+    let dry = invoke_as(&router, "log-queued", DRY_RUN_TYPE).await;
+    assert_eq!(
+        dry, 204,
+        "case {case:?}: the dry run answers 204, got {dry}"
+    );
+    let after_dry_run = groups(&router, case, group).await;
+    assert!(
+        after_dry_run.is_empty(),
+        "case {case:?}: a dry run invokes nothing, so it logs nothing, got {after_dry_run:?}"
+    );
+
+    // And the asynchronous one, whose run happens after the call was answered.
+    let accepted = invoke_as(&router, "log-queued", EVENT_TYPE).await;
+    assert_eq!(
+        accepted, 202,
+        "case {case:?}: an asynchronous invocation is accepted with 202, got {accepted}"
+    );
+
+    let (found, held, lines) = delivery_to(&router, case, group).await;
+    assert_eq!(
+        found,
+        vec![group.to_string()],
+        "case {case:?}: expected the delivered run to create {group:?}, got {found:?}"
+    );
+    assert_eq!(
+        held.len(),
+        1,
+        "case {case:?}: expected one stream for the one run, got {held:?}"
+    );
+    // The whole log of the run, in order: the framing around the one line the handler wrote.
+    let expected_lines = 4;
+    assert_eq!(
+        lines.len(),
+        expected_lines,
+        "case {case:?}: expected the framing around the handler's one line, got {lines:?}"
+    );
+    assert!(
+        lines[0].starts_with("START RequestId: "),
+        "case {case:?}: expected the log to open on its START line, got {lines:?}"
+    );
+    assert_eq!(
+        lines[1], "a queued run",
+        "case {case:?}: expected the handler's own line, got {lines:?}"
+    );
+    assert!(
+        lines[2].starts_with("END RequestId: ") && lines[3].starts_with("REPORT RequestId: "),
+        "case {case:?}: expected the log to close on END and then REPORT, got {lines:?}"
     );
 }
