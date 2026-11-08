@@ -905,8 +905,9 @@ async fn create_dataset_group_refuses_a_key_without_a_role_and_a_role_without_a_
 // Datasets
 // ---------------------------------------------------------------------------
 
-/// The dataset types Personalize accepts, in the spelling it reports them back in, each
-/// paired with a differently cased request value.
+/// The dataset types Personalize accepts, each paired with the canonical spelling its
+/// identity is derived from: the ARN's type segment and the spelling a read reports are that
+/// canonical name UPPER-CASED, whatever casing the create used.
 ///
 /// Source: the model's own documentation for `CreateDatasetRequest$datasetType` — "One of
 /// the following (case insensitive) values: Interactions, Items, Users, Actions,
@@ -1289,12 +1290,17 @@ async fn list_datasets_filters_by_group_and_pages_at_every_size() {
     .await;
 
     let mut expected_first: Vec<String> = Vec::new();
+    // The type each created dataset must be REPORTED with, keyed by its name: the expected
+    // spelling is written here from the documented catalog, not read back off a reply.
+    let mut expected_types: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
     for (_, canonical) in DATASET_TYPE_CASES {
+        let name = format!("first-{}", canonical.to_ascii_lowercase());
         let (status, body) = emulator
             .call(
                 "CreateDataset",
                 json!({
-                    "name": format!("first-{}", canonical.to_ascii_lowercase()),
+                    "name": name,
                     "schemaArn": schema_arn,
                     "datasetGroupArn": first,
                     "datasetType": canonical,
@@ -1305,6 +1311,7 @@ async fn list_datasets_filters_by_group_and_pages_at_every_size() {
             status, 200,
             "case \"paging\": expected CreateDataset to answer 200, got {status} {body:?}"
         );
+        expected_types.insert(name, canonical.to_ascii_uppercase());
         expected_first.push(body["datasetArn"].as_str().unwrap_or("").to_string());
     }
     expected_first.sort();
@@ -1364,6 +1371,17 @@ async fn list_datasets_filters_by_group_and_pages_at_every_size() {
             assert!(
                 summary["name"].as_str().is_some_and(|name| name.starts_with("first-")),
                 "case {case:?}: expected only the first group's datasets, got {summary:?}"
+            );
+            // A summary reports the type in the spelling the service identifies it by, the
+            // same one a describe reports.
+            let expected = summary["name"]
+                .as_str()
+                .and_then(|name| expected_types.get(name))
+                .map(String::as_str);
+            assert_eq!(
+                summary["datasetType"].as_str(),
+                expected,
+                "case {case:?}: expected the reported dataset type {expected:?}, got {summary:?}"
             );
         }
 

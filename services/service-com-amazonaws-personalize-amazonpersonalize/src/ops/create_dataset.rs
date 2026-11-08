@@ -229,11 +229,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }) {
             return Err(CreateDatasetErrorModeled::ResourceAlreadyExistsException(
                 ResourceAlreadyExistsException {
-                    message: Some(format!(
-                        "Dataset {existing_arn} of type {dataset_type} already exists in dataset \
-                         group {group_arn}.",
-                        existing_arn = existing.dataset_arn,
-                        group_arn = input.dataset_group_arn
+                    // The collision is reported by the ARN of the dataset already there,
+                    // in the Arn-generic sentence this service words the class with
+                    // ([`crate::state::resource_already_exists_message`]).
+                    message: Some(crate::state::resource_already_exists_message(
+                        &existing.dataset_arn,
                     )),
                 },
             )

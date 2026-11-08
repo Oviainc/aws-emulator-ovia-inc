@@ -166,7 +166,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if state.schemas.contains_key(&arn) {
             return Err(CreateSchemaErrorModeled::ResourceAlreadyExistsException(
                 ResourceAlreadyExistsException {
-                    message: Some(format!("Schema {arn} already exists.")),
+                    // The Arn-generic sentence this service words the class with: the
+                    // colliding resource's ARN is its one variable part
+                    // ([`crate::state::resource_already_exists_message`]).
+                    message: Some(crate::state::resource_already_exists_message(&arn)),
                 },
             )
             .into());

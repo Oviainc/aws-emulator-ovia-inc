@@ -197,7 +197,7 @@ pub fn dataset_group_arn(region: &str, name: &str) -> String {
 ///
 /// A dataset's identity inside its group is its TYPE, not its name — the model documents
 /// that a group holds at most one dataset of each type — so the type, upper-cased the way
-/// Personalize renders it in an ARN, is the last segment.
+/// Personalize renders it in an ARN and holds it on the record, is the last segment.
 pub fn dataset_arn(region: &str, dataset_group_name: &str, dataset_type: &str) -> String {
     ::emulator_server::emulator_arn(
         "personalize",
@@ -215,7 +215,9 @@ pub fn dataset_arn(region: &str, dataset_group_name: &str, dataset_type: &str) -
 //
 // Personalize words each refusal class itself, and the same class reads the same
 // whichever operation raised it, so the text lives here instead of being composed at the
-// rejection site. Only the parts the service itself varies are arguments.
+// rejection site. Only the parts the service itself varies are arguments — and the
+// not-found class varies by the KIND of resource the lookup resolved, so each kind has
+// its own entry point rather than one generic sentence.
 
 /// The kind of resource a lookup failed to resolve. Personalize words its not-found
 /// refusal PER KIND, so the kind — not the operation — is what selects the sentence:
@@ -237,6 +239,14 @@ pub fn resource_not_found_message(resource: MissingResource, arn: &str) -> Strin
         MissingResource::DatasetGroup => format!("The given dataset group does not exist: {arn}"),
         MissingResource::Dataset => format!("The given dataset does not exist: {arn}"),
     }
+}
+
+/// What a create whose resource already exists answers, for the ARN of the resource it
+/// collided with: the sentence is Arn-generic, naming neither the resource kind nor the
+/// name the caller asked for, so one wording serves every create this service holds a
+/// resource for.
+pub fn resource_already_exists_message(arn: &str) -> String {
+    format!("Another resource with Arn {arn} already exists.")
 }
 
 /// What a schema document that does not declare every field its dataset type requires

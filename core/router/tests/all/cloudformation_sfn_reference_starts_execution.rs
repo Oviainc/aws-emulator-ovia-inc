@@ -169,6 +169,7 @@ fn is_uuid(id: &str) -> bool {
         })
 }
 
+
 /// A one-state definition that ends immediately, as each row's template states it.
 fn pass_definition(result: &str) -> Value {
     json!({
@@ -491,7 +492,7 @@ async fn a_stack_published_state_machine_reference_starts_an_execution() {
 
         // Step Functions HOLDS that execution, read back through the machine the stack's
         // reference named and through the execution's own ARN — and each read answers for the
-        // reference the way the API documents it for the workflow type. A STANDARD machine
+        // reference the way that service answers for the workflow type. A STANDARD machine
         // reports both; for an EXPRESS one `ListExecutions` answers
         // `StateMachineTypeNotSupported` ("executions of an EXPRESS state machine aren't
         // supported by DescribeExecution unless a Map Run dispatched them", and the ARN such a

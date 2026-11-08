@@ -433,6 +433,16 @@ async fn a_lookup_that_resolves_to_nothing_names_the_kind_of_resource_it_looked_
                 "arn:aws:personalize:{REGION}:{ACCOUNT}:schema/absent-kind"
             )),
         ),
+        (
+            // Both ARNs unresolvable: the group is resolved first, so its own kind's
+            // sentence is the one answered.
+            "CreateDataset naming neither a group nor a schema that exists",
+            format!("arn:aws:personalize:{REGION}:{ACCOUNT}:dataset-group/absent-kind"),
+            format!("arn:aws:personalize:{REGION}:{ACCOUNT}:schema/absent-kind"),
+            dataset_group_not_found_message(&format!(
+                "arn:aws:personalize:{REGION}:{ACCOUNT}:dataset-group/absent-kind"
+            )),
+        ),
     ] {
         let (status, body) = emulator
             .call(
@@ -461,8 +471,8 @@ async fn a_lookup_that_resolves_to_nothing_names_the_kind_of_resource_it_looked_
     }
 
     // A dataset and a group that EXIST are read, and once deleted their own ARNs answer
-    // the very same sentence — so the wording belongs to the lookup that found nothing
-    // rather than to every call.
+    // their kind's not-found sentence — so the wording belongs to the lookup that found
+    // nothing rather than to every call.
     let case = "a group and a dataset that exist, then do not";
     let dataset_arn = create_dataset(
         &emulator,
