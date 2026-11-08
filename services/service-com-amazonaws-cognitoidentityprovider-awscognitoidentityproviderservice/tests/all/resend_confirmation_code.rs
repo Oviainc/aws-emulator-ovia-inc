@@ -376,10 +376,19 @@ async fn a_resend_addresses_the_pools_auto_verified_attribute_and_supersedes_the
     ];
 
     for (index, (case, auto_verified, attributes, expected)) in rows.iter().enumerate() {
+        // A pool that auto-verifies `phone_number` sends that verification over
+        // SMS, so it needs the Amazon SNS caller SMS is sent through:
+        // `CreateUserPool` refuses the pairing without it.
+        let mut configuration = json!({ "AutoVerifiedAttributes": auto_verified });
+        if auto_verified.contains(&"phone_number") {
+            configuration["SmsConfiguration"] = json!({
+                "SnsCallerArn": "arn:aws:iam::000000000000:role/sms-caller"
+            });
+        }
         let user_pool_id = pool(
             &setup,
             &format!("resend-destination-{index}"),
-            json!({ "AutoVerifiedAttributes": auto_verified }),
+            configuration,
         )
         .await;
         let (client_id, _) = app_client(&setup, &user_pool_id, "app", json!({})).await;

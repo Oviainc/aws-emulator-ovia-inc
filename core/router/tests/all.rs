@@ -305,6 +305,10 @@ mod cognito_vended_session_is_an_assumed_role_caller;
 mod cognito_post_confirmation_lambda_trigger;
 #[path = "all/cognito_group_role_mapping.rs"]
 mod cognito_group_role_mapping;
+// Declared beside its sibling cognito suites, at the head, for the same reason they are
+// here: the appended tail and the sorted `c…` span are both regions concurrent suites land in.
+#[path = "all/cognito_sms_caller_role_trust.rs"]
+mod cognito_sms_caller_role_trust;
 #[path = "all/pi_resource_metadata_reflects_rds_configuration.rs"]
 mod pi_resource_metadata_reflects_rds_configuration;
 // At the head for the reason the entries above record: the appended tail and the sorted

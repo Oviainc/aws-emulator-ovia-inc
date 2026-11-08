@@ -159,6 +159,15 @@ async fn pool(router: &MultiServiceRouter, name: &str, config: PoolConfig) -> St
             json!(config.auto_verified),
         );
     }
+    // A pool that auto-verifies `phone_number` sends that verification over SMS,
+    // so it needs the Amazon SNS caller SMS is sent through: `CreateUserPool`
+    // refuses the pairing without it.
+    if config.auto_verified.contains(&"phone_number") {
+        body.insert(
+            "SmsConfiguration".to_string(),
+            json!({ "SnsCallerArn": "arn:aws:iam::000000000000:role/sms-caller" }),
+        );
+    }
     if !config.verify_before_update.is_empty() {
         body.insert(
             "UserAttributeUpdateSettings".to_string(),

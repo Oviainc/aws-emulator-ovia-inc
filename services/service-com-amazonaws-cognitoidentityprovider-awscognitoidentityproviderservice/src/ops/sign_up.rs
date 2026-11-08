@@ -287,6 +287,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(unverified_secret_hash(&input.client_id));
         }
 
+        // A pool whose `AdminCreateUserConfig` reserves user creation to
+        // administrators registers nobody through this operation: "set to True if
+        // only the administrator is allowed to create user profiles. Set to False
+        // if users can sign themselves up via an app"
+        // (`AdminCreateUserConfigType.AllowAdminCreateUserOnly` in this service's
+        // model), so a self-service registration against such a pool is refused
+        // before the request's password, attributes or username are looked at.
+        if pool.admin_create_user_config.allow_admin_create_user_only {
+            return Err(not_authorized(SIGN_UP_NOT_PERMITTED_MESSAGE));
+        }
+
         // "The password must comply with the password requirements of your user pool"
         // (`SignUp.Password`). The member is optional — "To create a user with no
         // password, omit this parameter or submit a blank value" — so only a password
@@ -483,6 +494,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The message this operation's `NotAuthorizedException` carries on a pool that
+/// reserves user creation to administrators. Fixed text, naming neither the pool
+/// nor the app client the registration was asked through.
+const SIGN_UP_NOT_PERMITTED_MESSAGE: &str = "SignUp is not permitted for this user pool";
+
 /// This operation's `ResourceNotFoundException` for a `ClientId` no stored pool holds.
 fn client_not_found(client_id: &str) -> SignUpError {
     SignUpErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
@@ -494,8 +510,15 @@ fn client_not_found(client_id: &str) -> SignUpError {
 /// This operation's `NotAuthorizedException` for a request whose `SecretHash` is not the
 /// one the app client's stored secret expects — including a request that carries none.
 fn unverified_secret_hash(client_id: &str) -> SignUpError {
+    not_authorized(&format!(
+        "Unable to verify secret hash for client {client_id}."
+    ))
+}
+
+/// This operation's `NotAuthorizedException`, carrying `message`.
+fn not_authorized(message: &str) -> SignUpError {
     SignUpErrorModeled::NotAuthorizedException(NotAuthorizedException {
-        message: Some(format!("Unable to verify secret hash for client {client_id}.")),
+        message: Some(message.to_string()),
     })
     .into()
 }

@@ -137,6 +137,15 @@ const GET_CLIENT_TOKEN: &str = "GetClientToken";
 /// in, as the framework spells a member path.
 const SECRET_MEMBER_PATH: &str = "secret";
 
+/// The app-client listing, whose page size Amazon Cognito does not hold to the minimum its
+/// own model declares (`smithy_query(query="operation",operation="ListUserPoolClients")`
+/// puts `MaxResults` in `@range` 1..60): see [`served_despite`].
+const LIST_USER_POOL_CLIENTS: &str = "ListUserPoolClients";
+
+/// The validation path of the `MaxResults` member a listing's page size is asked for in, as
+/// the framework spells a member path.
+const MAX_RESULTS_MEMBER_PATH: &str = "maxResults";
+
 /// The `com-amazonaws-cognitoidentityprovider-awscognitoidentityproviderservice` emulated service: the generated [`ServiceDefinition`] plus
 /// the behavioral seams this file owns.
 ///
@@ -537,7 +546,7 @@ fn domain_name_prose(operation: &str, violations: &[(Violation, SubmittedEcho)])
 /// Whether `violation` is one this service does NOT refuse on, because Amazon Cognito
 /// SERVES the request that carries it — the handler then answers it from stored state.
 ///
-/// Two kinds of member reach this:
+/// Three kinds of member reach this:
 ///
 /// * A lookup addressed BY a hosted domain name reports the domain that name holds, and a
 ///   name no create could ever take holds none — so Amazon Cognito answers such a lookup with
@@ -557,6 +566,13 @@ fn domain_name_prose(operation: &str, violations: &[(Violation, SubmittedEcho)])
 ///
 /// Only the form of the presented value is served this way: a required member the request
 /// omitted carries no value to verify, so it keeps the framework's refusal.
+///
+/// A third kind is a PAGE SIZE under the minimum the model declares for it: the app-client
+/// listing is recorded answering such a request with a page — HTTP 200 carrying its
+/// `UserPoolClients` member — rather than refusing it, so the listing serves it and reports
+/// the items a page of that size holds. Only the floor is served: a page size over the
+/// declared maximum asks for more than the listing serves at once, which is not a page it
+/// has, and keeps the framework's refusal.
 fn served_despite(operation: &str, violation: &Violation) -> bool {
     let presented_value = !matches!(violation.kind, ViolationKind::MissingRequiredMember);
     (operation == DESCRIBE_USER_POOL_DOMAIN
@@ -565,6 +581,9 @@ fn served_despite(operation: &str, violation: &Violation) -> bool {
         || (operation == GET_CLIENT_TOKEN
             && violation.path == SECRET_MEMBER_PATH
             && presented_value)
+        || (operation == LIST_USER_POOL_CLIENTS
+            && violation.path == MAX_RESULTS_MEMBER_PATH
+            && matches!(violation.kind, ViolationKind::MinValue(_)))
 }
 
 impl<O> WithSubmittedValues<O>

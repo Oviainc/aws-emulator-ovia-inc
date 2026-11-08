@@ -305,7 +305,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
@@ -318,6 +317,41 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "unset" means.
         let policies = crate::state::effective_policies(input.policies);
         let user_pool_tier = crate::state::effective_user_pool_tier(input.user_pool_tier);
+        let auto_verified_attributes = input.auto_verified_attributes.unwrap_or_default();
+        let mfa_configuration = crate::state::effective_mfa_configuration(input.mfa_configuration);
+        let account_recovery_setting =
+            crate::state::effective_account_recovery_setting(input.account_recovery_setting);
+        // A cross-member precondition on the configuration this update would
+        // leave the pool with, asked BEFORE the pool is looked up or written —
+        // the same question `CreateUserPool` asks of the same values
+        // (`crate::state::pool_preconditions`).
+        if crate::state::duplicate_recovery_mechanisms(&account_recovery_setting) {
+            return Err(invalid_parameter(
+                crate::state::DUPLICATE_RECOVERY_MECHANISMS_MESSAGE.to_string(),
+            ));
+        }
+        if crate::state::sms_configuration_missing_for_auto_verification(
+            &auto_verified_attributes,
+            input.sms_configuration.as_ref(),
+        ) {
+            return Err(invalid_parameter(
+                crate::state::SMS_CONFIGURATION_REQUIRED_MESSAGE.to_string(),
+            ));
+        }
+        // A pool sends SMS by assuming the role its `SmsConfiguration` names, so a
+        // role that does not let Amazon Cognito assume it is refused rather than
+        // stored as a delivery path that could never send
+        // ([`crate::state::sms_caller_role_is_unassumable`]). Awaited with no state
+        // guard held, before the pool is read.
+        if crate::state::sms_caller_role_is_unassumable(
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            input.sms_configuration.as_ref(),
+        )
+        .await
+        {
+            return Err(invalid_sms_role_trust_relationship());
+        }
         let mut guard = state.lock();
         let pool = guard
             .pool_mut(&input.user_pool_id)
@@ -336,6 +370,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(feature_unavailable_in_tier(message));
         }
 
+        // MFA is turned on when a pool is CREATED or through
+        // `SetUserPoolMfaConfig`, which is also where the factor an MFA challenge
+        // is presented over is configured — this operation models no factor at
+        // all — so an update that would move a pool from MFA `OFF` to `ON` or
+        // `OPTIONAL` is refused. A request that repeats the mode the pool already
+        // holds, or turns MFA off, changes nothing about whether the pool can
+        // challenge and is served. Judged before the first member is written, so a
+        // refused update leaves the pool exactly as it was.
+        if pool.mfa_configuration == crate::state::MFA_OFF
+            && mfa_configuration != crate::state::MFA_OFF
+        {
+            return Err(invalid_parameter(MFA_NOT_TURNED_ON_BY_UPDATE_MESSAGE.to_string()));
+        }
+
         // `PoolName` is "the updated name of your user pool" and a pool must carry a
         // name — there is no default to fall back to — so an absent `PoolName` leaves
         // the stored name alone. Every OTHER member below is REPLACED: the request's
@@ -350,21 +398,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         pool.admin_create_user_config =
             crate::state::effective_admin_create_user_config(input.admin_create_user_config);
         pool.user_pool_tier = user_pool_tier;
-        pool.mfa_configuration = crate::state::effective_mfa_configuration(input.mfa_configuration);
+        pool.mfa_configuration = mfa_configuration;
         pool.deletion_protection =
             crate::state::effective_deletion_protection(input.deletion_protection);
         // A pool always applies an account-recovery configuration, so an update
         // that carries none restores the service default rather than leaving the
         // pool with nothing ([`crate::state::effective_account_recovery_setting`]).
-        pool.account_recovery_setting = Some(crate::state::effective_account_recovery_setting(
-            input.account_recovery_setting,
-        ));
+        pool.account_recovery_setting = Some(account_recovery_setting);
 
         // Everything else is optional with no default but "absent", so an omitted
         // member clears what the pool held — except the configuration blocks the
         // service materialises for every pool, which go back to the defaults
         // `state.rs` owns, exactly as a create with no such member stores them.
-        pool.auto_verified_attributes = input.auto_verified_attributes.unwrap_or_default();
+        pool.auto_verified_attributes = auto_verified_attributes;
         pool.lambda_config = crate::state::effective_lambda_config(input.lambda_config);
         pool.device_configuration = input.device_configuration;
         pool.email_configuration =
@@ -409,6 +455,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The message this operation's `InvalidParameterException` carries for a request
+/// that would turn a created pool's MFA on. Fixed text, naming neither the pool
+/// nor the mode the request asked for.
+const MFA_NOT_TURNED_ON_BY_UPDATE_MESSAGE: &str =
+    "Cannot turn MFA functionality ON, once the user pool has been created.";
+
 /// This operation's `ResourceNotFoundException` for an absent user pool.
 ///
 /// Its message is EMPTY: this operation reports the unresolved pool by the error
@@ -430,6 +482,30 @@ fn feature_unavailable_in_tier(message: String) -> UpdateUserPoolError {
             message: Some(message),
         },
     )
+    .into()
+}
+
+/// This operation's `InvalidSmsRoleTrustRelationshipException` for an
+/// `SmsConfiguration` naming a role Amazon Cognito cannot assume
+/// ([`crate::state::SMS_ROLE_TRUST_RELATIONSHIP_MESSAGE`]).
+fn invalid_sms_role_trust_relationship() -> UpdateUserPoolError {
+    UpdateUserPoolErrorModeled::InvalidSmsRoleTrustRelationshipException(
+        InvalidSmsRoleTrustRelationshipException {
+            message: Some(crate::state::SMS_ROLE_TRUST_RELATIONSHIP_MESSAGE.to_string()),
+        },
+    )
+    .into()
+}
+
+/// This operation's `InvalidParameterException` for a pool configuration this
+/// update may not leave the pool in, carrying `message`.
+fn invalid_parameter(message: String) -> UpdateUserPoolError {
+    UpdateUserPoolErrorModeled::InvalidParameterException(InvalidParameterException {
+        message: Some(message),
+        // `reasonCode` is AWS's own classification of the bad parameter and this
+        // service's model documents no value for it, so nothing is invented here.
+        reason_code: None,
+    })
     .into()
 }
 

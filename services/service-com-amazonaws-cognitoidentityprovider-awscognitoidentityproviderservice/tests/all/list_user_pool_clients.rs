@@ -671,19 +671,13 @@ async fn a_request_outside_a_modelled_constraint_is_refused() {
     // (`smithy_query(query="operation",operation="ListUserPoolClients")`):
     // `MaxResults` range 1..60, `UserPoolId` length 1..55 with pattern
     // `^[\w-]+_[0-9a-zA-Z]+$`, and `NextToken` length 1..131072 with pattern
-    // `^[\S]+$`.
+    // `^[\S]+$`. A `MaxResults` below the range MINIMUM is not here: Amazon
+    // Cognito serves such a request with a page rather than refusing it, which
+    // `tests/all/user_pool_request_preconditions.rs` covers.
     for (label, body) in [
         (
             "MaxResults 61, one past the range maximum 60",
             list_request(&user_pool_id, Some(61), None),
-        ),
-        (
-            "MaxResults 0, one below the range minimum 1",
-            list_request(&user_pool_id, Some(0), None),
-        ),
-        (
-            "MaxResults -1, below the range minimum 1",
-            list_request(&user_pool_id, Some(-1), None),
         ),
         (
             "an empty user pool id, below the length minimum 1",

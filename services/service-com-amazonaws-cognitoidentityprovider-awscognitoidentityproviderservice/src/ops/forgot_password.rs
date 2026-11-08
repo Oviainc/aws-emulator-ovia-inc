@@ -277,6 +277,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if !user.enabled {
             return Err(not_authorized("User is disabled."));
         }
+        // A self-service reset replaces the password the user OWNS, so a user that
+        // owns none — one that has never confirmed its sign-up, and one still
+        // holding the temporary password an administrator created it with — has no
+        // password for a reset to apply to and is refused rather than sent a code
+        // ([`crate::state::UserStatus::holds_own_password`], the same precondition
+        // `AdminResetUserPassword` applies).
+        if !user.status.holds_own_password() {
+            return Err(not_authorized(
+                crate::state::PASSWORD_NOT_RESETTABLE_MESSAGE,
+            ));
+        }
         let username = user.username.clone();
 
         // "The message delivery method is determined by the user's available attributes

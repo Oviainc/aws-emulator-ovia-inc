@@ -194,14 +194,18 @@ fn mfa_cases() -> Vec<MfaCase> {
         MfaCase {
             // `UserPoolMfaType` admits OFF | ON | OPTIONAL (this service's model);
             // this row is the third value, with TOTP configured but switched off.
-            case: "TOTP configured but disabled, MFA optional",
+            // Turning MFA on at all takes one enabled factor, so the email factor
+            // beside it is what this pool would challenge with.
+            case: "TOTP configured but disabled beside email OTP, MFA optional",
             request: json!({
                 "MfaConfiguration": "OPTIONAL",
-                "SoftwareTokenMfaConfiguration": { "Enabled": false }
+                "SoftwareTokenMfaConfiguration": { "Enabled": false },
+                "EmailMfaConfiguration": { "Message": "Your code is {####}" }
             }),
             expected: json!({
                 "MfaConfiguration": "OPTIONAL",
-                "SoftwareTokenMfaConfiguration": { "Enabled": false }
+                "SoftwareTokenMfaConfiguration": { "Enabled": false },
+                "EmailMfaConfiguration": { "Message": "Your code is {####}" }
             }),
         },
         MfaCase {
@@ -269,9 +273,13 @@ fn mfa_cases() -> Vec<MfaCase> {
             // `WebAuthnFactorConfigurationType` admits
             // MULTI_FACTOR_WITH_USER_VERIFICATION | SINGLE_FACTOR (this service's
             // model); this row takes one value of each and the next row the other.
-            case: "passkeys with required user verification, satisfying MFA",
+            // Passkeys are not one of the three factors an MFA challenge is
+            // presented over, so a pool that requires MFA enables one of those
+            // three beside them (`SetUserPoolMfaConfig`'s own refusal names them).
+            case: "passkeys with required user verification, beside TOTP, satisfying MFA",
             request: json!({
                 "MfaConfiguration": "ON",
+                "SoftwareTokenMfaConfiguration": { "Enabled": true },
                 "WebAuthnConfiguration": {
                     "RelyingPartyId": "auth.example.com",
                     "UserVerification": "required",
@@ -280,6 +288,7 @@ fn mfa_cases() -> Vec<MfaCase> {
             }),
             expected: json!({
                 "MfaConfiguration": "ON",
+                "SoftwareTokenMfaConfiguration": { "Enabled": true },
                 "WebAuthnConfiguration": {
                     "RelyingPartyId": "auth.example.com",
                     "UserVerification": "required",
@@ -415,11 +424,13 @@ async fn a_set_replaces_the_factors_the_request_leaves_out() {
     .await;
 
     // A set that carries only the MFA mode clears every factor whose
-    // configuration belongs to the MFA configuration alone.
+    // configuration belongs to the MFA configuration alone. The mode it carries is
+    // `OFF`, because a pool that requires or offers MFA needs a factor to challenge
+    // with and this request enables none.
     let narrowed = ok(
         &router,
         "SetUserPoolMfaConfig",
-        &set_request(&user_pool_id, &json!({ "MfaConfiguration": "OPTIONAL" })),
+        &set_request(&user_pool_id, &json!({ "MfaConfiguration": "OFF" })),
     )
     .await;
     for factor in [
@@ -434,7 +445,7 @@ async fn a_set_replaces_the_factors_the_request_leaves_out() {
     }
     assert_eq!(
         narrowed.get("MfaConfiguration"),
-        Some(&json!("OPTIONAL")),
+        Some(&json!("OFF")),
         "case {case:?}: got {narrowed}"
     );
 

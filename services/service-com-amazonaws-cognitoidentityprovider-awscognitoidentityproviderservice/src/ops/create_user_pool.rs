@@ -370,6 +370,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         pool.sms_authentication_message = input.sms_authentication_message;
         pool.tags = input.user_pool_tags.unwrap_or_default();
 
+        // A cross-member precondition on the configuration this create would
+        // store, asked before the pool exists so nothing is stored — the same
+        // question `UpdateUserPool` asks of the same values
+        // (`crate::state::pool_preconditions`).
+        if let Some(setting) = pool.account_recovery_setting.as_ref() {
+            if crate::state::duplicate_recovery_mechanisms(setting) {
+                return Err(invalid_parameter(
+                    crate::state::DUPLICATE_RECOVERY_MECHANISMS_MESSAGE.to_string(),
+                ));
+            }
+        }
+        if crate::state::sms_configuration_missing_for_auto_verification(
+            &pool.auto_verified_attributes,
+            pool.sms_configuration.as_ref(),
+        ) {
+            return Err(invalid_parameter(
+                crate::state::SMS_CONFIGURATION_REQUIRED_MESSAGE.to_string(),
+            ));
+        }
+        // A pool sends SMS by assuming the role its `SmsConfiguration` names, so a
+        // role that does not let Amazon Cognito assume it is refused rather than
+        // stored as a delivery path that could never send
+        // ([`crate::state::sms_caller_role_is_unassumable`]). Awaited with no state
+        // guard held, before the pool exists.
+        if crate::state::sms_caller_role_is_unassumable(ctx, &region, pool.sms_configuration.as_ref())
+            .await
+        {
+            return Err(invalid_sms_role_trust_relationship());
+        }
+
         // A pool configuration member whose feature plan the pool is not on is
         // refused before the pool exists, so nothing is stored: the plan judged
         // is the one this create CONFIGURES, and the rule is the one
@@ -433,6 +463,18 @@ fn invalid_parameter(message: String) -> CreateUserPoolError {
         message: Some(message),
         reason_code: None,
     })
+    .into()
+}
+
+/// This operation's `InvalidSmsRoleTrustRelationshipException` for an
+/// `SmsConfiguration` naming a role Amazon Cognito cannot assume
+/// ([`crate::state::SMS_ROLE_TRUST_RELATIONSHIP_MESSAGE`]).
+fn invalid_sms_role_trust_relationship() -> CreateUserPoolError {
+    CreateUserPoolErrorModeled::InvalidSmsRoleTrustRelationshipException(
+        InvalidSmsRoleTrustRelationshipException {
+            message: Some(crate::state::SMS_ROLE_TRUST_RELATIONSHIP_MESSAGE.to_string()),
+        },
+    )
     .into()
 }
 

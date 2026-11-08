@@ -506,7 +506,7 @@ async fn an_update_restores_the_blocks_it_names_none_of_and_keeps_the_pools_tags
     ok(
         &router,
         "UpdateUserPool",
-        &json!({ "UserPoolId": user_pool_id, "MfaConfiguration": "OPTIONAL" }),
+        &json!({ "UserPoolId": user_pool_id, "DeletionProtection": "ACTIVE" }),
     )
     .await;
     assert_member(

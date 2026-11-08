@@ -39,6 +39,10 @@ const TRIGGER_POST_CONFIRMATION: &str =
 /// The name every case's pool is created with.
 const CREATED_POOL_NAME: &str = "update-rule-pool";
 
+/// The Amazon SNS caller a pool's SMS messages are sent through
+/// (`SmsConfigurationType.SnsCallerArn`).
+const SNS_CALLER_ARN: &str = "arn:aws:iam::000000000000:role/sms-caller";
+
 /// One emulator with just this service mounted.
 fn router() -> MultiServiceRouter {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
@@ -348,11 +352,16 @@ fn update_cases() -> Vec<UpdateCase> {
             case: "two auto-verified attributes, a device configuration and an SMS message",
             request: json!({
                 "AutoVerifiedAttributes": ["email", "phone_number"],
+                // Auto-verifying `phone_number` sends that verification over SMS,
+                // so the update carries the Amazon SNS caller SMS is sent through:
+                // the pairing is refused without it.
+                "SmsConfiguration": { "SnsCallerArn": SNS_CALLER_ARN },
                 "DeviceConfiguration": { "ChallengeRequiredOnNewDevice": true },
                 "SmsAuthenticationMessage": "Updated code {####}"
             }),
             expected: overriding(vec![
                 ("AutoVerifiedAttributes", json!(["email", "phone_number"])),
+                ("SmsConfiguration.SnsCallerArn", json!(SNS_CALLER_ARN)),
                 (
                     "DeviceConfiguration.ChallengeRequiredOnNewDevice",
                     json!(true),

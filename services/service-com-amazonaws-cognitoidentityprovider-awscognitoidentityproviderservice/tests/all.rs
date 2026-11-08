@@ -243,6 +243,8 @@ mod user_pool_mfa_config;
 mod user_pool_replica_deletion;
 #[path = "all/user_pool_replicas.rs"]
 mod user_pool_replicas;
+#[path = "all/user_pool_request_preconditions.rs"]
+mod user_pool_request_preconditions;
 #[path = "all/user_pool_server_set_configuration.rs"]
 mod user_pool_server_set_configuration;
 #[path = "all/user_pool_web_acl_edge.rs"]

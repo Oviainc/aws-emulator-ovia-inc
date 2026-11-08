@@ -219,10 +219,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(internal_error());
         };
+
+        // A pool sends SMS by assuming the role its `SmsConfiguration` names, so a
+        // role that does not let Amazon Cognito assume it is refused rather than
+        // stored as a delivery path that could never send
+        // ([`crate::state::sms_caller_role_is_unassumable`]). Awaited with no state
+        // guard held, before the pool is read.
+        if crate::state::sms_caller_role_is_unassumable(
+            ctx,
+            &crate::state::request_region(ctx.parts()),
+            input
+                .sms_mfa_configuration
+                .as_ref()
+                .and_then(|sms| sms.sms_configuration.as_ref()),
+        )
+        .await
+        {
+            return Err(invalid_sms_role_trust_relationship());
+        }
 
         // The mode this call leaves the pool in. `MfaConfiguration` is optional and
         // `UserPoolMfaType` has no "unset" value, so a request that carries none
@@ -234,6 +251,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let pool = guard
             .pool_mut(&input.user_pool_id)
             .ok_or_else(|| user_pool_not_found(&input.user_pool_id))?;
+
+        // Turning MFA on is turning on a CHALLENGE, and a challenge is issued over
+        // one of the factors this request configures: SMS message, email message or
+        // a time-based one-time password. A request that sets `MfaConfiguration`
+        // away from `OFF` while enabling none of them asks the pool to require a
+        // factor it could never present, so it is refused before anything is
+        // stored — asked after the lookup, so a request naming no pool is reported
+        // as such whatever else it carries.
+        if mfa_configuration != crate::state::MFA_OFF
+            && !enables_an_mfa_factor(
+                input.sms_mfa_configuration.as_ref(),
+                input.email_mfa_configuration.as_ref(),
+                input.software_token_mfa_configuration.as_ref(),
+            )
+        {
+            return Err(invalid_parameter(MFA_METHOD_REQUIRED_MESSAGE.to_string()));
+        }
 
         // SMS codes are delivered through the Amazon SNS caller that
         // `SmsConfiguration` names, so a pool that offers SMS as an MFA factor needs
@@ -311,14 +345,57 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
+/// The message this operation's `InvalidParameterException` carries for a request
+/// that turns MFA on with no factor enabled ([`enables_an_mfa_factor`]). Fixed
+/// text, naming the three factors a pool can challenge with.
+const MFA_METHOD_REQUIRED_MESSAGE: &str =
+    "Invalid MFA Configuration given. SMS MFA, Email MFA, or Software Token MFA must be enabled.";
+
+/// Whether this request leaves the pool with at least one MFA factor to
+/// challenge with.
+///
+/// Configuring `SmsMfaConfiguration` or `EmailMfaConfiguration` IS enabling that
+/// factor — each carries the message template the code is sent with and no
+/// activation flag of its own — while TOTP carries one: "the activation state of
+/// TOTP MFA" (`SoftwareTokenMfaConfigType.Enabled` in this service's model), so a
+/// software-token configuration that is present and disabled enables nothing.
+/// Passkeys are not one of the three: `WebAuthnConfiguration` configures sign-in
+/// with authenticators rather than a factor an MFA challenge is presented over.
+fn enables_an_mfa_factor(
+    sms: Option<&SmsMfaConfigType>,
+    email: Option<&EmailMfaConfigType>,
+    software_token: Option<&SoftwareTokenMfaConfigType>,
+) -> bool {
+    sms.is_some()
+        || email.is_some()
+        || software_token.is_some_and(|software_token| software_token.enabled)
+}
+
 /// The refusal for an SMS MFA factor with no Amazon SNS caller configuration.
 fn sms_configuration_required() -> SetUserPoolMfaConfigError {
+    invalid_parameter("[SmsConfiguration] is a required member of [SmsMfaConfiguration].".to_string())
+}
+
+/// This operation's `InvalidParameterException`, carrying `message`.
+fn invalid_parameter(message: String) -> SetUserPoolMfaConfigError {
     SetUserPoolMfaConfigErrorModeled::InvalidParameterException(InvalidParameterException {
-        message: Some(
-            "[SmsConfiguration] is a required member of [SmsMfaConfiguration].".to_string(),
-        ),
+        message: Some(message),
+        // `reasonCode` is AWS's own classification of the bad parameter and this
+        // service's model documents no value for it, so nothing is invented here.
         reason_code: None,
     })
+    .into()
+}
+
+/// This operation's `InvalidSmsRoleTrustRelationshipException` for an
+/// `SmsConfiguration` naming a role Amazon Cognito cannot assume
+/// ([`crate::state::SMS_ROLE_TRUST_RELATIONSHIP_MESSAGE`]).
+fn invalid_sms_role_trust_relationship() -> SetUserPoolMfaConfigError {
+    SetUserPoolMfaConfigErrorModeled::InvalidSmsRoleTrustRelationshipException(
+        InvalidSmsRoleTrustRelationshipException {
+            message: Some(crate::state::SMS_ROLE_TRUST_RELATIONSHIP_MESSAGE.to_string()),
+        },
+    )
     .into()
 }
 
