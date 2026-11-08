@@ -36,7 +36,7 @@ use service_com_amazonaws_cloudformation_cloudformation::state::{
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::stack_lifecycle::{
-    call, create_stack, member, router, sns, wait_for_the_transition, xml_blocks, xml_text,
+    call, create_stack, member, router, sns, wait_for_the_transition,
 };
 use crate::stack_resources::sns_arn;
 use crate::update_rollback_recovery::{
@@ -169,25 +169,9 @@ async fn still_there(router: &MultiServiceRouter, subject: &Subject) -> (bool, S
 }
 
 /// Every `ResourceStatus` the stack's event stream carries for `logical_id`, which is what
-/// says whether the rollback skipped that resource's deletion or carried it out.
-async fn event_statuses(
-    router: &MultiServiceRouter,
-    case: &str,
-    stack: &str,
-    logical_id: &str,
-) -> Vec<String> {
-    let (http_status, body) =
-        call(router, "DescribeStackEvents", &[member("StackName", stack)]).await;
-    assert_eq!(
-        http_status, 200,
-        "case {case:?}: expected DescribeStackEvents to succeed, got {http_status} {body}"
-    );
-    xml_blocks(&body, "member")
-        .iter()
-        .filter(|entry| xml_text(entry, "LogicalResourceId").as_deref() == Some(logical_id))
-        .filter_map(|entry| xml_text(entry, "ResourceStatus"))
-        .collect()
-}
+/// says whether the rollback skipped that resource's deletion or carried it out: the crate's
+/// ONE reader of them ([`crate::stack_lifecycle::resource_event_statuses`]).
+use crate::stack_lifecycle::resource_event_statuses as event_statuses;
 
 #[tokio::test]
 async fn a_requested_rollback_gives_up_each_resource_as_its_deletion_policy_states() {

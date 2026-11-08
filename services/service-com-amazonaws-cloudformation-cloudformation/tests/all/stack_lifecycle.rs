@@ -280,6 +280,36 @@ pub(crate) async fn resource_event_reason(
         .unwrap_or_default()
 }
 
+/// Every `ResourceStatus` the stack's event stream carries for `logical_id`, newest first —
+/// `DescribeStackEvents` "returns all stack related events for a specified stack in reverse
+/// chronological order".
+///
+/// The statuses counterpart of [`resource_event_reason`], and the ONE reader of them: what a
+/// stack's event stream says BECAME of one resource — whether its deletion was skipped, carried
+/// out, or reported at all — is read the same way by every suite that asks.
+pub(crate) async fn resource_event_statuses(
+    router: &MultiServiceRouter,
+    case: &str,
+    stack: &str,
+    logical_id: &str,
+) -> Vec<String> {
+    let (code, body) = call(
+        router,
+        "DescribeStackEvents",
+        &[member("StackName", stack)],
+    )
+    .await;
+    assert_eq!(
+        code, 200,
+        "case {case:?}: DescribeStackEvents({stack}) must answer 200, got {code} {body}"
+    );
+    xml_blocks(&body, "member")
+        .iter()
+        .filter(|entry| xml_text(entry, "LogicalResourceId").as_deref() == Some(logical_id))
+        .filter_map(|entry| xml_text(entry, "ResourceStatus"))
+        .collect()
+}
+
 /// Wait past the instant a drift detection's own result becomes due.
 ///
 /// The drift clock's counterpart to [`wait_for_the_transition`], shared by every suite that

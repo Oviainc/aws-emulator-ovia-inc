@@ -37,6 +37,11 @@ pub struct Revision<'a> {
     /// The exported values in force in the instance's own Region, which its template's
     /// `Fn::ImportValue` references resolve against.
     pub exports: &'a BTreeMap<String, String>,
+    /// The physical names the live stacks of the instance's own Region manage, read once per
+    /// Region by the caller and shared by every instance deployed into it: a resource this
+    /// redeployment CREATES under a name another stack owns fails in CloudFormation's own
+    /// words ([`super::physical_name`]).
+    pub managed: &'a super::physical_name::ManagedNames,
 }
 
 /// WHICH instance one call of [`redeploy`] acts on, and as part of which operation: the
@@ -151,7 +156,10 @@ pub fn redeploy(
             previous,
             cannot_deploy,
             refused,
-            provenance: stack.provenance(),
+            provenance: super::provisioning::StackProvenance {
+                managed_names: revision.managed.clone(),
+                ..stack.provenance()
+            },
         })
     });
     // "PENDING: The operation in the specified account and Region has yet to start", and the

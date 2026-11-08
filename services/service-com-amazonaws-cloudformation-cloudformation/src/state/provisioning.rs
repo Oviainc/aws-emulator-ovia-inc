@@ -364,6 +364,24 @@ pub struct StackProvenance {
     /// in the summary of what could not be created
     /// ([`super::create_action`]).
     pub express: bool,
+    /// Which physical resource names the live stacks of the Region already manage, and which
+    /// stack manages each ([`super::physical_name::ManagedName`]).
+    ///
+    /// CloudFormation holds that record itself, so a create the owning service refused
+    /// because the name is already in use is reported in CLOUDFORMATION's own words, naming
+    /// the stack that holds the name, rather than as that service's report about its own
+    /// namespace ([`already_managed_reason`]). The operation that deploys the stack reads the
+    /// index under the store lock
+    /// ([`super::ComAmazonawsCloudformationCloudformationState::managed_physical_names`]),
+    /// since the walk itself holds none.
+    ///
+    /// EMPTY where the deployment re-creates only resources the stack ALREADY owned — its own
+    /// rollback, its continued rollback, a revert — because those names are this stack's and
+    /// so collide with no other stack's.
+    ///
+    /// SHARED: one read per Region answers every deployment one request sets off
+    /// ([`super::physical_name::ManagedNames`]).
+    pub managed_names: super::physical_name::ManagedNames,
 }
 
 impl StackProvenance {
@@ -2303,7 +2321,9 @@ pub async fn reconcile(
         // stack had before this deployment, or one this very walk has just created — cannot
         // be created, so nothing is asked of the owning service and the failure is reported
         // in CloudFormation's own words rather than as a handler's refusal
-        // ([`super::physical_name`]).
+        // ([`super::physical_name`]). The same reason is what a create the OWNING service
+        // refuses as a name already in use is reported with where this Region's stacks are
+        // what hold it ([`already_managed_reason`]).
         let collision = super::physical_name::taken_in_the_stack(
             &resource,
             outcome
@@ -2588,7 +2608,13 @@ pub async fn reconcile(
                 outcome.transitions.push(ResourceTransition::failed(
                     &resource,
                     super::resource_status::CREATE_FAILED,
-                    handler_failure_reason(owner, &refusal, &resource.physical_resource_id),
+                    // A name already in use that THIS REGION's stacks are what hold is
+                    // reported in CloudFormation's own words, naming the stack that manages
+                    // it; everything else the owning service refused is reported as that
+                    // service worded it.
+                    already_managed_reason(&resource, stack, &refusal).unwrap_or_else(|| {
+                        handler_failure_reason(owner, &refusal, &resource.physical_resource_id)
+                    }),
                 ));
                 outcome.resources.push(resource);
                 break;
@@ -3280,14 +3306,13 @@ async fn delete_pass(
             // Nothing exists in any owning service for this resource, so nothing is asked
             // of anybody. The stack still HELD the record, though, and its teardown is
             // reported exactly as every other resource's is — whether an owning service
-            // had one to delete is not something a stack's event stream says. Two records
-            // have no teardown at all: one whose create an owning service refused or never
-            // reached (the stack does not hold it), and one an earlier pass of this same
-            // walk already took down.
-            if owner.is_some()
-                || !held.contains(&resource.logical_id)
-                || opened.contains(&resource.logical_id)
-            {
+            // had one to delete is not something a stack's event stream says, and the
+            // record this disposal leaves says `DELETE_COMPLETE` either way
+            // ([`super::stack::disposed_resources`]), so a resource whose create FAILED
+            // goes through the delete pair as well. Two records have no teardown at all:
+            // one the stack does not hold (a declaration the operation never reached) and
+            // one an earlier pass of this same walk already took down.
+            if !held.contains(&resource.logical_id) || opened.contains(&resource.logical_id) {
                 continue;
             }
         }
@@ -3325,7 +3350,7 @@ async fn delete_pass(
         // OF ITS OWN it is made here, BEFORE the delete — so the snapshot outlives the
         // resource either way. A type whose owning service takes no snapshot on the way out
         // is deleted as it is for the default policy: there is no snapshot of it to take.
-        let final_snapshot = (policy == super::deletion_policy::SNAPSHOT)
+        let final_snapshot = (policy == super::deletion_policy::SNAPSHOT && resource.materialised)
             .then(|| final_snapshot_identifier(resource));
         if let Some(identifier) = final_snapshot.as_deref() {
             let resource = &outcome.resources[index];
@@ -3370,7 +3395,12 @@ async fn delete_pass(
         let provider_delete = (resource.materialised
             && custom_resource::is_custom_resource(&resource.resource_type))
             .then(custom_resource::new_request_id);
-        let deleted = match (&provider_delete, owner) {
+        // ...and the owning service is asked ONLY about a resource that really exists: a
+        // record nothing created has no resource anywhere to delete, and the identifier it
+        // carries may be another stack's (the name its create was refused for), which is
+        // that stack's to keep.
+        let asked = owner.filter(|_| resource.materialised);
+        let deleted = match (&provider_delete, asked) {
             (Some(request_id), _) => {
                 let call = custom_resource::ProviderCall {
                     request_type: custom_resource::request_type::DELETE,
@@ -3409,7 +3439,7 @@ async fn delete_pass(
                 // complete while a resource it deleted is still there. An unanswered read is
                 // no evidence that the resource is still there, so it opens no wait: the
                 // delete itself went through.
-                let removal = match (&provider_request, owner) {
+                let removal = match (&provider_request, asked) {
                     // The provider has been SENT the `Delete`; the resource is gone when it
                     // answers, which is a wait like any other.
                     (Some(_), _) => Ok(Removal::Pending(
@@ -3738,7 +3768,10 @@ const HANDLER_ERROR_CLASSES: &[(&str, &[&str])] = &[
         "ServiceLimitExceeded",
         &["LimitExceeded", "QuotaExceeded", "TooManyEntries"],
     ),
-    ("AlreadyExists", &["AlreadyExists", "AlreadyOwnedBy", "Duplicate"]),
+    (
+        HANDLER_ERROR_ALREADY_EXISTS,
+        &["AlreadyExists", "AlreadyOwnedBy", "Duplicate"],
+    ),
     ("NotFound", &["NotFound", "NoSuch", "DoesNotExist"]),
     (
         "ResourceConflict",
@@ -3773,6 +3806,11 @@ const HANDLER_ERROR_CLASSES: &[(&str, &[&str])] = &[
 /// Read by [`super::provisioner::Provisioner::handler_message`] too: it is the class whose
 /// own wording some providers carry inside the message.
 pub(super) const HANDLER_ERROR_INVALID_REQUEST: &str = "InvalidRequest";
+
+/// The class a refusal that the resource's NAME is already in use falls in — the one class
+/// CloudFormation's own record of the account and Region can say more about than the service
+/// that answered it ([`already_managed_reason`]).
+const HANDLER_ERROR_ALREADY_EXISTS: &str = "AlreadyExists";
 
 /// The lowest HTTP status that is the owning SERVICE failing rather than the request being
 /// wrong, for an answer that carried no error code at all ([`UNNAMED_CODE_PREFIX`]).
@@ -3845,6 +3883,41 @@ fn handler_failure_reason(owner: Option<Owner>, refusal: &Refusal, identifier: &
     )
 }
 
+
+/// CLOUDFORMATION's own reason for a create the owning service refused because the name is
+/// already in use AND a live stack of this Region is what manages the resource holding it, or
+/// `None` where the refusal is not that.
+///
+/// The service that owns a type arbitrates its own namespace, and a name already in use is
+/// what it answers the `AlreadyExists` class for ([`handler_error_code`]) — but CloudFormation
+/// knows something that service cannot: WHICH STACK manages the resource that holds the name.
+/// Where the holder is one of this Region's stacks, the resource's event therefore carries
+/// CloudFormation's own sentence naming that stack
+/// ([`super::physical_name::already_exists_in_stack`]) instead of the owning service's report
+/// about its own namespace, which is the actionable half of the failure. A name no stack of
+/// the Region manages is nothing CloudFormation can add to — a name another account holds, or
+/// one a client took outside any stack — so that service's own message stands.
+///
+/// Asked at the refusal rather than ahead of the create for the reason
+/// [`super::physical_name`] records: a create the owning service ACCEPTS under a name one of
+/// this Region's stacks holds is a deployment that got the resource it declared, and nothing
+/// of CloudFormation's turns it into a failure.
+fn already_managed_reason(
+    resource: &StoredResource,
+    stack: &StackProvenance,
+    refusal: &Refusal,
+) -> Option<String> {
+    if handler_error_code(&refusal.code) != HANDLER_ERROR_ALREADY_EXISTS {
+        return None;
+    }
+    super::physical_name::taken_by_another_stack(resource, &stack.managed_names, &stack.stack_id)
+        .map(|held| {
+            super::physical_name::already_exists_in_stack(
+                &held.physical_resource_id,
+                &held.stack_id,
+            )
+        })
+}
 
 /// The refusal the stack's SERVICE ROLE answers a call of `operation` on `signing_name`
 /// with, or `None` where nothing refuses it — so a call the role's policies deny is never

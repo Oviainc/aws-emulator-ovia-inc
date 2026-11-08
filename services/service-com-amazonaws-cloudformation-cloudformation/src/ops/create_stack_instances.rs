@@ -621,6 +621,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 )
                 .into());
             }
+            // Which physical names the live stacks of each TARGET Region manage: one read per
+            // Region, shared by every instance deployed into it
+            // ([`crate::state::physical_name::ManagedNames`]) — a resource a deployment
+            // CREATES under a name another stack owns fails in CloudFormation's own words.
+            let managed_by_region: ::std::collections::BTreeMap<
+                String,
+                crate::state::physical_name::ManagedNames,
+            > = prepared
+                .iter()
+                .map(|instance| {
+                    (
+                        instance.region.clone(),
+                        store.managed_physical_names(&instance.region),
+                    )
+                })
+                .collect();
             for Prepared {
                 stack,
                 account,
@@ -631,7 +647,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             {
                 let stack_id = stack.stack_id.clone();
                 let declared = stack.current_resources().to_vec();
-                let provenance = stack.provenance();
+                // Which physical names the live stacks of the instance's Region manage: a
+                // resource this deployment CREATES under a name another stack owns fails in
+                // CloudFormation's own words ([`crate::state::physical_name`]).
+                let provenance = crate::state::provisioning::StackProvenance {
+                    managed_names: managed_by_region
+                        .get(&target_region)
+                        .cloned()
+                        .unwrap_or_default(),
+                    ..stack.provenance()
+                };
                 store.stacks.push(stack);
 
                 let mut instance = StoredStackInstance::new(

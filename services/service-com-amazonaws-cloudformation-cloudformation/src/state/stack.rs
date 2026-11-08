@@ -2388,6 +2388,12 @@ impl StoredStack {
             // these resources is reported ([`provisioning::StackProvenance::express`]).
             express: super::stored_deployment_mode(self.deployment_config.as_ref())
                 == Some(super::DEPLOYMENT_MODE_EXPRESS),
+            // A stack holds no record of another stack's resources, so the index of which
+            // stack manages which physical name is the STORE's to read: the operation that
+            // deploys this stack fills it in
+            // ([`provisioning::StackProvenance::managed_names`]), and a deployment that
+            // re-creates only this stack's own resources leaves it empty.
+            managed_names: super::physical_name::ManagedNames::default(),
         }
     }
 

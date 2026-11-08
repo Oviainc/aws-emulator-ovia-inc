@@ -1054,6 +1054,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // that would stop publishing it, or publish another value under it, is the one
             // CloudFormation cancels ([`crate::state::exports`]).
             let importers = store.importers_by_export(&request_region);
+            // ...and which physical names the live stacks of the Region manage, read in the
+            // same breath: a resource this update CREATES under a name another stack owns
+            // fails in CloudFormation's own words ([`crate::state::physical_name`]).
+            let managed = store.managed_physical_names(&request_region);
             let stack = store
                 .resolve_mut(&request_region, &input.stack_name)
                 .filter(|stack| stack.is_live())
@@ -1244,7 +1248,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 stack.region.clone(),
                 stack.current_resources().to_vec(),
                 previous_resources,
-                stack.provenance(),
+                crate::state::provisioning::StackProvenance {
+                    managed_names: managed,
+                    ..stack.provenance()
+                },
                 refused_deployment,
             )
         };

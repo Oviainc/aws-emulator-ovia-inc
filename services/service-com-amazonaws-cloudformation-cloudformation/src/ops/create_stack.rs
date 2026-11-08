@@ -904,7 +904,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // whose owning services now have to create them, and the stack identity and
             // tags CloudFormation tags each of them with.
             let declared = stack.current_resources().to_vec();
-            let provenance = stack.provenance();
+            // ...and which names the OTHER live stacks of the Region already manage, read
+            // here because the walk below holds no lock: a resource whose name one of them
+            // owns fails in CloudFormation's own words
+            // ([`crate::state::physical_name`]).
+            let provenance = crate::state::provisioning::StackProvenance {
+                managed_names: store.managed_physical_names(&region),
+                ..stack.provenance()
+            };
             store.stacks.push(stack);
             (stack_id, declared, provenance)
         };

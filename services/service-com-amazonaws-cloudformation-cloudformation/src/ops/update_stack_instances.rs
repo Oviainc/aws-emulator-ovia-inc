@@ -519,6 +519,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .collect()
         };
 
+        // ...and which physical names the live stacks of each of those Regions MANAGE, read
+        // under the same kind of short lock and shared by every instance deployed into that
+        // Region ([`crate::state::physical_name::ManagedNames`]): a resource one of these
+        // deployments CREATES under a name another stack owns fails in CloudFormation's own
+        // words.
+        let managed_by_region: ::std::collections::BTreeMap<
+            String,
+            crate::state::physical_name::ManagedNames,
+        > = {
+            let store = state.lock();
+            exports_by_region
+                .keys()
+                .map(|target_region| {
+                    (
+                        target_region.clone(),
+                        store.managed_physical_names(target_region),
+                    )
+                })
+                .collect()
+        };
+
         // The operation this call starts, and the instance records it owns, under ONE short
         // lock: no template is read and no stack is touched inside it, so the critical section
         // is a handful of field writes. The OPERATION goes in FIRST, so a concurrent request
@@ -662,6 +683,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let prepared = {
                 let mut store = state.lock();
                 let exports = exports_by_region.get(&plan.region).unwrap_or(&no_exports);
+                // Which physical names the live stacks of the instance's Region manage, read
+                // once per Region above: a resource this deployment CREATES under a name
+                // another stack owns fails in CloudFormation's own words
+                // ([`crate::state::physical_name`]).
+                let managed = managed_by_region
+                    .get(&plan.region)
+                    .cloned()
+                    .unwrap_or_default();
                 // The instance's stack lives in the instance's OWN Region, which is the
                 // Region its resources were created in.
                 let stack = store
@@ -703,7 +732,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         // Region has no value to import, so CloudFormation refuses this
                         // deployment before anything is asked of the owning services.
                         refused: stack.unresolved_import_failure(),
-                        provenance: stack.provenance(),
+                        provenance: crate::state::provisioning::StackProvenance {
+                            managed_names: managed,
+                            ..stack.provenance()
+                        },
                     }
                 })
             };

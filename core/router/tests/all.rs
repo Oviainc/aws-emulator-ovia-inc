@@ -989,8 +989,6 @@ mod lambda_sqs_event_source_batching_window;
 // read from the objects Amazon S3 holds under the role IAM holds.
 #[path = "all/medical_imaging_dicom_import.rs"]
 mod medical_imaging_dicom_import;
-#[path = "all/cloudformation_wafv2_protection_stack.rs"]
-mod cloudformation_wafv2_protection_stack;
 // Declared here, in the appended tail: what REPEATED requests to one deployed stage are each
 // answered with, and the one stream record each new item they write carries.
 #[path = "all/apigateway_repeated_stage_requests.rs"]
@@ -1007,9 +1005,6 @@ mod apigateway_repeated_stage_requests;
 // reason those entries record: the appended tail at the end of this file and the `e…` span
 #[path = "all/eks_control_plane_logs.rs"]
 mod eks_control_plane_logs;
-// Declared in this same head region, for the reason the note above records.
-#[path = "all/bedrock_agentcore_data_plane_parent_resources.rs"]
-mod bedrock_agentcore_data_plane_parent_resources;
 // Declared here, in the appended tail, for the reason the entries above record: the tail and
 // the sorted `c…` span (where every cloudformation and codepipeline suite would land) are
 #[path = "all/cloudformation_provisions_codebuild_projects.rs"]

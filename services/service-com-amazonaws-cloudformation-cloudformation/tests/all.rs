@@ -59,6 +59,8 @@ mod cognito_user_pool_return_values;
 mod content_delivery_stack_outputs;
 #[path = "all/cross_stack_imports.rs"]
 mod cross_stack_imports;
+#[path = "all/cross_stack_name_collision.rs"]
+mod cross_stack_name_collision;
 #[path = "all/custom_resource_providers.rs"]
 mod custom_resource_providers;
 #[path = "all/custom_resource_response_identity.rs"]

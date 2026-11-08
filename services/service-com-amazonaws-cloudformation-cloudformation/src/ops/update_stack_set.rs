@@ -768,6 +768,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 })
                 .collect();
             let no_exports = ::std::collections::BTreeMap::new();
+            // ...and which physical names the live stacks of each of those Regions MANAGE:
+            // one read per Region, shared by every instance redeployed into it
+            // ([`crate::state::physical_name::ManagedNames`]).
+            let managed_by_region: ::std::collections::BTreeMap<
+                String,
+                crate::state::physical_name::ManagedNames,
+            > = exports_by_region
+                .keys()
+                .map(|target_region| {
+                    (
+                        target_region.clone(),
+                        store.managed_physical_names(target_region),
+                    )
+                })
+                .collect();
+            let no_managed_names = crate::state::physical_name::ManagedNames::default();
             for (instance, in_force) in &rollout {
                 let revision = crate::state::stack_set_rollout::Revision {
                     template_body: &template_body,
@@ -778,6 +794,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     exports: exports_by_region
                         .get(&instance.region)
                         .unwrap_or(&no_exports),
+                    managed: managed_by_region
+                        .get(&instance.region)
+                        .unwrap_or(&no_managed_names),
                 };
                 rollouts.extend(crate::state::stack_set_rollout::redeploy(
                     &mut store,

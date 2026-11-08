@@ -18,7 +18,9 @@
 //! **The second rule.** What CloudFormation quotes in a failed resource's
 //! `ResourceStatusReason` is the message the resource's own PROVIDER reported, and the bucket
 //! provider reports a name already in use as the bucket NAME it asked for — so the event says
-//! which bucket collided.
+//! which bucket collided. That is the reason for a name no stack of the Region manages;
+//! a name one of its stacks DOES manage is reported as CloudFormation's own collision
+//! (`cross_stack_name_collision.rs`).
 
 use serde_json::{json, Value};
 
@@ -217,6 +219,12 @@ async fn a_changed_bucket_declaration_is_applied_to_the_bucket_that_exists() {
 /// inside the wrapper CloudFormation quotes a provider's message in — so a client reads WHICH
 /// bucket collided and that the failure is an `AlreadyExists` one.
 ///
+/// The name is taken through Amazon S3's OWN wire rather than by another stack, because a
+/// bucket name is taken from whoever holds it anywhere: a name no stack of the Region manages
+/// is the case the provider's own message is reported for, while a name one of this Region's
+/// stacks manages is reported as CloudFormation's own collision instead
+/// (`cross_stack_name_collision.rs`).
+///
 /// The collision is deployed in a Region other than the one Amazon S3 answers a re-create of
 /// your own bucket with 200 in ("for legacy compatibility, if you re-create an existing bucket
 /// that you already own in the North Virginia Region, Amazon S3 returns 200 OK"), since there
@@ -234,24 +242,15 @@ async fn a_bucket_name_already_in_use_names_the_bucket_it_asked_for() {
         }}
     })
     .to_string();
-    let (code, body) = call_in(
-        &router,
-        REGION,
-        "CreateStack",
-        &[
-            member("StackName", "bucket-collision-first"),
-            member("TemplateBody", &template),
-        ],
-    )
-    .await;
+    let taken = s3(&router, "PUT", &format!("/{TAKEN}"), b"").await;
     assert_eq!(
-        code, 200,
-        "the stack that takes the name must be created first, got {code} {body}"
+        taken.status, 200,
+        "the name must be taken first, got {} {}",
+        taken.status, taken.body
     );
-    wait_for_the_transition().await;
 
-    // A SECOND stack asking for the same name: the create is refused, and the bucket's own
-    // event carries the provider's report of it.
+    // A STACK asking for that name: the create is refused, and the bucket's own event
+    // carries the provider's report of it.
     let (code, body) = call_in(
         &router,
         REGION,

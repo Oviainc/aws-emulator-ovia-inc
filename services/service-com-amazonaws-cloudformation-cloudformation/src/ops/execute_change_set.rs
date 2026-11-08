@@ -316,6 +316,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // in use is PINNED, so an execution that would withdraw one is cancelled rather
             // than carried out ([`crate::state::exports`]).
             let importers = store.importers_by_export(&request_region);
+            // ...and which physical names the live stacks of the Region manage, read in the
+            // same breath: a resource this execution CREATES under a name another stack owns
+            // fails in CloudFormation's own words ([`crate::state::physical_name`]).
+            let managed = store.managed_physical_names(&request_region);
 
             // A change set named beside a stack is addressed WITHIN that stack, so the stack
             // is resolved first: a request naming one this Region holds none of is refused
@@ -737,7 +741,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     previous.properties = drifted.actual.clone();
                 }
             }
-            let provenance = stack.provenance();
+            let provenance = crate::state::provisioning::StackProvenance {
+                managed_names: managed,
+                ..stack.provenance()
+            };
 
             // "When you execute a change set, CloudFormation deletes all other change sets
             // associated with the stack because they aren't valid for the updated stack."

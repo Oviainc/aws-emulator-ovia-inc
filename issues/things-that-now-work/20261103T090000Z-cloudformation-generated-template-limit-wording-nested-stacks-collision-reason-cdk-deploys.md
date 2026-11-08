@@ -68,6 +68,49 @@ Ids, names, uuids and timestamps are per-run fillers.
 ## Steps to Reproduce
 1) Exceed the in-flight generated-template limit and read the refusal's message. 2) Deploy a CDK app with a nested stack and `DescribeStacks` the child's `PhysicalResourceId`. 3) Create a stack whose resource name is already owned by another stack and read the CREATE_FAILED event and the stack's status. 4) Run the CDK deploys listed above and read the stack's own events for the stage that does not settle.
 
+## What the change resolving this report did, and what it left open
+
+FIXED — cause 3: a name-collision `CREATE_FAILED` reason is now CloudFormation's own. A create the
+owning service refuses because the name is already in use is reported as
+`<physical-name> already exists in stack <owning-stack-ARN>` whenever CloudFormation's own index of
+the Region's live stacks is what holds that name (`state::physical_name::managed_physical_names` /
+`taken_by_another_stack`, read under the store lock by every operation that deploys a template and
+carried in `provisioning::StackProvenance::managed_names`), and the rollback now disposes of the
+resource whose create failed as it disposes of every record it held, so that resource's last events
+are `DELETE_IN_PROGRESS`/`DELETE_COMPLETE` rather than the failure. Its replay unit
+(`cloudformation.cdk-deploy-replaces-a-rollback-complete-stack-with-a-new-one`) passes.
+Covered by `tests/all/cross_stack_name_collision.rs`.
+
+ALREADY IMPLEMENTED — cause 2: nested child stacks are real stacks
+(`state/provisioning/nested_stack.rs`, `tests/all/nested_stacks.rs`): the provider creates the child
+through CloudFormation's own `CreateStack`, the resource's physical id is the child's stack ARN, and
+the parent's deletion cascades. Its unit still fails earlier, at the CDK deploy of cause 4.
+
+STILL OPEN — carried, unchanged, with their trace ids and replay keys, to
+`issues/things-that-do-not-work/20261103T120000Z-cloudformation-generated-template-limit-wording-and-the-cdk-l2-deploys.md`,
+because nothing in that change implements them:
+
+STILL OPEN — cause 1: the generated-template concurrency refusal's wording. Both checks reject the
+model's documented sentence, and the attempt recorded above (that sentence with its period inside
+this surface's SDK envelope) was rejected too, so AWS's sentence does not begin with the model's
+text and nothing in the model, the docs or the replay output discloses it. It has to come from a
+recording of the refusal; inventing a sentence would be a value no rule produces.
+
+STILL OPEN — cause 4: the CDK L2 deploys. Each fails on a resource whose owning service answers
+`HandlerErrorCode: InvalidRequest`, and the replay discloses only the tail of the CDK output, so
+neither the resource nor the refusal is in evidence; the checks that follow those deploys also need
+an Amazon API Gateway REST data plane that serves HTTP, which no listener of this emulator provides.
+The two units carried here for other causes fail at that same step.
+
+STILL OPEN — the in-use export guard on a CDK-driven producer update
+(`deploy-cdk-cross-stack-export-ordering-and-in-use-guard`): the guard is in force on `UpdateStack`
+and on `ExecuteChangeSet` (`state::exports`), and its API-driven units pass, but the CDK deploy that
+changes the exported value still exits 0.
+
+STILL OPEN — `e2e-resource-scan-generated-template-to-managed-stack`: it now reaches
+`CreateChangeSet` and is refused by the documented import rule (every resource to import must carry
+a `DeletionPolicy`), which the generated template's `TemplateConfiguration` is what would assign.
+
 ## Also fixed in the change that split this report out
 The four causes of the original bundle that ARE fixed — the in-use export guard on every deployment of a publishing stack, the cancelled-operation reason's wording, the resource scan's inventory of the resources no stack manages, and the SDK exception a refused Amazon S3 call is reported as (plus `DeleteStack` with `RetainResources`, which that last one needed) — are described in
 `issues/things-that-now-work/20261102T101202Z-cloudformation-8-net-new-root-causes-in-use.md`.
