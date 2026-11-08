@@ -246,12 +246,18 @@ async fn a_reservation_reports_only_the_upload_member_its_form_selects() {
                  answer must not carry zipUploadUrl at all, got {zip:?}",
                 row.case
             );
-            let destinations: Vec<String> = per_file
+            // `fileUploadUrls` is a MAP, so the ORDER its members arrive in is not part
+            // of the contract — what the rule fixes is WHICH files carry a destination.
+            // Collected into a sorted set, like the sibling suite's `file_upload_urls`,
+            // so the comparison reads the same whichever order the body enumerates.
+            let destinations: std::collections::BTreeSet<String> = per_file
                 .and_then(Value::as_object)
                 .map(|members| members.keys().cloned().collect())
                 .unwrap_or_default();
+            let named: std::collections::BTreeSet<String> =
+                row.named_files.iter().cloned().collect();
             assert_eq!(
-                destinations, row.named_files,
+                destinations, named,
                 "case {:?}: expected a destination for exactly the files named, \
                  got {destinations:?}",
                 row.case

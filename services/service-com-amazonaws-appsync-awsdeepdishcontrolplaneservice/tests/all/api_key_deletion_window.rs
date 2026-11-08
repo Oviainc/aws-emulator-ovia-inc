@@ -52,6 +52,14 @@ pub(crate) const RETENTION: i64 = 60 * DAY;
 /// is 7 days from creation time."
 pub(crate) const DEFAULT_VALIDITY: i64 = 7 * DAY;
 
+/// The accepted validity window, measured from the call that sets the expiration — the
+/// class every row below draws its expiration from. Source:
+/// `ApiKeyValidityOutOfBoundsException` — "The API key expiration must be set to a value
+/// between 1 and 365 days from creation (for CreateApiKey) or from update (for
+/// UpdateApiKey)".
+pub(crate) const MIN_VALIDITY: i64 = DAY;
+pub(crate) const MAX_VALIDITY: i64 = 365 * DAY;
+
 /// How far inside a published validity bound a row sits, so the seconds elapsing
 /// between this test's clock read and the handler's — across every write a row makes —
 /// cannot push the row across the bound. The bounds come from

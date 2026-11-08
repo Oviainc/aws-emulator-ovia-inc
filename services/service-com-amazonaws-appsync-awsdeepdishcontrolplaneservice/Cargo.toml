@@ -85,6 +85,10 @@ hex = { workspace = true }
 # half, the CloudWatch service the metric assertions read through and the base64 the
 # handshake's auth token is written in are already this crate's own dependencies.
 tokio = { workspace = true, features = ["net", "time"] }
+# The generator behind the property-based API-key deletion-time suite: the expirations it
+# asserts the derivation over are DRAWN from the published validity window rather than
+# hand-picked. Test-only, seeded, and nothing of it reaches `src/`.
+rand = "0.9"
 
 [lints]
 workspace = true
