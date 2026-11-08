@@ -1417,6 +1417,10 @@ async fn serving<Eng: Send + Sync + 'static>(
                 stage: &stage.stage_name,
                 verb,
                 resource_path: matched_path,
+                // The resource an authorization decision is taken about is the path the
+                // CLIENT addressed, not the template the deployment matched by it: a
+                // statement is written about the paths a client reaches.
+                request_path: &resource_path,
                 source_vpce: resolved.source_vpce,
                 caller: match signed_as.as_deref() {
                     Some(principal) => resource_policy::Caller::Signed(principal),

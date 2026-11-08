@@ -14,6 +14,13 @@
 //! principal the account holds policies for is one this emulator cannot judge, and a grant
 //! it cannot read grounds no refusal.
 //!
+//! That sentence CLOSES with the clause IAM words the reason of an authorization failure in:
+//! which of the documents consulted refused the call, and whether its deny was explicit —
+//! so a caller can tell a deny a grant would lift from one no grant lifts. The rows below
+//! span the readings this gate reaches: no readable document allows the action, a readable
+//! document denies it, and the ceiling in force on the principal does not allow what its
+//! policies granted.
+//!
 //! WHY the session is the case that matters: an identity pool hands short-lived,
 //! deliberately under-privileged credentials of its authenticated or unauthenticated role
 //! to clients it does not trust, so a role carrying no `execute-api` grant must reach no
@@ -105,6 +112,14 @@ const SESSION_SECONDS: u64 = 3_600;
 
 /// The IAM action an invoke of a deployed method asks for.
 const INVOKE_ACTION: &str = "execute-api:Invoke";
+
+/// Two policies of the IAM emulator's own AWS managed-policy catalog
+/// (`service-com-amazonaws-iam-awsidentitymanagementv20100508/src/state/managed_policy_catalog.rs`,
+/// `AWS_MANAGED_POLICIES`), so a boundary attached by either ARN is a ceiling this emulator
+/// CAN read: one allowing every action of every service, and one allowing another service's
+/// actions only.
+const ADMIN_BOUNDARY: &str = "arn:aws:iam::aws:policy/AdministratorAccess";
+const OTHER_SERVICE_BOUNDARY: &str = "arn:aws:iam::aws:policy/AmazonS3ReadOnlyAccess";
 
 /// The body the method's `MOCK` integration answers with.
 fn served_body() -> String {
@@ -253,6 +268,23 @@ fn given_policy(gateway: &Gateway, entity: Entity, document: Option<&Value>) {
             );
         }
     }
+}
+
+/// Attach the managed policy `arn` names to the role as its PERMISSIONS BOUNDARY, the
+/// ceiling an identity-based grant cannot exceed — what `iam:PutRolePermissionsBoundary`
+/// does. `None` takes it off, as the matching delete does.
+fn given_role_boundary(gateway: &Gateway, arn: Option<&str>) {
+    use ::service_com_amazonaws_iam_awsidentitymanagementv20100508::ops::types::AttachedPermissionsBoundary;
+    let store = iam::service_state(gateway.engine()).expect("the IAM store");
+    let mut store = store.lock();
+    let role = store
+        .roles
+        .get_mut(&iam::name_key(ROLE))
+        .unwrap_or_else(|| panic!("the IAM store holds no role {ROLE}"));
+    role.permissions_boundary = arn.map(|arn| AttachedPermissionsBoundary {
+        permissions_boundary_type: Some("Policy".to_string()),
+        permissions_boundary_arn: Some(arn.to_string()),
+    });
 }
 
 /// Which kind of identity a document is attached to.
@@ -424,14 +456,50 @@ fn assert_served(case: &str, answered: &crate::execute_api_data_plane::Invoked) 
     );
 }
 
+/// Which document class refused the invoke, which is what the clause closing IAM's refusal
+/// sentence names.
+#[derive(Debug, Clone, Copy)]
+enum Reason {
+    /// Nothing the caller carries allows the action: an implicit deny, which a grant lifts.
+    NoIdentityGrant,
+    /// A readable identity-based document DENIES the action, which no grant lifts.
+    IdentityDeny,
+    /// The ceiling in force on the principal does not allow what its policies granted.
+    NoBoundaryGrant,
+    /// The api's own RESOURCE policy refused the call — the decision the gate beside the
+    /// identity one takes, whose sentence ends at the resource.
+    ResourcePolicy,
+}
+
+impl Reason {
+    /// The clause this refusal closes with, or `None` for the one decided against the api's
+    /// own document.
+    fn clause(self) -> Option<String> {
+        match self {
+            Self::NoIdentityGrant => {
+                Some(format!("because no identity-based policy allows the {INVOKE_ACTION} action"))
+            }
+            Self::IdentityDeny => {
+                Some("with an explicit deny in an identity-based policy".to_string())
+            }
+            Self::NoBoundaryGrant => {
+                Some(format!("because no permissions boundary allows the {INVOKE_ACTION} action"))
+            }
+            Self::ResourcePolicy => None,
+        }
+    }
+}
+
 /// Assert the invoke was refused as unauthorized: `403`, the `AccessDeniedException` class,
-/// the IAM sentence naming the principal, the action and the method ARN, and nothing of the
-/// integration's body — a refused request never reached it.
+/// the IAM sentence naming the principal, the action, the method ARN and the clause `reason`
+/// closes it with, and nothing of the integration's body — a refused request never reached
+/// it.
 fn assert_refused(
     case: &str,
     answered: &crate::execute_api_data_plane::Invoked,
     principal: &str,
     method_arn: &str,
+    reason: Reason,
 ) {
     assert_eq!(
         answered.status, 403,
@@ -445,13 +513,18 @@ fn assert_refused(
         answered.header("x-amzn-errortype")
     );
     let message = authorization_message(&answered.body, case);
+    let closing = reason
+        .clause()
+        .map(|clause| format!(" {clause}"))
+        .unwrap_or_default();
     assert_eq!(
         message,
         format!(
             "User: {principal} is not authorized to perform: {INVOKE_ACTION} on resource: \
-             {method_arn}"
+             {method_arn}{closing}"
         ),
-        "case {case}: expected the {INVOKE_ACTION} authorization sentence, got {message:?}"
+        "case {case}: expected the {INVOKE_ACTION} authorization sentence closed by \
+         {reason:?}, got {message:?}"
     );
     assert!(
         !answered.body.contains(NONCE),
@@ -481,65 +554,69 @@ async fn the_callers_own_policies_decide_an_aws_iam_invoke() {
     });
     // Rows differ along the document in force on the role the credential is a session of:
     // what it allows, which resource it scopes the grant to, and an explicit deny beside a
-    // grant of everything.
-    let rows: Vec<(&str, Option<Value>, bool)> = vec![
-        ("no policy at all", None, false),
-        ("the action on this very method", Some(allow(INVOKE_ACTION, &method)), true),
+    // grant of everything — and, for a row that is refused, along the clause IAM closes the
+    // refusal with, which names the document class that refused it.
+    let rows: Vec<(&str, Option<Value>, Option<Reason>)> = vec![
+        ("no policy at all", None, Some(Reason::NoIdentityGrant)),
+        ("the action on this very method", Some(allow(INVOKE_ACTION, &method)), None),
         // IAM compares an action name case-insensitively, so a document spelling it in
         // another case grants the same action.
         (
             "the action in another case",
             Some(allow("EXECUTE-API:INVOKE", &method)),
-            true,
+            None,
         ),
         (
             "every action of the service, on every resource",
             Some(allow("execute-api:*", "*")),
-            true,
+            None,
         ),
         (
             "the action on every method of the api",
             Some(allow(INVOKE_ACTION, &api_methods)),
-            true,
+            None,
         ),
         (
             "another service's action",
             Some(allow("s3:GetObject", "*")),
-            false,
+            Some(Reason::NoIdentityGrant),
         ),
         (
             "the invalidation action on this method",
             Some(allow("execute-api:InvalidateCache", &method)),
-            false,
+            Some(Reason::NoIdentityGrant),
         ),
         (
             "the action on the same method of another stage",
             Some(allow(INVOKE_ACTION, &another_stage)),
-            false,
+            Some(Reason::NoIdentityGrant),
         ),
         (
             "the action on another verb of the same path",
             Some(allow(INVOKE_ACTION, &another_verb)),
-            false,
+            Some(Reason::NoIdentityGrant),
         ),
         (
             "the action on another path of the same stage",
             Some(allow(INVOKE_ACTION, &another_path)),
-            false,
+            Some(Reason::NoIdentityGrant),
         ),
+        // A readable document that DENIES the action is not an implicit deny: no grant
+        // lifts it, and the clause says so.
         (
             "an explicit deny beside a grant of everything",
             Some(denied_beside_a_grant),
-            false,
+            Some(Reason::IdentityDeny),
         ),
     ];
-    for (case, document, served) in &rows {
+    for (case, document, refused) in &rows {
         given_policy(&gateway, Entity::Role, document.as_ref());
         let answered = invoke_as(&gateway, &deployed.api, SESSION_KEY_ID, RESOURCE_PATH).await;
-        if *served {
-            assert_served(case, &answered);
-        } else {
-            assert_refused(case, &answered, &session_arn(), &method);
+        match refused {
+            None => assert_served(case, &answered),
+            Some(reason) => {
+                assert_refused(case, &answered, &session_arn(), &method, *reason);
+            }
         }
     }
 }
@@ -565,7 +642,13 @@ async fn the_principal_the_credential_speaks_for_decides_whose_policies_are_read
     ];
     for (case, key_id, principal) in refused {
         let answered = invoke_as(&gateway, &deployed.api, key_id, RESOURCE_PATH).await;
-        assert_refused(case, &answered, principal, &method);
+        assert_refused(
+            case,
+            &answered,
+            principal,
+            &method,
+            Reason::NoIdentityGrant,
+        );
     }
     let unjudged = invoke_as(&gateway, &deployed.api, ACCOUNT_KEY_ID, RESOURCE_PATH).await;
     assert_served("the account's own published credential", &unjudged);
@@ -581,6 +664,7 @@ async fn the_principal_the_credential_speaks_for_decides_whose_policies_are_read
         &still_refused,
         &user_arn(),
         &method,
+        Reason::NoIdentityGrant,
     );
     given_policy(&gateway, Entity::User, Some(&allow(INVOKE_ACTION, &method)));
     let user_granted = invoke_as(&gateway, &deployed.api, USER_KEY_ID, RESOURCE_PATH).await;
@@ -642,6 +726,7 @@ async fn either_grant_suffices_and_either_deny_refuses() {
         &refused,
         &session_arn(),
         &method,
+        Reason::ResourcePolicy,
     );
 }
 
@@ -666,7 +751,100 @@ async fn a_method_that_authenticates_nobody_reads_no_identity_policy() {
         if *served {
             assert_served(case, &answered);
         } else {
-            assert_refused(case, &answered, &session_arn(), &deployed.method_arn(path_part));
+            assert_refused(
+                case,
+                &answered,
+                &session_arn(),
+                &deployed.method_arn(path_part),
+                Reason::NoIdentityGrant,
+            );
+        }
+    }
+}
+
+/// The ceiling in force on the principal is a document class of its own: a grant it does not
+/// also allow is not a permission the principal has, and the refusal closes with the clause
+/// naming the BOUNDARY rather than the policies that granted the action.
+#[tokio::test]
+async fn a_permissions_boundary_closes_the_refusal_with_its_own_clause() {
+    let gateway = Gateway::new();
+    let deployed = Deployed::stand_up(&gateway, "identity-policy-boundary").await;
+    given_session(&gateway);
+    let method = deployed.method_arn(RESOURCE_PATH);
+    // The role's own policies grant the invoke in every row below: what each row varies is
+    // the ceiling attached to it.
+    given_policy(&gateway, Entity::Role, Some(&allow(INVOKE_ACTION, &method)));
+    // Rows differ along the boundary the role carries — none at all, one allowing every
+    // action, and one allowing another service's actions only — which is what decides
+    // whether the grant stands and, where it does not, which clause the refusal closes with.
+    let rows: &[(&str, Option<&str>, Option<Reason>)] = &[
+        ("no boundary at all", None, None),
+        ("a boundary allowing every action", Some(ADMIN_BOUNDARY), None),
+        (
+            "a boundary allowing another service's actions only",
+            Some(OTHER_SERVICE_BOUNDARY),
+            Some(Reason::NoBoundaryGrant),
+        ),
+    ];
+    for (case, boundary, refused) in rows {
+        given_role_boundary(&gateway, *boundary);
+        let answered = invoke_as(&gateway, &deployed.api, SESSION_KEY_ID, RESOURCE_PATH).await;
+        match refused {
+            None => assert_served(case, &answered),
+            Some(reason) => {
+                assert_refused(case, &answered, &session_arn(), &method, *reason);
+            }
+        }
+    }
+}
+
+/// The resource the decision is taken about is the path the CLIENT addressed, not the
+/// template the deployment matched by it: a grant written about the paths a client reaches
+/// admits the call, one written about the template's own text admits nothing, and the
+/// refusal names the path the request asked for.
+#[tokio::test]
+async fn the_resource_judged_is_the_path_the_client_addressed() {
+    /// The concrete path segment the request addresses, which the template below binds.
+    const ADDRESSED: &str = "a-9f3";
+
+    let gateway = Gateway::new();
+    let deployed = Deployed::stand_up(&gateway, "identity-policy-path-parameter").await;
+    given_session(&gateway);
+    // A method deployed under a path TEMPLATE, reached at a concrete path.
+    let template = deployed
+        .mock_method(&gateway, "{agreementId}", "AWS_IAM")
+        .await;
+    let addressed = deployed.method_arn(ADDRESSED);
+    let stage_gets = deployed.execute_api_arn(&format!("{STAGE}/GET/*"));
+    // Rows differ along the resource the grant names: the concrete path the request
+    // addresses, a wildcard over every GET path of the stage, and the template's own text —
+    // which is a path no client ever addresses.
+    let rows: Vec<(&str, Option<Value>, Option<Reason>)> = vec![
+        ("no policy at all", None, Some(Reason::NoIdentityGrant)),
+        (
+            "the concrete path the request addressed",
+            Some(allow(INVOKE_ACTION, &addressed)),
+            None,
+        ),
+        (
+            "a wildcard over every GET path of the stage",
+            Some(allow(INVOKE_ACTION, &stage_gets)),
+            None,
+        ),
+        (
+            "the template's own text",
+            Some(allow(INVOKE_ACTION, &deployed.method_arn(&template))),
+            Some(Reason::NoIdentityGrant),
+        ),
+    ];
+    for (case, document, refused) in &rows {
+        given_policy(&gateway, Entity::Role, document.as_ref());
+        let answered = invoke_as(&gateway, &deployed.api, SESSION_KEY_ID, ADDRESSED).await;
+        match refused {
+            None => assert_served(case, &answered),
+            Some(reason) => {
+                assert_refused(case, &answered, &session_arn(), &addressed, *reason);
+            }
         }
     }
 }

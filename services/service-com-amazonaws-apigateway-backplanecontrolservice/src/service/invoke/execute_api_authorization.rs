@@ -28,6 +28,12 @@
 //!    ([`super::super::resource_policy::Call::method_arn`]) — so this gate and the api's
 //!    RESOURCE policy, which the data plane applies beside it, are asked about one resource.
 //!
+//! A refusal states all four: who was refused, the action, the method, and WHY — the clause
+//! IAM closes an authorization failure with, naming the document class that refused the call
+//! and whether its deny was explicit ([`not_authorized`]). That clause is what tells a caller
+//! whether a grant would lift the refusal, so it is part of the answer rather than a comment
+//! on it.
+//!
 //! ## How the two grants combine
 //!
 //! For a caller in the api's own account either grant suffices: AWS evaluates the api's
@@ -82,6 +88,32 @@ use super::super::resource_policy::{self, INVOKE_ACTION};
 /// not quoted back either. In the assembled emulator the layer that authenticates a request
 /// refuses such a credential before this is reached.
 const EXPIRED_CREDENTIAL_MESSAGE: &str = "The security token included in the request is expired";
+
+/// The clause IAM closes a refusal with when a readable identity-based document DENIES the
+/// action rather than merely not allowing it: adding a grant will not lift such a deny, which
+/// is exactly what the clause tells whoever reads the refusal.
+const IDENTITY_EXPLICIT_DENY: &str = "with an explicit deny in an identity-based policy";
+
+/// The clause IAM closes a refusal with when the ceiling in force on the principal carries an
+/// explicit `Deny` of the action — a fact about the BOUNDARY document, so the refusal names
+/// that document class rather than the policies that granted the action.
+const BOUNDARY_EXPLICIT_DENY: &str = "with an explicit deny in a permissions boundary";
+
+/// How IAM names the document class that holds what a PRINCIPAL may do, in the clause closing
+/// an implicit deny.
+const IDENTITY_POLICY_CLASS: &str = "identity-based policy";
+
+/// How IAM names the ceiling in force on a principal, in that same clause.
+const BOUNDARY_POLICY_CLASS: &str = "permissions boundary";
+
+/// The clause IAM closes an IMPLICIT deny with: no readable document of `class` allows
+/// `action`, so the request fell to IAM's default deny and a grant is what would lift it.
+///
+/// The action named here is the action the sentence already named, because it is the same
+/// decision being explained.
+fn no_policy_allows(class: &str, action: &str) -> String {
+    format!("because no {class} allows the {action} action")
+}
 
 /// The principal an invoke speaks for, and everything the decision is made from.
 #[derive(Debug, Clone)]
@@ -232,6 +264,10 @@ pub fn expired_refusal(caller: &SigningCaller) -> Option<String> {
 /// nor the api's own resource policy allow `execute-api:Invoke` on the method it addressed, or
 /// `None` when the request may proceed.
 ///
+/// The sentence closes with the clause IAM words the REASON of the failure in ([`not_authorized`]):
+/// which document class refused the call, and whether its deny was explicit or the default one
+/// of a call nothing allowed.
+///
 /// `allowed_by_resource_policy` is whether the document the api carries explicitly ALLOWS this
 /// call ([`resource_policy::allows_invoke`]): either grant suffices, so an allow there admits a
 /// caller whose own policies say nothing.
@@ -251,13 +287,21 @@ pub fn refusal(
     // the invoke whatever else the principal carries — including a grant this emulator cannot
     // read, which only lifts the DEFAULT deny of a call no readable statement allows.
     if identity_said == Decision::Denied {
-        return Some(not_authorized(&caller.arn, &method_arn));
+        return Some(not_authorized(
+            &caller.arn,
+            &method_arn,
+            IDENTITY_EXPLICIT_DENY,
+        ));
     }
     let granted = iam::is_allowed(identity_said, Decision::NotStated)
         || caller.identity_is_unbounded()
         || allowed_by_resource_policy;
     if !granted {
-        return Some(not_authorized(&caller.arn, &method_arn));
+        return Some(not_authorized(
+            &caller.arn,
+            &method_arn,
+            &no_policy_allows(IDENTITY_POLICY_CLASS, INVOKE_ACTION),
+        ));
     }
     // "A permissions boundary sets the maximum permissions that an identity-based policy can
     // grant": a grant the boundary does not also allow is not a permission the principal has. A
@@ -266,22 +310,34 @@ pub fn refusal(
         return None;
     }
     if let Some(boundary) = &caller.boundary {
-        if iam::identity_decision(::std::slice::from_ref(boundary), &request) != Decision::Allowed {
-            return Some(not_authorized(&caller.arn, &method_arn));
-        }
+        let reason = match iam::identity_decision(::std::slice::from_ref(boundary), &request) {
+            Decision::Allowed => return None,
+            // An explicit deny is a fact about the boundary document, so the refusal names it;
+            // a boundary that merely states nothing withheld the grant the identity-based
+            // policies gave.
+            Decision::Denied => BOUNDARY_EXPLICIT_DENY.to_string(),
+            Decision::NotStated => no_policy_allows(BOUNDARY_POLICY_CLASS, INVOKE_ACTION),
+        };
+        return Some(not_authorized(&caller.arn, &method_arn, &reason));
     }
     None
 }
 
 /// The sentence the `execute-api` endpoint refuses an unauthorized invoke with: the principal
-/// that asked, the action it asked for and the method it asked for.
+/// that asked, the action it asked for, the method it asked for and `reason` — the clause
+/// naming WHICH of the documents consulted refused it and whether that deny was explicit.
 ///
-/// It IS the sentence the api's own resource policy refuses a call with — the one formatter
-/// [`resource_policy::not_authorized`] owns, called rather than copied, because it is the same
-/// decision about the same method stated by the same endpoint, so a caller cannot tell which of
-/// the two grants was missing (which is what AWS's own wording does too).
-fn not_authorized(principal: &str, method_arn: &str) -> String {
-    resource_policy::not_authorized(INVOKE_ACTION, principal, method_arn)
+/// The part up to the resource IS the sentence the api's own resource policy refuses a call
+/// with — the one formatter [`resource_policy::not_authorized`] owns, called rather than
+/// copied, because it is the same decision about the same method stated by the same endpoint.
+/// What this adds is the reason clause, which is a fact about the IDENTITY-based decision
+/// taken here: a caller reading it can tell an implicit deny, which a grant would lift, from
+/// an explicit one, which no grant lifts.
+fn not_authorized(principal: &str, method_arn: &str, reason: &str) -> String {
+    format!(
+        "{sentence} {reason}",
+        sentence = resource_policy::not_authorized(INVOKE_ACTION, principal, method_arn)
+    )
 }
 
 #[cfg(test)]
@@ -300,6 +356,7 @@ mod tests {
             stage: "prod",
             verb: "GET",
             resource_path: "/orders",
+            request_path: "/orders",
             source_vpce: None,
             caller: resource_policy::Caller::Signed(arn),
         }
@@ -406,20 +463,69 @@ mod tests {
         }
     }
 
-    /// RULE: the refusal names the principal, the `execute-api:Invoke` action and the ARN of
-    /// the method the request addressed.
+    /// RULE: the refusal names the principal, the `execute-api:Invoke` action, the ARN of the
+    /// method the request addressed and the clause IAM closes an authorization failure with —
+    /// which document class refused the call and whether its deny was explicit.
     #[test]
-    fn the_refusal_names_the_principal_the_action_and_the_method() {
-        let caller = session(&[]);
-        let refused = refusal(&caller, &call(&caller.arn.clone()), false)
-            .expect("a session no policy allows is refused");
-        assert_eq!(
-            refused,
-            "User: arn:aws:sts::000000000000:assumed-role/pool-authenticated/CognitoIdentity is \
-             not authorized to perform: execute-api:Invoke on resource: \
-             arn:aws:execute-api:us-east-1:000000000000:abc1230000/prod/GET/orders",
-            "case \"a default deny\": got {refused:?}"
-        );
+    fn the_refusal_names_the_principal_the_action_the_method_and_the_reason() {
+        let allow_every_invoke = "{\"Statement\":[{\"Effect\":\"Allow\",\
+                                  \"Action\":\"execute-api:Invoke\",\"Resource\":\"*\"}]}";
+        let deny_every_invoke = "{\"Statement\":[{\"Effect\":\"Deny\",\
+                                 \"Action\":\"execute-api:Invoke\",\"Resource\":\"*\"}]}";
+        let boundary_other = "{\"Statement\":[{\"Effect\":\"Allow\",\
+                              \"Action\":\"execute-api:Invoke\",\
+                              \"Resource\":\"arn:aws:execute-api:us-east-1:000000000000:\
+                              other/prod/GET/orders\"}]}";
+        let sentence = "User: arn:aws:sts::000000000000:assumed-role/pool-authenticated/\
+                        CognitoIdentity is not authorized to perform: execute-api:Invoke on \
+                        resource: arn:aws:execute-api:us-east-1:000000000000:\
+                        abc1230000/prod/GET/orders";
+        // Rows differ along WHICH document class refused the invoke and along whether that
+        // class stated an explicit deny or merely failed to allow — the four readings this
+        // gate can reach.
+        let rows: &[(&str, &[&str], Option<&str>, &str)] = &[
+            (
+                "no document allows the action",
+                &[],
+                None,
+                "because no identity-based policy allows the execute-api:Invoke action",
+            ),
+            (
+                "a readable document denies it",
+                &[deny_every_invoke],
+                None,
+                "with an explicit deny in an identity-based policy",
+            ),
+            (
+                "the boundary states nothing about the action",
+                &[allow_every_invoke],
+                Some("{\"Statement\":[]}"),
+                "because no permissions boundary allows the execute-api:Invoke action",
+            ),
+            (
+                "the boundary allows only another api",
+                &[allow_every_invoke],
+                Some(boundary_other),
+                "because no permissions boundary allows the execute-api:Invoke action",
+            ),
+            (
+                "the boundary denies it",
+                &[allow_every_invoke],
+                Some(deny_every_invoke),
+                "with an explicit deny in a permissions boundary",
+            ),
+        ];
+        for (case, documents, boundary, reason) in rows {
+            let mut caller = session(documents);
+            caller.boundary = boundary.map(str::to_string);
+            let refused = refusal(&caller, &call(&caller.arn.clone()), false)
+                .unwrap_or_else(|| panic!("case {case:?}: an unauthorized invoke is refused"));
+            assert_eq!(
+                refused,
+                format!("{sentence} {reason}"),
+                "case {case:?}: got {refused:?}"
+            );
+        }
     }
 
     /// RULE: the account's own published credential holds no IAM policies, so it is not bounded

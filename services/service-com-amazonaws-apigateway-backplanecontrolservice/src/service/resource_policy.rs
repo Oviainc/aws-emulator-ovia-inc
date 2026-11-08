@@ -107,10 +107,10 @@ pub enum Caller<'a> {
 
 /// What one invoke asks the api's resource policy about.
 ///
-/// Every field is read off the request and the records that resolved it — the stage and the
-/// resource path the deployment matched, the verb the method is addressed by, the endpoint
-/// host it arrived on — so the decision is about this call rather than about a
-/// configuration.
+/// Every field is read off the request and the records that resolved it — the stage, the
+/// path the client addressed and the resource path the deployment matched, the verb the
+/// method is addressed by, the endpoint host it arrived on — so the decision is about this
+/// call rather than about a configuration.
 #[derive(Debug)]
 pub struct Call<'a> {
     /// The Region the request addressed, which is the Region of the method ARN a statement
@@ -123,8 +123,22 @@ pub struct Call<'a> {
     /// The verb the deployed method is addressed by — the request's own, or the `ANY`
     /// catch-all it matched.
     pub verb: &'a str,
-    /// The resource path of the DEPLOYED method the request matched, leading `/` included.
+    /// The resource path of the DEPLOYED method the request matched, leading `/` included —
+    /// the TEMPLATE, so a method put on `/pets/{petId}` carries that spelling whichever pet
+    /// a request addresses. It names the deployed method (which is what a stage's method
+    /// settings are keyed by), not the resource an authorization decision is taken about:
+    /// that is [`Self::request_path`].
     pub resource_path: &'a str,
+    /// The path WITHIN the stage that the client addressed, leading `/` included.
+    ///
+    /// An `execute-api` resource is "the path to the desired resource" the request asked
+    /// for — API Gateway's own policy examples name a concrete path (`/pets/fido`) and cover
+    /// a parameterised method by the wildcard `/pets/*`, and the method ARN handed to a
+    /// custom authorizer names the path the client sent — so the resource this call is judged
+    /// against, and the one a refusal reports, is built from THIS rather than from the
+    /// template the deployment matched. For a method carrying no path parameter the two are
+    /// the same string.
+    pub request_path: &'a str,
     /// The VPC endpoint the request arrived through, when the endpoint it was addressed on
     /// names one.
     pub source_vpce: Option<&'a str>,
@@ -134,7 +148,8 @@ pub struct Call<'a> {
 
 impl Call<'_> {
     /// The ARN of the method this call addresses:
-    /// `arn:aws:execute-api:{region}:{account}:{api-id}/{stage}/{verb}/{path}`.
+    /// `arn:aws:execute-api:{region}:{account}:{api-id}/{stage}/{verb}/{path}`, where the
+    /// path is the one the client addressed ([`Self::request_path`]).
     ///
     /// The path carries no leading `/` of its own — the ARN's separator is already there —
     /// so the root resource is the ARN ending in the verb and a slash, which is the form
@@ -149,19 +164,19 @@ impl Call<'_> {
                 api = self.api_id,
                 stage = self.stage,
                 verb = self.verb,
-                path = self.resource_path.trim_start_matches('/'),
+                path = self.request_path.trim_start_matches('/'),
             ),
         )
     }
 
-    /// The same method in the form an API Gateway resource policy's own examples name it
+    /// The same resource in the form an API Gateway resource policy's own examples name it
     /// by: `execute-api:/{stage}/{verb}/{path}`, the spelling `execute-api:/*` covers.
     fn scoped_resource(&self) -> String {
         format!(
             "{ARN_SERVICE}:/{stage}/{verb}/{path}",
             stage = self.stage,
             verb = self.verb,
-            path = self.resource_path.trim_start_matches('/'),
+            path = self.request_path.trim_start_matches('/'),
         )
     }
 
@@ -283,17 +298,19 @@ fn decision(policy: &str, call: &Call<'_>, action: &str) -> Decision {
 }
 
 /// The sentence AWS refuses a call with when the api's policy grants the caller nothing
-/// for the action it asked for: the principal that asked, that action and the method it
-/// asked for.
+/// for the action it asked for, up to and including the resource: the principal that
+/// asked, that action and the method it asked for.
 ///
 /// Not `::service_common::iam_authorization::not_authorized_by_resource_policy`, whose
-/// sentence ends in the clause OTHER services word their refusal with ("because no
-/// resource-based policy allows …"); the `execute-api` endpoint's own answer ends at the
-/// resource.
+/// sentence already closes with the clause OTHER services word their refusal with
+/// ("because no resource-based policy allows …").
 ///
 /// `pub(crate)` because the IDENTITY-based gate beside this one refuses the same call about
-/// the same method in the same sentence ([`super::invoke::execute_api_authorization`]) — one
-/// wording, so the two gates cannot diverge while their docs say they do not.
+/// the same method in the same words up to the resource
+/// ([`super::invoke::execute_api_authorization`]) — one wording, so the two gates cannot
+/// diverge on it — and then closes its own sentence with the clause naming WHY the identity
+/// decision it took was a deny, which is a fact about the documents IT read rather than
+/// about the one the api carries.
 pub(crate) fn not_authorized(action: &str, principal: &str, method_arn: &str) -> String {
     format!("User: {principal} is not authorized to perform: {action} on resource: {method_arn}")
 }
@@ -311,7 +328,8 @@ mod tests {
     const PRINCIPAL: &str = "arn:aws:sts::000000000000:assumed-role/pool-guest/session";
 
     /// One invoke of `GET /whoami` on stage `s` of api `abc1230000`, arriving through
-    /// `source_vpce` and speaking for `caller`.
+    /// `source_vpce` and speaking for `caller` — a method carrying no path parameter, so the
+    /// template it was deployed under and the path the client addressed are one string.
     fn call<'a>(source_vpce: Option<&'a str>, caller: Caller<'a>) -> Call<'a> {
         Call {
             region: "us-west-2",
@@ -319,6 +337,7 @@ mod tests {
             stage: "s",
             verb: "GET",
             resource_path: "/whoami",
+            request_path: "/whoami",
             source_vpce,
             caller,
         }
@@ -344,6 +363,7 @@ mod tests {
         // scoped form both end in the verb and a separator, with no segment after it.
         let root = Call {
             resource_path: "/",
+            request_path: "/",
             ..call
         };
         assert_eq!(
@@ -357,6 +377,27 @@ mod tests {
             "execute-api:/s/GET/",
             "case the root scoped resource: got {:?}",
             root.scoped_resource()
+        );
+
+        // A method deployed under a path TEMPLATE is reached at a concrete path, and the
+        // resource both spellings name is the concrete one: a statement is written about
+        // the paths a client reaches (`/agreements/*`), never about the template.
+        let parameterised = Call {
+            resource_path: "/agreements/{agreementId}",
+            request_path: "/agreements/a-9f3",
+            ..call
+        };
+        assert_eq!(
+            parameterised.method_arn(),
+            "arn:aws:execute-api:us-west-2:000000000000:abc1230000/s/GET/agreements/a-9f3",
+            "case the parameterised method ARN: got {:?}",
+            parameterised.method_arn()
+        );
+        assert_eq!(
+            parameterised.scoped_resource(),
+            "execute-api:/s/GET/agreements/a-9f3",
+            "case the parameterised scoped resource: got {:?}",
+            parameterised.scoped_resource()
         );
     }
 
