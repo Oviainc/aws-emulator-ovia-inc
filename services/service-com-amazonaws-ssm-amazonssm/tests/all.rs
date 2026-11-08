@@ -31,6 +31,8 @@ mod documents;
 mod hybrid_activations;
 #[path = "all/instance_properties.rs"]
 mod instance_properties;
+#[path = "all/just_in_time_node_access.rs"]
+mod just_in_time_node_access;
 #[path = "all/managed_node_filter_validation.rs"]
 mod managed_node_filter_validation;
 #[path = "all/managed_node_information.rs"]

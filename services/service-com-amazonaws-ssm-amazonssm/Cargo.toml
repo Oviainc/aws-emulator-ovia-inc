@@ -44,6 +44,12 @@ yaml-rust2 = { version = "0.10", default-features = false }
 # document was created", rendered hex.
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Whether the caller's identity-based policies allow a just-in-time node access call is
+# decided from the documents IAM holds for that principal and the session STS resolves the
+# request's access key id to, read through those services' own state accessors rather than
+# from a second copy of them here (`state::identity_authorization`).
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

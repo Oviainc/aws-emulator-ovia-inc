@@ -109,6 +109,14 @@
 //! replaces the source of one and `DeleteResourceDataSync` removes it, so whatever a
 //! write persisted is what a later listing reports.
 //!
+//! Then the **just-in-time node access requests** ([`just_in_time_node_access`]), keyed by
+//! `(region, access request id)`: `StartAccessRequest` raises one and `GetAccessToken`
+//! reports its status and the credentials an approved one is exchanged for. Whether the
+//! account has the workflow at all is read from the documents it holds — an access-request
+//! approval policy is an SSM document
+//! ([`ComAmazonawsSsmAmazonssmState::has_access_request_approval_policy`]) — so an account that
+//! created none has no access-request surface and a read invents no request.
+//!
 //! Last is the account's **service settings** ([`service_settings`]):
 //! `GetServiceSetting` reports one, `UpdateServiceSetting` overwrites it and
 //! `ResetServiceSetting` restores the value its service team provisioned. The settings an
@@ -154,6 +162,14 @@ pub mod resource_policies;
 /// The OpsItems OpsCenter holds: the record a create persists, the rules it is held to
 /// and the store the reads project.
 pub mod ops_items;
+
+/// Just-in-time node access: whether an account has the workflow at all, the access
+/// requests it holds and the credentials an approved one is exchanged for.
+pub mod just_in_time_node_access;
+
+/// Whether the caller's own identity-based IAM policies let a request perform the action
+/// it asks for — the decision an operation takes before it resolves anything.
+pub mod identity_authorization;
 
 /// The event trail OpsCenter keeps for an OpsItem: the event a write appends and the
 /// store `ListOpsItemEvents` projects.
@@ -3163,6 +3179,18 @@ pub struct ComAmazonawsSsmAmazonssmState {
     /// the predefined catalogue instead.
     pub default_patch_baselines: BTreeMap<(String, String), String>,
 
+    /// Every just-in-time node access request, keyed by `(region, access request id)`: a
+    /// request is raised through one Region's endpoint and is reached there by the id the
+    /// start minted
+    /// ([`ComAmazonawsSsmAmazonssmState::next_access_request_id`]). A `BTreeMap` so a walk
+    /// over them is stable and total. See [`just_in_time_node_access`].
+    pub access_requests:
+        BTreeMap<(String, String), just_in_time_node_access::AccessRequestRecord>,
+
+    /// How many access request ids this store has minted, which is what the next mint is
+    /// drawn from — so two access requests of one store never carry one id.
+    pub access_request_sequence: u64,
+
     /// Every resource data sync configuration, keyed by `(region, sync name)`: a sync is
     /// created through one Region's endpoint and its name is unique within that Region. A
     /// `BTreeMap` so a listing walks a stable, total order — ascending by sync name
@@ -3197,6 +3225,8 @@ impl Default for ComAmazonawsSsmAmazonssmState {
             patch_baseline_sequence: 0,
             default_patch_baselines: BTreeMap::new(),
             resource_data_syncs: BTreeMap::new(),
+            access_requests: BTreeMap::new(),
+            access_request_sequence: 0,
         }
     }
 }
@@ -3216,6 +3246,9 @@ impl ComAmazonawsSsmAmazonssmState {
         // An automation execution's pickup and every step of its walk that `now` allows
         // were owed whether or not anybody called (`automation`).
         self.advance_automations(now);
+        // The approval an auto-approval policy owes an access request was due at the same
+        // instant whether or not anybody called (`just_in_time_node_access`).
+        self.materialize_access_requests_due(now);
     }
 
     /// The command `command_id` names in `region`, or `None` when that Region holds none.
