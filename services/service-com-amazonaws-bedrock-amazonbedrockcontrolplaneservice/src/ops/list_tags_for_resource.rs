@@ -13,7 +13,7 @@
 //! the ARN spells ([`crate::state::tagging_resource_not_found_message`]).
 //!
 //! The one resolution of a tagging ARN lives in `crate::state` (`tagged_resource`), shared
-//! with `ops/tag_resource.rs`.
+//! with `ops/tag_resource.rs` and `ops/untag_resource.rs`.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!

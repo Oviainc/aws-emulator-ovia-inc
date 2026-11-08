@@ -488,6 +488,13 @@ pub struct ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
 pub enum TaggedResource {
     /// A guardrail, by its `guardrailId`.
     Guardrail(String),
+    /// The DRAFT of an Automated Reasoning policy, by the unversioned
+    /// `AutomatedReasoningPolicyArn` its record is keyed by.
+    AutomatedReasoningPolicy(String),
+    /// One numbered version of an Automated Reasoning policy, by that policy's unversioned
+    /// ARN and the version number — the pair the version's record is reached under, since a
+    /// version lives inside the policy it was cut from.
+    AutomatedReasoningPolicyVersion(String, u32),
     /// A prompt router, by its `PromptRouterArn`.
     PromptRouter(String),
     /// A model import job, by its `ModelImportJobArn`.
@@ -531,6 +538,17 @@ pub fn apply_tags(held: &mut Vec<Tag>, applied: Vec<Tag>) {
             None => held.push(tag),
         }
     }
+}
+
+/// Take the tags `removed` names away from the tags a resource `held`, keyed by `key`: a
+/// key the resource carries is dropped whatever value it holds, and a key it does not carry
+/// takes nothing away.
+///
+/// The counterpart of [`apply_tags`], and the removal every operation that takes tags away
+/// goes through, so a key is removed the same way it was associated: by key alone, leaving
+/// the remaining keys in the order a read already reported them.
+pub fn remove_tags(held: &mut Vec<Tag>, removed: &[String]) {
+    held.retain(|tag| !removed.contains(&tag.key));
 }
 
 impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {

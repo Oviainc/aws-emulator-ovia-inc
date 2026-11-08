@@ -1,15 +1,24 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op UntagResource
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `UntagResource`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`UntagResource::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Takes the tag keys the request names away from the resource its `resourceARN` names,
+//! off the very record that holds that resource's tags in [`crate::state`] — the list a
+//! create filled, `ops/tag_resource.rs` extends and `ops/list_tags_for_resource.rs`
+//! reports — so a key this call removes is gone from every later read of that resource.
+//!
+//! Tags are keyed by `key`: a key the resource carries is dropped whatever value it holds,
+//! and a key it does not carry takes nothing away, so repeating the call leaves the
+//! resource exactly as the first one left it and the keys that remain keep the order a
+//! read already reported them in.
+//!
+//! An ARN naming no resource this account holds is `ResourceNotFoundException`, worded for
+//! the resource TYPE the ARN spells
+//! ([`crate::state::tagging_resource_not_found_message`]) — the same refusal the other two
+//! tagging operations answer it with, through the one resolution of a tagging ARN in
+//! `crate::state` (`tagged_resource`).
+//!
+//! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +157,33 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `UntagResource` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(UntagResourceErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("UntagResource"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(UntagResourceErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("tagging state is not available on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+        // The region the request addressed, for the reason `ops/tag_resource.rs` reads it:
+        // the same ARN resolution serves all three tagging operations, so all three must
+        // resolve an ARN alike.
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+        let Some(held) = store.resource_tags_mut(&input.resource_arn, &region, now) else {
+            return Err(UntagResourceErrorModeled::ResourceNotFoundException(
+                ResourceNotFoundException {
+                    message: Some(crate::state::tagging_resource_not_found_message(
+                        &input.resource_arn,
+                    )),
+                },
+            )
+            .into());
+        };
+
+        crate::state::remove_tags(held, &input.tag_keys);
+        Ok(UntagResourceOutput {})
     }
 }

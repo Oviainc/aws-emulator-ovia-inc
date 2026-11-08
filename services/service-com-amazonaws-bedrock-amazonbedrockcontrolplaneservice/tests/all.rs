@@ -31,6 +31,8 @@ mod automated_reasoning_policy_definition_export;
 mod automated_reasoning_policy_deletion;
 #[path = "all/automated_reasoning_policy_listing.rs"]
 mod automated_reasoning_policy_listing;
+#[path = "all/automated_reasoning_policy_tagging.rs"]
+mod automated_reasoning_policy_tagging;
 #[path = "all/automated_reasoning_policy_test_case_deletion.rs"]
 mod automated_reasoning_policy_test_case_deletion;
 #[path = "all/automated_reasoning_policy_test_case_updates.rs"]

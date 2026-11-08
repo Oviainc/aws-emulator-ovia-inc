@@ -456,8 +456,12 @@ pub struct AutomatedReasoningPolicyRecord {
     pub kms_key_arn: Option<String>,
     /// `tags` — the tags the create request attached to the policy.
     ///
-    /// Kept for the reason [`CustomModelRecord::tags`] is: it is part of the request that
-    /// minted the record, and the policy's own reads report no tag member.
+    /// The ONE copy of this DRAFT's tags: the list the create filled is the list
+    /// `ops/tag_resource.rs` and `ops/untag_resource.rs` rewrite and
+    /// `ops/list_tags_for_resource.rs` reports, reached through
+    /// [`ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState::tagged_resource`] under
+    /// the policy's unversioned ARN. The policy's own reads report no tag member, so a
+    /// tagging call is where they are read back.
     pub tags: Vec<Tag>,
     pub created_at: SystemTime,
     /// When the policy was last written. The creation instant until an update rewrites
@@ -533,6 +537,11 @@ pub struct AutomatedReasoningPolicyVersionRecord {
     /// the version answers is the hash of what it froze.
     pub definition_hash: String,
     /// `tags` — the tags the create-version request attached to this version.
+    ///
+    /// The ONE copy of this VERSION's tags, reached by a tagging call under the versioned
+    /// ARN exactly as the draft's are reached under the unversioned one
+    /// ([`AutomatedReasoningPolicyRecord::tags`]) — a version is its own taggable revision,
+    /// so what is tagged on it is not on the draft.
     pub tags: Vec<Tag>,
     /// `createdAt` — when this version was cut. Also the instant a read reports as its
     /// last update, since nothing rewrites a version.

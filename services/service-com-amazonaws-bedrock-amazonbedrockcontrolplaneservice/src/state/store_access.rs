@@ -1191,10 +1191,19 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
     /// read back to the first — the one the store is keyed by — in the region the ARN
     /// itself carries, so neither spelling reaches another region's resource.
     ///
-    /// The families this resolution does not reach (a custom model, an Automated Reasoning
-    /// policy, a model invocation job, an async invoke) resolve to `None`, so a tagging
-    /// call that names one is answered as naming no taggable resource of this account;
-    /// wiring a family in is that family's own work, not a create's.
+    /// An Automated Reasoning policy is addressable under either spelling its own
+    /// `AutomatedReasoningPolicyArn` admits, and each spelling names its own REVISION: the
+    /// unversioned ARN names the policy's draft and the `:<version>` suffix names one
+    /// numbered version it cut (`TaggableResourcesArn` admits both,
+    /// `:automated-reasoning-policy/[a-zA-Z0-9]+(:[a-zA-Z0-9]+)?`). A revision carries the
+    /// tags its own record holds — the list the create that minted it filled — so tagging
+    /// the draft leaves a version's tags alone and the other way round, and a version
+    /// nothing cut names no resource.
+    ///
+    /// The families this resolution does not reach (a custom model, a model invocation job,
+    /// an async invoke) resolve to `None`, so a tagging call that names one is answered as
+    /// naming no taggable resource of this account; wiring a family in is that family's own
+    /// work, not a create's.
     pub fn tagged_resource(
         &mut self,
         resource_arn: &str,
@@ -1207,6 +1216,23 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
                 .guardrails
                 .contains_key(&id)
                 .then_some(TaggedResource::Guardrail(id));
+        }
+        if resource_arn.contains(":automated-reasoning-policy/") {
+            // The ARN names a REVISION of a policy — its draft, or the version its
+            // `:<version>` suffix selects — resolved through
+            // [`Self::automated_reasoning_policy_revision`], the index every read of that
+            // ARN resolves it through, so a tagging call reaches exactly the revisions those
+            // reads report and each revision's tags are the ones its own record holds. The
+            // number comes off the RESOLVED version rather than from a second read of the
+            // suffix, so the two cannot disagree.
+            let (policy, revision) = self.automated_reasoning_policy_revision(resource_arn)?;
+            let policy_arn = policy.arn.clone();
+            return Some(match revision {
+                Some(version) => {
+                    TaggedResource::AutomatedReasoningPolicyVersion(policy_arn, version.version)
+                }
+                None => TaggedResource::AutomatedReasoningPolicy(policy_arn),
+            });
         }
         if resource_arn.contains(":default-prompt-router/") {
             return self
@@ -1283,6 +1309,14 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
             TaggedResource::Guardrail(id) => {
                 self.guardrails.get(id).map(|guardrail| &guardrail.tags)
             }
+            TaggedResource::AutomatedReasoningPolicy(arn) => {
+                self.automated_reasoning_policies.get(arn).map(|policy| &policy.tags)
+            }
+            TaggedResource::AutomatedReasoningPolicyVersion(arn, number) => self
+                .automated_reasoning_policies
+                .get(arn)
+                .and_then(|policy| policy.versions.get(number))
+                .map(|version| &version.tags),
             TaggedResource::PromptRouter(arn) => {
                 self.prompt_routers.get(arn).map(|router| &router.tags)
             }
@@ -1316,6 +1350,15 @@ impl ComAmazonawsBedrockAmazonbedrockcontrolplaneserviceState {
                 .guardrails
                 .get_mut(id)
                 .map(|guardrail| &mut guardrail.tags),
+            TaggedResource::AutomatedReasoningPolicy(arn) => self
+                .automated_reasoning_policies
+                .get_mut(arn)
+                .map(|policy| &mut policy.tags),
+            TaggedResource::AutomatedReasoningPolicyVersion(arn, number) => self
+                .automated_reasoning_policies
+                .get_mut(arn)
+                .and_then(|policy| policy.versions.get_mut(number))
+                .map(|version| &mut version.tags),
             TaggedResource::PromptRouter(arn) => self
                 .prompt_routers
                 .get_mut(arn)

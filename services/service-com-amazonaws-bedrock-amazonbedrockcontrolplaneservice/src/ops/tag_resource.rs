@@ -3,10 +3,11 @@
 //! @op TagResource
 //!
 //! Associates the request's tags with the resource its `resourceARN` names, writing them
-//! onto the record that already holds that resource in [`crate::state`] — a guardrail, a
-//! prompt router, a model import job, the model such a job imports, an evaluation job or
-//! a Provisioned Throughput — so the tags a create carried and the tags this call adds
-//! are ONE list, which `ops/list_tags_for_resource.rs` reports back.
+//! onto the record that already holds that resource in [`crate::state`] — a guardrail, one
+//! revision of an Automated Reasoning policy, a prompt router, a model import job, the
+//! model such a job imports, an evaluation job or a Provisioned Throughput — so the tags a
+//! create carried and the tags this call adds are ONE list, which
+//! `ops/list_tags_for_resource.rs` reports back.
 //!
 //! Tags are keyed by `key`: a key the resource already carries takes the new value and a
 //! key it does not carry is added, so repeating a call leaves the resource exactly as the
@@ -20,7 +21,7 @@
 //! refused call changes nothing.
 //!
 //! The one resolution of a tagging ARN lives in `crate::state` (`tagged_resource`), shared
-//! with `ops/list_tags_for_resource.rs`.
+//! with `ops/list_tags_for_resource.rs` and `ops/untag_resource.rs`.
 //!
 //! Shared types live in `super::types`; the error channel in `crate::scaffolded`.
 //!
