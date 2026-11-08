@@ -253,6 +253,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         };
 
+        // Validating the recipe is exactly what the parse above did, and it is now
+        // done: the version is DEPLOYABLE from the instant that parse finished.
+        // That instant is after `now`, which is when the request was accepted and
+        // which is the instant this operation's own response reports the version's
+        // state at — so the create answers the non-terminal `REQUESTED` and every
+        // call after it sees the validated version. The floor keeps the two
+        // instants apart even if the wall clock steps backwards between them.
+        let validated_at =
+            ::std::time::SystemTime::now().max(now + st::MIN_VALIDATION_GAP);
+
         let mut store = state.lock();
         store.expire_tokens(now);
 
@@ -326,7 +336,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             arn: arn.clone(),
             component_name: recipe.component_name.clone(),
             component_version: recipe.component_version.clone(),
-            recipe: recipe_bytes,
+            // What is stored is the recipe document the service DERIVED from the
+            // submitted one — the submitted members plus the `ComponentType` this
+            // service assigns — because that document, not the submitted bytes, is
+            // what every reader of this version reports.
+            recipe: recipe.stored_recipe,
             recipe_format: recipe.format,
             description: recipe.description,
             publisher: recipe.publisher,
@@ -344,7 +358,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 vendor_guidance: Some(st::VENDOR_GUIDANCE_ACTIVE.to_string()),
                 vendor_guidance_message: Some(st::STATUS_MESSAGE_NONE.to_string()),
             },
-            deployable_at: now + st::COMPONENT_VALIDATION_SPAN,
+            deployable_at: validated_at,
             scope: st::SCOPE_PRIVATE.to_string(),
             tags: st::tags_in(input.tags.as_ref()),
         };

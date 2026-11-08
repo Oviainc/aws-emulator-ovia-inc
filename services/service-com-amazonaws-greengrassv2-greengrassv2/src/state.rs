@@ -28,15 +28,45 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// declares no `@default`, so the upper bound is the whole-collection page.
 pub const MAX_PAGE_SIZE: i32 = 100;
 
-/// How long after `CreateComponentVersion` the clock owes the
-/// `REQUESTED -> DEPLOYABLE` transition.
+/// The shortest gap this service keeps between the instant
+/// `CreateComponentVersion` ACCEPTS a request — the instant its own response
+/// reports the new version's state at — and the instant that request's recipe
+/// validation completed, from which the version is `DEPLOYABLE`.
 ///
-/// Greengrass answers `CreateComponentVersion` with a component version in the
-/// non-terminal `REQUESTED` state and moves it to `DEPLOYABLE` once it has
-/// validated the recipe. AWS documents no duration for that validation, so this
-/// span is CHOSEN; it is deliberately non-zero so a caller that reads the version
-/// straight after creating it still observes `REQUESTED`.
-pub const COMPONENT_VALIDATION_SPAN: Duration = Duration::from_millis(500);
+/// Greengrass validates an inline recipe as part of the create call: the create
+/// answers the state at acceptance (`REQUESTED`), and a read that follows the
+/// create reports the validated version (`DEPLOYABLE`). This emulator does that
+/// validation in the same place — the recipe parse inside the handler — so the two
+/// instants are the two clock readings around that parse, and they are always
+/// apart. This constant is the floor that keeps them apart even if the wall clock
+/// steps backwards between the readings.
+pub const MIN_VALIDATION_GAP: Duration = Duration::from_micros(1);
+
+/// The `ComponentType` IoT Greengrass assigns a component version published from a
+/// recipe, and the value it writes into the recipe document it stores.
+///
+/// The type is the service's to assign, not the caller's: the other
+/// `ComponentType` values name components generated from a Lambda function or
+/// published by AWS itself, neither of which an `inlineRecipe` create produces.
+pub const COMPONENT_TYPE_GENERIC: &str = "aws.greengrass.generic";
+
+/// The recipe member the assigned [`COMPONENT_TYPE_GENERIC`] is written into, and
+/// the member it is written after: the IoT Greengrass component recipe reference
+/// publishes a recipe's members in this order, with `ComponentType` immediately
+/// after `ComponentVersion`.
+const RECIPE_TYPE_KEY: &str = "ComponentType";
+/// See [`RECIPE_TYPE_KEY`].
+const RECIPE_VERSION_KEY: &str = "ComponentVersion";
+/// The recipe's list of platform-specific manifests, each of which carries its own
+/// [`RECIPE_LIFECYCLE_KEY`] and [`RECIPE_ARTIFACTS_KEY`]. See
+/// [`supply_empty_defaults`].
+const RECIPE_MANIFESTS_KEY: &str = "Manifests";
+/// A recipe member whose default is the empty mapping: the recipe's own lifecycle,
+/// and a manifest's. See [`supply_empty_defaults`].
+const RECIPE_LIFECYCLE_KEY: &str = "Lifecycle";
+/// A manifest member whose default is the empty sequence. See
+/// [`supply_empty_defaults`].
+const RECIPE_ARTIFACTS_KEY: &str = "Artifacts";
 
 /// `CloudComponentState` value a freshly created component version carries.
 pub const STATE_REQUESTED: &str = "REQUESTED";
@@ -222,8 +252,9 @@ impl RecipeFormat {
     }
 }
 
-/// One stored component version: the recipe bytes exactly as submitted, plus
-/// everything `DescribeComponent` / `ListComponents` report about it.
+/// One stored component version: the recipe document the service derived from the
+/// submitted one, plus everything `DescribeComponent` / `ListComponents` report
+/// about it.
 #[derive(Debug, Clone)]
 pub struct ComponentVersionEntry {
     pub arn: String,
@@ -236,7 +267,8 @@ pub struct ComponentVersionEntry {
     pub platforms: Vec<ComponentPlatform>,
     pub creation_timestamp: SystemTime,
     pub status: CloudComponentStatus,
-    /// The instant the `REQUESTED -> DEPLOYABLE` transition falls due.
+    /// The instant this version's recipe validation completed, from which the
+    /// version is `DEPLOYABLE`.
     pub deployable_at: SystemTime,
     pub scope: String,
     pub tags: BTreeMap<String, String>,
@@ -245,11 +277,14 @@ pub struct ComponentVersionEntry {
 impl ComponentVersionEntry {
     /// The component version's status at `now`.
     ///
-    /// The `REQUESTED -> DEPLOYABLE` move is owed by the CLOCK, so it is DERIVED
-    /// from the stored due instant rather than written during a read: a reporting
+    /// `componentState` is DERIVED from the instant the version's recipe
+    /// validation completed rather than written during a read: a reporting
     /// operation changes nothing a later caller sees, two readers at the same
     /// instant agree, and the work is O(1) per entry rather than a walk of the
-    /// whole catalog.
+    /// whole catalog. So the create that published the version reports the state
+    /// at the instant it accepted the request — before it validated the recipe,
+    /// which is `REQUESTED` — and every call that follows it reports the
+    /// validated version's terminal `DEPLOYABLE`.
     pub fn status_at(&self, now: SystemTime) -> CloudComponentStatus {
         let mut status = self.status.clone();
         status.component_state = Some(
@@ -961,7 +996,8 @@ pub fn decode_cursor(token: &str) -> Option<String> {
 // Component recipes
 // ---------------------------------------------------------------------------
 
-/// The parts of a component recipe the control plane reports.
+/// The parts of a component recipe the control plane reports, and the recipe
+/// document it stores.
 #[derive(Debug, Clone)]
 pub struct ParsedRecipe {
     pub component_name: String,
@@ -970,6 +1006,10 @@ pub struct ParsedRecipe {
     pub publisher: Option<String>,
     pub platforms: Vec<ComponentPlatform>,
     pub format: RecipeFormat,
+    /// The recipe document to STORE for this version: the submitted document plus
+    /// the service-assigned `ComponentType`, serialized in `format`. See
+    /// [`normalized_recipe`].
+    pub stored_recipe: Vec<u8>,
 }
 
 /// Why a submitted recipe was refused.
@@ -1226,7 +1266,156 @@ pub fn parse_recipe(bytes: &[u8]) -> Result<ParsedRecipe, RecipeError> {
         publisher: mapping_get(map, "ComponentPublisher").and_then(scalar_string),
         platforms: recipe_platforms(map),
         format,
+        stored_recipe: normalized_recipe(map, format).ok_or_else(|| {
+            RecipeError::Unparseable(
+                "every member of a recipe must be named by a string".to_string(),
+            )
+        })?,
     })
+}
+
+/// The recipe document this service STORES for a version published from
+/// `submitted`: that document with the members the service supplies, serialized in
+/// `format`.
+///
+/// Greengrass does not keep the submitted bytes. It stores the recipe it derived
+/// and serializes THAT document for every reader, which is why a recipe read back
+/// as JSON comes back compact, carries a `ComponentType` member no caller
+/// submitted, and carries the recipe members whose default is empty even when the
+/// submitted document left them out — while every member the caller did submit
+/// survives. Member order is the submitted document's, with `ComponentType` where
+/// the recipe reference publishes it (immediately after `ComponentVersion`, which
+/// [`parse_recipe`] has already required) and a supplied default appended to the
+/// mapping that was missing it.
+fn normalized_recipe(
+    submitted: &::yaml_rust2::yaml::Hash,
+    format: RecipeFormat,
+) -> Option<Vec<u8>> {
+    use ::yaml_rust2::Yaml;
+
+    let type_key = Yaml::String(RECIPE_TYPE_KEY.to_string());
+    let assigned = Yaml::String(COMPONENT_TYPE_GENERIC.to_string());
+    let mut document = ::yaml_rust2::yaml::Hash::new();
+    for (key, value) in submitted {
+        // A submitted `ComponentType` does not decide the stored one: the service
+        // assigns the type, so the member is rewritten wherever it appears.
+        if key.as_str() == Some(RECIPE_TYPE_KEY) {
+            continue;
+        }
+        document.insert(key.clone(), value.clone());
+        if key.as_str() == Some(RECIPE_VERSION_KEY) {
+            document.insert(type_key.clone(), assigned.clone());
+        }
+    }
+    if !document.contains_key(&type_key) {
+        document.insert(type_key, assigned);
+    }
+    supply_empty_defaults(&mut document);
+    render_document(&Yaml::Hash(document), format)
+}
+
+/// Add the recipe members whose default is the EMPTY collection to a stored recipe
+/// document that does not declare them: the recipe's own `Lifecycle`, and each
+/// manifest's `Lifecycle` and `Artifacts`.
+///
+/// Greengrass answers a recipe read with all three whether or not the submitted
+/// document carried them, so a client that reads `recipe['Lifecycle']` or iterates
+/// `Manifests[i]['Artifacts']` always finds a collection to read. A member the
+/// document DOES declare is left exactly as it was declared, empty or not.
+fn supply_empty_defaults(document: &mut ::yaml_rust2::yaml::Hash) {
+    use ::yaml_rust2::Yaml;
+
+    let lifecycle = Yaml::String(RECIPE_LIFECYCLE_KEY.to_string());
+    let artifacts = Yaml::String(RECIPE_ARTIFACTS_KEY.to_string());
+    if let Some(Yaml::Array(manifests)) =
+        document.get_mut(&Yaml::String(RECIPE_MANIFESTS_KEY.to_string()))
+    {
+        for manifest in manifests.iter_mut() {
+            if let Yaml::Hash(manifest) = manifest {
+                if !manifest.contains_key(&lifecycle) {
+                    manifest.insert(lifecycle.clone(), Yaml::Hash(::yaml_rust2::yaml::Hash::new()));
+                }
+                if !manifest.contains_key(&artifacts) {
+                    manifest.insert(artifacts.clone(), Yaml::Array(Vec::new()));
+                }
+            }
+        }
+    }
+    if !document.contains_key(&lifecycle) {
+        document.insert(lifecycle, Yaml::Hash(::yaml_rust2::yaml::Hash::new()));
+    }
+}
+
+/// A recipe document serialized in `format` — the ONE place this service decides
+/// how a stored recipe is written, so the bytes a create stores and the bytes a
+/// cross-format read renders agree: COMPACT JSON (no space after `:` or `,`, as
+/// the service answers `GetComponent` with) or the YAML emitter's block form.
+fn render_document(document: &::yaml_rust2::Yaml, format: RecipeFormat) -> Option<Vec<u8>> {
+    match format {
+        RecipeFormat::Json => ::serde_json::to_vec(&OrderedDocument {
+            node: document,
+            budget: MAX_RECIPE_DEPTH,
+        })
+        .ok(),
+        RecipeFormat::Yaml => {
+            let mut rendered = String::new();
+            ::yaml_rust2::YamlEmitter::new(&mut rendered)
+                .dump(document)
+                .ok()?;
+            Some(rendered.into_bytes())
+        }
+    }
+}
+
+/// A recipe document as `serde_json` writes it, with every mapping's members in
+/// the ORDER that mapping declares them.
+///
+/// `serde_json`'s `Value` object is a `BTreeMap`, so converting a recipe into one
+/// would reorder its members; handing the document to the serializer through this
+/// wrapper instead keeps `serde_json` responsible for every byte it writes — the
+/// compact separators, the string escapes and the number spelling — and leaves
+/// only the order to the document itself.
+struct OrderedDocument<'a> {
+    node: &'a ::yaml_rust2::Yaml,
+    /// The recursion left: [`load_document`] already refused anything past
+    /// [`MAX_RECIPE_DEPTH`], and this second, independent bound means a future
+    /// caller that forgets that check still cannot drive the serializer into the
+    /// stack.
+    budget: usize,
+}
+
+impl ::serde::Serialize for OrderedDocument<'_> {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use ::serde::ser::{Error, SerializeMap, SerializeSeq};
+        use ::yaml_rust2::Yaml;
+
+        let budget = self
+            .budget
+            .checked_sub(1)
+            .ok_or_else(|| S::Error::custom("the recipe nests deeper than can be rendered"))?;
+        match self.node {
+            Yaml::Hash(map) => {
+                let mut object = serializer.serialize_map(Some(map.len()))?;
+                for (key, value) in map {
+                    let key = key.as_str().ok_or_else(|| {
+                        S::Error::custom("every member of a recipe must be named by a string")
+                    })?;
+                    object.serialize_entry(key, &OrderedDocument { node: value, budget })?;
+                }
+                object.end()
+            }
+            Yaml::Array(items) => {
+                let mut sequence = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    sequence.serialize_element(&OrderedDocument { node: item, budget })?;
+                }
+                sequence.end()
+            }
+            scalar => scalar_as_json(scalar)
+                .ok_or_else(|| S::Error::custom("a recipe scalar that cannot be rendered"))?
+                .serialize(serializer),
+        }
+    }
 }
 
 /// The platforms a recipe declares: one `ComponentPlatform` per manifest that
@@ -1260,16 +1449,14 @@ fn recipe_platforms(map: &::yaml_rust2::yaml::Hash) -> Vec<ComponentPlatform> {
         .collect()
 }
 
-/// A recipe document as the JSON value that renders it.
+/// A recipe SCALAR as the JSON value that renders it.
 ///
-/// `budget` is the recursion left: [`load_document`] already refused anything past
-/// [`MAX_RECIPE_DEPTH`], and this second, independent bound means a future caller
-/// that forgets that check still cannot drive this function into the stack.
-fn document_as_json(document: &::yaml_rust2::Yaml, budget: usize) -> Option<::serde_json::Value> {
+/// Only scalars: the collections are written by [`write_compact_json`], which is
+/// what keeps a mapping's members in the order the document declares them.
+fn scalar_as_json(scalar: &::yaml_rust2::Yaml) -> Option<::serde_json::Value> {
     use ::serde_json::Value;
     use ::yaml_rust2::Yaml;
-    let budget = budget.checked_sub(1)?;
-    Some(match document {
+    Some(match scalar {
         Yaml::Null | Yaml::BadValue => Value::Null,
         Yaml::Boolean(b) => Value::Bool(*b),
         Yaml::Integer(i) => Value::Number((*i).into()),
@@ -1279,28 +1466,15 @@ fn document_as_json(document: &::yaml_rust2::Yaml, budget: usize) -> Option<::se
             .and_then(::serde_json::Number::from_f64)
             .map_or_else(|| Value::String(r.clone()), Value::Number),
         Yaml::String(s) => Value::String(s.clone()),
-        Yaml::Array(items) => Value::Array(
-            items
-                .iter()
-                .map(|item| document_as_json(item, budget))
-                .collect::<Option<Vec<_>>>()?,
-        ),
-        Yaml::Hash(map) => {
-            let mut object = ::serde_json::Map::new();
-            for (key, value) in map {
-                object.insert(key.as_str()?.to_string(), document_as_json(value, budget)?);
-            }
-            Value::Object(object)
-        }
-        // An alias is refused before the load by `reject_aliases`, so a resolved
-        // alias node can never reach here.
-        Yaml::Alias(_) => return None,
+        // A collection is the caller's to write, and an alias is refused before
+        // the load by `reject_aliases`, so neither can reach here.
+        Yaml::Array(_) | Yaml::Hash(_) | Yaml::Alias(_) => return None,
     })
 }
 
 /// The recipe bytes to answer `GetComponent` with, in the format the caller asked
-/// for: the stored bytes verbatim when that is already the stored format, and the
-/// same document re-rendered otherwise.
+/// for: the stored bytes verbatim when that is already the format they are written
+/// in, and the same document rendered in the other format otherwise.
 ///
 /// The stored bytes already passed [`guard_recipe`] when they were published; the
 /// guard runs again here (through [`load_document`]) because re-rendering
@@ -1316,16 +1490,5 @@ pub fn render_recipe(
     }
     let text = std::str::from_utf8(bytes).ok()?;
     let document = load_document(text).ok()?;
-    match requested {
-        RecipeFormat::Json => {
-            ::serde_json::to_vec(&document_as_json(&document, MAX_RECIPE_DEPTH)?).ok()
-        }
-        RecipeFormat::Yaml => {
-            let mut rendered = String::new();
-            ::yaml_rust2::YamlEmitter::new(&mut rendered)
-                .dump(&document)
-                .ok()?;
-            Some(rendered.into_bytes())
-        }
-    }
+    render_document(&document, requested)
 }

@@ -12,7 +12,6 @@ use std::sync::Arc;
 use aws_smithy_types::base64;
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_greengrassv2_greengrassv2::state::COMPONENT_VALIDATION_SPAN;
 use service_com_amazonaws_greengrassv2_greengrassv2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -121,10 +120,26 @@ fn encoded_label(arn: &str) -> String {
     arn.replace(':', "%3A")
 }
 
-/// Sleep past the chosen `REQUESTED -> DEPLOYABLE` validation window. Blocking,
-/// rather than `tokio::time`, because the workspace pins tokio without its timer.
-fn wait_out_validation_window() {
-    std::thread::sleep(COMPONENT_VALIDATION_SPAN * 2);
+/// A recipe document's members, as the mapping a reader can compare.
+fn recipe_members(document: &str) -> Vec<(String, String)> {
+    let loaded = yaml_rust2::YamlLoader::load_from_str(document)
+        .expect("a recipe document the YAML parser reads");
+    loaded
+        .first()
+        .and_then(yaml_rust2::Yaml::as_hash)
+        .expect("a recipe mapping")
+        .iter()
+        .map(|(key, value)| {
+            let mut rendered = String::new();
+            yaml_rust2::YamlEmitter::new(&mut rendered)
+                .dump(value)
+                .expect("an emittable recipe member");
+            (
+                key.as_str().expect("a string recipe key").to_string(),
+                rendered,
+            )
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -141,6 +156,9 @@ struct RecipeCase {
     recipe: &'static str,
     /// The `RecipeOutputFormat` the submitted bytes are written in.
     format: &'static str,
+    /// The document `GetComponent` must answer with for `recipeOutputFormat=JSON`:
+    /// the recipe the service DERIVED from `recipe`, byte for byte.
+    stored_json: &'static str,
     name: &'static str,
     version: &'static str,
     description: Option<&'static str>,
@@ -158,6 +176,7 @@ const RECIPES: &[RecipeCase] = &[
         label: "json, only the required keys",
         recipe: r#"{"RecipeFormatVersion":"2020-01-25","ComponentName":"com.example.Minimal","ComponentVersion":"1.0.0"}"#,
         format: "JSON",
+        stored_json: r#"{"RecipeFormatVersion":"2020-01-25","ComponentName":"com.example.Minimal","ComponentVersion":"1.0.0","ComponentType":"aws.greengrass.generic","Lifecycle":{}}"#,
         name: "com.example.Minimal",
         version: "1.0.0",
         description: None,
@@ -169,6 +188,7 @@ const RECIPES: &[RecipeCase] = &[
         label: "json, description, publisher and two platform manifests",
         recipe: r#"{"RecipeFormatVersion":"2020-01-25","ComponentName":"com.example.Full","ComponentVersion":"3.1.4","ComponentDescription":"A fully specified component.","ComponentPublisher":"Example Corp","Manifests":[{"Platform":{"os":"linux","architecture":"aarch64"},"Lifecycle":{"Run":"echo one"}},{"Platform":{"name":"windows-x86","os":"windows"},"Lifecycle":{"Run":"echo two"}}]}"#,
         format: "JSON",
+        stored_json: r#"{"RecipeFormatVersion":"2020-01-25","ComponentName":"com.example.Full","ComponentVersion":"3.1.4","ComponentType":"aws.greengrass.generic","ComponentDescription":"A fully specified component.","ComponentPublisher":"Example Corp","Manifests":[{"Platform":{"os":"linux","architecture":"aarch64"},"Lifecycle":{"Run":"echo one"},"Artifacts":[]},{"Platform":{"name":"windows-x86","os":"windows"},"Lifecycle":{"Run":"echo two"},"Artifacts":[]}],"Lifecycle":{}}"#,
         name: "com.example.Full",
         version: "3.1.4",
         description: Some("A fully specified component."),
@@ -180,6 +200,7 @@ const RECIPES: &[RecipeCase] = &[
         label: "yaml, only the required keys",
         recipe: "RecipeFormatVersion: '2020-01-25'\nComponentName: com.example.YamlMinimal\nComponentVersion: 2.3.4\n",
         format: "YAML",
+        stored_json: r#"{"RecipeFormatVersion":"2020-01-25","ComponentName":"com.example.YamlMinimal","ComponentVersion":"2.3.4","ComponentType":"aws.greengrass.generic","Lifecycle":{}}"#,
         name: "com.example.YamlMinimal",
         version: "2.3.4",
         description: None,
@@ -191,6 +212,7 @@ const RECIPES: &[RecipeCase] = &[
         label: "yaml, prerelease version and one platform manifest",
         recipe: "RecipeFormatVersion: '2020-01-25'\nComponentName: com.example.YamlFull\nComponentVersion: 0.1.0-alpha.1\nComponentDescription: A YAML component.\nComponentPublisher: Example Corp\nManifests:\n  - Platform:\n      os: linux\n    Lifecycle:\n      Run: echo hi\n",
         format: "YAML",
+        stored_json: r#"{"RecipeFormatVersion":"2020-01-25","ComponentName":"com.example.YamlFull","ComponentVersion":"0.1.0-alpha.1","ComponentType":"aws.greengrass.generic","ComponentDescription":"A YAML component.","ComponentPublisher":"Example Corp","Manifests":[{"Platform":{"os":"linux"},"Lifecycle":{"Run":"echo hi"},"Artifacts":[]}],"Lifecycle":{}}"#,
         name: "com.example.YamlFull",
         version: "0.1.0-alpha.1",
         description: Some("A YAML component."),
@@ -202,6 +224,7 @@ const RECIPES: &[RecipeCase] = &[
         label: "yaml, a lifecycle command carrying a shell '&&' and a '*' glob",
         recipe: "RecipeFormatVersion: '2020-01-25'\nComponentName: com.example.Shell\nComponentVersion: 4.5.6\nManifests:\n  - Platform:\n      os: linux\n    Lifecycle:\n      Run: \"make && ./run\"\n      Install: rm -f build/*.o\n",
         format: "YAML",
+        stored_json: r#"{"RecipeFormatVersion":"2020-01-25","ComponentName":"com.example.Shell","ComponentVersion":"4.5.6","ComponentType":"aws.greengrass.generic","Manifests":[{"Platform":{"os":"linux"},"Lifecycle":{"Run":"make && ./run","Install":"rm -f build/*.o"},"Artifacts":[]}],"Lifecycle":{}}"#,
         name: "com.example.Shell",
         version: "4.5.6",
         description: None,
@@ -213,6 +236,7 @@ const RECIPES: &[RecipeCase] = &[
         label: "json, two-digit major plus unrelated recipe sections",
         recipe: r#"{"RecipeFormatVersion":"2020-01-25","ComponentName":"com.example.Nested","ComponentVersion":"10.0.0","ComponentConfiguration":{"DefaultConfiguration":{"Message":"hello","Count":3}},"ComponentDependencies":{"aws.greengrass.Nucleus":{"VersionRequirement":">=2.0.0","DependencyType":"HARD"}}}"#,
         format: "JSON",
+        stored_json: r#"{"RecipeFormatVersion":"2020-01-25","ComponentName":"com.example.Nested","ComponentVersion":"10.0.0","ComponentType":"aws.greengrass.generic","ComponentConfiguration":{"DefaultConfiguration":{"Message":"hello","Count":3}},"ComponentDependencies":{"aws.greengrass.Nucleus":{"VersionRequirement":">=2.0.0","DependencyType":"HARD"}},"Lifecycle":{}}"#,
         name: "com.example.Nested",
         version: "10.0.0",
         description: None,
@@ -270,12 +294,13 @@ async fn a_created_component_version_reads_back_exactly_as_it_was_published() {
             "case {:?}: creationTimestamp is required, got {body}",
             case.label
         );
-        // A new component version is non-terminal: the validation window has not
-        // elapsed yet, so the caller still sees REQUESTED.
+        // The create reports the version's state at the instant it ACCEPTED the
+        // request, which is before it validated the recipe: the non-terminal
+        // REQUESTED.
         assert_eq!(
             text(&body["status"], "componentState"),
             "REQUESTED",
-            "case {:?}: a just-created version must still be REQUESTED, got {body}",
+            "case {:?}: the create must report the state at acceptance, got {body}",
             case.label
         );
     }
@@ -283,69 +308,59 @@ async fn a_created_component_version_reads_back_exactly_as_it_was_published() {
     // GET the recipe back, in the format it was submitted in and in the other one.
     for case in RECIPES {
         let arn = version_arn(case.name, case.version);
-        let (status, body) = get(
-            &router,
-            &format!(
-                "/greengrass/v2/components/{}?recipeOutputFormat={}",
-                encoded_label(&arn),
-                case.format
-            ),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {:?}: GetComponent must answer 200, got {status} {body}",
-            case.label
-        );
-        assert_eq!(
-            text(&body, "recipeOutputFormat"),
-            case.format,
-            "case {:?}: recipeOutputFormat must echo the requested format, got {body}",
-            case.label
-        );
-        let recipe = base64::decode(text(&body, "recipe")).expect("a base64 recipe blob");
-        assert_eq!(
-            recipe,
-            case.recipe.as_bytes(),
-            "case {:?}: the stored recipe must come back byte-identical, got {:?}",
-            case.label,
-            String::from_utf8_lossy(&recipe)
-        );
+        for format in ["JSON", "YAML"] {
+            let (status, body) = get(
+                &router,
+                &format!(
+                    "/greengrass/v2/components/{}?recipeOutputFormat={format}",
+                    encoded_label(&arn),
+                ),
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case {:?}: GetComponent as {format} must answer 200, got {status} {body}",
+                case.label
+            );
+            assert_eq!(
+                text(&body, "recipeOutputFormat"),
+                format,
+                "case {:?}: recipeOutputFormat must echo the requested format, got {body}",
+                case.label
+            );
+            let recipe = base64::decode(text(&body, "recipe")).expect("a base64 recipe blob");
+            let document = String::from_utf8(recipe).expect("a UTF-8 recipe");
 
-        // The default format is JSON, and the same document re-rendered in the
-        // other format still names the same component.
-        let other = if case.format == "JSON" { "YAML" } else { "JSON" };
-        let (status, body) = get(
-            &router,
-            &format!(
-                "/greengrass/v2/components/{}?recipeOutputFormat={other}",
-                encoded_label(&arn)
-            ),
-        )
-        .await;
-        assert_eq!(
-            status, 200,
-            "case {:?}: GetComponent as {other} must answer 200, got {status} {body}",
-            case.label
-        );
-        let rendered = base64::decode(text(&body, "recipe")).expect("a base64 recipe blob");
-        let rendered = String::from_utf8(rendered).expect("a UTF-8 recipe");
-        let reparsed = yaml_rust2::YamlLoader::load_from_str(&rendered)
-            .expect("the re-rendered recipe must parse");
-        assert_eq!(
-            reparsed
-                .first()
-                .and_then(yaml_rust2::Yaml::as_hash)
-                .and_then(|m| m.iter().find(|(k, _)| k.as_str() == Some("ComponentName")))
-                .and_then(|(_, v)| v.as_str()),
-            Some(case.name),
-            "case {:?}: the recipe re-rendered as {other} must carry the same ComponentName, got {rendered}",
-            case.label
-        );
+            // What comes back is the document the service DERIVED from the
+            // submitted one: every submitted member, in the submitted order, plus
+            // the members the service supplies — the assigned `ComponentType`, and
+            // the recipe members whose default is the empty collection.
+            if format == "JSON" {
+                assert_eq!(
+                    document, case.stored_json,
+                    "case {:?} (submitted as {}): expected the derived document {:?}, \
+                     got {document:?}",
+                    case.label, case.format, case.stored_json
+                );
+            } else {
+                // The YAML rendering is the same document, so it declares the same
+                // members with the same values, in the same order.
+                assert_eq!(
+                    recipe_members(&document),
+                    recipe_members(case.stored_json),
+                    "case {:?} (submitted as {}): the {format} rendering must carry the \
+                     same members as {:?}, got {document:?}",
+                    case.label,
+                    case.format,
+                    case.stored_json
+                );
+            }
+        }
     }
 
-    // The clock owes REQUESTED -> DEPLOYABLE; wait for it to fall due.
-    wait_out_validation_window();
+    // The create reported the state at the instant it accepted the request; the
+    // recipe it validated is validated by the time it answered, so every read that
+    // follows reports the terminal state.
 
     for case in RECIPES {
         let arn = version_arn(case.name, case.version);
@@ -381,7 +396,7 @@ async fn a_created_component_version_reads_back_exactly_as_it_was_published() {
         assert_eq!(
             text(&body["status"], "componentState"),
             "DEPLOYABLE",
-            "case {:?}: the validation window elapsed, so the version must be DEPLOYABLE, got {body}",
+            "case {:?}: a published version is validated, so it must be DEPLOYABLE, got {body}",
             case.label
         );
 

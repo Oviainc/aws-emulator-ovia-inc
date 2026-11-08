@@ -196,13 +196,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             deployment_status: Some(entry.deployment_status.clone()),
             iot_job_id: Some(entry.iot_job_id.clone()),
             iot_job_arn: Some(entry.iot_job_arn.clone()),
-            components: (!entry.components.is_empty()).then(|| {
+            // Greengrass reports a deployment's component specifications as a map,
+            // EMPTY when the deployment specifies none, rather than omitting the
+            // member — the same as the `tags` map beside it — so a client
+            // enumerating either always finds a map to enumerate.
+            components: Some(
                 entry
                     .components
                     .iter()
                     .map(|(name, spec)| (name.clone(), spec.clone()))
-                    .collect()
-            }),
+                    .collect(),
+            ),
             deployment_policies: entry.deployment_policies.clone(),
             iot_job_configuration: entry.iot_job_configuration.clone(),
             creation_timestamp: Some(st::to_datetime(entry.creation_timestamp)),

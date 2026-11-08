@@ -15,7 +15,7 @@ use aws_smithy_types::base64;
 use bytes::Bytes;
 use serde_json::{json, Value};
 use service_com_amazonaws_greengrassv2_greengrassv2::state::{
-    COMPONENT_VALIDATION_SPAN, MAX_RESOLVE_CANDIDATES, MAX_RESOLVE_REQUIREMENTS,
+    COMPONENT_TYPE_GENERIC, MAX_RESOLVE_CANDIDATES, MAX_RESOLVE_REQUIREMENTS,
 };
 use service_com_amazonaws_greengrassv2_greengrassv2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -129,6 +129,18 @@ fn platform_recipe(name: &str, version: &str, attributes: &[(&str, &str)]) -> St
     }
     document.push_str("    Lifecycle:\n      Run: echo hello\n");
     document
+}
+
+/// A scalar member of a recipe document, or `None` when the document declares none.
+fn recipe_member(document: &str, key: &str) -> Option<String> {
+    yaml_rust2::YamlLoader::load_from_str(document)
+        .ok()?
+        .first()?
+        .as_hash()?
+        .iter()
+        .find(|(member, _)| member.as_str() == Some(key))
+        .and_then(|(_, value)| value.as_str())
+        .map(str::to_string)
 }
 
 /// The name-level component ARN this emulator mints for `name`.
@@ -461,40 +473,34 @@ async fn republishing_a_version_names_the_state_the_stored_one_is_in() {
     // component, the account AND the state:
     //   Component [<name> : <version>] for account [<account>] already exists with
     //   state: [<state>]
-    // What this test varies is the one part the emulator computes: the state, which the
-    // clock moves from REQUESTED to DEPLOYABLE over the validation span.
+    // What this test judges is the one part the emulator computes: the state, which is
+    // the STORED version's. A published version has been validated, so that state is the
+    // terminal one, whichever of its versions the republish collides with and however
+    // long after the publish it arrives.
     let router = emulator();
     let name = "com.example.Duplicate";
-    let document = recipe(name, "1.0.0");
-    let (status, _) = publish(&router, &document).await;
-    assert_eq!(status, 201, "the first publish must answer 201");
+    for version in ["1.0.0", "2.1.3-beta.1"] {
+        let document = recipe(name, version);
+        let (status, _) = publish(&router, &document).await;
+        assert_eq!(status, 201, "case {version:?}: the first publish must answer 201");
 
-    // Straight after the publish the stored version is still in the non-terminal state
-    // the create reported, and the conflict names that state.
-    let (status, body) = publish(&router, &document).await;
-    assert_eq!(status, 409, "expected 409, got {status} {body}");
-    assert_eq!(
-        text(&body, "message"),
-        format!(
-            "Component [{name} : 1.0.0] for account [{ACCOUNT}] already exists with state: \
-             [REQUESTED]"
-        ),
-        "the conflict must name the stored version's state, got {body}"
-    );
-
-    // Once the validation window the clock owes has elapsed, the same conflict names
-    // the state the stored version has moved to.
-    std::thread::sleep(COMPONENT_VALIDATION_SPAN * 2);
-    let (status, body) = publish(&router, &document).await;
-    assert_eq!(status, 409, "expected 409, got {status} {body}");
-    assert_eq!(
-        text(&body, "message"),
-        format!(
-            "Component [{name} : 1.0.0] for account [{ACCOUNT}] already exists with state: \
-             [DEPLOYABLE]"
-        ),
-        "the conflict must name the state the clock moved the version to, got {body}"
-    );
+        for attempt in ["straight after the publish", "a second collision"] {
+            let (status, body) = publish(&router, &document).await;
+            assert_eq!(
+                status, 409,
+                "case {version:?} {attempt}: expected 409, got {status} {body}"
+            );
+            assert_eq!(
+                text(&body, "message"),
+                format!(
+                    "Component [{name} : {version}] for account [{ACCOUNT}] already exists \
+                     with state: [DEPLOYABLE]"
+                ),
+                "case {version:?} {attempt}: the conflict must name the stored version's \
+                 state, got {body}"
+            );
+        }
+    }
 }
 
 
@@ -641,15 +647,48 @@ async fn resolve_component_candidates_picks_the_greatest_version_every_requireme
                     "case {:?}: expected the minted version ARN, got {entry}",
                     case.label
                 );
-                // The recipe the core device installs is the one that was published,
-                // byte for byte.
+                // The recipe the core device installs is the one the service STORED for
+                // that version, byte for byte: the same document `GetComponent` serves
+                // for the same ARN, which is the published document plus the
+                // `ComponentType` the service assigned it.
                 let blob = base64::decode(text(entry, "recipe")).expect("a base64 recipe blob");
+                let blob = String::from_utf8(blob).expect("a UTF-8 recipe");
+                let (status, served) = get(
+                    &router,
+                    &format!(
+                        "/greengrass/v2/components/{}?recipeOutputFormat=YAML",
+                        version_arn(name, expected).replace(':', "%3A")
+                    ),
+                )
+                .await;
                 assert_eq!(
-                    blob,
-                    recipe(name, expected).as_bytes(),
-                    "case {:?}: expected the stored recipe, got {:?}",
-                    case.label,
-                    String::from_utf8_lossy(&blob)
+                    status, 200,
+                    "case {:?}: GetComponent must answer 200, got {status} {served}",
+                    case.label
+                );
+                let served = String::from_utf8(
+                    base64::decode(text(&served, "recipe")).expect("a base64 recipe blob"),
+                )
+                .expect("a UTF-8 recipe");
+                assert_eq!(
+                    blob, served,
+                    "case {:?}: the resolved recipe must be the stored document {served:?}, \
+                     got {blob:?}",
+                    case.label
+                );
+                assert_eq!(
+                    (
+                        recipe_member(&blob, "ComponentName"),
+                        recipe_member(&blob, "ComponentVersion"),
+                        recipe_member(&blob, "ComponentType"),
+                    ),
+                    (
+                        Some(name.to_string()),
+                        Some(expected.to_string()),
+                        Some(COMPONENT_TYPE_GENERIC.to_string()),
+                    ),
+                    "case {:?}: expected the stored recipe of {name}:{expected}, got {blob:?}",
+                    case.label
                 );
                 assert_eq!(
                     text(entry, "vendorGuidance"),

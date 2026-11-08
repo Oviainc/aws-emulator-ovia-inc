@@ -24,12 +24,10 @@
 //! says nothing about.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use aws_smithy_types::base64;
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_greengrassv2_greengrassv2::state::COMPONENT_VALIDATION_SPAN;
 use service_com_amazonaws_greengrassv2_greengrassv2::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -175,7 +173,8 @@ async fn publish(router: &MultiServiceRouter, name: &str, version: &str) {
         status, 201,
         "publishing {name}:{version} must answer 201, got {status} {body}"
     );
-    tokio::time::sleep(COMPONENT_VALIDATION_SPAN + Duration::from_millis(50)).await;
+    // The publish validated the recipe, so the version is settled by the time this
+    // helper returns and no wait is owed.
 }
 
 /// One candidate class a request can name.
