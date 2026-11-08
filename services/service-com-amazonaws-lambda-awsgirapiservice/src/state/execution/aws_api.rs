@@ -244,6 +244,28 @@ pub const APIS: &[Api] = &[
             json_version: "1.1",
         },
     },
+    // `services/service-com-amazonaws-opensearch-amazonopensearchservice/smithy-model/
+    // com-amazonaws-opensearch-amazonopensearchservice.json`: restJson1, sigv4Name `es`,
+    // endpointPrefix `es`, sdkId `OpenSearch`. Its requests are bound per operation out of
+    // that same model ([`OPENSEARCH`]).
+    //
+    // A handler that indexes or searches documents reads the DOMAIN it is to reach from
+    // this control plane (`DescribeDomain`), and then reaches the domain's own data plane
+    // over HTTP ([`super::guest_http`]).
+    Api {
+        sdk_token: "opensearch",
+        signing_name: "es",
+        endpoint_prefix: "es",
+        protocol: Protocol::RestJson(&OPENSEARCH),
+    },
+    // The same service under the token its ENDPOINT PREFIX gives it, which is the other
+    // name an SDK client for it is built with (`boto3.client("es")`).
+    Api {
+        sdk_token: "es",
+        signing_name: "es",
+        endpoint_prefix: "es",
+        protocol: Protocol::RestJson(&OPENSEARCH),
+    },
     // `services/service-com-amazonaws-sfn-awsstepfunctions/smithy-model/
     // com-amazonaws-sfn-awsstepfunctions.json`: awsJson1_0, sigv4Name `states`,
     // endpointPrefix `states`, sdkId `SFN`, service shape `AWSStepFunctions`.
@@ -316,6 +338,18 @@ static APIGATEWAY: super::rest_json::RestApi = super::rest_json::RestApi {
          com-amazonaws-apigateway-backplanecontrolservice.json"
     ),
     namespace: "com.amazonaws.apigateway",
+    parsed: ::std::sync::OnceLock::new(),
+};
+
+/// Amazon OpenSearch Service's own model, which a call to it is bound by — embedded exactly
+/// as [`APIGATEWAY`] is, and for the same reason: the wire facts of each operation are that
+/// model's, so this seam states none of them.
+static OPENSEARCH: super::rest_json::RestApi = super::rest_json::RestApi {
+    model: include_str!(
+        "../../../../service-com-amazonaws-opensearch-amazonopensearchservice/smithy-model/\
+         com-amazonaws-opensearch-amazonopensearchservice.json"
+    ),
+    namespace: "com.amazonaws.opensearch",
     parsed: ::std::sync::OnceLock::new(),
 };
 
@@ -492,7 +526,105 @@ impl AwsAccess {
             }
         }
     }
+
+    /// ONE HTTP request the handler built and signed ITSELF, sent into this emulator:
+    /// `method` `url`, carrying `headers` (a JSON array of name/value pairs) and `body` (its
+    /// bytes as base64 text).
+    ///
+    /// The address a URL may name, the signature and the destination are
+    /// [`super::guest_http`]'s; `within` is what the run has left of its deadline, so a
+    /// request cannot outlast the invocation that made it.
+    pub fn send(
+        &self,
+        method: &str,
+        url: &str,
+        headers: &str,
+        body: &str,
+        within: Duration,
+    ) -> Result<super::guest_http::Answered, Refusal> {
+        use ::base64::Engine;
+
+        let headers: Vec<(String, String)> = ::serde_json::from_str::<Vec<(String, String)>>(
+            headers,
+        )
+        .map_err(|error| Refusal::NotMade(format!("the request's headers are not a list: {error}")))?;
+        let body = ::base64::engine::general_purpose::STANDARD
+            .decode(body)
+            .map_err(|error| Refusal::NotMade(format!("the request's body is not base64: {error}")))?;
+        self.runtime.block_on(super::guest_http::sent(
+            &super::guest_http::Sending {
+                callback: &self.callback,
+                default_region: &self.region,
+                method,
+                url,
+                headers: &headers,
+                body: &body,
+                within,
+                identity: self.identity.as_ref(),
+            },
+        ))
+    }
+
+    /// The URL one call carries ITS OWN signature in, as an SDK presigns one.
+    ///
+    /// Nothing is sent. The URL names the service's own endpoint and carries a signature
+    /// over exactly that request, made with the SAME identity the handler's ordinary calls
+    /// are made as — the session of the function's own execution role
+    /// ([`super::execution_role_session`]). The guest holds that credential no more than it
+    /// holds any other: what it gets back is an access key id and a signature over the one
+    /// request the URL names, good for `expires_in` and for nothing else, which is what a
+    /// presigned URL is.
+    ///
+    /// Only an OBJECT URL is presigned ([`super::aws_s3::presigned`]), because that is the
+    /// one a handler hands out; a URL asked for of any other service is reported as one that
+    /// was not signed, naming the service.
+    pub fn presigned(
+        &self,
+        service: &str,
+        operation: &str,
+        region: &str,
+        body: &str,
+        expires_in: Duration,
+    ) -> Result<String, Refusal> {
+        let Some(api) = APIS.iter().find(|api| api.sdk_token == service) else {
+            return Err(Refusal::UnknownService);
+        };
+        if !well_formed_operation(operation) {
+            return Err(Refusal::UnknownOperation);
+        }
+        if body.len() > MAX_REQUEST_BYTES {
+            return Err(Refusal::RequestTooLarge);
+        }
+        if !matches!(api.protocol, Protocol::S3Rest) {
+            return Err(Refusal::NotMade(format!(
+                "the AWS SDK this runtime supplies presigns an object URL only; {} carries \
+                 its input in a request it signs when it is made",
+                api.sdk_token
+            )));
+        }
+        let region = if well_formed_region(region) {
+            region.to_string()
+        } else {
+            self.region.clone()
+        };
+        let expires_in = expires_in.min(MAX_PRESIGNED_LIFETIME);
+        self.runtime.block_on(super::aws_s3::presigned(
+            &self.callback,
+            self.identity.as_ref(),
+            &region,
+            operation,
+            body,
+            expires_in,
+        ))
+    }
 }
+
+/// The longest a presigned URL this seam hands back is good for.
+///
+/// SigV4's own ceiling for a query-signed request is seven days
+/// ("X-Amz-Expires … the maximum value is 604800"), so a guest asking for longer is given a
+/// URL good for that, not one that is refused.
+const MAX_PRESIGNED_LIFETIME: Duration = Duration::from_secs(604_800);
 
 /// Why a call was not made at all.
 ///
@@ -534,7 +666,7 @@ pub struct Answer {
     pub streams: Vec<String>,
 }
 
-/// Build, sign and dispatch one AWS JSON request, and read the answer back.
+/// Build, sign and dispatch one request, and read the answer back.
 async fn dispatch(
     callback: &EmbeddedEmulator,
     api: &Api,
@@ -783,9 +915,9 @@ mod tests {
                     target_prefix,
                     json_version
                 ),
-                // A REST-bound service states no operation of its own here: the model it
-                // carries is what every one of its requests is bound by, so the one fact to
-                // hold is that the model parsed and binds operations at all.
+                // A REST-bound service states no operation of its own in the table above:
+                // the model it carries is what every one of its requests is bound by, so
+                // the one fact to hold is that the model parsed and binds operations at all.
                 super::Protocol::RestJson(rest) => {
                     let bound = rest.model().operation_count();
                     assert!(

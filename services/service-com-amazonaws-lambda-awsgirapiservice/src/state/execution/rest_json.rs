@@ -67,7 +67,7 @@ static NO_MEMBERS: OnceLock<Map<String, Value>> = OnceLock::new();
 
 impl Model {
     /// Parse `source`, which is a Smithy model document.
-    fn parse(source: &str, namespace: &str) -> Self {
+    pub(crate) fn parse(source: &str, namespace: &str) -> Self {
         let shapes = ::serde_json::from_str::<Value>(source)
             .ok()
             .and_then(|document| document.get("shapes").cloned())
@@ -83,7 +83,7 @@ impl Model {
     }
 
     /// The shape `id` names, whether the id is absolute or this model's own short name.
-    fn shape(&self, id: &str) -> Option<&Value> {
+    pub(crate) fn shape(&self, id: &str) -> Option<&Value> {
         if let Some(shape) = self.shapes.get(id) {
             return Some(shape);
         }
@@ -91,7 +91,7 @@ impl Model {
     }
 
     /// The members of the shape `id` names.
-    fn members(&self, id: &str) -> &Map<String, Value> {
+    pub(crate) fn members(&self, id: &str) -> &Map<String, Value> {
         self.shape(id)
             .and_then(|shape| shape.get("members"))
             .and_then(Value::as_object)
@@ -99,15 +99,34 @@ impl Model {
     }
 
     /// The type the shape `id` names declares (`structure`, `list`, `map`, …).
-    fn kind(&self, id: &str) -> &str {
-        self.shape(id)
-            .and_then(|shape| shape.get("type"))
-            .and_then(Value::as_str)
-            .unwrap_or_default()
+    ///
+    /// A shape of the PRELUDE (`smithy.api#Integer`) is not declared in a service's own
+    /// model at all, so its type is read from its name — which is what the prelude defines
+    /// each of those shapes as. Without that a prelude-targeted member would have no type
+    /// here, and a number or a boolean would be read back as the text the wire carried it
+    /// as.
+    pub(crate) fn kind(&self, id: &str) -> &str {
+        if let Some(kind) = self.shape(id).and_then(|shape| shape.get("type")) {
+            return kind.as_str().unwrap_or_default();
+        }
+        match id.strip_prefix("smithy.api#") {
+            Some("Blob") => "blob",
+            Some("Boolean" | "PrimitiveBoolean") => "boolean",
+            Some("Byte" | "PrimitiveByte") => "byte",
+            Some("Short" | "PrimitiveShort") => "short",
+            Some("Integer" | "PrimitiveInteger") => "integer",
+            Some("Long" | "PrimitiveLong") => "long",
+            Some("Float" | "PrimitiveFloat") => "float",
+            Some("Double" | "PrimitiveDouble") => "double",
+            Some("Timestamp") => "timestamp",
+            Some("Document") => "document",
+            Some("String") => "string",
+            _ => "",
+        }
     }
 
     /// The operation `name` names, or `None` when this model binds no such operation.
-    fn operation(&self, name: &str) -> Option<&Value> {
+    pub(crate) fn operation(&self, name: &str) -> Option<&Value> {
         let shape = self.shape(name)?;
         (shape.get("type").and_then(Value::as_str) == Some("operation")).then_some(shape)
     }
@@ -128,8 +147,8 @@ const QUERY: &str = "smithy.api#httpQuery";
 const QUERY_PARAMS: &str = "smithy.api#httpQueryParams";
 const HEADER: &str = "smithy.api#httpHeader";
 const PREFIX_HEADERS: &str = "smithy.api#httpPrefixHeaders";
-const PAYLOAD: &str = "smithy.api#httpPayload";
-const RESPONSE_CODE: &str = "smithy.api#httpResponseCode";
+pub(crate) const PAYLOAD: &str = "smithy.api#httpPayload";
+pub(crate) const RESPONSE_CODE: &str = "smithy.api#httpResponseCode";
 const JSON_NAME: &str = "smithy.api#jsonName";
 
 /// One member's traits, or the empty set for a member carrying none.
@@ -138,12 +157,12 @@ fn traits(member: &Value) -> Option<&Map<String, Value>> {
 }
 
 /// The value of the trait `name` on `member`, if it carries it.
-fn member_trait<'a>(member: &'a Value, name: &str) -> Option<&'a Value> {
+pub(crate) fn member_trait<'a>(member: &'a Value, name: &str) -> Option<&'a Value> {
     traits(member).and_then(|traits| traits.get(name))
 }
 
 /// The shape a member targets.
-fn target(member: &Value) -> &str {
+pub(crate) fn target(member: &Value) -> &str {
     member
         .get("target")
         .and_then(Value::as_str)
@@ -173,10 +192,39 @@ pub struct Bound {
     pub json_body: bool,
 }
 
-/// Bind `operation` of `api`, carrying `input` as the operation's input document keyed by its
-/// own member names, to the HTTP request the service's model describes.
-pub fn bind(api: &RestApi, operation: &str, input: &Value) -> Result<Bound, String> {
-    let model = api.model();
+/// WHERE each member of one operation's input belongs on the wire, as far as that is the
+/// same for every REST protocol: the method, the addressed path and query, the headers the
+/// input bound, and WHICH members are left for the body.
+///
+/// The HTTP bindings (`@httpLabel`, `@httpQuery`, `@httpQueryParams`, `@httpHeader`,
+/// `@httpPrefixHeaders`, `@httpPayload`) are the `smithy.api` ones, so they bind one REST
+/// protocol's request the way they bind another's; what differs between protocols is only
+/// how the members left over are written as a DOCUMENT, which is each protocol's own
+/// ([`bind`] writes the JSON one).
+#[derive(Debug)]
+pub(crate) struct Parts {
+    /// The HTTP method the operation's `@http` trait names.
+    pub method: String,
+    /// The path and query the request is addressed to.
+    pub target: String,
+    /// The headers the input's own members bound.
+    pub headers: Vec<(String, String)>,
+    /// The member bound to the WHOLE body (`@httpPayload`), as its name and the shape it
+    /// targets.
+    pub payload: Option<(String, String)>,
+    /// The members that belong IN the body, each as its name and the shape it targets, in
+    /// the order the model declares them.
+    pub body: Vec<(String, String)>,
+    /// The operation's input shape id, which the body members are read against.
+    pub input_shape: String,
+}
+
+/// Bind the parts of `operation`'s request that every REST protocol binds the same way.
+pub(crate) fn bind_parts(
+    model: &Model,
+    operation: &str,
+    input: &Value,
+) -> Result<Parts, String> {
     let shape = model
         .operation(operation)
         .ok_or_else(|| format!("{operation} is not an operation of this service"))?;
@@ -192,16 +240,17 @@ pub fn bind(api: &RestApi, operation: &str, input: &Value) -> Result<Bound, Stri
         .get("input")
         .and_then(|input| input.get("target"))
         .and_then(Value::as_str)
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_string();
 
     let supplied = input.as_object().cloned().unwrap_or_default();
     let mut labels: BTreeMap<&str, String> = BTreeMap::new();
     let mut query: Vec<(String, String)> = Vec::new();
     let mut headers: Vec<(String, String)> = Vec::new();
-    let mut payload: Option<(String, bool)> = None;
-    let mut body = Map::new();
+    let mut payload: Option<(String, String)> = None;
+    let mut body: Vec<(String, String)> = Vec::new();
 
-    for (name, member) in model.members(input_shape) {
+    for (name, member) in model.members(&input_shape) {
         let Some(value) = supplied.get(name).filter(|value| !value.is_null()) else {
             continue;
         };
@@ -222,17 +271,9 @@ pub fn bind(api: &RestApi, operation: &str, input: &Value) -> Result<Bound, Stri
                 headers.push((format!("{prefix}{key}"), scalar(one)));
             }
         } else if member_trait(member, PAYLOAD).is_some() {
-            // A payload that is itself a structure travels as that structure's JSON; one
-            // that is text or a blob travels as its own bytes.
-            payload = Some(match (model.kind(target(member)), value) {
-                (_, Value::String(text)) => (text.clone(), false),
-                (_, other) => (to_wire(model, target(member), other).to_string(), true),
-            });
+            payload = Some((name.clone(), target(member).to_string()));
         } else {
-            body.insert(
-                wire_name(name, member).to_string(),
-                to_wire(model, target(member), value),
-            );
+            body.push((name.clone(), target(member).to_string()));
         }
     }
 
@@ -253,15 +294,52 @@ pub fn bind(api: &RestApi, operation: &str, input: &Value) -> Result<Bound, Stri
         rendered.push('?');
         rendered.push_str(&parameters.join("&"));
     }
-    let (body, json_body) = match payload {
-        Some((text, json)) => (text, json),
-        None if body.is_empty() => (String::new(), false),
-        None => (Value::Object(body).to_string(), true),
-    };
-    Ok(Bound {
+    Ok(Parts {
         method,
         target: rendered,
         headers,
+        payload,
+        body,
+        input_shape,
+    })
+}
+
+/// Bind `operation` of `api`, carrying `input` as the operation's input document keyed by its
+/// own member names, to the HTTP request the service's model describes.
+pub fn bind(api: &RestApi, operation: &str, input: &Value) -> Result<Bound, String> {
+    let model = api.model();
+    let parts = bind_parts(model, operation, input)?;
+    let supplied = input.as_object().cloned().unwrap_or_default();
+    let members = model.members(&parts.input_shape);
+    let mut document = Map::new();
+    for (name, shape) in &parts.body {
+        let Some(value) = supplied.get(name) else {
+            continue;
+        };
+        let member = members.get(name).cloned().unwrap_or(Value::Null);
+        document.insert(
+            wire_name(name, &member).to_string(),
+            to_wire(model, shape, value),
+        );
+    }
+    let payload = parts.payload.as_ref().and_then(|(name, shape)| {
+        let value = supplied.get(name)?;
+        // A payload that is itself a structure travels as that structure's JSON; one
+        // that is text or a blob travels as its own bytes.
+        Some(match value {
+            Value::String(text) => (text.clone(), false),
+            other => (to_wire(model, shape, other).to_string(), true),
+        })
+    });
+    let (body, json_body) = match payload {
+        Some((text, json)) => (text, json),
+        None if document.is_empty() => (String::new(), false),
+        None => (Value::Object(document).to_string(), true),
+    };
+    Ok(Bound {
+        method: parts.method,
+        target: parts.target,
+        headers: parts.headers,
         body,
         json_body,
     })
@@ -335,7 +413,7 @@ pub trait HeaderSource {
 
 /// A header-bound value, read as the member's own type: a list member carries a
 /// comma-separated list, a number or a boolean its own text.
-fn header_value(model: &Model, shape: &str, text: &str) -> Value {
+pub(crate) fn header_value(model: &Model, shape: &str, text: &str) -> Value {
     match model.kind(shape) {
         "list" => Value::Array(
             text.split(',')
@@ -360,7 +438,7 @@ fn header_value(model: &Model, shape: &str, text: &str) -> Value {
 }
 
 /// One value as the text a label, a query parameter or a header carries it as.
-fn scalar(value: &Value) -> String {
+pub(crate) fn scalar(value: &Value) -> String {
     match value {
         Value::String(text) => text.clone(),
         Value::Null => String::new(),
@@ -370,7 +448,7 @@ fn scalar(value: &Value) -> String {
 
 /// One value as the texts it carries: a list binds one parameter per element, everything else
 /// one.
-fn scalars(value: &Value) -> Vec<String> {
+pub(crate) fn scalars(value: &Value) -> Vec<String> {
     match value {
         Value::Array(elements) => elements.iter().map(scalar).collect(),
         other => vec![scalar(other)],

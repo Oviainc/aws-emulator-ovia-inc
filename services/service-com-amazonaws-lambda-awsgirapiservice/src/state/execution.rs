@@ -74,6 +74,10 @@ mod bootstrap;
 pub mod aws_api;
 pub use aws_api::AwsAccess;
 
+/// The HTTP seam a running handler reaches it through when it signs and sends a request of
+/// its own.
+pub mod guest_http;
+
 /// The Amazon S3 half of that seam, whose own protocol binds a request per operation.
 mod aws_s3;
 
@@ -554,7 +558,7 @@ pub async fn run_invocation(invocation: Invocation) -> Result<Invoked, Unrunnabl
     })?
     .map_err(|error| Unrunnable::Internal(format!("the run memory is gone: {error}")))?;
 
-    let budget = run_budget(invocation.timeout);
+    let budget = run_budget(invocation.timeout, invocation.memory_size);
     let heap_bytes = run_heap_bytes(invocation.memory_size);
     let started = SystemTime::now();
     let request_id = invocation.request_id.clone();
@@ -998,15 +1002,21 @@ fn event_text(payload: &[u8]) -> Option<String> {
 }
 
 /// What one run may spend: the function's own `Timeout`, clamped to the range the model
-/// allows for it and to this module's ceiling, plus the bounds that are this emulator's.
+/// allows for it and to this module's ceiling, and the memory its own `MemorySize` asks for
+/// ([`run_heap_bytes`]), plus the bounds that are this emulator's.
+///
+/// The memory bound is the SAME quantity the run's share of the process envelope is charged
+/// in ([`run_memory_claim_mb`]), so what a run may allocate and what it holds of the
+/// envelope cannot diverge: a function configured for the smallest `MemorySize` the model
+/// allows is bounded at that, not at the per-run ceiling.
 #[must_use]
-pub fn run_budget(timeout_seconds: i32) -> Budget {
+pub fn run_budget(timeout_seconds: i32, memory_size: i32) -> Budget {
     let clamped = i64::from(timeout_seconds).clamp(MIN_TIMEOUT_SECONDS, MAX_TIMEOUT_SECONDS);
     let wall_clock = Duration::from_secs(u64::try_from(clamped).unwrap_or(1)).min(HOST_WAIT_CEILING);
     Budget {
         wall_clock,
         steps: MAX_RUN_STEPS,
-        memory_bytes: MAX_RUN_MEMORY_BYTES,
+        memory_bytes: u64::try_from(run_heap_bytes(memory_size)).unwrap_or(MAX_RUN_MEMORY_BYTES),
         log_bytes: MAX_RUN_LOG_BYTES,
         response_bytes: MAX_RESPONSE_BYTES,
         recursion_limit: MAX_RUN_RECURSION,
@@ -1328,7 +1338,7 @@ mod tests {
             (Engine::Node, 3, "3.00"),
         ];
         for (engine, timeout, rendered) in cases {
-            let budget = run_budget(*timeout);
+            let budget = run_budget(*timeout, MIN_MEMORY_SIZE_MB as i32);
             let finished = Finished {
                 completion: Completion::Stopped(Stop::Deadline),
                 log: String::new(),
@@ -1401,7 +1411,7 @@ mod tests {
                     finished,
                     request_id,
                     &probe_invocation(),
-                    run_budget(3),
+                    run_budget(3, MIN_MEMORY_SIZE_MB as i32),
                     engine,
                     SystemTime::UNIX_EPOCH,
                 );
@@ -1524,7 +1534,7 @@ mod tests {
                     invoked_function_arn: "arn:aws:lambda:us-west-2:000000000000:function:probe",
                     client_context: None,
                     tenant_id: None,
-                    budget: run_budget(5),
+                    budget: run_budget(5, MIN_MEMORY_SIZE_MB as i32),
                     aws: None,
                 })
             })
@@ -1551,7 +1561,9 @@ mod tests {
             (100_000, HOST_WAIT_CEILING.as_secs()),
         ];
         for (configured, expected) in cases {
-            let actual = run_budget(*configured).wall_clock.as_secs();
+            let actual = run_budget(*configured, MIN_MEMORY_SIZE_MB as i32)
+                .wall_clock
+                .as_secs();
             assert_eq!(
                 actual, *expected,
                 "case {configured} s configured: expected a {expected} s run budget, got {actual}"

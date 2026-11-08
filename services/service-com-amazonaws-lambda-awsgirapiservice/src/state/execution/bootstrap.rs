@@ -259,6 +259,16 @@ def _bounded_sleep(seconds):
 def _run(request, library):
     sources = request["modules"]
     sys.meta_path.insert(0, _PackageFinder(sources, importlib.util.spec_from_loader))
+    # The modules of the STANDARD LIBRARY this runtime supplies itself — the socket
+    # interface a Python program expects of its operating system, and the HTTP client built
+    # on one — are resolved ahead of the frozen standard library and behind the deployment
+    # package, which is where a runtime's own standard library sits: these ARE this
+    # runtime's `socket` and `http.client`, and a package shipping its own still wins.
+    runtime_stdlib = request.get("runtimeStdlib") or {}
+    if runtime_stdlib:
+        sys.meta_path.insert(
+            1, _PackageFinder(runtime_stdlib, importlib.util.spec_from_loader)
+        )
     # The modules the RUNTIME supplies — the AWS SDK a managed runtime ships — are
     # resolved AFTER the deployment package's own entries and after the standard library,
     # so a package shipping its own copy of one of them wins, exactly as the package

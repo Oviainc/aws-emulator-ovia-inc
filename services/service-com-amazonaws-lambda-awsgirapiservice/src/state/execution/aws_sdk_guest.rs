@@ -47,6 +47,7 @@
 
 use super::package::PackageModule;
 
+
 /// DynamoDB's resource interface: the service resource, its tables, and the item
 /// marshalling between a plain Python value and an attribute value.
 mod dynamodb;
@@ -62,6 +63,10 @@ pub fn runtime_modules() -> Vec<PackageModule> {
         ("botocore/__init__.py", BOTOCORE_SOURCE),
         ("botocore/exceptions.py", BOTOCORE_EXCEPTIONS_SOURCE),
         ("botocore/response.py", BOTOCORE_RESPONSE_SOURCE),
+        ("botocore/credentials.py", BOTOCORE_CREDENTIALS_SOURCE),
+        ("botocore/awsrequest.py", BOTOCORE_AWSREQUEST_SOURCE),
+        ("botocore/auth.py", BOTOCORE_AUTH_SOURCE),
+        ("botocore/session.py", BOTOCORE_SESSION_SOURCE),
         ("botocore/client.py", BOTOCORE_CLIENT_SOURCE),
         ("boto3/__init__.py", BOTO3_SOURCE),
         ("boto3/session.py", BOTO3_SESSION_SOURCE),
@@ -227,6 +232,151 @@ class StreamingBody:
         return False
 "#;
 
+/// `botocore.credentials`: the handle on the invocation's credentials.
+///
+/// A handler that signs a request of its own asks the session for its credentials and hands
+/// them to [`BOTOCORE_AUTH_SOURCE`]'s signer. What it gets is a HANDLE and not a credential:
+/// the signature is put on by host code with a credential this runtime never hands the
+/// guest, so there is nothing secret here to read — and nothing is invented either, so a
+/// handler that reads `access_key` finds no key rather than one that signs nothing.
+const BOTOCORE_CREDENTIALS_SOURCE: &str = r#"
+"""The invocation's credentials, which the handler holds no copy of."""
+
+
+class Credentials:
+    """A handle on the credentials this invocation's calls are signed with.
+
+    The host signs those calls (see `botocore.auth`), so no access key, secret or session
+    token of the invocation is readable here.
+    """
+
+    method = "lambda-runtime"
+
+    def __init__(self, access_key=None, secret_key=None, token=None):
+        self.access_key = access_key
+        self.secret_key = secret_key
+        self.token = token
+
+    def get_frozen_credentials(self):
+        return self
+"#;
+
+/// `botocore.awsrequest`: the request a handler builds to sign and send itself.
+const BOTOCORE_AWSREQUEST_SOURCE: &str = r#"
+"""One HTTP request a handler builds for itself."""
+
+
+class AWSRequest:
+    """A request a handler signs and then sends with an HTTP client of its own.
+
+    The members are botocore's: `method`, `url`, `headers`, `body` (which `data` is the
+    other name of), and `params` for the query. Nothing is sent by building one.
+    """
+
+    def __init__(self, method=None, url=None, headers=None, data=None, params=None):
+        self.method = method
+        self.url = url
+        self.headers = dict(headers or {})
+        self.data = data
+        self.params = dict(params or {})
+        self.context = {}
+
+    @property
+    def body(self):
+        return self.data
+
+    @body.setter
+    def body(self, value):
+        self.data = value
+
+    def prepare(self):
+        return self
+"#;
+
+/// `botocore.auth`: the signer a handler puts on a request of its own.
+///
+/// WHAT IT DOES: it records on the request which service and Region the signature is for,
+/// and nothing else. The signature itself is put on by HOST code when the request is sent
+/// ([`super::guest_http`]), with a credential the guest never holds — so this writes no
+/// `Authorization` header, because it has nothing to write one from. A handler that signs a
+/// request and sends it with an HTTP client reaches the service it addressed, signed; a
+/// handler that reads the header back finds the request as it left it.
+const BOTOCORE_AUTH_SOURCE: &str = r#"
+"""Signing one request a handler built itself."""
+
+_SIGNING_CONTEXT = "emulator_signing"
+
+
+class BaseSigner:
+    def add_auth(self, request):
+        raise NotImplementedError("add_auth")
+
+
+class SigV4Auth(BaseSigner):
+    """The SigV4 signer, as a handler builds one: a credential handle, a service and a
+    Region.
+
+    `add_auth` states on the request WHICH service and Region its signature is for. The
+    signature is put on by the runtime when the request is sent, out of a credential the
+    handler never holds, so nothing secret passes through here and no signature is
+    invented.
+    """
+
+    def __init__(self, credentials, service_name, region_name):
+        self.credentials = credentials
+        self.service_name = service_name
+        self.region_name = region_name
+
+    def add_auth(self, request):
+        context = getattr(request, "context", None)
+        if context is None:
+            context = {}
+            request.context = context
+        context[_SIGNING_CONTEXT] = {
+            "service": self.service_name,
+            "region": self.region_name,
+        }
+        return request
+
+
+class SigV4QueryAuth(SigV4Auth):
+    """The same signer for a signature carried in the query, which is what a presigned URL
+    carries. A URL is presigned by the client itself
+    (`client.generate_presigned_url(...)`), where the runtime signs it; this exists so a
+    handler that names the class finds it."""
+
+    def __init__(self, credentials, service_name, region_name, expires=3600):
+        SigV4Auth.__init__(self, credentials, service_name, region_name)
+        self.expires = expires
+"#;
+
+/// `botocore.session`: the session the lower half of the SDK is reached through.
+const BOTOCORE_SESSION_SOURCE: &str = r#"
+"""The botocore session a handler asks for its credentials or a client."""
+
+from botocore.credentials import Credentials
+
+
+class Session:
+    def __init__(self, **_ignored):
+        self._credentials = Credentials()
+
+    def get_credentials(self):
+        return self._credentials
+
+    def get_scoped_config(self):
+        return {}
+
+    def create_client(self, service_name, region_name=None, **kwargs):
+        from botocore.client import Client
+
+        return Client(service_name, region_name=region_name, **kwargs)
+
+
+def get_session(**kwargs):
+    return Session(**kwargs)
+"#;
+
 /// `botocore.client`: the client itself, and the one host call behind every method.
 const BOTOCORE_CLIENT_SOURCE: &str = r##"
 """One AWS SDK client: a method per operation, over the runtime's own call seam."""
@@ -261,17 +411,44 @@ def _operation_name(method):
 def _encoded(value):
     """A value `json` does not write by itself.
 
-    An AWS JSON protocol carries a blob as base64 text, so `bytes` a handler passes are
-    encoded to it. Anything else is a value this SDK cannot send, and says so.
+    Every protocol this SDK speaks carries a blob as base64 text, so the `bytes` a handler
+    passes are encoded to it. Anything else is a value this SDK cannot send, and says so.
     """
     if isinstance(value, (bytes, bytearray)):
         return base64.b64encode(bytes(value)).decode("ascii")
     raise TypeError("%r is not a value an AWS SDK call can carry" % (value,))
 
 
+def _copy_source(value):
+    """The `CopySource` of a copy, as the SDK renders one.
+
+    `CopySource` travels as the text of a header, and the SDK lets a caller give it either
+    as that text or as `{"Bucket": …, "Key": …, "VersionId": …}` — in which case the SDK is
+    what renders it: the bucket, a slash, the key with the characters a header cannot carry
+    percent-encoded, and the version the copy reads, when one is named.
+    """
+    if not isinstance(value, dict):
+        return value
+    from urllib.parse import quote
+
+    rendered = "%s/%s" % (
+        value.get("Bucket", ""),
+        quote(str(value.get("Key", "")).encode("utf-8"), safe="/~"),
+    )
+    version = value.get("VersionId")
+    if version:
+        rendered += "?versionId=%s" % (quote(str(version).encode("utf-8"), safe="/~"),)
+    return rendered
+
+
 def _error_code(error_type, document):
     """The error code a refusal names, from the header or the document's own member."""
-    for named in (error_type, document.get("__type"), document.get("code")):
+    for named in (
+        error_type,
+        document.get("__type"),
+        document.get("Code"),
+        document.get("code"),
+    ):
         if not named:
             continue
         shape = named.split("#")[-1].split(":")[0].strip()
@@ -366,7 +543,50 @@ class Client:
     def close(self):
         return None
 
+    def generate_presigned_url(
+        self, ClientMethod, Params=None, ExpiresIn=3600, HttpMethod=None
+    ):
+        """A URL that carries its own signature, as botocore presigns one.
+
+        The URL is built and SIGNED by the runtime, out of the operation's own model and a
+        credential the handler never holds, so what comes back addresses the service this
+        client was built for and carries a signature over exactly that request.
+        """
+        operation_name = _operation_name(ClientMethod)
+        try:
+            expires = int(ExpiresIn)
+        except (TypeError, ValueError):
+            raise ParamValidationError(
+                report="ExpiresIn must be a number of seconds, got %r" % (ExpiresIn,)
+            )
+        answered = json.loads(
+            _host.presign(
+                self._service_name,
+                operation_name,
+                self._region_name,
+                json.dumps(Params or {}, default=_encoded),
+                expires,
+            )
+        )
+        refused = answered.get("refused")
+        if refused is not None:
+            self._raise_refusal(refused, answered, operation_name)
+        return answered.get("url")
+
+    def _input(self, parameters):
+        """The input as the operation's own model takes it.
+
+        The SDK renders a few members a caller may give in a friendlier form than the wire
+        carries: `CopySource` is the one this SDK renders ([`_copy_source`]), because a copy
+        is routinely written with the bucket and the key apart.
+        """
+        source = parameters.get("CopySource")
+        if isinstance(source, dict):
+            parameters = dict(parameters, CopySource=_copy_source(source))
+        return parameters
+
     def _call(self, operation_name, parameters):
+        parameters = self._input(parameters)
         answered = json.loads(
             _host.aws(
                 self._service_name,
@@ -469,6 +689,7 @@ const BOTO3_SESSION_SOURCE: &str = r#"
 """The session a client is built from."""
 
 from botocore.client import Client
+from botocore.credentials import Credentials
 from botocore.exceptions import SdkCallNotMade
 
 # The services this runtime's SDK supplies resource classes for.
@@ -477,10 +698,26 @@ _RESOURCE_SERVICES = ("dynamodb",)
 
 class Session:
     def __init__(self, region_name=None, **_ignored):
-        self.region_name = region_name
+        import os
+
+        self.region_name = (
+            region_name
+            or os.environ.get("AWS_REGION")
+            or os.environ.get("AWS_DEFAULT_REGION")
+            or None
+        )
 
     def client(self, service_name, region_name=None, **kwargs):
         return Client(service_name, region_name=region_name or self.region_name, **kwargs)
+
+    def get_credentials(self):
+        """The handle on this invocation's credentials.
+
+        A handler asks for these to sign a request of its own
+        (`botocore.auth.SigV4Auth`); the signature is the runtime's, so the handle carries
+        no key, secret or token of the invocation.
+        """
+        return Credentials()
 
     def resource(self, service_name, region_name=None, **kwargs):
         if service_name in _RESOURCE_SERVICES:

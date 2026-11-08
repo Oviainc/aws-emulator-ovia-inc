@@ -330,6 +330,10 @@ fn prepare(
     }
     refuse_host_file_access(vm)?;
     narrow_posix(vm)?;
+    // The DATA `os` re-exports from the module it is built on — the `stat_result` type and
+    // the `open` flags — installed before any import of `os`, because that is where `os`
+    // takes them from ([`super::host_posix::install_data_surface`]).
+    super::host_posix::install_data_surface(vm)?;
     install_environment(vm, request.environment)?;
     refuse_guest_threads(vm)?;
     clamp_guest_sleep(vm, bounds)?;
@@ -555,6 +559,7 @@ fn runtime_input(request: &Run<'_>) -> Result<String, String> {
         "handler": request.handler,
         "modules": modules,
         "runtimeModules": runtime_modules(),
+        "runtimeStdlib": runtime_stdlib(),
         "environment": environment,
         "event": request.event,
         "requestId": request.request_id,
@@ -571,6 +576,18 @@ fn runtime_input(request: &Run<'_>) -> Result<String, String> {
 /// ([`super::aws_sdk_guest`]).
 fn runtime_modules() -> ::serde_json::Map<String, ::serde_json::Value> {
     super::aws_sdk_guest::runtime_modules()
+        .into_iter()
+        .map(|module| (module.path, ::serde_json::Value::String(module.source)))
+        .collect()
+}
+
+/// The modules of the STANDARD LIBRARY this runtime supplies in place of the frozen ones:
+/// the socket module a Python program expects of its operating system and the HTTP client
+/// built on one ([`super::guest_http`]). Resolved before the frozen standard library and
+/// after the deployment package's own entries, which is where a runtime's own standard
+/// library sits.
+fn runtime_stdlib() -> ::serde_json::Map<String, ::serde_json::Value> {
+    super::guest_http::runtime_stdlib_modules()
         .into_iter()
         .map(|module| (module.path, ::serde_json::Value::String(module.source)))
         .collect()
@@ -666,7 +683,10 @@ fn host_module(
     // how long one may take — are held here, where no guest code can reach them.
     let access = aws.cloned();
     let call_bounds = Arc::clone(bounds);
+    // How many calls this RUN has made, counted once for every way it can make one: an SDK
+    // call and a request the handler sends itself spend the same budget.
     let made = Arc::new(AtomicU64::new(0));
+    let counted = Arc::clone(&made);
     set_function(
         vm,
         &module,
@@ -679,7 +699,7 @@ fn host_module(
             if let Some(stop) = call_bounds.stopped() {
                 return Err(vm.new_runtime_error(stop.reason().to_owned()));
             }
-            if made.fetch_add(1, Ordering::Relaxed) >= MAX_CALLS_PER_RUN as u64 {
+            if counted.fetch_add(1, Ordering::Relaxed) >= MAX_CALLS_PER_RUN as u64 {
                 return Err(vm.new_runtime_error(format!(
                     "one invocation may make at most {MAX_CALLS_PER_RUN} AWS SDK calls"
                 )));
@@ -701,6 +721,87 @@ fn host_module(
             Ok(vm.ctx.new_str(call_answer(&answered)).into())
         },
     );
+    // The ONE request a handler SENDS ITSELF, for a service whose data plane is reached
+    // over HTTP rather than through an SDK operation. The address it may name, the
+    // signature and the destination are all [`super::guest_http`]'s; the two bounds that
+    // are this run's — the call count it shares with the SDK seam above and how long one
+    // request may take — are held here, where no guest code can reach them.
+    let sending = aws.cloned();
+    let request_bounds = Arc::clone(bounds);
+    let requested = made;
+    set_function(
+        vm,
+        &module,
+        "request",
+        move |args: FuncArgs, vm: &VirtualMachine| {
+            let (method, url, headers, body): (String, String, String, String) = args.bind(vm)?;
+            if let Some(stop) = request_bounds.stopped() {
+                return Err(vm.new_runtime_error(stop.reason().to_owned()));
+            }
+            if requested.fetch_add(1, Ordering::Relaxed) >= MAX_CALLS_PER_RUN as u64 {
+                return Err(vm.new_runtime_error(format!(
+                    "one invocation may make at most {MAX_CALLS_PER_RUN} calls into this \
+                     emulator"
+                )));
+            }
+            let Some(access) = sending.as_ref() else {
+                return Ok(vm
+                    .ctx
+                    .new_str(refusal_answer(
+                        "not_made",
+                        "this invocation was given no seam to send a request on, so none was \
+                         sent",
+                    ))
+                    .into());
+            };
+            let remaining = request_bounds.remaining();
+            if remaining.is_zero() {
+                return Err(vm.new_runtime_error(Stop::Deadline.reason().to_owned()));
+            }
+            let answered = access.send(&method, &url, &headers, &body, remaining);
+            Ok(vm.ctx.new_str(request_answer(&answered)).into())
+        },
+    );
+    // The URL a handler asks the SDK to PRESIGN. Nothing is sent, so this spends neither
+    // the call count nor the deadline; the operation's own binding and the signature are
+    // host code's ([`super::aws_api::presigned`]), so what the guest decides is only which
+    // operation of which reachable service the URL names.
+    let presigning = aws.cloned();
+    set_function(
+        vm,
+        &module,
+        "presign",
+        move |args: FuncArgs, vm: &VirtualMachine| {
+            let (service, operation, region, body, expires): (
+                String,
+                String,
+                String,
+                String,
+                u64,
+            ) = args.bind(vm)?;
+            let Some(access) = presigning.as_ref() else {
+                return Ok(vm
+                    .ctx
+                    .new_str(refusal_answer(
+                        "not_made",
+                        "this invocation was given no AWS SDK seam, so no URL was signed",
+                    ))
+                    .into());
+            };
+            let signed = access.presigned(
+                &service,
+                &operation,
+                &region,
+                &body,
+                Duration::from_secs(expires),
+            );
+            let answered = match signed {
+                Ok(url) => ::serde_json::json!({ "url": url }).to_string(),
+                Err(refused) => refusal_answer_for(&refused),
+            };
+            Ok(vm.ctx.new_str(answered).into())
+        },
+    );
     module
 }
 
@@ -711,44 +812,64 @@ fn host_module(
 /// ([`super::bootstrap`]): the host's interpreter surface stays a string in and a string
 /// out.
 fn call_answer(answered: &Result<super::aws_api::Answer, Refusal>) -> String {
-    let document = match answered {
+    match answered {
         Ok(answer) => ::serde_json::json!({
             "status": answer.status,
             "body": answer.body,
             "errorType": answer.error_type,
             "requestId": answer.request_id,
             "streams": answer.streams,
-        }),
-        Err(Refusal::UnknownService) => {
-            return refusal_answer(
-                "unknown_service",
-                &super::aws_api::reachable_services().join(", "),
-            )
-        }
-        Err(Refusal::UnknownOperation) => return refusal_answer("unknown_operation", ""),
-        Err(Refusal::TimedOut) => return refusal_answer("timed_out", ""),
-        Err(Refusal::RequestTooLarge) => {
-            return refusal_answer(
-                "not_made",
-                &format!(
-                    "the request document is larger than the {} bytes one AWS SDK call may \
-                     carry",
-                    super::aws_api::MAX_REQUEST_BYTES
-                ),
-            )
-        }
-        Err(Refusal::ResponseTooLarge) => {
-            return refusal_answer(
-                "not_made",
-                &format!(
-                    "the answer is larger than the {} bytes one AWS SDK call may read back",
-                    super::aws_api::MAX_RESPONSE_BYTES
-                ),
-            )
-        }
-        Err(Refusal::NotMade(detail)) => return refusal_answer("not_made", detail),
-    };
-    document.to_string()
+        })
+        .to_string(),
+        Err(refused) => refusal_answer_for(refused),
+    }
+}
+
+/// The answer for a call or a signature this seam did not make, naming which refusal it
+/// was. Shared by every host call the guest makes, so one refusal is reported one way.
+fn refusal_answer_for(refused: &Refusal) -> String {
+    match refused {
+        Refusal::UnknownService => refusal_answer(
+            "unknown_service",
+            &super::aws_api::reachable_services().join(", "),
+        ),
+        Refusal::UnknownOperation => refusal_answer("unknown_operation", ""),
+        Refusal::TimedOut => refusal_answer("timed_out", ""),
+        Refusal::RequestTooLarge => refusal_answer(
+            "not_made",
+            &format!(
+                "the request document is larger than the {} bytes one AWS SDK call may carry",
+                super::aws_api::MAX_REQUEST_BYTES
+            ),
+        ),
+        Refusal::ResponseTooLarge => refusal_answer(
+            "not_made",
+            &format!(
+                "the answer is larger than the {} bytes one AWS SDK call may read back",
+                super::aws_api::MAX_RESPONSE_BYTES
+            ),
+        ),
+        Refusal::NotMade(detail) => refusal_answer("not_made", detail),
+    }
+}
+
+/// What the guest reads back from one request it sent itself: the service's own status,
+/// headers and body, or the reason no request was made.
+fn request_answer(answered: &Result<super::guest_http::Answered, Refusal>) -> String {
+    use ::base64::Engine;
+
+    match answered {
+        Ok(answer) => ::serde_json::json!({
+            "status": answer.status,
+            "reason": ::http::StatusCode::from_u16(answer.status)
+                .ok()
+                .and_then(|status| status.canonical_reason()),
+            "headers": answer.headers,
+            "body": ::base64::engine::general_purpose::STANDARD.encode(&answer.body),
+        })
+        .to_string(),
+        Err(refused) => refusal_answer_for(refused),
+    }
 }
 
 /// The answer for a call that was not made, naming which refusal it was.
@@ -1439,6 +1560,78 @@ mod tests {
             names,
             vec!["SECRET"],
             "expected only the invocation's own variables, got {names:?}"
+        );
+    }
+
+    /// What this runtime presents of the STANDARD LIBRARY, read from inside a run: one row
+    /// per module a handler imports that a module table missing a name of `os` could not
+    /// import at all, plus the `stat_result` type `os` re-exports.
+    ///
+    /// The modules are the ones the standard library itself cannot be imported without:
+    /// `shutil` (and `tempfile`, `zipfile`, `tarfile`, which import it) reads
+    /// `os.stat_result`, `glob` (and `pathlib`, which imports it) reads `os.O_RDONLY`,
+    /// `random` (and `secrets`, `statistics`) registers an at-fork hook, and `http.client`
+    /// and `urllib.request` are built on `socket`.
+    #[test]
+    fn the_standard_library_a_run_presents_is_a_complete_one() {
+        let modules = [
+            "shutil",
+            "zipfile",
+            "tempfile",
+            "tarfile",
+            "pathlib",
+            "glob",
+            "random",
+            "secrets",
+            "statistics",
+            "socket",
+            "http.client",
+            "urllib.request",
+            "importlib.metadata",
+        ];
+        let source = "def handler(event, context):\n    \
+                          read = {}\n    \
+                          for name in event['modules']:\n        \
+                              try:\n            \
+                                  __import__(name)\n            \
+                                  read[name] = 'ok'\n        \
+                              except BaseException as error:\n            \
+                                  read[name] = repr(error)\n    \
+                          return read\n";
+        let event = ::serde_json::json!({ "modules": modules }).to_string();
+        // Importing this much of the standard library is more work than the small budget
+        // above allows, and is work a real invocation's own budget covers
+        // ([`crate::state::execution`]), so this row is given a run's own.
+        let mut whole = budget();
+        whole.wall_clock = Duration::from_secs(120);
+        whole.steps = 20_000_000;
+        let finished = ran_with(
+            source,
+            "lambda_function.handler",
+            Some(&event),
+            &BTreeMap::new(),
+            whole,
+        );
+        let answered = returned(&finished, "the standard library");
+        for module in modules {
+            assert_eq!(
+                answered.get(module).and_then(::serde_json::Value::as_str),
+                Some("ok"),
+                "case {module}: expected the module to import, got {answered}"
+            );
+        }
+        // The type `os` re-exports from the module it is built on, read by name, by index
+        // and by length.
+        let built = "import os\n\
+                     def handler(event, context):\n    \
+                         read = os.stat_result((33188, 2, 3, 1, 0, 0, 12, 1.0, 2.0, 3.0))\n    \
+                         return [read.st_mode, read.st_size, read[6], len(read)]\n";
+        let finished = ran(built, "lambda_function.handler", None);
+        let answered = returned(&finished, "the stat_result type");
+        assert_eq!(
+            answered,
+            ::serde_json::json!([33188, 12, 12, 10]),
+            "case os.stat_result: expected the stat fields, got {answered}"
         );
     }
 

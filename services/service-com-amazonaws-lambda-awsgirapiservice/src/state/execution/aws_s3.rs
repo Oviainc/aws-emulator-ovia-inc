@@ -133,6 +133,64 @@ fn client(
     Client::from_conf(config.build())
 }
 
+/// The URL a presigned object request carries its own signature in.
+///
+/// The URL is built AND signed by the S3 client this module holds, with the same identity
+/// and the same endpoint a call made here uses, so what comes back addresses this emulator's
+/// own object endpoint and carries a SigV4 query signature over exactly the request it
+/// names, good for `expires_in`. Nothing is sent: presigning is a signature over a request
+/// that has not been made.
+///
+/// Only the two operations a presigned URL is handed out for are signed — reading an object
+/// and writing one — and any other is reported as a URL that was not signed, naming it.
+pub async fn presigned(
+    callback: &EmbeddedEmulator,
+    identity: Option<&CallerIdentity>,
+    region: &str,
+    operation: &str,
+    body: &str,
+    expires_in: ::std::time::Duration,
+) -> Result<String, Refusal> {
+    let input = Input::read(body)?;
+    let client = client(callback, identity, region, Observed::default());
+    let config = ::aws_sdk_s3::presigning::PresigningConfig::expires_in(expires_in)
+        .map_err(|error| Refusal::NotMade(error.to_string()))?;
+    let signed = match operation {
+        "GetObject" => {
+            input.only(&["Bucket", "Key", "VersionId", "Range"])?;
+            client
+                .get_object()
+                .bucket(input.required_text("Bucket")?)
+                .key(input.required_text("Key")?)
+                .set_version_id(input.text("VersionId")?)
+                .set_range(input.text("Range")?)
+                .presigned(config)
+                .await
+                .map(|presigned| presigned.uri().to_string())
+                .map_err(|error| error.to_string())
+        }
+        "PutObject" => {
+            input.only(&["Bucket", "Key", "ContentType"])?;
+            client
+                .put_object()
+                .bucket(input.required_text("Bucket")?)
+                .key(input.required_text("Key")?)
+                .set_content_type(input.text("ContentType")?)
+                .presigned(config)
+                .await
+                .map(|presigned| presigned.uri().to_string())
+                .map_err(|error| error.to_string())
+        }
+        other => {
+            return Err(Refusal::NotMade(format!(
+                "the AWS SDK this runtime supplies presigns a GetObject or a PutObject URL \
+                 on Amazon S3; {other} is not one it presigns"
+            )))
+        }
+    };
+    signed.map_err(Refusal::NotMade)
+}
+
 /// `GetObject`: the bytes and the metadata of the version the request addresses.
 async fn get_object(
     client: &Client,
@@ -219,7 +277,11 @@ async fn head_object(
         .await;
     let read = match sent {
         Ok(read) => read,
-        Err(error) => return refused(&error, observed),
+        // A `HEAD` answer carries NO BODY on the wire, so an SDK has no code or sentence to
+        // read out of one and reports the STATUS as the code with that status's own reason
+        // as the message. That is what a handler catching a missing object matches on, so
+        // it is what this refusal carries.
+        Err(error) => return refused_without_a_document(&error, observed),
     };
     let mut document = Map::new();
     insert_text(&mut document, "ContentType", read.content_type());
@@ -715,6 +777,40 @@ fn refused<E: ProvideErrorMetadata>(
         status: carried.status,
         body: Value::Object(document).to_string(),
         error_type: Some(code.to_string()),
+        request_id: carried.request_id,
+        streams: Vec::new(),
+    })
+}
+
+/// The same refusal for an operation whose answer carries NO DOCUMENT: a `HEAD`, where the
+/// code an SDK reports is the status itself and the message is that status's reason phrase,
+/// because there is no body to read either out of.
+fn refused_without_a_document<E: ProvideErrorMetadata>(
+    error: &::aws_sdk_s3::error::SdkError<E, ::aws_smithy_runtime_api::http::Response>,
+    observed: &Observed,
+) -> Result<Answer, Refusal> {
+    let Ok(carried) = observed.carried() else {
+        return Err(Refusal::NotMade(format!(
+            "the Amazon S3 call could not be made: {error}"
+        )));
+    };
+    let code = carried.status.to_string();
+    let mut document = Map::new();
+    document.insert("__type".to_string(), Value::String(code.clone()));
+    document.insert(
+        "message".to_string(),
+        Value::String(
+            ::http::StatusCode::from_u16(carried.status)
+                .ok()
+                .and_then(|status| status.canonical_reason())
+                .unwrap_or_default()
+                .to_string(),
+        ),
+    );
+    Ok(Answer {
+        status: carried.status,
+        body: Value::Object(document).to_string(),
+        error_type: Some(code),
         request_id: carried.request_id,
         streams: Vec::new(),
     })

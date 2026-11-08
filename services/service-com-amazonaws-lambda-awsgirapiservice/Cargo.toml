@@ -182,6 +182,10 @@ aws-smithy-eventstream = "0.60"
 # or a query parameter's value is percent-encoded on the way into one
 # (`state::execution::rest_json`).
 percent-encoding = "2.3"
+# The platform's own values for the names a complete POSIX module carries as plain data —
+# the `open` flags the standard library reads off `os` while being imported
+# (`state::execution::host_posix`) — taken from the C headers rather than written out here.
+libc = "0.2"
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
