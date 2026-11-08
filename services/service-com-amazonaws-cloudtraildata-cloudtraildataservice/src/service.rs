@@ -20,12 +20,15 @@
 //!   request's resolved route key against this service's signing name. Edit it
 //!   for anything the model does not express: a signing name shared by several
 //!   services, or routing that keys on the access-key id.
-//! - `override_operation` — serve a request the model's routing key cannot name
-//!   correctly. The default returns `None`, so every request resolves through the
-//!   generated routing table. Return `Some(op)` to route one yourself.
-//! - `override_refusal` — how this service words a request the framework refused
-//!   before any handler ran. The default returns `None`, keeping the framework's
-//!   wording. See the inline note on that method for how to reword.
+//! - `override_operation` — EDITED HERE. The routing DECISION is still the model's: this
+//!   service serves the operation the generated table names, through the wrapper in
+//!   [`validation`] that states a pre-handler refusal the way this service states one,
+//!   which the `override_refusal` seam cannot do because it never sees the request.
+//! - `override_refusal` — EDITED HERE. A refusal ABOUT a channel reference is answered
+//!   under the error this service's model declares for that fault; every other
+//!   pre-handler refusal is stated by the wrapper in [`validation`], which serves this
+//!   service's operation and can read the request the violations were found in. See the
+//!   inline note on that method.
 //! - `override_routing_error` — how this service words a request that reached it
 //!   but named no modeled operation. The default returns `None`, so the entry
 //!   renders the protocol-correct default (query -> 400 InvalidAction, awsJson ->
@@ -40,8 +43,11 @@
 //! and is reached, not edited, through the one `definition` method below. You
 //! do not write it; editing the entry would let this file drift from the model.
 
+mod validation;
+
 use smithy_server_runtime::{
-    http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
+    http, ErasedOperation, OperationRoutingTable, Refusal, Refused, Service, Violation,
+    ViolationKind,
 };
 use std::sync::Arc;
 
@@ -49,19 +55,23 @@ use crate::ops::put_audit_events::{
     CHANNEL_ARN_PATTERN, INVALID_CHANNEL_ARN_CODE, INVALID_CHANNEL_ARN_MESSAGE,
 };
 
-/// Whether a boundary refusal is ABOUT a channel reference: one of its violations is a
-/// `@pattern` violation of the expression every `ChannelArn` member is constrained with
-/// ([`CHANNEL_ARN_PATTERN`]).
+/// Whether ONE violation is about a channel reference: a `@pattern` violation of the
+/// expression every `ChannelArn` member is constrained with ([`CHANNEL_ARN_PATTERN`]).
 ///
-/// Keyed to that expression rather than to a member path, so the rule holds for
-/// whichever member of whichever operation carried the value. A refusal that ALSO
-/// carries other violations is still answered as the channel-ARN fault: the channel
-/// reference is what this service resolves the call against before it reads anything
-/// else, so that is the fault it reports.
+/// Keyed to that expression rather than to a member path, so the rule holds for whichever
+/// member of whichever operation carried the value.
+pub(crate) fn refuses_channel_arn(violation: &Violation) -> bool {
+    matches!(&violation.kind, ViolationKind::Pattern(pattern) if pattern == CHANNEL_ARN_PATTERN)
+}
+
+/// Whether a boundary refusal is ABOUT a channel reference: one of its violations is
+/// [`refuses_channel_arn`].
+///
+/// A refusal that ALSO carries other violations is still answered as the channel-ARN
+/// fault: the channel reference is what this service resolves the call against before it
+/// reads anything else, so that is the fault it reports.
 fn refused_channel_arn(violations: &[Violation]) -> bool {
-    violations.iter().any(|violation| {
-        matches!(&violation.kind, ViolationKind::Pattern(pattern) if pattern == CHANNEL_ARN_PATTERN)
-    })
+    violations.iter().any(refuses_channel_arn)
 }
 
 /// The `com-amazonaws-cloudtraildata-cloudtraildataservice` emulated service: the generated [`ServiceDefinition`] plus
@@ -71,6 +81,13 @@ fn refused_channel_arn(violations: &[Violation]) -> bool {
 /// router builds one shared engine and hands it to `new`.
 pub struct EmulatedService<Eng: Send + Sync + 'static> {
     entry: crate::ServiceDefinition<Eng>,
+    /// The same modelled operations the generated table holds, each wrapped so a refusal
+    /// found before the handler runs is stated the way this service states one (see
+    /// [`validation`]). Keyed by the routing key the protocol resolves — the key the
+    /// generated table uses — and built from the SAME shared engine, so a wrapped
+    /// operation reads and writes the one store. Held on the service because
+    /// [`Service::override_operation`] hands back a borrow of `self`.
+    stating_submitted_values: OperationRoutingTable,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -78,8 +95,16 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
     /// generated [`ServiceDefinition`], which constructs each operation from it; the
     /// operation's behaviour lives in that operation's own `impl Operation`.
     pub fn new(engine: Arc<Eng>) -> Self {
+        let mut stating_submitted_values = OperationRoutingTable::new();
+        stating_submitted_values.add_operation(
+            "PutAuditEvents",
+            Box::new(validation::StatingSubmittedValues::new(
+                crate::ops::put_audit_events::PutAuditEvents::new(Arc::clone(&engine)),
+            )) as Box<dyn ErasedOperation>,
+        );
         Self {
             entry: crate::ServiceDefinition::new(engine),
+            stating_submitted_values,
         }
     }
 }
@@ -106,12 +131,14 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         &self,
         req: &aws_smithy_runtime_api::http::Request,
     ) -> Option<&dyn ErasedOperation> {
-        // Return `Some(op)` to serve a request the model's routing key cannot name
-        // correctly; `None` (the default) lets the generated routing table resolve
-        // it. `req` is the whole request, so a decision that depends on the body —
-        // the `Action` form field on a query protocol, say — is reachable here.
-        let _ = req;
-        None
+        // Serve the operation the generated routing table names, through the wrapper that
+        // states a pre-handler refusal the way this service states one (see
+        // [`validation`]). The routing DECISION is not overridden: the key is resolved by
+        // the model's own protocol, and a request the table cannot serve is declined here
+        // so the framework's routing-error path stays exactly as it was.
+        let operation = self.definition().protocol().routing_key(req).ok()?;
+        self.definition().routing_table().get(operation)?;
+        self.stating_submitted_values.get(operation)
     }
 
     fn override_refusal(&self, refusal: &Refusal) -> Option<Refused> {
@@ -128,8 +155,15 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // channel. `ValidationException` is not modelled anywhere in this service, so a
         // generated client has no handler for it at all.
         //
-        // Every other refusal keeps the framework's wording: this service states nothing
-        // of its own about an absent member or an out-of-bounds batch.
+        // Every OTHER constraint refusal of this service is stated by the wrapper in
+        // [`validation`], which is what serves this service's one operation: it re-reads
+        // the request, so the clause about a COLLECTION can quote the collection the
+        // caller sent — which is what AWS states and what no renderer reachable from here
+        // could reproduce (this seam is handed the violations alone). Answering a second,
+        // valueless rendering of that same clause here would make one service state one
+        // class of clause two ways, so this path states nothing of its own about it and
+        // keeps the framework's wording for a refusal that somehow arrives without
+        // passing the wrapper.
         match refusal {
             Refusal::Invalid(violations) if refused_channel_arn(violations) => Some(Refused {
                 code: INVALID_CHANNEL_ARN_CODE.to_string(),

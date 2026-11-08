@@ -74,7 +74,12 @@
 //!   direction: a service whose model bounds the member a refusal is CARRIED in — the prose
 //!   member of its error shapes — states its ceiling from THAT maximum, so a clause fits the
 //!   member that has to hold it instead of overrunning it sixteenfold. Either way the number
-//!   is read off a model and the default is what a service that states nothing is held to.
+//!   is read off a model and the default is what a service that states nothing is held to. A
+//!   service whose recordings quote a whole COLLECTION whose rendering is larger than this
+//!   states that ceiling separately
+//!   ([`refusing_violations_with_declared_echoes_rendering_up_to`]), from the declared
+//!   maximum of the collection in question, for the same reason and under the same rule:
+//!   the number is a model constant, and past it the framework's own count summary stands.
 //! * [`MAX_RESTORED_TOTAL`] (64 KiB) — the restored bytes ALL clauses of one message may
 //!   carry together, so `violations x value size` is bounded as a product. For scale, the
 //!   framework's own ceiling on the same text is 100 clauses x 256 bytes ~= 25 KiB, so
@@ -475,6 +480,42 @@ pub fn refusing_violations_with_declared_echoes_quoting_up_to<O: Operation>(
         .collect()
 }
 
+/// As [`refusing_violations_with_declared_echoes_over`], with the ceiling ONE COMPOSITE's
+/// rendering is kept up to stated by the SERVICE rather than taken from
+/// [`MAX_RESTORED_ECHO`].
+///
+/// The sibling of [`refusing_violations_with_declared_echoes_quoting_up_to`], for the other
+/// half of the same fidelity: that one raises the ceiling a single LEAF value is quoted up
+/// to, this one the ceiling the rendering of a COLLECTION (or any other composite) is kept
+/// up to. A service needs it when its recordings show a clause quoting the whole collection
+/// a request carried and that collection's own declared maximum puts its rendering above the
+/// flat bound — a batch member, whose documented request maximum is the ceiling to state it
+/// from, so the ceiling is a MODEL constant and no response is sized by the request. Past it
+/// the framework's own count summary stands, which is the fail-safe direction.
+///
+/// `max_render` is the ceiling for a composite's rendering AND for one value a clause
+/// quotes, because a rendering no clause could carry is not worth holding. Everything else
+/// is [`refusing_violations_with_declared_echoes_over`]'s: the same collecting walk, the
+/// same violations, the same position count, the same structure form.
+#[must_use]
+pub fn refusing_violations_with_declared_echoes_rendering_up_to<O: Operation>(
+    protocol: &dyn ServerHttpProtocol,
+    req: &RtRequest,
+    max_positions: usize,
+    max_render: usize,
+) -> Vec<(Violation, SubmittedEcho)> {
+    let refusing = violations_in::<O>(
+        protocol,
+        req,
+        Echoes::DeclaredRenderingsRenderingUpTo(max_positions, max_render),
+    );
+    refusing
+        .violations
+        .into_iter()
+        .zip(refusing.echoes)
+        .collect()
+}
+
 /// As [`refusing_violations_with_declared_echoes_over`], with the members a structure is
 /// printed over stated by the CALLER for the shapes `printed` names, instead of read off
 /// the model.
@@ -564,6 +605,11 @@ pub(crate) enum Echoes {
     /// stated by the caller for the shapes it names
     /// ([`refusing_violations_with_printed_echoes_over`]).
     PrintedRenderingsOver(usize, PrintedMembers),
+    /// As [`Self::DeclaredRenderingsOver`], with the ceiling ONE COMPOSITE's rendering is
+    /// kept up to stated by the SERVICE
+    /// ([`refusing_violations_with_declared_echoes_rendering_up_to`]) instead of
+    /// [`MAX_RESTORED_ECHO`].
+    DeclaredRenderingsRenderingUpTo(usize, usize),
 }
 
 /// Which members a STRUCTURE is rendered over inside a clause.
@@ -754,6 +800,25 @@ pub(crate) fn violations_in<O: Operation>(
                         StructureForm::EveryMemberDeclared,
                         MapForm::Unrendered,
                         max_echo,
+                    )
+                    .into_iter()
+                    .unzip();
+                    Refusing {
+                        violations,
+                        lists: HashMap::new(),
+                        echoes,
+                    }
+                }
+                Echoes::DeclaredRenderingsRenderingUpTo(max_positions, max_render) => {
+                    let (violations, echoes) = echoed_over_rendering_up_to(
+                        violations,
+                        &input,
+                        O::INPUT_SCHEMA,
+                        max_positions,
+                        StructureForm::EveryMemberDeclared,
+                        MapForm::Unrendered,
+                        max_render,
+                        max_render,
                     )
                     .into_iter()
                     .unzip();
@@ -1173,7 +1238,8 @@ pub fn with_submitted_echoes_over(
 }
 
 /// [`with_submitted_echoes_over`], with the STRUCTURE and MAP forms the caller states, and
-/// the ceiling one LEAF value is quoted up to.
+/// the ceiling one LEAF value is quoted up to. A composite's rendering keeps this module's
+/// own ceiling; [`echoed_over_rendering_up_to`] is the form that states that one too.
 ///
 /// The one body every echo mode runs: the walk, the path spelling and the echo bounds are
 /// the same, so the forms cannot drift into several walks.
@@ -1186,6 +1252,35 @@ fn echoed_over(
     structures: StructureForm,
     maps: MapForm,
     max_echo: usize,
+) -> Vec<(Violation, SubmittedEcho)> {
+    echoed_over_rendering_up_to(
+        violations,
+        input,
+        schema,
+        max_positions,
+        structures,
+        maps,
+        max_echo,
+        MAX_RESTORED_ECHO,
+    )
+}
+
+/// [`echoed_over`], with the ceiling one COMPOSITE's rendering is kept up to stated too
+/// ([`refusing_violations_with_declared_echoes_rendering_up_to`]).
+///
+/// The ONE body every echo mode runs — [`echoed_over`] is this with the module's own
+/// composite ceiling — so a service that raises that ceiling runs exactly the same walk,
+/// the same path spelling and the same per-message budget as one that does not.
+#[allow(clippy::too_many_arguments)]
+fn echoed_over_rendering_up_to(
+    violations: Vec<Violation>,
+    input: &dyn SerializableStruct,
+    schema: &Schema,
+    max_positions: usize,
+    structures: StructureForm,
+    maps: MapForm,
+    max_echo: usize,
+    max_render: usize,
 ) -> Vec<(Violation, SubmittedEcho)> {
     // A refusal that states no value at all (an absent `@required` member is the common
     // case) is not worth a walk over the whole input. A violation whose value the
@@ -1200,7 +1295,15 @@ fn echoed_over(
             .map(|violation| (violation, SubmittedEcho::Absent))
             .collect();
     }
-    let renderings = renderings_in(input, schema, max_positions, structures, maps, max_echo);
+    let renderings = renderings_in(
+        input,
+        schema,
+        max_positions,
+        structures,
+        maps,
+        max_echo,
+        max_render,
+    );
     // ONE pass over the renderings builds the lookup, so the cost is O(positions) rather
     // than O(violations x positions).
     let mut by_path: HashMap<&str, Option<&str>> = HashMap::new();
@@ -1818,11 +1921,14 @@ pub fn submitted_renderings_over(
         StructureForm::MembersSet,
         MapForm::Unrendered,
         MAX_RESTORED_ECHO,
+        MAX_RESTORED_ECHO,
     )
 }
 
-/// [`submitted_renderings_over`], with the STRUCTURE and MAP forms the caller states and the
-/// ceiling one LEAF rendering is kept up to: the one walk every form runs.
+/// [`submitted_renderings_over`], with the STRUCTURE and MAP forms the caller states, the
+/// ceiling one LEAF rendering is kept up to and the ceiling one COMPOSITE rendering is kept
+/// up to: the one walk every form runs.
+#[allow(clippy::too_many_arguments)]
 fn renderings_in(
     input: &dyn SerializableStruct,
     schema: &Schema,
@@ -1830,6 +1936,7 @@ fn renderings_in(
     structures: StructureForm,
     maps: MapForm,
     max_echo: usize,
+    max_render: usize,
 ) -> Vec<(String, Option<String>)> {
     // The ONLY walk that composes renderings: a caller that reads one named leaf
     // ([`submitted_leaves`], [`submitted_lists`]) pays nothing for them.
@@ -1837,6 +1944,7 @@ fn renderings_in(
         renders: true,
         max_positions: Some(max_positions),
         max_echo: Some(max_echo),
+        max_render: Some(max_render),
         structures,
         maps,
         ..SubmittedValues::default()
@@ -1895,16 +2003,15 @@ struct Composite {
 
 impl Composite {
     /// Take one child, or mark this composite truncated once it is full — by child COUNT
-    /// or by the bytes its children already hold. A truncated composite renders as nothing
+    /// or by the bytes its children already hold, up to `max_bytes` (the walk's own
+    /// ceiling for a composite's rendering). A truncated composite renders as nothing
     /// ([`SubmittedValues::close_children`]), so dropping a child never states a value
     /// missing a part of itself.
-    fn take(&mut self, child: RenderedChild) {
+    fn take(&mut self, child: RenderedChild, max_bytes: usize) {
         let bytes = child.name.as_ref().map_or(0, String::len)
             + child.key.as_ref().map_or(0, String::len)
             + child.rendering.as_ref().map_or(0, String::len);
-        if self.children.len() >= MAX_RENDERED_CHILDREN
-            || self.bytes + bytes > MAX_RESTORED_ECHO
-        {
+        if self.children.len() >= MAX_RENDERED_CHILDREN || self.bytes + bytes > max_bytes {
             self.truncated = true;
             return;
         }
@@ -1938,8 +2045,8 @@ fn rendered_length(children: &[RenderedChild], named: bool) -> Option<usize> {
 /// no text rendering, so a list of blobs states no value rather than one missing an
 /// element, and `None` when the rendering would be longer than [`MAX_RESTORED_ECHO`] —
 /// measured before it is built, so an oversized rendering is never allocated.
-fn rendered_sequence(children: &[RenderedChild]) -> Option<String> {
-    if rendered_length(children, false)? > MAX_RESTORED_ECHO {
+fn rendered_sequence(children: &[RenderedChild], max_render: usize) -> Option<String> {
+    if rendered_length(children, false)? > max_render {
         return None;
     }
     let elements: Vec<&str> = children
@@ -1960,7 +2067,7 @@ fn rendered_sequence(children: &[RenderedChild]) -> Option<String> {
 ///
 /// Why KEY order: see [`refusing_violations_with_mapped_echoes`]. The built input's map is
 /// unordered, so the order the entries were written in is not the request's.
-fn rendered_entries(children: &[RenderedChild]) -> Option<String> {
+fn rendered_entries(children: &[RenderedChild], max_render: usize) -> Option<String> {
     // The braces, plus `<key>=<value>` and `, ` per entry — the same measurement
     // `rendered_length` makes for a named composite, with the key in place of the member.
     let mut length = 2;
@@ -1972,7 +2079,7 @@ fn rendered_entries(children: &[RenderedChild]) -> Option<String> {
         let key = child.key.as_deref()?;
         let value = child.rendering.as_deref()?;
         length += key.len() + 1 + value.len();
-        if length > MAX_RESTORED_ECHO {
+        if length > max_render {
             return None;
         }
         entries.push((key, value));
@@ -1988,8 +2095,8 @@ fn rendered_entries(children: &[RenderedChild]) -> Option<String> {
 /// one missing a part of itself. (An ABSENT member is never written, so it is not a child
 /// here and does not suppress the rendering.) `None` too when the rendering would be
 /// longer than [`MAX_RESTORED_ECHO`], measured before it is built.
-fn rendered_structure(name: &str, children: &[RenderedChild]) -> Option<String> {
-    if name.len() + rendered_length(children, true)? > MAX_RESTORED_ECHO {
+fn rendered_structure(name: &str, children: &[RenderedChild], max_render: usize) -> Option<String> {
+    if name.len() + rendered_length(children, true)? > max_render {
         return None;
     }
     let members: Vec<String> = children
@@ -2017,6 +2124,7 @@ fn rendered_declared_structure(
     name: &str,
     declared: &[String],
     children: &[RenderedChild],
+    max_render: usize,
 ) -> Option<String> {
     let mut length = name.len() + 2;
     let mut members: Vec<String> = Vec::with_capacity(declared.len());
@@ -2032,7 +2140,7 @@ fn rendered_declared_structure(
             length += 2; // ", "
         }
         length += member.len() + 1 + rendering.len();
-        if length > MAX_RESTORED_ECHO {
+        if length > max_render {
             return None;
         }
         members.push(format!("{member}={rendering}"));
@@ -2128,9 +2236,17 @@ struct SubmittedValues {
     /// up to a ceiling of its own
     /// ([`refusing_violations_with_declared_echoes_quoting_up_to`]) keeps a rendering up to
     /// that same ceiling, because a rendering no clause could quote is not worth holding. A
-    /// COMPOSITE's rendering is bounded by [`MAX_RESTORED_ECHO`] whatever this says: it is
-    /// built from many of a caller's values rather than being one of them.
+    /// COMPOSITE's rendering is bounded by [`Self::max_render`], which a caller states
+    /// separately: a composite is built from many of a caller's values rather than being
+    /// one of them.
     max_echo: Option<usize>,
+    /// The largest single COMPOSITE rendering this walk keeps, or `None` for
+    /// [`MAX_RESTORED_ECHO`], the bound this module states. A caller whose recordings show
+    /// a clause quoting a whole collection larger than that states its own ceiling
+    /// ([`refusing_violations_with_declared_echoes_rendering_up_to`]), from the declared
+    /// maximum of the collection in question, so the ceiling is a model constant and the
+    /// text this walk holds is not sized by the request.
+    max_render: Option<usize>,
     /// The composites currently open, innermost last, collecting the children each
     /// renders from. Pushed and popped with `collections`.
     open: Vec<Composite>,
@@ -2158,6 +2274,11 @@ impl SubmittedValues {
     /// The largest single leaf rendering this walk keeps; see [`Self::max_echo`].
     fn echo_bound(&self) -> usize {
         self.max_echo.unwrap_or(MAX_RESTORED_ECHO)
+    }
+
+    /// The largest single composite rendering this walk keeps; see [`Self::max_render`].
+    fn render_bound(&self) -> usize {
+        self.max_render.unwrap_or(MAX_RESTORED_ECHO)
     }
 
     /// True once no further leaf can be recorded, so the rest of the walk is skipped.
@@ -2300,20 +2421,24 @@ impl SubmittedValues {
             ) => pending_key.clone(),
             _ => None,
         };
+        let ceiling = self.render_bound();
         if let Some(open) = self.open.last_mut() {
-            open.take(RenderedChild {
-                name: Self::segment_for(schema),
-                // Read only by the forms that need it, so a form that states no
-                // shape name pays no allocation for one.
-                declared_by: match self.structures {
-                    StructureForm::EveryMemberDeclared | StructureForm::MembersPrinted(_) => {
-                        declaring_shape(schema)
-                    }
-                    StructureForm::MembersSet => None,
+            open.take(
+                RenderedChild {
+                    name: Self::segment_for(schema),
+                    // Read only by the forms that need it, so a form that states no
+                    // shape name pays no allocation for one.
+                    declared_by: match self.structures {
+                        StructureForm::EveryMemberDeclared | StructureForm::MembersPrinted(_) => {
+                            declaring_shape(schema)
+                        }
+                        StructureForm::MembersSet => None,
+                    },
+                    key,
+                    rendering,
                 },
-                key,
-                rendering,
-            });
+                ceiling,
+            );
         }
     }
 
@@ -2427,18 +2552,18 @@ impl SubmittedValues {
             return None;
         }
         let rendering = match frame {
-            Some(Frame::List { .. }) => rendered_sequence(&composite.children),
+            Some(Frame::List { .. }) => rendered_sequence(&composite.children, self.render_bound()),
             Some(Frame::Struct) => self.rendered_struct(schema, &composite.children),
             // A map renders only for a caller that states the form ([`MapForm`]), so a
             // service whose recordings show the valueless clause keeps it rather than
             // gaining a form it never emits.
             Some(Frame::Map { .. }) => match self.maps {
-                MapForm::Entries => rendered_entries(&composite.children),
+                MapForm::Entries => rendered_entries(&composite.children, self.render_bound()),
                 MapForm::Unrendered => None,
             },
             None => None,
         };
-        rendering.filter(|rendered| rendered.len() <= MAX_RESTORED_ECHO)
+        rendering.filter(|rendered| rendered.len() <= self.render_bound())
     }
 
     /// One closed STRUCT frame, rendered in the form the caller stated
@@ -2468,11 +2593,14 @@ impl SubmittedValues {
             None => {
                 let name = schema.shape_id().shape_name();
                 match self.structures {
-                    StructureForm::MembersSet => rendered_structure(name, children),
+                    StructureForm::MembersSet => {
+                        rendered_structure(name, children, self.render_bound())
+                    }
                     _ => rendered_declared_structure(
                         name,
                         &printed(name).unwrap_or_else(|| declared_members(schema)),
                         children,
+                        self.render_bound(),
                     ),
                 }
             }
@@ -2483,8 +2611,13 @@ impl SubmittedValues {
                 _ => {
                     let name = children.iter().find_map(|child| child.declared_by.as_deref())?;
                     match printed(name) {
-                        Some(members) => rendered_declared_structure(name, &members, children),
-                        None => rendered_structure(name, children),
+                        Some(members) => rendered_declared_structure(
+                            name,
+                            &members,
+                            children,
+                            self.render_bound(),
+                        ),
+                        None => rendered_structure(name, children, self.render_bound()),
                     }
                 }
             },
@@ -3281,7 +3414,7 @@ mod tests {
             ),
         ];
         for (case, children, expected) in sequences {
-            let actual = rendered_sequence(&children);
+            let actual = rendered_sequence(&children, MAX_RESTORED_ECHO);
             assert_eq!(
                 actual.as_deref(),
                 expected,
@@ -3313,7 +3446,7 @@ mod tests {
             ),
         ];
         for (case, children, expected) in structures {
-            let actual = rendered_structure("Thing", &children);
+            let actual = rendered_structure("Thing", &children, MAX_RESTORED_ECHO);
             assert_eq!(
                 actual.as_deref(),
                 expected,
@@ -3387,7 +3520,12 @@ mod tests {
             },
         ];
         for row in rows {
-            let actual = rendered_declared_structure("Thing", &row.declared, &row.children);
+            let actual = rendered_declared_structure(
+                "Thing",
+                &row.declared,
+                &row.children,
+                MAX_RESTORED_ECHO,
+            );
             assert_eq!(
                 actual.as_deref(),
                 row.expected,
@@ -3413,12 +3551,15 @@ mod tests {
         // One child at the bound is held; the next one tips the composite over it, and a
         // truncated composite renders as nothing rather than as a part of the value.
         let mut composite = Composite::default();
-        composite.take(child(&"a".repeat(MAX_RESTORED_ECHO - "name".len())));
+        composite.take(
+            child(&"a".repeat(MAX_RESTORED_ECHO - "name".len())),
+            MAX_RESTORED_ECHO,
+        );
         assert!(
             !composite.truncated && composite.children.len() == 1,
             "case a child at the byte bound: expected it held, got {composite:?}"
         );
-        composite.take(child("b"));
+        composite.take(child("b"), MAX_RESTORED_ECHO);
         assert!(
             composite.truncated && composite.children.len() == 1,
             "case a child past the byte bound: expected the composite truncated with the \
@@ -3428,7 +3569,7 @@ mod tests {
         // A child count past the cap is the other bound, unchanged.
         let mut counted = Composite::default();
         for _ in 0..=MAX_RENDERED_CHILDREN {
-            counted.take(child("a"));
+            counted.take(child("a"), MAX_RESTORED_ECHO);
         }
         assert!(
             counted.truncated && counted.children.len() == MAX_RENDERED_CHILDREN,
@@ -3443,12 +3584,12 @@ mod tests {
             child(&"a".repeat(MAX_RESTORED_ECHO)),
             child(&"b".repeat(MAX_RESTORED_ECHO)),
         ];
-        let sequence = rendered_sequence(&oversized);
+        let sequence = rendered_sequence(&oversized, MAX_RESTORED_ECHO);
         assert_eq!(
             sequence, None,
             "case an oversized list: expected no rendering, got {sequence:?}"
         );
-        let structure = rendered_structure("Thing", &oversized);
+        let structure = rendered_structure("Thing", &oversized, MAX_RESTORED_ECHO);
         assert_eq!(
             structure, None,
             "case an oversized structure: expected no rendering, got {structure:?}"
@@ -3457,10 +3598,34 @@ mod tests {
             "Thing",
             &["name".to_string()],
             &[child(&"a".repeat(MAX_RESTORED_ECHO))],
+            MAX_RESTORED_ECHO,
         );
         assert_eq!(
             declared, None,
             "case an oversized declared structure: expected no rendering, got {declared:?}"
+        );
+
+        // A caller that states its OWN composite ceiling is held to THAT one: the same
+        // children the module's own bound refuses render whole under a ceiling above them,
+        // and the bound still bites one byte past whatever was stated.
+        let stated = 4 * MAX_RESTORED_ECHO;
+        let under_stated = rendered_sequence(&oversized, stated);
+        assert!(
+            under_stated.is_some_and(|rendered| rendered.len() > MAX_RESTORED_ECHO),
+            "case a list past the default bound under a stated ceiling: expected the whole \
+             list rendered"
+        );
+        let mut held = Composite::default();
+        held.take(child(&"a".repeat(MAX_RESTORED_ECHO)), stated);
+        held.take(child(&"b".repeat(MAX_RESTORED_ECHO)), stated);
+        assert!(
+            !held.truncated && held.children.len() == 2,
+            "case two children inside a stated ceiling: expected both held, got {held:?}"
+        );
+        let tight = rendered_sequence(&oversized, 1);
+        assert_eq!(
+            tight, None,
+            "case a stated ceiling below the rendering: expected no rendering, got {tight:?}"
         );
     }
 
@@ -3606,7 +3771,7 @@ mod tests {
         ];
 
         for (case, children, expected) in rows {
-            let actual = rendered_entries(&children);
+            let actual = rendered_entries(&children, MAX_RESTORED_ECHO);
             assert_eq!(
                 actual.as_deref(),
                 expected,

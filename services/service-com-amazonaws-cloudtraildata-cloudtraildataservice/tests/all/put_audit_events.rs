@@ -86,6 +86,21 @@ pub fn ev(id: impl Into<String>, data: impl Into<String>) -> Ev {
 }
 
 impl Ev {
+    /// `AuditEvent$id` as this entry carries it.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// `AuditEvent$eventData` as this entry carries it.
+    pub fn data(&self) -> &str {
+        &self.data
+    }
+
+    /// `AuditEvent$eventDataChecksum`, when this entry carries one.
+    pub fn checksum(&self) -> Option<&str> {
+        self.checksum.as_deref()
+    }
+
     /// Carry an explicit `eventDataChecksum`.
     fn with_checksum(mut self, checksum: impl Into<String>) -> Self {
         self.checksum = Some(checksum.into());
@@ -466,7 +481,7 @@ async fn channel_resolution_answers_the_modelled_error_for_each_arn_form() {
         ("the registered channel ARN", registered.clone(), 200, ""),
         (
             "a well-formed channel ARN that was never registered",
-            channel_arn("does-not-exist"),
+            channel_arn("d0e1f203-1425-4637-8849-5a6b7c8d9e0f"),
             400,
             "ChannelNotFound",
         ),
@@ -506,25 +521,29 @@ async fn channel_resolution_answers_the_modelled_error_for_each_arn_form() {
         ),
         (
             "a channel ARN with no region",
-            "arn:aws:cloudtrail::000000000000:channel/abc".to_string(),
+            "arn:aws:cloudtrail::000000000000:channel/e1f20314-2536-4748-895a-6b7c8d9e0f10"
+                .to_string(),
             400,
             "InvalidChannelARN",
         ),
         (
             "a channel ARN with a malformed account id",
-            "arn:aws:cloudtrail:us-east-1:12345:channel/abc".to_string(),
+            "arn:aws:cloudtrail:us-east-1:12345:channel/f2031425-3647-4859-8a6b-7c8d9e0f1021"
+                .to_string(),
             400,
             "InvalidChannelARN",
         ),
         (
             "a channel ARN whose region is not an ARN field",
-            "arn:aws:cloudtrail:US_EAST_1:000000000000:channel/abc".to_string(),
+            "arn:aws:cloudtrail:US_EAST_1:000000000000:channel/03142536-4758-496a-8b7c-8d9e0f102132"
+                .to_string(),
             400,
             "InvalidChannelARN",
         ),
         (
             "a channel ARN whose partition is not an ARN field",
-            "arn:../x:cloudtrail:us-east-1:000000000000:channel/abc".to_string(),
+            "arn:../x:cloudtrail:us-east-1:000000000000:channel/14253647-5869-4a7b-8c8d-9e0f10213243"
+                .to_string(),
             400,
             "InvalidChannelARN",
         ),
@@ -649,7 +668,9 @@ async fn ownership_and_external_id_decide_permission() {
 
     // A channel owned by another account. Naming it by ARN is refused by authorization,
     // ahead of everything this service knows about the registration.
-    let foreign = "arn:aws:cloudtrail:us-east-1:111122223333:channel/foreign-0001".to_string();
+    let foreign =
+        "arn:aws:cloudtrail:us-east-1:111122223333:channel/25364758-697a-4b8c-8d9e-0f1021324354"
+            .to_string();
     harness.register(Channel::from_arn(&foreign, "Custom").expect("a channel ARN"));
 
     // (case name, channel, externalId, expected status, expected error code)
@@ -738,7 +759,7 @@ async fn ownership_and_external_id_decide_permission() {
 #[test]
 fn a_channel_resolves_by_its_arn_or_by_its_arn_suffix() {
     let engine = Arc::new(engine::InMemoryEngine::new());
-    let arn = channel_arn("6071-8293-a4b5-c6d7-e8f9012345ab");
+    let arn = channel_arn("36475869-7a8b-4c9d-8e0f-102132435465");
     state::service_state(&*engine)
         .expect("the shared engine holds this service's state")
         .lock()
@@ -749,13 +770,17 @@ fn a_channel_resolves_by_its_arn_or_by_its_arn_suffix() {
         ("the full ARN", arn.clone(), true),
         (
             "the ARN suffix (bare channel id)",
-            "6071-8293-a4b5-c6d7-e8f9012345ab".to_string(),
+            "36475869-7a8b-4c9d-8e0f-102132435465".to_string(),
             true,
         ),
-        ("another channel id", "another-channel".to_string(), false),
+        (
+            "another channel id",
+            "4758697a-8b9c-4d0e-8f10-213243546576".to_string(),
+            false,
+        ),
         (
             "another account's ARN for the same id",
-            "arn:aws:cloudtrail:us-east-1:111122223333:channel/6071-8293-a4b5-c6d7-e8f9012345ab"
+            "arn:aws:cloudtrail:us-east-1:111122223333:channel/36475869-7a8b-4c9d-8e0f-102132435465"
                 .to_string(),
             false,
         ),
@@ -785,6 +810,7 @@ fn a_channel_resolves_by_its_arn_or_by_its_arn_suffix() {
         ("a non-channel CloudTrail ARN", "arn:aws:cloudtrail:us-east-1:000000000000:trail/t"),
         ("another service's ARN", "arn:aws:s3:::bucket"),
         ("a channel ARN with no account", "arn:aws:cloudtrail:us-east-1::channel/abc"),
+        ("an id that is not a channel id", "not-a-channel-id"),
         ("an id with an illegal character", "channel id!"),
         ("an empty value", ""),
         (
@@ -806,11 +832,11 @@ fn a_channel_resolves_by_its_arn_or_by_its_arn_suffix() {
     // A second registration sharing the ARN suffix makes the bare-id form AMBIGUOUS:
     // it must resolve to nothing, deterministically, rather than to whichever channel
     // the hash map happens to yield first. Each full ARN still resolves to its own.
-    let twin = "arn:aws:cloudtrail:us-east-1:111122223333:channel/6071-8293-a4b5-c6d7-e8f9012345ab";
+    let twin = "arn:aws:cloudtrail:us-east-1:111122223333:channel/36475869-7a8b-4c9d-8e0f-102132435465";
     state
         .lock()
         .register_channel(Channel::from_arn(twin, "Custom").expect("a channel ARN"));
-    let bare = state::parse_channel_ref("6071-8293-a4b5-c6d7-e8f9012345ab").expect("a channel ref");
+    let bare = state::parse_channel_ref("36475869-7a8b-4c9d-8e0f-102132435465").expect("a channel ref");
     assert!(
         state.lock().channel(&bare).is_none(),
         "case \"ambiguous ARN suffix\": a suffix shared by two registrations must resolve to \
@@ -837,7 +863,7 @@ async fn the_ingest_log_is_bounded_by_its_retention_limits() {
     let small = r#"{"eventSource":"custom.app","eventName":"Login"}"#;
 
     // Count bound: 12 batches of 100 (the modelled maximum per request) = 1200 events.
-    let by_count = channel_arn("7182-93a4-b5c6-d7e8-f90123456789");
+    let by_count = channel_arn("58697a8b-9c0d-4e1f-8021-324354657687");
     harness.register(Channel::from_arn(&by_count, "Custom").expect("a channel ARN"));
     let batches = 12;
     for batch in 0..batches {
@@ -874,7 +900,7 @@ async fn the_ingest_log_is_bounded_by_its_retention_limits() {
     );
 
     // Byte bound: 20 single-event calls of 1 MB each, past the retained-byte cap.
-    let by_bytes = channel_arn("8293-a4b5-c6d7-e8f9-012345678901");
+    let by_bytes = channel_arn("697a8b9c-0d1e-4f20-8132-435465768798");
     harness.register(Channel::from_arn(&by_bytes, "Custom").expect("a channel ARN"));
     let calls = 20;
     for i in 0..calls {

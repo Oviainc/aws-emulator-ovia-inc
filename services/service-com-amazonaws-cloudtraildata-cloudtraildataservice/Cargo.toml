@@ -26,9 +26,20 @@ tracing = { workspace = true }
 sha2 = { workspace = true }
 # Hex-codes those bytes into the eventID's UUID form.
 hex = { workspace = true }
+# The shared ARN parse every service reads its own resource ARNs with, and the shared
+# constraint-violation renderer this service states a boundary refusal with.
+service-common = { path = "../common" }
+# Reads the canonical UUID form a channel id is minted in, so a channel ARN's resource
+# suffix is held to that form rather than to a hand-written grammar.
+uuid = { version = "1" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
+
+[dev-dependencies]
+# Percent-encodes a channel reference into the request URI, so a reference carrying
+# multi-byte characters reaches the service as the caller sent it.
+percent-encoding = "2"
 
 [lints]
 workspace = true

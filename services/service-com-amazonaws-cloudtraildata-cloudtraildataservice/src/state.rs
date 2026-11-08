@@ -62,56 +62,72 @@ pub enum ChannelRef {
     Id(String),
 }
 
-/// True when `value` has the form of a channel id: the ARN suffix a channel ARN
-/// carries, which is also the form `AuditEvent$id` / `AuditEventResultEntry$eventID`
-/// are modelled with (`@pattern ^[-_A-Za-z0-9]+$`, `@length 1..128`).
-fn is_channel_id(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 128
-        && value
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+/// The ARN vendor (service namespace) field a channel ARN carries: a CloudTrail Lake
+/// channel is a resource of the CloudTrail control plane, which is what mints it, so an
+/// ARN of any other vendor names no channel.
+const CHANNEL_ARN_VENDOR: &str = "cloudtrail";
+
+/// The resource prefix of a channel ARN's resource field:
+/// `arn:aws:cloudtrail:<region>:<account>:channel/<uuid>` — the form the CloudTrail
+/// control plane mints a channel ARN in (`CreateChannel`), and the only resource field
+/// that names a channel.
+const CHANNEL_RESOURCE_PREFIX: &str = "channel/";
+
+/// How many digits an AWS account id is written with.
+const ACCOUNT_ID_DIGITS: usize = 12;
+
+/// The ARN partition this emulator serves, read off an ARN `::engine::emulator_arn`
+/// builds rather than written here as a literal, so the partition a channel ARN is held
+/// to has one source of truth. A reference built in another partition names a resource
+/// no call to this emulator can reach.
+pub fn emulator_partition() -> String {
+    let minted = ::engine::emulator_arn(CHANNEL_ARN_VENDOR, "", CHANNEL_RESOURCE_PREFIX);
+    ::service_common::arn::parse(&minted)
+        .map(|arn| arn.partition.to_string())
+        .unwrap_or_default()
 }
 
-/// True when `value` has the form of an ARN partition or region field: AWS writes both
-/// as lowercase alphanumerics and hyphens (`aws`, `aws-cn`, `aws-us-gov`; `us-east-1`),
-/// so anything else is not an ARN field at all.
-fn is_arn_segment(value: &str) -> bool {
-    !value.is_empty()
-        && value.len() <= 64
-        && value
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+/// True when `value` is written the way CloudTrail writes a channel id: the canonical
+/// hyphenated UUID the control plane mints one in (`CreateChannel`, whose `UUID` is
+/// `@length 36` of `^[a-f0-9\-]+$` in 8-4-4-4-12 groups) — which is also what this
+/// emulator's CloudTrail crate mints.
+///
+/// Read through the maintained `uuid` crate and compared against its canonical
+/// rendering, so only that one spelling passes: a simple, braced or URN spelling of the
+/// same UUID is not an id the service ever wrote, and neither is any other string,
+/// whatever bytes or encoding it carries.
+fn is_channel_id(value: &str) -> bool {
+    ::uuid::Uuid::parse_str(value).is_ok_and(|parsed| parsed.hyphenated().to_string() == value)
 }
 
 /// Parse a CloudTrail Lake channel ARN, or `None` when `value` is not one.
 ///
-/// A channel ARN is `arn:<partition>:cloudtrail:<region>:<account-id>:channel/<id>`:
-/// six colon-separated fields, the service field `cloudtrail`, a 12-digit account id
-/// and a `channel/` resource whose suffix is a channel id. Every other `arn:` value
-/// (another service, another CloudTrail resource type, a missing field) is not a
-/// channel ARN.
+/// A channel ARN is `arn:aws:cloudtrail:<region>:<account-id>:channel/<channel-id>`. The
+/// six fields and the vendor are read through `::service_common::arn`, the ONE ARN parse
+/// the services share, and this reader adds what that parse leaves to the service: the
+/// partition this emulator serves ([`emulator_partition`]), the Region label and the
+/// 12-digit account a regional account-owned resource is addressed by, and a `channel`
+/// resource whose suffix is a channel id ([`is_channel_id`]). Every other `arn:` value —
+/// another partition, another service, another CloudTrail resource type, a missing field,
+/// a resource suffix that is not a channel id — is not a channel ARN.
 pub fn parse_channel_arn(value: &str) -> Option<ChannelArn> {
-    let fields: Vec<&str> = value.splitn(6, ':').collect();
-    if fields.len() != 6 || fields[0] != "arn" || fields[2] != "cloudtrail" {
+    let arn = ::service_common::arn::parse_of(value, CHANNEL_ARN_VENDOR)?;
+    if arn.partition != emulator_partition() {
         return None;
     }
-    let (partition, region, account_id, resource) = (fields[1], fields[3], fields[4], fields[5]);
-    if !is_arn_segment(partition) || !is_arn_segment(region) {
+    let region = ::service_common::arn::region_of(value, CHANNEL_ARN_VENDOR)?;
+    if arn.account.len() != ACCOUNT_ID_DIGITS || !arn.account.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
-    if account_id.len() != 12 || !account_id.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let channel_id = resource.strip_prefix("channel/")?;
+    let channel_id = arn.resource.strip_prefix(CHANNEL_RESOURCE_PREFIX)?;
     if !is_channel_id(channel_id) {
         return None;
     }
     Some(ChannelArn {
         arn: value.to_string(),
-        partition: partition.to_string(),
+        partition: arn.partition.to_string(),
         region: region.to_string(),
-        account_id: account_id.to_string(),
+        account_id: arn.account.to_string(),
         channel_id: channel_id.to_string(),
     })
 }

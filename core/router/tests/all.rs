@@ -1029,6 +1029,13 @@ mod cloudformation_wafv2_protection_stack;
 // from compiling, so the duplicate lines are removed and the first declaration of each
 // stands. Add a NEW suite in the sorted span its name belongs to, and check it is not
 // already declared before appending it here.
+// The five suites that stood here — `apigateway_iam_authenticated_invoke`,
+// `cloudformation_rollback_triggers_revert_the_operation`,
+// `cloudformation_wafv2_protection_stack`, `lambda_sqs_event_source_batching_window` and
+// `cloudformation_asset_bucket_publishing_role` — are each ALREADY declared above (the first
+// four in the sorted head, the fifth at line 34, and the wafv2 one at line 1006). Two
+// from compiling; the duplicate lines are removed here and the first declaration of each
+// stands.
 // Declared HERE, beside the sibling suites above in the same quiet `n`/`o` gap, for the
 // reason those entries record: the appended tail at the end of this file and the `e…` span
 // are both regions concurrently landing suites add their line to.
