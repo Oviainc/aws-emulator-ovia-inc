@@ -157,6 +157,8 @@ mod held_signal_waits;
 mod hook_result_detail;
 #[path = "all/hook_result_invocations.rs"]
 mod hook_result_invocations;
+#[path = "all/hotswapped_function_code.rs"]
+mod hotswapped_function_code;
 #[path = "all/iam_capability_gate.rs"]
 mod iam_capability_gate;
 #[path = "all/iam_identity_resources.rs"]
