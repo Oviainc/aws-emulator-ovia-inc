@@ -101,6 +101,29 @@ pub fn connection_mode_of(config: &DistributionConfig) -> &'static str {
     }
 }
 
+/// The `ConnectionMode` a SUBMITTED configuration declares.
+///
+/// `ConnectionMode` "specifies whether the connection mode is through a standard
+/// distribution (direct) or a multi-tenant distribution with distribution tenants
+/// (tenant-only)", so a configuration that states the member declares exactly the mode it
+/// names; one that states none declares the mode its other members describe
+/// ([`connection_mode_of`]) — [`CONNECTION_MODE_TENANT_ONLY`] for a configuration carrying
+/// the multi-tenant-only `TenantConfig`, and the standard [`CONNECTION_MODE_DIRECT`]
+/// otherwise.
+///
+/// This is the value an UPDATE is measured against the stored one by: what a configuration
+/// declares is what the distribution it describes would be served as, so two configurations
+/// declaring different modes describe different KINDS of distribution. The member itself
+/// takes precedence over the tenancy derived from the rest, so a request that states it is
+/// read as having asked for exactly that mode.
+pub fn connection_mode_declared(config: &DistributionConfig) -> &'static str {
+    match config.connection_mode.as_deref() {
+        Some(mode) if mode == CONNECTION_MODE_TENANT_ONLY => CONNECTION_MODE_TENANT_ONLY,
+        Some(_) => CONNECTION_MODE_DIRECT,
+        None => connection_mode_of(config),
+    }
+}
+
 /// ONE page of the stored distributions `matches` selects, as the `DistributionList`
 /// every CloudFront distribution listing answers with.
 ///

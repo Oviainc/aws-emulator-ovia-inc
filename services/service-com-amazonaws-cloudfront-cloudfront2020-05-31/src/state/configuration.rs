@@ -1159,6 +1159,35 @@ pub fn batch_path_count(batch: &InvalidationBatch) -> usize {
     items_len(&batch.paths.items)
 }
 
+/// Resolve an invalidation batch into the one the service STORES: its paths as a SET.
+///
+/// An invalidation batch IS the set of objects the invalidation removes from the caches —
+/// "the objects that you want to invalidate" — so naming one object twice asks for nothing
+/// more than naming it once, and the stored batch carries each distinct path once, in the
+/// order the request first named it, with `Paths$Quantity` ("the number of invalidation
+/// paths specified for the objects that you want to invalidate") stating how many that is.
+///
+/// Paths are compared as CloudFront matches them: a path is taken verbatim, so two paths
+/// differing only in the case of a character name different objects and both stay in the
+/// set.
+///
+/// The resolution happens once, where the batch is stored, so the create's own answer, every
+/// later read of that invalidation and the repeat a caller reference makes the same request
+/// again all report the one stored batch.
+pub fn resolve_invalidation_batch(mut batch: InvalidationBatch) -> InvalidationBatch {
+    let submitted = batch.paths.items.take().unwrap_or_default();
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    let mut distinct: Vec<String> = Vec::with_capacity(submitted.len());
+    for path in submitted {
+        if seen.insert(path.clone()) {
+            distinct.push(path);
+        }
+    }
+    batch.paths.quantity = i32::try_from(distinct.len()).unwrap_or(i32::MAX);
+    batch.paths.items = Some(distinct);
+    batch
+}
+
 /// Whether `path` names objects of a distribution the way an invalidation path does.
 ///
 /// "The path is relative to the distribution and must begin with a slash (/)", and "if the

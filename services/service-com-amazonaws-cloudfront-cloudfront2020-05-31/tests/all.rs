@@ -35,6 +35,8 @@ mod cache_policy_update;
 mod caller_reference_conflict_wording;
 #[path = "all/caller_reference_immutable.rs"]
 mod caller_reference_immutable;
+#[path = "all/caller_reference_replay_window.rs"]
+mod caller_reference_replay_window;
 #[path = "all/connection_function_code.rs"]
 mod connection_function_code;
 #[path = "all/connection_function_delete.rs"]
@@ -57,6 +59,8 @@ mod connection_group_tags;
 mod connection_group_update;
 #[path = "all/connection_groups.rs"]
 mod connection_groups;
+#[path = "all/connection_mode_immutable.rs"]
+mod connection_mode_immutable;
 #[path = "all/continuous_deployment_policies.rs"]
 mod continuous_deployment_policies;
 #[path = "all/continuous_deployment_policy_config_read.rs"]
@@ -159,6 +163,8 @@ mod function_publish;
 mod function_update;
 #[path = "all/invalidation_list.rs"]
 mod invalidation_list;
+#[path = "all/invalidation_path_set.rs"]
+mod invalidation_path_set;
 #[path = "all/key_group_config_read.rs"]
 mod key_group_config_read;
 #[path = "all/key_group_delete.rs"]
@@ -287,6 +293,8 @@ mod tenant_domain_certificate_gate;
 mod tenant_invalidation_batch_quantity;
 #[path = "all/tenant_invalidations.rs"]
 mod tenant_invalidations;
+#[path = "all/tenant_parameter_references.rs"]
+mod tenant_parameter_references;
 #[path = "all/tenant_unvalidated_domain_claim.rs"]
 mod tenant_unvalidated_domain_claim;
 #[path = "all/tenant_web_acl_association.rs"]

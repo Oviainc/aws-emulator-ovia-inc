@@ -240,15 +240,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // create a new invalidation request. Instead, CloudFront returns information about
         // the invalidation request that you previously created with the same
         // CallerReference" — the reference identifies one invalidation of this tenant.
+        //
+        // The batch as the service will store it — its paths as the SET they are, the same
+        // resolution a distribution's own batch goes through — resolved BEFORE the
+        // caller-reference question so the comparison below is one between like and like.
+        let batch = crate::state::resolve_invalidation_batch(input.invalidation_batch);
         let repeated = tenant
             .invalidations
             .values()
-            .find(|existing| {
-                existing.batch.caller_reference == input.invalidation_batch.caller_reference
-            })
+            .find(|existing| existing.batch.caller_reference == batch.caller_reference)
             .cloned();
         if let Some(existing) = repeated {
-            if crate::state::same_batch(&existing.batch, &input.invalidation_batch) {
+            if crate::state::same_batch(&existing.batch, &batch) {
                 return Ok(CreateInvalidationForDistributionTenantOutput {
                     location: Some(crate::state::location_uri(
                         &crate::state::distribution_tenant_invalidation_path(
@@ -269,7 +272,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         message: Some(format!(
                             "The CallerReference {} was already used for invalidation {} of \
                              this distribution tenant with different paths",
-                            input.invalidation_batch.caller_reference, existing.id
+                            batch.caller_reference, existing.id
                         )),
                     },
                 )
@@ -300,8 +303,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             create_time: now,
             completed_due: now + crate::state::PROPAGATION_DELAY,
             // Stored whole: a later read of this invalidation answers from the batch as
-            // submitted.
-            batch: input.invalidation_batch,
+            // submitted, its paths resolved into the set they describe.
+            batch,
         };
         let reported = invalidation.to_invalidation();
         let Some(owner) = store.distribution_tenants.get_mut(&tenant_id) else {

@@ -292,6 +292,32 @@ pub fn illegal_update_missing_price_class() -> crate::ops::types::IllegalUpdate 
     }
 }
 
+/// The sentence CloudFront refuses an update that would change a distribution's
+/// `ConnectionMode` with, on the wire.
+///
+/// The member the rule is about is named by the sentence and nothing else of the request is,
+/// so every refusal of it reads the same.
+pub const ILLEGAL_UPDATE_CONNECTION_MODE_MESSAGE: &str =
+    "You can't update the ConnectionMode field for this distribution.";
+
+/// The modelled `IllegalUpdate` (HTTP 400) for an update that would move a distribution's
+/// `ConnectionMode` onto another value.
+///
+/// `ConnectionMode` "specifies whether the connection mode is through a standard
+/// distribution (direct) or a multi-tenant distribution with distribution tenants
+/// (tenant-only)", which is what the distribution IS rather than a setting of how it serves:
+/// a standard distribution serves its own traffic under its own domain, while a multi-tenant
+/// one serves the tenants bound to it and has no traffic domain of its own. So the mode is
+/// fixed when the distribution is created, exactly as its caller reference is
+/// ([`illegal_update_distribution_caller_reference`] states that rule), and an update
+/// declaring a different one ([`connection_mode_declared`]) is a modification CloudFront
+/// does not allow.
+pub fn illegal_update_connection_mode() -> crate::ops::types::IllegalUpdate {
+    crate::ops::types::IllegalUpdate {
+        message: Some(ILLEGAL_UPDATE_CONNECTION_MODE_MESSAGE.to_string()),
+    }
+}
+
 /// The event types a CloudFront FUNCTION association may name.
 ///
 /// `FunctionAssociation$EventType` states the rule: "The event type of the function, either
@@ -3762,3 +3788,9 @@ mod store;
 /// reachable as `crate::state::<name>`.
 mod distributions;
 pub use distributions::*;
+
+/// The tenant PARAMETER references a distribution configuration carries: what names one, in
+/// which members, and the rule a reference is admitted by. A SUBMODULE for the same reason
+/// [`functions`] is one; `pub use` keeps every name reachable as `crate::state::<name>`.
+mod tenant_parameters;
+pub use tenant_parameters::*;

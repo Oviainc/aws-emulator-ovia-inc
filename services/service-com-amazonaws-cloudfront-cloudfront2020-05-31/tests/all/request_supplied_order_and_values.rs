@@ -20,7 +20,9 @@
 //! * `Paths$Items` (`PathList`), `FieldPatterns$Items` (`FieldPatternList`) and
 //!   `EncryptionEntities$Items` (`EncryptionEntityList`) are Smithy LISTS, i.e. ordered
 //!   sequences, so the SEQUENCE is part of the value: the entries are reported at the
-//!   positions the request put them in, on the create and on every later read or listing.
+//!   positions the request put them in, on the create and on every later read or listing — an
+//!   invalidation batch being the SET of objects to invalidate, where an exact repeat of a
+//!   path collapses onto its first position (`invalidation_path_set.rs` states that rule).
 //!
 //! Neither half of the rule is a property of one request document's FORM, so each suite below
 //! drives it from a table whose rows differ along what the rule generalises over: how many
@@ -111,7 +113,8 @@ async fn an_invalidation_reports_its_paths_in_the_order_submitted() {
 
     // Rows differing in how many paths a batch names and in where the submitted sequence sits
     // relative to a sorted one — descending, ascending, neither — plus a repeated entry, which
-    // a SEQUENCE keeps at both of the positions where a set would keep it once.
+    // the SET a batch describes keeps once, at the position the request first named it
+    // (`invalidation_path_set.rs` asserts that rule over the class).
     let rows: &[(&str, &[&str])] = &[
         ("one path", &["/*"]),
         (
@@ -142,7 +145,15 @@ async fn an_invalidation_reports_its_paths_in_the_order_submitted() {
             "case {case:?}: expected HTTP 201, got {} with {}",
             answer.status, answer.raw
         );
-        let expected: Vec<String> = paths.iter().map(|path| (*path).to_string()).collect();
+        // The batch is the SET of objects to invalidate, so the paths come back in the order
+        // submitted with an exact repeat collapsed onto its first position.
+        let mut expected: Vec<String> = Vec::new();
+        for path in *paths {
+            let path = (*path).to_string();
+            if !expected.contains(&path) {
+                expected.push(path);
+            }
+        }
         let id = answer.root().text_at("Id").unwrap_or_default().to_string();
         let read = get_invalidation(&router, &distribution, &id).await;
 
@@ -157,9 +168,9 @@ async fn an_invalidation_reports_its_paths_in_the_order_submitted() {
             let quantity = document.text_at("InvalidationBatch/Paths/Quantity");
             assert_eq!(
                 quantity,
-                Some(paths.len().to_string().as_str()),
+                Some(expected.len().to_string().as_str()),
                 "case {case:?} ({context}): expected Paths.Quantity {}, got {quantity:?} in {}",
-                paths.len(),
+                expected.len(),
                 answer.raw
             );
         }

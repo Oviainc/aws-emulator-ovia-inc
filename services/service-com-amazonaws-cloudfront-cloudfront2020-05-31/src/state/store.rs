@@ -1329,6 +1329,16 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             ));
         }
 
+        // A multi-tenant distribution's configuration is a TEMPLATE: the members that
+        // address the origin may name one of the parameters its `TenantConfig` declares, and
+        // nothing else may. A reference to a parameter the configuration does not declare —
+        // or any reference at all in a configuration that serves traffic directly, which
+        // declares none — names a value CloudFront could never substitute, so it is refused
+        // before any distribution is created carrying it.
+        if let Some(message) = tenant_parameter_refusal(&config) {
+            return Err(CreateRefusal::InvalidArgument(message));
+        }
+
         // A caller reference identifies ONE distribution for its whole life, and what it
         // takes part in is this: repeating a create under a reference the store already
         // holds is either the SAME request again or a second distribution under a taken
@@ -1340,6 +1350,14 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         // distribution with is associated with another distribution."
         // [`ComAmazonawsCloudfrontCloudfront20200531State::create_invalidation`]'s caller
         // reference follows the same rule for an invalidation batch.
+        //
+        // The replay is an AS-CREATED privilege: a reference names the create it was sent
+        // with, so it answers a repeat of that create only while the distribution still
+        // holds the configuration that create stored. Once the distribution has been
+        // reconfigured ([`StoredDistribution::reconfigured`]) the reference is associated
+        // with a distribution no create under it describes, and every create under it is
+        // refused — including one resending the distribution's own current configuration,
+        // which is a configuration no create ever submitted.
         let caller_reference = config.caller_reference.clone();
         // The configuration as the service will run it: the members submitted plus every
         // member the service itself supplies. Resolved BEFORE the caller-reference
@@ -1352,7 +1370,7 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         // reference it indexes is associated with nothing and this create claims it.
         if let Some(existing_id) = self.caller_references.get(&caller_reference).cloned() {
             if let Some(existing) = self.distribution(&existing_id) {
-                if same_config(&existing.config, &config) {
+                if !existing.reconfigured && same_config(&existing.config, &config) {
                     // The same request again: the record the first create left behind, at
                     // its current version. Nothing is minted and nothing is stored — so a
                     // tag set this repeat carries changes nothing either, the distribution
@@ -1398,6 +1416,9 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
             // it: a later read answers from this record — the configuration the
             // distribution actually runs under — never from the request that was served.
             config,
+            // The configuration this record holds is the one this create stored, so the
+            // caller reference's replay still answers a repeat of it.
+            reconfigured: false,
             tags,
             invalidations: BTreeMap::new(),
             // Additional CloudWatch metrics are enabled by a call of their own, so a
@@ -1919,6 +1940,10 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
     ///
     /// `None` when the store holds no such distribution, checked BEFORE the mint so a
     /// version token is never spent on a distribution that is not there.
+    ///
+    /// The record is marked RECONFIGURED: the configuration it now holds is no longer the
+    /// one its create stored, so the caller reference that created it no longer answers a
+    /// repeat of that create ([`StoredDistribution::reconfigured`]).
     pub fn apply_config(
         &mut self,
         id: &str,
@@ -1931,6 +1956,7 @@ impl ComAmazonawsCloudfrontCloudfront20200531State {
         let etag = self.next_etag();
         let stored = self.distributions.get_mut(id)?;
         stored.config = resolve_distribution_config(config);
+        stored.reconfigured = true;
         stored.last_modified_time = now;
         stored.etag = etag;
         stored.status = STATUS_IN_PROGRESS.to_string();

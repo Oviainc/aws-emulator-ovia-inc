@@ -7,6 +7,12 @@
 //! `InProgress` again until the clock owes it `Deployed`, and the mutation hands back a
 //! fresh version token.
 //!
+//! The configuration is submitted WHOLE — a member the resource carries and the document
+//! leaves out is refused rather than supplied — and the two members that identify what the
+//! distribution IS are fixed when it is created: its `CallerReference` and its
+//! `ConnectionMode`. An update declaring either differently is refused `IllegalUpdate`
+//! (HTTP 400) and nothing is written.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -360,16 +366,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut store = state.lock();
         store.settle(now);
 
-        let Some(current) = store
-            .distribution(&input.id)
-            .map(|stored| (stored.etag.clone(), stored.config.caller_reference.clone()))
-        else {
+        let Some(current) = store.distribution(&input.id).map(|stored| {
+            (
+                stored.etag.clone(),
+                stored.config.caller_reference.clone(),
+                crate::state::connection_mode_declared(&stored.config),
+            )
+        }) else {
             return Err(UpdateDistributionErrorModeled::NoSuchDistribution(
                 crate::state::no_such_distribution(),
             )
             .into());
         };
-        let (current_etag, current_caller_reference) = current;
+        let (current_etag, current_caller_reference, current_connection_mode) = current;
 
         // The precondition is checked against the stored version, so an update only
         // lands on the configuration its caller actually read.
@@ -501,6 +510,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // The same rule the create path applies: a configuration may reference a tenant
+        // parameter only where it declares one, so an update cannot leave a distribution
+        // carrying a reference CloudFront could never substitute either.
+        if let Some(message) =
+            crate::state::tenant_parameter_refusal(&input.distribution_config)
+        {
+            return Err(UpdateDistributionErrorModeled::InvalidArgument(InvalidArgument {
+                message: Some(message),
+            })
+            .into());
+        }
+
         // A distribution's caller reference identifies it for its whole life, so an
         // update that renames it is not a modification CloudFront allows. The fixed
         // sentence the DISTRIBUTION surface states that rule in, naming no value from the
@@ -508,6 +529,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if input.distribution_config.caller_reference != current_caller_reference {
             return Err(UpdateDistributionErrorModeled::IllegalUpdate(
                 crate::state::illegal_update_distribution_caller_reference(),
+            )
+            .into());
+        }
+
+        // The same KIND of rule, over the member that says what the distribution IS: a
+        // standard distribution serves its own traffic, a multi-tenant one serves the
+        // tenants bound to it, so the connection mode is fixed when the distribution is
+        // created and an update declaring another one is refused — otherwise every tenant
+        // bound to a multi-tenant distribution would be left unroutable by a call that
+        // reported success.
+        if crate::state::connection_mode_declared(&input.distribution_config)
+            != current_connection_mode
+        {
+            return Err(UpdateDistributionErrorModeled::IllegalUpdate(
+                crate::state::illegal_update_connection_mode(),
             )
             .into());
         }

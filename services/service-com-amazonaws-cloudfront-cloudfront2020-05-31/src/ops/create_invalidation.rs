@@ -7,6 +7,11 @@
 //! record it stored. A repeated `CallerReference` for the same batch is the same
 //! request again, so it reports the invalidation it already created.
 //!
+//! The batch is stored as the SET of objects it describes
+//! ([`crate::state::resolve_invalidation_batch`]): an exact repeat of a path asks for
+//! nothing more than naming it once and collapses, while paths differing in case name
+//! different objects and stay distinct.
+//!
 //! A batch naming a value that is no invalidation path — one not starting at the
 //! distribution's root, or carrying a character the documentation requires URL-encoded — and
 //! one naming no path at all, are refused with `InvalidArgument` before anything is stored
@@ -212,15 +217,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // doesn't create a new invalidation request. Instead, CloudFront returns
         // information about the invalidation request that you previously created with
         // the same CallerReference."
+        //
+        // The batch as the service will store it — its paths as the SET they are
+        // ([`crate::state::resolve_invalidation_batch`]) — resolved BEFORE the
+        // caller-reference question so the comparison below is one between like and like:
+        // the stored batch is resolved too, so a repeat that names an object twice and one
+        // that names it once are the same request, as they ask for the same objects.
+        let batch = crate::state::resolve_invalidation_batch(input.invalidation_batch);
         let repeated = stored
             .invalidations
             .values()
-            .find(|existing| {
-                existing.batch.caller_reference == input.invalidation_batch.caller_reference
-            })
+            .find(|existing| existing.batch.caller_reference == batch.caller_reference)
             .cloned();
         if let Some(existing) = repeated {
-            if crate::state::same_batch(&existing.batch, &input.invalidation_batch) {
+            if crate::state::same_batch(&existing.batch, &batch) {
                 return Ok(CreateInvalidationOutput {
                     location: Some(crate::state::location_uri(
                         &crate::state::invalidation_path(&input.distribution_id, &existing.id),
@@ -236,7 +246,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 message: Some(format!(
                     "The CallerReference {} was already used for invalidation {} of this \
                      distribution with different paths",
-                    input.invalidation_batch.caller_reference, existing.id
+                    batch.caller_reference, existing.id
                 )),
             })
             .into());
@@ -266,8 +276,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             create_time: now,
             completed_due: now + crate::state::PROPAGATION_DELAY,
             // Stored whole: a later read of this invalidation answers from the batch as
-            // submitted.
-            batch: input.invalidation_batch,
+            // submitted, its paths resolved into the set they describe.
+            batch,
         };
         let reported = invalidation.to_invalidation();
         let Some(owner) = store.distributions.get_mut(&input.distribution_id) else {

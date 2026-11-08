@@ -362,6 +362,17 @@ pub struct StoredDistribution {
     /// returns the configuration the distribution actually runs under rather than a
     /// re-derivation of it.
     pub config: DistributionConfig,
+    /// Whether this distribution's configuration has been REPLACED since it was created.
+    ///
+    /// `false` on the record a create leaves behind, and `true` from the first write that
+    /// replaces the configuration ([`ComAmazonawsCloudfrontCloudfront20200531State::apply_config`]).
+    /// What it decides is the reach of the caller reference's idempotent replay: a reference
+    /// names the create it was sent with, so it answers a repeat of that create only while
+    /// the distribution still holds the configuration that create stored. Once the
+    /// distribution has been reconfigured, the reference is associated with a distribution no
+    /// create under it describes, and a create under it is refused rather than answered with
+    /// this record.
+    pub reconfigured: bool,
     /// The tags associated with this distribution. A distribution created without a tag
     /// set carries none, which is the empty set rather than an absent one.
     pub tags: TagSet,
