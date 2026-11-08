@@ -138,7 +138,16 @@ pub fn suppression_list_prefix(tenant_name: Option<&str>) -> String {
 ///
 /// One wording for every operation that looks an address up on a suppression list,
 /// so a client sees the same sentence whichever call first tells it the address is
-/// not suppressed.
-pub fn suppressed_destination_not_found(email_address: &str) -> String {
-    format!("Email address {email_address} does not exist on your suppression list.")
+/// not suppressed. The sentence names the LIST that was read: a tenant's suppression
+/// list is a list of its own (`SuppressedDestination$TenantName` "is present only when
+/// the suppressed destination is on a tenant's suppression list"), so a lookup a
+/// request scoped to a tenant with `TenantName` reports the address absent from that
+/// tenant's list, and a lookup with no `TenantName` reports it absent from the
+/// account's. The address, taken from the request, is the only other variable part.
+pub fn suppressed_destination_not_found(tenant_name: Option<&str>, email_address: &str) -> String {
+    let list = match tenant_name {
+        Some(_) => "tenant suppression list",
+        None => "suppression list",
+    };
+    format!("Email address {email_address} does not exist on your {list}.")
 }

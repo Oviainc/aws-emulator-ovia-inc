@@ -40,6 +40,9 @@ mod configuration_sets;
 /// The dedicated-IP plane: the pools, the addresses in them, and the blocklist
 /// listings observed for those addresses.
 mod dedicated_ips;
+/// The order this service states an enumerated type's values in when it refuses a
+/// value outside them.
+mod enum_value_sets;
 /// The suppression-list plane: one suppressed address and how a list's entries are
 /// keyed.
 mod suppression;
@@ -50,6 +53,7 @@ pub mod template_rendering;
 
 pub use configuration_sets::*;
 pub use dedicated_ips::*;
+pub use enum_value_sets::*;
 pub use suppression::*;
 
 /// How long after `CreateEmailIdentity` an identity's `PENDING` -> `SUCCESS`
@@ -3467,9 +3471,12 @@ pub fn modelled_enum_value(
     if let Some(sentence) = service_worded_enum_refusal(member) {
         return Err(sentence.to_string());
     }
+    // The values are listed in the order this service publishes for the enum, the same
+    // order the request boundary's own report of the value set states
+    // ([`published_enum_value_list`]).
     Err(format!(
         "{member} {value} is not one of {}.",
-        allowed.join(", ")
+        published_enum_value_list(allowed)
     ))
 }
 
@@ -3547,11 +3554,17 @@ pub fn boundary_refusal_message(violations: &[Violation]) -> Option<String> {
 
 /// One clause of [`boundary_refusal_message`].
 ///
-/// The requirement half is always the framework's own words — the clause is cut at
-/// the separator rather than rebuilt — so a constraint class the framework learns to
-/// check cannot drift from this wording, and only the SUBJECT of a clause about a
-/// value's form changes: from the value-quoting form to the member on its own.
+/// The requirement half is the framework's own words — the clause is cut at the
+/// separator rather than rebuilt — so a constraint class the framework learns to check
+/// cannot drift from this wording, and only the SUBJECT of a clause about a value's
+/// form changes: from the value-quoting form to the member on its own. The one thing
+/// decided here rather than by the walk is the ORDER a value set is listed in, which
+/// belongs to the enum rather than to the walk that read the model's members
+/// ([`in_published_enum_value_order`]) — applied to the violation before it is
+/// rendered, so the sentence around the list stays the framework's whatever shape it
+/// takes.
 fn boundary_clause(violation: &Violation) -> String {
+    let violation = &in_published_enum_value_order(violation);
     let rendered = violation.message();
     if !matches!(
         violation.kind,

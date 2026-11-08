@@ -184,12 +184,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "To target a tenant's suppression list, specify the TenantName parameter. If
         // you omit TenantName, the operation targets the account-level suppression
         // list" — so the list to read is chosen by the request, and an address on one
-        // list is not on the other.
+        // list is not on the other. The refusal names the list that was read, for the
+        // same reason: an address absent from a tenant's list is not a statement about
+        // the account's list.
         let key = crate::state::suppression_key(tenant.as_deref(), &address);
         let Some(record) = store.suppressed_destinations.get(&key) else {
             return Err(GetSuppressedDestinationErrorModeled::NotFoundException(
                 NotFoundException {
-                    message: Some(crate::state::suppressed_destination_not_found(&address)),
+                    message: Some(crate::state::suppressed_destination_not_found(
+                        tenant.as_deref(),
+                        &address,
+                    )),
                 },
             )
             .into());

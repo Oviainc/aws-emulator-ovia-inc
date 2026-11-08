@@ -107,6 +107,8 @@ mod email_identity_verification_info;
 mod email_template_updates;
 #[path = "all/email_templates.rs"]
 mod email_templates;
+#[path = "all/enum_value_set_order.rs"]
+mod enum_value_set_order;
 #[path = "all/export_job_creation.rs"]
 mod export_job_creation;
 #[path = "all/export_jobs.rs"]
@@ -145,6 +147,8 @@ mod send_unverified_identity_refusal;
 mod state_roundtrip;
 #[path = "all/suppressed_destinations.rs"]
 mod suppressed_destinations;
+#[path = "all/suppression_list_scope_refusal.rs"]
+mod suppression_list_scope_refusal;
 #[path = "all/template_policy_and_tag_reads.rs"]
 mod template_policy_and_tag_reads;
 #[path = "all/tenant_deletion.rs"]

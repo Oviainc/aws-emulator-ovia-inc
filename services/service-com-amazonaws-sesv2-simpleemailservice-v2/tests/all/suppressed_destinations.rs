@@ -586,6 +586,42 @@ async fn an_address_absent_from_the_named_list_is_refused_as_not_found() {
             lookup: "example.com",
             tenant: None,
         },
+        // The rows below span the tenant-scoped misses the account-scoped rows above
+        // span, so the sentence each list is refused with is pinned over the same
+        // shapes of miss on both kinds of list.
+        MissCase {
+            name: "a tenant list, nothing is suppressed at all",
+            stored: Vec::new(),
+            lookup: "nobody@example.com",
+            tenant: Some("tenant_one"),
+        },
+        MissCase {
+            name: "another address is suppressed on the tenant list read",
+            stored: vec![tenant_entry.clone()],
+            lookup: "someone-else@example.com",
+            tenant: Some("tenant_one"),
+        },
+        MissCase {
+            name: "a tenant list, the local part differs in case",
+            stored: vec![SuppressedDestinationRecord {
+                tenant_name: Some("tenant-two".to_string()),
+                ..entry("Casey@example.com", "BOUNCE", moment(60))
+            }],
+            lookup: "casey@example.com",
+            tenant: Some("tenant-two"),
+        },
+        MissCase {
+            name: "a tenant list, a long local part nothing suppressed",
+            stored: vec![tenant_entry.clone()],
+            lookup: "a-very-long-local-part-that-nobody-suppressed@mail.example.com",
+            tenant: Some("tenant-two"),
+        },
+        MissCase {
+            name: "a tenant list, the address has no local part at all",
+            stored: vec![tenant_entry.clone()],
+            lookup: "example.com",
+            tenant: Some("tenant_one"),
+        },
     ];
 
     for case in &cases {
@@ -605,16 +641,30 @@ async fn an_address_absent_from_the_named_list_is_refused_as_not_found() {
             reply.body
         );
         // The refusal names the address the request asked about, taken from the
-        // request rather than from anything stored.
+        // request rather than from anything stored, and the LIST that was read: a
+        // tenant's when the request selected one, the account's otherwise.
+        let list = match case.tenant {
+            Some(_) => "tenant suppression list",
+            None => "suppression list",
+        };
         assert_eq!(
             reply.message(),
             format!(
-                "Email address {} does not exist on your suppression list.",
+                "Email address {} does not exist on your {list}.",
                 case.lookup
             ),
-            "case {:?}: expected the refusal to name {:?}, got {:?}",
+            "case {:?}: expected the refusal to name {:?} and the list read, got {:?}",
             case.name,
             case.lookup,
+            reply.message()
+        );
+        // The two sentences are distinct, so a client can tell which list answered:
+        // a tenant-scoped refusal never reads as the account-scoped one.
+        assert_eq!(
+            reply.message().contains("your tenant suppression list"),
+            case.tenant.is_some(),
+            "case {:?}: expected the tenant list to be named only for a tenant-scoped read, got {:?}",
+            case.name,
             reply.message()
         );
     }
