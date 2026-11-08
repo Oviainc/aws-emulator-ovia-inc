@@ -139,6 +139,14 @@ pub fn router_with_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
     router.register_service(
         service_com_amazonaws_kinesis_kinesis_20131202::EmulatedService::new(Arc::clone(&engine)),
     );
+    // AWS Secrets Manager, for the `AWS::SecretsManager::Secret` a stack really creates
+    // there, so a suite that deploys one reads the secret back — and reads its value — through
+    // that service's own wire.
+    router.register_service(
+        service_com_amazonaws_secretsmanager_secretsmanager::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
+    );
     // Application Auto Scaling, for the `AWS::ApplicationAutoScaling::ScalableTarget` and the
     // `AWS::ApplicationAutoScaling::ScalingPolicy` a stack really registers there, so a suite
     // that deploys one reads the target and the policy back through that service's own wire —

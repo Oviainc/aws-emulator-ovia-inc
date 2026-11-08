@@ -61,7 +61,9 @@ use std::collections::BTreeMap;
 
 use serde_json::{Map, Value};
 
-use super::{call_json_rpc, Created, Readiness, Refusal, Removal, AWS_JSON_1_0};
+use super::{
+    call_json_rpc, key_value_tag_list, Created, Readiness, Refusal, Removal, AWS_JSON_1_0,
+};
 use crate::state::provisioner::tags_of;
 use crate::state::StoredResource;
 
@@ -583,15 +585,10 @@ fn storable_tags(properties: &Value, propagated: &[(String, String)]) -> Vec<(St
 }
 
 /// The tag set as `CreateTable`'s own `Tags` list: "an array of key-value pairs", each a
-/// `Tag` with a `Key` and a `Value`.
+/// `Tag` with a `Key` and a `Value` — the form [`super::key_value_tag_list`] renders for
+/// every provider whose owning model spells it that way.
 fn tag_list(tags: &[(String, String)]) -> Value {
-    Value::Array(
-        tags.iter()
-            .map(|(key, value)| {
-                serde_json::json!({ "Key": key, "Value": value })
-            })
-            .collect(),
-    )
+    key_value_tag_list(tags)
 }
 
 /// Whether the declaration changes a property that `UpdateTable` does not take, which is

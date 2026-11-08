@@ -878,7 +878,7 @@ pub(super) fn return_values(
         // Secrets Manager secret ARN ends in a service-assigned six-character suffix
         // (`arn:aws:secretsmanager:<region>:<account>:secret:<name>-<suffix>`), so the
         // resource id is of THAT form rather than the name.
-        "AWS::SecretsManager::Secret" => {
+        SECRETSMANAGER_SECRET => {
             let suffix =
                 service_assigned_label(SECRET_ARN_SUFFIX_SALT, name, SECRET_ARN_SUFFIX_CHARACTERS);
             let arn = ::emulator_server::emulator_arn(
@@ -1551,7 +1551,7 @@ pub fn published_attribute_names(resource_type: &str) -> &'static [&'static str]
             "Endpoint.Address",
             "Endpoint.Port",
         ],
-        "AWS::SecretsManager::Secret" => &["Id"],
+        SECRETSMANAGER_SECRET => &["Id"],
         EC2_VPC => &["VpcId"],
         EC2_SUBNET => &["SubnetId"],
         EC2_SECURITY_GROUP => &["GroupId"],
@@ -1860,6 +1860,13 @@ pub fn identity_is_service_assigned(resource_type: &str) -> bool {
         // in force is the one that service answered. The pool's own NAME is its `Name`
         // attribute, which the create reports.
         || resource_type == COGNITO_IDENTITY_POOL
+        // A Secrets Manager secret is one more: `CreateSecret` takes the secret's NAME and
+        // answers the `ARN` that service built for it, whose six trailing characters it draws
+        // per secret ([`SECRETSMANAGER_SECRET`]) — so no naming rule could compute it — and
+        // "Ref returns the ARN of the secret", which is the handle every Secrets Manager call
+        // on one takes. The ARN computed here is the stand-in a declaration is resolved
+        // against until that create has answered, which the deployment then re-points.
+        || resource_type == SECRETSMANAGER_SECRET
         // A NESTED STACK is one more, and the clearest case of it: "Ref returns the stack
         // ID" of the stack CloudFormation created for the resource, which carries the unique
         // id that service minted for it — the name the naming rules compute is only what the
@@ -2695,6 +2702,15 @@ pub const STEP_FUNCTIONS_ACTIVITY: &str = "AWS::StepFunctions::Activity";
 /// Region, the account and the machine's name, so the handle a stack publishes for one is
 /// the ARN `sfn DescribeStateMachine` answers with.
 pub const STEP_FUNCTIONS_STATE_MACHINE: &str = "AWS::StepFunctions::StateMachine";
+
+/// An AWS Secrets Manager secret's resource type (the Secrets Manager model:
+/// `cloudFormationName: SecretsManager`, `arnNamespace: secretsmanager`). This is a type
+/// `super::provisioning` creates in Secrets Manager itself, and "Ref returns the ARN of the
+/// secret" — an ARN whose six trailing characters that service draws per secret, which is
+/// why [`identity_is_service_assigned`] names the type: the handle a stack publishes for one
+/// is the ARN `secretsmanager describe-secret` answers with, not a value a naming rule here
+/// could compute.
+pub const SECRETSMANAGER_SECRET: &str = "AWS::SecretsManager::Secret";
 
 /// A Systems Manager Parameter Store parameter's resource type (the SSM model:
 /// `cloudFormationName: SSM`). This is a type `super::provisioning` creates in Systems

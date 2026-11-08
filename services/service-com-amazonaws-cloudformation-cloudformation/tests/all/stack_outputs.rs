@@ -310,12 +310,18 @@ fn is_rds_resource_id(value: &str, prefix: &str) -> bool {
 /// Whether `value` is the ARN of the Secrets Manager secret named `name`:
 /// `arn:aws:secretsmanager:<region>:<account>:secret:<name>-<six characters Secrets
 /// Manager assigns>`.
+///
+/// The suffix is the OWNING service's: a stack's secret is created in Secrets Manager and
+/// the ARN the stack publishes is the one that create answered with, drawn from that
+/// service's own suffix alphabet (ASCII letters and digits, either case).
 fn is_secret_arn(value: &str, name: &str) -> bool {
     value
         .strip_prefix(&format!(
             "arn:aws:secretsmanager:{REGION}:{ACCOUNT_ID}:secret:{name}-"
         ))
-        .is_some_and(|suffix| suffix.len() == 6 && suffix.chars().all(is_lower_hex))
+        .is_some_and(|suffix| {
+            suffix.len() == 6 && suffix.chars().all(|character| character.is_ascii_alphanumeric())
+        })
 }
 
 /// Whether `value` is an Amazon EC2 security group id: `sg-` and 17 lowercase hexadecimal

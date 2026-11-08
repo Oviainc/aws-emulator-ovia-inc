@@ -148,6 +148,10 @@ service-com-amazonaws-apigateway-backplanecontrolservice = { workspace = true }
 # the Kinesis service's own stream registry, so a suite that declares one must create the
 # stream there first or the destination never replicates.
 service-com-amazonaws-kinesis-kinesis-20131202 = { workspace = true }
+# AWS Secrets Manager, for the `AWS::SecretsManager::Secret` a stack really creates there
+# (`state::provisioning::secretsmanager_secret`): a suite that deploys one must have its
+# owning service mounted beside CloudFormation, or the create is refused and the stack fails.
+service-com-amazonaws-secretsmanager-secretsmanager = { workspace = true }
 # Application Auto Scaling, for the `AWS::ApplicationAutoScaling::ScalableTarget` and
 # `AWS::ApplicationAutoScaling::ScalingPolicy` a stack really registers there
 # (`state::provisioning::application_auto_scaling`): a suite that deploys one must have its

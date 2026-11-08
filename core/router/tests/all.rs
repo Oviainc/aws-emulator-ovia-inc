@@ -17,6 +17,11 @@
 // else appends to.
 #[path = "all/cloudformation_fifo_resource_generated_names.rs"]
 mod cloudformation_fifo_resource_generated_names;
+// Declared here, in this same head region, for the reason the entry above records: the
+// secret a stack declares, which has to exist in AWS Secrets Manager under the ARN the
+// stack publishes for it.
+#[path = "all/cloudformation_provisions_secrets_manager_secrets.rs"]
+mod cloudformation_provisions_secrets_manager_secrets;
 // Declared here, in this same head region, for the reason the entry above records: what a
 // deployed `AWS_IAM` method makes of the credential its request presents, on a router that
 // verifies request signatures.
