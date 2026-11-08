@@ -476,36 +476,35 @@ fn rejected(rejection: crate::state::ListenerRejection) -> CreateLoadBalancerErr
     }
 }
 
-/// Collect the requested tags, refusing a key given more than once and a list longer
+/// Collect the requested tags, refusing a key given more than once and a set larger
 /// than the published per-load-balancer tag quota.
+///
+/// Collecting a tag list, and the wording of both refusals, is the same wherever a load
+/// balancer's tags are set, so it lives in `crate::state`; this operation only says which
+/// of its own modelled errors each refusal answers under.
 fn collect_tags(
     requested: Option<&[Tag]>,
 ) -> Result<::std::collections::BTreeMap<String, String>, CreateLoadBalancerError> {
-    let requested = requested.unwrap_or_default();
-    if requested.len() > crate::state::MAX_TAGS_PER_LOAD_BALANCER {
-        return Err(CreateLoadBalancerErrorModeled::TooManyTagsException(
-            TooManyTagsException {
-                message: Some(format!(
-                    "Quota of {} tags per load balancer reached",
-                    crate::state::MAX_TAGS_PER_LOAD_BALANCER
-                )),
-            },
-        )
-        .into());
-    }
-    let mut tags = ::std::collections::BTreeMap::new();
-    for tag in requested {
-        if tags
-            .insert(tag.key.clone(), tag.value.clone().unwrap_or_default())
-            .is_some()
-        {
-            return Err(CreateLoadBalancerErrorModeled::DuplicateTagKeysException(
-                DuplicateTagKeysException {
-                    message: Some(format!("Tag key '{}' was specified more than once", tag.key)),
-                },
-            )
-            .into());
+    crate::state::collect_requested_tags(
+        requested
+            .unwrap_or_default()
+            .iter()
+            .map(|tag| (tag.key.as_str(), tag.value.as_deref())),
+    )
+    .map_err(|refusal| {
+        let message = Some(refusal.reported_message());
+        match refusal {
+            crate::state::TagRefusal::TooMany => {
+                CreateLoadBalancerErrorModeled::TooManyTagsException(TooManyTagsException {
+                    message,
+                })
+            }
+            crate::state::TagRefusal::DuplicateKey(_) => {
+                CreateLoadBalancerErrorModeled::DuplicateTagKeysException(
+                    DuplicateTagKeysException { message },
+                )
+            }
         }
-    }
-    Ok(tags)
+        .into()
+    })
 }

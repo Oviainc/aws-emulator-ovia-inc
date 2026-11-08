@@ -95,6 +95,71 @@ pub fn security_groups_quota_message(count: usize) -> String {
     )
 }
 
+/// The refusal a request whose tags would push a load balancer's tag set past
+/// [`MAX_TAGS_PER_LOAD_BALANCER`] earns, stated over the quota: the caller fixes the
+/// request from the number, and it is the same quota wherever a load balancer's tags are
+/// set, so every operation that takes a tag list states it this way.
+pub fn too_many_tags_message() -> String {
+    format!("Quota of {MAX_TAGS_PER_LOAD_BALANCER} tags per load balancer reached")
+}
+
+/// The refusal a request naming one tag key more than once earns. `DuplicateTagKeys` is
+/// the refusal of every such request, so the message is what names the key the caller has
+/// to state once.
+pub fn duplicate_tag_key_message(key: &str) -> String {
+    format!("Tag key '{key}' was specified more than once")
+}
+
+/// Why a request's tag list cannot be collected: the two refusals every operation taking a
+/// `TagList` answers, each under its own modelled error.
+#[derive(Debug)]
+pub enum TagRefusal {
+    /// The list names more distinct keys than a load balancer may hold, so no load balancer
+    /// can end up carrying them — `TooManyTags`.
+    TooMany,
+    /// One key, stated more than once in one request — `DuplicateTagKeys`, naming the key.
+    DuplicateKey(String),
+}
+
+impl TagRefusal {
+    /// The sentence this refusal states: one error code answers it wherever a load
+    /// balancer's tags are set, so the wording lives here rather than in each handler.
+    pub fn reported_message(&self) -> String {
+        match self {
+            Self::TooMany => too_many_tags_message(),
+            Self::DuplicateKey(key) => duplicate_tag_key_message(key),
+        }
+    }
+}
+
+/// The DISTINCT tags of one request's tag list, keyed by tag key.
+///
+/// A tag's value is optional ("Each tag consists of a key and an optional value"), and a
+/// tag given no value is collected under the empty value, so one key holds one value
+/// whichever operation set it.
+///
+/// `TagList` carries no modelled maximum, so this is also where the work one request can
+/// ask for is bounded: collecting stops at the first key past
+/// [`MAX_TAGS_PER_LOAD_BALANCER`] distinct ones, and at the first key stated twice, because
+/// neither request can be served whatever the store holds.
+pub fn collect_requested_tags<'a>(
+    requested: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+) -> Result<BTreeMap<String, String>, TagRefusal> {
+    let mut tags: BTreeMap<String, String> = BTreeMap::new();
+    for (key, value) in requested {
+        if tags.len() >= MAX_TAGS_PER_LOAD_BALANCER && !tags.contains_key(key) {
+            return Err(TagRefusal::TooMany);
+        }
+        if tags
+            .insert(key.to_string(), value.unwrap_or_default().to_string())
+            .is_some()
+        {
+            return Err(TagRefusal::DuplicateKey(key.to_string()));
+        }
+    }
+    Ok(tags)
+}
+
 /// The largest `AvailabilityZones` or `Subnets` list a create accepts.
 ///
 /// AWS states this quota structurally ("one subnet per Availability Zone") rather than

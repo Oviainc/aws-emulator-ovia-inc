@@ -25,6 +25,8 @@ mod listeners_health_check_and_attributes;
 mod load_balancer_lifecycle;
 #[path = "all/load_balancer_policies.rs"]
 mod load_balancer_policies;
+#[path = "all/load_balancer_tags.rs"]
+mod load_balancer_tags;
 #[path = "all/modeled_refusal_envelopes.rs"]
 mod modeled_refusal_envelopes;
 #[path = "all/shared_endpoint_api_version_dispatch.rs"]
