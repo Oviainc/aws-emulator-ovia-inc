@@ -212,12 +212,20 @@ fn invalid_input(message: impl Into<String>) -> CreateSchemaError {
     .into()
 }
 
-/// Refuse a `schema` that is not an Avro record declaration.
+/// Refuse a `schema` that is not an Avro record declaration, or that omits a field its
+/// dataset type requires.
 ///
 /// "The schema you create must be in Avro JSON format", and a Personalize dataset schema
 /// is an Avro RECORD: the document is parsed as JSON (by `serde_json`, not by hand) and
-/// must be an object whose `type` is `record` and whose `fields` is a list. What each
-/// field must contain is per-dataset-type and is not checked here.
+/// must be an object whose `type` is `record` and whose `fields` is a list.
+///
+/// Each schema also "is associated with a dataset type and has a set of required field and
+/// keywords" (`smithy_query(query="doc", shape="CreateSchema")`), and the dataset type it
+/// is written for is the record's own `name`: so a document whose field list does not
+/// declare every field that type requires is refused HERE, at the call that submitted it,
+/// rather than accepted and left to fail against a dataset later. The refusal names
+/// exactly the required fields the document left out
+/// ([`crate::state::missing_schema_fields_message`]).
 fn check_avro_schema(schema: &str) -> Result<(), CreateSchemaError> {
     let parsed: ::serde_json::Value = ::serde_json::from_str(schema)
         .map_err(|error| invalid_input(format!("The schema is not valid JSON: {error}")))?;
@@ -231,13 +239,49 @@ fn check_avro_schema(schema: &str) -> Result<(), CreateSchemaError> {
             "The schema must declare an Avro record: expected \"type\": \"record\".",
         ));
     }
-    if !object
-        .get("fields")
-        .is_some_and(::serde_json::Value::is_array)
-    {
+    let Some(fields) = object.get("fields").and_then(::serde_json::Value::as_array) else {
         return Err(invalid_input(
             "The schema must declare an Avro record: expected a \"fields\" list.",
         ));
+    };
+    let record_name = object.get("name").and_then(::serde_json::Value::as_str);
+    check_required_fields(record_name, fields)
+}
+
+/// Refuse a record that does not declare every field the dataset type `record_name` names
+/// requires.
+///
+/// A record naming no dataset type has no per-type field set to check against (see
+/// [`crate::state::required_schema_fields`]), so it passes this check. A declared field
+/// counts whatever case its name is written in — the dataset type itself is matched
+/// case-insensitively, so its field names are too — and a field entry that declares no
+/// name at all declares nothing.
+fn check_required_fields(
+    record_name: Option<&str>,
+    fields: &[::serde_json::Value],
+) -> Result<(), CreateSchemaError> {
+    let Some(required) = record_name.and_then(crate::state::required_schema_fields) else {
+        return Ok(());
+    };
+
+    let declared: Vec<&str> = fields
+        .iter()
+        .filter_map(|field| field.get("name").and_then(::serde_json::Value::as_str))
+        .collect();
+    let missing: Vec<&str> = required
+        .iter()
+        .copied()
+        .filter(|required_field| {
+            !declared
+                .iter()
+                .any(|declared_field| declared_field.eq_ignore_ascii_case(required_field))
+        })
+        .collect();
+
+    if missing.is_empty() {
+        return Ok(());
     }
-    Ok(())
+    Err(invalid_input(
+        crate::state::missing_schema_fields_message(&missing),
+    ))
 }

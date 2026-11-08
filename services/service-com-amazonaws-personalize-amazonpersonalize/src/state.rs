@@ -223,6 +223,17 @@ pub fn resource_not_found_message(arn: &str) -> String {
     format!("Resource Arn {arn} does not exist.")
 }
 
+/// What a schema document that does not declare every field its dataset type requires
+/// answers, for the names it left out: the sentence's fixed text is followed by the
+/// bracketed, comma-separated list of those names.
+///
+/// `missing` is expected in the order the dataset type requires its fields (see
+/// [`required_schema_fields`]), so two documents omitting the same names read the same
+/// however their own field lists are ordered.
+pub fn missing_schema_fields_message(missing: &[&str]) -> String {
+    format!("Schema is missing required fields: [{}]", missing.join(", "))
+}
+
 /// What a schema delete still referenced by a dataset answers. The whole sentence is
 /// fixed: it names neither the schema nor the datasets holding it, however many there
 /// are, so a caller never learns the referencing ARNs from the refusal.
@@ -459,6 +470,44 @@ pub fn canonical_dataset_type(value: &str) -> Option<&'static str> {
         .iter()
         .find(|candidate| candidate.eq_ignore_ascii_case(value))
         .copied()
+}
+
+/// The fields a dataset schema of each dataset type must declare, in the order a refusal
+/// lists the ones a document left out.
+///
+/// A Personalize schema "is associated with a dataset type and has a set of required field
+/// and keywords" (`smithy_query(query="doc", shape="CreateSchema")`), and which dataset
+/// type a document is written for is the Avro record's own `name`. The model does not
+/// enumerate the sets, so these are Amazon Personalize's own per-dataset-type required
+/// fields, spelled as the service words them when it reports one missing: an interactions
+/// record is keyed by user, item and time; an items or users record by the entity it
+/// describes; an actions record by the action; an action-interactions record by user,
+/// action, time and the event that happened.
+pub const REQUIRED_SCHEMA_FIELDS: &[(&str, &[&str])] = &[
+    ("Interactions", &["user_id", "item_id", "timestamp"]),
+    ("Items", &["item_id"]),
+    ("Users", &["user_id"]),
+    ("Actions", &["action_id"]),
+    (
+        "Action_Interactions",
+        &["user_id", "action_id", "timestamp", "event_type"],
+    ),
+];
+
+/// The fields a schema written for `dataset_type` must declare, or `None` when the value
+/// names no dataset type at all — a document whose record names no dataset type has no
+/// per-type field set to be checked against, and the type a dataset uses it as is settled
+/// by `CreateDataset`.
+///
+/// The type is matched exactly as `CreateDataset` matches it
+/// ([`canonical_dataset_type`]), so one spelling of a type cannot be required fields the
+/// other is not.
+pub fn required_schema_fields(dataset_type: &str) -> Option<&'static [&'static str]> {
+    let canonical = canonical_dataset_type(dataset_type)?;
+    REQUIRED_SCHEMA_FIELDS
+        .iter()
+        .find(|(dataset_type, _)| *dataset_type == canonical)
+        .map(|(_, fields)| *fields)
 }
 
 /// The one dataset type Amazon Personalize provides a tracking id with: an Action

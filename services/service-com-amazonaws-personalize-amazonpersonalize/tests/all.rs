@@ -19,5 +19,7 @@ mod dataset_group_lifecycle;
 mod list_schemas;
 #[path = "all/refusal_wording.rs"]
 mod refusal_wording;
+#[path = "all/schema_required_fields.rs"]
+mod schema_required_fields;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;

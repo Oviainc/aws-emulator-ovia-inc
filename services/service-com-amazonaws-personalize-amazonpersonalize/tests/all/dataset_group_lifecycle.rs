@@ -166,16 +166,20 @@ async fn await_active(
 
 /// A minimal Avro record schema for `dataset_type`, in the Avro JSON format
 /// `CreateSchema` documents.
+///
+/// The record names the dataset type it is written for and declares every field that type
+/// requires (`crate::schema_required_fields::required_fields`), because a document that
+/// omits one of them is refused — which is what that suite is about.
 pub(crate) fn avro_schema(dataset_type: &str) -> String {
+    let fields: Vec<Value> = crate::schema_required_fields::required_fields(dataset_type)
+        .iter()
+        .map(|field| json!({"name": field.to_ascii_uppercase(), "type": "string"}))
+        .collect();
     json!({
         "type": "record",
         "name": dataset_type,
         "namespace": "com.amazonaws.personalize.schema",
-        "fields": [
-            {"name": "USER_ID", "type": "string"},
-            {"name": "ITEM_ID", "type": "string"},
-            {"name": "TIMESTAMP", "type": "long"},
-        ],
+        "fields": fields,
         "version": "1.0",
     })
     .to_string()
@@ -230,6 +234,26 @@ pub(crate) async fn create_active_group(emulator: &Emulator, name: &str, case: &
 // Schemas
 // ---------------------------------------------------------------------------
 
+/// A long Avro record for an action-interactions dataset: the four fields that type
+/// requires, followed by sixty-four of its own, so a large document is one row of the
+/// describe-back table.
+fn large_action_interactions_record() -> String {
+    let required = ["USER_ID", "ACTION_ID", "TIMESTAMP", "EVENT_TYPE"];
+    let fields: Vec<Value> = required
+        .into_iter()
+        .map(|field| json!({"name": field, "type": "string"}))
+        .chain(
+            (0..64).map(|index| json!({"name": format!("FIELD_{index}"), "type": "string"})),
+        )
+        .collect();
+    json!({
+        "type": "record",
+        "name": "Action_Interactions",
+        "fields": fields,
+    })
+    .to_string()
+}
+
 #[tokio::test]
 async fn a_created_schema_is_described_back_exactly_as_created() {
     let emulator = Emulator::new();
@@ -238,27 +262,24 @@ async fn a_created_schema_is_described_back_exactly_as_created() {
     // size, and whether the schema belongs to a Domain dataset group. The `domain` values
     // are the model's own `Domain` enum set (`DOMAIN_VALUES` in
     // `src/ops/types/shared_types.rs`); the first row is the case the bootstrap issue
-    // cited.
+    // cited. Each document declares the fields its dataset type requires — a document that
+    // omits one is refused, which `schema_required_fields.rs` covers.
     let cases: &[(&str, String, Option<&str>)] = &[
         ("my-interactions", avro_schema("Interactions"), None),
         ("items9", avro_schema("Items"), Some("ECOMMERCE")),
         (
+            // The smallest document a Users record admits: its one required field and
+            // nothing else.
             "vod_users",
-            json!({"type": "record", "name": "Users", "fields": []}).to_string(),
-            Some("VIDEO_ON_DEMAND"),
-        ),
-        (
-            "A",
             json!({
                 "type": "record",
-                "name": "Action_Interactions",
-                "fields": (0..64)
-                    .map(|index| json!({"name": format!("FIELD_{index}"), "type": "string"}))
-                    .collect::<Vec<_>>(),
+                "name": "Users",
+                "fields": [{"name": "USER_ID", "type": "string"}],
             })
             .to_string(),
-            None,
+            Some("VIDEO_ON_DEMAND"),
         ),
+        ("A", large_action_interactions_record(), None),
     ];
 
     for (name, schema, domain) in cases {
