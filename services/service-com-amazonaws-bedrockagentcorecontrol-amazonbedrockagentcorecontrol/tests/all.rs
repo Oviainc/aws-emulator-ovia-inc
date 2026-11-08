@@ -77,6 +77,8 @@ mod memory_update_and_read_projection;
 mod registry_lifecycle;
 #[path = "all/resource_error_message_wording.rs"]
 mod resource_error_message_wording;
+#[path = "all/runtime_vended_log_group.rs"]
+mod runtime_vended_log_group;
 #[path = "all/service_claim.rs"]
 mod service_claim;
 #[path = "all/signing_name_routing.rs"]

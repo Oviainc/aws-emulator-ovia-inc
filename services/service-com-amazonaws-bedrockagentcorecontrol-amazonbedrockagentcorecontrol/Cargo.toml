@@ -33,6 +33,10 @@ aws-sdk-lambda = { version = "1", default-features = false }
 # Resolves an agent runtime's code artifact against the emulator's own object
 # storage, through the in-process callback (src/state.rs).
 aws-sdk-s3 = { version = "1", default-features = false }
+# Creates the log group this service vends for an agent runtime in the emulator's
+# own CloudWatch Logs, through the in-process callback
+# (src/state/runtime_logs.rs).
+aws-sdk-cloudwatchlogs = { version = "1", default-features = false }
 # Encodes the opaque `nextToken` ListAgentRuntimes pages with.
 hex = { workspace = true }
 
@@ -43,6 +47,9 @@ emulator-core-build-support = { workspace = true }
 # Mounted beside this service in the code-artifact suite, so the object a create
 # resolves is one the emulator's object storage really holds.
 service-com-amazonaws-s3-amazons3 = { workspace = true }
+# Mounted beside this service in the vended-log-group suite, so the group a create
+# provisions is one the emulator's CloudWatch Logs really holds.
+service-com-amazonaws-cloudwatchlogs-logs-20140328 = { workspace = true }
 
 [lints]
 workspace = true

@@ -14,6 +14,11 @@
 //! account, or whose trust policy does not let this service assume it, is refused the
 //! same way.
 //!
+//! A served create also VENDS the runtime's logs: the CloudWatch Logs group derived from
+//! the `agentRuntimeId` it mints exists from then on, with no retention and so with no
+//! expiry, and it belongs to the account rather than to the runtime — see
+//! [`crate::state::runtime_logs`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -239,105 +244,124 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let mut store = state.lock();
+        // Everything this request decides and writes happens under ONE guard, which
+        // lives only in this block: it is released before the cross-service call
+        // below, because a lock is not held across an await.
+        let output = {
+            let mut store = state.lock();
 
-        // Read again under the guard that WRITES: the guard above was dropped for
-        // the call in between, so two requests carrying one token could both have
-        // got past it, and only this read is serialized with the insert.
-        if let Some(replayed) =
-            replayed_output(&store, Self::NAME, input.client_token.as_deref(), now)
-        {
-            return Ok(replayed);
-        }
+            // Read again under the guard that WRITES: the guard above was dropped for
+            // the call in between, so two requests carrying one token could both have
+            // got past it, and only this read is serialized with the insert.
+            if let Some(replayed) =
+                replayed_output(&store, Self::NAME, input.client_token.as_deref(), now)
+            {
+                return Ok(replayed);
+            }
 
-        // One runtime per name, so a repeated name is a conflict, not a second
-        // runtime that later reads cannot tell apart.
-        if let Some(existing) = store.runtime_names.get(&input.agent_runtime_name) {
-            return Err(CreateAgentRuntimeErrorModeled::ConflictException(ConflictException {
-                message: Some(format!(
-                    "an agent runtime named {} already exists (agentRuntimeId {existing})",
-                    input.agent_runtime_name
-                )),
-            })
-            .into());
-        }
+            // One runtime per name, so a repeated name is a conflict, not a second
+            // runtime that later reads cannot tell apart.
+            if let Some(existing) = store.runtime_names.get(&input.agent_runtime_name) {
+                return Err(CreateAgentRuntimeErrorModeled::ConflictException(
+                    ConflictException {
+                        message: Some(format!(
+                            "an agent runtime named {} already exists (agentRuntimeId \
+                             {existing})",
+                            input.agent_runtime_name
+                        )),
+                    },
+                )
+                .into());
+            }
 
-        // The store this request would grow is bounded, so a caller looping on
-        // create meets the modelled quota instead of this process's memory limit.
-        if store.agent_runtimes.len() >= crate::state::MAX_AGENT_RUNTIMES {
-            return Err(CreateAgentRuntimeErrorModeled::ServiceQuotaExceededException(
-                ServiceQuotaExceededException {
-                    message: Some(format!(
-                        "this account already holds the maximum of {} agent runtimes",
-                        crate::state::MAX_AGENT_RUNTIMES
-                    )),
-                },
-            )
-            .into());
-        }
+            // The store this request would grow is bounded, so a caller looping on
+            // create meets the modelled quota instead of this process's memory limit.
+            if store.agent_runtimes.len() >= crate::state::MAX_AGENT_RUNTIMES {
+                return Err(CreateAgentRuntimeErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: Some(format!(
+                            "this account already holds the maximum of {} agent runtimes",
+                            crate::state::MAX_AGENT_RUNTIMES
+                        )),
+                    },
+                )
+                .into());
+            }
 
-        let agent_runtime_id = store.mint_runtime_id(&input.agent_runtime_name, now);
-        let agent_runtime_arn = crate::state::runtime_arn(&region, &agent_runtime_id);
-        let version = crate::state::AgentRuntimeVersionRecord {
-            version: 1,
-            // A new runtime is created, not ready: the transition to READY is
-            // owed by the clock, not by this call.
-            transient_status: crate::state::STATUS_CREATING.to_string(),
-            settled_status: crate::state::STATUS_READY.to_string(),
-            settles_at: now + crate::state::RUNTIME_SETTLE_DELAY,
-            last_updated_at: now,
-            role_arn: input.role_arn,
-            description: input.description,
-            agent_runtime_artifact: input.agent_runtime_artifact,
-            network_configuration: input.network_configuration,
-            protocol_configuration: input.protocol_configuration,
-            authorizer_configuration: input.authorizer_configuration,
-            request_header_configuration: input.request_header_configuration,
-            // CreateAgentRuntime models no `metadataConfiguration` member; only
-            // UpdateAgentRuntime can set one.
-            metadata_configuration: None,
-            lifecycle_configuration: crate::state::effective_lifecycle_configuration(
-                input.lifecycle_configuration,
-            ),
-            environment_variables: crate::state::sorted_map(input.environment_variables),
-            filesystem_configurations: input.filesystem_configurations.unwrap_or_default(),
-            capacity_provider_configuration: input.capacity_provider_configuration,
-            platform_version: input.platform_version,
-            failure_reason: None,
-        };
-        let output = CreateAgentRuntimeOutput {
-            agent_runtime_arn: agent_runtime_arn.clone(),
-            workload_identity_details: Some(WorkloadIdentityDetails {
-                workload_identity_arn: crate::state::workload_identity_arn(
-                    &region,
-                    &agent_runtime_id,
+            let agent_runtime_id = store.mint_runtime_id(&input.agent_runtime_name, now);
+            let agent_runtime_arn = crate::state::runtime_arn(&region, &agent_runtime_id);
+            let version = crate::state::AgentRuntimeVersionRecord {
+                version: 1,
+                // A new runtime is created, not ready: the transition to READY is
+                // owed by the clock, not by this call.
+                transient_status: crate::state::STATUS_CREATING.to_string(),
+                settled_status: crate::state::STATUS_READY.to_string(),
+                settles_at: now + crate::state::RUNTIME_SETTLE_DELAY,
+                last_updated_at: now,
+                role_arn: input.role_arn,
+                description: input.description,
+                agent_runtime_artifact: input.agent_runtime_artifact,
+                network_configuration: input.network_configuration,
+                protocol_configuration: input.protocol_configuration,
+                authorizer_configuration: input.authorizer_configuration,
+                request_header_configuration: input.request_header_configuration,
+                // CreateAgentRuntime models no `metadataConfiguration` member; only
+                // UpdateAgentRuntime can set one.
+                metadata_configuration: None,
+                lifecycle_configuration: crate::state::effective_lifecycle_configuration(
+                    input.lifecycle_configuration,
                 ),
-            }),
-            agent_runtime_id: agent_runtime_id.clone(),
-            agent_runtime_version: version.version_string(),
-            created_at: crate::state::timestamp(now),
-            status: version.status_at(now).to_string(),
-        };
-        let record = crate::state::AgentRuntimeRecord {
-            agent_runtime_id: agent_runtime_id.clone(),
-            agent_runtime_arn,
-            agent_runtime_name: input.agent_runtime_name.clone(),
-            created_at: now,
-            latest_version: version.version,
-            highest_version_published: version.version,
-            versions: [(version.version, version)].into_iter().collect(),
-            // A runtime is created with no endpoints: each one is its own
-            // `CreateAgentRuntimeEndpoint` call.
-            endpoints: Default::default(),
-            tags: crate::state::sorted_map(input.tags),
-            workload_identity_details: output.workload_identity_details.clone(),
+                environment_variables: crate::state::sorted_map(input.environment_variables),
+                filesystem_configurations: input.filesystem_configurations.unwrap_or_default(),
+                capacity_provider_configuration: input.capacity_provider_configuration,
+                platform_version: input.platform_version,
+                failure_reason: None,
+            };
+            let output = CreateAgentRuntimeOutput {
+                agent_runtime_arn: agent_runtime_arn.clone(),
+                workload_identity_details: Some(WorkloadIdentityDetails {
+                    workload_identity_arn: crate::state::workload_identity_arn(
+                        &region,
+                        &agent_runtime_id,
+                    ),
+                }),
+                agent_runtime_id: agent_runtime_id.clone(),
+                agent_runtime_version: version.version_string(),
+                created_at: crate::state::timestamp(now),
+                status: version.status_at(now).to_string(),
+            };
+            let record = crate::state::AgentRuntimeRecord {
+                agent_runtime_id: agent_runtime_id.clone(),
+                agent_runtime_arn,
+                agent_runtime_name: input.agent_runtime_name.clone(),
+                created_at: now,
+                latest_version: version.version,
+                highest_version_published: version.version,
+                versions: [(version.version, version)].into_iter().collect(),
+                // A runtime is created with no endpoints: each one is its own
+                // `CreateAgentRuntimeEndpoint` call.
+                endpoints: Default::default(),
+                tags: crate::state::sorted_map(input.tags),
+                workload_identity_details: output.workload_identity_details.clone(),
+            };
+
+            store
+                .runtime_names
+                .insert(input.agent_runtime_name, agent_runtime_id.clone());
+            store.remember_client_token(Self::NAME, input.client_token, &agent_runtime_id, 1);
+            store
+                .agent_runtimes
+                .insert(agent_runtime_id.clone(), record);
+            output
         };
 
-        store
-            .runtime_names
-            .insert(input.agent_runtime_name, agent_runtime_id.clone());
-        store.remember_client_token(Self::NAME, input.client_token, &agent_runtime_id, 1);
-        store.agent_runtimes.insert(agent_runtime_id, record);
+        // Every refusal this create can answer has been decided and the name, the id
+        // and the record are all written, so what follows vends the logs of a runtime
+        // that EXISTS. A runtime's logs are this service's to vend, so the group they
+        // land in — the one a client derives from the `agentRuntimeId` this call
+        // answers with — exists from the create onward, and it is the account's from
+        // then on: nothing in this service deletes it.
+        crate::state::vend_runtime_log_group(ctx, &region, &output.agent_runtime_id).await;
 
         Ok(output)
     }

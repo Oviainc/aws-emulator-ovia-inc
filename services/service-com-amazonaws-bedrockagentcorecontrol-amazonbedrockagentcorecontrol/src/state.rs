@@ -1721,7 +1721,13 @@ pub mod memory_strategies;
 /// [`ComAmazonawsBedrockagentcorecontrolAmazonbedrockagentcorecontrolState`], which a
 /// handler reaches through the struct exactly as before.
 mod store;
+/// The CloudWatch Logs group this service vends for an agent runtime: the name it is
+/// derived under and the create that provisions it. Re-exported, so a handler names
+/// `crate::state::…` for it exactly as it does for the object-storage and IAM
+/// resolutions beside it.
+pub mod runtime_logs;
 pub use memory_strategies::*;
+pub use runtime_logs::*;
 
 /// The AgentCore Runtime environment a harness runs in, for a harness whose id
 /// is `harness_id` in `region`.
