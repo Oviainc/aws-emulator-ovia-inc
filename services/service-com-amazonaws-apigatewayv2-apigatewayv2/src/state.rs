@@ -3692,6 +3692,13 @@ pub mod portal_products;
 
 pub use portal_products::*;
 
+/// Whether the REST endpoint a product REST endpoint page documents resolves at all is a
+/// question for the service that OWNS REST APIs, so it is asked there, in
+/// [`rest_endpoint`] — re-exported in full, like every other part of this module.
+pub mod rest_endpoint;
+
+pub use rest_endpoint::*;
+
 /// A persisted `VpcLink` resource, owned by the account and Region rather than by an
 /// api.
 #[derive(Debug, Clone)]

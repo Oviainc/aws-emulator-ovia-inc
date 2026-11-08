@@ -3,9 +3,9 @@
 //! @op CreateProductRestEndpointPage
 //! IMPLEMENTED: mints a `ProductRestEndpointPageId` under the portal product the URI
 //! names, resolves the page's display content from the request's overrides and the REST
-//! endpoint it identifies, persists a [`crate::state::ProductRestEndpointPage`] record
-//! under that product and answers 201 with the stored page. This is the ONLY file to
-//! touch for this operation.
+//! endpoint it identifies, starts the generation of the page's content from that endpoint,
+//! persists a [`crate::state::ProductRestEndpointPage`] record under that product and
+//! answers 201 with the stored page. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -198,6 +198,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(bad_request)?;
 
+        // The page's content is generated FROM the REST endpoint it documents, so whether
+        // that generation can succeed is resolved against the service that owns REST APIs
+        // — before this service's own store is locked, which is the lock order every
+        // cross-service question of this crate is asked in.
+        let generation_failure =
+            crate::state::rest_endpoint_generation_failure(&*self.engine, parts);
+
         // `TryItState` is a modelled enum, so the boundary validator refuses a value
         // outside its catalog; a request that names none gets the service's default.
         let try_it_state = input
@@ -260,11 +267,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_modified: ::std::time::SystemTime::now(),
             try_it_state,
             // The page's content is generated from the REST endpoint it documents, which
-            // is not done when this call answers, so the record is due to become
-            // available one span from now: a transition the CLOCK owes, stored as its due
-            // instant rather than slept for.
-            available_at: ::std::time::Instant::now()
+            // is not done when this call answers, so the record is due to settle one span
+            // from now: a transition the CLOCK owes, stored as its due instant rather than
+            // slept for. What it settles IN was resolved above, against the owner of REST
+            // APIs.
+            settles_at: ::std::time::Instant::now()
                 + crate::state::PRODUCT_REST_ENDPOINT_PAGE_CREATE_SPAN,
+            generation_failure,
         };
 
         // `page_id` comes from the product's own id bijection, so it names no existing

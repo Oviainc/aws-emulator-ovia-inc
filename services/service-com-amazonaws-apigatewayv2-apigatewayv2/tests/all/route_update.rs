@@ -582,12 +582,20 @@ async fn an_update_cannot_move_a_route_onto_a_key_another_route_already_holds() 
     }
 }
 
+/// The `RouteKey` of a route API Gateway manages is patched like any other route's, and
+/// the route stays the service's: `UpdateApi$RouteKey` offers the very same change as a
+/// member of the api ("this value replaces the route key of the quick create route"), so
+/// the key is configuration rather than part of the managed route's identity, while
+/// `ApiGatewayManaged` is not an input of `UpdateRoute` at all.
+///
+/// The rows vary the form of the key the managed route is moved onto: a method-and-path
+/// key, a catch-all method key, a greedy path variable, and back onto the `$default`
+/// catch-all it was minted with.
 #[tokio::test]
-async fn the_route_key_of_an_api_gateway_managed_route_cannot_be_changed() {
+async fn the_route_key_of_an_api_gateway_managed_route_is_patched_like_any_other() {
     let emulator = emulator();
 
-    // Quick create mints the `$default` route and manages it: "You can't modify the
-    // $default route key" (`Route$ApiGatewayManaged`).
+    // Quick create mints the `$default` route and manages it.
     let api_id = create_api(
         &emulator,
         "quick create",
@@ -610,31 +618,47 @@ async fn the_route_key_of_an_api_gateway_managed_route_cannot_be_changed() {
         "quick create must mint an API-Gateway-managed route, got {routes}"
     );
     let route_id = as_str(&managed, "routeId");
+    let target = as_str(&managed, "target");
 
-    let (status, body) = update_route(
-        &emulator,
-        &api_id,
-        &route_id,
-        &json!({ "routeKey": "GET /elsewhere" }),
-    )
-    .await;
-    assert_eq!(
-        status, 400,
-        "expected 400 for a key change on a managed route, got {status} {body}"
-    );
-    assert_eq!(
-        error_code(&body),
-        "BadRequestException",
-        "expected BadRequestException, got {body}"
-    );
-    let (_, fetched) = get_route(&emulator, &api_id, &route_id).await;
-    assert_eq!(
-        fetched, managed,
-        "a refused key change must leave the managed route as it was, got {fetched}"
-    );
+    for case in ["ANY /managed", "GET /items", "ANY /{proxy+}", "$default"] {
+        let (status, updated) =
+            update_route(&emulator, &api_id, &route_id, &json!({ "routeKey": case })).await;
+        assert_eq!(
+            status, 201,
+            "case {case:?}: expected 201 moving the managed route onto the key, got \
+             {status} {updated}"
+        );
+        assert_eq!(
+            as_str(&updated, "routeKey"),
+            case,
+            "case {case:?}: expected the patched RouteKey, got {updated}"
+        );
+        assert_eq!(
+            updated.get("apiGatewayManaged"),
+            Some(&json!(true)),
+            "case {case:?}: a patched managed route is still the service's, got {updated}"
+        );
+        assert_eq!(
+            as_str(&updated, "target"),
+            target,
+            "case {case:?}: a key patch leaves the managed route's Target as it was, got \
+             {updated}"
+        );
 
-    // Every other member of a managed route is still patchable, and re-sending the key
-    // it already carries changes nothing.
+        // What the patch reported is what a later read reports, under the same id.
+        let (status, fetched) = get_route(&emulator, &api_id, &route_id).await;
+        assert_eq!(
+            status, 200,
+            "case {case:?}: expected 200 from GetRoute, got {status} {fetched}"
+        );
+        assert_eq!(
+            fetched, updated,
+            "case {case:?}: GetRoute must report the patched managed route, got {fetched}"
+        );
+    }
+
+    // Every other member of a managed route is patchable too, and re-sending the key it
+    // already carries changes nothing.
     let (status, updated) = update_route(
         &emulator,
         &api_id,
@@ -654,7 +678,7 @@ async fn the_route_key_of_an_api_gateway_managed_route_cannot_be_changed() {
     assert_eq!(
         as_str(&updated, "routeKey"),
         "$default",
-        "the managed route keeps its own key, got {updated}"
+        "re-sending the stored key changes nothing, got {updated}"
     );
 }
 

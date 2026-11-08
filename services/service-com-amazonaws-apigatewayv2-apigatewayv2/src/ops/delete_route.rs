@@ -2,8 +2,9 @@
 
 //! @op DeleteRoute
 //! IMPLEMENTED: removes the [`crate::state::Route`] record its api holds under the
-//! requested `RouteId`, together with the route responses that record owns. This is the
-//! ONLY file to touch for this operation.
+//! requested `RouteId`, together with the route responses that record owns — unless that
+//! record is a route API Gateway MANAGES, which this call leaves in place (see `handle`).
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -175,6 +176,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(not_found(crate::state::invalid_identifier_message(
                 crate::state::ROUTE_RESOURCE,
             )));
+        }
+
+        // A route API Gateway MANAGES is the service's own rather than the caller's: it is
+        // minted WITH the api, not asked for, and the api keeps serving it ("If you created
+        // an API using quick create, the $default route is managed by API Gateway",
+        // `Route$ApiGatewayManaged`). So a delete that addresses such a route is accepted —
+        // the same empty success every delete of this service answers — and removes
+        // NOTHING: the managed route stays listed, readable and patchable under the id it
+        // already had, and the api goes on serving the integration quick create wired it
+        // to. Only the delete of the api that owns it takes it away, with the rest of what
+        // quick create minted.
+        //
+        // This is about who OWNS the record, so it is read off the record
+        // (`Route::api_gateway_managed`) rather than off the route's key or the way its api
+        // was created: a managed route whose key a later `UpdateApi`/`UpdateRoute` replaced
+        // is still the service's.
+        if api
+            .routes
+            .get(&input.route_id)
+            .is_some_and(|route| route.api_gateway_managed)
+        {
+            return Ok(DeleteRouteOutput);
         }
 
         // The route OWNS its route responses, so removing the entry is the whole delete:

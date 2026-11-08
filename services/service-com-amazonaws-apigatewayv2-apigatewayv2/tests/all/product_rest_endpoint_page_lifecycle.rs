@@ -13,18 +13,21 @@
 //!   `GetProductRestEndpointPage` reports that same record, member for member.
 //! * **A page's display content is the default API Gateway derives from the identified
 //!   REST endpoint, with each member the request overrode replacing its default**: the
-//!   `Endpoint` defaults to that endpoint's own invoke URL
-//!   (`https://{restApiId}.execute-api.{region}.amazonaws.com/{stage}/{path}`), while
-//!   `Body` and `OperationName` are reported only where the request supplied them, since
-//!   their defaults live in the REST API this emulator does not hold.
+//!   `Endpoint` defaults to the invoke URL of that endpoint's STAGE
+//!   (`https://{restApiId}.execute-api.{region}.amazonaws.com/{stage}`, with neither the
+//!   method nor the endpoint's own path appended), while `Body` and `OperationName` are
+//!   reported only where the request supplied them, since their defaults live in the REST
+//!   API this emulator does not hold.
 //! * **A request that identifies no REST endpoint, or whose `DisplayContent` names
 //!   neither or both of its alternatives, is refused 400** and persists nothing.
 //! * **A page is addressed under its own product**: a product nothing minted is 404, and
 //!   so is a page id nothing minted, a page read under another product, and a read naming
 //!   another account as the resource owner.
 //! * **The page's `Status` is owed by the clock**: a created page is `IN_PROGRESS` while
-//!   its content is being generated and `AVAILABLE` once the span has passed; reading it
-//!   changes nothing a later caller sees.
+//!   its content is being generated and reports what that generation settled in once the
+//!   span has passed; reading it changes nothing a later caller sees. WHICH terminal
+//!   status it settles in follows from the REST endpoint it documents, which is
+//!   `product_rest_endpoint_page_generation`'s subject.
 //! * **`RawDisplayContent` is reported only for a request that asked for it**, and an
 //!   `IncludeRawDisplayContent` that spells no boolean is refused 400.
 //! * **One product holds at most `MAX_PRODUCT_REST_ENDPOINT_PAGES_PER_PRODUCT` pages**,
@@ -82,13 +85,14 @@ pub(crate) async fn product(
     as_str(&created, "portalProductId")
 }
 
-/// The invoke URL of the REST endpoint `identifier parts` name, as API Gateway serves a
-/// REST API: the API's default execute-api host, then the stage, then the endpoint's
-/// path. Written out here rather than taken from the service, so the table asserts the
-/// rule rather than the implementation. The method is not part of a URL.
-pub(crate) fn invoke_url(rest_api_id: &str, stage: &str, path: &str, region: &str) -> String {
-    let path = path.strip_prefix('/').unwrap_or(path);
-    format!("https://{rest_api_id}.execute-api.{region}.amazonaws.com/{stage}/{path}")
+/// The URL a page reports for the REST endpoint its `identifierParts` name: "the URL to
+/// invoke your REST API" (`EndpointDisplayContentResponse$Endpoint`) — the API's default
+/// execute-api host and then the STAGE, which is the base a client calls that API on.
+/// Neither the endpoint's method (not part of a URL at all) nor its path is appended.
+/// Written out here rather than taken from the service, so the table asserts the rule
+/// rather than the implementation.
+pub(crate) fn invoke_url(rest_api_id: &str, stage: &str, region: &str) -> String {
+    format!("https://{rest_api_id}.execute-api.{region}.amazonaws.com/{stage}")
 }
 
 /// One accepted-create row: the request's members, and what the stored page must report.
@@ -138,7 +142,7 @@ fn accepted_rows() -> Vec<Row> {
             }),
             display_content: None,
             try_it_state: None,
-            expected_endpoint: invoke_url("a1b2c3d4e5", "prod", "/orders", REGION),
+            expected_endpoint: invoke_url("a1b2c3d4e5", "prod", REGION),
             expected_body: None,
             expected_operation_name: None,
             // The default of a member the request left out.
@@ -154,7 +158,7 @@ fn accepted_rows() -> Vec<Row> {
             }),
             display_content: Some(json!({ "none": {} })),
             try_it_state: Some("ENABLED"),
-            expected_endpoint: invoke_url("zzz999", "test", "/orders", REGION),
+            expected_endpoint: invoke_url("zzz999", "test", REGION),
             expected_body: None,
             expected_operation_name: None,
             expected_try_it_state: "ENABLED",
@@ -191,7 +195,7 @@ fn accepted_rows() -> Vec<Row> {
             }),
             display_content: Some(json!({ "overrides": { "body": "custom documentation" } })),
             try_it_state: Some("DISABLED"),
-            expected_endpoint: invoke_url("bodyonly01", "beta", "/orders/{orderId}", REGION),
+            expected_endpoint: invoke_url("bodyonly01", "beta", REGION),
             expected_body: Some("custom documentation".to_string()),
             expected_operation_name: None,
             expected_try_it_state: "DISABLED",
@@ -206,7 +210,7 @@ fn accepted_rows() -> Vec<Row> {
             }),
             display_content: Some(json!({ "overrides": { "operationName": "PatchOrders" } })),
             try_it_state: None,
-            expected_endpoint: invoke_url("opnameonly", "gamma", "/orders", REGION),
+            expected_endpoint: invoke_url("opnameonly", "gamma", REGION),
             expected_body: None,
             expected_operation_name: Some("PatchOrders".to_string()),
             expected_try_it_state: "DISABLED",
@@ -221,7 +225,7 @@ fn accepted_rows() -> Vec<Row> {
             }),
             display_content: Some(json!({ "overrides": {} })),
             try_it_state: None,
-            expected_endpoint: invoke_url("emptyover1", "prod", "/health", REGION),
+            expected_endpoint: invoke_url("emptyover1", "prod", REGION),
             expected_body: None,
             expected_operation_name: None,
             expected_try_it_state: "DISABLED",
@@ -236,8 +240,9 @@ fn accepted_rows() -> Vec<Row> {
             }),
             display_content: None,
             try_it_state: None,
-            // One separator between the stage and the path, never two and never none.
-            expected_endpoint: invoke_url("noslash001", "prod", "orders", REGION),
+            // The endpoint's path is no part of the URL the page reports, however it is
+            // written.
+            expected_endpoint: invoke_url("noslash001", "prod", REGION),
             expected_body: None,
             expected_operation_name: None,
             expected_try_it_state: "DISABLED",
@@ -252,7 +257,7 @@ fn accepted_rows() -> Vec<Row> {
             }),
             display_content: None,
             try_it_state: None,
-            expected_endpoint: invoke_url("rootpath01", "prod", "/", REGION),
+            expected_endpoint: invoke_url("rootpath01", "prod", REGION),
             expected_body: None,
             expected_operation_name: None,
             expected_try_it_state: "DISABLED",
@@ -267,12 +272,7 @@ fn accepted_rows() -> Vec<Row> {
             }),
             display_content: None,
             try_it_state: None,
-            expected_endpoint: invoke_url(
-                "deeppath01",
-                "prod",
-                "/accounts/{accountId}/orders/{orderId}/items/{proxy+}",
-                REGION,
-            ),
+            expected_endpoint: invoke_url("deeppath01", "prod", REGION),
             expected_body: None,
             expected_operation_name: None,
             expected_try_it_state: "DISABLED",
@@ -287,7 +287,7 @@ fn accepted_rows() -> Vec<Row> {
             }),
             display_content: None,
             try_it_state: None,
-            expected_endpoint: invoke_url(&max_rest_api_id(), &max_stage(), "/orders", REGION),
+            expected_endpoint: invoke_url(&max_rest_api_id(), &max_stage(), REGION),
             expected_body: None,
             expected_operation_name: None,
             expected_try_it_state: "DISABLED",
@@ -302,7 +302,7 @@ fn accepted_rows() -> Vec<Row> {
             }),
             display_content: Some(json!({ "overrides": { "body": max_body() } })),
             try_it_state: None,
-            expected_endpoint: invoke_url("maxbody001", "prod", "/orders", REGION),
+            expected_endpoint: invoke_url("maxbody001", "prod", REGION),
             expected_body: Some(max_body()),
             expected_operation_name: None,
             expected_try_it_state: "DISABLED",
@@ -319,7 +319,7 @@ fn accepted_rows() -> Vec<Row> {
                 "overrides": { "body": "注文 API — ünïcödé 🎉", "operationName": "注文を取得" }
             })),
             try_it_state: None,
-            expected_endpoint: invoke_url("unicode001", "prod", "/注文", REGION),
+            expected_endpoint: invoke_url("unicode001", "prod", REGION),
             expected_body: Some("注文 API — ünïcödé 🎉".to_string()),
             expected_operation_name: Some("注文を取得".to_string()),
             expected_try_it_state: "DISABLED",
@@ -388,17 +388,21 @@ fn assert_reports_row(row: &Row, reader: &str, document: &Value) {
         row.case
     );
     // `Status` is one of the modelled `AVAILABLE | FAILED | IN_PROGRESS`; which of them a
-    // page reports when is asserted by the clock test below.
+    // page reports when is asserted by the clock test below, and which terminal status it
+    // settles in by `product_rest_endpoint_page_generation`.
     let status = as_str(document, "status");
     assert!(
         ["AVAILABLE", "FAILED", "IN_PROGRESS"].contains(&status.as_str()),
         "case {:?}: expected {reader} to report a modelled Status, got {status:?} {document}",
         row.case
     );
-    // Nothing failed, so there is no status exception to report.
-    assert!(
-        carries_nothing(document, "statusException"),
-        "case {:?}: expected {reader} to report no statusException, got {document}",
+    // "The status exception information" explains the status it is reported beside, so a
+    // page carries one exactly when its content generation FAILED.
+    assert_eq!(
+        !carries_nothing(document, "statusException"),
+        status == "FAILED",
+        "case {:?}: expected {reader} to report a statusException exactly for a FAILED \
+         page, got {document}",
         row.case
     );
 }
@@ -545,7 +549,7 @@ async fn the_derived_endpoint_and_arn_name_the_region_the_request_addressed() {
         let page_id = as_str(&created, "productRestEndpointPageId");
         assert_eq!(
             content_member(&created, "endpoint"),
-            Some(invoke_url("regional01", "prod", "/orders", region)),
+            Some(invoke_url("regional01", "prod", region)),
             "region {region:?}: expected the invoke URL to name that Region, got {created}"
         );
         assert_eq!(
@@ -627,19 +631,6 @@ async fn a_request_that_identifies_no_endpoint_is_refused_and_persists_nothing()
             }),
         ),
         (
-            "a path whose invoke URL would exceed the 1024 an endpoint may carry",
-            json!({
-                "restEndpointIdentifier": {
-                    "identifierParts": {
-                        "restApiId": "longpath01",
-                        "stage": "prod",
-                        "method": "GET",
-                        "path": format!("/{}", "p".repeat(1100))
-                    }
-                }
-            }),
-        ),
-        (
             "an identifier whose parts are incomplete",
             json!({
                 "restEndpointIdentifier": {
@@ -676,6 +667,39 @@ async fn a_request_that_identifies_no_endpoint_is_refused_and_persists_nothing()
             "case {case:?}: expected the request to be refused as invalid, got {code:?} {body}"
         );
     }
+
+    // A derived endpoint is this service's own value rather than one the model bounds at
+    // the boundary, and the Region it names comes from the request's credential scope, so a
+    // request whose invoke URL could not be reported at all is refused rather than answered
+    // with a response the model does not allow (`EndpointDisplayContentResponse$Endpoint`,
+    // len 1..1024).
+    let case = "a Region whose invoke URL would exceed the 1024 an endpoint may carry";
+    let (status, body) = call_in_region(
+        &emulator,
+        &"r".repeat(1100),
+        "POST",
+        &collection,
+        Some(json!({
+            "restEndpointIdentifier": {
+                "identifierParts": {
+                    "restApiId": "longhost01",
+                    "stage": "prod",
+                    "method": "GET",
+                    "path": "/orders"
+                }
+            }
+        })),
+    )
+    .await;
+    assert_eq!(
+        status, 400,
+        "case {case:?}: expected 400 from CreateProductRestEndpointPage, got {status} {body}"
+    );
+    assert_eq!(
+        error_code(&body),
+        "BadRequestException",
+        "case {case:?}: expected BadRequestException, got {body}"
+    );
 
     // Every create above was refused, so the only page this product holds is the one it
     // then accepts: it reads back under the id that create answered, carrying the
@@ -887,7 +911,11 @@ async fn the_page_status_is_owed_by_the_clock_and_reading_it_changes_nothing() {
         "expected the page to still report IN_PROGRESS within its span, got {polled}"
     );
 
-    // Once the span the clock owes has passed, the page is available — and stays so.
+    // Once the span the clock owes has passed, the page reports what its content
+    // generation settled in — and stays there. This page documents an endpoint of a REST
+    // API the account does not hold, so there is nothing to generate its content from and
+    // the generation failed; `product_rest_endpoint_page_generation` drives the other
+    // outcome.
     tokio::time::sleep(SPAN + ::std::time::Duration::from_millis(100)).await;
     let (status, settled) = call(&emulator, "GET", &uri, None).await;
     assert_eq!(
@@ -896,8 +924,8 @@ async fn the_page_status_is_owed_by_the_clock_and_reading_it_changes_nothing() {
     );
     assert_eq!(
         as_str(&settled, "status"),
-        "AVAILABLE",
-        "expected the page to report AVAILABLE once its span has passed, got {settled}"
+        "FAILED",
+        "expected the page to settle once its span has passed, got {settled}"
     );
 
     // A read is a report: a refused read of another page, and a refused create, between

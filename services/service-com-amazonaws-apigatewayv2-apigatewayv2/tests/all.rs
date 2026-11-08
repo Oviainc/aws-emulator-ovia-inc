@@ -169,6 +169,8 @@ mod product_page_lifecycle;
 mod product_page_update;
 #[path = "all/product_rest_endpoint_page_deletion.rs"]
 mod product_rest_endpoint_page_deletion;
+#[path = "all/product_rest_endpoint_page_generation.rs"]
+mod product_rest_endpoint_page_generation;
 #[path = "all/product_rest_endpoint_page_lifecycle.rs"]
 mod product_rest_endpoint_page_lifecycle;
 #[path = "all/product_rest_endpoint_page_update.rs"]

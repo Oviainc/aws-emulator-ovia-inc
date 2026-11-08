@@ -367,11 +367,12 @@ async fn delete_route_removes_the_record_and_a_later_read_reports_not_found() {
 
 /// The `$default` route a quick-created api carries is managed by API Gateway
 /// (`Route$ApiGatewayManaged`: "If you created an API using quick create, the $default
-/// route is managed by API Gateway"). The documented restriction on such a route is that
-/// its key cannot be modified, not that it cannot be removed, so the delete goes through
-/// like any other route's.
+/// route is managed by API Gateway"). Such a route is the SERVICE's, not the caller's: a
+/// `DeleteRoute` that addresses it is accepted with the same empty success every other
+/// delete answers, and removes nothing — the managed route stays listed, readable and
+/// patchable under the id it already had.
 #[tokio::test]
-async fn an_api_gateway_managed_route_is_removed_like_any_other() {
+async fn an_api_gateway_managed_route_outlives_a_delete_that_addresses_it() {
     let emulator = emulator();
 
     let api_id = create_api(
@@ -401,20 +402,32 @@ async fn an_api_gateway_managed_route_is_removed_like_any_other() {
         "expected the quick-created $default route to be managed by API Gateway, got {route}"
     );
 
-    let (status, body) = delete_route(&emulator, &api_id, &managed).await;
-    assert_eq!(
-        status, 204,
-        "expected 204 from DeleteRoute on the managed route, got {status} {body}"
-    );
-    let (status, body) = get_route(&emulator, &api_id, &managed).await;
-    assert_eq!(
-        status, 404,
-        "expected 404 from GetRoute after the delete, got {status} {body}"
-    );
-    assert!(
-        list_route_ids(&emulator, &api_id).await.is_empty(),
-        "expected the api to hold no routes after the delete"
-    );
+    // Twice, so a caller that retries its delete is told the same thing every time and the
+    // route is still there after both.
+    for attempt in 1..=2 {
+        let (status, body) = delete_route(&emulator, &api_id, &managed).await;
+        assert_eq!(
+            status, 204,
+            "attempt {attempt}: expected 204 from DeleteRoute on the managed route, got \
+             {status} {body}"
+        );
+        let (status, after) = get_route(&emulator, &api_id, &managed).await;
+        assert_eq!(
+            status, 200,
+            "attempt {attempt}: expected the managed route to outlive the delete, got \
+             {status} {after}"
+        );
+        assert_eq!(
+            after, route,
+            "attempt {attempt}: a delete that removes nothing must leave the managed route \
+             exactly as it was, got {after}"
+        );
+        assert_eq!(
+            list_route_ids(&emulator, &api_id).await,
+            vec![managed.clone()],
+            "attempt {attempt}: expected the api to still list its managed route"
+        );
+    }
 }
 
 /// A route OWNS its route responses, so the delete takes them with it — and a route

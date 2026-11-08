@@ -493,7 +493,7 @@ async fn the_served_page_is_rendered_from_the_build_the_publish_made() {
         ),
         (
             "a REST endpoint page's invoke URL",
-            "https://restapi0aa.execute-api.eu-west-1.amazonaws.com/prod/orders".to_string(),
+            "https://restapi0aa.execute-api.eu-west-1.amazonaws.com/prod".to_string(),
         ),
         ("each product's ARN", product_arns[0].clone()),
     ];

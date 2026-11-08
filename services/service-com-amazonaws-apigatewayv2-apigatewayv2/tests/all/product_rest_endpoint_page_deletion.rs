@@ -422,7 +422,6 @@ async fn delete_product_rest_endpoint_page_removes_the_record_and_a_later_read_i
             Some(invoke_url(
                 &as_str(&row.parts, "restApiId"),
                 &as_str(&row.parts, "stage"),
-                &as_str(&row.parts, "path"),
                 REGION,
             )),
             "case {:?}: expected the recreated page to report its own derived endpoint, \

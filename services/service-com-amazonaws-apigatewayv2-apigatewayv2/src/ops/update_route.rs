@@ -268,18 +268,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // later caller can still see through `GetRoute`.
         let mut updated = existing.clone();
         if let Some(route_key) = input.route_key {
-            // "If you created an API using quick create, the $default route is managed
-            // by API Gateway. You can't modify the $default route key"
-            // (`Route$ApiGatewayManaged`), so a managed route keeps the key the service
-            // gave it. Re-sending the key it already carries changes nothing and is
-            // accepted.
-            if updated.api_gateway_managed && route_key != updated.route_key {
-                return Err(bad_request(&format!(
-                    "The RouteKey of a route managed by API Gateway cannot be changed; \
-                     this route's RouteKey is {}",
-                    updated.route_key
-                )));
-            }
+            // The `RouteKey` of a route API Gateway manages is patched like any other
+            // route's, and the route stays the service's: the api that owns it offers the
+            // very same change as a member of its own ("this value replaces the route key
+            // of the quick create route", `UpdateApi$RouteKey`), so the key a managed route
+            // carries is configuration rather than part of its identity. What stays fixed
+            // is WHO the route belongs to: `ApiGatewayManaged` is not an input of this
+            // operation, so a patched managed route is still reported as managed.
             updated.route_key = route_key;
         }
         if let Some(target) = input.target {

@@ -398,14 +398,19 @@ pub const STATUS_IN_PROGRESS: &str = "IN_PROGRESS";
 /// `STATUS_VALUES`.
 pub const STATUS_AVAILABLE: &str = "AVAILABLE";
 
-/// How long a created product REST endpoint page reports [`STATUS_IN_PROGRESS`] before
-/// it reports [`STATUS_AVAILABLE`]: the page's content is generated from the REST
-/// endpoint it documents, which is not done when the create call answers — the reason
-/// the modelled response carries a `Status` and a `StatusException` at all.
+/// The `Status` a resource carries when the service could not assemble it, from
+/// `STATUS_VALUES`. It is the status the modelled `StatusException` explains.
+pub const STATUS_FAILED: &str = "FAILED";
+
+/// How long a product REST endpoint page reports [`STATUS_IN_PROGRESS`] after a write that
+/// generates its content, before it reports the status that generation settled in: the
+/// page's content is generated from the REST endpoint it documents, which is not done when
+/// the call answers — the reason the modelled response carries a `Status` and a
+/// `StatusException` at all.
 ///
 /// AWS documents no duration for it, so this span is the emulator's own, chosen short
 /// enough not to slow a caller down and long enough that a caller reading straight after
-/// the create still observes the transient status. It is the span
+/// the write still observes the transient status. It is the span
 /// [`VPC_LINK_CREATE_SPAN`] uses for the same kind of transition.
 pub const PRODUCT_REST_ENDPOINT_PAGE_CREATE_SPAN: Duration = Duration::from_millis(500);
 
@@ -481,20 +486,19 @@ pub fn rest_endpoint_identifier_parts(
     }
 }
 
-/// The URL a consumer invokes the REST endpoint a page documents on.
+/// The URL a consumer invokes the REST API a page documents on.
 ///
-/// A REST endpoint is identified by its REST API, stage, method and path
-/// (`IdentifierParts`), and API Gateway serves it on that API's default execute-api
-/// endpoint under the stage and the path — the host
-/// `{api-id}.execute-api.{region}.amazonaws.com` [`execute_api_endpoint`] builds for
-/// every api of this service. The method is not part of a URL, so it does not appear
-/// here.
+/// "The URL to invoke your REST API" (`EndpointDisplayContentResponse$Endpoint`): what a
+/// page reports is the INVOKE URL OF THE STAGE — the API's default execute-api endpoint,
+/// the host `{api-id}.execute-api.{region}.amazonaws.com` [`execute_api_endpoint`] builds
+/// for every api, followed by the stage the endpoint is deployed to. The remaining parts of
+/// an `IdentifierParts` select WHICH endpoint of that API the page documents rather than
+/// where the API is served: neither the method (which is not part of a URL at all) nor the
+/// endpoint's own `Path` is appended, so what is reported is the base a client calls the
+/// API on, as every portal page of one stage reports the same base.
 pub fn rest_endpoint_invoke_url(parts: &wire::IdentifierParts, region: &str) -> String {
-    // The path is written with a leading separator (`/orders`), and the stage already
-    // contributes one, so a leading separator is dropped rather than doubled.
-    let path = parts.path.strip_prefix('/').unwrap_or(&parts.path);
     format!(
-        "{}/{}/{path}",
+        "{}/{}",
         execute_api_endpoint(&parts.rest_api_id, region, HTTP_PROTOCOL_TYPE),
         parts.stage
     )
@@ -597,11 +601,20 @@ pub struct ProductRestEndpointPage {
     /// One of `TRY_IT_STATE_VALUES`; [`DEFAULT_TRY_IT_STATE`] for a page whose create
     /// named none.
     pub try_it_state: String,
-    /// When this page's content finishes being generated, after which it reports
-    /// [`STATUS_AVAILABLE`]; before it, [`STATUS_IN_PROGRESS`]. See
-    /// [`ProductRestEndpointPage::status`] and
+    /// When the generation of this page's content — started by the write that stored this
+    /// record — comes due, after which the page reports the status that generation settled
+    /// in; before it, [`STATUS_IN_PROGRESS`]. See [`ProductRestEndpointPage::status`] and
     /// [`PRODUCT_REST_ENDPOINT_PAGE_CREATE_SPAN`].
-    pub available_at: Instant,
+    pub settles_at: Instant,
+    /// Why that generation cannot succeed, resolved at the WRITE that started it against
+    /// the service that owns the REST API this page documents
+    /// ([`rest_endpoint_generation_failure`]), or `None` when the identified endpoint
+    /// resolved.
+    ///
+    /// Decided once, by the write, rather than per read: the page reports what the
+    /// generation this record's writer started ended in, so two readers never disagree and
+    /// a read asks nothing of anybody.
+    pub generation_failure: Option<wire::StatusException>,
 }
 
 /// The members `CreateProductRestEndpointPage`, `GetProductRestEndpointPage` and
@@ -624,18 +637,34 @@ pub struct ProductRestEndpointPageView {
 impl ProductRestEndpointPage {
     /// The `Status` this page reports now.
     ///
-    /// A created page's content is still being generated when the create call answers, so
+    /// A page's content is still being generated when the write that started it answers, so
     /// it is reported [`STATUS_IN_PROGRESS`] until
-    /// [`PRODUCT_REST_ENDPOINT_PAGE_CREATE_SPAN`] has passed and [`STATUS_AVAILABLE`]
-    /// after it. The transition is one the CLOCK owes, materialised from the stored due
-    /// instant rather than by sleeping or by being read, so every reader agrees on it and
-    /// a read changes nothing.
+    /// [`PRODUCT_REST_ENDPOINT_PAGE_CREATE_SPAN`] has passed. After that it reports what
+    /// that generation settled in: [`STATUS_AVAILABLE`] for a page whose REST endpoint
+    /// resolved, and [`STATUS_FAILED`] for one whose endpoint it could not be generated
+    /// from ([`ProductRestEndpointPage::generation_failure`]). The transition is one the
+    /// CLOCK owes, materialised from the stored due instant rather than by sleeping or by
+    /// being read, so every reader agrees on it and a read changes nothing.
     pub fn status(&self) -> &'static str {
-        if Instant::now() < self.available_at {
+        if Instant::now() < self.settles_at {
             STATUS_IN_PROGRESS
+        } else if self.generation_failure.is_some() {
+            STATUS_FAILED
         } else {
             STATUS_AVAILABLE
         }
+    }
+
+    /// Start the generation of this page's content, as of `now`: it comes due one
+    /// [`PRODUCT_REST_ENDPOINT_PAGE_CREATE_SPAN`] from here and settles in what `failure`
+    /// says — `None` for an endpoint that resolved, the exception to report otherwise.
+    ///
+    /// This is how a write that REWRITES an existing record starts it over (the update);
+    /// the create sets these same two fields as it constructs the record it stores, since
+    /// there is no earlier generation there to replace.
+    pub fn start_generation(&mut self, now: Instant, failure: Option<wire::StatusException>) {
+        self.settles_at = now + PRODUCT_REST_ENDPOINT_PAGE_CREATE_SPAN;
+        self.generation_failure = failure;
     }
 
     /// The page's content as it was supplied, for the reader that asks for it
@@ -649,17 +678,23 @@ impl ProductRestEndpointPage {
 
     /// Project the record onto the members every page reader reports.
     pub fn to_wire(&self) -> ProductRestEndpointPageView {
+        let status = self.status();
         ProductRestEndpointPageView {
             display_content: Some(self.display_content.clone()),
             last_modified: Some(to_timestamp(self.last_modified)),
             product_rest_endpoint_page_arn: Some(self.product_rest_endpoint_page_arn.clone()),
             product_rest_endpoint_page_id: Some(self.product_rest_endpoint_page_id.clone()),
             rest_endpoint_identifier: Some(self.rest_endpoint_identifier.clone()),
-            status: Some(self.status().to_string()),
+            status: Some(status.to_string()),
             // "The status exception information" reports what went WRONG with a page the
-            // service could not assemble (`Status` `FAILED`). Nothing failed here, so
-            // there is no exception to report rather than an empty one.
-            status_exception: None,
+            // service could not assemble, so it is reported with the status it explains and
+            // with no other: a page whose generation is still in flight has not failed yet,
+            // and one that settled available has nothing to explain.
+            status_exception: if status == STATUS_FAILED {
+                self.generation_failure.clone()
+            } else {
+                None
+            },
             try_it_state: Some(self.try_it_state.clone()),
         }
     }

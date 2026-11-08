@@ -3,8 +3,9 @@
 //! @op UpdateProductRestEndpointPage
 //! IMPLEMENTED: patches the stored [`crate::state::ProductRestEndpointPage`] the URI
 //! names — a member the request carries replaces the stored one, a member it omits leaves
-//! the stored value alone — and answers 200 with the stored page. This is the ONLY file to
-//! touch for this operation.
+//! the stored value alone — re-generates the page's content from the REST endpoint it
+//! documents, and answers 200 with the stored page. This is the ONLY file to touch for this
+//! operation.
 //!
 //! ## Shape of an operation
 //!
@@ -182,6 +183,35 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ));
         };
 
+        // An update RE-GENERATES the page's content, so whether that generation can succeed
+        // is resolved against the service that owns the REST API this page documents —
+        // asked, like every cross-service question of this crate, BEFORE this service's own
+        // store lock is taken. The identifier it is asked about belongs to the STORED page
+        // (it is not an input of this operation), so the record is read for it here and
+        // patched under the lock below; a page the store does not hold is answered there,
+        // where every other refusal of this operation is. A page deleted between the two
+        // locks is therefore still refused as absent, and one recreated between them under
+        // the same id only decides which generation outcome this patch records.
+        let identified = {
+            let store = state.lock();
+            store
+                .portal_products
+                .get(&input.portal_product_id)
+                .and_then(|product| {
+                    product
+                        .product_rest_endpoint_pages
+                        .get(&input.product_rest_endpoint_page_id)
+                })
+                .map(|page| page.rest_endpoint_identifier.clone())
+        };
+        let generation_failure = match identified
+            .as_ref()
+            .and_then(|identifier| crate::state::rest_endpoint_identifier_parts(identifier).ok())
+        {
+            Some(parts) => crate::state::rest_endpoint_generation_failure(&*self.engine, parts),
+            None => ::std::option::Option::None,
+        };
+
         let mut store = state.lock();
 
         // A page is addressed UNDER its product
@@ -247,8 +277,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "The timestamp when the product REST endpoint page was last modified" — it
         // advances only when this request carried a member to apply, so a patch that
         // configures nothing is not recorded as a modification of the record.
+        //
+        // A patch that DID rewrite the record has the page's content generated again from
+        // the REST endpoint it documents, so the page reports `IN_PROGRESS` until that
+        // generation comes due and then the status it settles in: a client that waits for
+        // the re-generation to clear observes it, exactly as it does after the create.
         if modified {
             updated.last_modified = ::std::time::SystemTime::now();
+            updated.start_generation(::std::time::Instant::now(), generation_failure);
         }
 
         // Write the patched record back where it was, then report what the STORE now

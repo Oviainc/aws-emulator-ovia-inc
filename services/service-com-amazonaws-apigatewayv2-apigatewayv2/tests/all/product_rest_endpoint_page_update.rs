@@ -113,9 +113,9 @@ impl Row {
     /// else the invoke URL of the endpoint it documents, in the Region the page was
     /// created in.
     fn endpoint(&self) -> String {
-        self.expected_endpoint.clone().unwrap_or_else(|| {
-            invoke_url(&self.rest_api_id, &self.stage, self.path, REGION)
-        })
+        self.expected_endpoint
+            .clone()
+            .unwrap_or_else(|| invoke_url(&self.rest_api_id, &self.stage, REGION))
     }
 }
 
@@ -439,16 +439,19 @@ async fn a_patch_replaces_the_members_it_carries_and_leaves_the_others_as_they_w
             row.expected_try_it_state
         );
 
-        // Nothing failed, so there is no status exception to report.
-        assert!(
-            carries_nothing(&patched, "statusException"),
-            "case {:?}: expected the patched page to report no statusException, got {patched}",
+        // A patch re-generates the page's content, so the page is back to IN_PROGRESS
+        // until that generation comes due — and a status still in flight has nothing to
+        // explain, so it carries no status exception.
+        let status_value = as_str(&patched, "status");
+        assert_eq!(
+            status_value, "IN_PROGRESS",
+            "case {:?}: expected the patched page to report IN_PROGRESS, got {patched}",
             row.case
         );
-        let status_value = as_str(&patched, "status");
         assert!(
-            ["AVAILABLE", "FAILED", "IN_PROGRESS"].contains(&status_value.as_str()),
-            "case {:?}: expected a modelled Status, got {status_value:?} {patched}",
+            carries_nothing(&patched, "statusException"),
+            "case {:?}: expected a page whose generation is in flight to report no \
+             statusException, got {patched}",
             row.case
         );
 
@@ -684,7 +687,7 @@ async fn the_re_derived_endpoint_names_the_region_the_page_was_created_in() {
         );
         assert_eq!(
             content_member(&patched, "endpoint"),
-            Some(invoke_url("regional02", "prod", "/orders", home)),
+            Some(invoke_url("regional02", "prod", home)),
             "case {case:?}: expected the re-derived invoke URL to name the page's own \
              Region, got {patched}"
         );
