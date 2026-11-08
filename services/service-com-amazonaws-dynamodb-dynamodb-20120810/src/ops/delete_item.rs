@@ -375,6 +375,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ) {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
+            // The item is stored ENCRYPTED under the table's KMS key, so a key KMS will
+            // not use leaves nothing this delete could read its condition against: the
+            // KMS fault is reported and NOTHING is removed
+            // ([`crate::state::check_table_key_accessible`]).
+            crate::state::check_table_key_accessible(&*self.engine, table).map_err(lift)?;
             table.key_of_key_map(&input.key).map_err(lift)?
         };
         // The condition is read against the item this delete would remove, which is

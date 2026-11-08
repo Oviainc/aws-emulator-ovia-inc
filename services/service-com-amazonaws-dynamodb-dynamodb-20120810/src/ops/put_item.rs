@@ -445,6 +445,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ) {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
+            // The item would be stored ENCRYPTED under the table's KMS key, so a key KMS
+            // will not use leaves nothing this write could be encrypted with: the KMS
+            // fault is reported and NOTHING is written
+            // ([`crate::state::check_table_key_accessible`]).
+            crate::state::check_table_key_accessible(&*self.engine, table).map_err(lift)?;
             // The key attributes are bounded by the documented key-value limits, for
             // this table's own key schema (inside `key_of_item`) and for every index
             // key the item would be projected into — which is also where an index key

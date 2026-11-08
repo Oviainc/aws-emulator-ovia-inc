@@ -257,6 +257,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (request, statement) in input.statements.iter().zip(parsed) {
             let served = statement.map_err(SlotFailure::from).and_then(|statement| {
                 run_slot(
+                    &*self.engine,
                     &mut store,
                     &caller,
                     &region,
@@ -420,7 +421,12 @@ impl From<crate::state::RequestError> for SlotFailure {
 type SlotOutcome = (BatchStatementResponse, Option<ConsumedCapacity>);
 
 /// Serve one statement of the batch.
-fn run_slot(
+// One parameter per piece of request context this slot is served against, as
+// `write_transaction` in `execute_transaction` takes them; grouping them would only move
+// the same list behind a struct built at the one call site.
+#[allow(clippy::too_many_arguments)]
+fn run_slot<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+    engine: &Eng,
     store: &mut Store,
     caller: &crate::state::authorization::Caller,
     region: &str,
@@ -446,6 +452,12 @@ fn run_slot(
         ) {
             return Err(SlotFailure::new(ACCESS_DENIED_CODE, denial).at(&name));
         }
+        // The items are stored ENCRYPTED under the table's KMS key, so a key KMS will
+        // not use leaves nothing this statement could read or encrypt: this slot reports
+        // the KMS fault and writes NOTHING
+        // ([`crate::state::check_table_key_accessible`]).
+        crate::state::check_table_key_accessible(engine, table)
+            .map_err(|error| SlotFailure::from(error).at(&name))?;
     }
     let return_old_on_failure =
         request.return_values_on_condition_check_failure.as_deref() == Some("ALL_OLD");

@@ -341,6 +341,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         if reads == parsed.len() {
             return read_transaction(
+                &*self.engine,
                 &mut store,
                 &caller,
                 &region,
@@ -350,6 +351,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         let answered = write_transaction(
+            &*self.engine,
             &mut store,
             &caller,
             &region,
@@ -450,7 +452,8 @@ fn canonical_statements(entries: &[ParameterizedStatement]) -> String {
 
 /// A READ transaction: each `SELECT` reports the ONE item it addresses, and the store is
 /// not written at all.
-fn read_transaction(
+fn read_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+    engine: &Eng,
     store: &mut Store,
     caller: &crate::state::authorization::Caller,
     region: &str,
@@ -488,6 +491,10 @@ fn read_transaction(
         ) {
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
+        // The items are stored ENCRYPTED under the table's KMS key, so a key KMS will
+        // not use leaves nothing this statement could decrypt — and a transaction is
+        // served whole or not at all ([`crate::state::check_table_key_accessible`]).
+        crate::state::check_table_key_accessible(engine, table).map_err(lift)?;
         if select.index.is_some() {
             return Err(crate::scaffolded::Scaffolded::validation(
                 SINGLE_ITEM_READ_MESSAGE,
@@ -580,7 +587,8 @@ fn read_transaction(
 /// A WRITE transaction: every statement resolved and read against the state as it stood
 /// BEFORE the transaction, then applied all-or-nothing.
 #[allow(clippy::too_many_arguments)]
-fn write_transaction(
+fn write_transaction<Eng: ::std::marker::Send + ::std::marker::Sync + 'static>(
+    engine: &Eng,
     store: &mut Store,
     caller: &crate::state::authorization::Caller,
     region: &str,
@@ -619,6 +627,11 @@ fn write_transaction(
             ) {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
+            // The items are stored ENCRYPTED under the table's KMS key, so a key KMS
+            // will not use leaves nothing this statement could read or encrypt — and a
+            // transaction is served whole or not at all, so NOTHING is written
+            // ([`crate::state::check_table_key_accessible`]).
+            crate::state::check_table_key_accessible(engine, table).map_err(lift)?;
         }
         let prepared = match statement {
             // Guarded by the read/write split above; stated so this match names every

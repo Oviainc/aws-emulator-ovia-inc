@@ -507,6 +507,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ) {
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
+        // The items are stored ENCRYPTED under the table's KMS key, so a key KMS will not
+        // use leaves nothing this query could decrypt: the KMS fault is reported rather
+        // than a page of items ([`crate::state::check_table_key_accessible`]).
+        crate::state::check_table_key_accessible(&*self.engine, table).map_err(lift)?;
         // Which index this query reads, with the refusals that resolution carries: a
         // name the table declares no index for, a strongly consistent read of a global
         // one, and a read of every attribute from an index that does not project them

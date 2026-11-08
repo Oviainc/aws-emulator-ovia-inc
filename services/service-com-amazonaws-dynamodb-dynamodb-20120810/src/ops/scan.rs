@@ -481,6 +481,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(denial) = crate::state::policy_denial(&caller, table, "dynamodb:Scan", now) {
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
+        // The items are stored ENCRYPTED under the table's KMS key, so a key KMS will not
+        // use leaves nothing this scan could decrypt: the KMS fault is reported rather
+        // than a page of items ([`crate::state::check_table_key_accessible`]).
+        crate::state::check_table_key_accessible(&*self.engine, table).map_err(lift)?;
         // Which index this scan reads, with the two refusals that resolution carries —
         // all three facts of the request, decided before anything is read
         // ([`crate::state::resolve_index`]).

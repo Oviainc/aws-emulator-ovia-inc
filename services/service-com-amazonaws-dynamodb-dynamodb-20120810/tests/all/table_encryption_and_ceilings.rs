@@ -28,13 +28,10 @@
 //! The KMS service is mounted beside DynamoDB over ONE shared engine, because the key ARN
 //! a table reports is that service's answer — the same assembly `core/router` performs.
 
-use std::sync::Arc;
-
 use serde_json::{json, Value};
-use service_com_amazonaws_dynamodb_dynamodb_20120810::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
-use crate::emulator::{call_in, error_code, ok_in, REGION};
+use crate::emulator::{call_in, emulator_with_kms, error_code, ok_in, ok_kms, ok_kms_in, REGION};
 
 /// Wait out one transient span, so whatever the clock owes a table is due.
 async fn settle() {
@@ -43,70 +40,6 @@ async fn settle() {
             + std::time::Duration::from_millis(150),
     )
     .await;
-}
-
-/// One emulator holding DynamoDB and KMS over one shared engine: a table's encryption key
-/// is a KMS resource, so the service that owns it answers for it here exactly as it does
-/// in the assembled emulator.
-fn emulator_with_kms() -> MultiServiceRouter {
-    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
-    let mut router = MultiServiceRouter::new();
-    router.set_request_authentication(false);
-    router.register_service(EmulatedService::new(Arc::clone(&engine)));
-    router.register_service(
-        service_com_amazonaws_kms_trentservice::EmulatedService::new(engine),
-    );
-    router
-}
-
-/// Call one KMS operation in `region`. KMS signs as `kms` and names its operations under
-/// its own `X-Amz-Target` prefix, which is the whole of what tells the two services apart.
-async fn call_kms_in(
-    router: &MultiServiceRouter,
-    region: &str,
-    operation: &str,
-    body: Value,
-) -> (u16, Value) {
-    let request = http::Request::builder()
-        .method("POST")
-        .uri(format!("https://kms.{region}.amazonaws.com/"))
-        .header("content-type", "application/x-amz-json-1.1")
-        .header("x-amz-target", format!("TrentService.{operation}"))
-        .header(
-            "authorization",
-            format!(
-                "AWS4-HMAC-SHA256 Credential=AKIDTEST/20260101/{region}/kms/aws4_request, \
-                 SignedHeaders=host;x-amz-target, Signature=0000"
-            ),
-        )
-        .body(bytes::Bytes::from(
-            serde_json::to_vec(&body).expect("the request body serializes"),
-        ))
-        .expect("a well-formed request");
-    let response = router.dispatch(request).await;
-    let status = response.status().as_u16();
-    let parsed = serde_json::from_slice(response.body()).unwrap_or(Value::Null);
-    (status, parsed)
-}
-
-/// One KMS operation in `region` that must succeed, answering its parsed body.
-async fn kms_ok_in(
-    router: &MultiServiceRouter,
-    region: &str,
-    operation: &str,
-    body: Value,
-) -> Value {
-    let (status, parsed) = call_kms_in(router, region, operation, body.clone()).await;
-    assert_eq!(
-        status, 200,
-        "case KMS {operation} in {region} {body}: expected HTTP 200, got {status} with {parsed}"
-    );
-    parsed
-}
-
-/// [`kms_ok_in`] in [`REGION`], for a case that is not about Regions.
-async fn kms_ok(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
-    kms_ok_in(router, REGION, operation, body).await
 }
 
 /// One table in `billing_mode`, created in [`REGION`] with the members `extra` adds.
@@ -150,7 +83,7 @@ async fn an_sse_specification_reports_the_key_arn_kms_resolved_it_to() {
     let router = emulator_with_kms();
     // A customer managed key and an alias for it, so the rows below can name one key in
     // every form KMS accepts.
-    let key = kms_ok(&router, "CreateKey", json!({})).await;
+    let key = ok_kms(&router, "CreateKey", json!({})).await;
     let key_id = key["KeyMetadata"]["KeyId"]
         .as_str()
         .unwrap_or_default()
@@ -163,7 +96,7 @@ async fn an_sse_specification_reports_the_key_arn_kms_resolved_it_to() {
         !key_id.is_empty() && !key_arn.is_empty(),
         "case the key: KMS must mint a key to name, got {key}"
     );
-    kms_ok(
+    ok_kms(
         &router,
         "CreateAlias",
         json!({"AliasName": "alias/orders-table", "TargetKeyId": key_id}),
@@ -173,7 +106,7 @@ async fn an_sse_specification_reports_the_key_arn_kms_resolved_it_to() {
         service_com_amazonaws_kms_trentservice::state::alias_arn(REGION, "alias/orders-table");
     // The default DynamoDB key is a predefined Amazon Web Services alias: KMS associates
     // it with a managed key, and that key's ARN is what a table naming no key reports.
-    let default_key = kms_ok(
+    let default_key = ok_kms(
         &router,
         "DescribeKey",
         json!({"KeyId": "alias/aws/dynamodb"}),
@@ -282,7 +215,7 @@ async fn an_sse_specification_reports_the_key_arn_kms_resolved_it_to() {
 #[tokio::test]
 async fn an_sse_specification_at_create_is_in_force_from_the_table_s_first_instant() {
     let router = emulator_with_kms();
-    let key = kms_ok(&router, "CreateKey", json!({})).await;
+    let key = ok_kms(&router, "CreateKey", json!({})).await;
     let key_arn = key["KeyMetadata"]["Arn"]
         .as_str()
         .unwrap_or_default()
@@ -304,7 +237,7 @@ async fn an_sse_specification_at_create_is_in_force_from_the_table_s_first_insta
         json!({"SSESpecification": {"Enabled": true}}),
     )
     .await;
-    let default_arn = kms_ok(
+    let default_arn = ok_kms(
         &router,
         "DescribeKey",
         json!({"KeyId": "alias/aws/dynamodb"}),
@@ -407,7 +340,7 @@ async fn a_replica_s_kms_key_is_resolved_and_in_force_in_its_own_region() {
     // A KMS key is REGIONAL, and the key a replica is encrypted with is one its own
     // Region's endpoint serves — so this key is created in the Region the replica will
     // live in, not in the Region the table was created in.
-    let key = kms_ok_in(&router, REPLICA_REGION, "CreateKey", json!({})).await;
+    let key = ok_kms_in(&router, REPLICA_REGION, "CreateKey", json!({})).await;
     let key_id = key["KeyMetadata"]["KeyId"]
         .as_str()
         .unwrap_or_default()
@@ -416,7 +349,7 @@ async fn a_replica_s_kms_key_is_resolved_and_in_force_in_its_own_region() {
         .as_str()
         .unwrap_or_default()
         .to_string();
-    kms_ok_in(
+    ok_kms_in(
         &router,
         REPLICA_REGION,
         "CreateAlias",

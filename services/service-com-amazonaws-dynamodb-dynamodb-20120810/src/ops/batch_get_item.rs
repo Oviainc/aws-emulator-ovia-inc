@@ -344,6 +344,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ) {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
+            // The items are stored ENCRYPTED under this table's KMS key, so a key KMS
+            // will not use leaves nothing this batch could decrypt from it: the KMS fault
+            // is reported ([`crate::state::check_table_key_accessible`]).
+            crate::state::check_table_key_accessible(&*self.engine, table).map_err(lift)?;
             let mut found: Vec<crate::state::Item> = Vec::new();
             let mut withheld: Vec<crate::state::Item> = Vec::new();
             for key_map in &requested_keys.keys {

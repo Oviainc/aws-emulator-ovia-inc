@@ -313,6 +313,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ) {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
+            // The items are stored ENCRYPTED under the table's KMS key, so a key KMS will
+            // not use leaves nothing this statement could read or encrypt: the KMS fault
+            // is reported and NOTHING is written
+            // ([`crate::state::check_table_key_accessible`]).
+            crate::state::check_table_key_accessible(&*self.engine, table).map_err(lift)?;
         }
         let answered = match &statement {
             crate::state::PartiqlStatement::Select(select) => {

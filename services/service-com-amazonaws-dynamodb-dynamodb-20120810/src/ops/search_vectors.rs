@@ -290,6 +290,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         {
             return Err(crate::scaffolded::Scaffolded::access_denied(denial));
         }
+        // The items are stored ENCRYPTED under the table's KMS key, so a key KMS will not
+        // use leaves nothing this search could decrypt: the KMS fault is reported rather
+        // than a page of matches ([`crate::state::check_table_key_accessible`]).
+        crate::state::check_table_key_accessible(&*self.engine, table).map_err(lift)?;
         // An `IndexName` the table declares no vector index for is the REQUEST's mistake:
         // the table was found and has no such index, which AWS states over the name the
         // request sent.

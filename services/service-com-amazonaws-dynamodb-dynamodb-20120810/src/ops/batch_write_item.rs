@@ -344,6 +344,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ) {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
+            // The items are stored ENCRYPTED under this table's KMS key, so a key KMS
+            // will not use leaves nothing this batch could encrypt its writes with: the
+            // KMS fault is reported and NOTHING is written
+            // ([`crate::state::check_table_key_accessible`]).
+            crate::state::check_table_key_accessible(&*self.engine, table).map_err(lift)?;
             for request in requests {
                 let write = match (&request.put_request, &request.delete_request) {
                     (Some(put), None) => {

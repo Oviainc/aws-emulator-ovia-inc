@@ -401,6 +401,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     }
                 };
 
+            // The items are stored ENCRYPTED under this table's KMS key, so a key KMS
+            // will not use leaves nothing this element could read or encrypt — and "the
+            // entire transaction is rejected" when any part of it cannot be served, so
+            // NOTHING is written ([`crate::state::check_table_key_accessible`]).
+            crate::state::check_table_key_accessible(
+                &*self.engine,
+                store.active_table(&region, &name, now).map_err(lift)?,
+            )
+            .map_err(lift)?;
+
             let prepared = match action {
                 Requested::Put(put) => {
                     let mut item = put.item.clone();

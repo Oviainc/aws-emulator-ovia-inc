@@ -272,6 +272,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             ) {
                 return Err(crate::scaffolded::Scaffolded::access_denied(denial));
             }
+            // The items are stored ENCRYPTED under this table's KMS key, so a key KMS
+            // will not use leaves nothing this get could decrypt — and "the entire
+            // transaction is rejected" when any part of it cannot be served
+            // ([`crate::state::check_table_key_accessible`]).
+            crate::state::check_table_key_accessible(&*self.engine, table).map_err(lift)?;
             let key = table.key_of_key_map(&requested.get.key).map_err(lift)?;
             if !keyed.insert((name.clone(), key.clone())) {
                 return Err(crate::scaffolded::Scaffolded::validation(

@@ -4,10 +4,8 @@
 //!
 //! Put a new suite at `tests/all/<name>.rs` and declare it below, keeping the list
 //! sorted.
-//!
 //! A suite that is not declared here compiles nowhere and its tests never run. A
 //! suite left at the top level of `tests/` fails the build.
-
 // `tests/all.rs` is a test-target CRATE ROOT, so a bare `mod` resolves to a SIBLING
 // (`tests/state_roundtrip.rs`) — which the layout check refuses. The `#[path]` is what
 // points it into `tests/all/`.
@@ -89,8 +87,8 @@ mod kinesis_destination_state_refusals;
 mod kinesis_destination_stream_resolution;
 #[path = "all/kinesis_streaming_destinations.rs"]
 mod kinesis_streaming_destinations;
-#[path = "all/legacy_filters_and_statement_values.rs"]
-mod legacy_filters_and_statement_values;
+#[path = "all/kms_key_state_refusals.rs"]
+mod kms_key_state_refusals;
 #[path = "all/list_exports.rs"]
 mod list_exports;
 #[path = "all/list_imports.rs"]
@@ -119,144 +117,103 @@ mod partiql_transaction_responses;
 mod partiql_transactions;
 #[path = "all/probe.rs"]
 mod probe;
-
 #[path = "all/provisioned_read_capacity.rs"]
 mod provisioned_read_capacity;
 #[path = "all/query_indexes_and_projections.rs"]
 mod query_indexes_and_projections;
 #[path = "all/refusal_contracts_and_expression_pre_images.rs"]
 mod refusal_contracts_and_expression_pre_images;
-
 #[path = "all/required_member_refusals.rs"]
 mod required_member_refusals;
 #[path = "all/request_shape_validation_classes.rs"]
 mod request_shape_validation_classes;
 #[path = "all/request_validation_refusals.rs"]
 mod request_validation_refusals;
-
 #[path = "all/region_from_the_request_endpoint.rs"]
 mod region_from_the_request_endpoint;
 #[path = "all/regions_indexes_and_capacity.rs"]
 mod regions_indexes_and_capacity;
-
 #[path = "all/resource_policy_not_found_messages.rs"]
 mod resource_policy_not_found_messages;
-
 #[path = "all/response_request_id.rs"]
 mod response_request_id;
-
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
-
 #[path = "all/restore_table_from_backup.rs"]
 mod restore_table_from_backup;
-
 #[path = "all/scan_filter_value_types_and_segments.rs"]
 mod scan_filter_value_types_and_segments;
-
 #[path = "all/scan_indexes_and_projections.rs"]
 mod scan_indexes_and_projections;
-
 #[path = "all/select_rules_and_policy_resources.rs"]
 mod select_rules_and_policy_resources;
-
 #[path = "all/result_filter_expressions.rs"]
 mod result_filter_expressions;
-
 #[path = "all/restore_table_to_point_in_time.rs"]
 mod restore_table_to_point_in_time;
-
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
-
 #[path = "all/stream_checkpoint_resume.rs"]
 mod stream_checkpoint_resume;
-
 #[path = "all/stream_enabled_table_round_trip.rs"]
 mod stream_enabled_table_round_trip;
-
 #[path = "all/stream_identity_is_minted_once.rs"]
 mod stream_identity_is_minted_once;
-
 #[path = "all/stream_record_images.rs"]
 mod stream_record_images;
-
 #[path = "all/stream_specification_presence.rs"]
 mod stream_specification_presence;
-
 #[path = "all/stream_specification_with_other_members.rs"]
 mod stream_specification_with_other_members;
-
 #[path = "all/table_control_plane.rs"]
 mod table_control_plane;
-
 #[path = "all/table_description_members.rs"]
 mod table_description_members;
-
 #[path = "all/table_description_shape.rs"]
 mod table_description_shape;
-
 #[path = "all/table_exports.rs"]
 mod table_exports;
 #[path = "all/table_encryption_and_ceilings.rs"]
 mod table_encryption_and_ceilings;
-
 #[path = "all/table_items.rs"]
 mod table_items;
-
 #[path = "all/table_replicas.rs"]
 mod table_replicas;
-
 #[path = "all/table_scan.rs"]
 mod table_scan;
-
 #[path = "all/table_streams.rs"]
 mod table_streams;
-
 #[path = "all/table_throughput_mode_and_warm_capacity.rs"]
 mod table_throughput_mode_and_warm_capacity;
-
 #[path = "all/tag_read_propagation.rs"]
 mod tag_read_propagation;
-
 #[path = "all/time_to_live.rs"]
 mod time_to_live;
-
 #[path = "all/transactional_undefined_expression_tokens.rs"]
 mod transactional_undefined_expression_tokens;
-
 #[path = "all/transitional_status_span.rs"]
 mod transitional_status_span;
-
 #[path = "all/undefined_expression_tokens.rs"]
 mod undefined_expression_tokens;
-
 #[path = "all/unused_substitution_key_envelopes.rs"]
 mod unused_substitution_key_envelopes;
-
 #[path = "all/update_contributor_insights_writes.rs"]
 mod update_contributor_insights_writes;
-
 #[path = "all/update_table_transient_status.rs"]
 mod update_table_transient_status;
-
 #[path = "all/validation_message_fidelity.rs"]
 mod validation_message_fidelity;
-
 #[path = "all/validation_message_wording.rs"]
 mod validation_message_wording;
-
 #[path = "all/value_rules_and_resource_policy.rs"]
 mod value_rules_and_resource_policy;
-
 #[path = "all/vector_index_updates.rs"]
 mod vector_index_updates;
-
 #[path = "all/vector_indexes.rs"]
 mod vector_indexes;
-
 #[path = "all/vector_search.rs"]
 mod vector_search;
-
 #[path = "all/vector_write_validation.rs"]
 mod vector_write_validation;
+#[path = "all/legacy_filters_and_statement_values.rs"]
+mod legacy_filters_and_statement_values;

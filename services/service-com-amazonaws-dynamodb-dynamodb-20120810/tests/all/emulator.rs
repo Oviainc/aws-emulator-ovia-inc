@@ -144,6 +144,62 @@ pub fn emulator_with_streams() -> MultiServiceRouter {
     router
 }
 
+/// One emulator holding this service AND KMS, over ONE shared engine.
+///
+/// A table's encryption key is a KMS resource: the key ARN a table reports, and the key
+/// STATE its data plane is held to, are that service's answers — so a suite about either
+/// mounts KMS beside DynamoDB, exactly as `core/router` assembles them.
+pub fn emulator_with_kms() -> MultiServiceRouter {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(service_com_amazonaws_kms_trentservice::EmulatedService::new(
+        engine,
+    ));
+    router
+}
+
+/// Send one KMS operation in `region`, signed for that service. KMS names its operations
+/// under its own `X-Amz-Target` prefix, which is what tells it apart here.
+pub async fn call_kms_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: Value,
+) -> (u16, Value) {
+    dispatch_as(
+        router,
+        region,
+        "kms",
+        &format!("TrentService.{operation}"),
+        body,
+    )
+    .await
+}
+
+/// [`call_kms_in`] for a KMS operation that must succeed in `region`, returning its parsed
+/// body — for a suite whose keys live in more than one Region, since a KMS key is a
+/// REGIONAL resource.
+pub async fn ok_kms_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    operation: &str,
+    body: Value,
+) -> Value {
+    let (status, parsed) = call_kms_in(router, region, operation, body.clone()).await;
+    assert_eq!(
+        status, 200,
+        "case kms {operation} in {region} {body}: expected HTTP 200, got {status} with {parsed}"
+    );
+    parsed
+}
+
+/// [`ok_kms_in`] in [`REGION`], for a suite that is not about Regions.
+pub async fn ok_kms(router: &MultiServiceRouter, operation: &str, body: Value) -> Value {
+    ok_kms_in(router, REGION, operation, body).await
+}
+
 /// Send one operation in `region` and return its HTTP status and parsed body.
 pub async fn call_in(
     router: &MultiServiceRouter,
