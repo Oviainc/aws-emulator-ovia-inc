@@ -384,7 +384,7 @@ fn delete_multiplex(
             id,
             Some(multiplex.arn.clone()),
             failure_code::CONFLICT,
-            crate::state::not_idle_message("Multiplex", id, multiplex.state()),
+            crate::state::multiplex_not_deletable_message(multiplex.state()),
         ));
     }
     multiplex.begin_delete(now);

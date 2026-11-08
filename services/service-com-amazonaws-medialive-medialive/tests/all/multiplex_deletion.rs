@@ -19,7 +19,8 @@
 //! `ConflictException`, not a 404 — because the record is still the account's.
 //!
 //! The suites are tables: the recorded case (a delete refused on a `RUNNING`
-//! multiplex holding no program) is ONE row of them.
+//! multiplex holding no program) is ONE row of them. The WORDING the state
+//! refusal carries is `crate::multiplex_delete_refusal_message`'s subject.
 
 use serde_json::{json, Value};
 use smithy_server_runtime::MultiServiceRouter;
@@ -209,7 +210,8 @@ async fn a_stopped_multiplex_is_deleted_whatever_it_holds() {
 
 /// Rule: a multiplex is deleted from the stopped state only, so a delete sent
 /// while it is in any other state is refused with a 409 `ConflictException`
-/// naming the state it is in and the state a delete needs, and moves nothing — a
+/// carrying the fixed sentence of that rejection class — which names the state
+/// the multiplex is in and nothing the caller supplied — and moves nothing: a
 /// refused delete is never a no-op.
 ///
 /// The rows span every state this service can put a multiplex in besides the
@@ -245,10 +247,11 @@ async fn a_multiplex_is_deleted_only_from_the_stopped_state() {
             "ConflictException",
             "case {case:?}: expected ConflictException, got {body}"
         );
-        let message = error_message(&body);
-        assert!(
-            message.contains(&id) && message.contains(state) && message.contains(IDLE),
-            "case {case:?}: expected the refusal to name the multiplex, its state and the state a delete needs, got {body}"
+        assert_eq!(
+            error_message(&body),
+            crate::multiplex_delete_refusal_message::not_deletable(state),
+            "case {case:?}: expected the fixed sentence of the class naming the state that \
+             refused the delete, got {body}"
         );
 
         // The refused delete wrote nothing: the multiplex reads back exactly as
@@ -392,12 +395,25 @@ async fn a_mutation_of_a_multiplex_whose_delete_was_accepted_conflicts() {
                 "case {case:?}/{}: expected the modelled ConflictException while the multiplex is {phase}, got {refusal}",
                 mutation.op
             );
+            // The start and the program create name the multiplex they refused;
+            // the DELETE answers the fixed sentence of its own rejection class,
+            // which names the state that refused it and nothing the caller
+            // supplied (`crate::multiplex_delete_refusal_message`).
             let message = error_message(&refusal);
-            assert!(
-                message.contains(&id),
-                "case {case:?}/{}: expected the refusal to name the multiplex it refused, got {message:?}",
-                mutation.op
-            );
+            if mutation.op == "DeleteMultiplex" {
+                assert_eq!(
+                    message,
+                    crate::multiplex_delete_refusal_message::not_deletable(phase),
+                    "case {case:?}/{}: expected the class's sentence for {phase}, got {message:?}",
+                    mutation.op
+                );
+            } else {
+                assert!(
+                    message.contains(&id),
+                    "case {case:?}/{}: expected the refusal to name the multiplex it refused, got {message:?}",
+                    mutation.op
+                );
+            }
         }
 
         // Every refusal above wrote nothing: the record reads back as it did
@@ -504,7 +520,11 @@ async fn a_delete_touches_only_the_multiplex_it_names() {
 
 /// Drive the multiplex `id` into `state`, through the operations a client uses,
 /// asserting each step was accepted.
-async fn reach(router: &MultiServiceRouter, case: &str, id: &str, state: &str) {
+///
+/// Shared with [`crate::multiplex_delete_refusal_message`], whose rows need a
+/// multiplex in each state a delete refuses, so the two suites reach a state the
+/// same way.
+pub(crate) async fn reach(router: &MultiServiceRouter, case: &str, id: &str, state: &str) {
     if state == "CREATING" {
         return;
     }

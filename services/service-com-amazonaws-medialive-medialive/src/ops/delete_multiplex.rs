@@ -178,12 +178,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // or deleted is the resource being in a condition that prevents the
         // action, which is the 409 `ConflictException` this operation models (the
         // same answer `DeleteChannel` gives a channel that is not idle), and it
-        // writes nothing: a refused delete is never a no-op.
+        // writes nothing: a refused delete is never a no-op. The refusal carries
+        // the fixed sentence of that class, naming the state that refused it and
+        // nothing the caller supplied.
         if !multiplex.is_deletable() {
             return Err(DeleteMultiplexErrorModeled::ConflictException(ConflictException {
-                message: Some(crate::state::not_idle_message(
-                    "Multiplex",
-                    &input.multiplex_id,
+                message: Some(crate::state::multiplex_not_deletable_message(
                     multiplex.state(),
                 )),
             })

@@ -294,9 +294,9 @@ pub enum ReservationDeleteRefusal {
 /// and the state a delete acts from.
 ///
 /// The same request-composed shape as this service's other state refusals
-/// ([`super::not_idle_message`], [`super::channel_not_running_message`]), with
-/// this operation's own required state: "Delete an expired reservation", so
-/// `EXPIRED` is the one state it deletes from.
+/// ([`super::channel_not_running_message`]), with this operation's own required
+/// state: "Delete an expired reservation", so `EXPIRED` is the one state it
+/// deletes from.
 pub fn reservation_not_expired_message(id: &str, state: &str) -> String {
     format!(
         "Reservation {id} is in state {state} and can only be deleted from {}",

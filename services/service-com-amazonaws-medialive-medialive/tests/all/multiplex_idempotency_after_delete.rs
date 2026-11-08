@@ -64,7 +64,10 @@ async fn update_multiplex(
 }
 
 /// Every multiplex id the account holds, sorted, as `ListMultiplexes` reports
-/// them — a deleted multiplex's record included, since the delete keeps it.
+/// them — a multiplex whose delete has COMPLETED is no longer one the account
+/// holds, so the listing leaves it out (`crate::multiplex_listing`) while its
+/// record stays readable through `DescribeMultiplex`, which is what this suite
+/// asserts separately.
 async fn held_ids(router: &MultiServiceRouter, case: &str) -> Vec<String> {
     let (status, body) = call(router, "GET", MULTIPLEXES, None).await;
     assert_eq!(
@@ -317,13 +320,15 @@ async fn a_deleted_multiplex_is_not_resurrected_by_its_idempotency_token() {
             described(&router, case, &first_id).await
         );
 
-        let mut expected_held = vec![first_id.clone(), retried_id.clone()];
-        expected_held.sort();
+        // The deleted multiplex is out of the account, so the listing reports
+        // the retry's own multiplex alone — while the tombstone stays readable
+        // through its describe, which the assertion above just made.
+        let expected_held = vec![retried_id.clone()];
         assert_eq!(
             held_ids(&router, case).await,
             expected_held,
-            "case {case:?}: expected the account to hold the deleted multiplex and the retry's \
-             own, got {:?}",
+            "case {case:?}: expected the account to hold the retry's own multiplex and not the \
+             deleted one, got {:?}",
             held_ids(&router, case).await
         );
 

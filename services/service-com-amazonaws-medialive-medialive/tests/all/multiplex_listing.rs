@@ -264,8 +264,6 @@ enum Lifecycle {
     Idle,
     /// Started and settled: `RUNNING`, with one pipeline healthy per zone.
     Running,
-    /// Deleted and settled: the terminal `DELETED` record the account keeps.
-    Deleted,
 }
 
 /// One row of the projection table: the multiplex's name, the settings the
@@ -349,14 +347,6 @@ async fn a_listed_multiplex_is_the_multiplex_describe_reports() {
             programs: 1,
             lifecycle: Lifecycle::Running,
         },
-        Stored {
-            case: "deleted, keeping its record",
-            name: "deleted",
-            multiplex_settings: || settings(TRANSPORT_STREAM_BITRATE.0, 1),
-            tags: Some(|| json!({ "env": "gone" })),
-            programs: 0,
-            lifecycle: Lifecycle::Deleted,
-        },
     ];
 
     for Stored {
@@ -391,15 +381,6 @@ async fn a_listed_multiplex_is_the_multiplex_describe_reports() {
                 assert_eq!(
                     status, 202,
                     "case {case:?}: StartMultiplex: expected 202, got {status}: {started}"
-                );
-                wait_for_the_clock();
-            }
-            Lifecycle::Deleted => {
-                let (status, deleted) =
-                    call(&router, "DELETE", &format!("{MULTIPLEXES}/{id}"), None).await;
-                assert_eq!(
-                    status, 202,
-                    "case {case:?}: DeleteMultiplex: expected 202, got {status}: {deleted}"
                 );
                 wait_for_the_clock();
             }
@@ -439,7 +420,6 @@ async fn a_listed_multiplex_is_the_multiplex_describe_reports() {
         let expected_state = match lifecycle {
             Lifecycle::Idle => "IDLE",
             Lifecycle::Running => "RUNNING",
-            Lifecycle::Deleted => "DELETED",
         };
         assert_eq!(
             summary["state"],
@@ -481,6 +461,110 @@ async fn a_listed_multiplex_is_the_multiplex_describe_reports() {
             "case {case:?}: expected no destinations on a summary, got {:?}",
             summary["destinations"]
         );
+    }
+}
+
+/// Rule: a listing reports the multiplexes the account currently holds, so one
+/// whose delete has been ACCEPTED leaves it from that call on — while it is
+/// being torn down (`DELETING`) and in the terminal `DELETED` state alike —
+/// while that multiplex's own `DescribeMultiplex` goes on reporting the state
+/// the teardown is in, which is what the SDK's `MultiplexDeleted` waiter polls
+/// for.
+///
+/// That the listing drops it before the teardown finishes is recorded: the
+/// `medialive.multiplex-start-without-programs-rejected` fixture finds the
+/// multiplex already absent from `ListMultiplexes` while a `StartMultiplex`
+/// sent straight afterwards is still refused on the `DELETING` state. The same
+/// split is what the input security group's listing answers with on its own
+/// recorded evidence (`crate::input_security_group_listing`).
+///
+/// The rows differ along WHICH of the five stored multiplexes are deleted — the
+/// first, one in the middle, the last, several, all of them, none — because the
+/// delete's position in mint order is what a paged listing could get wrong, and
+/// each row is walked unpaged, one multiplex at a time and two at a time, in
+/// both phases of the teardown.
+#[tokio::test]
+async fn a_deleted_multiplex_leaves_the_listing_but_is_still_described() {
+    // (case, the indices of the five stored multiplexes the row deletes)
+    let table: [(&str, &[usize]); 6] = [
+        ("nothing deleted", &[]),
+        ("the first multiplex deleted", &[0]),
+        ("a middle multiplex deleted", &[2]),
+        ("the last multiplex deleted", &[4]),
+        ("two multiplexes deleted", &[1, 3]),
+        ("every multiplex deleted", &[0, 1, 2, 3, 4]),
+    ];
+
+    for (case, deleted_indices) in table {
+        let router = medialive();
+        let mut created: Vec<String> = Vec::new();
+        for index in 0..5 {
+            created.push(
+                stored_multiplex(
+                    &router,
+                    case,
+                    &format!("stored-{index}"),
+                    settings(TRANSPORT_STREAM_BITRATE.0, index),
+                )
+                .await,
+            );
+        }
+        // A multiplex is deleted from the stopped state the create settles into.
+        wait_for_the_clock();
+        for index in deleted_indices {
+            let (status, deleting) = call(
+                &router,
+                "DELETE",
+                &format!("{MULTIPLEXES}/{}", created[*index]),
+                None,
+            )
+            .await;
+            assert_eq!(
+                status, 202,
+                "case {case:?}: DeleteMultiplex: expected 202, got {status}: {deleting}"
+            );
+        }
+
+        let survivors: Vec<String> = created
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !deleted_indices.contains(index))
+            .map(|(_, id)| id.clone())
+            .collect();
+
+        // Both phases of the teardown: the transient one the accepted delete
+        // opens, and the terminal one the clock then makes due.
+        for phase in ["DELETING", "DELETED"] {
+            if phase == "DELETED" {
+                wait_for_the_clock();
+            }
+            for page_size in [None, Some(1), Some(2)] {
+                let (reported, pages) = every_page(&router, case, page_size).await;
+                assert_eq!(
+                    reported, survivors,
+                    "case {case:?}: with page size {page_size:?} while the deleted ones are \
+                     {phase}, expected the listing to report only the multiplexes still in the \
+                     account, in mint order; pages were {pages:?}"
+                );
+            }
+
+            // The deleted multiplexes are still READABLE, in the state the
+            // teardown is in — the listing dropped them, the store did not.
+            for index in deleted_indices {
+                let (status, described) = describe_multiplex(&router, &created[*index]).await;
+                assert_eq!(
+                    status, 200,
+                    "case {case:?}: DescribeMultiplex: expected 200, got {status}: {described}"
+                );
+                assert_eq!(
+                    described["state"],
+                    json!(phase),
+                    "case {case:?}: expected the deleted multiplex to still describe as {phase}, \
+                     got {:?}",
+                    described["state"]
+                );
+            }
+        }
     }
 }
 

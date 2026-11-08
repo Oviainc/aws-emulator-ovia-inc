@@ -333,8 +333,8 @@ pub use managed_monitor_templates::{
 pub mod multiplexes;
 
 pub use multiplexes::{
-    multiplex_alert_state, multiplex_alert_type, multiplex_program_not_found_message,
-    multiplex_state,
+    multiplex_alert_state, multiplex_alert_type, multiplex_not_deletable_message,
+    multiplex_program_not_found_message, multiplex_state,
     MultiplexProgramDeleteRefusal, MultiplexProgramRecord, MultiplexProgramRefusal,
     MultiplexProgramSettingsRefusal, MultiplexProgramUpdateRefusal, MultiplexRecord,
     MultiplexRefusal, MultiplexSettingOutOfRange, MultiplexStartRefusal, MultiplexStopRefusal,
@@ -3730,22 +3730,6 @@ pub fn multiplex_not_startable_message(multiplex_id: &str, state: &str) -> Strin
     format!(
         "Multiplex {multiplex_id} is in state {state} and can only be started from {}",
         multiplex_state::IDLE
-    )
-}
-
-/// The message a delete refused on the resource's state carries: the resource,
-/// the state it is in, and the state a delete needs.
-///
-/// This is the generic, request-composed wording, used for a resource whose
-/// class message this service does not know — the multiplex, whose
-/// not-stopped refusal only `BatchDelete` reaches. The CHANNEL delete has a
-/// known fixed message for the class and uses [`CHANNEL_NOT_STOPPED_MESSAGE`]
-/// instead.
-pub fn not_idle_message(resource_type: &str, identifier: &str, state: &str) -> String {
-    format!(
-        "{resource_type} {identifier} is in state {state} and must be \
-         {} before it can be deleted",
-        channel_state::IDLE
     )
 }
 

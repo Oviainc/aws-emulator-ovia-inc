@@ -272,6 +272,9 @@ mod multiplex_alert_instants;
 #[path = "all/multiplex_alerts.rs"]
 mod multiplex_alerts;
 
+#[path = "all/multiplex_delete_refusal_message.rs"]
+mod multiplex_delete_refusal_message;
+
 #[path = "all/multiplex_deletion.rs"]
 mod multiplex_deletion;
 

@@ -465,7 +465,8 @@ async fn a_stack_published_state_machine_reference_starts_an_execution() {
             }
             None => {
                 // A start that names no execution gets the name Step Functions minted, inside
-                // an execution ARN of the machine the reference named.
+                // an execution ARN of the machine the reference named. Every EXPRESS row names
+                // its execution, so the prefix here is the STANDARD `execution` form.
                 let prefix = execution_arn(region, &machine_name, "");
                 let minted = started_arn.strip_prefix(prefix.as_str()).unwrap_or_else(|| {
                     panic!(

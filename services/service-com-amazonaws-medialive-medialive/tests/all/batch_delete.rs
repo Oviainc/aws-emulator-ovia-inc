@@ -410,7 +410,7 @@ async fn every_resource_a_delete_cannot_touch_is_reported_as_its_own_failure() {
             "creating multiplex",
             "ConflictException",
             Some("CREATING"),
-            "Multiplex {id} is in state CREATING",
+            "Cannot delete a multiplex that is in CREATING state",
         ),
     ];
 

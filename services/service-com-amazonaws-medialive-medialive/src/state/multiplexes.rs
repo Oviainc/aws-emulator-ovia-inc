@@ -1524,10 +1524,24 @@ impl ComAmazonawsMedialiveMedialiveState {
     /// `first`, in id order, at most `page_size` of them, together with the id
     /// the next page starts at when a multiplex is left over after this one.
     ///
-    /// A deleted multiplex keeps its record in its terminal state, so it goes on
-    /// being listed there exactly as `DescribeMultiplex` goes on reporting it —
-    /// which is what makes a listing a read of the same stored multiplex rather
-    /// than a second account of it.
+    /// A multiplex whose delete has been ACCEPTED is not one of the multiplexes
+    /// the account holds any more, so the listing leaves it out from that call
+    /// on — while it is being torn down (`DELETING`) and in the terminal
+    /// `DELETED` state alike: this operation produces a list of the account's
+    /// CURRENT multiplexes, not of every one it ever held. Its record stays in
+    /// the store, so `DescribeMultiplex` goes on reporting the state the
+    /// teardown is in (which is what the SDK's `MultiplexDeleted` waiter polls
+    /// for), and the two readers of a deleted multiplex differ exactly here.
+    ///
+    /// The recorded evidence is that the listing drops it BEFORE the teardown
+    /// finishes: in the `medialive.multiplex-start-without-programs-rejected`
+    /// fixture the multiplex is already absent from `ListMultiplexes` while a
+    /// `StartMultiplex` sent straight afterwards is still refused on the
+    /// `DELETING` state — so the predicate is the accepted delete
+    /// ([`MultiplexRecord::delete_accepted`]) and not the terminal state alone.
+    /// The same split is what the input security group's listing answers with,
+    /// on that family's own recorded evidence
+    /// (`crate::ops::list_input_security_groups`).
     ///
     /// Every member of a summary comes from the same place the full
     /// [`ComAmazonawsMedialiveMedialiveState::multiplex_description`] takes it
@@ -1538,7 +1552,10 @@ impl ComAmazonawsMedialiveMedialiveState {
         first: Bound<&str>,
         page_size: usize,
     ) -> (Vec<MultiplexSummary>, Option<String>) {
-        let mut remaining = self.multiplexes.range::<str, _>((first, Bound::Unbounded));
+        let mut remaining = self
+            .multiplexes
+            .range::<str, _>((first, Bound::Unbounded))
+            .filter(|(_, multiplex)| !multiplex.delete_accepted());
         let summaries: Vec<MultiplexSummary> = remaining
             .by_ref()
             .take(page_size)
@@ -2370,6 +2387,30 @@ pub fn multiplex_program_not_found_message(multiplex_id: &str, program_name: &st
         "Multiplex program",
         &multiplex_program_key(multiplex_id, program_name),
     )
+}
+
+/// The message a multiplex delete refused on the multiplex's state carries.
+///
+/// This rejection CLASS has a fixed sentence of its own — "Cannot delete a
+/// multiplex that is in <MultiplexState> state" — the same shape the channel's
+/// delete has ([`crate::state::CHANNEL_NOT_STOPPED_MESSAGE`]): it says what was
+/// refused and the condition that refused it, and nothing the caller supplied.
+/// So neither the multiplex's id nor its name nor its ARN appears in it: a
+/// client matching on the refusal text sees the same sentence whichever
+/// multiplex it asked about.
+///
+/// Its ONE variable part is the `MultiplexState` the multiplex is in, read out
+/// of the record this delete was judged against — the condition itself, and the
+/// only thing a caller has to clear ("Delete a multiplex. The multiplex must be
+/// idle", `smithy_query(query="operation", operation="DeleteMultiplex")`). It is
+/// taken from the store rather than fixed at one state's spelling, because a
+/// sentence naming a state the multiplex is not in would report a condition
+/// that does not hold.
+///
+/// ONE helper, so `DeleteMultiplex` and `BatchDelete` — which refuse the same
+/// multiplex for the same reason — cannot word it two ways.
+pub fn multiplex_not_deletable_message(state: &str) -> String {
+    format!("Cannot delete a multiplex that is in {state} state")
 }
 
 /// Project a `Multiplex` onto one of the structurally identical per-operation
