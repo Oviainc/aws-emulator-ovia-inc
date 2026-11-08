@@ -353,16 +353,20 @@ async fn updating_a_notification_replaces_it_in_place_and_keeps_its_subscribers(
             body["Subscribers"]
         );
 
-        // And the old notification is no longer a notification of this budget.
+        // And the old notification is no longer a notification of this budget: the read
+        // of its subscribers reports the empty set that identity now has — `Subscribers`
+        // is `@length(min: 1)`, so the empty set is the member left out.
         let (status, body) =
             read_subscribers(&router, &account_id, &budget_name, &catalog[target]).await;
         assert_eq!(
-            status, 400,
-            "case {case:?}: expected the replaced notification to be gone, got {status} {body}"
+            status, 200,
+            "case {case:?}: expected the replaced notification to read as an empty \
+             subscriber set, got {status} {body}"
         );
         assert!(
-            is_error(&body, "NotFoundException"),
-            "case {case:?}: expected NotFoundException for the replaced notification, got {body}"
+            body.get("Subscribers").is_none_or(Value::is_null),
+            "case {case:?}: expected no Subscribers member for the replaced notification, \
+             got {body}"
         );
         let (status, body) =
             update_notification(&router, &account_id, &budget_name, &catalog[target], &new).await;

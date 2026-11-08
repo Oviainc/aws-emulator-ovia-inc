@@ -24,9 +24,9 @@
 //! a new file under `src/ops/` would be picked up by `build.rs` as an operation.
 
 use crate::ops::types::{
-    Action, ActionHistory, ActionHistoryDetails, Budget, BudgetedAndActualAmounts, CalculatedSpend,
-    CostTypes, Definition, HealthStatus, Notification, NotificationWithSubscribers, ResourceTag,
-    Spend, Subscriber, TimePeriod,
+    Action, ActionHistory, ActionHistoryDetails, ActionThreshold, Budget,
+    BudgetedAndActualAmounts, CalculatedSpend, CostTypes, Definition, HealthStatus, Notification,
+    NotificationWithSubscribers, ResourceTag, Spend, Subscriber, TimePeriod,
 };
 use std::collections::HashMap;
 use std::time::{Duration, SystemTime};
@@ -35,6 +35,11 @@ use std::time::{Duration, SystemTime};
 /// only part of this service that calls another service, so it is kept apart from the
 /// store itself.
 pub mod alerts;
+
+/// The execution role a budget action is written with, resolved against the account's IAM
+/// records — the other part of this service that calls another service, kept apart from
+/// the store for the same reason.
+pub mod execution_role;
 
 /// Per-service state for com-amazonaws-budgets-awsbudgetservicegateway. A handler reaches it through [`service_state`].
 #[derive(Debug, Default)]
@@ -115,8 +120,10 @@ pub struct PendingSettle {
 }
 
 impl StoredAction {
-    /// A newly created action: [`ACTION_STATUS_STANDBY`], with nothing owed and an
-    /// empty history — the call that creates it records its own `CREATE_ACTION` event.
+    /// A newly created action: the status this service's reading of its trigger threshold
+    /// gives it ([`created_action_status`]) is already stamped on `action`, and it carries
+    /// nothing owed and an empty history — the call that creates it records its own
+    /// `CREATE_ACTION` event.
     pub fn new(action: Action, tags: Vec<ResourceTag>) -> Self {
         Self {
             action,
@@ -175,13 +182,90 @@ impl StoredAction {
     }
 }
 
-/// `ActionStatus$STANDBY` — the status a created action carries, and the one a reset
-/// action returns to: the action is armed and waiting for its threshold.
+/// `ActionStatus$STANDBY` — the status a created action carries and the one a reset action
+/// returns to: the action is armed and waiting for the threshold that triggers it, the
+/// definition it applies not being in place.
 pub const ACTION_STATUS_STANDBY: &str = "STANDBY";
 
-/// `ActionStatus$PENDING` — a triggered action waiting for the manual approval its
-/// `ApprovalModel` requires.
+/// `ActionStatus$PENDING` — the status of an action whose trigger threshold the spend it
+/// watches has reached while the manual approval its `ApprovalModel` requires has not been
+/// given: the action is no longer merely waiting, and nothing has applied its definition
+/// either.
 pub const ACTION_STATUS_PENDING: &str = "PENDING";
+
+/// `ApprovalModel$MANUAL` — the action whose execution has to be approved before it runs,
+/// which is what `ExecuteBudgetAction`'s `APPROVE_BUDGET_ACTION` does.
+pub const APPROVAL_MODEL_MANUAL: &str = "MANUAL";
+
+/// The `ActionStatus` a CREATED action carries: the service's own reading of the action's
+/// trigger threshold against the spend the budget tracks ([`action_threshold_passed`]),
+/// under the approval its `ApprovalModel` asks for ("this specifies if the action needs
+/// manual or automatic approval").
+///
+/// A created action is ARMED and waiting for its threshold, which is
+/// [`ACTION_STATUS_STANDBY`] — there is nothing to do for it until the spend the budget
+/// tracks reaches the threshold that triggers it. Where that spend has ALREADY reached the
+/// threshold and the action's execution needs manual approval, that approval is what the
+/// action is now waiting for, which is [`ACTION_STATUS_PENDING`]: the approval is given by
+/// an `ExecuteBudgetAction` and by nothing else, so the action stands there until one
+/// arrives.
+///
+/// An action that is approved automatically is left ARMED even where its trigger is
+/// already met: AWS would run such an action, and nothing in this emulator performs an
+/// action's execution, so reporting an execution status for it would be a status for work
+/// nothing did. That is a known divergence of this emulator rather than a reading of the
+/// model.
+///
+/// Where the budget's figures state no comparison at all — a `FORECASTED` action of a
+/// budget no forecast is reported for, a percentage of a budget that reports no limit —
+/// nothing has reached the threshold, so the action is armed: the same reading
+/// [`notification_state`] takes of a threshold it cannot compare.
+///
+/// The ONE place the created status is decided, so `CreateBudgetAction` and every read of
+/// a fresh action agree on it.
+pub fn created_action_status(
+    budget: &Budget,
+    notification_type: &str,
+    action_threshold: &ActionThreshold,
+    approval_model: &str,
+) -> &'static str {
+    let triggered =
+        action_threshold_passed(budget, notification_type, action_threshold).unwrap_or(false);
+    if triggered && approval_model == APPROVAL_MODEL_MANUAL {
+        ACTION_STATUS_PENDING
+    } else {
+        ACTION_STATUS_STANDBY
+    }
+}
+
+/// Whether the spend an action watches has already reached the threshold that triggers it,
+/// or `None` when this budget's figures do not state the comparison at all.
+///
+/// Which spend the action watches is its `NotificationType` ("the type of a notification.
+/// It must be `ACTUAL` or `FORECASTED`"), read off the same `CalculatedSpend` a read of the
+/// budget reports ([`spend_watched_by`]), and the amount it is measured against is
+/// `ActionThreshold$ActionThresholdValue` read through
+/// `ActionThreshold$ActionThresholdType` ([`threshold_in_budget_unit`]) — the same two
+/// readings a notification's threshold is made of. An `ActionThreshold` carries no
+/// comparison operator of its own, so the one comparison it states is the trigger: the
+/// action triggers once the watched spend REACHES the threshold.
+///
+/// `None` wherever there is nothing to compare, the same cases [`notification_state`]
+/// answers `OK` for: a figure the budget reports none of, and a threshold type or
+/// notification type this service does not know.
+pub fn action_threshold_passed(
+    budget: &Budget,
+    notification_type: &str,
+    action_threshold: &ActionThreshold,
+) -> Option<bool> {
+    let spent = spend_watched_by(budget, notification_type)?;
+    let threshold = threshold_in_budget_unit(
+        budget,
+        action_threshold.action_threshold_value,
+        &action_threshold.action_threshold_type,
+    )?;
+    Some(spent >= threshold)
+}
 
 /// `ActionStatus$EXECUTION_IN_PROGRESS` — the action's execution is under way.
 pub const ACTION_STATUS_EXECUTION_IN_PROGRESS: &str = "EXECUTION_IN_PROGRESS";
@@ -982,8 +1066,23 @@ fn notification_in_alarm(budget: &Budget, notification: &Notification) -> bool {
 /// with: the actual spend for an `ACTUAL` notification, the forecast for a `FORECASTED`
 /// one. `None` when the budget reports no such figure.
 fn watched_spend(budget: &Budget, notification: &Notification) -> Option<f64> {
+    spend_watched_by(budget, &notification.notification_type)
+}
+
+/// The figure a `NotificationType` watches, out of the `CalculatedSpend` `budget` reads
+/// back with: "whether the notification is for how much you have spent (`ACTUAL`) or for
+/// how much that you're forecasted to spend (`FORECASTED`)".
+///
+/// `None` when the budget reports no such figure — including every `FORECASTED` reading
+/// here, since no forecast is reported for a budget of this emulator (see
+/// [`calculated_spend`]) — and for a notification type this service does not know.
+///
+/// The ONE reading of which spend a threshold is measured against, shared by a
+/// notification's alarm state ([`notification_state`]) and an action's trigger
+/// ([`action_threshold_passed`]), so the two cannot come to watch different figures.
+pub fn spend_watched_by(budget: &Budget, notification_type: &str) -> Option<f64> {
     let spend = budget.calculated_spend.as_ref()?;
-    let watched = match notification.notification_type.as_str() {
+    let watched = match notification_type {
         NOTIFICATION_TYPE_ACTUAL => Some(&spend.actual_spend),
         NOTIFICATION_TYPE_FORECASTED => spend.forecasted_spend.as_ref(),
         // A notification type this service does not know watches nothing it holds.
@@ -1004,15 +1103,34 @@ fn watched_spend(budget: &Budget, notification: &Notification) -> Option<f64> {
 /// whose read reports no `BudgetLimit` has no amount for a percentage to be of, and there
 /// is nothing to compare.
 fn threshold_amount(budget: &Budget, notification: &Notification) -> Option<f64> {
-    match notification
-        .threshold_type
-        .as_deref()
-        .unwrap_or(THRESHOLD_TYPE_PERCENTAGE)
-    {
-        THRESHOLD_TYPE_ABSOLUTE_VALUE => Some(notification.threshold),
+    threshold_in_budget_unit(
+        budget,
+        notification.threshold,
+        notification
+            .threshold_type
+            .as_deref()
+            .unwrap_or(THRESHOLD_TYPE_PERCENTAGE),
+    )
+}
+
+/// `threshold` read through `threshold_type`, in the unit the watched spend is measured in.
+///
+/// The ONE reading of a `ThresholdType`, shared by a notification's threshold and an
+/// action's ([`action_threshold_passed`]), both of which are written as a value plus that
+/// type: `ABSOLUTE_VALUE` is the amount itself, `PERCENTAGE` is that percentage of the
+/// budgeted amount. `None` for a percentage of a budget whose read reports no limit — there
+/// is no amount for it to be a percentage of — and for a threshold type this service does
+/// not know.
+pub fn threshold_in_budget_unit(
+    budget: &Budget,
+    threshold: f64,
+    threshold_type: &str,
+) -> Option<f64> {
+    match threshold_type {
+        THRESHOLD_TYPE_ABSOLUTE_VALUE => Some(threshold),
         THRESHOLD_TYPE_PERCENTAGE => {
             let limit = numeric_amount(&budget.budget_limit.as_ref()?.amount)?;
-            Some(limit * notification.threshold / PERCENT)
+            Some(limit * threshold / PERCENT)
         }
         // A threshold type this service does not know names no amount.
         _ => None,

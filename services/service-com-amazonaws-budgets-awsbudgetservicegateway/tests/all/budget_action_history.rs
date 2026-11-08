@@ -33,10 +33,10 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::ops::types::{
 };
 use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     encode_next_token, ComAmazonawsBudgetsAwsbudgetservicegatewayState,
-    ACTION_STATUS_EXECUTION_IN_PROGRESS, ACTION_STATUS_STANDBY, EVENT_TYPE_CREATE_ACTION,
-    EVENT_TYPE_EXECUTE_ACTION, EVENT_TYPE_SYSTEM, EVENT_TYPE_UPDATE_ACTION,
-    EXECUTION_TYPE_APPROVE, MAX_ACTIONS_PER_BUDGET, MAX_ACTION_HISTORY_RECORDS,
-    MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION,
+    ACTION_STATUS_EXECUTION_IN_PROGRESS, ACTION_STATUS_PENDING, ACTION_STATUS_STANDBY,
+    EVENT_TYPE_CREATE_ACTION, EVENT_TYPE_EXECUTE_ACTION, EVENT_TYPE_SYSTEM,
+    EVENT_TYPE_UPDATE_ACTION, EXECUTION_TYPE_APPROVE, MAX_ACTIONS_PER_BUDGET,
+    MAX_ACTION_HISTORY_RECORDS, MAX_SNS_SUBSCRIBERS_PER_NOTIFICATION,
 };
 
 use super::budget_lifecycle::{caller_account, call, is_error, router, router_with_engine, same};
@@ -186,6 +186,24 @@ impl Row {
         })
     }
 
+    /// The `ActionStatus` a created action of this row carries: ARMED (`STANDBY`) while
+    /// the spend the budget tracks has not reached the threshold that triggers the action,
+    /// `PENDING` once it has and the action's execution needs the manual approval its
+    /// `ApprovalModel` asks for. Nothing spends behind a budget here, no forecast is
+    /// reported for one and nothing performs an action's execution, so the `MANUAL` rows
+    /// that watch the ACTUAL spend at the published minimum threshold ([`THRESHOLD_MIN`])
+    /// are the ones a created action waits in `PENDING` for.
+    fn created_status(&self) -> &'static str {
+        if self.notification_type == "ACTUAL"
+            && self.approval_model == "MANUAL"
+            && self.threshold_value <= THRESHOLD_MIN
+        {
+            ACTION_STATUS_PENDING
+        } else {
+            ACTION_STATUS_STANDBY
+        }
+    }
+
     /// The `Action` a read must report for this row once created: every member the
     /// caller supplied, plus the two the SERVICE owns (the minted `ActionId` and the
     /// `Status` a new action starts in).
@@ -199,7 +217,7 @@ impl Row {
             "Definition": definition_for(self.action_type),
             "ExecutionRoleArn": execution_role(account_id),
             "ApprovalModel": self.approval_model,
-            "Status": ACTION_STATUS_STANDBY,
+            "Status": self.created_status(),
             "Subscribers": subscribers(self.subscriber_count),
         })
     }
@@ -452,7 +470,7 @@ async fn creating_an_action_records_one_create_action_event() {
         );
         assert_eq!(
             record.get("Status").and_then(Value::as_str),
-            Some(ACTION_STATUS_STANDBY),
+            Some(row.created_status()),
             "case {}: expected the status at the time of the event, got {record}",
             row.case
         );
@@ -690,8 +708,8 @@ async fn executing_an_action_records_one_execute_action_event() {
     }
     assert_eq!(
         records[0].get("Status").and_then(Value::as_str),
-        Some(ACTION_STATUS_STANDBY),
-        "case approve: expected the create record to keep the armed status, got {}",
+        Some(row.created_status()),
+        "case approve: expected the create record to keep the status the create left, got {}",
         records[0]
     );
 }

@@ -23,6 +23,8 @@ mod attached_notification_identity;
 mod budget_action_execution;
 #[path = "all/budget_action_execution_role.rs"]
 mod budget_action_execution_role;
+#[path = "all/budget_action_execution_role_trust.rs"]
+mod budget_action_execution_role_trust;
 #[path = "all/budget_action_history.rs"]
 mod budget_action_history;
 #[path = "all/budget_action_lifecycle.rs"]
@@ -69,6 +71,10 @@ mod calculated_spend;
 mod client_error_envelopes;
 #[path = "all/create_resource_tag_keys.rs"]
 mod create_resource_tag_keys;
+#[path = "all/created_action_trigger_status.rs"]
+mod created_action_trigger_status;
+#[path = "all/dead_notification_subscriber_reads.rs"]
+mod dead_notification_subscriber_reads;
 #[path = "all/default_page_sizes.rs"]
 mod default_page_sizes;
 #[path = "all/empty_collection_selections.rs"]

@@ -42,12 +42,12 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::ops::types::{
 };
 use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     ACTION_SETTLES_AFTER, ACTION_STATUS_EXECUTION_IN_PROGRESS, ACTION_STATUS_EXECUTION_SUCCESS,
-    ACTION_STATUS_STANDBY, EXECUTION_TYPE_APPROVE, MAX_ACTIONS_PER_BUDGET,
+    EXECUTION_TYPE_APPROVE, MAX_ACTIONS_PER_BUDGET,
 };
 
 use super::budget_action_execution::{
-    create_body, definition_for, describe_action, email_subscriber, execute_action, is_action_id,
-    seed_action, seed_budget, sns_subscriber,
+    create_body, created_status, definition_for, describe_action, email_subscriber, execute_action,
+    is_action_id, seed_action, seed_budget, sns_subscriber,
 };
 use super::budget_lifecycle::{caller_account, call, is_error, router, same};
 
@@ -268,8 +268,9 @@ async fn the_list_reports_every_action_of_the_budget_as_a_read_reports_it() {
                 read["Action"]
             );
             assert!(
-                same(&action["Status"], &json!(ACTION_STATUS_STANDBY)),
-                "case {case:?}: expected a created action to be listed as armed, got {}",
+                same(&action["Status"], &json!(created_status(action))),
+                "case {case:?}: expected a created action to be listed with the status its \
+                 trigger threshold gives it, got {}",
                 action["Status"]
             );
         }
@@ -539,8 +540,9 @@ async fn the_list_reports_the_status_the_clock_owes() {
             let expected = if position == target {
                 ACTION_STATUS_EXECUTION_IN_PROGRESS
             } else {
-                ACTION_STATUS_STANDBY
+                created_status(action)
             };
+
             assert!(
                 same(&action["Status"], &json!(expected)),
                 "case {case:?}: expected position {position} to be listed as {expected}, got {}",
@@ -562,7 +564,7 @@ async fn the_list_reports_the_status_the_clock_owes() {
             let expected = if position == target {
                 ACTION_STATUS_EXECUTION_SUCCESS
             } else {
-                ACTION_STATUS_STANDBY
+                created_status(action)
             };
             assert!(
                 same(&action["Status"], &json!(expected)),

@@ -11,8 +11,9 @@
 //!
 //! 1. The subscribers reported are exactly the list stored for the notification of the
 //!    budget the request addresses — the account, the budget name and what the
-//!    notification alerts on together — in stored order; a triple the store does not
-//!    hold is `NotFoundException`, never another triple's subscribers.
+//!    notification alerts on together — in stored order; a notification that budget does
+//!    not hold holds no subscribers, which is the empty set the read reports by leaving
+//!    `Subscribers` out, and a budget the account does not hold is `NotFoundException`.
 //! 2. The page size and the continuation token are the modelled ones: a `MaxResults`
 //!    inside the published `@range` caps a page and the pages concatenate to the stored
 //!    list, one past either published bound is refused at request validation, a
@@ -149,8 +150,9 @@ struct Scope {
 }
 
 /// RULE 1: the subscribers reported are exactly those stored for the notification of the
-/// budget the request addresses, in stored order — and a triple the store does not hold
-/// is `NotFoundException`, not another triple's subscribers.
+/// budget the request addresses, in stored order — a notification the budget does not hold
+/// reports no subscribers rather than another notification's, and a budget the account
+/// does not hold is `NotFoundException`.
 ///
 /// The rows span what the addressing generalises over: one account holding two budgets,
 /// each budget holding a different subset of the notification catalog, every cell with
@@ -222,13 +224,17 @@ async fn subscribers_are_reported_for_the_addressed_notification_only() {
                     "case {case:?}: a whole list leaves nothing to continue, got {body}"
                 );
             } else {
+                // A notification this budget does not hold holds no subscribers, which is
+                // the EMPTY set this read reports by leaving `Subscribers` out — the list
+                // is `@length(min: 1)`, so no empty list can be serialized for it.
                 assert_eq!(
-                    status, 400,
-                    "case {case:?}: expected the refusal at 400, got {status} {body}"
+                    status, 200,
+                    "case {case:?}: expected 200 for a notification the budget does not \
+                     hold, got {status} {body}"
                 );
                 assert!(
-                    is_error(&body, "NotFoundException"),
-                    "case {case:?}: expected NotFoundException, got {body}"
+                    body.get("Subscribers").is_none_or(Value::is_null),
+                    "case {case:?}: expected no Subscribers member, got {body}"
                 );
             }
         }

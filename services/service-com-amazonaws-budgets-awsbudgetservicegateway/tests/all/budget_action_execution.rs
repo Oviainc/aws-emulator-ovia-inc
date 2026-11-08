@@ -129,6 +129,34 @@ pub(crate) fn definition_for(action_type: &str) -> Value {
     }
 }
 
+/// The `ActionStatus` a freshly created action carries, read off the action as it was
+/// created (either the request body or the `Action` a read reports).
+///
+/// A created action is ARMED (`STANDBY`) while the spend the budget tracks has not reached
+/// the threshold that triggers it, and `PENDING` once that spend has reached it AND the
+/// action's execution needs the manual approval its `ApprovalModel` asks for. Three facts
+/// about this emulator decide that for the rows below: nothing spends behind a budget, so
+/// every budget here reports an ACTUAL spend of zero; no forecast is reported at all, so a
+/// `FORECASTED` action watches a figure the budget does not state and nothing has reached
+/// its threshold; and nothing performs an action's execution, so an `AUTOMATIC` action is
+/// left armed. A `MANUAL` `ACTUAL` action at a threshold of zero — the `@range(min: 0)` of
+/// `NotificationThreshold`, which is also `ActionThresholdValue`'s documented default
+/// (`smithy_query(query="shape",shape="ActionThreshold")`) — is therefore the one created
+/// action waiting for its approval. Stated for a budget that reports a limit, which every
+/// budget these suites seed does.
+pub(crate) fn created_status(action: &Value) -> &'static str {
+    let threshold = action["ActionThreshold"]["ActionThresholdValue"]
+        .as_f64()
+        .unwrap_or_default();
+    let watches_actual_spend = action["NotificationType"] == json!("ACTUAL");
+    let needs_approval = action["ApprovalModel"] == json!("MANUAL");
+    if watches_actual_spend && needs_approval && threshold <= 0.0 {
+        "PENDING"
+    } else {
+        "STANDBY"
+    }
+}
+
 /// An email subscriber; `Address` satisfies `SubscriberAddress`'s `@length(min: 1)` and
 /// its "can't contain line breaks" rule.
 pub(crate) fn email_subscriber(n: usize) -> Value {

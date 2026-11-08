@@ -3,12 +3,19 @@
 //! @op CreateBudgetAction
 //!
 //! Persists a new budget action on the budget it names, under the UUID `ActionId` this
-//! operation mints for it, and leaves it in `ActionStatus$STANDBY` — armed, waiting for
-//! its threshold. `Action$ActionType` determines which member of `Definition` describes
+//! operation mints for it, and leaves it in the status this service's reading of its
+//! trigger threshold gives it ([`crate::state::created_action_status`]):
+//! `ActionStatus$STANDBY` — armed, waiting for its threshold — while the spend the action
+//! watches has not reached that threshold, and `ActionStatus$PENDING` where it has and the
+//! action's execution needs the manual approval its `ApprovalModel` asks for.
+//! `Action$ActionType` determines which member
+//! of `Definition` describes
 //! the work, so a mismatch is an `InvalidParameterException`
 //! ([`crate::state::validate_action_definition`]); an `ExecutionRoleArn` naming a role
 //! outside the account the action is created in is another
-//! ([`crate::state::validate_execution_role_account`]); a subscriber set past the
+//! ([`crate::state::validate_execution_role_account`]), and one naming a role this
+//! account's IAM cannot let this service assume is the modelled `AccessDeniedException`
+//! ([`crate::state::execution_role`]); a subscriber set past the
 //! documented per-type split is the subscriber limit `CreationLimitExceededException`
 //! names ([`crate::state::subscriber_limit_violation`]); a `ResourceTags` list naming one
 //! key twice is an `InvalidParameterException` again, since "each key must be unique for
@@ -198,7 +205,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // The budgets control plane is scoped to the account the caller signed with, so
         // an `AccountId` naming any other account is refused with the modelled 403
         // before anything is read or written (`crate::state::foreign_account_refusal`).
@@ -302,6 +308,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
+        // A budget action is executed and reverted AS the role it names, so that role is
+        // resolved against the account's IAM records BEFORE anything is persisted
+        // ([`crate::state::execution_role`]): an action whose role this service cannot
+        // assume could never run, so it is refused rather than created. Asked here,
+        // before the store is locked, because the answer comes from another service.
+        if let Some(message) =
+            crate::state::execution_role::unassumable_refusal(ctx, &input.execution_role_arn).await
+        {
+            return Err(CreateBudgetActionErrorModeled::AccessDeniedException(
+                AccessDeniedException {
+                    message: Some(message),
+                },
+            )
+            .into());
+        }
+
         let now = ::std::time::SystemTime::now();
         let mut store = crate::state::store_at(&state, now);
         // An action is a resource OF the budget it names (`Action$BudgetName`), so the
@@ -336,6 +358,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // "A system-generated universally unique identifier (UUID) for the action"
         // (`Action$ActionId`) — minted here, never taken from the request.
         let action_id = ::uuid::Uuid::new_v4().to_string();
+        // The status the created action carries is this service's reading of the action's
+        // trigger threshold against the figures the budget reads back with, under the
+        // approval the request asked for ([`crate::state::created_action_status`]), so it
+        // is decided from the budget as a read reports it rather than from the record as
+        // stored.
+        let status = crate::state::created_action_status(
+            &crate::state::project_budget(stored, now),
+            &input.notification_type,
+            &input.action_threshold,
+            &input.approval_model,
+        )
+        .to_string();
         let action = Action {
             action_id: action_id.clone(),
             budget_name: input.budget_name.clone(),
@@ -345,11 +379,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             definition: input.definition,
             execution_role_arn: input.execution_role_arn,
             approval_model: input.approval_model,
-            // The one member of an action the SERVICE owns rather than the caller. A
-            // created action is armed and waiting for its threshold, which is
-            // `STANDBY`; the statuses past it are reached by `ExecuteBudgetAction`,
-            // since no spend in this emulator ever crosses an action threshold.
-            status: crate::state::ACTION_STATUS_STANDBY.to_string(),
+            // The one member of an action the SERVICE owns rather than the caller: the
+            // service's own reading of the threshold the action triggers on, under the
+            // approval its `ApprovalModel` asks for
+            // ([`crate::state::created_action_status`]) — armed (`STANDBY`) while the spend
+            // it watches has not reached that threshold, and `PENDING` where it has and
+            // that execution needs approving. The statuses past those are reached by
+            // `ExecuteBudgetAction`, since no spend in this emulator ever moves.
+            status,
             // The subscribers of an action are the same modelled `Subscribers` set a
             // notification holds, keyed by subscription type and address, so a repeat in
             // the supplied list names a subscriber the set already holds and is collapsed

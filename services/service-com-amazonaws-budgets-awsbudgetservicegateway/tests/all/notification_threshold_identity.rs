@@ -420,13 +420,13 @@ async fn a_notification_names_itself_whatever_its_threshold() {
         let (status, body) =
             subscribers_of(&router, &account_id, &budget_name, &row.notification).await;
         assert_eq!(
-            status, REFUSAL_STATUS,
-            "case {case:?}: expected the threshold it was moved off to name nothing, \
+            status, 200,
+            "case {case:?}: expected the threshold it was moved off to be readable, \
              got {status} {body}"
         );
         assert!(
-            is_error(&body, "NotFoundException"),
-            "case {case:?}: expected NotFoundException for the threshold it left, got {body}"
+            body.get("Subscribers").is_none_or(Value::is_null),
+            "case {case:?}: expected the threshold it left to hold no subscribers, got {body}"
         );
         let (status, body) =
             subscribers_of(&router, &account_id, &budget_name, &row.moved_to).await;

@@ -42,11 +42,11 @@ use std::time::Duration;
 
 use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
     ACTION_SETTLES_AFTER, ACTION_STATUS_EXECUTION_IN_PROGRESS, ACTION_STATUS_EXECUTION_SUCCESS,
-    ACTION_STATUS_STANDBY, EXECUTION_TYPE_APPROVE, MAX_ACTIONS_PER_BUDGET,
+    EXECUTION_TYPE_APPROVE, MAX_ACTIONS_PER_BUDGET,
 };
 
 use super::budget_action_execution::{
-    describe_action, execute_action, seed_budget, simple_create_body,
+    created_status, describe_action, execute_action, seed_budget, simple_create_body,
 };
 use super::budget_actions_for_budget::{action_rows, create_action, ids_of, list_actions};
 use super::budget_lifecycle::{account, caller_account, call, is_error, router, same};
@@ -225,8 +225,12 @@ async fn the_account_list_reports_every_action_of_every_budget_in_budget_name_or
                 served[position]
             );
             assert!(
-                same(&served[position]["Status"], &json!(ACTION_STATUS_STANDBY)),
-                "case {case:?}: expected a created action to be listed as armed, got {}",
+                same(
+                    &served[position]["Status"],
+                    &json!(created_status(&served[position]))
+                ),
+                "case {case:?}: expected a created action to be listed with the status its \
+                 trigger threshold gives it, got {}",
                 served[position]["Status"]
             );
             position += 1;
@@ -556,7 +560,7 @@ async fn the_account_list_reports_the_status_the_clock_owes() {
             let want = if position == target {
                 ACTION_STATUS_EXECUTION_IN_PROGRESS
             } else {
-                ACTION_STATUS_STANDBY
+                created_status(action)
             };
             assert!(
                 same(&action["Status"], &json!(want)),
@@ -583,7 +587,7 @@ async fn the_account_list_reports_the_status_the_clock_owes() {
             let want = if position == target {
                 ACTION_STATUS_EXECUTION_SUCCESS
             } else {
-                ACTION_STATUS_STANDBY
+                created_status(action)
             };
             assert!(
                 same(&action["Status"], &json!(want)),

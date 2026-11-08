@@ -7,7 +7,9 @@
 //! action's history. Reports the action as it was before the call (`OldAction`) and as
 //! it is after it (`NewAction`). A replacement `Definition` must match the type the
 //! action was created with, a replacement `ExecutionRoleArn` must name a role in the
-//! account the action lives in ([`crate::state::validate_execution_role_account`]), and a
+//! account the action lives in ([`crate::state::validate_execution_role_account`]) that
+//! this service can assume ([`crate::state::execution_role`] — refused with the modelled
+//! `AccessDeniedException`), and a
 //! replacement `Subscribers` set is held to the same per-type split as a create's
 //! ([`crate::state::subscriber_limit_violation`]); each is refused with
 //! `InvalidParameterException`, the client-error this operation models.
@@ -182,7 +184,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
         // The budgets control plane is scoped to the account the caller signed with, so
         // an `AccountId` naming any other account is refused with the modelled 403
         // before anything is read or written (`crate::state::foreign_account_refusal`).
@@ -225,6 +226,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                         },
                     )
                 })?;
+            // A replacement role is the role the action would be executed and reverted AS,
+            // so it is resolved against the account's IAM records exactly as the role a
+            // create establishes is ([`crate::state::execution_role`]): a role this
+            // service cannot assume is refused with the modelled `AccessDeniedException`
+            // and the stored action keeps the role it had.
+            if let Some(message) =
+                crate::state::execution_role::unassumable_refusal(ctx, execution_role_arn).await
+            {
+                return Err(UpdateBudgetActionErrorModeled::AccessDeniedException(
+                    AccessDeniedException {
+                        message: Some(message),
+                    },
+                )
+                .into());
+            }
         }
 
         // A replacement subscriber set is held to the same per-type split as the set a

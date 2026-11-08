@@ -587,8 +587,9 @@ async fn what_a_notification_alerts_on_is_its_identity() {
 
 /// RULE 3: a notification belongs to a budget — "you must create the budget before you
 /// create the associated notification" — so a call naming a budget the account does not
-/// hold is refused with `NotFoundException` and stores nothing. The same holds for
-/// reading the subscribers of a notification that is not there.
+/// hold is refused with `NotFoundException` and stores nothing. Reading the subscribers of
+/// a notification THAT budget does not hold is not such a call: the notification holds no
+/// subscribers, which the read reports as the empty set.
 ///
 /// The rows differ along WHAT is missing: the budget name, and the notification itself.
 #[tokio::test]
@@ -634,15 +635,6 @@ async fn a_notification_needs_the_budget_that_owns_it() {
             }),
         ),
         (
-            "read subscribers of a notification the budget does not hold",
-            "DescribeSubscribersForNotification",
-            json!({
-                "AccountId": &account_id,
-                "BudgetName": name,
-                "Notification": &absent
-            }),
-        ),
-        (
             "read subscribers for a budget that does not exist",
             "DescribeSubscribersForNotification",
             json!({
@@ -662,6 +654,31 @@ async fn a_notification_needs_the_budget_that_owns_it() {
             "case {case:?}: expected NotFoundException, got {body}"
         );
     }
+
+    // The notification the budget does not hold is the OTHER half of the rule: the budget
+    // exists, so there is a subscriber set to report for the notification addressed, and
+    // that set is empty — `Subscribers` is `@length(min: 1)`, so the empty set is the
+    // member left out.
+    let (status, body) = call(
+        &router,
+        "DescribeSubscribersForNotification",
+        &json!({
+            "AccountId": &account_id,
+            "BudgetName": name,
+            "Notification": &absent
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 200,
+        "case \"read subscribers of a notification the budget does not hold\": expected 200, \
+         got {status} {body}"
+    );
+    assert!(
+        body.get("Subscribers").is_none_or(Value::is_null),
+        "case \"read subscribers of a notification the budget does not hold\": expected no \
+         Subscribers member, got {body}"
+    );
 
     // Nothing the refusals named was created: the budget still holds exactly the one
     // notification, and no budget was brought into being by a refused call.
@@ -873,7 +890,9 @@ async fn a_notification_holds_at_most_the_documented_subscribers_of_each_type() 
                     is_error(&body, exception),
                     "case {case:?}: expected {exception}, got {body}"
                 );
-                // A refused create stores nothing: the notification is not there.
+                // A refused create stores nothing: the notification is not there, so the
+                // read of its subscribers reports the empty set (`Subscribers` is
+                // `@length(min: 1)`, so the empty set is the member left out).
                 let (status, body) = call(
                     &router,
                     "DescribeSubscribersForNotification",
@@ -885,7 +904,7 @@ async fn a_notification_holds_at_most_the_documented_subscribers_of_each_type() 
                 )
                 .await;
                 assert!(
-                    status == 400 && is_error(&body, "NotFoundException"),
+                    status == 200 && body.get("Subscribers").is_none_or(Value::is_null),
                     "case {case:?}: expected a refused create to store nothing, \
                      got {status} {body}"
                 );

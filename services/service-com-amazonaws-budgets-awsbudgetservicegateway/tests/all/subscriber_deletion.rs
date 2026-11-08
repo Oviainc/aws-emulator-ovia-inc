@@ -388,18 +388,19 @@ async fn a_delete_removes_only_the_named_subscriber() {
             );
 
             if expected.is_empty() {
-                // The last subscriber took its notification with it, so there is nothing
-                // left to read subscribers from.
+                // The last subscriber took its notification with it, so the read reports
+                // the empty subscriber set that notification now has: `Subscribers` is
+                // `@length(min: 1)`, so the empty set is the member left out.
                 let (status, body) =
                     read_subscribers(&router, &account_id, &budget_name, &catalog[target]).await;
                 assert_eq!(
-                    status, 400,
-                    "case {case:?}: expected the emptied notification to be gone, \
-                     got {status} {body}"
+                    status, 200,
+                    "case {case:?}: expected the emptied notification to read as an empty \
+                     subscriber set, got {status} {body}"
                 );
                 assert!(
-                    is_error(&body, "NotFoundException"),
-                    "case {case:?}: expected NotFoundException reading an emptied \
+                    body.get("Subscribers").is_none_or(Value::is_null),
+                    "case {case:?}: expected no Subscribers member for an emptied \
                      notification, got {body}"
                 );
             } else {

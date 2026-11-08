@@ -4,9 +4,11 @@
 //!
 //! Reports the subscribers stored for ONE notification of a budget, a page at a time.
 //! The notification is addressed by what it alerts on
-//! ([`crate::state::same_notification`]), since it carries no id; a budget this
-//! account does not hold, and a notification that budget does not hold, are both
-//! `NotFoundException`. This is a pure read: nothing about the budget changes.
+//! ([`crate::state::same_notification`]), since it carries no id; a budget this account
+//! does not hold is `NotFoundException`, while a notification that budget does not hold
+//! holds no subscribers, which is the EMPTY set this read reports by leaving the
+//! optional `Subscribers` member out — the list is `@length(min: 1)`, so no empty list
+//! can be serialized for it. This is a pure read: nothing about the budget changes.
 //!
 //! ## Shape of an operation
 //!
@@ -209,21 +211,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     },
                 )
             })?;
-        let held = crate::state::find_notification(stored, &input.notification).ok_or_else(|| {
-            DescribeSubscribersForNotificationErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "Unable to get subscribers: {} - the notification doesn't exist.",
-                    input.budget_name
-                )),
-            })
-        })?;
+        // A notification carries no subscribers of its own once the budget no longer
+        // holds it — a notification exists only as the set of subscribers attached to it
+        // (`Subscribers` is `@length(min: 1)`, so deleting the last one takes the
+        // notification with it) — so this read reports the subscribers the addressed
+        // notification has, which for one the budget does not hold is NONE. The read
+        // itself succeeds: only the budget has to exist for there to be a set to report.
+        let subscribers = crate::state::find_notification(stored, &input.notification)
+            .map(|held| held.subscribers.clone())
+            .unwrap_or_default();
 
         // `MaxResults` documents no default here, so an absent one is served the biggest
         // page this operation can report: its own `@range(max: 100)`
         // ([`crate::state::MAX_RESULTS_CEILING`]), which is at least the `@length(max)`
         // of the `Subscribers` list being paged.
         let (page, next_token) = crate::state::page(
-            &held.subscribers,
+            &subscribers,
             crate::state::page_size(
                 input.max_results,
                 None,
@@ -240,7 +243,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         })?;
 
         Ok(DescribeSubscribersForNotificationOutput {
-            subscribers: Some(page),
+            // `Subscribers` is optional and `@length(min: 1)`: an empty subscriber set is
+            // therefore reported by omitting the member, never as an empty list the
+            // modelled list does not admit.
+            subscribers: (!page.is_empty()).then_some(page),
             next_token,
         })
     }

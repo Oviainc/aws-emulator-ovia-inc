@@ -46,8 +46,8 @@ use service_com_amazonaws_budgets_awsbudgetservicegateway::state::{
 };
 
 use super::budget_action_execution::{
-    create_body, definition_for, describe_action, email_subscriber, execute_action, is_action_id,
-    seed_action, seed_budget, seed_status, sns_subscriber,
+    create_body, created_status, definition_for, describe_action, email_subscriber, execute_action,
+    is_action_id, seed_action, seed_budget, seed_status, sns_subscriber,
 };
 use super::budget_lifecycle::{caller_account, call, is_error, router, router_with_engine, same};
 
@@ -205,7 +205,7 @@ fn supplied_tags(create: &Value) -> Vec<(String, String)> {
 
 /// RULE 1: the delete removes the action its id names and reports it as it stood — the
 /// same `Action` `DescribeBudgetAction` reported an instant earlier, with the minted
-/// `ActionId` and the armed `STANDBY` status the create left it in. Afterwards no read
+/// `ActionId` and the status the create left it in. Afterwards no read
 /// locates it and a second delete is refused with `NotFoundException`.
 ///
 /// Every row of the action table is one case, so the rule holds across action types and
@@ -230,8 +230,9 @@ async fn deleting_an_action_reports_what_went_away_and_leaves_nothing_behind() {
             "case {case:?}: expected the created action to be readable, got {status} {read}"
         );
         assert!(
-            same(&read["Action"]["Status"], &json!(ACTION_STATUS_STANDBY)),
-            "case {case:?}: expected a created action to be armed, got {}",
+            same(&read["Action"]["Status"], &json!(created_status(&create))),
+            "case {case:?}: expected a created action to carry the status its trigger \
+             threshold gives it, got {}",
             read["Action"]["Status"]
         );
         // The tags supplied with the action are persisted with it, which

@@ -46,6 +46,11 @@ hex = { workspace = true }
 # SNS is mounted beside budgets on one engine in the alert-delivery suite, because a
 # budget alert is asserted where a client sees it: on the topic the subscriber named.
 service-com-amazonaws-sns-amazonsimplenotificationservice = { workspace = true }
+# IAM is mounted beside budgets on one engine in the execution-role suite, because the
+# role a budget action is written with exists only if IAM answers for it — and the roles
+# that suite creates are created through IAM's own operations, over this client.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+aws-sdk-iam = { version = "1", default-features = false }
 
 [lints]
 workspace = true

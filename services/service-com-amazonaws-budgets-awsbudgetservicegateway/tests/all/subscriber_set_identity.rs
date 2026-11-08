@@ -648,12 +648,20 @@ async fn the_per_type_limits_count_distinct_subscribers() {
                     is_error(&body, expected),
                     "case {case:?}: expected {expected}, got {body}"
                 );
+                // A refused create stored no notification, so the read of that
+                // notification's subscribers reports the empty set: `Subscribers` is
+                // `@length(min: 1)`, so the empty set is the member left out.
                 let (status, reported) =
                     reported_subscribers(&router, &account_id, budget_name, &notification).await;
                 assert_eq!(
-                    status, REFUSAL_STATUS,
+                    status, 200,
+                    "case {case:?}: expected the read of a notification no refused create \
+                     stored to answer 200, got {status} {reported}"
+                );
+                assert!(
+                    reported.is_null(),
                     "case {case:?}: expected a refused create to store no notification, \
-                     got {status} {reported}"
+                     got {reported}"
                 );
             }
         }
