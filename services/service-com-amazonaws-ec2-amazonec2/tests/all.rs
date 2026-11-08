@@ -15,14 +15,13 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
-// What `DescribeAccountAttributes` reports about the ACCOUNT: every attribute the operation
-// documents with the value the account holds for it, `default-vpc` asserted against the VPC
-// the same Region's `DescribeVpcs` reports, the narrowing `AttributeNames` does, and the
-// refusals for a name that is no account attribute and for a dry run. Declared beside
+// What `DescribeBundleTasks` reports out of the bundle-task store: every member of a stored
+// task, the ids and the published filters that narrow the report, the bounds on a request's
+// match, the dry-run answer, and that describing writes nothing. Declared beside
 // `prefix_lists` for the reason the note above gives: the sorted neighbourhood and the tail
 // of this file are where every new ec2 suite inserts its lines.
-#[path = "all/account_attributes.rs"]
-mod account_attributes;
+#[path = "all/bundle_tasks.rs"]
+mod bundle_tasks;
 // The VPC Block Public Access OPTIONS of one Region: the mode
 // `ModifyVpcBlockPublicAccessOptions` puts it into, the default a Region no modify was made
 // for reports, the clock-owed `update-in-progress` -> `update-complete` move, and what each
@@ -75,8 +74,6 @@ mod published_amazon_linux_catalog;
 // `EnableSerialConsoleAccess` and `DisableSerialConsoleAccess` move and
 // `GetSerialConsoleAccessStatus` reports, with the `ManagedBy` every value carries and the
 // `DryRun` each of the three refuses without writing. Declared beside `prefix_lists` for the
-// reason the note above gives: the sorted neighbourhood and the tail of this file are where
-// every new ec2 suite inserts its lines.
 #[path = "all/serial_console_access.rs"]
 mod serial_console_access;
 // What `ModifyNetworkInterfaceAttribute` writes onto one stored network interface and what
@@ -89,8 +86,6 @@ mod modify_network_interface_attribute;
 // and read back through `DescribeNetworkAcls`: the one association the moved subnet is left
 // with, the new association id the call answers and the next move names, the cross-VPC
 // pairing it refuses, and the ids and dry run that move nothing. Declared beside
-// `prefix_lists` for the reason the note above gives: the sorted neighbourhood and the tail
-// of this file are where every new ec2 suite inserts its lines.
 #[path = "all/replace_network_acl_association.rs"]
 mod replace_network_acl_association;
 // What `CreateDefaultVpc` creates and what it refuses: the default VPC of the Region the
@@ -1599,12 +1594,6 @@ mod verified_access_trust_provider_attachment;
 // `DescribeSecurityGroupRules` and the group's aggregated permissions. Declared beside
 #[path = "all/modify_security_group_rules.rs"]
 mod modify_security_group_rules;
-// The published instance-type catalog every call that PLACES an instance is held to: a launch,
-// a Spot Instance request, one pool of a Spot Fleet request and a launch template's own data
-// each refuse a type the service does not publish, naming the value. Declared at the tail of
-// this file, which is where every new ec2 suite inserts its lines.
-#[path = "all/launch_instance_type_catalog.rs"]
-mod launch_instance_type_catalog;
 // WHO may drive EC2's account-wide `Describe` reads: the identity-based IAM policies in
 // force on the principal a request's credential speaks for, decided over every resource —
 // the gate the CDK context providers' lookup role is served and refused through. Declared
@@ -1616,3 +1605,14 @@ mod account_wide_read_authorization;
 // reported it, and every sibling left as resolvable as it was. Declared beside
 #[path = "all/delete_launch_template_resolution.rs"]
 mod delete_launch_template_resolution;
+// What `DescribeAccountAttributes` reports about the ACCOUNT: every attribute the operation
+// documents with the value the account holds for it, `default-vpc` asserted against the VPC
+// the same Region's `DescribeVpcs` reports, the narrowing `AttributeNames` does, and the
+// refusals for a name that is no account attribute and for a dry run. Declared beside
+#[path = "all/account_attributes.rs"]
+mod account_attributes;
+// The published instance-type catalog every call that PLACES an instance is held to: a launch,
+// a Spot Instance request, one pool of a Spot Fleet request and a launch template's own data
+// each refuse a type the service does not publish, naming the value. Declared at the tail of
+#[path = "all/launch_instance_type_catalog.rs"]
+mod launch_instance_type_catalog;

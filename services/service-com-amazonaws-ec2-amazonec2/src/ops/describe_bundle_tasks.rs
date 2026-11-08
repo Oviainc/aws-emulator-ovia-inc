@@ -1,15 +1,12 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeBundleTasks
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeBundleTasks`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeBundleTasks::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Reports the bundle tasks the account holds, out of
+//! [`crate::state::ComAmazonawsEc2Amazonec2State::bundle_tasks`] — narrowed by the
+//! `BundleIds` and the published `Filters` the request names, and by nothing else. This is a
+//! READ: a bundle task is stored as the modelled shape every report of one answers with, so
+//! reporting one writes nothing and cannot change what a later caller sees.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +144,240 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeBundleTasks` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeBundleTasksErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        use crate::scaffolded::Scaffolded;
+        use crate::state::{
+            CompiledFilter, MAX_FILTER_MATCH_STEPS, MAX_FILTER_VALUE_BYTES, MAX_FILTER_VALUES,
+            MAX_FILTERS, MAX_RESOURCE_IDS, MatchBudget, matches_every_filter,
+            require_service_state,
+        };
+
+        // `ctx` carries request metadata only; this operation reads none of it — a bundle
+        // task's modelled shape names no Region. The store is reached through the engine
+        // held on `self`.
+        let _ = ctx;
+
+        // Read in place for the cap, which is asked before anything proportional to the ids
+        // is done; they are collected once below, for the lookups.
+        let requested_ids: &[String] = input.bundle_ids.as_deref().unwrap_or_default();
+        if requested_ids.len() > MAX_RESOURCE_IDS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "BundleIds carries {} ids, above the maximum of {MAX_RESOURCE_IDS}",
+                requested_ids.len()
+            )));
+        }
+
+        // Matching cost is filters x values x held values x stored tasks, and the model
+        // bounds none of those, so the request-controlled factors are capped here, before
+        // any work proportional to them is done — and their PRODUCT is charged to ONE
+        // [`MatchBudget`] below, which is the bound the per-factor caps cannot give.
+        let supplied_filters = input.filters.as_ref().map_or(0, Vec::len);
+        if supplied_filters > MAX_FILTERS {
+            return Err(Scaffolded::invalid_parameter_value(format!(
+                "The request carries {supplied_filters} filters, above the maximum \
+                 of {MAX_FILTERS}"
+            )));
+        }
+
+        // A filter name outside the list this operation publishes is refused whether or not
+        // any bundle task would have matched it, so a misspelling can never read as "no
+        // bundle tasks" — the shape every describe of this crate whose `Filters` member
+        // publishes its own list of names takes.
+        let filters: &[Filter] = input.filters.as_deref().unwrap_or_default();
+        let mut selectors: Vec<CompiledFilter> = Vec::with_capacity(filters.len());
+        for filter in filters {
+            let name = filter.name.as_deref().unwrap_or_default();
+            if !BUNDLE_TASK_FILTERS.contains(&name) {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' is invalid"
+                )));
+            }
+            let values = filter.values.as_deref().unwrap_or_default();
+            if values.len() > MAX_FILTER_VALUES {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "The filter '{name}' carries {} values, above the maximum of \
+                     {MAX_FILTER_VALUES}",
+                    values.len()
+                )));
+            }
+            // A capped NUMBER of comparisons is not capped WORK: the matcher's cost is the
+            // product of the pattern's length and the value's, so each value's size is
+            // bounded too, before any matching runs under the lock.
+            if let Some(oversize) = values
+                .iter()
+                .find(|value| value.len() > MAX_FILTER_VALUE_BYTES)
+            {
+                return Err(Scaffolded::invalid_parameter_value(format!(
+                    "A value of the filter '{name}' carries {} bytes, above the maximum of \
+                     {MAX_FILTER_VALUE_BYTES}",
+                    oversize.len()
+                )));
+            }
+            selectors.push(CompiledFilter::new(name.to_string(), values.to_vec()));
+        }
+
+        // DryRun sits AFTER every parameter has been validated: the flag asks whether the
+        // request WOULD have succeeded, so one that would have been refused is refused with
+        // that reason instead.
+        if input.dry_run == Some(true) {
+            return Err(Scaffolded::dry_run_operation());
+        }
+
+        // "The bundle task IDs" (`DescribeBundleTasksRequest$BundleIds`) NARROW the report —
+        // "default: describes all your bundle tasks" — but an id this account holds no bundle
+        // task for is REFUSED rather than reported as an empty selection: EC2 answers
+        // `InvalidBundleID.NotFound`, naming every id at fault, the way it answers
+        // `InvalidInstanceID.NotFound` for an instance id a describe names and the account
+        // does not hold. That is what the recorded behaviour of the real service shows: the
+        // corpus unit `ec2.op-contract-describeBundleTasks` names a bundle id no account holds
+        // and AWS answers that code, not an empty `bundleInstanceTasksSet`.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeBundleTasks"))
+        // The ids go into a SET as well, so narrowing one stored task is a logarithmic lookup
+        // rather than a scan of up to `MAX_RESOURCE_IDS` ids per task under the state lock.
+        let requested_ids: Vec<&str> = requested_ids.iter().map(String::as_str).collect();
+        let named_ids: ::std::collections::BTreeSet<&str> =
+            requested_ids.iter().copied().collect();
+
+        let state = require_service_state(&*self.engine)?;
+        let store = state.lock();
+
+        // Every id the request named must resolve, and it is asked BEFORE any filter is
+        // evaluated: whether the account holds the task is not a question the filters narrow,
+        // so a request naming an id that resolves to nothing is refused whatever else it
+        // carries.
+        let unresolved = store.unresolved_bundle_ids(&requested_ids);
+        if !unresolved.is_empty() {
+            return Err(crate::state::invalid_bundle_ids(&unresolved));
+        }
+
+        // Every comparison is charged to ONE budget — one step per task as well, so even an
+        // unfiltered scan is counted — so the PRODUCT of stored tasks, filters, values, held
+        // values and value length is bounded however the caller combines them, which is also
+        // what bounds how long this holds the state lock.
+        //
+        // This loop only READS: a bundle task is stored as the modelled shape every report
+        // of one answers with, so reporting it stores nothing and cannot change what a later
+        // caller sees.
+        let mut budget = MatchBudget::new(MAX_FILTER_MATCH_STEPS);
+        let mut selected: Vec<BundleTask> = Vec::new();
+        // Whether the scan stopped before it had looked at every task. A budget spent while
+        // the LAST task was being compared leaves a COMPLETE answer, so incompleteness is
+        // recorded where it happens rather than inferred from the spent budget afterwards.
+        let mut stopped_early = false;
+        for (bundle_id, task) in &store.bundle_tasks {
+            if budget.exhausted() {
+                stopped_early = true;
+                break;
+            }
+            // The id narrowing is read off the stored key, so a task the request did not
+            // name costs no comparison at all.
+            if !named_ids.is_empty() && !named_ids.contains(bundle_id.as_str()) {
+                continue;
+            }
+            // The AND/OR rule EC2 defines for every `Filters` member is evaluated by the one
+            // shared evaluator; only the per-operation lookup is local.
+            if matches_every_filter(&selectors, &mut budget, &|name| filter_values(task, name)) {
+                selected.push(task.clone());
+            }
+        }
+        // A scan that stopped before the end answers an INCOMPLETE set, and so does one whose
+        // budget was spent WHILE the last task was being compared — the shared evaluator
+        // reports an aborted comparison as a non-match, which must not read as a genuine one.
+        // Neither is something to report as a result: the request asked for more filtering
+        // than one call will do, and is told so rather than given a silently truncated set.
+        // This operation models no page size to narrow with, so the refusal names the
+        // filters.
+        if stopped_early || budget.exhausted() {
+            return Err(Scaffolded::request_limit_exceeded(format!(
+                "The request's filters would take more than {MAX_FILTER_MATCH_STEPS} \
+                 comparisons to evaluate; narrow them or name the bundle tasks to describe"
+            )));
+        }
+
+        // Reported in `BundleId` order: the store is an ordered map, so its iteration order
+        // already satisfies this, and two calls therefore report one set the same way —
+        // which this operation's own doc allows but does not require ("the order of the
+        // elements in the response, including those within nested structures, might vary").
+        Ok(DescribeBundleTasksOutput {
+            bundle_tasks: Some(selected),
+        })
+    }
+}
+
+/// The filter names this operation publishes, in the order
+/// `DescribeBundleTasksRequest$Filters` documents them:
+///
+/// ```text
+/// smithy_query(query="doc",shape="DescribeBundleTasksRequest",member="Filters",model_path="services/service-com-amazonaws-ec2-amazonec2/smithy-model/com-amazonaws-ec2-amazonec2.json")
+/// ```
+///
+/// "bundle-id - The ID of the bundle task. error-code - If the task failed, the error code
+/// returned. error-message - If the task failed, the error message returned. instance-id -
+/// The ID of the instance. progress - The level of task completion, as a percentage (for
+/// example, 20%). s3-bucket - The Amazon S3 bucket to store the AMI. s3-prefix - The
+/// beginning of the AMI name. start-time - The time the task started. state - The state of
+/// the task. update-time - The time of the most recent update for the task."
+///
+/// A bundle task carries no `Tags` member (`smithy_query(query="shape",shape="BundleTask")`)
+/// and the published list names no `tag-key`, so the tag filters EC2 documents for a taggable
+/// resource are not among these. Every entry must be answered by [`filter_values`].
+const BUNDLE_TASK_FILTERS: [&str; 10] = [
+    "bundle-id",
+    "error-code",
+    "error-message",
+    "instance-id",
+    "progress",
+    "s3-bucket",
+    "s3-prefix",
+    "start-time",
+    "state",
+    "update-time",
+];
+
+/// The values the EC2 filter `name` compares against this bundle task.
+///
+/// A filter naming an attribute this task does not carry compares against NO values, so it
+/// selects nothing — which is the answer for `error-code` on a task that has not failed.
+/// `name` is one of [`BUNDLE_TASK_FILTERS`], every other name having been refused already.
+/// This is the one per-operation half of the shared AND/OR evaluator
+/// ([`crate::state::matches_every_filter`]).
+fn filter_values<'a>(task: &'a BundleTask, name: &str) -> Vec<::std::borrow::Cow<'a, str>> {
+    use ::std::borrow::Cow;
+
+    let text = |value: Option<&'a str>| -> Vec<Cow<'a, str>> {
+        value.map(Cow::Borrowed).into_iter().collect()
+    };
+    let s3 = |pick: &dyn Fn(&'a S3Storage) -> Option<&'a str>| -> Vec<Cow<'a, str>> {
+        text(
+            task.storage
+                .as_ref()
+                .and_then(|storage| storage.s3.as_ref())
+                .and_then(pick),
+        )
+    };
+    let failure = |pick: &dyn Fn(&'a BundleTaskError) -> Option<&'a str>| -> Vec<Cow<'a, str>> {
+        text(task.bundle_task_error.as_ref().and_then(pick))
+    };
+    match name {
+        "bundle-id" => text(task.bundle_id.as_deref()),
+        // "If the task failed, the error code returned": a task that has not failed carries
+        // no error, so it holds no value for either error filter to match.
+        "error-code" => failure(&|error| error.code.as_deref()),
+        "error-message" => failure(&|error| error.message.as_deref()),
+        "instance-id" => text(task.instance_id.as_deref()),
+        "progress" => text(task.progress.as_deref()),
+        // "The Amazon S3 bucket to store the AMI" and "the beginning of the AMI name": the
+        // two members of the task's own `Storage$S3` location
+        // (`smithy_query(query="shape",shape="S3Storage")`).
+        "s3-bucket" => s3(&|s3| s3.bucket.as_deref()),
+        "s3-prefix" => s3(&|s3| s3.prefix.as_deref()),
+        "state" => text(task.state.as_deref()),
+        // A timestamp compares against the wire rendering a caller was shown, through the
+        // crate's one definition of it.
+        "start-time" => crate::state::filter_timestamp_values(task.start_time),
+        "update-time" => crate::state::filter_timestamp_values(task.update_time),
+        // Unreachable: every published name is answered above and every other one was
+        // refused before any matching ran. An attribute a bundle task does not have holds no
+        // value for a filter to match, so a filter naming one selects nothing.
+        _ => Vec::new(),
     }
 }

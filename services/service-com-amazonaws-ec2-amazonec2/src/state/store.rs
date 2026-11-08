@@ -2466,6 +2466,12 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// [`ExportTaskRecord`]. `CreateInstanceExportTask` is the operation that starts one and
     /// `CancelExportTask` the one that cancels it.
     pub export_tasks: BTreeMap<String, ExportTaskRecord>,
+    /// Every bundle task the account holds, by `BundleId`, stored as the modelled
+    /// [`BundleTask`] shape `DescribeBundleTasks` reports — so a member a writer sets
+    /// round-trips without a field-by-field copy that can silently drop one, the way
+    /// [`Self::conversion_tasks`] holds a conversion task. Ordered by id, the same stable
+    /// order the other stores are kept in, which is the order the report takes.
+    pub bundle_tasks: BTreeMap<String, BundleTask>,
     /// Every secondary subnet the account holds, by `SecondarySubnetId`, as the modelled
     /// [`SecondarySubnet`] shape itself — see the module docs. Ordered by id, which is the
     /// order `DescribeSecondarySubnets` reports and pages over.
@@ -3331,6 +3337,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             image_usage_report_available_at: BTreeMap::new(),
             image_usage_report_client_tokens: HashMap::new(),
             export_tasks: BTreeMap::new(),
+            bundle_tasks: BTreeMap::new(),
             secondary_subnets: BTreeMap::new(),
             secondary_interfaces: BTreeMap::new(),
             capacity_reservation_billing_requests: BTreeMap::new(),

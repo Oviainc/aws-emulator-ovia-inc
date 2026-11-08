@@ -1665,6 +1665,14 @@
 //! instant the clock owes a cancelled task its `cancelling` -> `cancelled` move in
 //! [`ComAmazonawsEc2Amazonec2State::conversion_task_cancelled_at`].
 //!
+//! [`ComAmazonawsEc2Amazonec2State::bundle_tasks`] holds the BUNDLE tasks of the
+//! instance-store-backed AMI path — "a bundle task" (`BundleTask`) — as the modelled
+//! [`BundleTask`] shape `DescribeBundleTasks` reports, keyed by `BundleId`, for the same
+//! reason a conversion task is stored as its own modelled shape: every member a writer sets
+//! round-trips through the describe without a field-by-field copy that can silently drop
+//! one. `BundleInstance` is the operation that starts one and `CancelBundleTask` the one
+//! that cancels it.
+//!
 //! ## Root volume replacement tasks
 //!
 //! [`ComAmazonawsEc2Amazonec2State::replace_root_volume_tasks`] holds the root volume
@@ -1787,6 +1795,7 @@ use crate::ops::types::{
     AttachVolumeOutput,
     AttributeValue,
     AvailabilityZone, AvailabilityZoneMessage, BlockDeviceMapping, BlockPublicAccessStates,
+    BundleTask,
     Byoasn, ByoipCidr, ConnectionNotification,
     DhcpConfiguration, DhcpOptions,
     CapacityBlock, CapacityReservation, CapacityReservationBillingRequest,
@@ -2314,9 +2323,15 @@ mod instance_ids_and_instance_types;
 mod instances_and_filters;
 mod vpcs_and_security_groups;
 mod store;
+/// The bundle-task store's identity and refusals: the prefix a bundle task id carries, the
+/// code EC2 answers for one it cannot resolve, and the one reading of a request-named bundle
+/// task. Everything it declares is re-exported below, so a handler reaches it as
+/// `crate::state::require_bundle_task` like any helper of this module.
+mod bundle_tasks;
 /// The published parameter bounds the handlers enforce by hand, and the sentences EC2
 /// refuses a violation of one with.
 mod parameter_bounds;
+pub use bundle_tasks::*;
 pub use parameter_bounds::*;
 pub use store::*;
 pub use vpcs_and_security_groups::*;
