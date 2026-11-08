@@ -151,6 +151,15 @@ impl From<CreateAliasErrorModeled> for CreateAliasError {
     }
 }
 
+/// The sentence this service refuses a create whose alias name is already taken
+/// with: the fixed text `Alias `, the alias name exactly as the request supplied it,
+/// and the fixed text ` already exists.`. The name is the only variable part — an
+/// alias name is unique in the account and region, so the refusal names the name the
+/// caller asked for and nothing else about the binding that holds it.
+fn alias_already_exists(alias_name: &str) -> String {
+    format!("Alias {alias_name} already exists.")
+}
+
 /// The `CreateAlias` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -223,10 +232,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if let Some(existing) = store.aliases.get(&input.alias_name) {
             if existing.as_deref() != Some(key_arn.as_str()) {
                 return Err(CreateAliasErrorModeled::ConflictException(ConflictException {
-                    message: Some(format!(
-                        "the alias {} already exists and is bound to another key",
-                        input.alias_name
-                    )),
+                    message: Some(alias_already_exists(&input.alias_name)),
                 })
                 .into());
             }
