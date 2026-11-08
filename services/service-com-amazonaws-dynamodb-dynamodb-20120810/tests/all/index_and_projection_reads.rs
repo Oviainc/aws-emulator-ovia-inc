@@ -167,11 +167,19 @@ struct RefusalRow {
 /// across the five read operations that take them. None of these is an unimplemented
 /// feature: each is a request AWS refuses, so each must be the modelled 400.
 fn refusal_rows() -> Vec<RefusalRow> {
+    // "If you use the ProjectionExpression parameter, then the value for Select can only
+    // be SPECIFIC_ATTRIBUTES" (`Query$Select`): AWS states the clash as one clause naming
+    // the projection member the request carried and what its Select asked for — the count
+    // itself for `COUNT`.
     let select_conflict = |select: &str| {
+        let target = if select == "COUNT" {
+            "only the Count"
+        } else {
+            select
+        };
         format!(
-            "One or more parameter values were invalid: Select type {select} is not supported \
-             when the attributes to return are listed; the only Select type that is, is \
-             SPECIFIC_ATTRIBUTES"
+            "1 validation error detected: Cannot specify the ProjectionExpression when \
+             choosing to get {target}"
         )
     };
     vec![
@@ -212,8 +220,8 @@ fn refusal_rows() -> Vec<RefusalRow> {
                          "KeyConditionExpression": "gpk = :g AND gsk = :s",
                          "ExpressionAttributeValues": {":g": {"S": "g1"},
                                                        ":s": {"S": "2"}}}),
-            message: "One or more parameter values were invalid: Type mismatch for key gsk \
-                      expected: N actual: S"
+            message: "One or more parameter values were invalid: Condition parameter type \
+                      does not match schema type"
                 .to_string(),
         },
         RefusalRow {
@@ -221,8 +229,8 @@ fn refusal_rows() -> Vec<RefusalRow> {
             operation: "Query",
             body: json!({"TableName": TABLE, "KeyConditionExpression": "pk = :p",
                          "ExpressionAttributeValues": {":p": {"N": "1"}}}),
-            message: "One or more parameter values were invalid: Type mismatch for key pk \
-                      expected: S actual: N"
+            message: "One or more parameter values were invalid: Condition parameter type \
+                      does not match schema type"
                 .to_string(),
         },
         RefusalRow {

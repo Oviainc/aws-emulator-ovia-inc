@@ -36,6 +36,12 @@ const TABLE: &str = "ElementExpressionEnvelopes";
 /// The envelope a refusal about a REQUEST's own members is stated inside, over one clause.
 const ENVELOPE: &str = "1 validation error detected: ";
 
+/// The sentence a substitution table offered with NO expression to substitute into earns:
+/// the member itself is the mistake, so the refusal names it rather than one of its
+/// entries, and it is an element's own sentence like every other refusal about an element.
+const SUBSTITUTION_WITHOUT_EXPRESSION: &str =
+    "ExpressionAttributeNames can only be specified when using expressions";
+
 /// The key of the first seeded item, which most rows address so no row is refused for its
 /// key instead of for its substitution tables.
 fn key() -> Value {
@@ -177,7 +183,7 @@ fn element_rows() -> Vec<Row> {
                 "TableName": TABLE,
                 "Item": {"pk": {"S": "item-3"}, "status": {"S": "paused"}},
                 "ExpressionAttributeNames": {"#unused": "labels"}}}]}),
-            expected: unused_entries_in_element("ExpressionAttributeNames", &["#unused"]),
+            expected: SUBSTITUTION_WITHOUT_EXPRESSION.to_string(),
             enveloped: false,
         },
         Row {
@@ -215,7 +221,7 @@ fn element_rows() -> Vec<Row> {
                 "TableName": TABLE,
                 "Key": key(),
                 "ExpressionAttributeNames": {"#unused": "status"}}}]}),
-            expected: unused_entries_in_element("ExpressionAttributeNames", &["#unused"]),
+            expected: SUBSTITUTION_WITHOUT_EXPRESSION.to_string(),
             enveloped: false,
         },
         Row {
@@ -225,7 +231,7 @@ fn element_rows() -> Vec<Row> {
                 {"Get": {"TableName": TABLE, "Key": key()}},
                 {"Get": {"TableName": TABLE, "Key": other_key(),
                          "ExpressionAttributeNames": {"#unused": "status"}}}]}),
-            expected: unused_entries_in_element("ExpressionAttributeNames", &["#unused"]),
+            expected: SUBSTITUTION_WITHOUT_EXPRESSION.to_string(),
             enveloped: false,
         },
         Row {
@@ -234,7 +240,7 @@ fn element_rows() -> Vec<Row> {
             request: json!({"RequestItems": {TABLE: {
                 "Keys": [key()],
                 "ExpressionAttributeNames": {"#a": "status", "#b": "category"}}}}),
-            expected: unused_entries_in_element("ExpressionAttributeNames", &["#a", "#b"]),
+            expected: SUBSTITUTION_WITHOUT_EXPRESSION.to_string(),
             enveloped: false,
         },
     ]

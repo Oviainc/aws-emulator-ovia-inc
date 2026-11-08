@@ -696,34 +696,90 @@ async fn a_resource_arn_that_is_not_an_arn_is_refused_by_that_rule() {
         }
     }
 
-    // A value that IS an ARN and still addresses no table of this endpoint is refused by
-    // the member it was sent in: the rule it broke is which resource it names.
+    // A value that IS an ARN and still addresses no resource of this endpoint is refused
+    // by the member it was sent in: the rule it broke is which resource it names. Each
+    // surface words that over the resources IT addresses — a table for the tagging
+    // surface, "a table or stream" (the `PutResourcePolicy` doc) for the policy surface —
+    // so the two sentences are asserted side by side.
     let arn_shaped = [
         (
             "an ARN of another service",
             format!("arn:aws:sqs:{REGION}:{ACCOUNT}:Addressed"),
+            format!(
+                "One or more parameter values were invalid: Invalid resource arn provided, only \
+                 table or stream is accepted. Provided resource arn: arn:aws:sqs:{REGION}:\
+                 {ACCOUNT}:Addressed"
+            ),
         ),
         (
             "an ARN of another region",
             format!("arn:aws:dynamodb:eu-west-1:{ACCOUNT}:table/Addressed"),
-        ),
-        (
-            "a stream sub-resource ARN",
-            format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Addressed/stream/2026-01-01"),
+            format!(
+                "One or more parameter values were invalid: Invalid resource Arn: \
+                 arn:aws:dynamodb:eu-west-1:{ACCOUNT}:table/Addressed"
+            ),
         ),
     ];
-    for (case, value) in &arn_shaped {
+    for (case, value, policy_refusal) in &arn_shaped {
         for (operation, body) in arn_addressed(value) {
             let (code, stated) = refusal(&router, case, operation, body).await;
+            let expected = if operation.ends_with("ResourcePolicy") {
+                policy_refusal.clone()
+            } else {
+                format!("Invalid TableArn: Invalid ResourceArn provided as input {value}")
+            };
+            assert_eq!(
+                (code.as_str(), stated.as_str()),
+                ("ValidationException", expected.as_str()),
+                "case {case:?} ({operation}): expected the member refusal, got {code} with \
+                 {stated:?}"
+            );
+        }
+    }
+
+    // A STREAM sub-resource ARN is not a resource the tagging surface addresses at all,
+    // while the policy surface takes it and looks the stream up — which is where a table
+    // publishing to no stream answers that the stream is not there.
+    let stream_arn = format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/Addressed/stream/2026-01-01");
+    for (operation, body) in arn_addressed(&stream_arn) {
+        let (code, stated) = refusal(&router, "a stream sub-resource ARN", operation, body).await;
+        if operation == "PutResourcePolicy" {
+            // This body's document names a TABLE action, which a stream's policy cannot
+            // carry: the document is read before the resource is looked up, so that is
+            // the refusal it earns.
             assert_eq!(
                 (code.as_str(), stated.as_str()),
                 (
                     "ValidationException",
-                    format!("Invalid TableArn: Invalid ResourceArn provided as input {value}")
+                    "One or more parameter values were invalid: Invalid policy document: Policy \
+                     has an action that is not supported for the resource: dynamodb:GetItem"
+                ),
+                "case a stream sub-resource ARN ({operation}): expected the unsupported-action \
+                 refusal, got {code} with {stated:?}"
+            );
+        } else if operation.ends_with("ResourcePolicy") {
+            assert_eq!(
+                (code.as_str(), stated.as_str()),
+                (
+                    "ResourceNotFoundException",
+                    format!("Requested resource not found: Stream: {stream_arn} not found")
                         .as_str()
                 ),
-                "case {case:?} ({operation}): expected the member refusal, got {code} with \
-                 {stated:?}"
+                "case a stream sub-resource ARN ({operation}): expected the stream not-found, \
+                 got {code} with {stated:?}"
+            );
+        } else {
+            assert_eq!(
+                (code.as_str(), stated.as_str()),
+                (
+                    "ValidationException",
+                    format!(
+                        "Invalid TableArn: Invalid ResourceArn provided as input {stream_arn}"
+                    )
+                    .as_str()
+                ),
+                "case a stream sub-resource ARN ({operation}): expected the member refusal, got \
+                 {code} with {stated:?}"
             );
         }
     }

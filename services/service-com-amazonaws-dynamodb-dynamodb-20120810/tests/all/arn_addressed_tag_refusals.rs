@@ -56,6 +56,13 @@ fn policy(resource_arn: &str) -> String {
 /// that is otherwise valid (the members the model marks required on that input:
 /// `TagResource$Tags`, `UntagResource$TagKeys`, `PutResourcePolicy$Policy`).
 fn arn_addressed(resource_arn: &str) -> Vec<(&'static str, Value)> {
+    let mut addressed = tag_addressed(resource_arn);
+    addressed.extend(policy_addressed(resource_arn));
+    addressed
+}
+
+/// The TAGGING surface, whose `ResourceArn` names a table and nothing deeper.
+fn tag_addressed(resource_arn: &str) -> Vec<(&'static str, Value)> {
     vec![
         (
             "TagResource",
@@ -66,6 +73,14 @@ fn arn_addressed(resource_arn: &str) -> Vec<(&'static str, Value)> {
             json!({"ResourceArn": resource_arn, "TagKeys": ["env"]}),
         ),
         ("ListTagsOfResource", json!({"ResourceArn": resource_arn})),
+    ]
+}
+
+/// The resource-POLICY surface, whose `ResourceArn` names a table or that table's
+/// stream — "the resource, which can be a table or stream" (the `PutResourcePolicy`
+/// doc) — and which words its own two refusals of a value that is neither.
+fn policy_addressed(resource_arn: &str) -> Vec<(&'static str, Value)> {
+    vec![
         (
             "PutResourcePolicy",
             json!({"ResourceArn": resource_arn, "Policy": policy(resource_arn)}),
@@ -148,69 +163,100 @@ async fn a_resource_arn_outside_this_endpoint_s_scope_is_an_input_refusal_naming
     // One real table, so every refusal below is about the ARN and nothing else.
     let real = create_table(&router, REGION, "scoped-table").await;
 
-    // (case, the submitted ResourceArn). The rows span the ways a value that IS an ARN
-    // can fail to address a table of this endpoint: the ARN's shape (a missing or wrong
-    // resource type, a deeper sub-resource, a table name outside the documented 3..=255
+    // (case, the submitted ResourceArn, the sentence the resource-POLICY surface words
+    // its refusal with). The rows span the ways a value that IS an ARN can fail to
+    // address a resource of this endpoint: the ARN's shape (a missing or wrong resource
+    // type, a deeper sub-resource, a table name outside the documented 3..=255
     // `[a-zA-Z0-9_.-]+` form) and its scope (another service, partition, account or
     // region). A value that is no ARN at all breaks a different rule and states that one;
     // `tests/all/required_member_refusals.rs` drives it.
-    let cases: Vec<(&str, String)> = vec![
-        ("an ARN with too few fields", format!("arn:aws:dynamodb:{REGION}:table/scoped-table")),
-        (
-            "an ARN of another service",
-            format!("arn:aws:sqs:{REGION}:{ACCOUNT}:scoped-table"),
-        ),
-        (
-            "an ARN naming another resource type",
-            format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:backup/scoped-table"),
-        ),
-        (
-            "an ARN with no resource type",
-            format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:scoped-table"),
-        ),
-        (
-            "an index sub-resource ARN",
-            format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/scoped-table/index/by-env"),
-        ),
-        (
-            "a stream sub-resource ARN",
-            format!(
-                "arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/scoped-table/stream/\
-                 2026-01-01T00:00:00.000"
-            ),
-        ),
-        (
-            "a trailing slash after the table name",
-            format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/scoped-table/"),
-        ),
-        (
-            "a table name below the documented minimum length",
-            format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/ab"),
-        ),
-        (
-            "a table name outside the documented pattern",
-            format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/not a name"),
-        ),
-        (
-            "an ARN with no region",
-            format!("arn:aws:dynamodb::{ACCOUNT}:table/scoped-table"),
-        ),
-        (
-            "an ARN of another region",
-            format!("arn:aws:dynamodb:{OTHER_REGION}:{ACCOUNT}:table/scoped-table"),
-        ),
-        (
-            "an ARN of another account",
-            format!("arn:aws:dynamodb:{REGION}:111111111111:table/scoped-table"),
-        ),
-        (
-            "an ARN of another partition",
-            format!("arn:aws-cn:dynamodb:{REGION}:{ACCOUNT}:table/scoped-table"),
-        ),
+    //
+    // The two surfaces address different resources, so each words its own refusal: the
+    // TAGGING surface takes a table ARN and nothing deeper, while the resource-POLICY
+    // surface takes "a table or stream" (the `PutResourcePolicy` doc) and says which of
+    // the two rules the value broke — it is not the resource kind this surface accepts, or
+    // it is not a resource of this endpoint at all.
+    let unsupported = |arn: &str| {
+        format!(
+            "One or more parameter values were invalid: Invalid resource arn provided, only \
+             table or stream is accepted. Provided resource arn: {arn}"
+        )
+    };
+    let out_of_scope =
+        |arn: &str| format!("One or more parameter values were invalid: Invalid resource Arn: {arn}");
+    let cases: Vec<(&str, String, String)> = vec![
+        {
+            let arn = format!("arn:aws:dynamodb:{REGION}:table/scoped-table");
+            ("an ARN with too few fields", arn.clone(), out_of_scope(&arn))
+        },
+        {
+            let arn = format!("arn:aws:sqs:{REGION}:{ACCOUNT}:scoped-table");
+            ("an ARN of another service", arn.clone(), unsupported(&arn))
+        },
+        {
+            let arn = format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:backup/scoped-table");
+            (
+                "an ARN naming another resource type",
+                arn.clone(),
+                unsupported(&arn),
+            )
+        },
+        {
+            let arn = format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:scoped-table");
+            (
+                "an ARN with no resource type",
+                arn.clone(),
+                unsupported(&arn),
+            )
+        },
+        {
+            let arn = format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/scoped-table/index/by-env");
+            ("an index sub-resource ARN", arn.clone(), unsupported(&arn))
+        },
+        {
+            let arn = format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/scoped-table/");
+            (
+                "a trailing slash after the table name",
+                arn.clone(),
+                unsupported(&arn),
+            )
+        },
+        {
+            let arn = format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/ab");
+            (
+                "a table name below the documented minimum length",
+                arn.clone(),
+                unsupported(&arn),
+            )
+        },
+        {
+            let arn = format!("arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/not a name");
+            (
+                "a table name outside the documented pattern",
+                arn.clone(),
+                unsupported(&arn),
+            )
+        },
+        {
+            let arn = format!("arn:aws:dynamodb::{ACCOUNT}:table/scoped-table");
+            ("an ARN with no region", arn.clone(), out_of_scope(&arn))
+        },
+        {
+            let arn = format!("arn:aws:dynamodb:{OTHER_REGION}:{ACCOUNT}:table/scoped-table");
+            ("an ARN of another region", arn.clone(), out_of_scope(&arn))
+        },
+        {
+            let arn = format!("arn:aws:dynamodb:{REGION}:111111111111:table/scoped-table");
+            ("an ARN of another account", arn.clone(), out_of_scope(&arn))
+        },
+        {
+            let arn = format!("arn:aws-cn:dynamodb:{REGION}:{ACCOUNT}:table/scoped-table");
+            ("an ARN of another partition", arn.clone(), out_of_scope(&arn))
+        },
     ];
 
-    for (case, resource_arn) in &cases {
-        for (operation, body) in arn_addressed(resource_arn) {
+    for (case, resource_arn, policy_refusal) in &cases {
+        for (operation, body) in tag_addressed(resource_arn) {
             let (status, answered) = call_in(&router, REGION, operation, body).await;
             assert_eq!(
                 (status, error_code(&answered).as_str()),
@@ -225,6 +271,71 @@ async fn a_resource_arn_outside_this_endpoint_s_scope_is_an_input_refusal_naming
                 message(&answered)
             );
         }
+        for (operation, body) in policy_addressed(resource_arn) {
+            let (status, answered) = call_in(&router, REGION, operation, body).await;
+            assert_eq!(
+                (status, error_code(&answered).as_str()),
+                (400, "ValidationException"),
+                "case {case:?} on {operation}: expected 400 ValidationException for \
+                 {resource_arn:?}, got {status} with {answered}"
+            );
+            assert_eq!(
+                &message(&answered),
+                policy_refusal,
+                "case {case:?} on {operation}: expected {policy_refusal:?}, got {}",
+                message(&answered)
+            );
+        }
+    }
+
+    // A STREAM sub-resource ARN is not a resource the TAGGING surface addresses, and IS
+    // one the resource-policy surface does: the policy surface gets as far as looking the
+    // stream up, which is where a table that publishes to no stream answers that the
+    // stream is not there.
+    let stream_arn = format!(
+        "arn:aws:dynamodb:{REGION}:{ACCOUNT}:table/scoped-table/stream/2026-01-01T00:00:00.000"
+    );
+    for (operation, body) in tag_addressed(&stream_arn) {
+        let (status, answered) = call_in(&router, REGION, operation, body).await;
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (400, "ValidationException"),
+            "case a stream sub-resource ARN on {operation}: expected 400 ValidationException, \
+             got {status} with {answered}"
+        );
+    }
+    for (operation, body) in policy_addressed(&stream_arn) {
+        // A stream's policy carries the STREAM's own actions, so the row that attaches
+        // one names one of those: what is under test here is the ARN, not the document.
+        let body = match operation {
+            "PutResourcePolicy" => json!({
+                "ResourceArn": &stream_arn,
+                "Policy": json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Deny",
+                        "Principal": {"AWS": "*"},
+                        "Action": "dynamodb:GetRecords",
+                        "Resource": &stream_arn,
+                    }],
+                })
+                .to_string(),
+            }),
+            _ => body,
+        };
+        let (status, answered) = call_in(&router, REGION, operation, body).await;
+        assert_eq!(
+            (status, error_code(&answered).as_str()),
+            (400, "ResourceNotFoundException"),
+            "case a stream sub-resource ARN on {operation}: the stream is addressable and not \
+             there, got {status} with {answered}"
+        );
+        assert_eq!(
+            message(&answered),
+            format!("Requested resource not found: Stream: {stream_arn} not found"),
+            "case a stream sub-resource ARN on {operation}: the refusal names the stream, got {}",
+            message(&answered)
+        );
     }
 
     // The ARN of the real table is in scope for the endpoint it names, and out of scope

@@ -304,7 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let resource_policy = match input.resource_policy.as_deref() {
             Some(document) => Some(
                 crate::state::AttachedPolicy::attach(document, now)
-                    .map_err(|fault| lift_policy_fault(&input.table_name, fault))?,
+                    .map_err(lift_policy_fault)?,
             ),
             None => None,
         };
@@ -389,10 +389,31 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut store = state.lock();
         store.apply_due_transitions(now);
+        // "You tried to create a table that already exists" (the `ResourceInUseException`
+        // doc): a name this region already holds a table under is refused, and WHICH
+        // sentence the refusal states follows the state that table is in — a table whose
+        // creation (or deletion) the clock has not settled yet is a resource still in
+        // use, which is what every other control-plane refusal of a transitioning table
+        // says, while a settled table is simply already there.
         if store.contains_table(&region, &name) {
+            let transitioning = store
+                .table(&region, &name)
+                .ok()
+                .and_then(|table| match table.status(now) {
+                    crate::state::TableStatus::Creating => Some("created"),
+                    crate::state::TableStatus::Deleting => Some("deleted"),
+                    _ => None,
+                });
+            let message = match transitioning {
+                Some(verb) => format!(
+                    "Attempt to change a resource which is still in use: Table is being \
+                     {verb}: {name}"
+                ),
+                None => format!("Table already exists: {name}"),
+            };
             return Err(CreateTableErrorModeled::ResourceInUseException(
                 ResourceInUseException {
-                    message: Some(format!("Table already exists: {name}")),
+                    message: Some(message),
                 },
             )
             .into());
@@ -507,6 +528,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             pay_per_request_at,
             removed_at: None,
             resource_policy,
+            // A stream's policy is the stream's own, and a table minted here publishes
+            // to a stream nothing has attached one to yet.
+            stream_resource_policy: None,
             stream,
             items: ::std::collections::BTreeMap::new(),
             stored_bytes: 0,
@@ -646,19 +670,12 @@ fn too_many_tags() -> CreateTableError {
 }
 
 /// Lift a refusal of the `ResourcePolicy` document into this operation's error
-/// channel: the documented size limit is a modelled limit error, and a document that
-/// is not a policy is a bad request.
-fn lift_policy_fault(resource: &str, fault: crate::state::PolicyFault) -> CreateTableError {
+/// channel: a document past the documented size limit and one that is not a policy at
+/// all are both bad REQUESTS, so both are the service-common `ValidationException`.
+fn lift_policy_fault(fault: crate::state::PolicyFault) -> CreateTableError {
     match fault {
-        crate::state::PolicyFault::TooLarge(size) => {
-            CreateTableErrorModeled::LimitExceededException(LimitExceededException {
-                message: Some(format!(
-                    "Policy size exceeds the maximum supported size of {} bytes for resource \
-                     {resource}: {size} bytes",
-                    crate::state::MAX_RESOURCE_POLICY_BYTES
-                )),
-            })
-            .into()
+        crate::state::PolicyFault::TooLarge => {
+            crate::scaffolded::Scaffolded::validation(crate::state::policy_too_large_message())
         }
         crate::state::PolicyFault::Invalid(detail) => {
             crate::scaffolded::Scaffolded::validation(detail)
@@ -691,15 +708,13 @@ fn unsupported_member(input: &CreateTableInput) -> Option<&'static str> {
     if input.global_table_settings_replication_mode.is_some() {
         return Some("GlobalTableSettingsReplicationMode");
     }
-    // The same two members an index may carry: this slice stores an index's
-    // PROVISIONED throughput only, so an on-demand or warm throughput asked for per
-    // index is "not written yet" rather than accepted and dropped.
+    // An index's ON-DEMAND throughput is the one member this slice does not store: an
+    // index's throughput is stored as a PROVISIONED one, so an on-demand ceiling asked
+    // for per index is "not written yet" rather than accepted and dropped. Its WARM
+    // throughput is stored and reported, by the same rule the table's own is.
     for index in input.global_secondary_indexes.iter().flatten() {
         if index.on_demand_throughput.is_some() {
             return Some("GlobalSecondaryIndexes carrying OnDemandThroughput");
-        }
-        if index.warm_throughput.is_some() {
-            return Some("GlobalSecondaryIndexes carrying WarmThroughput");
         }
     }
     None
@@ -916,9 +931,10 @@ fn validated_key_schema(
             .iter()
             .find(|definition| definition.attribute_name == name)
         else {
-            return Err(crate::state::RequestError::Validation(
-                UNDEFINED_TABLE_KEY_MESSAGE.to_string(),
-            ));
+            // The same fact as for a secondary index's key, stated the same way: AWS's
+            // parameter-value sentence over the WHOLE key schema the request declared
+            // and the attribute names it defined.
+            return Err(undefined_schema_keys(&key_schema, &definitions));
         };
         if !matches!(definition.attribute_type.as_str(), "S" | "N" | "B") {
             return Err(crate::state::RequestError::Validation(format!(
@@ -1026,10 +1042,17 @@ fn validated_indexes(
             billing_mode,
             index.provisioned_throughput.clone(),
         )?;
-        // No request may name a warm throughput per index (that member is refused with
-        // the scaffold's 501), so a new index keeps warm the capacity it is provisioned
-        // for.
-        let warm_throughput = crate::state::WarmThroughputSettings::tracking(throughput.as_ref(), now);
+        // "Represents the warm throughput value (in read units per second and write
+        // units per second) for the specified secondary index. If you use this
+        // parameter, you must specify ReadUnitsPerSecond, WriteUnitsPerSecond, or both"
+        // (`GlobalSecondaryIndex$WarmThroughput`): the member is read by the same rule
+        // the table's own is, so an index the request names no warm throughput for keeps
+        // warm the capacity it is provisioned for.
+        let warm_throughput = crate::state::resolved_warm_throughput(
+            index.warm_throughput.as_ref(),
+            &crate::state::WarmThroughputSettings::tracking(throughput.as_ref(), now),
+            now,
+        )?;
         indexes.push(crate::state::GlobalSecondaryIndex {
             arn: crate::state::index_arn(region, table, &index.index_name),
             name: index.index_name.clone(),
@@ -1156,6 +1179,7 @@ fn validated_vector_indexes(
             )));
         }
         validated_projection(&index.index_name, &index.projection)?;
+        check_vector_dimensions(index.dimensions)?;
         for element in index.search_schema.iter().flatten() {
             let name = element.attribute_name.as_str();
             if !definitions
@@ -1225,19 +1249,10 @@ pub(crate) fn validated_index_key_schema(
             .iter()
             .find(|definition| definition.attribute_name == name)
         else {
-            // Every key attribute with no definition is named, not just the first:
-            // AWS states both sides of the mismatch so the caller can see which list
-            // to extend.
-            let missing: Vec<&str> = key_schema
-                .iter()
-                .map(|element| element.attribute_name.as_str())
-                .filter(|name| {
-                    !definitions
-                        .iter()
-                        .any(|definition| definition.attribute_name == *name)
-                })
-                .collect();
-            return Err(undefined_index_keys(&missing, definitions));
+            // The WHOLE key schema of this index is named, not just the attributes with
+            // no definition: AWS reports the keys the index is built on beside the
+            // attribute names the request defined, so the caller sees both lists.
+            return Err(undefined_schema_keys(key_schema, definitions));
         };
         if !matches!(definition.attribute_type.as_str(), "S" | "N" | "B") {
             return Err(crate::state::RequestError::Validation(format!(
@@ -1297,19 +1312,67 @@ pub(crate) const INCLUDE_WITHOUT_NON_KEY_ATTRIBUTES_MESSAGE: &str =
     "One or more parameter values were invalid: ProjectionType is INCLUDE, but NonKeyAttributes \
      is not specified";
 
+/// The most dimensions one vector may carry: a vector index holds vectors of up to 4096
+/// dimensions ("Service, Account, and Table Quotas" in the Amazon DynamoDB Developer
+/// Guide, the vector-search entry), so an index asking for more than that could never be
+/// built. The model bounds the member below ([`VectorIndex$Dimensions`] is a
+/// `PositiveLongObject` with a `@range` minimum of 1 and no maximum), so the ceiling is
+/// this service's to state.
+pub(crate) const MAX_VECTOR_DIMENSIONS: i64 = 4096;
+
+/// Hold one vector index's `Dimensions` to that ceiling. AWS states it as a
+/// parameter-value sentence naming the member and the range it has to fall in, and
+/// nothing of the index: the quota is the same for every index of every table.
+pub(crate) fn check_vector_dimensions(dimensions: i64) -> Result<(), crate::state::RequestError> {
+    if dimensions > MAX_VECTOR_DIMENSIONS {
+        return Err(crate::state::RequestError::Validation(format!(
+            "One or more parameter values were invalid: Dimensions must be between 1 and \
+             {MAX_VECTOR_DIMENSIONS}"
+        )));
+    }
+    Ok(())
+}
+
+/// AWS's fixed text for a `PAY_PER_REQUEST` table that also states a
+/// `ProvisionedThroughput`: "If you set BillingMode as PAY_PER_REQUEST, you cannot
+/// specify this property" (`CreateTable$ProvisionedThroughput`). The sentence names the
+/// MEMBER the request may not carry and the billing mode that rules it out, and nothing
+/// of either capacity dimension or of the table.
+pub(crate) const THROUGHPUT_WITH_PAY_PER_REQUEST_MESSAGE: &str =
+    "One or more parameter values were invalid: ProvisionedThroughput cannot be specified when \
+     BillingMode is PAY_PER_REQUEST";
+
+/// AWS's fixed text for a `PROVISIONED` table that states no `ProvisionedThroughput`:
+/// "If you set BillingMode as PROVISIONED, you must specify this property"
+/// (`CreateTable$ProvisionedThroughput`).
+pub(crate) const THROUGHPUT_WITHOUT_PROVISIONED_MESSAGE: &str =
+    "One or more parameter values were invalid: ProvisionedThroughput must be specified when \
+     BillingMode is PROVISIONED";
+
 /// AWS's fixed text for a TABLE whose own `KeySchema` names an attribute
 /// `AttributeDefinitions` does not declare — "The attributes in KeySchema must also be
 /// defined in the AttributeDefinitions array" (`CreateTable$KeySchema`).
 pub(crate) const UNDEFINED_TABLE_KEY_MESSAGE: &str =
     "Invalid KeySchema: Some index key attribute have no definition";
 
-/// The refusal for SECONDARY-INDEX key attributes `AttributeDefinitions` does not
-/// declare: AWS's parameter-value template, naming every key attribute that has no
-/// definition and the attribute names the request did define.
-pub(crate) fn undefined_index_keys(
-    missing: &[&str],
+/// The refusal for KEY attributes `AttributeDefinitions` does not declare: AWS's
+/// parameter-value template over the WHOLE key schema the request declared and the
+/// attribute names it defined.
+///
+/// The keys are the schema's own, in schema order — AWS reports the keys the schema is
+/// built on rather than only the ones with no definition, which is what tells the caller
+/// which of the two lists to extend — and the definitions are the ones the request
+/// declared, in the order it declared them. One wording for a table's own key and for a
+/// secondary index's, because it is one rule: "The attributes in KeySchema must also be
+/// defined in the AttributeDefinitions array" (`CreateTable$KeySchema`).
+pub(crate) fn undefined_schema_keys(
+    key_schema: &[KeySchemaElement],
     definitions: &[AttributeDefinition],
 ) -> crate::state::RequestError {
+    let keys: Vec<&str> = key_schema
+        .iter()
+        .map(|element| element.attribute_name.as_str())
+        .collect();
     let defined: Vec<&str> = definitions
         .iter()
         .map(|definition| definition.attribute_name.as_str())
@@ -1317,7 +1380,7 @@ pub(crate) fn undefined_index_keys(
     crate::state::RequestError::Validation(format!(
         "One or more parameter values were invalid: Some index key attributes are not defined \
          in AttributeDefinitions. Keys: [{}], AttributeDefinitions: [{}]",
-        missing.join(", "),
+        keys.join(", "),
         defined.join(", ")
     ))
 }
@@ -1368,9 +1431,7 @@ fn validated_throughput(
     match (billing_mode.as_str(), input.provisioned_throughput.clone()) {
         ("PAY_PER_REQUEST", None) => Ok((billing_mode, None)),
         ("PAY_PER_REQUEST", Some(_)) => Err(crate::state::RequestError::Validation(
-            "One or more parameter values were invalid: Neither ReadCapacityUnits nor \
-             WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST"
-                .to_string(),
+            THROUGHPUT_WITH_PAY_PER_REQUEST_MESSAGE.to_string(),
         )),
         ("PROVISIONED", Some(throughput)) => {
             if throughput.read_capacity_units < 1 || throughput.write_capacity_units < 1 {
@@ -1383,9 +1444,7 @@ fn validated_throughput(
             Ok((billing_mode, Some(throughput)))
         }
         ("PROVISIONED", None) => Err(crate::state::RequestError::Validation(
-            "One or more parameter values were invalid: Both ReadCapacityUnits and \
-             WriteCapacityUnits must be specified when BillingMode is PROVISIONED"
-                .to_string(),
+            THROUGHPUT_WITHOUT_PROVISIONED_MESSAGE.to_string(),
         )),
         (other, _) => Err(crate::state::RequestError::Validation(format!(
             "Invalid BillingMode: {other} must be PROVISIONED or PAY_PER_REQUEST"

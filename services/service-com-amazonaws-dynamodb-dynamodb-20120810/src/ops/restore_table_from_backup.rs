@@ -375,6 +375,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             tags: crate::state::ResourceTags::default(),
             stream: None,
             resource_policy: None,
+            // "Resource-based policies are not copied to the restored table" — nor to
+            // the stream the restored table publishes to.
+            stream_resource_policy: None,
             creation_date_time: now,
             active_at,
             updated_at: None,

@@ -145,6 +145,9 @@ mod scan_filter_value_types_and_segments;
 #[path = "all/scan_indexes_and_projections.rs"]
 mod scan_indexes_and_projections;
 
+#[path = "all/select_rules_and_policy_resources.rs"]
+mod select_rules_and_policy_resources;
+
 #[path = "all/result_filter_expressions.rs"]
 mod result_filter_expressions;
 

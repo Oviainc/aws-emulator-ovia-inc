@@ -105,6 +105,41 @@ pub enum Selection {
     Count,
 }
 
+/// Which reader is applying the `Select` rules.
+///
+/// Two of those refusals name the operation the caller called — "Allowed only when
+/// querying an index" (`Query$Select`) is a rule about the CALL — so the sentence
+/// carries the verb of that call rather than one reader's verb for both.
+#[derive(Debug, Clone, Copy)]
+pub enum Reader {
+    /// `Query`: one partition of the schema it was pointed at.
+    Query,
+    /// `Scan`: every entry of it.
+    Scan,
+}
+
+impl Reader {
+    /// How a refusal names what this reader was doing.
+    fn verb(self) -> &'static str {
+        match self {
+            Self::Query => "Querying",
+            Self::Scan => "Scanning",
+        }
+    }
+}
+
+/// How a refusal of the `Select`/projection pair names what was asked for: `COUNT`
+/// "returns the number of matching items, rather than the matching items themselves"
+/// (`Query$Select`), which AWS's sentence words as the count itself; every other value
+/// is named as the request spelled it.
+fn select_target(select: &str) -> &str {
+    if select == "COUNT" {
+        "only the Count"
+    } else {
+        select
+    }
+}
+
 /// What each reported item carries, from the request's `Select` and the paths its
 /// projection named.
 ///
@@ -113,8 +148,16 @@ pub enum Selection {
 /// index. You cannot use both Select and ProjectionExpression together in a single
 /// request, unless the value for Select is SPECIFIC_ATTRIBUTES" (`Query$Select`, which
 /// `Scan$Select` repeats), which is the whole of the rule below.
+///
+/// Each refusal is a violation of a rule over the request's own members, so it is stated
+/// as one clause INSIDE the `<N> validation error(s) detected: ` envelope, naming the
+/// member the request carried its projection in ([`stated_projection_member`]) and the
+/// `Select` it stated. The envelope is part of the refusal recorded for these three
+/// clauses — a reader tempted to state them bare should check that recording first.
 pub fn resolve_selection(
+    reader: Reader,
     select: Option<&str>,
+    projection_member: Option<&'static str>,
     requested: Option<Vec<DocumentPath>>,
     on_index: bool,
 ) -> Result<Selection, RequestError> {
@@ -127,35 +170,56 @@ pub fn resolve_selection(
             ));
         }
     }
+    let member = projection_member.unwrap_or(PROJECTION_MEMBER);
     match select {
         None => Ok(match requested {
             Some(paths) => Selection::Specific(paths),
             None if on_index => Selection::AllProjected,
             None => Selection::AllAttributes,
         }),
+        // "SPECIFIC_ATTRIBUTES - Returns only the attributes listed in
+        // ProjectionExpression": there are none to return when the request listed none.
         Some("SPECIFIC_ATTRIBUTES") => requested.map(Selection::Specific).ok_or_else(|| {
-            RequestError::Validation(
-                "One or more parameter values were invalid: Select type SPECIFIC_ATTRIBUTES \
-                 requires the attributes to be listed in ProjectionExpression"
-                    .to_string(),
-            )
+            super::refused(format!(
+                "Must specify the {PROJECTION_MEMBER} when choosing to get SPECIFIC_ATTRIBUTES"
+            ))
         }),
         // "If you use the ProjectionExpression parameter, then the value for Select can
         // only be SPECIFIC_ATTRIBUTES. Any other value for Select will return an error."
-        Some(other) if requested.is_some() => Err(RequestError::Validation(format!(
-            "One or more parameter values were invalid: Select type {other} is not supported \
-             when the attributes to return are listed; the only Select type that is, is \
-             SPECIFIC_ATTRIBUTES"
+        Some(other) if requested.is_some() => Err(super::refused(format!(
+            "Cannot specify the {member} when choosing to get {}",
+            select_target(other)
         ))),
         Some("ALL_ATTRIBUTES") => Ok(Selection::AllAttributes),
         Some("COUNT") => Ok(Selection::Count),
         Some("ALL_PROJECTED_ATTRIBUTES") if on_index => Ok(Selection::AllProjected),
-        Some(other) => Err(RequestError::Validation(format!(
-            "One or more parameter values were invalid: Select type {other} is allowed only \
-             when an index is scanned"
+        // "ALL_PROJECTED_ATTRIBUTES - Allowed only when querying an index": the read has
+        // no index projection to report when it was pointed at the table itself.
+        Some(other) => Err(super::refused(format!(
+            "{other} can be used only when {} using an IndexName",
+            reader.verb()
         ))),
     }
 }
+
+/// The member a request stated its projection through, or `None` when it stated none:
+/// which of the two a refusal names follows the request, not the reader.
+pub fn stated_projection_member(
+    projection_expression: Option<&str>,
+    attributes_to_get: Option<&[String]>,
+) -> Option<&'static str> {
+    if projection_expression.is_some() {
+        return Some(PROJECTION_MEMBER);
+    }
+    attributes_to_get
+        .filter(|names| !names.is_empty())
+        .map(|_| LEGACY_PROJECTION_MEMBER)
+}
+
+/// The member a request states its projection through today: "ProjectionExpression - A
+/// string that identifies one or more attributes to retrieve from the table"
+/// (`Query$ProjectionExpression`).
+const PROJECTION_MEMBER: &str = "ProjectionExpression";
 
 /// The document paths the request's PROJECTION names, or `None` when it names none at
 /// all — in which case "all attributes will be returned" (`ProjectionExpression`).

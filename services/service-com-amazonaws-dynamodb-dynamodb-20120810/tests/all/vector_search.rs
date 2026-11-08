@@ -185,16 +185,16 @@ async fn the_index_distance_function_decides_which_items_are_most_similar() {
     .await;
 
     // The items the index holds: `a` is the search vector itself, `f` points the same way
-    // but twice as far, `c` points nearly that way, `b` is orthogonal to it. The last two
-    // are NOT in any of the indexes — one carries no vector at all, the other a vector of
-    // the wrong number of dimensions — so no search may ever report them.
+    // but twice as far, `c` points nearly that way, `b` is orthogonal to it. The last one
+    // is NOT in any of the indexes — it carries no vector at all — so no search may ever
+    // report it. A vector of the WRONG number of dimensions is not an item this table
+    // accepts at all (`a_write_whose_vector_is_not_the_indexed_shape_is_refused`).
     for (key, embedding_values) in [
         ("a", Some(vec![1.0, 0.0, 0.0])),
         ("b", Some(vec![0.0, 1.0, 0.0])),
         ("c", Some(vec![0.9, 0.1, 0.0])),
         ("f", Some(vec![2.0, 0.0, 0.0])),
         ("no-vector", None),
-        ("short-vector", Some(vec![1.0, 0.0])),
     ] {
         let mut item = json!({"pk": {"S": key}});
         if let Some(values) = embedding_values {

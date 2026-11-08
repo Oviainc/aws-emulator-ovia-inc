@@ -528,17 +528,10 @@ fn lift(error: crate::state::RequestError) -> SearchVectorsError {
 /// element that is not a number — or is a number no 32-bit float can hold — is refused
 /// rather than silently skipped.
 fn read_search_vector(values: &[AttributeValue]) -> Result<Vec<f32>, crate::state::RequestError> {
-    values
-        .iter()
-        .map(|value| match value {
-            AttributeValue::N(text) => text
-                .parse::<f32>()
-                .ok()
-                .filter(|number| number.is_finite())
-                .ok_or_else(invalid_search_vector),
-            _ => Err(invalid_search_vector()),
-        })
-        .collect()
+    // The one reading of a vector this service has ([`crate::state::vector_values`]),
+    // refused rather than skipped here because the member is the request's own.
+    crate::state::vector_values(&AttributeValue::L(values.to_vec()))
+        .ok_or_else(invalid_search_vector)
 }
 
 /// How an element of `SearchVector` that is not a 32-bit float is refused, inside the
@@ -564,22 +557,10 @@ fn indexed_vector(
     attribute: &str,
     dimensions: i64,
 ) -> Option<Vec<f32>> {
-    let AttributeValue::L(values) = item.get(attribute)? else {
-        return None;
-    };
-    if i64::try_from(values.len()).unwrap_or(i64::MAX) != dimensions {
-        return None;
-    }
-    values
-        .iter()
-        .map(|value| match value {
-            AttributeValue::N(text) => text
-                .parse::<f32>()
-                .ok()
-                .filter(|number| number.is_finite()),
-            _ => None,
-        })
-        .collect()
+    // The one reading of a vector this service has, held to the length THIS index was
+    // built for.
+    let values = crate::state::vector_values(item.get(attribute)?)?;
+    (i64::try_from(values.len()).unwrap_or(i64::MAX) == dimensions).then_some(values)
 }
 
 /// The projection a `SearchVectors` reports through, or `None` when the request names

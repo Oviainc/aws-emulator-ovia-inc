@@ -190,7 +190,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
-        let resource = crate::state::resolve_resource_arn(
+        let resource = crate::state::resolve_policy_resource_arn(
             &input.resource_arn,
             &crate::state::request_region(ctx.parts()),
         )
@@ -205,10 +205,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // (`DeleteResourcePolicy$ExpectedRevisionId`).
         if let Some(expected) = input.expected_revision_id.as_deref() {
             let attached_revision_id = table
-                .resource_policy
-                .as_ref()
-                .map(|policy| policy.revision_id.as_str());
-            if attached_revision_id != Some(expected) {
+                .attached_policy(&resource)
+                .map_err(lift)?
+                .map(|policy| policy.revision_id.clone());
+            if attached_revision_id.as_deref() != Some(expected) {
                 // The refusal names the revision the request asked for and what the
                 // target carries instead, so the two situations the modelled error
                 // covers are told apart.
@@ -218,7 +218,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                             message: Some(crate::state::policy_revision_mismatch_message(
                                 expected,
                                 &resource.table,
-                                attached_revision_id,
+                                attached_revision_id.as_deref(),
                             )),
                         },
                     )
@@ -226,7 +226,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 );
             }
         }
-        let removed = table.resource_policy.take();
+        let removed = table.policy_slot(&resource).map_err(lift)?.take();
 
         ::tracing::info!(
             operation = Self::NAME,

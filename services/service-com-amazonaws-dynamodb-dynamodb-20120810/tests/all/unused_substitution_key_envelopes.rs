@@ -10,15 +10,16 @@
 //! service raises about a request's expressions does, i.e. where the request states its
 //! intent through `UpdateExpression` or `ConditionExpression`. A request whose expressions
 //! only NARROW a read (`FilterExpression`, `ProjectionExpression`,
-//! `KeyConditionExpression`), or that carries no expression at all, earns the sentence on
-//! its own.
+//! `KeyConditionExpression`) earns the sentence on its own.
 //!
 //! The rows span what the rule generalises over: the expression member the keys were
-//! offered to (a filter, a projection, a key condition, an update, a condition, and none
-//! at all), the operation (a scan, a query, an item read, a batch read, an item write, an
-//! item delete and an item update), which substitution table holds the unused keys
+//! offered to (a filter, a projection, a key condition, an update and a condition), the
+//! operation (a scan, a query, an item read, a batch read, an item write, an item delete
+//! and an item update), which substitution table holds the unused keys
 //! (`ExpressionAttributeNames` and `ExpressionAttributeValues`) and how many of them are
-//! unused (one, two and three).
+//! unused (one, two and three). A request that states NO expression at all offers its
+//! tokens to nothing and earns a different sentence — that one member cannot be used
+//! without an expression — which `substitution_without_expression` drives.
 //!
 //! The last assertion is the boundary the rule draws: a violation of a bound the MODEL
 //! declares on the same operation (`Scan$Limit` is `PositiveIntegerObject` with
@@ -147,14 +148,15 @@ fn rows() -> Vec<Row> {
             keys: &["#b"],
         },
         Row {
-            case: "a name a batch read offers with no projection at all",
+            case: "a name a batch read's projection never references",
             operation: "BatchGetItem",
             request: json!({"RequestItems": {TABLE: {
                 "Keys": [key()],
-                "ExpressionAttributeNames": {"#a": "status"}}}}),
-            expression_member: "",
+                "ProjectionExpression": "#a",
+                "ExpressionAttributeNames": {"#a": "status", "#b": "category"}}}}),
+            expression_member: "ProjectionExpression",
             table: "ExpressionAttributeNames",
-            keys: &["#a"],
+            keys: &["#b"],
         },
         Row {
             case: "a value a write's condition never references",

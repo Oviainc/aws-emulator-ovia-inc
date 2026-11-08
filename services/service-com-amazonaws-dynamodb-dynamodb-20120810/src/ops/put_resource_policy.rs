@@ -219,7 +219,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
         // The ARN is the caller's whole selector, and it must address a table of the
         // endpoint this request reached, exactly as it does for the tagging operations.
-        let resource = crate::state::resolve_resource_arn(
+        let resource = crate::state::resolve_policy_resource_arn(
             &input.resource_arn,
             &crate::state::request_region(ctx.parts()),
         )
@@ -235,7 +235,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.policy,
             now + crate::state::STATUS_TRANSITION,
         )
-        .map_err(|fault| lift_policy_fault(&input.resource_arn, fault))?;
+        .map_err(lift_policy_fault)?;
+        // A policy over the STREAM decides requests to the stream, so every action it
+        // names has to be one a stream has: a table action in it could never be decided
+        // by the resource it is attached to.
+        if resource.target == crate::state::PolicyTarget::Stream {
+            crate::state::check_stream_policy_actions(&policy).map_err(lift_policy_fault)?;
+        }
         // "Set this parameter to true to confirm that you want to remove your
         // permissions to change the policy of this resource in the future"
         // (`ConfirmRemoveSelfResourceAccess`): a document that denies the caller the
@@ -264,9 +270,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // conditionally attach a policy when no policy exists for the resource, specify
         // NO_POLICY for the revision ID" (`PutResourcePolicy$ExpectedRevisionId`).
         let attached_revision_id = table
-            .resource_policy
-            .as_ref()
-            .map(|policy| policy.revision_id.as_str());
+            .attached_policy(&resource)
+            .map_err(lift)?
+            .map(|policy| policy.revision_id.clone());
+        let attached_revision_id = attached_revision_id.as_deref();
         let unmet_expectation = match input.expected_revision_id.as_deref() {
             None => None,
             // `NO_POLICY` asks for the ABSENCE of a policy, so it is satisfied by that
@@ -287,7 +294,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let revision_id = policy.revision_id.clone();
-        table.resource_policy = Some(policy);
+        *table.policy_slot(&resource).map_err(lift)? = Some(policy);
 
         // The audit record for a state-changing call: who asked, what changed and that
         // it succeeded. Never the document itself, and never a credential.
@@ -345,23 +352,13 @@ fn policy_not_found(
     .into()
 }
 
-/// Lift a refusal of the policy document into this operation's error channel: the
-/// documented size limit is the modelled limit error, and a document that is not a
-/// policy is a bad request.
-fn lift_policy_fault(
-    resource_arn: &str,
-    fault: crate::state::PolicyFault,
-) -> PutResourcePolicyError {
+/// Lift a refusal of the policy document into this operation's error channel: a document
+/// past the documented size limit and one that is not a policy at all are both bad
+/// REQUESTS, so both are the service-common `ValidationException`.
+fn lift_policy_fault(fault: crate::state::PolicyFault) -> PutResourcePolicyError {
     match fault {
-        crate::state::PolicyFault::TooLarge(size) => {
-            PutResourcePolicyErrorModeled::LimitExceededException(LimitExceededException {
-                message: Some(format!(
-                    "Policy size exceeds the maximum supported size of {} bytes for resource \
-                     {resource_arn}: {size} bytes",
-                    crate::state::MAX_RESOURCE_POLICY_BYTES
-                )),
-            })
-            .into()
+        crate::state::PolicyFault::TooLarge => {
+            crate::scaffolded::Scaffolded::validation(crate::state::policy_too_large_message())
         }
         crate::state::PolicyFault::Invalid(detail) => {
             crate::scaffolded::Scaffolded::validation(detail)

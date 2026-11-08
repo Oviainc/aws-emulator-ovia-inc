@@ -686,7 +686,7 @@ async fn a_scan_request_the_service_refuses() {
                                              "AttributeValueList": [{"N": "3"}]}}}),
             400,
             "ValidationException",
-            "BETWEEN takes 2 value(s)",
+            "Invalid number of argument(s) for the BETWEEN ComparisonOperator",
         ),
         (
             "the legacy ConditionalOperator with no ScanFilter to combine",
@@ -709,7 +709,7 @@ async fn a_scan_request_the_service_refuses() {
                    "Select": "ALL_ATTRIBUTES"}),
             400,
             "ValidationException",
-            "SPECIFIC_ATTRIBUTES",
+            "Cannot specify the ProjectionExpression when choosing to get ALL_ATTRIBUTES",
         ),
         (
             "Select SPECIFIC_ATTRIBUTES with nothing listed to return",
@@ -723,7 +723,7 @@ async fn a_scan_request_the_service_refuses() {
             json!({"TableName": &table.name, "Select": "ALL_PROJECTED_ATTRIBUTES"}),
             400,
             "ValidationException",
-            "allowed only when an index is scanned",
+            "can be used only when Scanning using an IndexName",
         ),
     ];
 

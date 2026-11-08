@@ -563,13 +563,14 @@ fn unused_rows() -> Vec<UnusedRow> {
             keys: ":b",
         },
         UnusedRow {
-            case: "a GetItem with a name no projection references",
+            case: "a GetItem with a name its projection never references",
             operation: "GetItem",
             request: json!({"TableName": "Unused", "Key": {"id": {"S": "one"}},
-                            "ExpressionAttributeNames": {"#a": "status"}}),
-            expression_member: "",
+                            "ProjectionExpression": "#a",
+                            "ExpressionAttributeNames": {"#a": "label", "#b": "status"}}),
+            expression_member: "ProjectionExpression",
             member: "ExpressionAttributeNames",
-            keys: "#a",
+            keys: "#b",
         },
         UnusedRow {
             case: "a PutItem whose condition leaves a value unreferenced",

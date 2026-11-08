@@ -31,9 +31,9 @@
 //! has to go on to the parent table are the rules `Scan` reads an index by too
 //! ([`crate::state::indexed_read`]).
 //!
-//! The legacy result filters (`QueryFilter`, `ConditionalOperator`) are refused with the
-//! scaffold's 501 and filed as their own gap issue — AFTER every rule above, so no
-//! refusal this operation models is pre-empted by it. `ConsistentRead` needs no handling
+//! The legacy result filter (`QueryFilter` with `ConditionalOperator`) states the same
+//! filter one generation back, lowered onto the one filter both readers of this service
+//! share ([`crate::state::ReadFilter`]). `ConsistentRead` needs no handling
 //! beyond its effect on `ConsumedCapacity`, this store having one copy of each item,
 //! except on a global secondary index, which does not support it and refuses the
 //! request.
@@ -424,7 +424,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         )
         .map_err(lift)?;
         let selection = crate::state::resolve_selection(
+            crate::state::Reader::Query,
             input.select.as_deref(),
+            crate::state::stated_projection_member(
+                input.projection_expression.as_deref(),
+                input.attributes_to_get.as_deref(),
+            ),
             requested,
             input.index_name.is_some(),
         )
@@ -433,24 +438,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let comparisons = key_comparisons(&input).map_err(lift)?;
         // "A filter expression is applied after a Query finishes, but before the
-        // results are returned" (`Query$FilterExpression`): the same
-        // `ConditionExpression` language `Scan` filters with, judged against each
-        // item the key conditions selected. Parsed BEFORE the store is read, so an
-        // expression the service would refuse is refused without reading anything.
-        let filter = match input.filter_expression.as_deref() {
-            Some(expression) => Some(
-                crate::state::ParsedCondition::parse(
-                    "FilterExpression",
-                    expression,
-                    crate::state::Substitutions::new(
-                        input.expression_attribute_names.as_ref(),
-                        input.expression_attribute_values.as_ref(),
-                    ),
-                )
-                .map_err(lift)?,
+        // results are returned" (`Query$FilterExpression`), stated either in that
+        // language or through the legacy `QueryFilter` map it replaced — the one filter
+        // both readers of this service state it through
+        // ([`crate::state::ReadFilter`]). Read BEFORE the store is, so a filter the
+        // service would refuse is refused without reading anything.
+        let filter = crate::state::ReadFilter::resolve(
+            "QueryFilter",
+            input.filter_expression.as_deref(),
+            input.query_filter.as_ref(),
+            input.conditional_operator.as_deref(),
+            crate::state::Substitutions::new(
+                input.expression_attribute_names.as_ref(),
+                input.expression_attribute_values.as_ref(),
             ),
-            None => None,
-        };
+        )
+        .map_err(lift)?;
         // Every token the request DEFINES must be one an expression uses: an unused
         // entry of either substitution table makes the whole request invalid, however
         // well-formed the expressions that ignore it are.
@@ -476,16 +479,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         for (placeholder, value) in input.expression_attribute_values.iter().flatten() {
             crate::state::check_bare_attribute_value(placeholder, value).map_err(lift)?;
         }
-        // The legacy `QueryFilter` is the one member of this operation that is not
-        // served yet, and it is its own gap issue. The guard sits HERE, after every rule
-        // above: a request whose defect the service states as a `ValidationException` is
-        // answered that way whether or not it also carries this member.
-        if input.query_filter.as_ref().is_some_and(|map| !map.is_empty()) {
-            return Err(crate::scaffolded::Scaffolded::not_implemented(
-                "Query with QueryFilter",
-            ));
-        }
-
         // WHO this request speaks for, resolved before this service's store is locked
         // ([`crate::state::authorization`]).
         let caller = crate::state::request_caller(&*self.engine, ctx);
@@ -539,10 +532,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // schema the read is addressed through — the table's own, and the index's when
         // the request named one. An index query reads items of the table, so the
         // table's key attributes are primary key attributes there too.
-        let filter_attributes: ::std::collections::BTreeSet<String> = filter
-            .as_ref()
-            .map(|filter| filter.attribute_reads().into_keys().collect())
-            .unwrap_or_default();
+        let filter_attributes: ::std::collections::BTreeSet<String> = filter.attributes();
         if let Some(key) = filter_attributes
             .iter()
             .find(|attribute| table.is_table_key(attribute) || condition.is_key(attribute))
@@ -671,11 +661,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let scanned_count = i32::try_from(page.len()).unwrap_or(i32::MAX);
         let mut matched: Vec<&crate::state::Read<'_>> = Vec::with_capacity(page.len());
         for read in &page {
-            let keep = match &filter {
-                Some(filter) => filter.evaluate(Some(read.seen())).map_err(lift)?,
-                None => true,
-            };
-            if keep {
+            if filter.matches(read.seen()).map_err(lift)? {
                 matched.push(read);
             }
         }
@@ -827,9 +813,9 @@ impl KeyCondition {
     /// equality on the partition key, and at most one comparison on the sort key.
     ///
     /// The operands are held to the type the TABLE declared for the attribute they are
-    /// compared with ([`crate::state::Table::key_value`]), whichever schema names it, so
-    /// a value of another type than the key's declared one is refused before anything is
-    /// read.
+    /// compared with ([`crate::state::Table::key_condition_value`]), whichever schema
+    /// names it, so a value of another type than the key's declared one is refused before
+    /// anything is read.
     fn resolve(
         table: &crate::state::Table,
         schema: &[KeySchemaElement],
@@ -870,7 +856,7 @@ impl KeyCondition {
             let encoded = comparison
                 .operands
                 .iter()
-                .map(|value| table.key_value(&comparison.attribute, value))
+                .map(|value| table.key_condition_value(&comparison.attribute, value))
                 .collect::<Result<Vec<_>, _>>()?;
             if is_partition {
                 // "The partition key equality test is required": no other comparison
@@ -1112,16 +1098,25 @@ fn legacy_comparison(
         "BETWEEN" => Operator::Between,
         "BEGINS_WITH" => Operator::BeginsWith,
         other => {
+            // AWS's sentence for that defect names the member and the operator the
+            // request sent, and does not enumerate the operators it does support.
             return Err(crate::state::RequestError::Validation(format!(
-                "Unsupported operator on KeyConditions: {other} must be one of EQ, LE, LT, GE, \
-                 GT, BEGINS_WITH or BETWEEN"
+                "Unsupported operator on KeyConditions: {other}"
             )))
         }
     };
     Ok(Comparison {
         attribute: attribute.to_string(),
         operator,
-        operands: condition.attribute_value_list.clone().unwrap_or_default(),
+        // The operand count is part of each legacy operator's definition, so an entry
+        // given the wrong number of them is refused the way every legacy condition map
+        // of this service refuses one ([`crate::state::check_legacy_comparison`]) — one
+        // sentence for that defect whichever member carried the map.
+        operands: {
+            let operands = condition.attribute_value_list.clone().unwrap_or_default();
+            crate::state::check_legacy_comparison(&condition.comparison_operator, &operands)?;
+            operands
+        },
     })
 }
 

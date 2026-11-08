@@ -12,7 +12,11 @@ use super::*;
 
 impl ComAmazonawsDynamodbDynamodb20120810State {
     /// The table a RESOURCE-POLICY operation names, or the not-found that surface words.
-    pub fn table_for_policy(&self, resource: &TaggedResource) -> Result<&Table, RequestError> {
+    ///
+    /// A policy addresses a table or that table's stream, and both live on the table
+    /// record, so both are looked up here; which of the two a request addressed is
+    /// [`PolicyTarget`].
+    pub fn table_for_policy(&self, resource: &PolicyResource) -> Result<&Table, RequestError> {
         self.tables_in(&resource.region)
             .and_then(|tables| tables.get(&resource.table))
             .ok_or_else(|| not_found(&resource.table))
@@ -21,7 +25,7 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
     /// The same, mutably, for the policy operations that attach or remove a document.
     pub fn table_for_policy_mut(
         &mut self,
-        resource: &TaggedResource,
+        resource: &PolicyResource,
     ) -> Result<&mut Table, RequestError> {
         self.table_mut(&resource.region, &resource.table)
             .map_err(|_| not_found(&resource.table))

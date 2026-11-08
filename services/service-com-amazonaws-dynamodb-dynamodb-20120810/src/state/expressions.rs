@@ -655,6 +655,22 @@ impl<'a> Substitutions<'a> {
         expressions: &[(&str, Option<&str>)],
     ) -> Result<(), RequestError> {
         self.check_tables_not_empty()?;
+        // A substitution table holds "substitution tokens for attribute names in an
+        // expression" / "values that can be substituted in an expression" (those
+        // members' docs), so a request that states NO expression at all offers its
+        // tokens to nothing: the member itself is the mistake, not one of its entries,
+        // and the caller is told it cannot be used without an expression rather than
+        // which entry went unused.
+        if expressions
+            .iter()
+            .all(|(_, expression)| expression.is_none())
+        {
+            if let Some(member) = self.supplied_table() {
+                return Err(RequestError::Validation(format!(
+                    "{member} can only be specified when using expressions"
+                )));
+            }
+        }
         let mut names: BTreeSet<String> = BTreeSet::new();
         let mut values: BTreeSet<String> = BTreeSet::new();
         for (member, expression) in expressions {
@@ -692,6 +708,18 @@ impl<'a> Substitutions<'a> {
         });
         check_referenced("ExpressionAttributeNames", self.names, &names, enveloped)?;
         check_referenced("ExpressionAttributeValues", self.values, &values, enveloped)
+    }
+
+    /// Which substitution table this request SUPPLIED entries in, the names table first:
+    /// what a refusal about carrying a table at all has to name.
+    fn supplied_table(&self) -> Option<&'static str> {
+        if self.names.is_some_and(|names| !names.is_empty()) {
+            return Some("ExpressionAttributeNames");
+        }
+        if self.values.is_some_and(|values| !values.is_empty()) {
+            return Some("ExpressionAttributeValues");
+        }
+        None
     }
 
     /// A substitution table the request SENT must define something, and every name it
@@ -3066,27 +3094,29 @@ pub fn check_legacy_comparison(
         operands.len() == required
     };
     if !count_ok {
-        return Err(RequestError::Validation(format!(
-            "One or more parameter values were invalid: {operator} takes {} value(s) in \
-             AttributeValueList, got {}",
-            if required == usize::MAX {
-                "one or more".to_string()
-            } else {
-                required.to_string()
-            },
-            operands.len()
-        )));
+        return Err(RequestError::Validation(invalid_argument_count(operator)));
     }
     // The one operator whose operand count the request chooses, held to the documented
     // ceiling on that list ([`MAX_IN_OPERANDS`]).
     if required == usize::MAX && operands.len() > MAX_IN_OPERANDS {
-        return Err(RequestError::Validation(format!(
-            "One or more parameter values were invalid: {operator} takes at most \
-             {MAX_IN_OPERANDS} value(s) in AttributeValueList, got {}",
-            operands.len()
-        )));
+        return Err(RequestError::Validation(invalid_argument_count(operator)));
     }
     Ok(())
+}
+
+/// How a legacy comparison given the wrong number of `AttributeValueList` entries is
+/// refused: AWS's sentence for that defect, over the operator the entry named.
+///
+/// "AttributeValueList - One or more values to evaluate against the supplied attribute.
+/// The number of values in the list depends on the ComparisonOperator being used"
+/// (`Condition$AttributeValueList`), so the count is part of the operator's own
+/// definition — which is why the refusal names the operator and neither the count it
+/// takes nor the count that was sent.
+fn invalid_argument_count(operator: &str) -> String {
+    format!(
+        "{INVALID_PARAMETER_CLAUSE}: Invalid number of argument(s) for the {operator} \
+         ComparisonOperator"
+    )
 }
 
 /// Hold a legacy condition MAP to what one request may ask the service to evaluate for

@@ -170,7 +170,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let now = ::std::time::SystemTime::now();
         let state = crate::state::service_state(&*self.engine).ok_or_else(store_unavailable)?;
-        let resource = crate::state::resolve_resource_arn(
+        let resource = crate::state::resolve_policy_resource_arn(
             &input.resource_arn,
             &crate::state::request_region(ctx.parts()),
         )
@@ -181,15 +181,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // clock already made due.
         store.apply_due_transitions(now);
         let table = store.table_for_policy(&resource).map_err(lift)?;
-        let policy = table.resource_policy.as_ref().ok_or_else(|| {
-            GetResourcePolicyError::from(
-                GetResourcePolicyErrorModeled::PolicyNotFoundException(PolicyNotFoundException {
-                    message: Some(crate::state::policy_not_found_message(
-                        &input.resource_arn,
-                    )),
-                }),
-            )
-        })?;
+        let policy = table
+            .attached_policy(&resource)
+            .map_err(lift)?
+            .ok_or_else(|| {
+                GetResourcePolicyError::from(
+                    GetResourcePolicyErrorModeled::PolicyNotFoundException(PolicyNotFoundException {
+                        message: Some(crate::state::policy_not_found_message(
+                            &input.resource_arn,
+                        )),
+                    }),
+                )
+            })?;
 
         Ok(GetResourcePolicyOutput {
             policy: Some(policy.document.clone()),

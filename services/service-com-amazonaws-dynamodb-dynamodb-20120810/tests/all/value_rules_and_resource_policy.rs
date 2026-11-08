@@ -634,8 +634,11 @@ async fn a_resource_policy_decides_whether_the_data_plane_serves_the_request() {
         PolicyCase {
             case: "an Allow of the same action",
             statement: json!({
+                // An Allow may not name a PUBLIC principal, so this row grants to the
+                // account that is going to make the read instead: what is under test is
+                // that an Allow denies nothing.
                 "Effect": "Allow",
-                "Principal": {"AWS": "*"},
+                "Principal": {"AWS": format!("arn:aws:iam::{ACCOUNT_ID}:root")},
                 "Action": "dynamodb:GetItem",
                 "Resource": arn,
             }),
@@ -983,7 +986,8 @@ async fn a_policy_document_this_emulator_cannot_honour_is_refused_not_stored() {
         );
     }
 
-    // Past the documented 20 KB the answer is the modelled limit error.
+    // Past the documented 20 KB the document breaks a bound on a member's VALUE, which
+    // is the service-common validation refusal naming that bound.
     let padded = json!({
         "Version": "2012-10-17",
         "Sid": "x".repeat(MAX_RESOURCE_POLICY_BYTES),
@@ -1003,9 +1007,18 @@ async fn a_policy_document_this_emulator_cannot_honour_is_refused_not_stored() {
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (400, "LimitExceededException"),
+        (400, "ValidationException"),
         "case a document past {MAX_RESOURCE_POLICY_BYTES} bytes: expected 400 \
-         LimitExceededException, got {status} {body}"
+         ValidationException, got {status} {body}"
+    );
+    assert_eq!(
+        message_of(&body),
+        format!(
+            "One or more parameter values were invalid: Policy size exceeds the maximum \
+             allowed size of {MAX_RESOURCE_POLICY_BYTES} bytes"
+        ),
+        "case a document past {MAX_RESOURCE_POLICY_BYTES} bytes: the refusal names the limit, \
+         got {body}"
     );
 
     // None of the refusals attached anything.

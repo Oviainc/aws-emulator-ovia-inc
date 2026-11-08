@@ -329,8 +329,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the work one call may ask for rather than a malformed request, so it is
         // answered with the control plane's modelled limit error — the code a client
         // backs off and retries one index at a time on.
-        // A CREATE and a DELETE in one call are two different limits, so each is
-        // counted on its own.
+        // A CREATE and a DELETE in one call are two lifecycle actions, so they count
+        // together against that one.
         if let Some(message) = index_lifecycle_actions_over_limit(&index_updates) {
             return Err(UpdateTableErrorModeled::LimitExceededException(
                 LimitExceededException {
@@ -963,10 +963,11 @@ fn unsupported_member(input: &UpdateTableInput) -> Option<&'static str> {
     if input.disassociation_protection_enabled.is_some() {
         return Some("DisassociationProtectionEnabled");
     }
-    // An index's throughput is stored as a PROVISIONED one only, so an on-demand or
-    // warm throughput asked for per index is "not written yet" rather than accepted and
-    // dropped. Checked here so it answers the scaffold's 501, like the table-level
-    // members above, instead of a bad-request refusal.
+    // An index's ON-DEMAND throughput is the one member this slice does not store, so an
+    // on-demand ceiling asked for per index is "not written yet" rather than accepted and
+    // dropped. Checked here so it answers the scaffold's 501, like the table-level members
+    // above, instead of a bad-request refusal. An index's WARM throughput is stored and
+    // reported, by the same rule the table's own is.
     for update in input.global_secondary_index_updates.iter().flatten() {
         let on_demand = update
             .create
@@ -978,17 +979,6 @@ fn unsupported_member(input: &UpdateTableInput) -> Option<&'static str> {
                 .is_some_and(|change| change.on_demand_throughput.is_some());
         if on_demand {
             return Some("GlobalSecondaryIndexUpdates carrying OnDemandThroughput");
-        }
-        let warm = update
-            .create
-            .as_ref()
-            .is_some_and(|create| create.warm_throughput.is_some())
-            || update
-                .update
-                .as_ref()
-                .is_some_and(|change| change.warm_throughput.is_some());
-        if warm {
-            return Some("GlobalSecondaryIndexUpdates carrying WarmThroughput");
         }
     }
     None
@@ -1049,20 +1039,19 @@ fn validated_index_updates(
 /// global secondary index per UpdateTable operation"
 /// (`UpdateTable$GlobalSecondaryIndexUpdates`).
 ///
-/// A CREATE and a DELETE in one call are two different limits, so each is counted on
-/// its own and the sentence names the one the request broke and how many it asked for.
+/// A CREATE and a DELETE in one call are two lifecycle actions on one table's indexes,
+/// which is one more than a single call may carry, so the two are counted TOGETHER; the
+/// sentence names the limit and nothing of which index or how many the request named.
 fn index_lifecycle_actions_over_limit(updates: &[GlobalSecondaryIndexUpdate]) -> Option<String> {
-    /// How many indexes one `UpdateTable` may create, and how many it may delete.
+    /// How many indexes one `UpdateTable` may create or delete, counted over both
+    /// actions: "You can create or delete only one global secondary index per UpdateTable
+    /// operation".
     const PER_CALL: usize = 1;
-    let creates = updates
+    let lifecycle = updates
         .iter()
-        .filter(|update| update.create.is_some())
+        .filter(|update| update.create.is_some() || update.delete.is_some())
         .count();
-    let deletes = updates
-        .iter()
-        .filter(|update| update.delete.is_some())
-        .count();
-    if creates <= PER_CALL && deletes <= PER_CALL {
+    if lifecycle <= PER_CALL {
         return None;
     }
     // AWS's text for this limit is FIXED: it states the limit and nothing of which
@@ -1130,10 +1119,20 @@ fn resolve_table_throughput(
 ) -> Result<Option<ProvisionedThroughput>, crate::state::RequestError> {
     if billing_mode == "PAY_PER_REQUEST" {
         if input.provisioned_throughput.is_some() {
+            // WHICH sentence states it follows what the REQUEST said: a request that
+            // names the billing mode is told the two members contradict each other,
+            // while one that names only the throughput is told what the mode in force
+            // accepts — the capacity members cannot be set on a table that is
+            // pay-per-request.
             return Err(crate::state::RequestError::Validation(
-                "One or more parameter values were invalid: Neither ReadCapacityUnits nor \
-                 WriteCapacityUnits can be specified when BillingMode is PAY_PER_REQUEST"
-                    .to_string(),
+                match input.billing_mode.is_some() {
+                    true => super::create_table::THROUGHPUT_WITH_PAY_PER_REQUEST_MESSAGE
+                        .to_string(),
+                    false => "One or more parameter values were invalid: Neither \
+                              ReadCapacityUnits nor WriteCapacityUnits can be specified when \
+                              BillingMode is PAY_PER_REQUEST"
+                        .to_string(),
+                },
             ));
         }
         return Ok(None);
@@ -1154,9 +1153,7 @@ fn resolve_table_throughput(
             Ok(Some(throughput))
         }
         None => Err(crate::state::RequestError::Validation(
-            "One or more parameter values were invalid: Both ReadCapacityUnits and \
-             WriteCapacityUnits must be specified when BillingMode is PROVISIONED"
-                .to_string(),
+            super::create_table::THROUGHPUT_WITHOUT_PROVISIONED_MESSAGE.to_string(),
         )),
     }
 }
@@ -1365,11 +1362,14 @@ fn resolve_indexes(
                 billing_mode,
                 create.provisioned_throughput.clone(),
             )?;
-            // No request may name a warm throughput per index (that member is refused
-            // with the scaffold's 501), so a new index keeps warm the capacity it is
-            // provisioned for.
-            let warm_throughput =
-                crate::state::WarmThroughputSettings::tracking(throughput.as_ref(), now);
+            // An index the request names no warm throughput for keeps warm the capacity
+            // it is provisioned for; one that names it is held to the same rule the
+            // table-level member is ([`crate::state::resolved_warm_throughput`]).
+            let warm_throughput = crate::state::resolved_warm_throughput(
+                create.warm_throughput.as_ref(),
+                &crate::state::WarmThroughputSettings::tracking(throughput.as_ref(), now),
+                now,
+            )?;
             indexes.push(crate::state::GlobalSecondaryIndex {
                 arn: crate::state::index_arn(&table.region, &table.name, &create.index_name),
                 name: create.index_name.clone(),
@@ -1392,10 +1392,14 @@ fn resolve_indexes(
             let before = indexes.len();
             indexes.retain(|index| index.name != delete.index_name);
             if indexes.len() == before {
-                return Err(crate::state::index_not_found(
-                    &table.name,
-                    &delete.index_name,
-                ));
+                // An index name the table carries no index under is the REQUEST's own
+                // mistake — the table it addresses is there — so it is a validation
+                // refusal naming the action that could not be applied and the name it
+                // named, not a missing resource.
+                return Err(crate::state::RequestError::Validation(format!(
+                    "Attempting to delete an index which does not exist: {}",
+                    delete.index_name
+                )));
             }
         }
         if let Some(change) = &update.update {
@@ -1408,14 +1412,14 @@ fn resolve_indexes(
                     &change.index_name,
                 ));
             };
-            if change.on_demand_throughput.is_some() || change.warm_throughput.is_some() {
+            if change.on_demand_throughput.is_some() {
                 // Refused up front by `unsupported_member`, which answers the
                 // scaffold's 501 for it; reaching here would mean that check was
                 // bypassed, so it is an internal inconsistency rather than a bad
                 // request.
                 return Err(crate::state::RequestError::Validation(format!(
                     "Invalid GlobalSecondaryIndexUpdates: index {} can only be updated through \
-                     ProvisionedThroughput in this emulator",
+                     ProvisionedThroughput and WarmThroughput in this emulator",
                     change.index_name
                 )));
             }
@@ -1432,10 +1436,14 @@ fn resolve_indexes(
             }
             index.provisioned_throughput = throughput;
             // An index nobody has named a warm throughput for keeps warm the capacity it
-            // is now provisioned for.
-            index.warm_throughput = index
-                .warm_throughput
-                .tracking_capacity(index.provisioned_throughput.as_ref());
+            // is now provisioned for; one the request names it for takes what it asked.
+            index.warm_throughput = crate::state::resolved_warm_throughput(
+                change.warm_throughput.as_ref(),
+                &index
+                    .warm_throughput
+                    .tracking_capacity(index.provisioned_throughput.as_ref()),
+                now,
+            )?;
             index.transient_status = crate::state::IndexStatus::Updating;
             index.active_at = now + crate::state::STATUS_TRANSITION;
         }

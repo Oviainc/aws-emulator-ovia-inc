@@ -5,6 +5,51 @@
 
 use super::*;
 
+/// How an operand a key CONDITION compares a key attribute with is refused when its type
+/// is not the one the schema declares for that attribute: AWS's FIXED sentence for a
+/// condition parameter, which states the rule and reports neither the attribute nor
+/// either type. A key the request ADDRESSES an item by is a different member and keeps
+/// its own sentence ([`Table::key_value`]).
+const CONDITION_PARAMETER_TYPE_MESSAGE: &str =
+    "One or more parameter values were invalid: Condition parameter type does not match \
+     schema type";
+
+/// Whether `value` is a vector at all: the one reading of that attribute this service
+/// has ([`vector_values`]).
+fn value_is_vector(value: &AttributeValue) -> bool {
+    vector_values(value).is_some()
+}
+
+/// The least a write to a vector index meters: a vector write is denominated in BYTES
+/// ("VectorWriteRequestBytes" — `ConsumedCapacity$VectorIndexes`) with a 1 KB floor, so a
+/// small vector costs the floor rather than its own few bytes, the way a write of a small
+/// item still costs one capacity unit.
+pub const MIN_VECTOR_WRITE_BYTES: i64 = 1024;
+
+/// What one dimension of a STORED vector costs: a vector attribute is a list of 32-bit
+/// IEEE-754 floats ([`value_is_vector`]), so each dimension is four bytes once it is held
+/// as the index holds it rather than as the decimal text the request sent.
+pub const BYTES_PER_VECTOR_DIMENSION: i64 = 4;
+
+impl VectorIndex {
+    /// The bytes one write of `item` meters on this index, BEFORE the floor every vector
+    /// write is held to ([`MIN_VECTOR_WRITE_BYTES`]).
+    ///
+    /// What the index stores for the item: the attributes it holds, sized the way this
+    /// store sizes an item, with the vector itself counted at
+    /// [`BYTES_PER_VECTOR_DIMENSION`] per dimension of the index instead of as the text
+    /// the request spelled it with — which is what makes the figure grow with the
+    /// index's `Dimensions` rather than with the way a client wrote the numbers.
+    pub fn write_request_bytes(&self, item: &Item) -> i64 {
+        let written = item
+            .get(&self.vector_attribute.attribute_name)
+            .map_or(0, attribute_value_size);
+        item_size(item)
+            .saturating_sub(written)
+            .saturating_add(self.dimensions.saturating_mul(BYTES_PER_VECTOR_DIMENSION))
+    }
+}
+
 impl Table {
     /// The status at `now`, derived from the stored instants.
     pub fn status(&self, now: SystemTime) -> TableStatus {
@@ -172,6 +217,78 @@ impl Table {
         Ok(encoded)
     }
 
+    /// Encode one operand a key CONDITION compares a key attribute with.
+    ///
+    /// The same encoding as [`Self::key_value`], with the refusal a key condition earns:
+    /// an operand is a "condition parameter" rather than a key the request addresses an
+    /// item by, so AWS states the type mismatch as the rule the parameter broke, naming
+    /// neither the attribute nor the two types.
+    pub fn key_condition_value(
+        &self,
+        attribute: &str,
+        value: &AttributeValue,
+    ) -> Result<AttributeValueKey, RequestError> {
+        if self
+            .declared_type(attribute)
+            .is_some_and(|declared| declared != attribute_value_type(value))
+        {
+            return Err(RequestError::Validation(
+                CONDITION_PARAMETER_TYPE_MESSAGE.to_string(),
+            ));
+        }
+        self.key_value(attribute, value)
+    }
+
+    /// The policy slot a `*ResourcePolicy` call addressed on this table: the table's own
+    /// policy, or its stream's.
+    ///
+    /// A stream is addressed by the ARN of the stream the table publishes to, so an ARN
+    /// naming any OTHER stream label — a stream this table never had, or one it has
+    /// replaced — names a resource that is not there, which is the not-found the Streams
+    /// surface words over the ARN the request carried.
+    pub fn policy_slot(
+        &mut self,
+        resource: &PolicyResource,
+    ) -> Result<&mut Option<AttachedPolicy>, RequestError> {
+        match resource.target {
+            PolicyTarget::Table => Ok(&mut self.resource_policy),
+            PolicyTarget::Stream => {
+                self.check_addresses_stream(resource)?;
+                Ok(&mut self.stream_resource_policy)
+            }
+        }
+    }
+
+    /// The policy that call addressed, for a reader: `None` when the resource carries
+    /// none at all.
+    pub fn attached_policy(
+        &self,
+        resource: &PolicyResource,
+    ) -> Result<Option<&AttachedPolicy>, RequestError> {
+        match resource.target {
+            PolicyTarget::Table => Ok(self.resource_policy.as_ref()),
+            PolicyTarget::Stream => {
+                self.check_addresses_stream(resource)?;
+                Ok(self.stream_resource_policy.as_ref())
+            }
+        }
+    }
+
+    /// Whether the ARN of that call names the stream THIS table publishes to.
+    fn check_addresses_stream(&self, resource: &PolicyResource) -> Result<(), RequestError> {
+        let names_it = self
+            .stream
+            .as_ref()
+            .is_some_and(|stream| stream.arn == resource.arn);
+        if names_it {
+            return Ok(());
+        }
+        Err(RequestError::NotFound(format!(
+            "Requested resource not found: Stream: {} not found",
+            resource.arn
+        )))
+    }
+
     /// The role `attribute` plays in a key schema of this table — its own, or one of
     /// its global secondary indexes — if it plays one at all.
     ///
@@ -308,7 +425,47 @@ impl Table {
     /// separately instead.
     pub fn check_index_keys(&self, item: &Item) -> Result<(), RequestError> {
         self.check_index_key_types(item)?;
-        self.check_index_key_values(item)
+        self.check_index_key_values(item)?;
+        self.check_vector_attributes(item)
+    }
+
+    /// Hold the item's VECTOR attributes to the shape every vector index over them was
+    /// built for: "The number of dimensions in each vector" (`VectorIndex$Dimensions`),
+    /// and "If multiple vector indexes reference the same attribute, they must all use
+    /// the same number of dimensions" (`CreateVectorIndexAction$VectorAttribute`) — so an
+    /// attribute an index indexes carries a list of exactly that many numbers.
+    ///
+    /// An item carrying something else under that name could not be indexed at all, so
+    /// the write is refused rather than stored outside the index it was written for. An
+    /// item that carries NO value for the attribute is simply not covered by the index
+    /// ([`VectorIndex::covers`]) and is written as it stands.
+    pub fn check_vector_attributes(&self, item: &Item) -> Result<(), RequestError> {
+        for index in &self.vector_indexes {
+            let name = index.vector_attribute.attribute_name.as_str();
+            let Some(value) = item.get(name) else {
+                continue;
+            };
+            let dimensions = match value {
+                AttributeValue::L(values) => i64::try_from(values.len()).unwrap_or(i64::MAX),
+                _ => -1,
+            };
+            if dimensions != index.dimensions {
+                return Err(RequestError::Validation(format!(
+                    "{INVALID_PARAMETER_CLAUSE}: The number of dimensions in the vector \
+                     attribute {name} must match the number of dimensions configured for the \
+                     vector index {}: {}",
+                    index.name, index.dimensions
+                )));
+            }
+            let numeric = value_is_vector(value);
+            if !numeric {
+                return Err(RequestError::Validation(format!(
+                    "{INVALID_PARAMETER_CLAUSE}: The vector attribute {name} must hold only \
+                     numbers, each a 32-bit IEEE-754 floating point value"
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// The TYPE rule for the item's secondary-index key attributes: "If you specify
@@ -970,6 +1127,27 @@ impl Table {
                 capacity
                     .global_secondary_indexes
                     .insert(index.name.clone(), units);
+            }
+        }
+        // A VECTOR index is metered in bytes rather than in capacity units
+        // ("ConsumedCapacity … also includes a VectorIndexes field with
+        // VectorWriteRequestBytes consumed for each affected vector index" —
+        // `PutItem$ConsumedCapacity`), so each index the write reached carries its own
+        // figure beside the capacity breakdown above.
+        for index in &self.vector_indexes {
+            let metered = [before, after]
+                .into_iter()
+                .flatten()
+                .filter(|item| index.covers(item))
+                .map(|item| index.write_request_bytes(item))
+                .max();
+            if let Some(bytes) = metered {
+                capacity.vector_indexes.insert(
+                    index.name.clone(),
+                    // Exact: the store admits far fewer bytes than an `f64` carries
+                    // whole numbers for, so the figure reported is the figure counted.
+                    bytes.max(MIN_VECTOR_WRITE_BYTES) as f64,
+                );
             }
         }
         capacity

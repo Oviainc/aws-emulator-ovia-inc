@@ -831,6 +831,9 @@ impl Table {
             // A resource-based policy is attached to ONE table by its own ARN, so the
             // replica carries none until a policy is put on it.
             resource_policy: None,
+            // Its stream's policy is the stream's own, and the replica is created with no
+            // stream at all.
+            stream_resource_policy: None,
             // The replica's change feed is a stream of its own Region, which only a
             // `StreamSpecification` on this table creates; the replica is created without
             // one rather than reporting an ARN nothing registered.

@@ -785,8 +785,8 @@ fn refusal_cases() -> Vec<RefusalCase> {
                 }),
                 &json!({}),
             ),
-            message: "One or more parameter values were invalid: Type mismatch for key \
-                      priority expected: N actual: S"
+            message: "One or more parameter values were invalid: Condition parameter type \
+                      does not match schema type"
                 .to_string(),
         },
         RefusalCase {
@@ -801,8 +801,8 @@ fn refusal_cases() -> Vec<RefusalCase> {
                 }),
                 &json!({}),
             ),
-            message: "One or more parameter values were invalid: Type mismatch for key \
-                      status expected: S actual: N"
+            message: "One or more parameter values were invalid: Condition parameter type \
+                      does not match schema type"
                 .to_string(),
         },
         RefusalCase {
@@ -835,9 +835,8 @@ fn refusal_cases() -> Vec<RefusalCase> {
                 }),
                 &json!({"Select": "COUNT", "ProjectionExpression": "note"}),
             ),
-            message: "One or more parameter values were invalid: Select type COUNT is not \
-                      supported when the attributes to return are listed; the only Select \
-                      type that is, is SPECIFIC_ATTRIBUTES"
+            message: "1 validation error detected: Cannot specify the ProjectionExpression \
+                      when choosing to get only the Count"
                 .to_string(),
         },
         RefusalCase {
@@ -851,9 +850,8 @@ fn refusal_cases() -> Vec<RefusalCase> {
                 }),
                 &json!({"Select": "ALL_ATTRIBUTES", "ProjectionExpression": "note"}),
             ),
-            message: "One or more parameter values were invalid: Select type ALL_ATTRIBUTES \
-                      is not supported when the attributes to return are listed; the only \
-                      Select type that is, is SPECIFIC_ATTRIBUTES"
+            message: "1 validation error detected: Cannot specify the ProjectionExpression \
+                      when choosing to get ALL_ATTRIBUTES"
                 .to_string(),
         },
         RefusalCase {
@@ -867,9 +865,8 @@ fn refusal_cases() -> Vec<RefusalCase> {
                 }),
                 &json!({"Select": "SPECIFIC_ATTRIBUTES"}),
             ),
-            message: "One or more parameter values were invalid: Select type \
-                      SPECIFIC_ATTRIBUTES requires the attributes to be listed in \
-                      ProjectionExpression"
+            message: "1 validation error detected: Must specify the ProjectionExpression \
+                      when choosing to get SPECIFIC_ATTRIBUTES"
                 .to_string(),
         },
         RefusalCase {

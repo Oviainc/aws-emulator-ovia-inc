@@ -410,9 +410,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .map_err(lift)?;
         // "A filter expression is applied after a Scan finishes but before the results
         // are returned" (`Scan$FilterExpression`), stated either in that language or
-        // through the legacy map it replaced ([`Filter`]); it is read BEFORE the store
-        // is, so a filter the service would refuse is refused without reading anything.
-        let filter = Filter::resolve(&input).map_err(lift)?;
+        // through the legacy map it replaced — the one filter both readers of this
+        // service state it through ([`crate::state::ReadFilter`]); it is read BEFORE the
+        // store is, so a filter the service would refuse is refused without reading
+        // anything.
+        let filter = crate::state::ReadFilter::resolve(
+            "ScanFilter",
+            input.filter_expression.as_deref(),
+            input.scan_filter.as_ref(),
+            input.conditional_operator.as_deref(),
+            crate::state::Substitutions::new(
+                input.expression_attribute_names.as_ref(),
+                input.expression_attribute_values.as_ref(),
+            ),
+        )
+        .map_err(lift)?;
         let requested = crate::state::requested_projection(
             "ProjectionExpression",
             input.projection_expression.as_deref(),
@@ -450,7 +462,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // item carries is decided here too: the defaults differ between a table scan
         // and an index scan ([`resolve_selection`]).
         let selection = crate::state::resolve_selection(
+            crate::state::Reader::Scan,
             input.select.as_deref(),
+            crate::state::stated_projection_member(
+                input.projection_expression.as_deref(),
+                input.attributes_to_get.as_deref(),
+            ),
             requested,
             input.index_name.is_some(),
         )
@@ -649,98 +666,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             last_evaluated_key,
             consumed_capacity,
         })
-    }
-}
-
-/// Which of the items a `Scan` page read it answers with: "a filter expression is
-/// applied after a Scan finishes but before the results are returned"
-/// (`Scan$FilterExpression`), stated either in the expression language or through the
-/// legacy map that language replaced.
-#[derive(Debug)]
-enum Filter<'a> {
-    /// No filter at all: every item the page evaluated is answered, so "Count is the
-    /// same as ScannedCount".
-    Unfiltered,
-    /// A `FilterExpression`: the `ConditionExpression` language — one grammar, parsed by
-    /// the one parser this crate has for it — judged against each item the scan read
-    /// rather than against a key.
-    Expression(crate::state::ParsedCondition),
-    /// The legacy `ScanFilter` map, its entries combined by `ConditionalOperator`.
-    Legacy {
-        conditions: &'a ::std::collections::HashMap<String, Condition>,
-        conditional_operator: Option<&'a str>,
-    },
-}
-
-impl<'a> Filter<'a> {
-    /// The filter this request states, refusing a request that states it twice or states
-    /// a comparison the service does not serve — both facts of the request, so both are
-    /// settled before anything is read.
-    fn resolve(input: &'a ScanInput) -> Result<Self, crate::state::RequestError> {
-        let legacy = input.scan_filter.as_ref().filter(|map| !map.is_empty());
-        let conditional_operator = input.conditional_operator.as_deref();
-        match (input.filter_expression.as_deref(), legacy) {
-            // Both generations at once has already been refused over the whole of each
-            // side ([`crate::state::check_expression_parameter_mix`]); the arms stay
-            // total rather than unreachable.
-            (Some(_), Some(_)) => Err(crate::state::expression_conflict(
-                "ScanFilter",
-                "FilterExpression",
-            )),
-            (Some(expression), None) => {
-                Ok(Self::Expression(crate::state::ParsedCondition::parse(
-                    "FilterExpression",
-                    expression,
-                    crate::state::Substitutions::new(
-                        input.expression_attribute_names.as_ref(),
-                        input.expression_attribute_values.as_ref(),
-                    ),
-                )?))
-            }
-            (None, Some(conditions)) => {
-                // How many entries the map states, whether each names a comparison this
-                // service serves with the operands it takes, and whether the operator
-                // combining them is one the model declares, are all facts of the
-                // request: settled once here rather than per item, so the work the
-                // filter does per row is bounded by this service's own constants.
-                crate::state::check_legacy_conditions(conditions, conditional_operator)?;
-                Ok(Self::Legacy {
-                    conditions,
-                    conditional_operator,
-                })
-            }
-            (None, None) => {
-                if conditional_operator.is_some() {
-                    return Err(crate::state::RequestError::Validation(
-                        "ConditionalOperator can only be used together with ScanFilter"
-                            .to_string(),
-                    ));
-                }
-                Ok(Self::Unfiltered)
-            }
-        }
-    }
-
-    /// Whether this filter answers the attributes one read saw.
-    fn matches(&self, seen: &crate::state::Item) -> Result<bool, crate::state::RequestError> {
-        match self {
-            Self::Unfiltered => Ok(true),
-            Self::Expression(condition) => condition.evaluate(Some(seen)),
-            Self::Legacy {
-                conditions,
-                conditional_operator,
-            } => crate::state::legacy_conditions_match(conditions, *conditional_operator, seen),
-        }
-    }
-
-    /// Every top-level attribute this filter READS, which is what a read served from an
-    /// index must have in order to judge it.
-    fn attributes(&self) -> ::std::collections::BTreeSet<String> {
-        match self {
-            Self::Unfiltered => ::std::collections::BTreeSet::new(),
-            Self::Expression(condition) => condition.attribute_reads().into_keys().collect(),
-            Self::Legacy { conditions, .. } => conditions.keys().cloned().collect(),
-        }
     }
 }
 
