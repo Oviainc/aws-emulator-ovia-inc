@@ -22,11 +22,12 @@
 //! a role the CALLER supplied can only be installed by passing Amazon Bedrock that role,
 //! and [`crate::state::pass_role_denial`] takes that decision — for the CloudWatch Logs
 //! destination, the one whose `roleArn` is `@required` — BEFORE anything is stored. That
-//! decision is taken over the SUBMITTED value: the role has to be one of the CALLING
-//! account (`iam:PassRole` is granted by the account that holds the role), and, where this
-//! account's IAM holds it, its trust policy has to admit the Amazon Bedrock service
-//! principal the `sts:AssumeRole` such a hand-off is. A pass neither part refuses installs
-//! the destination, so it is read back; a denied pass is answered with the modelled
+//! decision is taken over the SUBMITTED value: the account's pass-role boundary over that
+//! role has to allow the CALLING principal the `iam:PassRole` the hand-off is, the role has
+//! to be one of the CALLING account (`iam:PassRole` is granted by the account that holds the
+//! role), and, where this account's IAM holds it, its trust policy has to admit the Amazon
+//! Bedrock service principal the `sts:AssumeRole` such a hand-off is. A pass no part refuses
+//! installs the destination, so it is read back; a denied pass is answered with the modelled
 //! `AccessDeniedException` (HTTP 403) and leaves the account singleton exactly as it was,
 //! so an independent `GetModelInvocationLoggingConfiguration` reports no part of the
 //! refused configuration. A configuration that passes no role (`s3Config` only, or no
@@ -143,7 +144,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The PassRole step first, ahead of the store: a destination whose role may not be
         // passed to Amazon Bedrock is refused, and a refused put installs nothing.
         if let Some(denial) =
-            crate::state::pass_role_denial(ctx, &region, &input.logging_config).await
+            crate::state::pass_role_denial(&*self.engine, ctx, &region, &input.logging_config)
+                .await
         {
             return Err(
                 PutModelInvocationLoggingConfigurationErrorModeled::AccessDeniedException(

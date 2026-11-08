@@ -196,12 +196,56 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     operation: &str,
     resource: &str,
 ) -> Result<(), AccessDeniedException> {
-    let action = format!("{ACTION_PREFIX}:{operation}");
+    authorize_action(engine, ctx, &format!("{ACTION_PREFIX}:{operation}"), resource)
+}
+
+/// `iam:PassRole`, the IAM action a principal has to hold to hand a service a role that
+/// service will then take on ("Granting a user permissions to pass a role to an AWS
+/// service", IAM User Guide).
+///
+/// It is an action of IAM rather than of this service, so it is not spelled with
+/// [`ACTION_PREFIX`]: what IAM evaluates is `iam:PassRole` on the ROLE being passed.
+pub const IAM_PASS_ROLE: &str = "iam:PassRole";
+
+/// Whether the IAM boundary in force on this caller WITHHOLDS the `iam:PassRole` of
+/// `role_arn` — the account's pass-role boundary over the role a request asks this service
+/// to take on.
+///
+/// Handing a service a role is a permission of the CALLER rather than a property of the
+/// role: the principal making the call has to be allowed `iam:PassRole` for that very role,
+/// and the account bounds which of its roles each of its principals may hand out, so two
+/// accounts can answer the same well-formed, same-account, correctly-trusted destination
+/// differently. The decision is the identity-based one every action of this service is
+/// judged by ([`authorize`]) asked for the IAM action on the role's own ARN, so a policy
+/// `iam:PutRolePolicy` wrote takes effect on the next request and removing it lifts the
+/// refusal again.
+///
+/// `false` — withhold nothing — for every caller this gate does not bound (the module
+/// docs: the account's own published credential, a principal holding a grant this emulator
+/// cannot read, an engine with no IAM store), because a refusal has to be grounded in a
+/// document that was READ.
+#[must_use]
+pub fn pass_role_is_withheld<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    role_arn: &str,
+) -> bool {
+    authorize_action(engine, ctx, IAM_PASS_ROLE, role_arn).is_err()
+}
+
+/// The identity-based decision [`authorize`] and [`pass_role_is_withheld`] share, taken for
+/// the IAM `action` spelled whole against the `resource` it names.
+fn authorize_action<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    action: &str,
+    resource: &str,
+) -> Result<(), AccessDeniedException> {
     let caller = caller(engine, ctx);
     // The principal spellings travel with the request because that is what a statement's
     // `Principal` element would be matched against; an identity-based document states no
     // such element, so the decision below rests on the action and the resource.
-    let request = iam::Request::new(&action, resource, &caller.principals);
+    let request = iam::Request::new(action, resource, &caller.principals);
     let identity_said = iam::identity_decision(&caller.documents, &request);
     // The decision is taken FIRST, so an explicit `Deny` in a document that CAN be read
     // refuses the request whatever else the principal carries — including a grant this
@@ -210,7 +254,7 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     if identity_said == Decision::Denied {
         return Err(not_authorized(
             &caller.arn,
-            &action,
+            action,
             resource,
             "with an explicit deny in an identity-based policy",
         ));
@@ -219,7 +263,7 @@ pub fn authorize<Eng: Send + Sync + 'static>(
     if !granted {
         return Err(not_authorized(
             &caller.arn,
-            &action,
+            action,
             resource,
             &format!("because no identity-based policy allows the {action} action"),
         ));
@@ -238,7 +282,7 @@ pub fn authorize<Eng: Send + Sync + 'static>(
                 format!("because no permissions boundary allows the {action} action")
             }
         };
-        return Err(not_authorized(&caller.arn, &action, resource, &reason));
+        return Err(not_authorized(&caller.arn, action, resource, &reason));
     }
     Ok(())
 }

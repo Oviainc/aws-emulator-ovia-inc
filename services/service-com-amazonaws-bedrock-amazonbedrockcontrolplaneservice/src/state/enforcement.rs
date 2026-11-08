@@ -251,9 +251,21 @@ pub const CROSS_ACCOUNT_PASS_ROLE_DENIED: &str = "Cross-account pass role is not
 /// role, has no `iam:PassRole` step to authorize, and is admitted; whether the account may
 /// write to a named bucket is not a decision about a passed role.
 ///
-/// The decision for the CloudWatch destination is taken over the SUBMITTED value, in two
-/// parts, and a pass that neither part refuses is made:
+/// The decision for the CloudWatch destination is taken over the SUBMITTED value, in three
+/// parts, and a pass that no part refuses is made:
 ///
+/// * the ACCOUNT's PASS-ROLE BOUNDARY over the role being passed
+///   ([`crate::service::authorization::pass_role_is_withheld`]). Handing a service a role is
+///   a permission of the CALLING PRINCIPAL rather than a property of the role: IAM evaluates
+///   `iam:PassRole` on the role's own ARN against the policies in force on that principal,
+///   and the account decides which of its roles each of its principals may hand out. This is
+///   the part that is a property of the ACCOUNT rather than of the value: the corpus records
+///   one account refusing a well-formed, same-account, correctly-trusted destination while
+///   another installs the same shape of destination, which is the difference a pass-role
+///   boundary makes and nothing about the role itself can express. A caller this gate cannot
+///   ground — the account's own published credential, a principal holding a grant this
+///   emulator cannot read, an engine with no IAM store — is left admitted, so the recorded
+///   success path stands for a caller whose permissions this emulator holds nothing about;
 /// * the ACCOUNT the value names. `iam:PassRole` is granted by the account that HOLDS the
 ///   role, so a principal of this account can hand Amazon Bedrock a role of its own account
 ///   and no role of another one, whatever that other role trusts. The account is read out of
@@ -275,22 +287,27 @@ pub const CROSS_ACCOUNT_PASS_ROLE_DENIED: &str = "Cross-account pass role is not
 ///   confused-deputy clauses AWS documents on a logging role are over keys a single
 ///   invocation carries rather than values of this request.
 ///
-/// Refused only on what this account's IAM ANSWERED about the role — it holds no such role,
-/// or the trust document it reported withholds the grant. An emulator with no IAM to ask,
-/// or an answer that could not be read, leaves the pass admitted, because a refusal has to
-/// be grounded.
+/// Refused only on what this account's IAM ANSWERED: a document it holds for the calling
+/// principal that does not allow the `iam:PassRole` of that role, or an answer about the
+/// role itself — it holds no such role, or the trust document it reported withholds the
+/// grant. An emulator with no IAM to ask, a caller it holds no policies for, or an answer
+/// that could not be read, leaves the pass admitted, because a refusal has to be grounded.
 ///
 /// A denied pass is [`CROSS_ACCOUNT_PASS_ROLE_DENIED`] in the modelled
 /// `AccessDeniedException` (`@httpError(403)`) with nothing installed; a pass this account
 /// may make installs the configuration, so the CloudWatch Logs destination is reported back
 /// by the get, cleared by the delete, and honoured where the configuration is enforced.
-pub async fn pass_role_denial(
+pub async fn pass_role_denial<Eng: Send + Sync + 'static>(
+    engine: &Eng,
     ctx: &smithy_server_runtime::OperationContext<'_>,
     region: &str,
     config: &LoggingConfig,
 ) -> Option<String> {
     let role_arn = &config.cloud_watch_config.as_ref()?.role_arn;
     if ::service_common::iam_role::role_name(role_arn).is_none() {
+        return Some(CROSS_ACCOUNT_PASS_ROLE_DENIED.to_string());
+    }
+    if crate::service::authorization::pass_role_is_withheld(engine, ctx, role_arn) {
         return Some(CROSS_ACCOUNT_PASS_ROLE_DENIED.to_string());
     }
     ::service_common::iam_role::role_is_unassumable(
