@@ -23,6 +23,14 @@
 //!   architectures that published generation of an AWS-managed base image supports. The
 //!   shape declares `imageArn`, `imageVersion`, `status`, `createdAt` and `updatedAt`
 //!   alone (same `smithy_query`).
+//! * `versionStateTimeBucket` on every response that reports one VERSION of a MicroVM
+//!   image — the time bucket that version's state settled in
+//!   ([`crate::state::MicrovmImageVersion::reported_state_time_bucket`]), which a client
+//!   reading a settled build groups its own records by.
+//!   `GetMicrovmImageVersionOutput` and `MicrovmImageVersionSummary` declare the
+//!   version's build inputs, `state`, `status`, `stateReason`, `createdAt`, `updatedAt`
+//!   and `tags` and no such member
+//!   (`smithy_query(query="shape",shape="GetMicrovmImageVersionOutput,MicrovmImageVersionSummary",model_path="services/service-com-amazonaws-lambdamicrovms-lambdamicrovms/smithy-model/com-amazonaws-lambdamicrovms-lambdamicrovms.json")`).
 //!
 //! Each member schema is declared in the `com.amazonaws.lambdamicrovms.recorded`
 //! namespace rather than in the service's own: the member is NOT in the model, so its
@@ -113,6 +121,34 @@ pub const SUPPORTED_CPU_CONFIGURATIONS_ON_MANAGED_VERSION: ::aws_smithy_schema::
         ::aws_smithy_schema::ShapeType::List,
         "supportedCpuConfigurations",
         5,
+    );
+
+/// `versionStateTimeBucket` on `GetMicrovmImageVersionOutput`, whose 20 modelled members
+/// occupy indices `0..=19`.
+pub const VERSION_STATE_TIME_BUCKET_ON_GET_VERSION_OUTPUT: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.lambdamicrovms.recorded#GetMicrovmImageVersionOutput$versionStateTimeBucket",
+            RECORDED_NAMESPACE,
+            "versionStateTimeBucket",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "versionStateTimeBucket",
+        20,
+    );
+
+/// `versionStateTimeBucket` on `MicrovmImageVersionSummary` — one row of the version
+/// listing — whose 20 modelled members occupy indices `0..=19`.
+pub const VERSION_STATE_TIME_BUCKET_ON_VERSION_SUMMARY: ::aws_smithy_schema::Schema =
+    ::aws_smithy_schema::Schema::new_member(
+        ::aws_smithy_schema::ShapeId::from_static(
+            "com.amazonaws.lambdamicrovms.recorded#MicrovmImageVersionSummary$versionStateTimeBucket",
+            RECORDED_NAMESPACE,
+            "versionStateTimeBucket",
+        ),
+        ::aws_smithy_schema::ShapeType::String,
+        "versionStateTimeBucket",
+        20,
     );
 
 /// One member the RECORDED service carries beside a modelled response, with the member

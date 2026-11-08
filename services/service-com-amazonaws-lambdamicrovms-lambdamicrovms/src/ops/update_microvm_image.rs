@@ -236,6 +236,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::Instant::now();
         let updated_at = crate::state::now_datetime();
 
+        // What the build this update starts can establish about its code artifact, taken
+        // BEFORE the store is locked for the same reason as on the create path, and
+        // through the same resolution, so the two paths cannot disagree about which
+        // branch a build settles on (`crate::state::code_artifact`).
+        let CodeArtifact::Uri(code_artifact_uri) = &input.code_artifact;
+        let artifact = crate::state::code_artifact::resolve(ctx, code_artifact_uri).await;
+
         let mut store = state.lock();
         store.materialize_due(now);
 
@@ -276,7 +283,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         //
         // `codeArtifact$uri` is "The URI of the code artifact in Amazon S3" and the
         // build resolves that location before anything is persisted.
-        let CodeArtifact::Uri(code_artifact_uri) = &input.code_artifact;
         if crate::state::s3_object_uri(code_artifact_uri).is_none() {
             return Err(validation(
                 crate::state::CODE_ARTIFACT_URI_REQUIREMENT.to_string(),
@@ -391,6 +397,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // UPDATING -> UPDATED move, once the clock makes it due. Until then the
             // version the image was serving stays its active one.
             build_due_at: Some(now + crate::state::IMAGE_BUILD_SPAN),
+            // "or UPDATE_FAILED on failure": the branch that move takes is the verdict
+            // the object store gave for this version's code artifact, and a build that
+            // produced nothing leaves the version the image was serving active.
+            build_failure_reason: artifact.failure_reason(),
+            // The build has not settled yet, so the version's state has no settlement
+            // instant to report.
+            state_settled_at: None,
             builds,
         };
 

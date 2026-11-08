@@ -11,7 +11,9 @@
 //! Several of the service's lifecycles are asynchronous:
 //!
 //! * `CreateMicrovmImage` — "The build is asynchronous — the image transitions
-//!   from CREATING to CREATED on success";
+//!   from CREATING to CREATED on success", or to CREATE_FAILED on failure, which is
+//!   decided by resolving the version's code artifact against the emulator's own object
+//!   store ([`code_artifact`]);
 //! * `RunMicrovm` — "The MicroVM starts in PENDING state and transitions to
 //!   RUNNING once provisioning completes."; and
 //! * `DeleteMicrovmImage` — the image is reported `DELETING` and the removal that
@@ -38,6 +40,11 @@ use crate::ops::types::{
 /// The MicroVM endpoint: the address a MicroVM is published on, the tokens that
 /// address accepts, and what this emulator answers there.
 pub mod microvm_endpoint;
+
+/// Where a version's `codeArtifact` comes from: the object the emulator's own Amazon S3
+/// holds at the address the request named, which is what says whether its build can
+/// produce an image at all.
+pub mod code_artifact;
 
 /// The region an ARN carries when the request is unsigned, matching the region
 /// the emulator's generated client config defaults to.
@@ -207,6 +214,15 @@ pub const IMAGE_STATE_UPDATING: &str = "UPDATING";
 /// A `MicrovmImageState` value (`MICROVM_IMAGE_STATE_VALUES`): the state an image
 /// reaches once the build `UpdateMicrovmImage` triggered has succeeded.
 pub const IMAGE_STATE_UPDATED: &str = "UPDATED";
+/// A `MicrovmImageState` value (`MICROVM_IMAGE_STATE_VALUES`): the state an image
+/// reaches when the build `CreateMicrovmImage` started FAILED — "the image transitions
+/// from CREATING to CREATED on success, or CREATE_FAILED on failure".
+pub const IMAGE_STATE_CREATE_FAILED: &str = "CREATE_FAILED";
+/// A `MicrovmImageState` value (`MICROVM_IMAGE_STATE_VALUES`): the settled value of the
+/// UPDATE lifecycle whose build failed, the same move one level on from
+/// [`IMAGE_STATE_CREATE_FAILED`] — each lifecycle of an image is a pair of a progressive
+/// value and the settled value the work it started reaches.
+pub const IMAGE_STATE_UPDATE_FAILED: &str = "UPDATE_FAILED";
 
 /// Whether an image in `state` still has an asynchronous lifecycle operation of this
 /// service's own in flight.
@@ -763,6 +779,9 @@ pub fn is_connectable_microvm_state(state: &str) -> bool {
 pub const VERSION_STATE_IN_PROGRESS: &str = "IN_PROGRESS";
 /// A `MicrovmImageVersionState` value (`MICROVM_IMAGE_VERSION_STATE_VALUES`).
 pub const VERSION_STATE_SUCCESSFUL: &str = "SUCCESSFUL";
+/// A `MicrovmImageVersionState` value (`MICROVM_IMAGE_VERSION_STATE_VALUES`): the state a
+/// version settles in when the build of it did not produce an image.
+pub const VERSION_STATE_FAILED: &str = "FAILED";
 
 /// A `MicrovmImageVersionStatus` value (`MICROVM_IMAGE_VERSION_STATUS_VALUES`).
 pub const VERSION_STATUS_ACTIVE: &str = "ACTIVE";
@@ -773,6 +792,9 @@ pub const VERSION_STATUS_INACTIVE: &str = "INACTIVE";
 pub const BUILD_STATE_IN_PROGRESS: &str = "IN_PROGRESS";
 /// A `BuildState` value (`BUILD_STATE_VALUES`): the build produced a snapshot.
 pub const BUILD_STATE_SUCCESSFUL: &str = "SUCCESSFUL";
+/// A `BuildState` value (`BUILD_STATE_VALUES`): the build produced nothing, so it has a
+/// `stateReason` ("the reason for the build state, if applicable") and no snapshot.
+pub const BUILD_STATE_FAILED: &str = "FAILED";
 
 /// One target an image version's asynchronous build produces a build record for: a CPU
 /// architecture, the chipset that architecture runs on, and the generation of that
@@ -998,6 +1020,18 @@ pub struct MicrovmImageVersion {
     pub tags: BTreeMap<String, String>,
     /// When the asynchronous build completes; `None` once it has.
     pub build_due_at: Option<Instant>,
+    /// Why the build of this version cannot produce an image, as the object store
+    /// ANSWERED when the build was scheduled ([`code_artifact::CodeArtifactVerdict`]);
+    /// `None` for a build whose code artifact the store served. The verdict is settled
+    /// on the record by [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::materialize_due`]
+    /// when the clock makes the build due, so a caller reading before then still
+    /// observes the build in flight.
+    pub build_failure_reason: Option<String>,
+    /// When this version's state last SETTLED — the instant the build it was waiting on
+    /// ended, whichever branch it ended on. `None` while the build is still in flight,
+    /// which is why a version reports no state-time bucket until then
+    /// ([`Self::reported_state_time_bucket`]).
+    pub state_settled_at: Option<DateTime>,
     /// The per-target builds this version's asynchronous build fans out into, keyed by
     /// `buildId` — see [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::mint_builds`].
     pub builds: BTreeMap<String, MicrovmImageBuild>,
@@ -1016,6 +1050,52 @@ impl MicrovmImageVersion {
             .values()
             .find_map(|build| build.state_reason.clone())
     }
+
+    /// The `versionStateTimeBucket` a response reporting this version answers with: the
+    /// time bucket the version's state settled in ([`state_time_bucket`]), and nothing
+    /// at all while the build it is waiting on is still in flight.
+    ///
+    /// The member is recorded AWS behaviour rather than modelled (the shapes reporting a
+    /// version declare no such member), so it is written beside the modelled payload —
+    /// see [`crate::ops::types::RecordedMembers`]. The ONE projection of the stored
+    /// settlement instant, so a read of a version and a listing row for it cannot
+    /// disagree.
+    pub fn reported_state_time_bucket(&self) -> Option<String> {
+        state_time_bucket(self.state_settled_at?)
+    }
+
+    /// This version's state-time bucket, as the recorded-only member a response writes
+    /// beside its modelled payload under the member schema `member` — empty for a
+    /// version whose state has not settled yet.
+    pub fn recorded_state_time_bucket_member(
+        &self,
+        member: &'static ::aws_smithy_schema::Schema,
+    ) -> Vec<RecordedMember> {
+        self.reported_state_time_bucket()
+            .map(|bucket| RecordedMember::Text(member, bucket))
+            .into_iter()
+            .collect()
+    }
+}
+
+/// How long one `versionStateTimeBucket` spans.
+///
+/// A BUCKET is an interval rather than an instant: the member is recorded AWS behaviour
+/// and AWS publishes neither its width nor its form, so the width is chosen — the hour
+/// the state settled in, the coarsest bucket a client polling a build can still tell two
+/// builds of one day apart by.
+pub const VERSION_STATE_TIME_BUCKET: Duration = Duration::from_secs(60 * 60);
+
+/// The time bucket the instant `at` falls in: the start of its
+/// [`VERSION_STATE_TIME_BUCKET`]-wide interval, as the ISO-8601 instant every timestamp
+/// of this service's JSON bodies is written as. `None` when the instant cannot be
+/// rendered, which leaves the member unwritten rather than reported as something else.
+pub fn state_time_bucket(at: DateTime) -> Option<String> {
+    let width = i64::try_from(VERSION_STATE_TIME_BUCKET.as_secs()).ok()?;
+    let start = at.secs() - at.secs().rem_euclid(width);
+    DateTime::from_secs(start)
+        .fmt(::aws_smithy_types::date_time::Format::DateTime)
+        .ok()
 }
 
 /// A MicroVM image, keyed in [`ComAmazonawsLambdamicrovmsLambdamicrovmsState::images`] by its name.
@@ -1317,35 +1397,72 @@ impl ComAmazonawsLambdamicrovmsLambdamicrovmsState {
                     continue;
                 };
                 record.build_due_at = None;
-                record.state = VERSION_STATE_SUCCESSFUL.to_string();
-                record.status = VERSION_STATUS_ACTIVE.to_string();
                 record.updated_at = Some(updated_at);
-                // The version's build is the fan-out of its per-target builds, so the
-                // builds settle with it: each produced the snapshot the version's own
-                // resource requirement sizes.
-                let snapshot = snapshot_build_of(&record.resources);
-                for build in record.builds.values_mut() {
-                    build.state = BUILD_STATE_SUCCESSFUL.to_string();
-                    build.snapshot_build = snapshot.clone();
-                }
-                image.updated_at = Some(updated_at);
-                // A newly successful build becomes the image's active version,
-                // and the previous one steps down: `MicrovmImageVersionStatus`
-                // marks exactly one version ACTIVE.
-                if let Some(previous) = image.latest_active_image_version.replace(version.clone()) {
-                    if previous != version {
-                        if let Some(old) = image.versions.get_mut(&previous) {
-                            old.status = VERSION_STATUS_INACTIVE.to_string();
+                // The build is TERMINAL whichever way it ends, so the instant it ends is
+                // the instant this version's state settled.
+                record.state_settled_at = Some(updated_at);
+                // The verdict the build was scheduled with decides which branch of the
+                // state machine the version, its builds and the image settle on: "the
+                // image transitions from CREATING to CREATED on success, or CREATE_FAILED
+                // on failure".
+                let failure = record.build_failure_reason.clone();
+                match failure {
+                    // The FAILURE branch. The version is the settlement of its builds, so
+                    // each per-target build carries the verdict and its reason, and none
+                    // of them produced a snapshot to report.
+                    Some(reason) => {
+                        record.state = VERSION_STATE_FAILED.to_string();
+                        record.status = VERSION_STATUS_INACTIVE.to_string();
+                        for build in record.builds.values_mut() {
+                            build.state = BUILD_STATE_FAILED.to_string();
+                            build.state_reason = Some(reason.clone());
+                            build.snapshot_build = None;
+                        }
+                        image.updated_at = Some(updated_at);
+                        // The failed version is the image's latest FAILED one; the
+                        // version it was serving, if any, stays its active one, because
+                        // a build that produced nothing cannot replace it.
+                        image.latest_failed_image_version = Some(version.clone());
+                        if image.state == IMAGE_STATE_CREATING {
+                            image.state = IMAGE_STATE_CREATE_FAILED.to_string();
+                        } else if image.state == IMAGE_STATE_UPDATING {
+                            image.state = IMAGE_STATE_UPDATE_FAILED.to_string();
                         }
                     }
-                }
-                // The build settling ends the lifecycle that started it: each
-                // progressive `MicrovmImageState` reaches its own settled value, and a
-                // record already in a settled one is left as it is.
-                if image.state == IMAGE_STATE_CREATING {
-                    image.state = IMAGE_STATE_CREATED.to_string();
-                } else if image.state == IMAGE_STATE_UPDATING {
-                    image.state = IMAGE_STATE_UPDATED.to_string();
+                    // The SUCCESS branch.
+                    None => {
+                        record.state = VERSION_STATE_SUCCESSFUL.to_string();
+                        record.status = VERSION_STATUS_ACTIVE.to_string();
+                        // The version's build is the fan-out of its per-target builds, so
+                        // the builds settle with it: each produced the snapshot the
+                        // version's own resource requirement sizes.
+                        let snapshot = snapshot_build_of(&record.resources);
+                        for build in record.builds.values_mut() {
+                            build.state = BUILD_STATE_SUCCESSFUL.to_string();
+                            build.snapshot_build = snapshot.clone();
+                        }
+                        image.updated_at = Some(updated_at);
+                        // A newly successful build becomes the image's active version,
+                        // and the previous one steps down: `MicrovmImageVersionStatus`
+                        // marks exactly one version ACTIVE.
+                        if let Some(previous) =
+                            image.latest_active_image_version.replace(version.clone())
+                        {
+                            if previous != version {
+                                if let Some(old) = image.versions.get_mut(&previous) {
+                                    old.status = VERSION_STATUS_INACTIVE.to_string();
+                                }
+                            }
+                        }
+                        // The build settling ends the lifecycle that started it: each
+                        // progressive `MicrovmImageState` reaches its own settled value,
+                        // and a record already in a settled one is left as it is.
+                        if image.state == IMAGE_STATE_CREATING {
+                            image.state = IMAGE_STATE_CREATED.to_string();
+                        } else if image.state == IMAGE_STATE_UPDATING {
+                            image.state = IMAGE_STATE_UPDATED.to_string();
+                        }
+                    }
                 }
             }
         }

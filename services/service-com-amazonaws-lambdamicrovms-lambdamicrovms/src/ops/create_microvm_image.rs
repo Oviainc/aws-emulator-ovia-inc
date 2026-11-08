@@ -5,7 +5,9 @@
 //! Mints a MicroVM image: one [`crate::state::MicrovmImage`] keyed by `name`, holding
 //! its first [`crate::state::MicrovmImageVersion`]. The build is asynchronous, so the
 //! image is persisted `CREATING` with the version's completion instant recorded; a later
-//! read materialises `CREATED` once the clock has made it due.
+//! read materialises `CREATED` once the clock has made it due — or `CREATE_FAILED`, when
+//! the emulator's own object store answered that it serves no such code artifact
+//! ([`crate::state::code_artifact`]).
 //!
 //! ## Shape of an operation
 //!
@@ -242,6 +244,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let now = ::std::time::Instant::now();
         let created_at = crate::state::now_datetime();
 
+        // What the build this create starts can establish about its code artifact, taken
+        // BEFORE the store is locked because resolving the artifact against the
+        // emulator's own object store is an await (`crate::state::code_artifact`). The
+        // verdict decides which branch the build settles on when the clock makes it due;
+        // a `uri` that addresses no S3 object is asked of nothing and refused below on
+        // its own shape.
+        let CodeArtifact::Uri(code_artifact_uri) = &input.code_artifact;
+        let artifact = crate::state::code_artifact::resolve(ctx, code_artifact_uri).await;
+
         let mut store = state.lock();
         store.materialize_due(now);
 
@@ -261,7 +272,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // build resolves that location before creating anything, so a URI that
         // addresses no S3 object is refused here rather than stored on an image that
         // could never build.
-        let CodeArtifact::Uri(code_artifact_uri) = &input.code_artifact;
         if crate::state::s3_object_uri(code_artifact_uri).is_none() {
             return Err(CreateMicrovmImageErrorModeled::ValidationException(ValidationException {
                 message: Some(crate::state::CODE_ARTIFACT_URI_REQUIREMENT.to_string()),
@@ -391,6 +401,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The build is asynchronous: the version completes, and with it the
             // image's CREATING -> CREATED move, once the clock makes it due.
             build_due_at: Some(now + crate::state::IMAGE_BUILD_SPAN),
+            // "or CREATE_FAILED on failure": the branch that move takes is the verdict
+            // the object store gave for this version's code artifact.
+            build_failure_reason: artifact.failure_reason(),
+            // The build has not settled yet, so the version's state has no settlement
+            // instant to report.
+            state_settled_at: None,
             builds,
         };
 

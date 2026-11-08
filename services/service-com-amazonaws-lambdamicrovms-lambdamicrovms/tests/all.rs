@@ -15,6 +15,8 @@
 mod chipset_generation_form;
 #[path = "all/gone_image_delete_refusal.rs"]
 mod gone_image_delete_refusal;
+#[path = "all/image_build_outcome.rs"]
+mod image_build_outcome;
 #[path = "all/image_build_read_path.rs"]
 mod image_build_read_path;
 #[path = "all/image_build_scope.rs"]

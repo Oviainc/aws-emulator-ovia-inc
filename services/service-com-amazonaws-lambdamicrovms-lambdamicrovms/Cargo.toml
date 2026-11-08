@@ -29,6 +29,12 @@ hex = { workspace = true }
 # Digests a MicroVM endpoint authentication token, so the store holds no token secret,
 # and the opaque bytes a minted MicroVM image `id` is rendered from.
 sha2 = { workspace = true }
+# The AWS SDK for Amazon S3, driven over the in-process callback
+# (`OperationContext::callback`): a MicroVM image version's `codeArtifact` is an object of
+# the emulator's own object store, so `src/state/code_artifact.rs` asks Amazon S3 whether
+# it serves that artifact rather than deciding the build's outcome here. Only the
+# generated client is needed — the emulator supplies the transport.
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -38,6 +44,11 @@ emulator-core-build-support = { workspace = true }
 hex = { workspace = true }
 # `tokio::time::sleep` for the clock-owed transitions the tests wait out.
 tokio = { workspace = true, features = ["time"] }
+# Amazon S3, mounted beside this service in the build-outcome harness: that a build
+# settles on the failure branch exactly when the object store does not serve its code
+# artifact can only be driven end to end with the owner of objects on the same engine.
+# DEV-ONLY: this crate depends on no other service's crate outside its tests.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

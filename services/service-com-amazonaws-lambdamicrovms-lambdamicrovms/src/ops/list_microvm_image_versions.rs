@@ -82,6 +82,16 @@
 //!   Retry the request later.
 //! * `ValidationException` (HTTP 400) — The input does not satisfy the constraints specified
 //!   by the service.
+//!
+//! ## Beside the model
+//!
+//! Each row of a settled version carries one further member the model declares on no
+//! shape: `versionStateTimeBucket`, the time bucket that version's state settled in,
+//! projected out of the stored record through
+//! [`crate::state::MicrovmImageVersion::reported_state_time_bucket`] under the member
+//! schema [`VERSION_STATE_TIME_BUCKET_ON_VERSION_SUMMARY`] — the same projection
+//! `GetMicrovmImageVersion` answers with. A version whose build is still in flight has
+//! not settled, so its row carries none.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -279,8 +289,22 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     }
 }
 
-/// The modelled summary of one stored version of the image whose ARN is `image_arn`.
+/// The modelled summary of one stored version of the image whose ARN is `image_arn`,
+/// with the version's own recorded `versionStateTimeBucket` beside it — through the
+/// record's one projection of it, so a listing row and the single-version read cannot
+/// disagree about the bucket a version settled in.
 fn summary_of(
+    image_arn: &str,
+    version: &crate::state::MicrovmImageVersion,
+) -> MicrovmImageVersionRow {
+    MicrovmImageVersionRow::new(
+        payload_of(image_arn, version),
+        version.recorded_state_time_bucket_member(&VERSION_STATE_TIME_BUCKET_ON_VERSION_SUMMARY),
+    )
+}
+
+/// The modelled half of one listing row.
+fn payload_of(
     image_arn: &str,
     version: &crate::state::MicrovmImageVersion,
 ) -> MicrovmImageVersionSummary {

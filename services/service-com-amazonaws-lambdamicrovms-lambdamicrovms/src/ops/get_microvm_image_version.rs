@@ -103,6 +103,17 @@
 //!   Retry the request later.
 //! * `ValidationException` (HTTP 400) — The input does not satisfy the constraints specified
 //!   by the service.
+//!
+//! ## Beside the model
+//!
+//! A settled version's recorded 200 carries one further top-level member the model
+//! declares on no shape: `versionStateTimeBucket`, the time bucket the version's state
+//! settled in, projected out of the stored record through
+//! [`crate::state::MicrovmImageVersion::reported_state_time_bucket`] under the member
+//! schema [`VERSION_STATE_TIME_BUCKET_ON_GET_VERSION_OUTPUT`] — the same projection one
+//! row of `ListMicrovmImageVersions` carries, so the read of a version and a listing
+//! that carries it report one bucket. A version whose build is still in flight has not
+//! settled, so it carries none.
 
 #[allow(unused_imports)]
 use super::types::*;
@@ -166,7 +177,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     for GetMicrovmImageVersion<Eng>
 {
     type Input = GetMicrovmImageVersionInput;
-    type Output = GetMicrovmImageVersionOutput;
+    type Output = GetMicrovmImageVersionResponse;
     type Error = GetMicrovmImageVersionError;
 
     const NAME: &'static str = "GetMicrovmImageVersion";
@@ -264,11 +275,29 @@ fn not_found(message: String) -> GetMicrovmImageVersionError {
     .into()
 }
 
+/// What `GetMicrovmImageVersion` answers: the modelled `GetMicrovmImageVersionOutput`
+/// plus the recorded `versionStateTimeBucket`.
+pub type GetMicrovmImageVersionResponse = RecordedMembers<GetMicrovmImageVersionOutput>;
+
 /// The STORED version record as this operation's response: the build inputs, state,
 /// status and instants held on the record, beside the ARN of the image holding it — the
 /// same projection of the same record one row of the version listing carries, so a read
 /// of one version and a listing that carries it cannot disagree.
 fn rendered(
+    image_arn: &str,
+    version: &crate::state::MicrovmImageVersion,
+) -> GetMicrovmImageVersionResponse {
+    GetMicrovmImageVersionResponse::new(
+        payload_of(image_arn, version),
+        // The bucket the version's state settled in, through the record's own one
+        // projection of it, so this read and a listing row for the version report the
+        // same bucket — and a version whose build is still in flight reports none.
+        version.recorded_state_time_bucket_member(&VERSION_STATE_TIME_BUCKET_ON_GET_VERSION_OUTPUT),
+    )
+}
+
+/// The modelled half of the response for a stored version.
+fn payload_of(
     image_arn: &str,
     version: &crate::state::MicrovmImageVersion,
 ) -> GetMicrovmImageVersionOutput {
