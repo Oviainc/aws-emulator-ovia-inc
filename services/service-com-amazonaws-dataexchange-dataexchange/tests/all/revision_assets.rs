@@ -227,6 +227,7 @@ fn store_assets(
             asset_type: asset_type.clone(),
             content: Vec::new(),
             api: None,
+            s3_data_access: None,
             created_at: imported_at,
             updated_at: imported_at,
         });
@@ -840,6 +841,7 @@ async fn the_asset_types_details_are_composed_for_are_modelled_values() {
     for value in [
         dataexchange::state::ASSET_TYPE_S3_SNAPSHOT,
         dataexchange::state::ASSET_TYPE_API_GATEWAY_API,
+        dataexchange::state::ASSET_TYPE_S3_DATA_ACCESS,
     ] {
         assert!(
             dataexchange::ops::types::ASSET_TYPE_VALUES.contains(&value),

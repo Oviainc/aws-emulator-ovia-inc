@@ -6,8 +6,11 @@
 //! one execution span later, which any later read materialises — and refuses a job in
 //! any other state with the modelled 409. An import whose content a client uploaded to
 //! the URL `CreateJob` announced carries its work out: it puts that content into the
-//! revision its details name as an asset and completes. This is the ONLY file to touch
-//! for this operation.
+//! revision its details name as an asset and completes. A job that publishes an Amazon
+//! S3 data access is decided from what this emulator's own object storage answers about
+//! the bucket it would share — the grant that bucket's policy carries for AWS Data
+//! Exchange, and whether the keys and prefixes it names are there. This is the ONLY
+//! file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -67,8 +70,6 @@
 
 #[allow(unused_imports)]
 use super::types::*;
-
-use ::aws_smithy_types::DateTime;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -154,40 +155,65 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // An asset this execution creates carries an ARN, so the Region this call was
         // signed for is read here, where the request is.
         let region = crate::state::request_region(ctx);
-        let mut store = state.lock();
-        // An earlier execution may already be owed its terminal state, so that is
-        // materialised before this call decides anything: otherwise a second start
-        // would be judged against a state the job had already left.
-        store.settle_jobs(now);
 
-        // `JobId` is `@httpLabel` with pattern ^[a-zA-Z0-9]{30,40}$, so an id of the
-        // wrong shape was already refused as a 400 before this handler ran; reaching
-        // here, the id is well-formed but may name nothing.
-        let Some(job) = store.jobs.get_mut(&input.job_id) else {
-            return Err(StartJobErrorModeled::ResourceNotFoundException(
-                crate::state::job_not_found(&input.job_id),
-            )
-            .into());
+        // What the job asks its execution to do, read out of the stored job. The store
+        // is unlocked again before the source of that work is read, because reading it
+        // calls another service of this emulator.
+        let work = {
+            let mut store = state.lock();
+            // An earlier execution may already be owed its terminal state, so that is
+            // materialised before this call decides anything: otherwise a second start
+            // would be judged against a state the job had already left.
+            store.settle_jobs(now);
+            planned_work(waiting_job(&mut store, &input.job_id)?, &region)
         };
-        // A job runs once: one that is already running, and one that has reached a
-        // terminal state, both conflict with a start.
-        if !job.is_waiting() {
-            return Err(StartJobErrorModeled::ConflictException(
-                crate::state::job_state_conflict(&input.job_id, START_VERB),
-            )
-            .into());
-        }
 
-        let settlement = execution_outcome(job, now, &region);
+        // Where that work ends, decided from the source it actually reads.
+        let outcome = outcome_of(ctx, work).await;
+
+        let mut store = state.lock();
+        // The job is located again, because the lock was handed back while the source
+        // was read: a start that lost the race to another call finds the job no longer
+        // waiting and conflicts with it, exactly as the second start of a pair does.
+        let job = waiting_job(&mut store, &input.job_id)?;
         job.state = crate::state::JOB_STATE_IN_PROGRESS.to_string();
         job.updated_at = now;
         // The execution does not run here and nothing sleeps: where it ends and when
         // it is owed are recorded, and the first call at or past that instant
         // materialises it.
-        job.pending_settlement = Some(settlement);
+        job.pending_settlement = Some(crate::state::JobSettlement {
+            due_at: crate::state::later(now, crate::state::JOB_EXECUTION_SECONDS),
+            state: outcome.state.to_string(),
+            errors: outcome.errors,
+            import: outcome.import,
+        });
 
         Ok(StartJobOutput {})
     }
+}
+
+/// The stored job `job_id` names, when a start is admitted on it.
+///
+/// `JobId` is `@httpLabel` with pattern ^[a-zA-Z0-9]{30,40}$, so an id of the wrong
+/// shape was already refused as a 400 before the handler ran; reaching here, the id is
+/// well-formed but may name nothing — and a job runs once, so one that is already
+/// running, and one that has reached a terminal state, both conflict with a start.
+fn waiting_job<'store>(
+    store: &'store mut crate::state::ComAmazonawsDataexchangeDataexchangeState,
+    job_id: &str,
+) -> Result<&'store mut crate::state::Job, StartJobError> {
+    let job = store.jobs.get_mut(job_id).ok_or_else(|| {
+        StartJobError::from(StartJobErrorModeled::ResourceNotFoundException(
+            crate::state::job_not_found(job_id),
+        ))
+    })?;
+    if !job.is_waiting() {
+        return Err(StartJobErrorModeled::ConflictException(
+            crate::state::job_state_conflict(job_id, START_VERB),
+        )
+        .into());
+    }
+    Ok(job)
 }
 
 /// What this operation asks of the job, for the wording of the 409 a job in a state
@@ -236,52 +262,445 @@ const CONTENT_SOURCE_FOR_TYPE: &[(&str, &str)] = &[
     ("IMPORT_ASSET_FROM_SIGNED_URL", SOURCE_S3_OBJECT),
 ];
 
-/// Where the execution this call sets going ends, and when it is owed.
+/// What the execution a start sets going has to do, as the job's own `Type` and
+/// `Details` describe it — and so WHICH prerequisite its outcome turns on.
 ///
-/// Every `Type` this service creates moves asset CONTENT: an import reads the source
-/// its details name into the revision, an export writes the content of that
-/// revision's assets out.
-///
-/// An import that takes its content from an upload URL this service announced has that
-/// content exactly when a client has uploaded it: the execution then carries the import
-/// out — the staged bytes become an asset of the revision the details name — and ends
-/// in the terminal state of work that was done. For every other job the content is not
-/// there to read: this emulator serves no object store, so an export's assets, an asset
-/// source key, a Redshift datashare and a Lake Formation data permission are all
-/// unreadable, and so is an upload nobody uploaded to. Such an execution ends in the
-/// terminal state that reports exactly that: `ERROR`, carrying the job error for a
-/// source that could not be found, naming the source the job's own `Type` reads.
-fn execution_outcome(
-    job: &crate::state::Job,
-    started_at: DateTime,
-    region: &str,
-) -> crate::state::JobSettlement {
-    let due_at = crate::state::later(started_at, crate::state::JOB_EXECUTION_SECONDS);
-    if let Some(import) = staged_import(job, region) {
-        return crate::state::JobSettlement {
-            due_at,
-            state: crate::state::JOB_STATE_COMPLETED.to_string(),
-            // The execution read what it was pointed at, so there is nothing to report.
+/// Every `Type` this service creates works on asset CONTENT, but not all of them work
+/// on content this service holds: an import reads a source into the revision, an
+/// export writes the content of that revision's assets out, and an Amazon S3 data
+/// access publishes a view of a bucket that stays the CALLER's. The prerequisite each
+/// of those fails on is a different one, so the job error an execution reports is
+/// decided from the work rather than from one hard-coded answer.
+enum Work {
+    /// Carry the import of content a client staged with this service out: the staged
+    /// bytes become an asset of the revision the details name.
+    StagedImport(Box<crate::state::PendingImport>),
+    /// Publish an Amazon S3 data access over data in a bucket the caller owns, which
+    /// AWS Data Exchange reads in its own name on behalf of every subscriber the data
+    /// access entitles — so it turns on the grant that bucket's own policy carries.
+    S3DataAccess(Box<DataAccess>),
+    /// Read content from a source this emulator holds nothing of, named as the job's
+    /// own `Type` names it ([`CONTENT_SOURCE_FOR_TYPE`]).
+    UnreadableSource(&'static str),
+}
+
+/// The Amazon S3 data access one job publishes: where the asset it produces belongs,
+/// and the source in the caller's own bucket it shares.
+struct DataAccess {
+    /// The Region the call that started the job was signed for, which is the Region
+    /// the asset's ARN carries and the one the bucket is asked about in.
+    region: String,
+    data_set_id: String,
+    revision_id: String,
+    /// The bucket, keys, key prefixes and KMS keys the job's own `AssetSource` names.
+    source: S3DataAccessAssetSourceEntry,
+}
+
+/// Where an execution ends: the terminal `State`, what it reports there, and the asset
+/// it places in its revision when it finishes.
+struct Outcome {
+    /// One of the model's terminal `State` values
+    /// (`crate::state::JOB_STATE_COMPLETED` / `crate::state::JOB_STATE_ERROR`).
+    state: &'static str,
+    /// The `Errors` a reader answers with — empty for work that was carried out.
+    errors: Vec<JobError>,
+    /// The asset the execution adds to the revision, for work that produces one.
+    import: Option<crate::state::PendingImport>,
+}
+
+impl Outcome {
+    /// The outcome of work that was carried out: the terminal state of a job that is
+    /// over with nothing to report, placing `import`.
+    fn carried_out(import: Option<crate::state::PendingImport>) -> Self {
+        Self {
+            state: crate::state::JOB_STATE_COMPLETED,
             errors: Vec::new(),
-            import: Some(import),
-        };
+            import,
+        }
     }
-    crate::state::JobSettlement {
-        due_at,
-        state: crate::state::JOB_STATE_ERROR.to_string(),
-        errors: vec![JobError {
-            // `crate::state`'s constant, so every job error this service composes names
-            // the same value of the model's `Code` enum.
-            code: crate::state::JOB_ERROR_CODE_RESOURCE_NOT_FOUND.to_string(),
-            message: format!(
-                "Resource not found. Unable to find source {}.",
-                source_for(&job.r#type)
-            ),
-            ..JobError::default()
-        }],
-        import: None,
+
+    /// The outcome of work that could not be carried out: the terminal state of a
+    /// failed execution, reporting the one job error that stopped it.
+    fn stopped_by(error: JobError) -> Self {
+        Self {
+            state: crate::state::JOB_STATE_ERROR,
+            errors: vec![error],
+            import: None,
+        }
     }
 }
+
+/// What the stored job asks of its execution.
+fn planned_work(job: &crate::state::Job, region: &str) -> Work {
+    if let Some(import) = staged_import(job, region) {
+        return Work::StagedImport(Box::new(import));
+    }
+    if let Some(detail) = job.details.create_s3_data_access_from_s3_bucket.as_ref() {
+        return Work::S3DataAccess(Box::new(DataAccess {
+            region: region.to_string(),
+            data_set_id: detail.data_set_id.clone(),
+            revision_id: detail.revision_id.clone(),
+            source: detail.asset_source.clone(),
+        }));
+    }
+    Work::UnreadableSource(source_for(&job.r#type))
+}
+
+/// Where `work` ends — the outcome the start call records for the clock to materialise
+/// one execution span later.
+///
+/// An import that takes its content from an upload URL this service announced has that
+/// content exactly when a client has uploaded it, so it ends in the terminal state of
+/// work that was done. A data access is decided from what this emulator's own object
+/// storage answers about the bucket it would share. For every other job the content is
+/// not there to read: this emulator holds no object store of its own for an export's
+/// assets, and a Redshift datashare, a Lake Formation data permission and an upload
+/// nobody uploaded to are all unreadable, so such an execution ends in `ERROR`
+/// reporting exactly that.
+async fn outcome_of(ctx: &smithy_server_runtime::OperationContext<'_>, work: Work) -> Outcome {
+    match work {
+        Work::StagedImport(import) => Outcome::carried_out(Some(*import)),
+        Work::UnreadableSource(source) => Outcome::stopped_by(source_not_found(source)),
+        Work::S3DataAccess(access) => data_access_outcome(ctx, &access).await,
+    }
+}
+
+/// Where the execution of an Amazon S3 data access ends, decided from what this
+/// emulator's own object storage answers about the bucket the job names.
+///
+/// The data access entitles subscribers to read data that stays in the PROVIDER's
+/// bucket, which AWS Data Exchange serves them from in its own name — so the one thing
+/// the provider has to put in place before the job can run is the grant in that
+/// bucket's own policy. A bucket whose policy does not carry it is the validation
+/// failure this reports; a bucket, key or prefix the object storage answers that it
+/// does not hold is a source that cannot be found; and a bucket whose policy carries
+/// the grant and whose data is there is a data access that was published, which this
+/// records as the asset the revision then holds.
+async fn data_access_outcome(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    access: &DataAccess,
+) -> Outcome {
+    let bucket = access.source.bucket.as_str();
+    match bucket_policy(ctx, &access.region, bucket).await {
+        // Nothing answered about the bucket, or the answer was that there is no such
+        // bucket: either way this emulator serves none of the data the job would
+        // share, so there is no source to publish rather than a grant to ask for.
+        BucketPolicy::Unanswered | BucketPolicy::NoSuchBucket => {
+            return Outcome::stopped_by(source_not_found(SOURCE_S3_OBJECT))
+        }
+        // A bucket with no policy at all grants AWS Data Exchange nothing, which is
+        // the same answer as a policy that leaves the read out.
+        BucketPolicy::WithoutPolicy => {
+            return Outcome::stopped_by(data_exchange_not_granted(bucket))
+        }
+        BucketPolicy::Document(document) => {
+            if !grants_the_data_access(&document, &access.source) {
+                return Outcome::stopped_by(data_exchange_not_granted(bucket));
+            }
+        }
+    }
+    if shared_data_is_absent(ctx, &access.region, &access.source).await {
+        return Outcome::stopped_by(source_not_found(SOURCE_S3_OBJECT));
+    }
+    Outcome::carried_out(Some(crate::state::PendingImport {
+        region: access.region.clone(),
+        data_set_id: access.data_set_id.clone(),
+        revision_id: access.revision_id.clone(),
+        // The asset IS the data access, and what the model's `S3DataAccessAsset`
+        // names it by is the bucket whose data it shares.
+        asset_name: bucket.to_string(),
+        api: None,
+        s3_data_access: Some(S3DataAccessAsset {
+            bucket: bucket.to_string(),
+            key_prefixes: access.source.key_prefixes.clone(),
+            keys: access.source.keys.clone(),
+            kms_keys_to_grant: access.source.kms_keys_to_grant.clone(),
+            // Minted by the access point AWS creates for the data access, which this
+            // emulator has none of: an invented alias or ARN would name an endpoint
+            // nothing serves.
+            s3_access_point_alias: None,
+            s3_access_point_arn: None,
+        }),
+    }))
+}
+
+/// The job error of an execution whose source is not there: the not-found `Code` and
+/// the sentence of that error class, naming the kind of source the job reads.
+fn source_not_found(source: &str) -> JobError {
+    JobError {
+        // `crate::state`'s constant, so every job error this service composes names
+        // the same value of the model's `Code` enum.
+        code: crate::state::JOB_ERROR_CODE_RESOURCE_NOT_FOUND.to_string(),
+        message: format!("Resource not found. Unable to find source {source}."),
+        ..JobError::default()
+    }
+}
+
+/// The job error of a data access whose bucket does not let AWS Data Exchange in.
+///
+/// The failure is about the request not holding against the state of the resource it
+/// names rather than about a resource that is missing, so it carries the modelled
+/// validation `Code`. The bucket the job's own `AssetSource` named is the one variable
+/// part of the sentence; the rest is fixed text naming the prerequisite and the two
+/// Amazon S3 actions it covers — reading an object being shared, and listing the
+/// bucket those objects are found in, which is how the keys and key prefixes of a
+/// data access are resolved. `ResourceType` is left unset: the model's
+/// `JobErrorResourceTypes` is `REVISION | ASSET | DATA_SET`, and a bucket is none of
+/// them.
+fn data_exchange_not_granted(bucket: &str) -> JobError {
+    JobError {
+        code: crate::state::JOB_ERROR_CODE_VALIDATION.to_string(),
+        message: format!(
+            "Validation failed. The bucket policy of the Amazon S3 bucket {bucket} does not \
+             grant AWS Data Exchange the {GET_OBJECT_ACTION} and {LIST_BUCKET_ACTION} \
+             permissions required to create an Amazon S3 data access from it."
+        ),
+        ..JobError::default()
+    }
+}
+
+/// Whether `document` grants AWS Data Exchange the access the data access `source`
+/// describes needs: the read of every object the source shares, and the listing of the
+/// bucket those objects are found in.
+///
+/// A source naming neither keys nor key prefixes shares the bucket's whole object
+/// space, so that is what the read is asked about then. One decision is made per key
+/// and prefix the request named, which `CreateJob` bounds at
+/// `crate::state::MAX_JOB_DETAIL_ENTRIES` each.
+fn grants_the_data_access(document: &str, source: &S3DataAccessAssetSourceEntry) -> bool {
+    let bucket = source.bucket.as_str();
+    if !grants(document, LIST_BUCKET_ACTION, &bucket_arn(bucket)) {
+        return false;
+    }
+    let mut shared = shared_paths(source).peekable();
+    if shared.peek().is_none() {
+        return grants(document, GET_OBJECT_ACTION, &object_arn(bucket, ""));
+    }
+    shared.all(|path| grants(document, GET_OBJECT_ACTION, &object_arn(bucket, path)))
+}
+
+/// Every key and key prefix of the bucket the data access shares, in the order the
+/// request named them.
+fn shared_paths(source: &S3DataAccessAssetSourceEntry) -> impl Iterator<Item = &str> {
+    let keys = source.keys.as_deref().unwrap_or_default();
+    let prefixes = source.key_prefixes.as_deref().unwrap_or_default();
+    keys.iter().chain(prefixes.iter()).map(String::as_str)
+}
+
+/// Whether `document` allows the AWS Data Exchange service principal `action` on
+/// `resource`.
+///
+/// The data access is served to subscribers by AWS Data Exchange rather than by the
+/// caller, so the grant a bucket policy has to carry names the SERVICE. The decision
+/// carries a value for every global condition key this read itself fixes, so a clause
+/// over one of them is decided rather than left undecided.
+fn grants(document: &str, action: &str, resource: &str) -> bool {
+    let principals = [DATA_EXCHANGE_SERVICE_PRINCIPAL.to_string()];
+    let context = [
+        (
+            SOURCE_ACCOUNT_KEY.to_string(),
+            ::engine::EMULATOR_ACCOUNT_ID.to_string(),
+        ),
+        (
+            SECURE_TRANSPORT_KEY.to_string(),
+            SECURE_TRANSPORT_VALUE.to_string(),
+        ),
+    ];
+    let request = ::service_common::iam_authorization::Request::new(action, resource, &principals)
+        .with_context(&context)
+        .with_published_keys(DATA_ACCESS_CONDITION_KEYS);
+    ::service_common::iam_authorization::resource_decision(document, &request)
+        == ::service_common::iam_authorization::Decision::Allowed
+}
+
+/// What asking this emulator's object storage for a bucket's policy answered.
+enum BucketPolicy {
+    /// The policy document the bucket carries.
+    Document(String),
+    /// The bucket is there and carries no policy.
+    WithoutPolicy,
+    /// There is no such bucket.
+    NoSuchBucket,
+    /// The question did not get through — an emulator assembled without object
+    /// storage, or a transport failure — so nothing is known about the bucket.
+    Unanswered,
+}
+
+/// The policy of the bucket a data access would share, read from this emulator's own
+/// object storage.
+///
+/// S3 is reached the way the framework documents a handler reaching another emulated
+/// service ([`smithy_server_runtime::OperationContext::callback`]), so this crate
+/// names no other service crate and the policy is the one S3 itself holds.
+async fn bucket_policy(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    bucket: &str,
+) -> BucketPolicy {
+    let answer = s3_client(ctx, region)
+        .get_bucket_policy()
+        .bucket(bucket)
+        .send()
+        .await;
+    let failure = match answer {
+        Ok(answer) => {
+            return answer
+                .policy
+                .map_or(BucketPolicy::WithoutPolicy, BucketPolicy::Document)
+        }
+        Err(failure) => failure,
+    };
+    // S3's own two codes for this read are its answers ABOUT the bucket: it holds no
+    // such bucket, or the bucket carries no policy. Any other answer — a refusal, a
+    // fault, or no response at all — settles nothing, so neither is read into it.
+    match ::aws_sdk_s3::error::ProvideErrorMetadata::code(&failure) {
+        Some(NO_SUCH_BUCKET_CODE) => BucketPolicy::NoSuchBucket,
+        Some(NO_SUCH_BUCKET_POLICY_CODE) => BucketPolicy::WithoutPolicy,
+        other => {
+            ::tracing::warn!(
+                bucket,
+                code = ?other,
+                error = %::aws_smithy_types::error::display::DisplayErrorContext(&failure),
+                "the data access source bucket's policy could not be read"
+            );
+            BucketPolicy::Unanswered
+        }
+    }
+}
+
+/// Whether the object storage ANSWERED that it holds none of the data the data access
+/// `source` names.
+///
+/// Only an answer counts: an object S3 answers it does not hold, and a key prefix it
+/// answers holds nothing, are absences; a question that did not get through says
+/// nothing and is not read as one. The number of asks is the number of keys and
+/// prefixes the request named, which `CreateJob` bounds at
+/// `crate::state::MAX_JOB_DETAIL_ENTRIES` each.
+async fn shared_data_is_absent(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    source: &S3DataAccessAssetSourceEntry,
+) -> bool {
+    let client = s3_client(ctx, region);
+    let bucket = source.bucket.as_str();
+    for key in source.keys.as_deref().unwrap_or_default() {
+        let answer = client.head_object().bucket(bucket).key(key).send().await;
+        if let Err(failure) = answer {
+            let status = failure
+                .raw_response()
+                .map(|response| response.status().as_u16());
+            // A HEAD carries no body, so the status is the whole answer
+            // (`NoSuchKey` / `NoSuchBucket`).
+            if status == Some(OBJECT_NOT_FOUND_STATUS) {
+                return true;
+            }
+        }
+    }
+    // A source naming no prefix and no key at all shares the bucket's whole object
+    // space, so the bucket itself is what is then asked about.
+    let prefixes = source.key_prefixes.as_deref().unwrap_or_default();
+    let empty_prefix = [String::new()];
+    let asked = if prefixes.is_empty() && source.keys.as_deref().unwrap_or_default().is_empty() {
+        &empty_prefix[..]
+    } else {
+        prefixes
+    };
+    for prefix in asked {
+        let answer = client
+            .list_objects_v2()
+            .bucket(bucket)
+            .prefix(prefix)
+            // One object is enough to settle whether the prefix holds anything.
+            .max_keys(1)
+            .send()
+            .await;
+        if answer.is_ok_and(|listing| listing.contents().is_empty()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The Amazon S3 client a data access's source is read through: the AWS SDK driven
+/// over the emulator's own in-process transport, signing in the emulator's own name.
+///
+/// Nothing here opens a socket or leaves the host: `ctx.callback()` is the framework's
+/// in-process channel into this same emulator's services.
+fn s3_client(
+    ctx: &smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+) -> ::aws_sdk_s3::Client {
+    let config = ::aws_sdk_s3::Config::builder()
+        .behavior_version(::aws_sdk_s3::config::BehaviorVersion::latest())
+        .http_client(ctx.callback().http_client())
+        .credentials_provider(ctx.callback().aws_credentials_provider())
+        .region(::aws_sdk_s3::config::Region::new(region.to_string()))
+        .endpoint_url(format!("https://s3.{region}.amazonaws.com"))
+        // The emulator serves one endpoint for every service, so the bucket travels
+        // in the path rather than in a per-bucket host the router could not resolve.
+        .force_path_style(true)
+        // The transport is in-process: there is nothing to retry, time out or watch
+        // for a stalled stream, and each of those would need a sleep implementation
+        // this client is not given. The same goes for caching the identity: the
+        // credentials are handed over directly.
+        .retry_config(::aws_sdk_s3::config::retry::RetryConfig::disabled())
+        .timeout_config(::aws_sdk_s3::config::timeout::TimeoutConfig::disabled())
+        .identity_cache(::aws_sdk_s3::config::IdentityCache::no_cache())
+        .stalled_stream_protection(::aws_sdk_s3::config::StalledStreamProtectionConfig::disabled())
+        .build();
+    ::aws_sdk_s3::Client::from_conf(config)
+}
+
+/// The ARN of an Amazon S3 bucket: a bucket is global to the partition, so the ARN
+/// carries neither a region nor an account.
+fn bucket_arn(bucket: &str) -> String {
+    format!("arn:aws:s3:::{bucket}")
+}
+
+/// The ARN of one object, or of the path a key prefix addresses, inside `bucket`.
+fn object_arn(bucket: &str, key: &str) -> String {
+    format!("arn:aws:s3:::{bucket}/{key}")
+}
+
+/// The AWS service principal a data access source bucket's policy has to grant the
+/// read to: AWS Data Exchange serves the shared data to subscribers in its own name,
+/// so the grant names the SERVICE rather than the caller.
+pub const DATA_EXCHANGE_SERVICE_PRINCIPAL: &str = "dataexchange.amazonaws.com";
+
+/// The Amazon S3 action that reads one object the data access shares.
+pub const GET_OBJECT_ACTION: &str = "s3:GetObject";
+
+/// The Amazon S3 action that enumerates a bucket's objects, which is how the keys
+/// under a shared key prefix are resolved.
+pub const LIST_BUCKET_ACTION: &str = "s3:ListBucket";
+
+/// The condition key naming the account a cross-service read is made on behalf of.
+const SOURCE_ACCOUNT_KEY: &str = "aws:SourceAccount";
+
+/// The condition key saying whether the request was sent over a secure transport.
+///
+/// This read answers it rather than leaving it open: the emulator serves every
+/// endpoint over TLS, and the bucket is read through one of them. A bucket whose
+/// policy carries the usual clause refusing everything that did NOT arrive that way
+/// therefore refuses nothing here, where a key with no value would leave that clause
+/// undecided — and an undecided refusal still refuses.
+const SECURE_TRANSPORT_KEY: &str = "aws:SecureTransport";
+
+/// The value that key carries, as IAM's boolean literals spell it.
+const SECURE_TRANSPORT_VALUE: &str = "true";
+
+/// The condition keys this read carries a value for, so a clause over one of them is
+/// decided rather than left undecided.
+const DATA_ACCESS_CONDITION_KEYS: &[&str] = &[SOURCE_ACCOUNT_KEY, SECURE_TRANSPORT_KEY];
+
+/// The Amazon S3 error code for a bucket this emulator does not hold.
+const NO_SUCH_BUCKET_CODE: &str = "NoSuchBucket";
+
+/// The Amazon S3 error code for a bucket that exists and carries no policy.
+const NO_SUCH_BUCKET_POLICY_CODE: &str = "NoSuchBucketPolicy";
+
+/// The status Amazon S3 answers a `HeadObject` for an object it does not hold.
+const OBJECT_NOT_FOUND_STATUS: u16 = 404;
 
 /// The asset this job's import would add, when a client has uploaded its content to
 /// the URL the job announced — `None` for a job that announced none, or whose upload is
@@ -308,6 +727,7 @@ fn staged_import(job: &crate::state::Job, region: &str) -> Option<crate::state::
             revision_id: detail.revision_id.clone(),
             asset_name: detail.asset_name.clone(),
             api: None,
+            s3_data_access: None,
         });
     }
     let detail = job.details.import_asset_from_api_gateway_api.as_ref()?;
@@ -329,6 +749,7 @@ fn staged_import(job: &crate::state::Job, region: &str) -> Option<crate::state::
             api_specification_download_url: None,
             api_specification_download_url_expires_at: None,
         }),
+        s3_data_access: None,
     })
 }
 

@@ -43,6 +43,8 @@ mod revision_deletion;
 mod revision_finalization;
 #[path = "all/revisions.rs"]
 mod revisions;
+#[path = "all/s3_data_access_jobs.rs"]
+mod s3_data_access_jobs;
 #[path = "all/signed_url_uploads.rs"]
 mod signed_url_uploads;
 #[path = "all/start_job.rs"]

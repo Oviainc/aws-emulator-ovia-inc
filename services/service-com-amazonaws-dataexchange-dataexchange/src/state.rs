@@ -21,7 +21,7 @@ use ::aws_smithy_schema_server::{envelope, Violation, ViolationKind};
 use crate::ops::types::{
     Action, ApiGatewayApiAsset, AssetConfiguration, AssetDetails, ConflictException, Event,
     InternalServerException, JobError, OriginDetails, ResourceNotFoundException, ResponseDetails,
-    S3SnapshotAsset, ServiceLimitExceededException, ValidationException,
+    S3DataAccessAsset, S3SnapshotAsset, ServiceLimitExceededException, ValidationException,
 };
 
 /// The service's SigV4 signing name, and so the ARN service segment.
@@ -48,6 +48,12 @@ pub const ASSET_TYPE_S3_SNAPSHOT: &str = "S3_SNAPSHOT";
 /// model's `AssetType` values (see [`ASSET_TYPE_S3_SNAPSHOT`]). Its details are that
 /// API's ([`AssetDetails::api_gateway_api_asset`]).
 pub const ASSET_TYPE_API_GATEWAY_API: &str = "API_GATEWAY_API";
+
+/// `AssetType` for an asset that IS an Amazon S3 data access — another of the model's
+/// `AssetType` values (see [`ASSET_TYPE_S3_SNAPSHOT`]). Its details are the data
+/// access's own ([`AssetDetails::s3_data_access_asset`]): the bucket whose data it
+/// shares and the keys and key prefixes of that bucket it shares.
+pub const ASSET_TYPE_S3_DATA_ACCESS: &str = "S3_DATA_ACCESS";
 
 /// `Origin` for a subscriber's copy of someone else's data set — the other of the
 /// model's `Origin` values (see [`ORIGIN_OWNED`]), which a data grant or an AWS
@@ -157,6 +163,14 @@ pub struct Asset {
     /// of its specification, which names the endpoint the read arrived at) are left
     /// absent here: they are not part of what was imported.
     pub api: Option<ApiGatewayApiAsset>,
+    /// The Amazon S3 data access this asset IS, as the job that created it recorded
+    /// it — set only for an asset whose content is a view of a bucket the caller owns
+    /// rather than bytes this store holds.
+    ///
+    /// The access-point members of the modelled `S3DataAccessAsset` are left absent:
+    /// this emulator mints no Amazon S3 access point, so there is no alias or ARN of
+    /// one to report, and a made-up one would name an endpoint nothing serves.
+    pub s3_data_access: Option<S3DataAccessAsset>,
     pub created_at: DateTime,
     pub updated_at: DateTime,
 }
@@ -184,6 +198,10 @@ impl Asset {
             },
             ASSET_TYPE_API_GATEWAY_API => AssetDetails {
                 api_gateway_api_asset: self.api.clone(),
+                ..AssetDetails::default()
+            },
+            ASSET_TYPE_S3_DATA_ACCESS => AssetDetails {
+                s3_data_access_asset: self.s3_data_access.clone(),
                 ..AssetDetails::default()
             },
             _ => AssetDetails::default(),
@@ -296,9 +314,10 @@ pub struct JobSettlement {
     pub import: Option<PendingImport>,
 }
 
-/// The asset an import execution adds to the revision its details name.
+/// The asset an execution adds to the revision its details name — the one an import
+/// produces, and the one a published Amazon S3 data access IS.
 ///
-/// What an import produces is fixed by the job's own `Details`, so it is resolved
+/// What an execution produces is fixed by the job's own `Details`, so it is resolved
 /// once, by the call that starts the job, and kept until the clock makes the execution
 /// due; the bytes stay in the job's [`JobUpload`] until then rather than being copied
 /// here.
@@ -314,6 +333,10 @@ pub struct PendingImport {
     /// The API the asset fulfils, for an import of an API specification; `None` for
     /// an import of a data file. See [`Asset::api`].
     pub api: Option<ApiGatewayApiAsset>,
+    /// The Amazon S3 data access the asset IS, for a job that publishes one; `None`
+    /// for a job that produces an asset of any other kind. See
+    /// [`Asset::s3_data_access`].
+    pub s3_data_access: Option<S3DataAccessAsset>,
 }
 
 /// An import whose execution has just finished and whose revision has yet to receive
@@ -525,6 +548,7 @@ impl ComAmazonawsDataexchangeDataexchangeState {
             asset_type,
             content: import.content,
             api: plan.api.clone(),
+            s3_data_access: plan.s3_data_access.clone(),
             created_at: import.at,
             updated_at: import.at,
         });

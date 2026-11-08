@@ -112,9 +112,10 @@ pub(crate) fn import_assets(
             name: format!("feed-{index}.csv"),
             asset_type: asset_type.clone(),
             // These assets are written straight into the store, so no import staged
-            // content for them and none fulfils an API.
+            // content for them, none fulfils an API and none is a data access.
             content: Vec::new(),
             api: None,
+            s3_data_access: None,
             created_at: imported_at,
             updated_at: imported_at,
         });

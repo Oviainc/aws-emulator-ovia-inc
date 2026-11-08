@@ -28,8 +28,14 @@ hex = { workspace = true }
 # job declared and HTTP's own `Content-MD5` are both Base64 MD5 digests of the body.
 md-5 = "0.10"
 # `request_path`: the one reading of a request URI's path, which the upload plane's
-# routing goes through rather than splitting a URI of its own.
+# routing goes through rather than splitting a URI of its own; `iam_authorization`: the
+# one evaluation of policy documents, which `StartJob` decides a data access source
+# bucket's grant to AWS Data Exchange with.
 service-common = { path = "../common" }
+# Amazon S3 client the source of an Amazon S3 data access is read through: `StartJob`
+# reads the source bucket's policy and its objects over the in-process callback into this
+# same emulator (no network client feature is enabled: the transport is the emulator's own).
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
@@ -40,6 +46,9 @@ hex = { workspace = true }
 # The upload tests compute the Base64 MD5 and the entity tag of the content they PUT,
 # the way a client uploading to a presigned target does.
 md-5 = "0.10"
+# The data access suite mounts the S3 service beside DataExchange on one engine, because
+# StartJob reads a data access's source by calling S3 in process.
+service-com-amazonaws-s3-amazons3 = { workspace = true }
 
 [lints]
 workspace = true

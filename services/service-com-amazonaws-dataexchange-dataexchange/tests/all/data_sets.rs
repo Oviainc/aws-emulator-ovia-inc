@@ -89,6 +89,23 @@ pub(crate) fn harness() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     (router, engine)
 }
 
+/// The same emulator with the S3 service mounted BESIDE this one on the one shared
+/// engine — what the assembled router does — handed back with that engine too.
+///
+/// For the suite that drives both front doors (`tests/all/s3_data_access_jobs.rs`):
+/// `StartJob` reads the source of an Amazon S3 data access by calling S3 in process,
+/// so S3 has to be there for its answer to be S3's.
+pub(crate) fn harness_with_object_storage() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
+    (router, engine)
+}
+
 /// Send one restJson1 request and reduce the answer.
 pub(crate) async fn call(
     router: &MultiServiceRouter,
