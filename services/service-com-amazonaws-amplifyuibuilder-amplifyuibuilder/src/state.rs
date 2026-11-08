@@ -47,14 +47,16 @@
 //!
 //! ## The page walk
 //!
-//! Every paginated operation of this service — the component, theme and
+//! Every paginated operation of this service — the component, form, theme and
 //! codegen-job lists and the three exports — serves its page from [`page_of`],
 //! the one walk over an app environment's records: it honours only a token
-//! [`page_token`] issued for that app environment, resumes at the cursor the
-//! token carries and issues the token of the next page. An operation supplies
-//! only what is its own — the records, the page bound and the projection it
-//! reports — so the resume semantics and the refusal of an unknown token cannot
-//! drift between two of them.
+//! [`page_token`] issued for that app environment over the SAME collection
+//! ([`PagedCollection`]), resumes at the cursor the token carries and issues the
+//! token of the next page. An operation supplies only what is its own — the
+//! records, the page bound and the projection it reports — so the resume
+//! semantics and the refusal of an unknown token cannot drift between two of
+//! them, and the collection a token belongs to is read off the record kind the
+//! walk runs over rather than restated by each handler.
 //!
 //! ## The third-party token surface
 //!
@@ -270,15 +272,14 @@ pub fn access_code_not_valid() -> InvalidParameterException {
     }
 }
 
-/// How a `ListComponents` page token is spelled, so a token this operation never
-/// issued can be told apart from one it did.
+/// How a page token of this service is spelled, so a token none of its paginated
+/// operations ever issued can be told apart from one that was issued.
 const PAGE_TOKEN_PREFIX: &str = "c-";
 
 /// The width of the cursor a page token carries, in hex digits (a `u64`).
 const PAGE_TOKEN_HEX_WIDTH: usize = 16;
 
-/// The width of the app-environment digest a page token carries, in hex digits
-/// (a `u32`).
+/// The width of the scope digest a page token carries, in hex digits (a `u32`).
 const PAGE_TOKEN_SCOPE_WIDTH: usize = 8;
 
 /// The lowest cursor this service ever hands out, and so the lowest one a page
@@ -1477,31 +1478,71 @@ pub fn reserved_name_in_variants(variants: &[ComponentVariant]) -> Option<String
     })
 }
 
-/// The `nextToken` a page of `key`'s entities that ends before `cursor`
-/// reports.
+/// Which collection of an app environment a page of records was served over.
 ///
-/// The token carries the app environment it was issued for as well as the
-/// cursor, so a token cannot be replayed against another (appId,
-/// environmentName): the pages a caller walks are the ones of the list it
+/// A cursor is a position in ONE collection's creation order, and every record
+/// this service stores draws its cursor from the single counter
+/// [`ComAmazonawsAmplifyuibuilderAmplifyuibuilderState::next_cursor`] hands out,
+/// so the same cursor value names a component in one collection and nothing at
+/// all in another. A page token therefore carries which collection it indexes
+/// beside the app environment it was issued for, and a token presented to an
+/// operation that pages a DIFFERENT collection names no page of it.
+///
+/// The variants are the four collections this service pages: the components,
+/// forms and themes of an app environment, and its codegen jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PagedCollection {
+    Components,
+    Forms,
+    Themes,
+    CodegenJobs,
+}
+
+impl PagedCollection {
+    /// How a collection is spelled into the digest a page token carries: the
+    /// last segment of the `@http` URI its operations are bound to, so the four
+    /// labels are distinct and each names its collection as the model does.
+    fn label(self) -> &'static str {
+        match self {
+            PagedCollection::Components => "components",
+            PagedCollection::Forms => "forms",
+            PagedCollection::Themes => "themes",
+            PagedCollection::CodegenJobs => "codegen-jobs",
+        }
+    }
+}
+
+/// The `nextToken` a page of `collection`'s records in `key` that ends before
+/// `cursor` reports.
+///
+/// The token carries the app environment it was issued for and the collection it
+/// was served over as well as the cursor, so it cannot be replayed against
+/// another (appId, environmentName) or against another collection of the same
+/// app environment: the pages a caller walks are the ones of the list it
 /// started.
-pub fn page_token(key: &EnvironmentKey, cursor: u64) -> String {
+pub fn page_token(key: &EnvironmentKey, collection: PagedCollection, cursor: u64) -> String {
     format!(
         "{PAGE_TOKEN_PREFIX}{scope:0scope_width$x}{cursor:0cursor_width$x}",
-        scope = token_scope(key),
+        scope = token_scope(key, collection),
         scope_width = PAGE_TOKEN_SCOPE_WIDTH,
         cursor_width = PAGE_TOKEN_HEX_WIDTH
     )
 }
 
-/// The cursor `token` resumes `key`'s list at, or `None` when it is not a token
-/// this service issued for that app environment.
+/// The cursor `token` resumes `collection` in `key` at, or `None` when it is not
+/// a token this service issued over that collection of that app environment.
 ///
 /// The cursor has to be one the service actually handed out: the cursors in
 /// existence run from [`FIRST_CURSOR`] to `issued`, the highest handed out, so a
 /// well-formed token carrying anything outside that span — above `issued`, or
 /// below the first cursor ever minted — names no page, exactly as a token of the
-/// wrong shape or the wrong app environment does.
-pub fn parse_page_token(token: &str, key: &EnvironmentKey, issued: u64) -> Option<u64> {
+/// wrong shape, the wrong app environment or another collection does.
+pub fn parse_page_token(
+    token: &str,
+    key: &EnvironmentKey,
+    collection: PagedCollection,
+    issued: u64,
+) -> Option<u64> {
     let digits = token.strip_prefix(PAGE_TOKEN_PREFIX)?;
     // Both halves are hex digits, so refusing anything else here is what makes
     // the split below land on a character boundary: a request-supplied token is
@@ -1513,7 +1554,7 @@ pub fn parse_page_token(token: &str, key: &EnvironmentKey, issued: u64) -> Optio
         return None;
     }
     let (scope, cursor) = digits.split_at(PAGE_TOKEN_SCOPE_WIDTH);
-    if u32::from_str_radix(scope, 16).ok()? != token_scope(key) {
+    if u32::from_str_radix(scope, 16).ok()? != token_scope(key, collection) {
         return None;
     }
     let cursor = u64::from_str_radix(cursor, 16).ok()?;
@@ -1521,36 +1562,52 @@ pub fn parse_page_token(token: &str, key: &EnvironmentKey, issued: u64) -> Optio
 }
 
 /// A record one of this service's paginated operations pages over: one held in
-/// its app environment's creation (or start) order and carrying the cursor that
-/// order assigned it.
+/// its app environment's creation (or start) order, carrying the cursor that
+/// order assigned it and belonging to one of the collections this service pages.
 ///
-/// It is the one thing [`page_of`] needs of a record, so every stored kind whose
-/// list is paginated implements it and none of them needs its own page walk.
+/// It is all [`page_of`] needs of a record, so every stored kind whose list is
+/// paginated implements it and none of them needs its own page walk. The
+/// collection comes off the record kind rather than from the handler, so the
+/// operations that page one collection — its list and its export alike — all
+/// honour each other's tokens and no operation can mint a token under another
+/// collection's name.
 pub trait PagedRecord {
+    /// Which collection a walk over these records pages, and so the collection
+    /// the tokens that walk issues belong to.
+    const COLLECTION: PagedCollection;
+
     /// The position this record holds in its app environment's order — what a
     /// page token indexes into.
     fn cursor(&self) -> u64;
 }
 
 impl PagedRecord for StoredComponent {
+    const COLLECTION: PagedCollection = PagedCollection::Components;
+
     fn cursor(&self) -> u64 {
         self.cursor
     }
 }
 
 impl PagedRecord for StoredCodegenJob {
+    const COLLECTION: PagedCollection = PagedCollection::CodegenJobs;
+
     fn cursor(&self) -> u64 {
         self.cursor
     }
 }
 
 impl PagedRecord for StoredForm {
+    const COLLECTION: PagedCollection = PagedCollection::Forms;
+
     fn cursor(&self) -> u64 {
         self.cursor
     }
 }
 
 impl PagedRecord for StoredTheme {
+    const COLLECTION: PagedCollection = PagedCollection::Themes;
+
     fn cursor(&self) -> u64 {
         self.cursor
     }
@@ -1564,8 +1621,8 @@ pub struct Page<T> {
     pub next_token: Option<String>,
 }
 
-/// A `nextToken` this service never issued for the app environment it was
-/// presented against, and so names no page.
+/// A `nextToken` this service never issued for the app environment and the
+/// collection it was presented against, and so names no page.
 #[derive(Debug)]
 pub struct UnknownPageToken(String);
 
@@ -1588,9 +1645,10 @@ impl UnknownPageToken {
 /// * a request carrying no token starts at [`FIRST_CURSOR`], the head of the
 ///   list;
 /// * a token is honoured only when [`parse_page_token`] recognises it as one this
-///   service issued for `key` out of the `issued` cursors it has handed out —
-///   anything else yields [`UnknownPageToken`], which the caller turns into its
-///   own modelled refusal rather than serving a page;
+///   service issued for `key` over the collection `records` belong to, out of
+///   the `issued` cursors it has handed out — anything else, a token of another
+///   collection included, yields [`UnknownPageToken`], which the caller turns
+///   into its own modelled refusal rather than serving a page;
 /// * the page resumes at the first record AT OR AFTER the cursor, so a page is
 ///   still served when the record the token named was deleted meanwhile;
 /// * once `page_size` records are served, the next token is issued from the
@@ -1606,7 +1664,7 @@ pub fn page_of<R: PagedRecord, T>(
 ) -> Result<Page<T>, UnknownPageToken> {
     let cursor = match next_token {
         None => FIRST_CURSOR,
-        Some(token) => parse_page_token(token, key, issued)
+        Some(token) => parse_page_token(token, key, R::COLLECTION, issued)
             .ok_or_else(|| UnknownPageToken(token.to_string()))?,
     };
 
@@ -1617,7 +1675,7 @@ pub fn page_of<R: PagedRecord, T>(
             continue;
         }
         if entities.len() == page_size {
-            resume_at = Some(page_token(key, record.cursor()));
+            resume_at = Some(page_token(key, R::COLLECTION, record.cursor()));
             break;
         }
         entities.push(project(record));
@@ -1629,17 +1687,22 @@ pub fn page_of<R: PagedRecord, T>(
     })
 }
 
-/// The app environment half of a page token: a digest of the (appId,
-/// environmentName) the page was served for.
+/// The scope half of a page token: a digest of the (appId, environmentName) the
+/// page was served for and of the collection it was served over.
+///
+/// Both, because a cursor is a position in one collection of one app
+/// environment: a token whose scope digest does not match the page being asked
+/// for names no page of it.
 ///
 /// A token is only meaningful within the run that issued it, so the standard
 /// hasher is enough; nothing persists a token across runs.
-fn token_scope(key: &EnvironmentKey) -> u32 {
+fn token_scope(key: &EnvironmentKey, collection: PagedCollection) -> u32 {
     use std::hash::{Hash, Hasher};
 
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     key.0.hash(&mut hasher);
     key.1.hash(&mut hasher);
+    collection.label().hash(&mut hasher);
     (hasher.finish() >> 32) as u32
 }
 

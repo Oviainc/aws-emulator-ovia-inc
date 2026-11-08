@@ -15,7 +15,7 @@ use aws_smithy_types::DateTime;
 use bytes::Bytes;
 use serde_json::{json, Map, Value};
 use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::state::{
-    page_token, parse_page_token,
+    page_token, parse_page_token, PagedCollection,
 };
 use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
@@ -1126,25 +1126,26 @@ async fn a_reserved_property_name_is_refused() {
 
 /// A `nextToken` is arbitrary caller-supplied UTF-8, so the parser must ANSWER for every
 /// byte string rather than fail on one: it accepts exactly the tokens `page_token` issued
-/// for that app environment with a cursor the service handed out — the span from the first
-/// cursor minted to the highest — and returns `None` for everything else, including a
-/// token whose byte length is right but whose bytes are not hex digits (a multi-byte
-/// scalar straddling the halves' boundary would panic a parser that split before
-/// checking).
+/// for that app environment, over the collection being paged, with a cursor the service
+/// handed out — the span from the first cursor minted to the highest — and returns `None`
+/// for everything else, including a token whose byte length is right but whose bytes are
+/// not hex digits (a multi-byte scalar straddling the halves' boundary would panic a parser
+/// that split before checking).
 #[test]
 fn a_page_token_the_service_never_issued_is_answered_not_panicked() {
     let key = (APP_ID.to_string(), ENVIRONMENT.to_string());
     let other_app = ("d9999zzzz".to_string(), ENVIRONMENT.to_string());
     let other_environment = (APP_ID.to_string(), "production".to_string());
+    let paged = PagedCollection::Components;
     let issued: u64 = 7;
 
     // Every token the service can issue for cursors it handed out round-trips. The
     // cursors handed out start at one: the counter pre-increments, so no record and no
     // token of this service ever carries the cursor zero.
     for cursor in [1, 2, issued] {
-        let token = page_token(&key, cursor);
+        let token = page_token(&key, paged, cursor);
         assert_eq!(
-            parse_page_token(&token, &key, issued),
+            parse_page_token(&token, &key, paged, issued),
             Some(cursor),
             "case cursor={cursor}: the token {token:?} this service issued must parse back"
         );
@@ -1153,18 +1154,33 @@ fn a_page_token_the_service_never_issued_is_answered_not_panicked() {
     // Rows differ in how the token fails: the empty string, a shape never emitted, the
     // prefix alone, non-hex bytes of the right length, a multi-byte scalar across the
     // scope/cursor boundary, one byte too few and one too many, a cursor past everything
-    // issued, a cursor below the first one ever handed out, and a token issued for another
-    // app environment.
+    // issued, a cursor below the first one ever handed out, a token issued for another
+    // app environment, and a token issued over another collection of this one.
     let right_length_non_hex = format!("c-{}", "z".repeat(24));
     let multibyte_across_boundary = format!("c-{}{}{}", "a".repeat(6), "€", "b".repeat(15));
-    let too_short = page_token(&key, 1)[..25].to_string();
-    let too_long = format!("{}0", page_token(&key, 1));
-    let past_issued = page_token(&key, issued + 1);
-    let largest_cursor = page_token(&key, u64::MAX);
-    let below_first_issued = page_token(&key, 0);
-    let from_other_app = page_token(&other_app, 1);
-    let from_other_environment = page_token(&other_environment, 1);
-    let cases: Vec<(&str, String)> = vec![
+    let too_short = page_token(&key, paged, 1)[..25].to_string();
+    let too_long = format!("{}0", page_token(&key, paged, 1));
+    let past_issued = page_token(&key, paged, issued + 1);
+    let largest_cursor = page_token(&key, paged, u64::MAX);
+    let below_first_issued = page_token(&key, paged, 0);
+    let from_other_app = page_token(&other_app, paged, 1);
+    let from_other_environment = page_token(&other_environment, paged, 1);
+    // Every OTHER collection this service pages: each of their tokens names a position in
+    // its own creation order, so none of them names a page of the component list.
+    let from_other_collections: Vec<(String, String)> = [
+        PagedCollection::Forms,
+        PagedCollection::Themes,
+        PagedCollection::CodegenJobs,
+    ]
+    .into_iter()
+    .map(|collection| {
+        (
+            format!("a token issued over {collection:?}"),
+            page_token(&key, collection, 1),
+        )
+    })
+    .collect();
+    let mut cases: Vec<(&str, String)> = vec![
         ("the empty string", String::new()),
         ("a token shape never emitted", "not-a-token".to_string()),
         ("the prefix alone", "c-".to_string()),
@@ -1184,10 +1200,15 @@ fn a_page_token_the_service_never_issued_is_answered_not_panicked() {
             from_other_environment,
         ),
     ];
+    cases.extend(
+        from_other_collections
+            .iter()
+            .map(|(case, token)| (case.as_str(), token.clone())),
+    );
 
     for (case, token) in cases {
         assert_eq!(
-            parse_page_token(&token, &key, issued),
+            parse_page_token(&token, &key, paged, issued),
             None,
             "case {case:?}: the token {token:?} names no page of this list"
         );
@@ -1196,9 +1217,9 @@ fn a_page_token_the_service_never_issued_is_answered_not_panicked() {
     // The span is empty while nothing has been created, so before the first create even a
     // correctly scoped token of the lowest cursor names no page.
     for cursor in [0, 1, 2] {
-        let token = page_token(&key, cursor);
+        let token = page_token(&key, paged, cursor);
         assert_eq!(
-            parse_page_token(&token, &key, 0),
+            parse_page_token(&token, &key, paged, 0),
             None,
             "case cursor={cursor} with nothing handed out: the token {token:?} names no page"
         );

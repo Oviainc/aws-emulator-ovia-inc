@@ -163,8 +163,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // one page walk (`crate::state::page_of`), projected to the FULL
         // `Component` record rather than to a summary and bounded by this
         // export's own page limit. A malformed token, one issued for another app
-        // environment, or one whose cursor is not among those handed out names no
-        // page of this export, so it is refused rather than served as a page.
+        // environment, one issued over another collection of this app
+        // environment, or one whose cursor is not among those handed out names
+        // no page of this export, so it is refused rather than served as a page.
         // With no token at all the export starts at the first cursor the service
         // ever hands out, i.e. at the head of the list.
         let page = crate::state::page_of(

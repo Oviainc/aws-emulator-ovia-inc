@@ -59,6 +59,9 @@ mod invalid_parameter_refusals;
 #[path = "all/metadata_flags.rs"]
 mod metadata_flags;
 
+#[path = "all/page_token_collection_scope.rs"]
+mod page_token_collection_scope;
+
 #[path = "all/page_token_cursor_bounds.rs"]
 mod page_token_cursor_bounds;
 

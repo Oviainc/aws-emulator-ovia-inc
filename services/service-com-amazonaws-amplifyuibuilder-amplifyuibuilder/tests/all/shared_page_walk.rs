@@ -6,7 +6,8 @@
 //! The rule under test, which all six of them implement: a page of an app environment's
 //! records starts at the head of that environment's creation order when the request names
 //! no `nextToken`; a token is honoured only when it is one the service issued for that app
-//! environment, and anything else is refused with the modelled `InvalidParameterException`
+//! environment over the collection the operation pages, and anything else is refused with
+//! the modelled `InvalidParameterException`
 //! (HTTP 400) naming the operation and the token rather than served as a page; a honoured
 //! token resumes at the first record AT OR AFTER the cursor it carries, so the rest of the
 //! list is still served when the record that cursor named was deleted meanwhile; and
@@ -23,7 +24,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use serde_json::{json, Value};
-use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::state::page_token;
+use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::state::{page_token, PagedCollection};
 use service_com_amazonaws_amplifyuibuilder_amplifyuibuilder::EmulatedService;
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -196,10 +197,30 @@ impl Kind {
         }
     }
 
+    /// Another collection than this kind's, so a row can present a token of a collection
+    /// its operation does not page.
+    fn other_collection(self) -> PagedCollection {
+        match self {
+            Kind::Themes => PagedCollection::Components,
+            _ => PagedCollection::Themes,
+        }
+    }
+
     /// Whether this service models a delete for the kind, so a row can prove the walk
     /// resumes past a record the token named and a delete removed.
     fn has_delete(self) -> bool {
         !matches!(self, Kind::CodegenJobs)
+    }
+
+    /// The collection a page token of this kind's pages is issued over: a token names a
+    /// page of ONE collection, so a token forged for a case must name this one.
+    fn collection(self) -> PagedCollection {
+        match self {
+            Kind::Components => PagedCollection::Components,
+            Kind::Forms => PagedCollection::Forms,
+            Kind::Themes => PagedCollection::Themes,
+            Kind::CodegenJobs => PagedCollection::CodegenJobs,
+        }
     }
 }
 
@@ -421,7 +442,7 @@ async fn every_paginated_operation_serves_the_same_page_walk() {
         let key = (APP_ID.to_string(), ENVIRONMENT.to_string());
         for (index, _) in created.iter().enumerate() {
             let cursor = u64::try_from(index + 1).expect("a record index fits in u64");
-            let token = page_token(&key, cursor);
+            let token = page_token(&key, kind.collection(), cursor);
             let resumed = row.page(&router, Some(&token)).await;
             assert_eq!(
                 resumed.status, 200,
@@ -444,20 +465,26 @@ async fn every_paginated_operation_serves_the_same_page_walk() {
             );
         }
 
-        // A token the service never issued for this app environment names no page, so it is
-        // refused rather than served. The rows differ in HOW it fails to name one: a shape
-        // the service never emits, a cursor below the first one ever minted, a cursor far
-        // above the highest handed out, and a token of another app environment.
+        // A token the service never issued for this app environment and this collection
+        // names no page, so it is refused rather than served. The rows differ in HOW it
+        // fails to name one: a shape the service never emits, a cursor below the first one
+        // ever minted, a cursor far above the highest handed out, a token of another app
+        // environment, and a token of another collection of this app environment.
         let other_key = (APP_ID.to_string(), OTHER_ENVIRONMENT.to_string());
-        let below_the_first = page_token(&key, 0);
-        let past_the_highest = page_token(&key, u64::MAX);
-        let from_elsewhere = page_token(&other_key, 1);
+        let below_the_first = page_token(&key, kind.collection(), 0);
+        let past_the_highest = page_token(&key, kind.collection(), u64::MAX);
+        let from_elsewhere = page_token(&other_key, kind.collection(), 1);
+        let from_another_collection = page_token(&key, kind.other_collection(), 1);
         for (case, token) in [
             ("a shape the service never emits", "not-a-token"),
             ("a prefix with no digits", "c-"),
             ("a cursor below the first minted", below_the_first.as_str()),
             ("a cursor past the highest handed out", past_the_highest.as_str()),
             ("a token of another app environment", from_elsewhere.as_str()),
+            (
+                "a token of another collection of this app environment",
+                from_another_collection.as_str(),
+            ),
         ] {
             let refused = row.page(&router, Some(token)).await;
             assert_eq!(
@@ -508,7 +535,7 @@ async fn every_paginated_operation_serves_the_same_page_walk() {
                 deleted.status, deleted.body
             );
             let resumed = row
-                .page(&router, Some(&page_token(&key, cursor)))
+                .page(&router, Some(&page_token(&key, kind.collection(), cursor)))
                 .await;
             assert_eq!(
                 resumed.status, 200,

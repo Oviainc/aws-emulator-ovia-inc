@@ -9,10 +9,10 @@
 //! outside that span is refused with the modelled `InvalidParameterException` (HTTP 400),
 //! whether it lies above the highest cursor or below the first one.
 //!
-//! All four paginated operations of this crate (`ListComponents`, `ExportComponents`,
-//! `ExportForms`, `ExportThemes`) share one token validator, so each case here is driven
-//! against every one of them: the cursor bound is a property of the token, not of the
-//! operation that reads it.
+//! All four paginated operations of this crate the cases drive (`ListComponents`,
+//! `ExportComponents`, `ExportForms`, `ExportThemes`) share one token validator, so each
+//! case here is driven against every one of them, each with a token of the collection it
+//! pages: the cursor bound is a property of the token, not of the operation that reads it.
 //!
 //! Every case goes through the router, so it exercises routing, deserialization, the
 //! handler, the persisted state and serialization — the same path a client takes.
@@ -161,10 +161,12 @@ async fn create(router: &MultiServiceRouter, kind: &str, data: Value) {
 }
 
 /// The operations a page token can be presented to, each with the `@http` URI it is bound
-/// to.
+/// to and the collection listing whose issued tokens that operation honours — a token names
+/// a page of ONE collection, so each row is driven with a token of the collection it pages.
 struct Paginated {
     operation: &'static str,
     uri: String,
+    collection: &'static str,
 }
 
 fn paginated_operations() -> Vec<Paginated> {
@@ -172,18 +174,22 @@ fn paginated_operations() -> Vec<Paginated> {
         Paginated {
             operation: "ListComponents",
             uri: collection_uri("components"),
+            collection: "components",
         },
         Paginated {
             operation: "ExportComponents",
             uri: export_uri("components"),
+            collection: "components",
         },
         Paginated {
             operation: "ExportForms",
             uri: export_uri("forms"),
+            collection: "forms",
         },
         Paginated {
             operation: "ExportThemes",
             uri: export_uri("themes"),
+            collection: "themes",
         },
     ]
 }
@@ -203,11 +209,16 @@ fn cursor_of(issued: &str) -> u64 {
     })
 }
 
-/// Walk `ListComponents` one component at a time, returning every token it issued: each
-/// one is a token the service really handed out, and the last carries the newest cursor of
-/// the store when the components were the last entities created.
-async fn issued_tokens(router: &MultiServiceRouter, pages_at_most: usize) -> Vec<String> {
-    let list_uri = collection_uri("components");
+/// Walk the list of `collection` one record at a time, returning every token it issued:
+/// each one is a token the service really handed out over that collection, and the last
+/// carries the newest cursor of the store when that collection's records were the last
+/// entities created.
+async fn issued_tokens(
+    router: &MultiServiceRouter,
+    collection: &str,
+    pages_at_most: usize,
+) -> Vec<String> {
+    let list_uri = collection_uri(collection);
     let mut tokens: Vec<String> = Vec::new();
     let mut token: Option<String> = None;
     loop {
@@ -218,8 +229,8 @@ async fn issued_tokens(router: &MultiServiceRouter, pages_at_most: usize) -> Vec
         let page = call(router, "GET", &uri, None).await;
         assert_eq!(
             page.status, 200,
-            "case nextToken={token:?}: a token ListComponents issued must be served, got {} with \
-             {:?}",
+            "case {collection} nextToken={token:?}: a token the list issued must be served, got \
+             {} with {:?}",
             page.status, page.body
         );
         match page.next_token() {
@@ -231,8 +242,8 @@ async fn issued_tokens(router: &MultiServiceRouter, pages_at_most: usize) -> Vec
         }
         assert!(
             tokens.len() < pages_at_most,
-            "walking the components one at a time must issue fewer than {pages_at_most} tokens, \
-             got {tokens:?}"
+            "walking the {collection} one at a time must issue fewer than {pages_at_most} \
+             tokens, got {tokens:?}"
         );
     }
     tokens
@@ -265,7 +276,7 @@ async fn a_cursor_outside_the_span_handed_out_is_refused_by_every_paginated_oper
         .await;
     }
 
-    let walked = issued_tokens(&router, components).await;
+    let walked = issued_tokens(&router, "components", components).await;
     let issued = walked
         .last()
         .unwrap_or_else(|| panic!("a walk of {components} components must issue a token"))
@@ -288,6 +299,29 @@ async fn a_cursor_outside_the_span_handed_out_is_refused_by_every_paginated_oper
          after four other entities and {components} components"
     );
 
+    // One token each of the other two collections' lists really issued, so every row below
+    // is driven with a token of the collection its operation pages: a token names a page of
+    // ONE collection, and the scope digest it carries is what says which.
+    let fixtures_per_collection = 2;
+    let form_token = issued_tokens(&router, "forms", fixtures_per_collection)
+        .await
+        .last()
+        .unwrap_or_else(|| panic!("a walk of {fixtures_per_collection} forms must issue a token"))
+        .clone();
+    let theme_token = issued_tokens(&router, "themes", fixtures_per_collection)
+        .await
+        .last()
+        .unwrap_or_else(|| panic!("a walk of {fixtures_per_collection} themes must issue a token"))
+        .clone();
+    let token_of = |collection: &str| -> String {
+        match collection {
+            "components" => issued.clone(),
+            "forms" => form_token.clone(),
+            "themes" => theme_token.clone(),
+            other => panic!("no fixture token for the {other} collection"),
+        }
+    };
+
     // The floor of the span: the cursor counter pre-increments, so the first cursor handed
     // out is one and zero names no record. Spelled out here, independently of the constant
     // `src/state.rs` carries, so a wrong floor in the implementation fails this test rather
@@ -303,9 +337,15 @@ async fn a_cursor_outside_the_span_handed_out_is_refused_by_every_paginated_oper
         ("the largest cursor a token can spell", u64::MAX, false),
     ];
 
-    for Paginated { operation, uri } in paginated_operations() {
+    for Paginated {
+        operation,
+        uri,
+        collection,
+    } in paginated_operations()
+    {
+        let scope_source = token_of(collection);
         for (case, cursor, handed_out) in &cases {
-            let token = forge(&issued, *cursor);
+            let token = forge(&scope_source, *cursor);
             let answer = call(&router, "GET", &format!("{uri}?nextToken={token}"), None).await;
             if *handed_out {
                 assert_eq!(
