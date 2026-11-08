@@ -250,10 +250,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
                 .ok_or_else(|| {
                     CreateNotificationErrorModeled::NotFoundException(NotFoundException {
-                        message: Some(format!(
-                            "Unable to create notification: {} - the budget doesn't exist.",
-                            input.budget_name
-                        )),
+                        message: Some(crate::state::budget_not_found(&input.budget_name)),
                     })
                 })?;
 
@@ -277,12 +274,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if stored.notifications.len() >= crate::state::MAX_NOTIFICATIONS_PER_BUDGET {
                 return Err(CreateNotificationErrorModeled::CreationLimitExceededException(
                     CreationLimitExceededException {
-                        message: Some(format!(
-                            "Unable to create notification: {} - a budget can have at most {} \
-                             notifications.",
-                            input.budget_name,
-                            crate::state::MAX_NOTIFICATIONS_PER_BUDGET
-                        )),
+                        message: Some(crate::state::notification_quota_exceeded()),
                     },
                 )
                 .into());

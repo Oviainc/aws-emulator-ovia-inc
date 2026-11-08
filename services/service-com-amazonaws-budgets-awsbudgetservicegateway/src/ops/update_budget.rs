@@ -214,10 +214,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             let mut store = crate::state::store_at(&state, now);
             let stored = store.budgets.get_mut(&key).ok_or_else(|| {
                 UpdateBudgetErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!(
-                        "Unable to update budget: {} - the budget doesn't exist.",
-                        key.1
-                    )),
+                    message: Some(crate::state::budget_not_found(&key.1)),
                 })
             })?;
 

@@ -179,10 +179,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // the associated notifications and subscribers" together.
         if store.budgets.remove(&key).is_none() {
             return Err(DeleteBudgetErrorModeled::NotFoundException(NotFoundException {
-                message: Some(format!(
-                    "Unable to delete budget: {} - the budget doesn't exist.",
-                    input.budget_name
-                )),
+                message: Some(crate::state::budget_not_found(&input.budget_name)),
             })
             .into());
         }

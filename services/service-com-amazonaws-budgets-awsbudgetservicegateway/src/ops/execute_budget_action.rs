@@ -5,9 +5,10 @@
 //! Drives the `Action$Status` state machine of one stored budget action: the execution
 //! type the caller names takes the action into the matching `*_IN_PROGRESS` status, and
 //! the clock owes the settled status [`crate::state::ACTION_SETTLES_AFTER`] later
-//! ([`crate::state::action_execution`]). An execution type the action's current status
-//! leaves nothing to do is an `InvalidParameterException`; one aimed at an action whose
-//! work is still running is the locked resource `ResourceLockedException` names; a
+//! ([`crate::state::action_execution`]). An execution the action's current status does
+//! not allow — one aimed at work that is still running, or one its settled status leaves
+//! nothing to do — is refused for the state the resource is in, which is the locked
+//! resource `ResourceLockedException` names; a
 //! budget or action this account does not hold is a `NotFoundException`. The call is
 //! recorded as the action's `EXECUTE_ACTION` event, which
 //! `DescribeBudgetActionHistories` reports.
@@ -215,10 +216,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
             .ok_or_else(|| {
                 ExecuteBudgetActionErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!(
-                        "Unable to execute budget action: {} - the budget doesn't exist.",
-                        input.budget_name
-                    )),
+                    message: Some(crate::state::budget_not_found(&input.budget_name)),
                 })
             })?;
         // The lookup materialises any settle the clock had already made due, so the
@@ -226,41 +224,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let action =
             crate::state::find_action_mut(stored, &input.action_id, now).ok_or_else(|| {
                 ExecuteBudgetActionErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!(
-                        "Unable to execute budget action: {} - the action doesn't exist.",
-                        input.action_id
+                    message: Some(crate::state::action_not_found(
+                        &input.account_id,
+                        &input.action_id,
                     )),
                 })
             })?;
 
-        // Work this service started and has not settled yet: the action is locked
-        // against a second execution until it does.
-        if crate::state::action_is_in_progress(&action.action.status) {
-            return Err(ExecuteBudgetActionErrorModeled::ResourceLockedException(
-                ResourceLockedException {
-                    message: Some(format!(
-                        "Unable to execute budget action: {} - the action is {} and cannot \
-                         take another execution until that completes.",
-                        input.action_id, action.action.status
-                    )),
-                },
-            )
-            .into());
-        }
-
-        // Which executions an action's status leaves to do is the rule; an execution
-        // type with nothing to do from here is an invalid input value, not a 501.
-        let execution = crate::state::action_execution(&input.execution_type, &action.action.status)
+        // Which executions an action's status leaves to do is the rule, and an execution
+        // the action's CURRENT STATUS does not allow is a refusal of the method for the
+        // state the resource is in — not of any value in the request: work this service
+        // started and has not settled yet is locked against a second execution, and a
+        // settled status that leaves this execution type nothing to do refuses it the
+        // same way. Both are the locked resource `ResourceLockedException` names ("the
+        // server rejected that particular method for the requested resource"), reported
+        // with the status the action carries at this instant.
+        let execution = (!crate::state::action_is_in_progress(&action.action.status))
+            .then(|| crate::state::action_execution(&input.execution_type, &action.action.status))
+            .flatten()
             .ok_or_else(|| {
-                ExecuteBudgetActionErrorModeled::InvalidParameterException(
-                    InvalidParameterException {
-                        message: Some(format!(
-                            "Unable to execute budget action: {} - a {} execution isn't allowed \
-                             while the action is {}.",
-                            input.action_id, input.execution_type, action.action.status
-                        )),
-                    },
-                )
+                ExecuteBudgetActionErrorModeled::ResourceLockedException(ResourceLockedException {
+                    message: Some(crate::state::method_not_allowed_during(
+                        &action.action.status,
+                    )),
+                })
             })?;
         // In progress NOW, settled when the clock says so — so a caller reading
         // straight after this call still sees the in-progress status and the refusals

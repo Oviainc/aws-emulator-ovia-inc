@@ -198,10 +198,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
             .ok_or_else(|| {
                 DescribeBudgetActionErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!(
-                        "Unable to get budget action: {} - the budget doesn't exist.",
-                        input.budget_name
-                    )),
+                    message: Some(crate::state::budget_not_found(&input.budget_name)),
                 })
             })?;
         // The ONLY write a read makes: the settle the clock had already made due. Every
@@ -209,9 +206,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let action =
             crate::state::find_action_mut(stored, &input.action_id, now).ok_or_else(|| {
                 DescribeBudgetActionErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!(
-                        "Unable to get budget action: {} - the action doesn't exist.",
-                        input.action_id
+                    message: Some(crate::state::action_not_found(
+                        &input.account_id,
+                        &input.action_id,
                     )),
                 })
             })?;

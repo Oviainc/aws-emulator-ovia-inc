@@ -79,6 +79,8 @@ mod dead_notification_subscriber_reads;
 mod default_page_sizes;
 #[path = "all/empty_collection_selections.rs"]
 mod empty_collection_selections;
+#[path = "all/error_message_fidelity.rs"]
+mod error_message_fidelity;
 #[path = "all/filter_expression_projection.rs"]
 mod filter_expression_projection;
 #[path = "all/notification_alarm_state.rs"]

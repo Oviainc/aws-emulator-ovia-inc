@@ -186,17 +186,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let store = crate::state::store_at(&state, now);
         let held = crate::state::resource_tags(&store, &target).ok_or_else(|| {
             ListTagsForResourceErrorModeled::NotFoundException(NotFoundException {
-                message: Some(match &target {
-                    crate::state::TaggedResource::Budget { .. } => {
-                        "Unable to list tags: the budget the ResourceARN names doesn't exist."
-                            .to_string()
-                    }
-                    crate::state::TaggedResource::Action { .. } => {
-                        "Unable to list tags: the budget action the ResourceARN names doesn't \
-                         exist."
-                            .to_string()
-                    }
-                }),
+                message: Some(crate::state::tagged_resource_not_found(&target)),
             })
         })?;
 

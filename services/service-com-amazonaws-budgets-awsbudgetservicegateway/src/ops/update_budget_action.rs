@@ -278,15 +278,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let now = ::std::time::SystemTime::now();
         let mut store = crate::state::store_at(&state, now);
-        let held = store
+        let stored = store
             .budgets
             .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
-            .and_then(|stored| crate::state::find_action_mut(stored, &input.action_id, now))
             .ok_or_else(|| {
                 UpdateBudgetActionErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!(
-                        "Unable to update budget action: {} - the budget action doesn't exist.",
-                        input.action_id
+                    message: Some(crate::state::budget_not_found(&input.budget_name)),
+                })
+            })?;
+        let held =
+            crate::state::find_action_mut(stored, &input.action_id, now).ok_or_else(|| {
+                UpdateBudgetActionErrorModeled::NotFoundException(NotFoundException {
+                    message: Some(crate::state::action_not_found(
+                        &input.account_id,
+                        &input.action_id,
                     )),
                 })
             })?;
@@ -299,11 +304,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::action_is_in_progress(&held.action.status) {
             return Err(UpdateBudgetActionErrorModeled::ResourceLockedException(
                 ResourceLockedException {
-                    message: Some(format!(
-                        "Unable to update budget action: {} - the action is {} and cannot \
-                         be updated until that completes.",
-                        input.action_id, held.action.status
-                    )),
+                    message: Some(crate::state::method_not_allowed_during(&held.action.status)),
                 },
             )
             .into());

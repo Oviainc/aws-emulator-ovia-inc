@@ -209,10 +209,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
             .ok_or_else(|| {
                 DeleteBudgetActionErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!(
-                        "Unable to delete budget action: {} - the budget doesn't exist.",
-                        input.budget_name
-                    )),
+                    message: Some(crate::state::budget_not_found(&input.budget_name)),
                 })
             })?;
         // The action the caller named, inside the budget that owns it.
@@ -222,9 +219,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .position(|held| held.action.action_id == input.action_id)
             .ok_or_else(|| {
                 DeleteBudgetActionErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!(
-                        "Unable to delete budget action: {} - the action doesn't exist.",
-                        input.action_id
+                    message: Some(crate::state::action_not_found(
+                        &input.account_id,
+                        &input.action_id,
                     )),
                 })
             })?;
@@ -241,11 +238,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         if crate::state::action_is_in_progress(status) {
             return Err(DeleteBudgetActionErrorModeled::ResourceLockedException(
                 ResourceLockedException {
-                    message: Some(format!(
-                        "Unable to delete budget action: {} - the action is {status} and \
-                         cannot be deleted until that completes.",
-                        input.action_id
-                    )),
+                    message: Some(crate::state::method_not_allowed_during(status)),
                 },
             )
             .into());

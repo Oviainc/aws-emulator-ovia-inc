@@ -60,9 +60,7 @@ enum Expect {
 fn refusal_message(expect: Expect) -> &'static str {
     match expect {
         Expect::Accepted => "",
-        Expect::Unordered => {
-            "Unable to create/update budget: TimePeriod Start must come before End."
-        }
+        Expect::Unordered => "Unable to create/update budget - end time has to be after start time.",
         Expect::EndPastBound => {
             "Unable to create/update budget: TimePeriod End must not come after \
              06/15/87 00:00 UTC."

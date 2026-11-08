@@ -36,6 +36,12 @@ use std::time::{Duration, SystemTime};
 /// store itself.
 pub mod alerts;
 
+/// How this service words the refusals several operations share — one sentence per
+/// CONDITION rather than per operation, so a client that recognises a condition by its
+/// message recognises it whichever operation answered.
+mod refusals;
+pub use refusals::*;
+
 /// The execution role a budget action is written with, resolved against the account's IAM
 /// records — the other part of this service that calls another service, kept apart from
 /// the store for the same reason.
@@ -1620,11 +1626,7 @@ pub fn notification_set_limit_violation(
     attaching: &[NotificationWithSubscribers],
 ) -> Result<(), String> {
     if already_held + attaching.len() > MAX_NOTIFICATIONS_PER_BUDGET {
-        return Err(format!(
-            "Unable to create budget: a budget can have at most {MAX_NOTIFICATIONS_PER_BUDGET} \
-             notifications, and it would hold {}.",
-            already_held + attaching.len()
-        ));
+        return Err(notification_quota_exceeded());
     }
     for supplied in attaching {
         subscriber_limit_violation(&supplied.subscribers)?;
@@ -2099,7 +2101,10 @@ pub fn budget_name_violation(member_path: &[&str], name: &str) -> Option<String>
 /// value."). Every rule here is quoted from the model's own documentation:
 ///
 /// * "You can't use `BudgetLimit` with `PlannedBudgetLimits` for `CreateBudget`
-///   and `UpdateBudget` actions." (`Budget$BudgetLimit`)
+///   and `UpdateBudget` actions." (`Budget$BudgetLimit`) — one of the three pairings of
+///   the members that determine a budget's amount, which are mutually exclusive as a
+///   set: the fixed `BudgetLimit`, the planned map and the `AutoAdjustData` whose amount
+///   the service adjusts instead ([`BUDGET_AMOUNT_EXCLUSIVITY_REFUSAL`])
 /// * "only one set of filter and metric selections can be present in the syntax at
 ///   one time. Either `FilterExpression` and `Metrics` or `CostFilters` and
 ///   `CostTypes`, not both or a different combination." (`CreateBudget`)
@@ -2132,12 +2137,20 @@ pub fn budget_name_violation(member_path: &[&str], name: &str) -> Option<String>
 /// that write — the one the service's own defaults are computed from — so a rule over a
 /// member the service supplies judges the value the write will actually leave behind.
 pub fn validate_budget(budget: &Budget, at: SystemTime) -> Result<(), String> {
-    if budget.budget_limit.is_some() && selects(&budget.planned_budget_limits) {
-        return Err(
-            "Unable to create/update budget: BudgetLimit can't be used with \
-             PlannedBudgetLimits."
-                .to_string(),
-        );
+    // The three members that can determine a budget's amount are mutually exclusive, so
+    // a budget that supplies more than one of them names no single amount. Counted over
+    // all three rather than checked pair by pair: the rule is "only one of them", and
+    // the refusal names the whole set either way.
+    let amount_sources = [
+        budget.budget_limit.is_some(),
+        selects(&budget.planned_budget_limits),
+        budget.auto_adjust_data.is_some(),
+    ]
+    .into_iter()
+    .filter(|supplied| *supplied)
+    .count();
+    if amount_sources > 1 {
+        return Err(BUDGET_AMOUNT_EXCLUSIVITY_REFUSAL.to_string());
     }
     let legacy_filters = selects(&budget.cost_filters) || budget.cost_types.is_some();
     let expression_filters = budget.filter_expression.is_some() || selects(&budget.metrics);
@@ -2386,9 +2399,7 @@ pub const MAX_ACTION_HISTORY_RECORDS: usize = 1_000;
 ///   it is not.
 fn validate_time_period(period: &TimePeriod) -> Result<(), String> {
     if !time_period_ordered(period) {
-        return Err(
-            "Unable to create/update budget: TimePeriod Start must come before End.".to_string(),
-        );
+        return Err(BUDGET_TIME_PERIOD_ORDER_REFUSAL.to_string());
     }
     let Some(end) = period.end.as_ref() else {
         return Ok(());

@@ -205,10 +205,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .get_mut(&(input.account_id.clone(), input.budget_name.clone()))
             .ok_or_else(|| {
                 DeleteSubscriberErrorModeled::NotFoundException(NotFoundException {
-                    message: Some(format!(
-                        "Unable to delete subscriber: {} - the budget doesn't exist.",
-                        input.budget_name
-                    )),
+                    message: Some(crate::state::budget_not_found(&input.budget_name)),
                 })
             })?;
 

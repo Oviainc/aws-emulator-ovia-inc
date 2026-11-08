@@ -204,10 +204,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .ok_or_else(|| {
                 DescribeSubscribersForNotificationErrorModeled::NotFoundException(
                     NotFoundException {
-                        message: Some(format!(
-                            "Unable to get subscribers: {} - the budget doesn't exist.",
-                            input.budget_name
-                        )),
+                        message: Some(crate::state::budget_not_found(&input.budget_name)),
                     },
                 )
             })?;

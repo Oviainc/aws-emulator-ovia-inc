@@ -1057,3 +1057,6 @@ mod cloudformation_wafv2_protection_stack;
 // `cloudformation_asset_bucket_publishing_role` and
 // `bedrock_agentcore_data_plane_parent_resources` — are each ALREADY declared above, in the
 // declaration of each stands.
+// Several suites that stood here are each ALREADY declared above: two concurrent changes
+// appended the same entry, which is a redefinition and stops this target from compiling, so
+// the duplicate lines are removed and the first declaration of each stands.

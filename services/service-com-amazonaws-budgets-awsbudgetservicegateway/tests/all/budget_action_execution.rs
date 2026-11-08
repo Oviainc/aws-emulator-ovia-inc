@@ -12,8 +12,9 @@
 //!    (`Status`) stamped — `STANDBY`, the armed status.
 //! 2. `ExecuteBudgetAction` moves the action into the `*_IN_PROGRESS` status its
 //!    `ExecutionType` names, and the clock settles that status a span later; an
-//!    execution type the action's current status leaves nothing to do is refused, and
-//!    an action whose work is still running is locked against a second execution. The
+//!    execution the action's current status does not allow — one its status leaves
+//!    nothing to do, or one aimed at work that is still running — is refused for that
+//!    state. The
 //!    rule is asserted over the WHOLE cross product of the modelled `ActionStatus` and
 //!    `ExecutionType` catalogs.
 //! 3. The settle is owed to the CLOCK, so it happens with no further call.
@@ -587,7 +588,10 @@ async fn a_created_action_round_trips_as_supplied() {
 /// The `*_IN_PROGRESS` statuses of the modelled `ActionStatus` catalog: work this
 /// service has started and not settled yet, which is the locked resource
 /// `ResourceLockedException` names.
-const IN_PROGRESS_STATUSES: [&str; 3] = [
+///
+/// `pub(crate)` so the sibling suite that asserts the refusal's WORDING reads the same
+/// matrix rather than copying it.
+pub(crate) const IN_PROGRESS_STATUSES: [&str; 3] = [
     "EXECUTION_IN_PROGRESS",
     "REVERSE_IN_PROGRESS",
     "RESET_IN_PROGRESS",
@@ -602,7 +606,10 @@ const IN_PROGRESS_STATUSES: [&str; 3] = [
 /// `ActionStatus` has no `RESET_SUCCESS`, so a completed reset leaves the action armed
 /// in `STANDBY`); `RETRY_…` runs the work that failed again, whichever operation that
 /// was. Every other pair of the catalogs has nothing to do and is refused.
-const ALLOWED_EXECUTIONS: &[(&str, &str, &str, &str)] = &[
+///
+/// `pub(crate)` so the sibling suite that asserts the refusal's WORDING reads the same
+/// matrix rather than copying it.
+pub(crate) const ALLOWED_EXECUTIONS: &[(&str, &str, &str, &str)] = &[
     (
         "STANDBY",
         "APPROVE_BUDGET_ACTION",
@@ -679,9 +686,10 @@ const ALLOWED_EXECUTIONS: &[(&str, &str, &str, &str)] = &[
 
 /// RULE 2, over the WHOLE cross product of the modelled `ActionStatus` and
 /// `ExecutionType` catalogs: an execution the action's status leaves work for takes it
-/// into the matching `*_IN_PROGRESS` status and settles there; an action already
-/// mid-flight is locked; every other pair is refused as an invalid input value. A
-/// refusal changes nothing.
+/// into the matching `*_IN_PROGRESS` status and settles there; every other pair is
+/// refused for the state the action is in — an action already mid-flight and a settled
+/// status that leaves this execution type nothing to do alike. A refusal changes
+/// nothing.
 #[tokio::test]
 async fn an_execution_moves_the_action_only_where_its_status_leaves_work() {
     let (router, engine) = router_with_engine();
@@ -731,8 +739,8 @@ async fn an_execution_moves_the_action_only_where_its_status_leaves_work() {
                     "case {case:?}: expected an execution with nothing to do to be refused with 400, got {http} {body}"
                 );
                 assert!(
-                    is_error(&body, "InvalidParameterException"),
-                    "case {case:?}: expected InvalidParameterException, got {body}"
+                    is_error(&body, "ResourceLockedException"),
+                    "case {case:?}: expected ResourceLockedException, got {body}"
                 );
                 let read = read_status(&router, &account_id, budget_name, &action_id).await;
                 assert_eq!(
