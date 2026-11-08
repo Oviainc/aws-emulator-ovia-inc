@@ -199,6 +199,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
         record.delivery_options = options;
 
+        // The set's delivery configuration belongs to the ACCOUNT's set, so the change is
+        // published to the account's configuration-set registry: the classic SES surface
+        // reports the TLS policy this call wrote, and none where this call left the set
+        // carrying no delivery configuration. The store lock is dropped first, since the
+        // publication takes it itself.
+        drop(store);
+        crate::state::publish_configuration_set(&*self.engine, &name);
+
         // `PutConfigurationSetDeliveryOptionsResponse` carries no members: the stored
         // configuration is read back with `GetConfigurationSet`.
         Ok(PutConfigurationSetDeliveryOptionsOutput {})

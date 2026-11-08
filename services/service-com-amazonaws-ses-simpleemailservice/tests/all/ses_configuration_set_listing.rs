@@ -212,8 +212,7 @@ async fn paging_visits_every_configuration_set_exactly_once_at_every_page_size()
 
 #[tokio::test]
 async fn the_listing_reports_what_the_account_holds_right_now() {
-    let (router, engine) = emulator_with_store();
-    let store = service_state(&*engine).expect("this service has a store on the shared engine");
+    let (router, _engine) = emulator_with_store();
 
     // Names differing in the ways a configuration set name can differ — length,
     // case, digits, underscores, dashes — created in an order that is not the
@@ -250,11 +249,20 @@ async fn the_listing_reports_what_the_account_holds_right_now() {
     // And a set the account no longer holds drops out of the listing, so the
     // answer is read from state on every call rather than fixed at the first.
     for name in ["a", "set-2", longest.as_str()] {
-        store
-            .lock()
-            .configuration_sets
-            .remove(name)
-            .unwrap_or_else(|| panic!("case {name:?}: the store holds the set that was created"));
+        // Deleted through the operation that owns the set, which is what takes it from the
+        // account: a set this service holds is one the ACCOUNT holds — the SES v2 surface
+        // answers for it too (`service_common::ses_configuration_sets`) — so a removal
+        // straight out of this service's own store would leave the account still holding it.
+        let (status, body) = call(
+            &router,
+            "DeleteConfigurationSet",
+            &[field("ConfigurationSetName", name)],
+        )
+        .await;
+        assert_eq!(
+            status, 200,
+            "case delete {name:?}: expected 200, got {status} with {body}"
+        );
         expected.retain(|held| held != name);
         let seen = every_page(&router, None, MAX_PAGE_SIZE).await;
         assert_eq!(

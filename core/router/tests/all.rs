@@ -1060,3 +1060,23 @@ mod cloudformation_wafv2_protection_stack;
 // Several suites that stood here are each ALREADY declared above: two concurrent changes
 // appended the same entry, which is a redefinition and stops this target from compiling, so
 // the duplicate lines are removed and the first declaration of each stands.
+// appended tail and the sorted `c…`/`s…` spans are both regions concurrently landing suites
+#[path = "all/ses_configuration_sets_shared_across_v1_and_v2.rs"]
+mod ses_configuration_sets_shared_across_v1_and_v2;
+#[path = "all/cloudformation_deployed_configuration_set_reaches_the_email_api.rs"]
+mod cloudformation_deployed_configuration_set_reaches_the_email_api;
+// Three EMPTY files, declared because the layout check in `vendor/build-support` REFUSES an
+// undeclared file under `tests/all/` (rule 2 of `check_test_layout`) and this fixer's tool set
+// can write a file but not remove one. `all/rds_shared_signing_name_routing.rs` is the same
+// case and is declared below — its own header saying it is not declared is stale. They held
+// the scratch probes used while tracing the configuration-set issue; the two suites above
+// assert what those probes established, and the next change to touch this directory should
+// delete the files and these six lines.
+#[path = "all/sesv2_probe.rs"]
+mod sesv2_probe;
+#[path = "all/sesv2_probe2.rs"]
+mod sesv2_probe2;
+#[path = "all/sesv2_probe3.rs"]
+mod sesv2_probe3;
+// `bedrock_agentcore_data_plane_parent_resources` — are each ALREADY declared above. Two
+// concurrent changes declared the same entry, which is a redefinition and stops this target

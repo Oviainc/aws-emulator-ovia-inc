@@ -100,6 +100,10 @@
 //!   identities Amazon SES's two APIs publish, written by whichever surface records or
 //!   deletes an identity and read by both, so an identity created with the modern API
 //!   is listed, reported and gated on by the legacy one and the other way round;
+//! * [`ses_configuration_sets`], the account's configuration-set registry — the ONE set of
+//!   configuration sets those same two APIs publish, written by whichever surface records,
+//!   configures or deletes a set and read by both, so a set created with either API is
+//!   described, used on a send and deleted through the other;
 //! * [`service_principal_calls`], the cross-service calls one service is making as its own
 //!   SERVICE PRINCIPAL on behalf of one of its resources — written by the calling service
 //!   while its call is in flight and read by the service that authorizes that call, which
@@ -458,6 +462,10 @@ pub mod s3_bucket_name;
 /// identities one account holds and the verification state of each, written by
 /// whichever surface records or deletes one and read by both.
 pub mod ses_identities;
+/// The account's CONFIGURATION SET registry, shared by the two SES surfaces: the set of
+/// configuration sets one account holds and the options of each that both APIs publish,
+/// written by whichever surface records, configures or deletes one and read by both.
+pub mod ses_configuration_sets;
 /// Which member paths a boundary refusal states no value for, read from a service's own
 /// Smithy model: the members it marks `@sensitive`.
 pub mod sensitive_members;

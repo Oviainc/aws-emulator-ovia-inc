@@ -179,6 +179,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // repeated call with the same value leaves the set exactly as it was.
         record.sending_enabled = input.sending_enabled;
 
+        // Whether sending through the set is enabled is a fact about the ACCOUNT's set, so
+        // the change is published to the account's configuration-set registry: a send made
+        // through the classic SES surface is refused while this call has it paused. The store
+        // lock is dropped first, since the publication takes it itself.
+        drop(store);
+        crate::state::publish_configuration_set(&*self.engine, &name);
+
         // `PutConfigurationSetSendingOptionsResponse` carries no members: the stored
         // switch is read back with `GetConfigurationSet`.
         Ok(PutConfigurationSetSendingOptionsOutput {})

@@ -298,17 +298,24 @@ async fn a_second_create_of_one_name_is_a_conflict_not_a_replacement() {
             );
         }
         if !*sending_enabled {
-            // The operation that pauses a set is still a scaffold, so the
-            // paused state is written through the same state API the handlers
-            // use.
-            let store =
-                service_state(&*engine).expect("this service has a store on the shared engine");
-            store
-                .lock()
-                .configuration_sets
-                .get_mut(*name)
-                .expect("the set was created above")
-                .sending_enabled = false;
+            // The paused state is written through the operation that owns it, which is
+            // where the pause a `SendEmail` is refused under is recorded: the stored set is
+            // one the ACCOUNT holds — the SES v2 surface answers for it too
+            // (`service_common::ses_configuration_sets`) — so a write straight into this
+            // service's own store would be a change the account's record never heard about.
+            let (status, body) = call(
+                &router,
+                "UpdateConfigurationSetSendingEnabled",
+                &[
+                    field("ConfigurationSetName", *name),
+                    field("Enabled", "false"),
+                ],
+            )
+            .await;
+            assert_eq!(
+                status, 200,
+                "case pause {name}: expected 200, got {status} with {body}"
+            );
         }
     }
 

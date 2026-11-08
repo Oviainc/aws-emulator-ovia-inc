@@ -187,6 +187,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carries the state to hold rather than a toggle, so repeating the call
         // with the same value changes nothing.
         configuration_set.reputation_metrics_enabled = input.enabled;
+        // Whether SES collects the set's reputation metrics is a fact about the ACCOUNT's
+        // set, so the change is published to the account's configuration-set registry: the
+        // SES v2 surface reports what this call wrote. The store lock is dropped first, since
+        // the publication takes it itself.
+        drop(state);
+        crate::state::publish_configuration_set(&*self.engine, &name);
         Ok(UpdateConfigurationSetReputationMetricsEnabledOutput)
     }
 }

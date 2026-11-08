@@ -204,6 +204,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )
             .into());
         }
+        // The set belongs to the ACCOUNT rather than to this API, so it is published to the
+        // account's configuration-set registry: the SES v2 surface describes it, refuses a
+        // second create under its name and accepts a send that names it from the moment this
+        // call returns. The store lock is dropped first, since the publication takes it
+        // itself.
+        drop(state);
+        crate::state::publish_configuration_set(&*self.engine, &name);
         Ok(CreateConfigurationSetOutput {})
     }
 }

@@ -309,6 +309,14 @@ pub struct ConfigurationSetRecord {
     /// Event destinations attached to this set, keyed by `EventDestinationName`. The
     /// `*ConfigurationSetEventDestination` operations that fill it are still scaffolded.
     pub event_destinations: BTreeMap<String, EventDestinationDefinition>,
+    /// Whether the ACCOUNT's configuration-set registry
+    /// ([`::service_common::ses_configuration_sets`]) already carries this set.
+    ///
+    /// A set this service recorded is published there, so the two Amazon SES surfaces answer
+    /// for it too; this flag is what tells a set deleted through one of them — registered
+    /// here, gone from the registry — from one this service has recorded but not published
+    /// yet.
+    pub registered: bool,
 }
 
 /// One message `SendEmail` accepted. The log is what makes a minted `MessageId` the id of
@@ -404,7 +412,89 @@ pub fn service_state<Eng: Send + Sync + 'static>(
     let state = engine.state::<ComAmazonawsPinpointemailAmazonpinpointemailserviceState>();
     let registry = engine.state::<::service_common::ses_identities::SesIdentityDirectory>();
     reconcile_identities(&state, &registry, SystemTime::now());
+    let configuration_sets =
+        engine.state::<::service_common::ses_configuration_sets::SesConfigurationSetDirectory>();
+    reconcile_configuration_sets(&state, &configuration_sets, SystemTime::now());
     Some(state)
+}
+
+/// The account's configuration-set registry in the shared engine, which this service and the
+/// two Amazon SES surfaces all publish to and read: call it with a handler's `&*self.engine`.
+///
+/// An operation that CREATES, CONFIGURES or DELETES a configuration set publishes the change
+/// here, so the other surfaces answer for it from the moment the call returns. Take this lock
+/// while holding this service's own store, never the other way round, so two callers on
+/// different surfaces cannot wait on each other.
+pub fn configuration_set_registry<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<
+    ::engine::ServiceState<
+        ::service_common::ses_configuration_sets::SesConfigurationSetDirectory,
+    >,
+> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<
+            ::service_common::ses_configuration_sets::SesConfigurationSetDirectory,
+        >)
+}
+
+/// Bring this service's configuration-set table and the account's configuration-set registry
+/// back into agreement at `now`, so every API over the account's configuration sets answers
+/// for ONE set of them.
+///
+/// The reconciliation itself is the registry's
+/// ([`::service_common::ses_configuration_sets::SesConfigurationSetDirectory::reconcile`]),
+/// written once there rather than per surface; what this service contributes is its
+/// [`::service_common::ses_configuration_sets::AccountConfigurationSetRecord`] impl below.
+fn reconcile_configuration_sets(
+    state: &::engine::ServiceState<ComAmazonawsPinpointemailAmazonpinpointemailserviceState>,
+    registry: &::engine::ServiceState<
+        ::service_common::ses_configuration_sets::SesConfigurationSetDirectory,
+    >,
+    now: SystemTime,
+) {
+    // The lock order of this service: its own store, then the registry.
+    let mut state = state.lock();
+    let mut registry = registry.lock();
+    registry.reconcile(&mut state.configuration_sets, now);
+}
+
+/// Publish the configuration set `name` as this service now holds it to the account's
+/// configuration-set registry, so every other API over the account's configuration sets
+/// reports what this one last wrote.
+///
+/// What an operation that CREATES or CHANGES a configuration set calls once it has written
+/// it. Changes nothing when the account holds no such set, and writes nothing but the
+/// registry's record of it. Reads this service's store WITHOUT reconciling it: the change
+/// being published is newer than the registry's copy of it.
+pub fn publish_configuration_set<Eng: Send + Sync + 'static>(engine: &Eng, name: &str) {
+    let Some(engine) = (engine as &dyn ::std::any::Any).downcast_ref::<::engine::InMemoryEngine>()
+    else {
+        return;
+    };
+    let state = engine.state::<ComAmazonawsPinpointemailAmazonpinpointemailserviceState>();
+    let registry =
+        engine.state::<::service_common::ses_configuration_sets::SesConfigurationSetDirectory>();
+    // The lock order of this service: its own store, then the registry.
+    let mut state = state.lock();
+    let mut registry = registry.lock();
+    let Some(held) = state.configuration_sets.get(name) else {
+        return;
+    };
+    if registry
+        .publish(
+            ::service_common::ses_configuration_sets::AccountConfigurationSetRecord::published(
+                held,
+            ),
+            SystemTime::now(),
+        )
+        .is_some()
+    {
+        if let Some(held) = state.configuration_sets.get_mut(name) {
+            held.registered = true;
+        }
+    }
 }
 
 /// The account's identity registry in the shared engine, which this service and the two
@@ -591,5 +681,142 @@ fn service_dkim_status(
         SesVerificationState::Failed => "FAILED",
         SesVerificationState::TemporaryFailure => "TEMPORARY_FAILURE",
         SesVerificationState::NotStarted => DKIM_STATUS_NOT_STARTED,
+    }
+}
+
+impl ::service_common::ses_configuration_sets::AccountConfigurationSetRecord
+    for ConfigurationSetRecord
+{
+    fn set_name(&self) -> &str {
+        &self.name
+    }
+
+    fn is_registered(&self) -> bool {
+        self.registered
+    }
+
+    fn mark_registered(&mut self) {
+        self.registered = true;
+    }
+
+    /// The account's configuration for the set, onto the members this surface's own model
+    /// spells them with. Everything this surface adds beside them — the set's tags and its
+    /// event destinations — is untouched.
+    ///
+    /// Each of the four option structures exists exactly while the ACCOUNT's set carries a
+    /// value this surface can report in it: a structure whose every member is the account's
+    /// own is dropped where the account holds none, and the one member of a structure this
+    /// surface has of its own (`DeliveryOptions$SendingPoolName`) is kept.
+    fn take_shared(
+        &mut self,
+        published: &::service_common::ses_configuration_sets::SesConfigurationSetRecord,
+    ) {
+        self.tracking_options = published
+            .custom_redirect_domain
+            .clone()
+            .map(|custom_redirect_domain| TrackingOptions {
+                custom_redirect_domain,
+            });
+        // This surface spells the TLS policy with its own model's value set
+        // (`shared_types::TLS_POLICY_VALUES`), which is the SES v2 spelling.
+        let tls_policy = published.tls_policy.map(|policy| {
+            match policy {
+                ::service_common::ses_configuration_sets::SesTlsPolicy::Require => "REQUIRE",
+                ::service_common::ses_configuration_sets::SesTlsPolicy::Optional => "OPTIONAL",
+            }
+            .to_string()
+        });
+        let sending_pool_name = self
+            .delivery_options
+            .as_ref()
+            .and_then(|options| options.sending_pool_name.clone());
+        self.delivery_options = (tls_policy.is_some() || sending_pool_name.is_some())
+            .then_some(DeliveryOptions {
+                tls_policy,
+                sending_pool_name,
+            });
+        self.reputation_options = match self.reputation_options.take() {
+            // A structure this surface already holds takes the account's value for the one
+            // member both publish, and keeps the fresh start the account holds for the set.
+            Some(held) => Some(ReputationOptions {
+                reputation_metrics_enabled: published.reputation_metrics_enabled,
+                last_fresh_start: published
+                    .last_fresh_start
+                    .map(::aws_smithy_types::DateTime::from)
+                    .or(held.last_fresh_start),
+            }),
+            // One it holds none of is materialised only where the ACCOUNT holds something
+            // this surface's own default does not say — metrics are on for a set nobody
+            // configured, and such a set has had no fresh start — so a set created with no
+            // options still reports no reputation options at all.
+            None => (!published.reputation_metrics_enabled
+                || published.last_fresh_start.is_some())
+            .then_some(ReputationOptions {
+                reputation_metrics_enabled: published.reputation_metrics_enabled,
+                last_fresh_start: published
+                    .last_fresh_start
+                    .map(::aws_smithy_types::DateTime::from),
+            }),
+        };
+        self.sending_options = match self.sending_options.take() {
+            Some(_) => Some(SendingOptions {
+                sending_enabled: published.sending_enabled,
+            }),
+            // The same rule: sending is on for a set nobody configured, so only a PAUSED
+            // account set gives this surface something to report.
+            None => (!published.sending_enabled).then_some(SendingOptions {
+                sending_enabled: published.sending_enabled,
+            }),
+        };
+    }
+
+    /// How the registry carries this record: the set's name and the whole configuration both
+    /// SES surfaces publish, read off the structures this surface holds it in. A structure
+    /// this set carries none of is a set no caller configured that way, which this surface
+    /// reports as its own model's default — reputation metrics and sending both on, as
+    /// `CreateConfigurationSet` stores a set that states neither.
+    fn published(
+        &self,
+    ) -> ::service_common::ses_configuration_sets::SesConfigurationSetRecord {
+        ::service_common::ses_configuration_sets::SesConfigurationSetRecord {
+            name: self.name.clone(),
+            custom_redirect_domain: self
+                .tracking_options
+                .as_ref()
+                .map(|options| options.custom_redirect_domain.clone()),
+            tls_policy: self
+                .delivery_options
+                .as_ref()
+                .and_then(|options| options.tls_policy.as_deref())
+                .and_then(::service_common::ses_configuration_sets::SesTlsPolicy::of),
+            reputation_metrics_enabled: self
+                .reputation_options
+                .as_ref()
+                .is_none_or(|options| options.reputation_metrics_enabled),
+            sending_enabled: self
+                .sending_options
+                .as_ref()
+                .is_none_or(|options| options.sending_enabled),
+            last_fresh_start: self
+                .reputation_options
+                .as_ref()
+                .and_then(|options| options.last_fresh_start)
+                .and_then(|instant| ::std::time::SystemTime::try_from(instant).ok()),
+        }
+    }
+
+    /// This surface's record of a set the account holds that it does not: the set exists,
+    /// carries the account's own configuration (applied by [`Self::take_shared`], which runs
+    /// for every set both sides hold) and holds none of what this surface's own API adds,
+    /// since none of it has been asked for.
+    fn adopt(
+        record: &::service_common::ses_configuration_sets::SesConfigurationSetRecord,
+        _created_at: SystemTime,
+    ) -> Self {
+        Self {
+            name: record.name.clone(),
+            registered: true,
+            ..Self::default()
+        }
     }
 }

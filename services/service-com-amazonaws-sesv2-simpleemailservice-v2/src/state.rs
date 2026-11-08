@@ -4617,13 +4617,17 @@ pub fn decode_page_token(token: &str) -> Option<String> {
 /// Every call RECONCILES this service's identity table against the account's identity
 /// registry first ([`reconcile_identities`]), so an operation served here answers for
 /// every identity the account holds — including the ones recorded through the classic
-/// SES surface — and for none it has deleted.
+/// SES surface — and for none it has deleted. Its configuration sets are reconciled
+/// against the account's configuration-set registry the same way
+/// ([`reconcile_configuration_sets`]), and for the same reason.
 pub fn service_state<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<::engine::ServiceState<ComAmazonawsSesv2SimpleemailserviceV2State>> {
     let state = own_state(engine)?;
     let registry = identity_registry(engine)?;
     reconcile_identities(&state, &registry, SystemTime::now());
+    let configuration_sets = configuration_set_registry(engine)?;
+    reconcile_configuration_sets(&state, &configuration_sets, SystemTime::now());
     Some(state)
 }
 

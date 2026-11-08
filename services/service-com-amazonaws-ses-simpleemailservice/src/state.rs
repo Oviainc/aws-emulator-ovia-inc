@@ -921,6 +921,14 @@ pub struct ConfigurationSet {
     /// `CreateConfigurationSetEventDestination`'s
     /// `EventDestinationAlreadyExistsException` reports a conflict on.
     pub event_destinations: Vec<crate::ops::types::EventDestination>,
+    /// Whether the ACCOUNT's configuration-set registry
+    /// ([`::service_common::ses_configuration_sets`]) already carries this set.
+    ///
+    /// A set this service recorded is published there, so the SES v2 surface answers for it
+    /// too; this flag is what tells a set deleted through that surface — registered here,
+    /// gone from the registry — from one this service has recorded but not published yet
+    /// ([`reconcile_configuration_sets`] copies it back onto this record).
+    pub registered: bool,
 }
 
 impl ConfigurationSet {
@@ -1767,6 +1775,11 @@ impl ComAmazonawsSesSimpleemailserviceState {
                     // And it publishes to no event destination:
                     // `CreateConfigurationSetEventDestination` is what adds one.
                     event_destinations: Vec::new(),
+                    // And the account's configuration-set registry does not carry it yet:
+                    // the operation that recorded it publishes it
+                    // ([`publish_configuration_set`]), and a record written straight into
+                    // this store reaches the registry on the next reconciliation.
+                    registered: false,
                 }),
         )
     }
@@ -3015,13 +3028,17 @@ fn system_entropy() -> u64 {
 /// Every call RECONCILES this service's identity list against the account's identity
 /// registry first ([`reconcile_identities`]), so an operation served here answers for
 /// every identity the account holds — including the ones recorded through the SES v2
-/// surface — and for none it has deleted.
+/// surface — and for none it has deleted. Its configuration sets are reconciled against
+/// the account's configuration-set registry the same way
+/// ([`reconcile_configuration_sets`]), and for the same reason.
 pub fn service_state<Eng: Send + Sync + 'static>(
     engine: &Eng,
 ) -> Option<::engine::ServiceState<ComAmazonawsSesSimpleemailserviceState>> {
     let state = own_state(engine)?;
     let registry = identity_registry(engine)?;
     reconcile_identities(&state, &registry, SystemTime::now());
+    let configuration_sets = configuration_set_registry(engine)?;
+    reconcile_configuration_sets(&state, &configuration_sets, SystemTime::now());
     Some(state)
 }
 
@@ -3197,6 +3214,186 @@ fn reconcile_identities(
     let mut state = state.lock();
     let mut registry = registry.lock();
     registry.reconcile(&mut state.identities, now);
+}
+
+/// The account's configuration-set registry in the shared engine, which this service and
+/// the SES v2 surface both publish to and read: call it with a handler's `&*self.engine`.
+///
+/// An operation that CREATES, CONFIGURES or DELETES a configuration set publishes the
+/// change here, so the other surface answers for it from the moment the call returns. Take
+/// this lock while holding this service's own store, never the other way round, so two
+/// callers on different surfaces cannot wait on each other.
+pub fn configuration_set_registry<Eng: Send + Sync + 'static>(
+    engine: &Eng,
+) -> Option<
+    ::engine::ServiceState<
+        ::service_common::ses_configuration_sets::SesConfigurationSetDirectory,
+    >,
+> {
+    (engine as &dyn ::std::any::Any)
+        .downcast_ref::<::engine::InMemoryEngine>()
+        .map(::engine::InMemoryEngine::state::<
+            ::service_common::ses_configuration_sets::SesConfigurationSetDirectory,
+        >)
+}
+
+/// Bring this service's configuration-set store and the account's configuration-set
+/// registry back into agreement at `now`, so every API over the account's configuration
+/// sets answers for ONE set of them.
+///
+/// The reconciliation itself is the registry's
+/// ([`::service_common::ses_configuration_sets::SesConfigurationSetDirectory::reconcile`]),
+/// written once there rather than per surface; what this service contributes is its
+/// [`::service_common::ses_configuration_sets::AccountConfigurationSetRecord`] impl below.
+fn reconcile_configuration_sets(
+    state: &::engine::ServiceState<ComAmazonawsSesSimpleemailserviceState>,
+    registry: &::engine::ServiceState<
+        ::service_common::ses_configuration_sets::SesConfigurationSetDirectory,
+    >,
+    now: SystemTime,
+) {
+    // The lock order of this service: its own store, then the registry.
+    let mut state = state.lock();
+    let mut registry = registry.lock();
+    registry.reconcile(&mut state.configuration_sets, now);
+}
+
+/// Publish the configuration set `name` as this service now holds it — its tracking
+/// options, its delivery options, whether its reputation metrics are collected and whether
+/// sending through it is enabled — to the account's configuration-set registry, so every
+/// other API over the account's configuration sets reports what this one last wrote.
+///
+/// What an operation that CREATES or CHANGES a configuration set calls once it has written
+/// it. Changes nothing when the account holds no such set, and writes nothing but the
+/// registry's record of it. Reads this service's store WITHOUT reconciling it
+/// ([`own_state`]): the change being published is newer than the registry's copy of it.
+pub fn publish_configuration_set<Eng: Send + Sync + 'static>(engine: &Eng, name: &str) {
+    let Some(state) = own_state(engine) else {
+        return;
+    };
+    let Some(registry) = configuration_set_registry(engine) else {
+        return;
+    };
+    // The lock order of this service: its own store, then the registry.
+    let mut state = state.lock();
+    let mut registry = registry.lock();
+    let Some(held) = state.configuration_sets.get(name) else {
+        return;
+    };
+    if registry
+        .publish(
+            ::service_common::ses_configuration_sets::AccountConfigurationSetRecord::published(
+                held,
+            ),
+            SystemTime::now(),
+        )
+        .is_some()
+    {
+        if let Some(held) = state.configuration_sets.get_mut(name) {
+            held.registered = true;
+        }
+    }
+}
+
+/// Remove the configuration set `name` names from this account — from this service's own
+/// store and from the account registry both — so neither SES surface reports it afterwards.
+///
+/// Removing a set this account does not hold changes nothing, which is the rule the delete
+/// operation of this surface follows.
+pub fn forget_configuration_set<Eng: Send + Sync + 'static>(engine: &Eng, name: &str) {
+    let Some(state) = own_state(engine) else {
+        return;
+    };
+    let Some(registry) = configuration_set_registry(engine) else {
+        return;
+    };
+    let mut state = state.lock();
+    let mut registry = registry.lock();
+    state.configuration_sets.remove(name);
+    registry.forget(name);
+}
+
+impl ::service_common::ses_configuration_sets::AccountConfigurationSetRecord
+    for ConfigurationSet
+{
+    fn set_name(&self) -> &str {
+        &self.name
+    }
+
+    fn is_registered(&self) -> bool {
+        self.registered
+    }
+
+    fn mark_registered(&mut self) {
+        self.registered = true;
+    }
+
+    /// The account's configuration for the set, onto the members this surface's own model
+    /// spells them with. Everything this surface adds beside them — the set's event
+    /// destinations — is untouched.
+    fn take_shared(
+        &mut self,
+        published: &::service_common::ses_configuration_sets::SesConfigurationSetRecord,
+    ) {
+        self.custom_redirect_domain = published.custom_redirect_domain.clone();
+        // The policy is spelled with THIS model's own value set
+        // (`crate::ops::types::TLS_POLICY_VALUES`), which the v2 surface spells in upper
+        // case: a client of this API reads a value its own model declares.
+        self.tls_policy = published.tls_policy.map(|policy| {
+            match policy {
+                ::service_common::ses_configuration_sets::SesTlsPolicy::Require => "Require",
+                ::service_common::ses_configuration_sets::SesTlsPolicy::Optional => "Optional",
+            }
+            .to_string()
+        });
+        self.reputation_metrics_enabled = published.reputation_metrics_enabled;
+        self.sending_enabled = published.sending_enabled;
+        self.last_fresh_start = published.last_fresh_start;
+    }
+
+    fn published(
+        &self,
+    ) -> ::service_common::ses_configuration_sets::SesConfigurationSetRecord {
+        ::service_common::ses_configuration_sets::SesConfigurationSetRecord {
+            name: self.name.clone(),
+            custom_redirect_domain: self.custom_redirect_domain.clone(),
+            tls_policy: self
+                .tls_policy
+                .as_deref()
+                .and_then(::service_common::ses_configuration_sets::SesTlsPolicy::of),
+            reputation_metrics_enabled: self.reputation_metrics_enabled,
+            sending_enabled: self.sending_enabled,
+            last_fresh_start: self.last_fresh_start,
+        }
+    }
+
+    /// This surface's record of a set the account holds that it does not: the set exists,
+    /// carries the account's own configuration (applied by [`Self::take_shared`], which runs
+    /// for every set both sides hold) and publishes to no event destination of this
+    /// surface, since none has been created through it.
+    fn adopt(
+        record: &::service_common::ses_configuration_sets::SesConfigurationSetRecord,
+        _created_at: SystemTime,
+    ) -> Self {
+        Self {
+            name: record.name.clone(),
+            sending_enabled: record.sending_enabled,
+            reputation_metrics_enabled: record.reputation_metrics_enabled,
+            custom_redirect_domain: record.custom_redirect_domain.clone(),
+            tls_policy: record.tls_policy.map(|policy| {
+                match policy {
+                    ::service_common::ses_configuration_sets::SesTlsPolicy::Require => "Require",
+                    ::service_common::ses_configuration_sets::SesTlsPolicy::Optional => {
+                        "Optional"
+                    }
+                }
+                .to_string()
+            }),
+            last_fresh_start: record.last_fresh_start,
+            event_destinations: Vec::new(),
+            registered: true,
+        }
+    }
 }
 
 impl ::service_common::ses_identities::AccountIdentityRecord for Identity {

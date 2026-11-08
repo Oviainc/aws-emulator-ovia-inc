@@ -206,6 +206,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        // The sub-resource was the ACCOUNT's set's, so its removal is published to the
+        // account's configuration-set registry: the SES v2 surface stops reporting the custom
+        // redirect domain this call took away. The store lock is dropped first, since the
+        // publication takes it itself.
+        drop(state);
+        crate::state::publish_configuration_set(&*self.engine, &name);
         Ok(DeleteConfigurationSetTrackingOptionsOutput {})
     }
 }

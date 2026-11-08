@@ -163,6 +163,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .into(),
             );
         }
+        // The set was the ACCOUNT's, so it goes from the account's configuration-set
+        // registry too: the SES v2 surface stops reporting it from the moment this call
+        // returns, rather than describing a set this one has deleted. The store lock is
+        // dropped first, since the removal takes it itself.
+        drop(state);
+        crate::state::forget_configuration_set(&*self.engine, &name);
         Ok(DeleteConfigurationSetOutput {})
     }
 }

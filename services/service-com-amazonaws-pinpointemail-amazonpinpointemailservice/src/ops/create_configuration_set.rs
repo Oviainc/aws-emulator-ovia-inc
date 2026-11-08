@@ -208,15 +208,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         store.configuration_sets.insert(            input.configuration_set_name.clone(),
             crate::state::ConfigurationSetRecord {
-                name: input.configuration_set_name,
+                name: input.configuration_set_name.clone(),
                 tracking_options: input.tracking_options,
                 delivery_options: input.delivery_options,
                 reputation_options: input.reputation_options,
                 sending_options: input.sending_options,
                 tags: input.tags.unwrap_or_default(),
                 event_destinations: ::std::collections::BTreeMap::new(),
+                // The account's configuration-set registry does not carry it yet: the
+                // publication below is what puts it there.
+                registered: false,
             },
         );
+
+        // The set belongs to the ACCOUNT rather than to this API, so it is published to the
+        // account's configuration-set registry: the two Amazon SES surfaces describe it,
+        // refuse a second create under its name and accept a send that names it from the
+        // moment this call returns. The store lock is dropped first, since the publication
+        // takes it itself.
+        drop(store);
+        crate::state::publish_configuration_set(&*self.engine, &input.configuration_set_name);
 
         Ok(CreateConfigurationSetOutput {})
     }

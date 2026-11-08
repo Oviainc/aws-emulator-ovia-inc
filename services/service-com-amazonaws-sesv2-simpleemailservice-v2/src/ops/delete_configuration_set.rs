@@ -179,6 +179,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // set answers to — until a later `PutEmailIdentityConfigurationSetAttributes`
         // replaces it or, carrying no name at all, clears it.
 
+        // The set was the ACCOUNT's, so it goes from the account's configuration-set
+        // registry too: the classic SES surface stops reporting it from the moment this call
+        // returns, rather than describing a set this one has deleted. The store lock is
+        // dropped first, since the removal takes it itself.
+        drop(store);
+        crate::state::forget_configuration_set(&*self.engine, &name);
+
         // `DeleteConfigurationSetResponse` carries no members.
         Ok(DeleteConfigurationSetOutput {})
     }

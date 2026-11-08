@@ -227,6 +227,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             );
         }
         configuration_set.custom_redirect_domain = Some(domain);
+        // The set's tracking options belong to the ACCOUNT's set, so the change is published
+        // to the account's configuration-set registry: the SES v2 surface reports the custom
+        // redirect domain this call wrote. The store lock is dropped first, since the
+        // publication takes it itself.
+        drop(state);
+        crate::state::publish_configuration_set(&*self.engine, &name);
         Ok(UpdateConfigurationSetTrackingOptionsOutput {})
     }
 }

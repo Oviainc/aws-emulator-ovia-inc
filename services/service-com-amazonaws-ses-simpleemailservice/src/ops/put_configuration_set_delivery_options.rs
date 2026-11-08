@@ -189,6 +189,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // carries, so a request supplying a policy replaces whatever the set held
         // and one supplying none leaves it carrying none.
         configuration_set.tls_policy = tls_policy;
+        // The set's delivery options belong to the ACCOUNT's set, so the change is published
+        // to the account's configuration-set registry: the SES v2 surface reports the TLS
+        // policy this call wrote, and none where this call left the set carrying none. The
+        // store lock is dropped first, since the publication takes it itself.
+        drop(state);
+        crate::state::publish_configuration_set(&*self.engine, &name);
         Ok(PutConfigurationSetDeliveryOptionsOutput {})
     }
 }
