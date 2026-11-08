@@ -103,6 +103,11 @@ parquet = { version = "60", default-features = false, features = ["flate2-rust_b
 # its query fields, and `chrono` reads the basic ISO 8601 instant SigV4 signs it at, so
 # neither a query string nor a calendar is parsed by hand. Both are already in this
 # workspace's lock file.
+# The records a `LOAD DATA FROM S3` loads are read out of the S3 object's bytes by `csv`,
+# configured from the statement's own `FIELDS`/`LINES` clauses (the delimiter, the enclosing
+# character, the line terminator), so the delimited-text format is read by library code
+# rather than split by hand (`src/state/data_plane/mysql_s3_load.rs`).
+csv = "1"
 form_urlencoded = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 

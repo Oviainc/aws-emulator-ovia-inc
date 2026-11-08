@@ -704,11 +704,7 @@ pub fn as_the_engine_words_it(wire: EngineWire, sql: &str, error: EngineError) -
                 .unwrap_or_default()
                 .matches('\n')
                 .count();
-            format!(
-                "You have an error in your SQL syntax; check the manual that corresponds to \
-                 your MySQL server version for the right syntax to use near '{rest}' at line \
-                 {line}"
-            )
+            mysql_parse_error(&rest, line)
         }
         EngineWire::Postgres => match offending_token(&error.message, sql, at) {
             Some(token) => format!("syntax error at or near \"{token}\""),
@@ -722,7 +718,22 @@ pub fn as_the_engine_words_it(wire: EngineWire, sql: &str, error: EngineError) -
 ///
 /// The server's own limit on the text it echoes back, which is what keeps the message a
 /// message rather than a copy of the statement.
-const MYSQL_PARSE_ERROR_QUOTE_CHARS: usize = 80;
+pub const MYSQL_PARSE_ERROR_QUOTE_CHARS: usize = 80;
+
+/// `ER_PARSE_ERROR` as the MySQL server words it: the statement from the point the server
+/// stopped reading it, and the line it stopped on.
+///
+/// The ONE place that sentence is written, so every statement this endpoint could not read
+/// — one the embedded engine refused ([`as_the_engine_words_it`]) and one a server-side
+/// grammar of this crate stopped on ([`super::mysql_s3_load`]) — is reported in the same
+/// words a client branches on.
+#[must_use]
+pub fn mysql_parse_error(rest: &str, line: usize) -> String {
+    format!(
+        "You have an error in your SQL syntax; check the manual that corresponds to your \
+         MySQL server version for the right syntax to use near '{rest}' at line {line}"
+    )
+}
 
 /// The token the statement stopped on: the one the engine named in its own message, else
 /// the word at the position it stopped at.

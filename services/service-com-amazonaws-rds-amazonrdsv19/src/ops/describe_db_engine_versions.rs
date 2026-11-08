@@ -627,13 +627,19 @@ impl VersionProfile {
 /// member is a list, and an engine with no feature reports it empty, not absent).
 const NO_FEATURE_NAMES: &[&str] = &[];
 
-/// The `SupportedFeatureNames` of an Aurora MySQL version: it associates a role per
-/// feature for the Amazon S3 load/unload integrations and for the three Aurora machine
+/// The `SupportedFeatureNames` of an Aurora MySQL version: the three Aurora machine
 /// learning services Aurora MySQL integrates with (Amazon Bedrock, Amazon Comprehend and
-/// SageMaker). Lexicographic order, which is the only order this list can state a source
-/// for — the model documents none.
-const AURORA_MYSQL_FEATURE_NAMES: &[&str] =
-    &["Bedrock", "Comprehend", "SageMaker", "s3Export", "s3Import"];
+/// SageMaker), and NO S3 feature.
+///
+/// Aurora MySQL is one of the engines that associates no role per S3 direction: loading
+/// from and unloading to Amazon S3 is configured there as [`NO_FEATURE_NAMES`] describes it
+/// for RDS for MySQL — through the DB CLUSTER parameter group's `aws_default_s3_role`-style
+/// parameters, with the role associated with the cluster under no feature at all — so
+/// `s3Import` and `s3Export` name no feature of this engine. The machine learning
+/// integrations ARE associated per feature, so those are the names it publishes.
+/// Lexicographic order, which is the only order this list can state a source for — the
+/// model documents none.
+const AURORA_MYSQL_FEATURE_NAMES: &[&str] = &["Bedrock", "Comprehend", "SageMaker"];
 
 /// The `SupportedFeatureNames` of an RDS for PostgreSQL version: the `aws_s3` extension's
 /// import and export, and `aws_lambda`'s invoke.

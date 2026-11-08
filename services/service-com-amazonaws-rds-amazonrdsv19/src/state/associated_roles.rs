@@ -78,30 +78,34 @@ pub fn feature_name_is_supported(
 }
 
 /// What a request naming a `FeatureName` the addressed resource's engine version does not
-/// publish is refused with.
+/// publish is refused with: "The feature name &lt;FeatureName&gt; is not valid for the engine
+/// &lt;engine&gt;."
 ///
-/// The sentence names the value that was rejected and the names that engine version does
-/// publish, because the caller has to fix the request from this text alone — and those names
-/// are the `SupportedFeatureNames` of that version, so the text and the catalogue a client
-/// reads cannot disagree.
+/// The sentence names the value that was rejected and the ENGINE it was rejected for, under
+/// the DESCRIPTION that engine is published with rather than its product name
+/// ([`engine_published_description`]) — because the engine is what decides whether a feature
+/// name exists, and that description is the name of it a client reading the published
+/// catalogue has already seen.
 #[must_use]
-pub fn unsupported_feature_name_message(
-    engine: &str,
-    engine_version: Option<&str>,
-    feature_name: &str,
-) -> String {
-    let supported = supported_feature_names(engine, engine_version);
-    if supported.is_empty() {
-        return format!(
-            "The feature name {feature_name} is not supported for engine {engine}; that engine \
-             publishes no feature an IAM role can be associated for."
-        );
-    }
+pub fn unsupported_feature_name_message(engine: &str, feature_name: &str) -> String {
     format!(
-        "The feature name {feature_name} is not supported for engine {engine}; supported \
-         feature names are {}.",
-        supported.join(", ")
+        "The feature name {feature_name} is not valid for the engine {}.",
+        engine_published_description(engine)
     )
+}
+
+/// The engine's `DBEngineDescription`, as the published engine catalogue reports it
+/// (`aurora-postgresql` → `Aurora (PostgreSQL)`), for the sentences that name the engine
+/// that way rather than by its product name ([`engine_display_name`], which is
+/// `Aurora PostgreSQL` for that same engine): the two differ, and which one a refusal
+/// carries is the refusal's own.
+///
+/// An engine the catalogue publishes nothing for is named by the `Engine` value itself —
+/// there is no other name for it this service knows.
+#[must_use]
+pub fn engine_published_description(engine: &str) -> &str {
+    crate::ops::describe_db_engine_versions::engine_facts(engine)
+        .map_or(engine, |facts| facts.description)
 }
 
 /// The ARN form a member that names an IAM ROLE must carry:

@@ -264,11 +264,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             &input.feature_name,
         ) {
             return Err(AddRoleToDBInstanceError::invalid_parameter_value(
-                crate::state::unsupported_feature_name_message(
-                    &engine,
-                    engine_version.as_deref(),
-                    &input.feature_name,
-                ),
+                crate::state::unsupported_feature_name_message(&engine, &input.feature_name),
             ));
         }
 

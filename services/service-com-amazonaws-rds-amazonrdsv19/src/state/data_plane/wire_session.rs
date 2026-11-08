@@ -172,6 +172,11 @@ pub struct SessionContext {
     pub sessions: super::pg_sessions::SessionRegistry,
     /// The core's TLS server, for the in-band upgrade each wire negotiates.
     pub upgrader: ::emulator_server::TlsUpgrader,
+    /// The OBJECT STORE on the engine this service is mounted on, for the engine statements
+    /// that read an Amazon S3 object (`LOAD DATA FROM S3`). `None` when no object store is
+    /// reachable from this engine, which such a statement is refused for rather than served
+    /// from nothing.
+    pub objects: Option<super::mysql_s3_load::ObjectStore>,
     /// The engine's run: a session ends when this changes (a reboot, a stop).
     pub generation: watch::Receiver<u64>,
     /// The connection ids this endpoint has handed out.
@@ -269,6 +274,46 @@ impl SessionContext {
                 Some(super::cluster_endpoint::cluster_runtime_of(&store, record))
             }
         }
+    }
+
+    /// The IAM role ARNs the resource this listener serves has associated with it right
+    /// now, in the order the resource reports them.
+    ///
+    /// Read fresh for each statement that needs them, for the same reason
+    /// [`Self::engine_runtime`] is: an association a caller makes — or drops — under a live
+    /// session is what the next statement of that session acts under, so an engine
+    /// capability the association gates cannot be decided from what the login happened to
+    /// find.
+    #[must_use]
+    pub fn associated_role_arns(&self) -> Vec<String> {
+        let store = self.state.lock();
+        match &self.target {
+            SessionTarget::DbInstance {
+                region,
+                resource_id,
+            } => store
+                .instance_by_resource_id(region, resource_id)
+                .map(|record| {
+                    record
+                        .associated_roles
+                        .iter()
+                        .filter_map(|role| role.role_arn.clone())
+                        .collect()
+                }),
+            SessionTarget::DbCluster {
+                region,
+                resource_id,
+            } => store
+                .cluster_by_resource_id(region, resource_id)
+                .map(|record| {
+                    record
+                        .associated_roles
+                        .iter()
+                        .filter_map(|role| role.role_arn.clone())
+                        .collect()
+                }),
+        }
+        .unwrap_or_default()
     }
 
     /// Whether this login could be an IAM-authenticated one, read BEFORE the credential it

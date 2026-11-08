@@ -319,6 +319,11 @@ fn unescaped(field: &str) -> String {
 
 /// An identifier as the engine is handed it, quoted so a name that needs quoting keeps its
 /// case and so nothing in it is read as SQL.
-fn quoted(identifier: &str) -> String {
+///
+/// `pub(super)` because every bulk load in this module tree hands the engine the table and
+/// column names a client wrote: the other wire's `LOAD DATA FROM S3`
+/// ([`super::mysql_s3_load`]) quotes them the same way, and one copy of that is what keeps
+/// the two from quoting differently.
+pub(super) fn quoted(identifier: &str) -> String {
     format!("\"{}\"", identifier.replace('"', "\"\""))
 }

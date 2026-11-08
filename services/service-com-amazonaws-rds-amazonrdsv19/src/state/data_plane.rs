@@ -33,6 +33,8 @@
 //!   transaction;
 //! * [`pg_grants`] — the role memberships and object privileges a PostgreSQL client grants
 //!   and revokes, and the catalogs they live in;
+//! * [`mysql_s3_load`] — `LOAD DATA FROM S3`, the Amazon S3 import the MySQL engines serve
+//!   under the IAM role their parameter group names;
 //! * [`iam_auth_token`] — the authentication token an IAM-authenticated login presents in
 //!   place of a password;
 //! * [`pg_wire`] and [`mysql_wire`] — the server half of each protocol.
@@ -52,6 +54,7 @@ use super::{ComAmazonawsRdsAmazonrdsv19State, DbInstanceRecord, RegionalKey};
 pub mod cluster_endpoint;
 pub mod dialect;
 pub mod iam_auth_token;
+pub mod mysql_s3_load;
 pub mod mysql_wire;
 pub mod pg_copy;
 pub mod pg_grants;
@@ -384,6 +387,10 @@ pub async fn open_engine_endpoint<Eng: Send + Sync + 'static>(
         database: Arc::clone(&database),
         sessions: sessions.clone(),
         upgrader,
+        // The object store the S3 import statements read through, on the same engine this
+        // service is mounted on: what Amazon S3's own `PutObject` wrote is what such a
+        // statement loads.
+        objects: mysql_s3_load::object_store(engine),
         generation: generation_rx,
         next_connection_id: Arc::new(AtomicU32::new(1)),
     };

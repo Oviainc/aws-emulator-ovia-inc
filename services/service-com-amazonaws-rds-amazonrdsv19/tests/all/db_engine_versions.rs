@@ -1039,8 +1039,11 @@ async fn the_envelope_reports_the_published_per_engine_and_per_version_reference
         "s3Export",
         "s3Import",
     ];
-    const AURORA_MYSQL_FEATURES: &[&str] =
-        &["Bedrock", "Comprehend", "SageMaker", "s3Export", "s3Import"];
+    // Aurora MySQL publishes the machine learning features and NO S3 feature: that engine's
+    // S3 load and unload are configured through the DB cluster parameter group's import-role
+    // parameters, with the role associated under no feature, so there is no `s3Import` or
+    // `s3Export` feature name to publish.
+    const AURORA_MYSQL_FEATURES: &[&str] = &["Bedrock", "Comprehend", "SageMaker"];
     let rows: Vec<Row> = vec![
         // RDS for MySQL and MariaDB associate a role with no feature at all.
         ("RDS for MySQL", "mysql", "8.0.40", MYSQL_LOGS, &[], None),

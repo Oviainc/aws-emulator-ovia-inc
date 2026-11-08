@@ -495,6 +495,11 @@ async fn serve_query(
         if let Some(runtime) = context.engine_runtime() {
             facts.runtime = runtime;
         }
+        // `LOAD DATA FROM S3` is not a statement the SQL engine runs: the rows come from an
+        // Amazon S3 object the engine reads under the role this resource is configured with.
+        if let Some(parsed) = super::mysql_s3_load::s3_load_statement(facts, &statement) {
+            return serve_s3_load(conn, sequence, context, database, facts, parsed).await;
+        }
         let database = Arc::clone(database);
         let session = facts.clone();
         let statement = statement.clone();
@@ -538,6 +543,41 @@ async fn serve_query(
         deprecate_eof,
     )
     .await
+}
+
+/// Serve one `LOAD DATA FROM S3`: read the objects it names out of Amazon S3 under the
+/// resource's import role, load their records, and answer with how many rows were loaded —
+/// or with the error the load stopped on.
+async fn serve_s3_load(
+    conn: &mut ::emulator_server::ListenerConn,
+    sequence: u8,
+    context: &SessionContext,
+    database: &Arc<InstanceDatabase>,
+    facts: &SessionFacts,
+    parsed: Result<super::mysql_s3_load::S3Load, EngineError>,
+) -> std::io::Result<()> {
+    let statement = match parsed {
+        Ok(statement) => statement,
+        Err(error) => return write_engine_error(conn, sequence, &error).await,
+    };
+    let objects = match super::mysql_s3_load::objects_to_load(context, facts, &statement) {
+        Ok(objects) => objects,
+        Err(error) => return write_engine_error(conn, sequence, &error).await,
+    };
+    let loaded = {
+        let database = Arc::clone(database);
+        let session = facts.clone();
+        let statement = statement.clone();
+        tokio::task::spawn_blocking(move || {
+            super::mysql_s3_load::load(&database, &session, &statement, &objects)
+        })
+        .await
+        .map_err(|error| std::io::Error::other(error.to_string()))?
+    };
+    match loaded {
+        Ok(loaded) => write_ok(conn, sequence, database, &facts.database, loaded, 0).await,
+        Err(error) => write_engine_error(conn, sequence, &error).await,
+    }
 }
 
 /// A result set in the text protocol: the column count, one definition per column, the

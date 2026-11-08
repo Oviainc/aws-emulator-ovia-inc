@@ -111,9 +111,11 @@ const S3_INTEGRATION: &[&str] = &["S3_INTEGRATION"];
 /// The log types the Aurora MySQL engine exports to CloudWatch Logs.
 const MYSQL_LOG_TYPES: &[&str] = &["audit", "error", "general", "slowquery"];
 
-/// The `FeatureName` values Aurora MySQL associates an IAM role under.
-const AURORA_MYSQL_FEATURES: &[&str] =
-    &["Bedrock", "Comprehend", "SageMaker", "s3Export", "s3Import"];
+/// The `FeatureName` values Aurora MySQL associates an IAM role under: the machine learning
+/// integrations, and NO S3 feature — that engine's S3 load and unload are configured through
+/// the DB cluster parameter group's import-role parameters, with the role associated under
+/// no feature at all.
+const AURORA_MYSQL_FEATURES: &[&str] = &["Bedrock", "Comprehend", "SageMaker"];
 
 /// The log types the Aurora PostgreSQL engine exports to CloudWatch Logs.
 const AURORA_POSTGRESQL_LOG_TYPES: &[&str] = &["iam-db-auth-error", "instance", "postgresql"];

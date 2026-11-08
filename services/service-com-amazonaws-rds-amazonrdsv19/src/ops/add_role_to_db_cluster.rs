@@ -244,11 +244,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 feature_name,
             ) {
                 return Err(AddRoleToDBClusterError::invalid_parameter_value(
-                    crate::state::unsupported_feature_name_message(
-                        &engine,
-                        engine_version.as_deref(),
-                        feature_name,
-                    ),
+                    crate::state::unsupported_feature_name_message(&engine, feature_name),
                 ));
             }
         }

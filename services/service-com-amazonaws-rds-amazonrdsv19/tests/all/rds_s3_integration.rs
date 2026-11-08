@@ -190,7 +190,7 @@ fn kms(router: &MultiServiceRouter) -> aws_sdk_kms::Client {
 /// A regional endpoint requires the create to state its own location constraint ("the
 /// unspecified location constraint is incompatible for the region specific endpoint this
 /// request was sent to"), so every bucket here names the Region it is created in.
-async fn create_bucket(router: &MultiServiceRouter, bucket: &str, region: &str) {
+pub(crate) async fn create_bucket(router: &MultiServiceRouter, bucket: &str, region: &str) {
     s3_in(router, region)
         .create_bucket()
         .bucket(bucket)
@@ -203,6 +203,29 @@ async fn create_bucket(router: &MultiServiceRouter, bucket: &str, region: &str) 
         .await
         .unwrap_or_else(|error| {
             panic!("the emulated Amazon S3 creates the bucket {bucket} in {region}: {error}")
+        });
+}
+
+/// Stage one object in `bucket`, through Amazon S3's OWN `PutObject` — so an object this
+/// service then reads is an object that service really holds.
+///
+/// `pub(crate)` so the sibling suite that drives the engine's own S3 import stages its
+/// objects the same way rather than growing a second copy of this call.
+pub(crate) async fn put_object(
+    router: &MultiServiceRouter,
+    bucket: &str,
+    key: &str,
+    body: Vec<u8>,
+) {
+    s3(router)
+        .put_object()
+        .bucket(bucket)
+        .key(key)
+        .body(aws_sdk_s3::primitives::ByteStream::from(body))
+        .send()
+        .await
+        .unwrap_or_else(|error| {
+            panic!("the emulated Amazon S3 holds the object {bucket}/{key}: {error}")
         });
 }
 
@@ -494,11 +517,16 @@ async fn a_cluster_role_association_is_recorded_and_reported() {
     available_cluster(&router, identifier, "aurora-mysql").await;
 
     // (case, the FeatureName the request names, whether Aurora MySQL publishes it)
+    //
+    // Aurora MySQL publishes the machine-learning features and NO S3 feature: the S3
+    // load/unload integration of that engine is configured through the cluster parameter
+    // group's import-role parameters, with the role associated under no feature at all,
+    // which is the row that names none.
     let rows: Vec<(&str, Option<&str>, bool)> = vec![
-        ("Aurora MySQL imports from S3", Some("s3Import"), true),
-        ("Aurora MySQL exports to S3", Some("s3Export"), true),
         ("an Aurora machine-learning feature", Some("SageMaker"), true),
         ("no feature name at all", None, true),
+        ("the S3 import feature, which Aurora MySQL does not publish", Some("s3Import"), false),
+        ("the S3 export feature, likewise", Some("s3Export"), false),
         ("a name published for no Aurora version", Some("S3_INTEGRATION"), false),
     ];
     for (case, feature, published) in rows {
@@ -547,6 +575,99 @@ async fn a_cluster_role_association_is_recorded_and_reported() {
             call(&router, "RemoveRoleFromDBCluster", &request).await,
             404,
             "DBClusterRoleNotFound",
+        );
+    }
+}
+
+/// One row of the engine-name table: the resource an association is made on, the
+/// `FeatureName` its engine does not publish, and the name that engine is published under.
+struct EngineNameRow {
+    case: &'static str,
+    engine: &'static str,
+    /// Whether the row's resource is a DB CLUSTER (the Aurora engines) or a DB instance.
+    cluster: bool,
+    feature: &'static str,
+    /// The engine's `DBEngineDescription`, which is the name a sentence about the engine
+    /// uses: the same description `DescribeDBEngineVersions` reports for it.
+    display: &'static str,
+}
+
+/// The engine-name table: the refusal names the ENGINE, under the description that engine
+/// publishes, so the rows span engines whose descriptions differ in form — an Aurora engine
+/// named for its product, one whose description parenthesises the dialect, and the community
+/// editions of the two provisioned engines — with a feature name published for ANOTHER
+/// engine beside one published in another case.
+const ENGINE_NAME_ROWS: &[EngineNameRow] = &[
+    EngineNameRow {
+        case: "Aurora MySQL does not publish the S3 import feature",
+        engine: "aurora-mysql",
+        cluster: true,
+        feature: "s3Import",
+        display: "Aurora MySQL",
+    },
+    EngineNameRow {
+        case: "an Aurora PostgreSQL cluster named a feature of the Oracle engines",
+        engine: "aurora-postgresql",
+        cluster: true,
+        feature: "S3_INTEGRATION",
+        display: "Aurora (PostgreSQL)",
+    },
+    EngineNameRow {
+        case: "RDS for MySQL publishes no role feature at all",
+        engine: "mysql",
+        cluster: false,
+        feature: "s3Import",
+        display: "MySQL Community Edition",
+    },
+    EngineNameRow {
+        case: "a feature RDS for PostgreSQL publishes, named in another case",
+        engine: "postgres",
+        cluster: false,
+        feature: "s3import",
+        display: "PostgreSQL",
+    },
+];
+
+/// Rule: a `FeatureName` the addressed resource's engine does not publish is refused with
+/// `InvalidParameterValue` and the sentence AWS words it in — the value the request named and
+/// the engine, under the description that engine publishes.
+#[tokio::test]
+async fn an_unpublished_feature_name_is_refused_naming_the_engine() {
+    let (router, _engine) = emulator();
+    let role_arn = role(&router, "rds-s3-feature-name", st::RDS_SERVICE_PRINCIPAL, None).await;
+    for (index, row) in ENGINE_NAME_ROWS.iter().enumerate() {
+        let identifier = format!("emu-feature-name-{index}");
+        let (action, resource_member) = if row.cluster {
+            available_cluster(&router, &identifier, row.engine).await;
+            ("AddRoleToDBCluster", "DBClusterIdentifier")
+        } else {
+            available_instance(&router, &identifier, row.engine).await;
+            ("AddRoleToDBInstance", "DBInstanceIdentifier")
+        };
+        let body = expect_error(
+            row.case,
+            call(
+                &router,
+                action,
+                &params![
+                    resource_member => identifier,
+                    "RoleArn" => role_arn,
+                    "FeatureName" => row.feature,
+                ],
+            )
+            .await,
+            400,
+            "InvalidParameterValue",
+        );
+        let message = text(&body, "Message");
+        let expected = format!(
+            "The feature name {} is not valid for the engine {}.",
+            row.feature, row.display
+        );
+        assert_eq!(
+            message, expected,
+            "case {:?}: expected the refusal to name the engine, got {message:?}",
+            row.case
         );
     }
 }
