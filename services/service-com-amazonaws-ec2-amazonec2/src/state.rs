@@ -2151,6 +2151,13 @@ pub use declarative_policies_reports::*;
 pub mod instance_console;
 pub use instance_console::*;
 
+/// The BOOTS of one instance's guest — every time its operating system started, which is
+/// what the console it wrote carries one block of. A SUBMODULE for the same reason
+/// [`image_usage_reports`] is one, and `pub use` keeps every name reachable as
+/// `crate::state::<name>`.
+pub mod instance_boots;
+pub use instance_boots::*;
+
 /// Which capacity resources each of Capacity Manager's metrics measures, and the DIMENSION
 /// VALUES each of those resources carries — the one reading every operation that answers
 /// along Capacity Manager's dimensions shares, so the report of the available dimensions and

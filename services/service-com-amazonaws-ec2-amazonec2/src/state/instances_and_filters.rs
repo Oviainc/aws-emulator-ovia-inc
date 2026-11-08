@@ -241,6 +241,12 @@ impl ComAmazonawsEc2Amazonec2State {
     /// records nothing — the handler refuses such an id before it gets here, and a
     /// terminated instance is skipped by the handler, "requests to reboot terminated
     /// instances are ignored".
+    ///
+    /// What the queued reboot then DOES is owed to the clock: `RebootInstances` "only queues
+    /// a request to reboot the specified instances", so the guest comes up again
+    /// [`TRANSITION_DELAY`] later whether or not anybody calls again — a boot of its own,
+    /// with its own identity, appended to what the earlier boots wrote to the console (see
+    /// [`crate::state::instance_boots`]).
     pub fn queue_instance_reboot(&mut self, instance_id: &str, at: SystemTime) {
         debug_assert!(
             self.instances.contains_key(instance_id),
@@ -249,6 +255,7 @@ impl ComAmazonawsEc2Amazonec2State {
         if let Some(instance) = self.instances.get_mut(instance_id) {
             instance.queued_reboots = instance.queued_reboots.saturating_add(1);
             instance.last_reboot_queued_at = Some(at);
+            instance.boot_due = Some(at + TRANSITION_DELAY);
         }
     }
 
@@ -405,6 +412,11 @@ impl ComAmazonawsEc2Amazonec2State {
         for address in released {
             self.release_private_ip(&address);
         }
+        // The guest boots the clock already owes: an instance that has just finished starting
+        // has brought its operating system up, and one whose queued reboot fell due has
+        // brought it up again. Applied after the state moves above, so an instance that
+        // reached `running` in this same sweep boots in it rather than one call later.
+        self.boot_due_instance_guests(SystemTime::now());
         // An instance that has reached `terminated` no longer holds the network interfaces
         // its attachments are marked to delete with it — "indicates whether the network
         // interface is deleted when the instance is terminated"

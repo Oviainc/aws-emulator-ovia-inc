@@ -25,6 +25,11 @@ mod control_plane_rules;
 mod delete_target_account_configuration;
 #[path = "all/execution_role_is_one_lookup.rs"]
 mod execution_role_is_one_lookup;
+// What a started experiment DOES to the resources its targets resolved to: the
+// `aws:ec2:reboot-instances` action carried out on the EC2 store of the same engine, and the
+// progress the action itself then reports.
+#[path = "all/experiment_actions_reach_their_targets.rs"]
+mod experiment_actions_reach_their_targets;
 #[path = "all/experiment_lifecycle.rs"]
 mod experiment_lifecycle;
 #[path = "all/experiment_logging.rs"]

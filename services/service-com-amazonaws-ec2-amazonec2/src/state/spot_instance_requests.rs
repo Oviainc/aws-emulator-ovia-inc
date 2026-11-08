@@ -663,6 +663,10 @@ impl ComAmazonawsEc2Amazonec2State {
             last_reboot_queued_at: None,
             diagnostic_interrupts: 0,
             last_diagnostic_interrupt_at: None,
+            // The guest's FIRST boot: the operating system comes up as the instance finishes
+            // starting, the same instant the `pending` -> `running` move above falls due.
+            boots: Vec::new(),
+            boot_due: Some(at + TRANSITION_DELAY),
             // The instance was launched when the fulfillment fell due, not when somebody
             // next asked about it.
             launch_time: at,

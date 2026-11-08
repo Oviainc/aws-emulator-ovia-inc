@@ -835,6 +835,10 @@ mod instance_event_notification_attributes;
 mod instance_event_window_associations;
 #[path = "all/instance_event_windows.rs"]
 mod instance_event_windows;
+// Every start of an instance's guest — its launch, a start of a stopped instance and a
+// queued reboot taking effect — as a BOOT of its own, appended to the console it writes.
+#[path = "all/instance_guest_boots.rs"]
+mod instance_guest_boots;
 #[path = "all/instance_lifecycle.rs"]
 mod instance_lifecycle;
 #[path = "all/instance_metadata_defaults.rs"]

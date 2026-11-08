@@ -158,6 +158,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
+        // The action effects the clock has made due before this stop arrived, carried out on
+        // the services that own the targeted resources: an action the run had already
+        // reached was carried out at that instant, and a stop does not take it back. Run
+        // before the stop below, so an action the stop cancels is one the clock had NOT
+        // reached ([`crate::state::action_execution`]).
+        crate::state::materialise_action_effects(&*self.engine, now);
+
         // The report generation an ENDED experiment owes the clock, materialised before the
         // stop below settles that same experiment: the settle can end a run that elapsed,
         // and the generation that end makes due is owed even when the stop is then refused

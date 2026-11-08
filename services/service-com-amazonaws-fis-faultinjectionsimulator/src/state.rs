@@ -153,11 +153,13 @@ use crate::ops::types::{
     EMPTY_TARGET_RESOLUTION_MODE_VALUES, SAFETY_LEVER_STATUS_INPUT_VALUES,
 };
 
+pub mod action_execution;
 pub mod action_permissions;
 pub mod experiment_logs;
 mod catalog;
 mod experiment_reports;
 mod template_validation;
+pub use action_execution::*;
 pub use template_validation::*;
 pub use experiment_reports::*;
 pub use catalog::*;
@@ -1529,6 +1531,11 @@ pub struct ExperimentRecord {
     pub resolved_targets: Vec<ResolvedTarget>,
     /// Copied from the template, as `ExperimentAction`s.
     pub actions: HashMap<String, ExperimentAction>,
+    /// What the run DOES with the actions it carries out, keyed by action name, and what
+    /// each one's own progress is — see [`action_execution`]. Empty for a run that carries
+    /// nothing out, and holding only the actions this emulator really carries out, so no
+    /// action is given a status for work nothing did.
+    pub action_runs: BTreeMap<String, ActionRun>,
     /// Copied from the template, as `ExperimentStopCondition`s.
     pub stop_conditions: Vec<ExperimentStopCondition>,
     pub tags: HashMap<String, String>,
@@ -1620,6 +1627,20 @@ impl ExperimentRecord {
             &plan.carried_out,
             plan.empty_target_failure.clone().or(failure),
         );
+        // The actions the run carries out, laid out across the window the experiment is
+        // `running` for. A run that does not get going at all — one the start already showed
+        // a failure for — carries nothing out, so it is given no action runs and claims no
+        // action progress.
+        let action_runs = match &outcome {
+            ExperimentOutcome::Completed => action_execution::plan_action_runs(
+                &plan.carried_out,
+                &targets,
+                &resolved_targets,
+                now + TRANSITION_DELAY,
+                run_span,
+            ),
+            ExperimentOutcome::Failed(_) => BTreeMap::new(),
+        };
         let mut record = Self {
             id,
             arn,
@@ -1646,6 +1667,8 @@ impl ExperimentRecord {
                 .iter()
                 .map(experiment_stop_condition)
                 .collect(),
+            // The actions the run carries out, as planned above.
+            action_runs,
             tags: tags.unwrap_or_default(),
             experiment_options: ExperimentOptions {
                 account_targeting: template.experiment_options.account_targeting.clone(),
@@ -1843,6 +1866,9 @@ impl ExperimentRecord {
     pub fn settle(&mut self, now: SystemTime) {
         while let Some(due) = self.transition_due {
             if now < due {
+                // The experiment's own status is where it was, and its ACTIONS are still
+                // advancing inside the window it is running for.
+                self.settle_actions(now);
                 return;
             }
             match self.status {
@@ -1891,6 +1917,9 @@ impl ExperimentRecord {
                 | ExperimentStatus::Failed => self.transition_due = None,
             }
         }
+        // The status above is where the run now stands, so the actions are reconciled with
+        // it: a run that has ended carried out what it reached and nothing after it.
+        self.settle_actions(now);
     }
 
     /// Start the move to `stopped`, due [`TRANSITION_DELAY`] from `now`.
@@ -2019,7 +2048,9 @@ impl ExperimentRecord {
             role_arn: Some(self.role_arn.clone()),
             state: Some(self.to_state()),
             targets: Some(self.targets.clone()),
-            actions: Some(self.actions.clone()),
+            // The template's actions, each carrying the state of the run it had — see
+            // [`ExperimentRecord::reported_actions`].
+            actions: Some(self.reported_actions()),
             stop_conditions: Some(self.stop_conditions.clone()),
             creation_time: Some(::aws_smithy_types::DateTime::from(self.creation_time)),
             start_time: Some(::aws_smithy_types::DateTime::from(self.start_time)),

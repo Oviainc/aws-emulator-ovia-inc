@@ -349,6 +349,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             MAX_SECURITY_GROUPS_PER_INSTANCE, MAX_STORED_BYTES, MAX_STORED_INSTANCES,
             MAX_USER_DATA_BYTES, RUN_INSTANCES_TAGGABLE_RESOURCES,
             STORED_RECORD_OVERHEAD_BYTES,
+            TRANSITION_DELAY,
         };
 
         // A launch template carries the launch parameters this handler would have to
@@ -918,6 +919,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 last_reboot_queued_at: None,
                 diagnostic_interrupts: 0,
                 last_diagnostic_interrupt_at: None,
+                // The guest's FIRST boot: the operating system comes up as the instance
+                // finishes starting, which is the same instant the launch's own
+                // `pending` -> `running` move falls due.
+                boots: Vec::new(),
+                boot_due: Some(launch_time + TRANSITION_DELAY),
                 launch_time,
                 ami_launch_index: i32::try_from(launch_index).unwrap_or(i32::MAX),
                 user_data: input.user_data.clone(),

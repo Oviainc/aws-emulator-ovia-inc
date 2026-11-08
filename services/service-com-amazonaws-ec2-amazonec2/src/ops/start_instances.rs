@@ -150,7 +150,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         use crate::scaffolded::Scaffolded;
         use crate::state::{
             deduplicate_ids, require_known_instance, require_service_state, InstanceStateName,
-            PendingTransition, MAX_RESOURCE_IDS,
+            PendingTransition, MAX_RESOURCE_IDS, TRANSITION_DELAY,
         };
 
         let _ = ctx;
@@ -215,6 +215,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 instance.pending_transition = Some(PendingTransition::starting_now(
                     InstanceStateName::Running,
                 ));
+                // A stopped instance has no running operating system, so starting it brings
+                // the guest up again: a boot of its own, owed at the instant the instance
+                // finishes starting (see `crate::state::instance_boots`).
+                instance.boot_due = Some(::std::time::SystemTime::now() + TRANSITION_DELAY);
                 // The instance is on its way up again, so the reason recorded for
                 // the stop no longer describes its state.
                 instance.state_transition_reason = None;

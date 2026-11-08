@@ -491,6 +491,15 @@ pub struct InstanceRecord {
     /// nobody has asked to reboot. The service's own clock reading, not a value any
     /// request carries.
     pub last_reboot_queued_at: Option<SystemTime>,
+    /// The boots this instance's GUEST has had, oldest first: its launch, each start of it
+    /// from `stopped`, and each queued reboot that took effect. See
+    /// [`crate::state::instance_boots`] — the console is what reports them.
+    pub boots: Vec<InstanceBoot>,
+    /// When the guest is owed its next BOOT, or `None` when it is owed none: the instant a
+    /// launch, a start or a queued reboot made the operating system due to come up. Spent by
+    /// [`ComAmazonawsEc2Amazonec2State::boot_due_instance_guests`], exactly as
+    /// [`InstanceRecord::pending_transition`] is spent by the move it owes.
+    pub boot_due: Option<SystemTime>,
     /// How many diagnostic interrupts have been sent to this instance: the interrupt
     /// crashes and reboots the instance's operating system and moves the instance itself
     /// nowhere, so — like [`InstanceRecord::queued_reboots`] — this count is the whole of

@@ -29,6 +29,11 @@ service-common = { path = "../common" }
 # The IAM store StartExperiment resolves an experiment template's `roleArn` against, to
 # check the role's trust policy grants fis.amazonaws.com before an experiment is created.
 service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+# The EC2 store an experiment's EC2 actions are CARRIED OUT on: the built-in action
+# `aws:ec2:reboot-instances` reboots the instances its target resolved to, which is a write
+# to the very store the EC2 handlers read (see `src/state/action_execution.rs`). Reached
+# through EC2's own state accessor, the way the IAM store above is.
+service-com-amazonaws-ec2-amazonec2 = { workspace = true }
 # The CloudWatch Logs and Amazon S3 clients an experiment's log records are DELIVERED
 # through, over the in-process callback into this same emulator (no network client
 # feature is enabled: the transport is the emulator's own). A template's
@@ -44,6 +49,9 @@ emulator-core-build-support = { workspace = true }
 [dev-dependencies]
 sha2 = { workspace = true }
 hex = { workspace = true }
+# `GetConsoleOutputResult$Output` carries an instance's console as base64 text, which the
+# action-execution suite decodes to read the boots a rebooted guest wrote.
+base64 = "0.22"
 # RFC 3986 percent-encoding, so the untag suite can put a tag key carrying a space, a
 # `+` or a non-ASCII character in the `tagKeys` query string the way a client does.
 percent-encoding = "2.3"

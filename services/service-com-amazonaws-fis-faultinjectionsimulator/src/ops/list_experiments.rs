@@ -167,6 +167,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
+        // The action effects the clock has made due for every run under way, carried out on
+        // the services that own the targeted resources before anything is reported — see
+        // `GetExperiment`, which owes the same for the one experiment it reports
+        // ([`crate::state::action_execution`]).
+        crate::state::materialise_action_effects(&*self.engine, now);
+
         // The report generation every ENDED experiment owes the clock, which writes each
         // report to the Amazon S3 output its configuration names. This operation settles
         // EVERY experiment, so it materialises the end of every run that elapsed — the very

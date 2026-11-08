@@ -60,10 +60,15 @@ pub fn require_console_instance<'store, E>(
 pub const CONSOLE_LABEL_WIDTH: usize = 20;
 
 /// The lines of text one instance's console shows: the facts this service holds about that
-/// instance, one per line, labelled.
+/// instance, one per line, labelled — and then one block per BOOT its guest has had.
 ///
 /// A fact the record does not carry gets no line at all, rather than a line with a
 /// placeholder in it: an instance with no public address has nothing to report there.
+///
+/// The boot blocks come after the facts, in the order the guest had them
+/// ([`super::instance_boot_lines`]): a console is APPENDED to, so an instance that has
+/// restarted shows what the earlier boots wrote with the new boot's lines after them, and
+/// an instance whose guest has not come up yet shows no boot block at all.
 pub fn instance_console_lines(instance: &InstanceRecord) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     let mut line = |label: &str, value: &str| {
@@ -82,6 +87,11 @@ pub fn instance_console_lines(instance: &InstanceRecord) -> Vec<String> {
         line("public-ip-address", public_ip);
     }
     line("launch-time", &iso8601_utc(instance.launch_time));
+    for boot in super::instance_boots(instance) {
+        for (label, value) in super::instance_boot_lines(boot) {
+            line(&label, &value);
+        }
+    }
     lines
 }
 

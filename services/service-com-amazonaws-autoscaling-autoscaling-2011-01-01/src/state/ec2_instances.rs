@@ -203,6 +203,11 @@ pub fn launch<Eng: Send + Sync + 'static>(
             last_reboot_queued_at: None,
             diagnostic_interrupts: 0,
             last_diagnostic_interrupt_at: None,
+            // The guest's FIRST boot: its operating system comes up as the instance
+            // finishes starting, the same instant the `pending` -> `running` move above
+            // falls due.
+            boots: Vec::new(),
+            boot_due: Some(launch_time + ec2::TRANSITION_DELAY),
             launch_time,
             // One instance per reservation, so it is that reservation's first.
             ami_launch_index: 0,

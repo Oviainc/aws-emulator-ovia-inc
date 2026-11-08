@@ -433,6 +433,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
+        // The action effects the clock has made due for every run under way, carried out on
+        // the services that own the targeted resources before anything is reported. This
+        // call settles every experiment (its quota is taken against the runs genuinely under
+        // way), so it reaches every action the clock has got to and owes what each one does
+        // ([`crate::state::action_execution`]).
+        crate::state::materialise_action_effects(&*self.engine, now);
+
         // The report generation every ENDED experiment owes the clock. The start below
         // SETTLES every experiment — its active-experiment quota is taken against the runs
         // genuinely under way — so it materialises the end of every run that elapsed, which

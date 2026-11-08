@@ -156,6 +156,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let region = crate::state::request_region(ctx.parts());
         let now = ::std::time::SystemTime::now();
 
+        // The action effects the clock has made due for every run under way, carried out on
+        // the services that own the targeted resources before anything is reported: an
+        // action the run reached was carried out at that instant whether or not anybody
+        // polled. It takes this service's store lock itself and releases it before reaching
+        // the owning service, so it runs before this handler takes the lock to read the
+        // record out ([`crate::state::action_execution`]).
+        crate::state::materialise_action_effects(&*self.engine, now);
+
         // The report generation an ENDED experiment owes the clock, which writes the report
         // to the Amazon S3 output its configuration names. It settles the record and takes
         // the store lock itself, holding it across no call, so it runs before this handler

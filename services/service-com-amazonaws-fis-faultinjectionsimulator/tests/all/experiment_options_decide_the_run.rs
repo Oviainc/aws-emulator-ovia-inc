@@ -31,6 +31,12 @@
 //! What a skipped action does NOT claim: `startTime`, `endTime` and any effect on another
 //! service. `skipped` is the decision the options made about the action, which is known at
 //! start — not a report of work this emulator performed.
+//!
+//! What an action the run CARRIES OUT claims is the other half of that: its own progress,
+//! reported exactly for the actions whose work this emulator really performs (the `aws:fis`
+//! actions it carries out itself, and the ones whose effect it performs on the service that
+//! owns the targeted resource), and nothing at all for an action whose effect is on
+//! something this emulator does not hold.
 
 use std::time::Duration;
 
@@ -131,9 +137,13 @@ struct Expected {
     /// its reason has to name — the option that skipped it, or the target that resolved to
     /// nothing.
     skipped: &'static [(&'static str, &'static str)],
-    /// The actions that must report NO state at all: the ones the run carries out, whose
-    /// per-action progress this emulator does not model.
+    /// The actions that must report NO state at all: the ones the run carries out whose own
+    /// work this emulator does not perform, so there is no progress of theirs to report.
     carried_out: &'static [&'static str],
+    /// The actions whose own progress the run DOES report, because this emulator carries
+    /// their work out: it reaches a terminal `completed` by the time the run has, with the
+    /// `startTime` and `endTime` of the window it was carried out in.
+    reported: &'static [&'static str],
     /// The terminal status the run must reach.
     terminal: &'static str,
     /// For a run that ends `failed` on the resolution: the target the failure must locate
@@ -177,7 +187,8 @@ fn rows() -> Vec<Row> {
             }),
             expected: Expected {
                 skipped: &[],
-                carried_out: &["fault", "after"],
+                carried_out: &["fault"],
+                reported: &["after"],
                 terminal: "completed",
                 empty_target: None,
                 floor_span: false,
@@ -198,7 +209,8 @@ fn rows() -> Vec<Row> {
             }),
             expected: Expected {
                 skipped: &[],
-                carried_out: &["fault", "after"],
+                carried_out: &["fault"],
+                reported: &["after"],
                 terminal: "completed",
                 empty_target: None,
                 floor_span: false,
@@ -223,6 +235,7 @@ fn rows() -> Vec<Row> {
             expected: Expected {
                 skipped: &[("fault", "skip-all"), ("after", "skip-all")],
                 carried_out: &[],
+                reported: &[],
                 terminal: "completed",
                 empty_target: None,
                 floor_span: true,
@@ -239,6 +252,7 @@ fn rows() -> Vec<Row> {
             expected: Expected {
                 skipped: &[],
                 carried_out: &["fault"],
+                reported: &[],
                 terminal: "completed",
                 empty_target: None,
                 floor_span: false,
@@ -256,6 +270,7 @@ fn rows() -> Vec<Row> {
             expected: Expected {
                 skipped: &[],
                 carried_out: &["onTagged", "onNamed"],
+                reported: &[],
                 terminal: "failed",
                 empty_target: Some("tagged"),
                 floor_span: true,
@@ -275,6 +290,7 @@ fn rows() -> Vec<Row> {
             expected: Expected {
                 skipped: &[("onTagged", "skip-all"), ("onNamed", "skip-all")],
                 carried_out: &[],
+                reported: &[],
                 terminal: "failed",
                 empty_target: Some("tagged"),
                 floor_span: true,
@@ -294,6 +310,7 @@ fn rows() -> Vec<Row> {
             expected: Expected {
                 skipped: &[("onTagged", "tagged")],
                 carried_out: &["onNamed"],
+                reported: &[],
                 terminal: "completed",
                 // The long action was skipped, so the run is the floor: the only action it
                 // carried out models a minute, which compresses below it.
@@ -312,6 +329,7 @@ fn rows() -> Vec<Row> {
             expected: Expected {
                 skipped: &[],
                 carried_out: &["wait"],
+                reported: &[],
                 terminal: "failed",
                 empty_target: Some("tagged"),
                 floor_span: true,
@@ -328,7 +346,8 @@ fn rows() -> Vec<Row> {
             actions: json!({ "wait": { "actionId": "aws:fis:wait", "parameters": { "duration": "PT1M" } } }),
             expected: Expected {
                 skipped: &[],
-                carried_out: &["wait"],
+                carried_out: &[],
+                reported: &["wait"],
                 terminal: "completed",
                 empty_target: None,
                 floor_span: true,
@@ -400,10 +419,45 @@ fn assert_action_states(case: &str, where_from: &str, row: &Row, experiment: &Va
     for name in row.expected.carried_out {
         assert!(
             experiment["actions"][name]["state"].is_null(),
-            "case {case:?} ({where_from}): this emulator claims no per-action state for an \
-             action the run carries out, got {:?}",
+            "case {case:?} ({where_from}): an action whose own work this emulator does not \
+             perform claims no per-action state, got {:?}",
             experiment["actions"][name]
         );
+    }
+    // An action whose work this emulator DOES carry out reports its own progress, so the
+    // status it shows depends on where the run has got: `pending` until the run reaches it,
+    // and `completed` once the run has ended.
+    let final_read = where_from == "after the run";
+    for name in row.expected.reported {
+        let state = &experiment["actions"][name]["state"];
+        let status = state["status"].as_str().unwrap_or_default();
+        let allowed: &[&str] = if final_read {
+            &["completed"]
+        } else {
+            &["pending", "running", "completed"]
+        };
+        assert!(
+            allowed.contains(&status),
+            "case {case:?} ({where_from}): expected action {name:?} to report one of \
+             {allowed:?}, got {state:?}"
+        );
+        assert!(
+            state["reason"]
+                .as_str()
+                .is_some_and(|reason| !reason.is_empty()),
+            "case {case:?} ({where_from}): an action that reports a state says why, got \
+             {state:?}"
+        );
+        if final_read {
+            for member in ["startTime", "endTime"] {
+                assert!(
+                    !experiment["actions"][name][member].is_null(),
+                    "case {case:?} ({where_from}): an action the run carried out reports its \
+                     {member}, got {:?}",
+                    experiment["actions"][name]
+                );
+            }
+        }
     }
 }
 

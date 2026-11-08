@@ -601,6 +601,10 @@ pub fn launch_host_instance<Eng: Send + Sync + 'static>(
         last_reboot_queued_at: None,
         diagnostic_interrupts: 0,
         last_diagnostic_interrupt_at: None,
+        // The host's FIRST boot: its operating system comes up as the instance finishes
+        // starting, the same instant the `pending` -> `running` move above falls due.
+        boots: Vec::new(),
+        boot_due: Some(::std::time::SystemTime::now() + ec2::TRANSITION_DELAY),
         launch_time: ::std::time::SystemTime::now(),
         ami_launch_index: 0,
         // "EC2 instances created through Amazon EVS do not support associating an IAM
