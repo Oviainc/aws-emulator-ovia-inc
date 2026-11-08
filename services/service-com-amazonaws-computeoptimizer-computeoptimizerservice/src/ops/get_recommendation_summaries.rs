@@ -264,13 +264,32 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         let mut recommendation_summaries: Vec<RecommendationSummary> = Vec::new();
         let mut next_token = None;
+        // The databases the account holds an analysis for, by the crate's one rule for it
+        // ([`crate::state::analysed_databases`]): a summary of the account's Amazon Aurora and
+        // RDS databases counts exactly the databases `GetRDSDatabaseRecommendations` reports
+        // at this endpoint, so the two cannot disagree about how many there are or about any
+        // one's finding, risk or cost. Compute Optimizer is regional, so the databases
+        // summarised are the ones of the region the request was signed for.
+        let databases = crate::state::analysed_databases(
+            &*self.engine,
+            &guard,
+            &crate::state::request_region(ctx),
+            &account_id,
+            crate::state::now_secs(),
+        );
         // The records a caller can read, grouped by resource type: the rightsizing catalog
         // and the idle analysis. A caller sees either only once the analysis its enrollment
         // started is due
         // ([`crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::visible_analysed_resources`]) —
         // the same gate the per-resource readers apply — so that gate decides what the counts
         // below ARE and not which resource types are summarised.
-        let analysed = guard.analysed_resources_by_type(&account_id);
+        let mut analysed = guard.analysed_resources_by_type(&account_id);
+        // The database rows are the analysed databases above — which already carry the
+        // catalog's own database rows — so the group is theirs rather than the catalog's.
+        analysed.insert(
+            crate::state::SOURCE_TYPE_RDS_DB_INSTANCE,
+            databases.iter().collect(),
+        );
         let idle = guard.idle_analyses_by_source_type(&account_id);
         // One summary per resource type this service TRACKS — every value of the
         // `RecommendationSourceType` vocabulary `RecommendationSummary$recommendationResourceType`

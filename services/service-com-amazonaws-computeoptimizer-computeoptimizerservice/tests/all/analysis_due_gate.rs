@@ -22,7 +22,8 @@ use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    reports_idle_recommendations, service_state, ANALYSIS_DELAY, SOURCE_TYPE_RDS_DB_INSTANCE,
+    reports_idle_recommendations, service_state, AnalysedResource, RdsDatabaseDetail,
+    ANALYSIS_DELAY, SOURCE_TYPE_RDS_DB_INSTANCE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
@@ -68,7 +69,7 @@ struct Reader {
 /// The listers are the ones `tests/all/timestamp_probe.rs` reads one analysis through, plus
 /// the two the findings catalog answers (`GetRDSDatabaseRecommendations` and the summary
 /// reader); the per-resource rows are the two projected-metrics readers, each naming a
-/// resource of the store's own seeded analysis.
+/// resource of the store's own analysis.
 fn readers(instance_arn: &str, database_arn: &str) -> Vec<Reader> {
     let lister = |operation: &'static str, items: &'static str| Reader {
         operation,
@@ -192,25 +193,49 @@ async fn assert_opt_in_required(router: &MultiServiceRouter, phase: &str, reader
     }
 }
 
-/// The ARNs of two resources the store's own seeded analysis holds: an Amazon EC2 instance
-/// and an Amazon Aurora or RDS database, as the endpoint in [`REGION`] reports them.
+/// The ARNs of two resources the store's analysis holds, as the endpoint in [`REGION`]
+/// reports them: an Amazon EC2 instance the store observes, and an Amazon Aurora or RDS
+/// database recorded here the way Compute Optimizer's own analysis of an observed workload
+/// would record it — no operation of this API creates either.
 ///
 /// Taken from the stored analysis rather than written out here, so these rows name whatever
-/// the seeded analysis holds rather than one memorised identifier.
-fn seeded_resources(engine: &Arc<engine::InMemoryEngine>) -> (String, String) {
+/// that analysis holds rather than one memorised identifier.
+fn analysed_resources(engine: &Arc<engine::InMemoryEngine>) -> (String, String) {
     let state = service_state(&**engine).expect("the engine bears this service's state");
-    let guard = state.lock();
+    let mut guard = state.lock();
     let instance = guard
         .instances
         .values()
         .next()
-        .expect("the seeded analysis holds an Amazon EC2 instance")
+        .expect("the observed analysis holds an Amazon EC2 instance")
         .instance_arn(REGION);
+    guard.analysed_resources.push(AnalysedResource {
+        account_id: ::engine::emulator_account_id().to_string(),
+        resource_type: SOURCE_TYPE_RDS_DB_INSTANCE.to_string(),
+        // The catalog records a resource's REGION-FREE identity; the ARN reported for it
+        // names the region of the endpoint that reports it.
+        arn_service: "rds".to_string(),
+        arn_resource: "db:ledger-primary".to_string(),
+        // An over-provisioned database: the analysis would move it to a smaller DB instance
+        // class, which is what gives it a recommendation option to project metrics onto.
+        finding: "Overprovisioned".to_string(),
+        finding_reason_codes: Vec::new(),
+        current_performance_risk: "Low".to_string(),
+        current_monthly_cost: 200.0,
+        recommended_monthly_cost: 150.0,
+        inferred_workload_types: Vec::new(),
+        rds_database: Some(RdsDatabaseDetail {
+            engine: Some("postgres".to_string()),
+            current_db_instance_class: Some("db.r6g.2xlarge".to_string()),
+            recommended_db_instance_class: Some("db.r6g.xlarge".to_string()),
+            ..RdsDatabaseDetail::default()
+        }),
+    });
     let database = guard
         .analysed_resources
         .iter()
         .find(|resource| resource.resource_type == SOURCE_TYPE_RDS_DB_INSTANCE)
-        .expect("the seeded findings catalog holds an Amazon Aurora or RDS database")
+        .expect("the findings catalog holds an Amazon Aurora or RDS database")
         .arn_in(REGION);
     (instance, database)
 }
@@ -221,7 +246,7 @@ fn seeded_resources(engine: &Arc<engine::InMemoryEngine>) -> (String, String) {
 #[tokio::test]
 async fn every_reader_of_the_analysis_waits_for_the_enrollment_and_the_analysis() {
     let (router, engine) = emulator_with_engine();
-    let (instance_arn, database_arn) = seeded_resources(&engine);
+    let (instance_arn, database_arn) = analysed_resources(&engine);
     let readers = readers(&instance_arn, &database_arn);
 
     assert_opt_in_required(&router, "never opted in", &readers).await;
@@ -334,7 +359,7 @@ async fn every_reader_of_the_analysis_waits_for_the_enrollment_and_the_analysis(
 #[tokio::test]
 async fn the_two_readers_of_one_resource_agree_about_whether_its_analysis_exists() {
     let (router, engine) = emulator_with_engine();
-    let (instance_arn, database_arn) = seeded_resources(&engine);
+    let (instance_arn, database_arn) = analysed_resources(&engine);
     let all = readers(&instance_arn, &database_arn);
 
     // (the resource's ARN, the lister of its analysis, the member it lists, the member the

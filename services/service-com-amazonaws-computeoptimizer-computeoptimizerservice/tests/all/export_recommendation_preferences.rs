@@ -21,17 +21,20 @@
 //! over Amazon S3's own `GetObject`.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::CPU_VENDOR_ARCHITECTURE_VALUES;
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    ANALYSIS_DELAY, EXPORT_JOB_STEP, JOB_STATUS_COMPLETE,
+    service_state, AnalysedResource, RdsDatabaseDetail, ANALYSIS_DELAY, EXPORT_JOB_STEP,
+    JOB_STATUS_COMPLETE, SOURCE_TYPE_RDS_DB_INSTANCE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    call, cell, create_bucket, csv_rows, emulator, export_destination, get_object, opt_in, strings,
+    call, cell, create_bucket, csv_rows, emulator_with_engine, export_destination, get_object,
+    opt_in, strings, ACCOUNT,
 };
 
 /// The destination bucket these fixtures export to. Compute Optimizer does not create it, so
@@ -133,11 +136,39 @@ fn selections() -> Vec<Option<Vec<&'static str>>> {
 /// enrollment starts already due — which is what a recommendation reader reports over, so it is
 /// what an export file holds.
 async fn analysed_emulator() -> MultiServiceRouter {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
+    record_analysed_database(&engine);
     create_bucket(&router, BUCKET).await;
     opt_in(&router).await;
     tokio::time::sleep(ANALYSIS_DELAY + SLACK).await;
     router
+}
+
+/// Record one analysed Amazon Aurora or RDS database into the findings catalog, the way
+/// Compute Optimizer's own analysis of an observed workload would: the database surface has a
+/// recommendation to read and export only once such an analysis exists.
+fn record_analysed_database(engine: &Arc<engine::InMemoryEngine>) {
+    let state = service_state(&**engine).expect("the engine bears this service's state");
+    state.lock().analysed_resources.push(AnalysedResource {
+        account_id: ACCOUNT.to_string(),
+        resource_type: SOURCE_TYPE_RDS_DB_INSTANCE.to_string(),
+        // The catalog records a resource's REGION-FREE identity; the ARN reported for it names
+        // the region of the endpoint that reports it.
+        arn_service: "rds".to_string(),
+        arn_resource: "db:ledger-primary".to_string(),
+        finding: "Overprovisioned".to_string(),
+        finding_reason_codes: Vec::new(),
+        current_performance_risk: "Low".to_string(),
+        current_monthly_cost: 200.0,
+        recommended_monthly_cost: 150.0,
+        inferred_workload_types: Vec::new(),
+        rds_database: Some(RdsDatabaseDetail {
+            engine: Some("postgres".to_string()),
+            current_db_instance_class: Some("db.r6g.2xlarge".to_string()),
+            recommended_db_instance_class: Some("db.r6g.xlarge".to_string()),
+            ..RdsDatabaseDetail::default()
+        }),
+    });
 }
 
 /// The request member the selection of `architectures` carries, or no member at all.

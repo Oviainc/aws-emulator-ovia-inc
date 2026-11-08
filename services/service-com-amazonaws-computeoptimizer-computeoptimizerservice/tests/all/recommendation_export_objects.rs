@@ -24,22 +24,24 @@
 //! calls as `POST /` with `X-Amz-Target`, the object calls as the path-style S3 requests a
 //! client sends (`PUT /<bucket>`, `GET /<bucket>/<key>`, `DELETE /<bucket>`).
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::ops::types::EXPORTABLE_AUTO_SCALING_GROUP_FIELD_VALUES;
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::export::MISSING_DESTINATION_MESSAGE;
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    ANALYSIS_DELAY, EXPORT_JOB_STEP, JOB_STATUS_COMPLETE, JOB_STATUS_FAILED,
-    RESOURCE_TYPE_AUTO_SCALING_GROUP, RESOURCE_TYPE_EBS_VOLUME, RESOURCE_TYPE_EC2_INSTANCE,
-    RESOURCE_TYPE_ECS_SERVICE, RESOURCE_TYPE_IDLE, RESOURCE_TYPE_LAMBDA_FUNCTION,
-    RESOURCE_TYPE_LICENSE, RESOURCE_TYPE_RDS_DB_INSTANCE,
+    service_state, AnalysedResource, RdsDatabaseDetail, ANALYSIS_DELAY, EXPORT_JOB_STEP,
+    JOB_STATUS_COMPLETE, JOB_STATUS_FAILED, RESOURCE_TYPE_AUTO_SCALING_GROUP,
+    RESOURCE_TYPE_EBS_VOLUME, RESOURCE_TYPE_EC2_INSTANCE, RESOURCE_TYPE_ECS_SERVICE,
+    RESOURCE_TYPE_IDLE, RESOURCE_TYPE_LAMBDA_FUNCTION, RESOURCE_TYPE_LICENSE,
+    RESOURCE_TYPE_RDS_DB_INSTANCE, SOURCE_TYPE_RDS_DB_INSTANCE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    call, cell, create_bucket, csv_rows, delete_bucket, emulator, error_code, export_destination,
-    get_object, opt_in, ACCOUNT,
+    call, cell, create_bucket, csv_rows, delete_bucket, emulator, emulator_with_engine,
+    error_code, export_destination, get_object, opt_in, ACCOUNT,
 };
 
 /// The destination bucket these fixtures export to.
@@ -99,11 +101,40 @@ const EXPORTS: &[(&str, &str, &[&str])] = &[
 /// analysis the enrollment starts already due — which is what a recommendation reader reports
 /// over, so it is what an export file holds.
 async fn analysed_emulator() -> MultiServiceRouter {
-    let router = emulator();
+    let (router, engine) = emulator_with_engine();
+    record_analysed_database(&engine);
     create_bucket(&router, BUCKET).await;
     opt_in(&router).await;
     tokio::time::sleep(ANALYSIS_DELAY + SLACK).await;
     router
+}
+
+/// Record one analysed Amazon Aurora or RDS database into the findings catalog, the way
+/// Compute Optimizer's own analysis of an observed workload would: a database recommendation
+/// is an analysis of a DB instance the account owns, so the database export holds a row only
+/// once such an analysis exists.
+fn record_analysed_database(engine: &Arc<engine::InMemoryEngine>) {
+    let state = service_state(&**engine).expect("the engine bears this service's state");
+    state.lock().analysed_resources.push(AnalysedResource {
+        account_id: ACCOUNT.to_string(),
+        resource_type: SOURCE_TYPE_RDS_DB_INSTANCE.to_string(),
+        // The catalog records a resource's REGION-FREE identity; the ARN reported for it names
+        // the region of the endpoint that reports it.
+        arn_service: "rds".to_string(),
+        arn_resource: "db:ledger-primary".to_string(),
+        finding: "Overprovisioned".to_string(),
+        finding_reason_codes: Vec::new(),
+        current_performance_risk: "Low".to_string(),
+        current_monthly_cost: 200.0,
+        recommended_monthly_cost: 150.0,
+        inferred_workload_types: Vec::new(),
+        rds_database: Some(RdsDatabaseDetail {
+            engine: Some("postgres".to_string()),
+            current_db_instance_class: Some("db.r6g.2xlarge".to_string()),
+            recommended_db_instance_class: Some("db.r6g.xlarge".to_string()),
+            ..RdsDatabaseDetail::default()
+        }),
+    });
 }
 
 /// Call one export operation, asserting it was accepted, and answer its response body.

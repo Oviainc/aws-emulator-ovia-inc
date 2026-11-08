@@ -386,9 +386,9 @@ async fn read(
 
 /// An emulator every reader in [`readers`] has at least two items to report from: the
 /// account is enrolled, the organization holds member accounts, preference records are
-/// written at four distinct scopes, export jobs exist for three resource types, a second
-/// analysed database joins the one the findings catalog seeds, and two Amazon ECS services
-/// have the analysis inputs a recommendation is computed from.
+/// written at four distinct scopes, export jobs exist for three resource types, two analysed
+/// databases are recorded, and two Amazon ECS services have the analysis inputs a
+/// recommendation is computed from.
 async fn paged_emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let (router, engine) = emulator_with_analysed_services_and_engine();
     opt_in(&router).await;
@@ -397,7 +397,7 @@ async fn paged_emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     // ([`ANALYSIS_DELAY`]) and the margin covers scheduler jitter.
     tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
     record_organization(&engine);
-    record_second_analysed_database(&engine);
+    record_analysed_databases(&engine);
     write_preference_records(&router).await;
     create_bucket(&router, BUCKET).await;
     create_export_jobs(&router).await;
@@ -418,30 +418,31 @@ fn record_organization(engine: &Arc<engine::InMemoryEngine>) {
     }
 }
 
-/// Record one more analysed Amazon Aurora or RDS database into the findings catalog, the way
-/// Compute Optimizer's own analysis of an observed workload would: the catalog this emulator
-/// starts with holds a single database row, and a page size is only observable over a
-/// sequence of more than one.
-fn record_second_analysed_database(engine: &Arc<engine::InMemoryEngine>) {
+/// Record two analysed Amazon Aurora or RDS databases into the findings catalog, the way
+/// Compute Optimizer's own analysis of an observed workload would: a page size is only
+/// observable over a sequence of more than one.
+fn record_analysed_databases(engine: &Arc<engine::InMemoryEngine>) {
     let state = service_state(&**engine).expect("the engine bears this service's state");
     let mut guard = state.lock();
-    guard.analysed_resources.push(AnalysedResource {
-        account_id: ::engine::emulator_account_id().to_string(),
-        resource_type: SOURCE_TYPE_RDS_DB_INSTANCE.to_string(),
-        // The catalog records a resource's REGION-FREE identity; the ARN reported for it
-        // names the region of the endpoint that reports it.
-        arn_service: "rds".to_string(),
-        arn_resource: "db:ledger-replica".to_string(),
-        // An `RDSInstanceFinding` value with nothing to change, so the row needs no
-        // recommendation option of its own.
-        finding: "Optimized".to_string(),
-        finding_reason_codes: Vec::new(),
-        current_performance_risk: "VeryLow".to_string(),
-        current_monthly_cost: 120.0,
-        recommended_monthly_cost: 120.0,
-        inferred_workload_types: Vec::new(),
-        rds_database: None,
-    });
+    for identifier in ["db:ledger-primary", "db:ledger-replica"] {
+        guard.analysed_resources.push(AnalysedResource {
+            account_id: ::engine::emulator_account_id().to_string(),
+            resource_type: SOURCE_TYPE_RDS_DB_INSTANCE.to_string(),
+            // The catalog records a resource's REGION-FREE identity; the ARN reported for it
+            // names the region of the endpoint that reports it.
+            arn_service: "rds".to_string(),
+            arn_resource: identifier.to_string(),
+            // An `RDSInstanceFinding` value with nothing to change, so the row needs no
+            // recommendation option of its own.
+            finding: "Optimized".to_string(),
+            finding_reason_codes: Vec::new(),
+            current_performance_risk: "VeryLow".to_string(),
+            current_monthly_cost: 120.0,
+            recommended_monthly_cost: 120.0,
+            inferred_workload_types: Vec::new(),
+            rds_database: None,
+        });
+    }
 }
 
 /// Write one preference record at each of four distinct scopes, which is what

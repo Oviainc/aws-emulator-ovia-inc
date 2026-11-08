@@ -183,6 +183,14 @@ pub struct ExportPlan {
     /// Empty for a request that asked for none — and for a surface whose model declares no
     /// such member — which restricts nothing.
     pub cpu_vendor_architectures: Vec<String>,
+    /// The Amazon Aurora and RDS databases the account held an analysis for when the export
+    /// was created ([`super::analysed_databases`]): the DB instances of its own Amazon RDS
+    /// inventory, beside the database rows of the findings catalog. They are resolved with the
+    /// plan — "the export is of the recommendations the account held when it asked for the
+    /// export" — so an exported file holds exactly the databases
+    /// `GetRDSDatabaseRecommendations` reported at that moment. Empty for every other resource
+    /// type's export, which no database row belongs to.
+    pub analysed_databases: Vec<AnalysedResource>,
 }
 
 /// The two objects an export job has computed but not yet written: the export file and its
@@ -527,7 +535,7 @@ pub fn create_export_job<Eng: Send + Sync + 'static, F: ExportFilter>(
     );
     let plan = ExportPlan {
         job_id: job_id.clone(),
-        region,
+        region: region.clone(),
         resource_type: request.resource_type.to_string(),
         bucket: bucket.to_string(),
         key,
@@ -542,6 +550,20 @@ pub fn create_export_job<Eng: Send + Sync + 'static, F: ExportFilter>(
         include_member_accounts: request.include_member_accounts,
         filters: filter_pairs(&filters),
         cpu_vendor_architectures,
+        // The databases the account holds an analysis for, resolved through the ONE rule every
+        // database surface of this service reads them by, so an export and a read of the same
+        // moment cannot differ on which databases the account has.
+        analysed_databases: if request.resource_type == RESOURCE_TYPE_RDS_DB_INSTANCE {
+            super::analysed_databases(
+                &**engine,
+                &guard,
+                &region,
+                ::engine::emulator_account_id(),
+                now,
+            )
+        } else {
+            Vec::new()
+        },
     };
     // The destination this call answers is the job's own, so it names exactly the objects
     // `DescribeRecommendationExportJobs` reports for the job and exactly the objects the
@@ -917,6 +939,7 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
                 last_refresh,
             ),
             RESOURCE_TYPE_RDS_DB_INSTANCE => self.rds_database_export_rows(
+                &plan.analysed_databases,
                 &plan.region,
                 &plan.cpu_vendor_architectures,
                 last_refresh,
@@ -1105,35 +1128,30 @@ impl ComAmazonawsComputeoptimizerComputeoptimizerserviceState {
     /// analysis would move it to — none of which is a column of the findings-catalog row every
     /// other findings reader shares, so this surface builds its rows from the recommendation
     /// itself rather than from that row.
+    ///
+    /// `databases` are the analysed databases the plan resolved
+    /// ([`ExportPlan::analysed_databases`]), which is the SAME selection
+    /// `GetRDSDatabaseRecommendations` reads, so a file and a read of that moment hold the
+    /// same databases.
     fn rds_database_export_rows(
         &self,
+        databases: &[AnalysedResource],
         region: &str,
         requested_architectures: &[String],
         last_refresh: Option<f64>,
     ) -> Vec<ExportRow> {
-        let account_id = ::engine::emulator_account_id();
-        let by_type = self.analysed_resources_by_type(account_id);
-        by_type
-            .get(RESOURCE_TYPE_RDS_DB_INSTANCE)
-            .map(|resources| {
-                resources
-                    .iter()
-                    .map(|resource| {
-                        // The recommendation is built under the CPU vendor architectures the
-                        // EXPORT request asked for, exactly as the reader builds it under the
-                        // ones a read asks for, so the file's
-                        // `EffectiveRecommendationPreferences*` columns state the preferences
-                        // the exported recommendation was generated under.
-                        let recommendation = self.rds_recommendation(
-                            resource,
-                            region,
-                            Some(requested_architectures),
-                        );
-                        rds_database_row(&recommendation, last_refresh)
-                    })
-                    .collect()
+        databases
+            .iter()
+            .map(|resource| {
+                // The recommendation is built under the CPU vendor architectures the EXPORT
+                // request asked for, exactly as the reader builds it under the ones a read
+                // asks for, so the file's `EffectiveRecommendationPreferences*` columns state
+                // the preferences the exported recommendation was generated under.
+                let recommendation =
+                    self.rds_recommendation(resource, region, Some(requested_architectures));
+                rds_database_row(&recommendation, last_refresh)
             })
-            .unwrap_or_default()
+            .collect()
     }
 
     /// The export rows of the commercial software license inventory: one per licensed

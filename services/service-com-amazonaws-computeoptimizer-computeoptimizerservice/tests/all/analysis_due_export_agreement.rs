@@ -22,16 +22,19 @@
 //! Amazon S3's own path-style `GetObject`.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::{json, Value};
 use service_com_amazonaws_computeoptimizer_computeoptimizerservice::state::{
-    ANALYSIS_DELAY, EXPORT_JOB_STEP,
+    service_state, AnalysedResource, RdsDatabaseDetail, ANALYSIS_DELAY, EXPORT_JOB_STEP,
+    SOURCE_TYPE_RDS_DB_INSTANCE,
 };
 use smithy_server_runtime::MultiServiceRouter;
 
 use crate::harness::{
-    call, cell, create_bucket, csv_rows, emulator, export_destination, get_object, opt_in, ACCOUNT,
+    call, cell, create_bucket, csv_rows, emulator_with_engine, export_destination, get_object,
+    opt_in, ACCOUNT,
 };
 
 /// The destination bucket these fixtures export to.
@@ -221,6 +224,34 @@ async fn exported_arns(
     (exported, data.len())
 }
 
+/// Record one analysed Amazon Aurora or RDS database into the findings catalog, the way
+/// Compute Optimizer's own analysis of an observed workload would: a database recommendation
+/// is an analysis of a DB instance the account owns, so the database surface has one to serve
+/// only once such an analysis exists.
+fn record_analysed_database(engine: &Arc<engine::InMemoryEngine>) {
+    let state = service_state(&**engine).expect("the engine bears this service's state");
+    state.lock().analysed_resources.push(AnalysedResource {
+        account_id: ACCOUNT.to_string(),
+        resource_type: SOURCE_TYPE_RDS_DB_INSTANCE.to_string(),
+        // The catalog records a resource's REGION-FREE identity; the ARN reported for it names
+        // the region of the endpoint that reports it.
+        arn_service: "rds".to_string(),
+        arn_resource: "db:ledger-primary".to_string(),
+        finding: "Overprovisioned".to_string(),
+        finding_reason_codes: Vec::new(),
+        current_performance_risk: "Low".to_string(),
+        current_monthly_cost: 200.0,
+        recommended_monthly_cost: 150.0,
+        inferred_workload_types: Vec::new(),
+        rds_database: Some(RdsDatabaseDetail {
+            engine: Some("postgres".to_string()),
+            current_db_instance_class: Some("db.r6g.2xlarge".to_string()),
+            recommended_db_instance_class: Some("db.r6g.xlarge".to_string()),
+            ..RdsDatabaseDetail::default()
+        }),
+    });
+}
+
 /// One enrollment, two instants, every surface pair: while the analysis the enrollment started
 /// is not due the reader reports nothing and an export asked for then holds its header row
 /// alone; once it is due the reader reports the analysis and an export asked for then holds the
@@ -230,7 +261,8 @@ async fn the_reader_and_the_export_of_one_analysis_agree_about_whether_it_exists
     for surface in surfaces() {
         // A fresh emulator per row: only one export job of a resource type is in progress per
         // Region at a time, and each row creates two.
-        let router = emulator();
+        let (router, engine) = emulator_with_engine();
+        record_analysed_database(&engine);
         create_bucket(&router, BUCKET).await;
         opt_in(&router).await;
 

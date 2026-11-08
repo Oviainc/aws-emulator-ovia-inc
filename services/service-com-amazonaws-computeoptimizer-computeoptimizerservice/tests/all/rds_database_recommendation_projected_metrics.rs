@@ -37,7 +37,7 @@ use crate::harness::{call, call_in_region, emulator_with_engine, error_code, opt
 /// unless it names another.
 const REGION: &str = "us-east-1";
 
-/// The account the emulator's own findings catalog is seeded for, and the database it holds.
+/// The account this service answers for, as a findings-catalog row records it.
 const SEEDED_ACCOUNT: &str = "000000000000";
 
 /// The first data point every window below asks for, in epoch seconds.
@@ -894,6 +894,26 @@ async fn the_read_waits_for_the_enrollment_and_the_analysis() {
 async fn the_projected_option_is_the_recommended_option() {
     let (router, engine) = emulator_with_engine();
     opt_in(&router).await;
+    // The database this projection is of: an over-provisioned instance the analysis would move
+    // to half the capacity, recorded the way Compute Optimizer's own analysis would.
+    record(
+        &engine,
+        &[database(
+            "orders-primary",
+            "Overprovisioned",
+            300.0,
+            225.0,
+            detail(
+                "db.r6g.2xlarge",
+                Some("db.r6g.xlarge"),
+                vec![
+                    metric("CPU", "Maximum", 17.5),
+                    metric("Memory", "Maximum", 24.0),
+                    metric("DatabaseConnections", "Maximum", 12.0),
+                ],
+            ),
+        )],
+    );
     // The catalog is read only once the analysis the enrollment started is due.
     tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
     let before = catalog_size(&engine);
@@ -907,7 +927,7 @@ async fn the_projected_option_is_the_recommended_option() {
     .await;
     assert_eq!(
         status, 200,
-        "the recommendation of the seeded database: got {status}: {recommendations}"
+        "the recommendation of the recorded database: got {status}: {recommendations}"
     );
     let recommended = &recommendations["rdsDBRecommendations"][0]["instanceRecommendationOptions"]
         [0]["dbInstanceClass"];
@@ -919,8 +939,8 @@ async fn the_projected_option_is_the_recommended_option() {
         "startTime": WINDOW_START,
         "endTime": WINDOW_START + 3 * 3_600,
     });
-    let response = projected(&router, "the seeded database", body.clone()).await;
-    let option = only_option("the seeded database", &response);
+    let response = projected(&router, "the recorded database", body.clone()).await;
+    let option = only_option("the recorded database", &response);
     assert_eq!(
         &option["recommendedDBInstanceClass"], recommended,
         "the projection is onto the recommended option: {option} vs {recommendations}"

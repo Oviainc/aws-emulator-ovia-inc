@@ -6,17 +6,18 @@
 //! recommendations for Amazon Aurora and RDS databases that meet a specific set of
 //! requirements.
 //!
-//! A REPORTING operation: it selects and pages over the rows this service's findings
-//! catalog ([`crate::state::AnalysedResource`]) holds for the resources analysed as
-//! `RdsDBInstance` — the `RecommendationSourceType` the model's `RDSDBRecommendation`
-//! describes — and writes nothing. Compute Optimizer's own analysis of an observed workload
-//! is what produces such a row, so no request to this API creates one and this handler never
-//! invents one: every member it reports is computed from the stored row (its finding, reason
-//! codes, performance risk, database configuration and monthly costs) and from the
-//! preferences stored for that database, and a member the analysis recorded nothing for is
-//! omitted rather than filled in. A requested resource the catalog holds no database row for
-//! is simply absent from the answer, which stays a successful empty result rather than a
-//! per-resource failure of the request.
+//! A REPORTING operation: it selects and pages over the databases this account has an
+//! analysis for ([`crate::state::analysed_databases`]) — the DB instances of its own Amazon
+//! RDS inventory, analysed from the utilization published for them, beside any row this
+//! service's findings catalog ([`crate::state::AnalysedResource`]) holds — and writes
+//! nothing. Compute Optimizer's own analysis of an observed workload is what produces such a
+//! row, so no request to this API creates one and this handler never invents one: every
+//! member it reports is computed from the analysed row (its finding, reason codes,
+//! performance risk, database configuration and monthly costs) and from the preferences
+//! stored for that database, and a member the analysis recorded nothing for is omitted rather
+//! than filled in. A requested resource the account holds no database analysis for is simply
+//! absent from the answer, which stays a successful empty result rather than a per-resource
+//! failure of the request.
 //!
 //! The rows it reports are those of the ONE account it answers for: `accountIds` names a
 //! member account of an organization, which this emulator has none of, so a well-formed id
@@ -298,20 +299,28 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // names carry that region.
         let region = crate::state::request_region(ctx);
 
-        // The databases the request selects: those the account it asks about owns, of the
-        // named resources, whose recommendation satisfies every filter. A caller sees the
-        // catalog's rows only once the analysis its enrollment started is due
-        // ([`crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::visible_analysed_resources`]),
-        // so a just-enrolled account reads no recommendation rather than one nothing has
-        // produced yet. A member the request omits selects nothing away. The account is
-        // never a filter key a request chooses: it is the ONE account this service answers
-        // for ([`requested_account_id`]), so a row
-        // another account owns is reported to nobody. The filters read the REPORTED
+        // The databases the request selects: those the account it asks about holds an analysis
+        // for, of the named resources, whose recommendation satisfies every filter. WHICH
+        // databases the account has an analysis for is the crate's one rule for it
+        // ([`crate::state::analysed_databases`]): the DB instances of its own Amazon RDS
+        // inventory that this endpoint's region holds, are running, and have published
+        // utilization over the look-back period, beside any row the findings catalog holds —
+        // so a database this account does not own is reported to nobody, and an account that
+        // owns none reads the empty list rather than a finding nothing produced. A caller
+        // sees an analysis only once the one its enrollment started is due, so a just-enrolled
+        // account reads nothing either. A member the request omits selects nothing away. The
+        // account is never a filter key a request chooses: it is the ONE account this service
+        // answers for ([`requested_account_id`]). The filters read the REPORTED
         // recommendation, so they select on exactly the values the response carries.
-        let selected: Vec<RDSDBRecommendation> = store
-            .visible_analysed_resources()
-            .filter(|resource| resource.resource_type == crate::state::SOURCE_TYPE_RDS_DB_INSTANCE)
-            .filter(|resource| resource.account_id == account_id)
+        let analysed = crate::state::analysed_databases(
+            &*self.engine,
+            store,
+            &region,
+            &account_id,
+            crate::state::now_secs(),
+        );
+        let selected: Vec<RDSDBRecommendation> = analysed
+            .iter()
             .filter(|resource| {
                 resource_arns.is_empty() || resource_arns.contains(&resource.arn_in(&region))
             })

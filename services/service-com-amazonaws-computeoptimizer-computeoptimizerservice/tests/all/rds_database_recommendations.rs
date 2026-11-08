@@ -114,10 +114,67 @@ fn storage(storage_type: &str, allocated: i32, iops: i32) -> DBStorageConfigurat
     }
 }
 
-/// The analysis output every fixture below reads: five analysed databases of the account
-/// this service answers for, covering every `RDSInstanceFinding` plus the one finding only
-/// `RDSStorageFinding` declares, recommendations that save / grow / change nothing, and a
-/// row whose database configuration the analysis did not record.
+/// The first analysed database every fixture below records: an over-provisioned PostgreSQL
+/// instance the analysis would move to the next class down. The row
+/// [`an_analysed_database_is_reported_from_its_catalog_row`] reads member for member, and the
+/// first row of the catalog the selection and paging fixtures walk.
+fn primary_database() -> AnalysedResource {
+    analysed_database(
+        own_account(),
+        "db:orders-primary",
+        "Overprovisioned",
+        &[],
+        "Medium",
+        300.0,
+        225.0,
+        Some(RdsDatabaseDetail {
+            // `Engine`/`EngineVersion` are free-form strings in the model; these are the
+            // engine name and version an RDS PostgreSQL instance reports.
+            engine: Some("postgres".to_string()),
+            engine_version: Some("15.4".to_string()),
+            // Not a cluster member, so no promotion tier and no cluster identifier.
+            promotion_tier: None,
+            db_cluster_identifier: None,
+            current_db_instance_class: Some("db.r6g.2xlarge".to_string()),
+            recommended_db_instance_class: Some("db.r6g.xlarge".to_string()),
+            current_storage_configuration: Some(DBStorageConfiguration {
+                storage_type: Some("gp3".to_string()),
+                allocated_storage: 500,
+                iops: Some(3_000),
+                max_allocated_storage: Some(1_000),
+                storage_throughput: Some(125),
+            }),
+            // The analysis would keep the storage as it is: its finding is about the
+            // instance, so there is no storage configuration to move to.
+            recommended_storage_configuration: None,
+            // `RDSDBMetricName` / `RDSDBMetricStatistic` values.
+            utilization_metrics: vec![
+                RDSDBUtilizationMetric {
+                    name: Some("CPU".to_string()),
+                    statistic: Some("Maximum".to_string()),
+                    value: 17.5,
+                },
+                RDSDBUtilizationMetric {
+                    name: Some("Memory".to_string()),
+                    statistic: Some("Maximum".to_string()),
+                    value: 24.0,
+                },
+                RDSDBUtilizationMetric {
+                    name: Some("DatabaseConnections".to_string()),
+                    statistic: Some("Maximum".to_string()),
+                    value: 12.0,
+                },
+            ],
+            last_refresh_timestamp: None,
+            tags: Vec::new(),
+        }),
+    )
+}
+
+/// The analysis output every fixture below reads beside [`primary_database`]: five analysed
+/// databases of the account this service answers for, covering every `RDSInstanceFinding` plus
+/// the one finding only `RDSStorageFinding` declares, recommendations that save / grow /
+/// change nothing, and a row whose database configuration the analysis did not record.
 fn corpus() -> Vec<AnalysedResource> {
     vec![
         // Over-provisioned: the recommendation is a smaller DB instance class, so it saves.
@@ -264,7 +321,7 @@ fn reported_arns(body: &Value) -> Vec<String> {
 }
 
 /// An emulator whose account is opted in, whose analysis is due and whose findings catalog
-/// holds [`corpus`].
+/// holds [`primary_database`] and then [`corpus`].
 ///
 /// A recommendation is reported only once the analysis the enrollment started is due
 /// ([`ANALYSIS_DELAY`]), so the fixture waits that span out before reading, the way every
@@ -277,6 +334,7 @@ async fn emulator_with_corpus() -> (
     let (router, engine) = emulator_with_engine();
     opt_in(&router).await;
     let corpus = corpus();
+    record(&engine, &[primary_database()]);
     record(&engine, &corpus);
     tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
     (router, engine, corpus)
@@ -324,14 +382,15 @@ fn assert_members(case: &str, reported: &Value, expected: &Value) {
     }
 }
 
-/// The database the emulator's own findings catalog holds is reported from that row, member
-/// for member, and the savings it reports are the ones `GetRecommendationSummaries`
-/// aggregates for the same resource type — one catalog seen two ways. A read reports: it
-/// must not change what a later caller sees.
+/// An analysed database the findings catalog holds is reported from that row, member for
+/// member, and the savings it reports are the ones `GetRecommendationSummaries` aggregates
+/// for the same resource type — one catalog seen two ways. A read reports: it must not change
+/// what a later caller sees.
 #[tokio::test]
-async fn the_seeded_analysed_database_is_reported_from_its_catalog_row() {
+async fn an_analysed_database_is_reported_from_its_catalog_row() {
     let (router, engine) = emulator_with_engine();
     opt_in(&router).await;
+    record(&engine, &[primary_database()]);
     // The catalog is read only once the analysis the enrollment started is due.
     tokio::time::sleep(ANALYSIS_DELAY + Duration::from_millis(100)).await;
     let seeded = db_arn(own_account(), "orders-primary");
@@ -775,8 +834,8 @@ async fn the_read_selects_by_resource_account_and_filter() {
 async fn another_account_is_refused_and_its_analysed_database_is_reported_to_nobody() {
     let (router, engine, corpus) = emulator_with_corpus().await;
 
-    // What the catalog holds for the account this service answers for: the database the
-    // emulator seeds plus the recorded corpus, in catalog order.
+    // What the catalog holds for the account this service answers for: the primary database
+    // plus the recorded corpus, in catalog order.
     let mut own_databases = vec![db_arn(own_account(), "orders-primary")];
     own_databases.extend(corpus.iter().map(|resource| resource.arn_in(REGION)));
 
@@ -1330,7 +1389,7 @@ async fn the_reported_arn_names_the_region_the_endpoint_serves() {
         let reported = reported_arns(&body);
         assert_eq!(
             reported.len(),
-            corpus().len() + 1,
+            corpus().len(),
             "region {region:?}: every analysed database is this region's, got {body}"
         );
         for arn in &reported {

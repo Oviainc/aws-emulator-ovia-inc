@@ -28,6 +28,10 @@ sha2 = { workspace = true }
 # The Amazon ECS inventory an ECS service recommendation is computed over: the service's
 # launch type, its task definition's task-level CPU/memory and its container definitions.
 service-com-amazonaws-ecs-amazonec2containerservicev20141113 = { workspace = true }
+# The Amazon RDS inventory an Amazon Aurora or RDS database recommendation is computed over:
+# the DB instances the account owns, their DB instance class, engine and storage, and the
+# classes that service publishes as orderable for an engine.
+service-com-amazonaws-rds-amazonrdsv19 = { workspace = true }
 # The observed utilization an ECS service recommendation is computed from: the
 # `AWS/ECS` `CPUUtilization` / `MemoryUtilization` datapoints published for the service.
 service-com-amazonaws-cloudwatch-graniteserviceversion20100801 = { workspace = true }

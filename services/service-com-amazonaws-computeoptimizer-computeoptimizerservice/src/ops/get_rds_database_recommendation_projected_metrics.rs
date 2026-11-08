@@ -279,16 +279,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // endpoint: the database it asks about is that region's, and a resource named by the
         // ARN of another region is one this endpoint holds no analysis for.
         let region = crate::state::request_region(ctx);
-        // The databases a caller can read: those of the findings catalog, which a caller sees
-        // only once the analysis its enrollment started is due
-        // ([`crate::state::ComAmazonawsComputeoptimizerComputeoptimizerserviceState::visible_analysed_resources`]),
-        // so a database the analysis has not reached yet is reported exactly as one this
-        // service holds no analysis for — the gate every recommendation reader of this
-        // service applies.
-        let Some(resource) = guard.visible_analysed_resources().find(|resource| {
-            resource.resource_type == crate::state::SOURCE_TYPE_RDS_DB_INSTANCE
-                && resource.arn_in(&region) == input.resource_arn
-        }) else {
+        // The databases a caller can read: those the account holds an analysis for, by the
+        // crate's one rule for it ([`crate::state::analysed_databases`]) — the DB instances of
+        // its own Amazon RDS inventory that this endpoint's region holds and has published
+        // utilization for, beside any row the findings catalog holds — and only once the
+        // analysis its enrollment started is due, the gate every recommendation reader of
+        // this service applies. So a database the analysis has not reached yet is reported
+        // exactly as one this service holds no analysis for.
+        let analysed = crate::state::analysed_databases(
+            &*self.engine,
+            &guard,
+            &region,
+            ::engine::emulator_account_id(),
+            crate::state::now_secs(),
+        );
+        let Some(resource) = analysed
+            .iter()
+            .find(|resource| resource.arn_in(&region) == input.resource_arn)
+        else {
             // A resource this service holds no database analysis for has no projection to
             // report, and that is not a failed request: `recommendedOptionProjectedMetrics`
             // is an optional list with no required member, so the answer is the EMPTY list

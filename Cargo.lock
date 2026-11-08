@@ -9953,6 +9953,7 @@ dependencies = [
  "serde_json",
  "service-com-amazonaws-cloudwatch-graniteserviceversion20100801",
  "service-com-amazonaws-ecs-amazonec2containerservicev20141113",
+ "service-com-amazonaws-rds-amazonrdsv19",
  "service-com-amazonaws-s3-amazons3",
  "sha2 0.10.9",
  "tokio",

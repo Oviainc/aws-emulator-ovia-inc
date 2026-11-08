@@ -11,10 +11,13 @@
 //! Compute Optimizer does not stand alone: an Amazon ECS service recommendation is computed
 //! over the ECS service the ECS emulator holds and the `AWS/ECS` utilization the CloudWatch
 //! emulator holds, so [`emulator_with_analysed_services`] mounts all three on ONE engine —
-//! exactly what `core/router` assembles. Amazon S3 is mounted by every emulator here for the
-//! same reason: a recommendations export is written into a bucket of the one object store
-//! this emulator holds, so an export suite CREATES its destination bucket over S3's own wire
-//! ([`create_bucket`]) and reads the exported objects back over it ([`get_object`]).
+//! exactly what `core/router` assembles. An Amazon Aurora or RDS database recommendation is
+//! computed the same way over the DB instances the Amazon RDS emulator holds and the
+//! `AWS/RDS` utilization published for them, which is what
+//! [`emulator_with_analysed_databases`] mounts. Amazon S3 is mounted by every emulator here
+//! for the same reason: a recommendations export is written into a bucket of the one object
+//! store this emulator holds, so an export suite CREATES its destination bucket over S3's own
+//! wire ([`create_bucket`]) and reads the exported objects back over it ([`get_object`]).
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -104,6 +107,91 @@ pub(crate) fn emulator_with_analysed_services_and_engine(
         Arc::clone(&engine),
     ));
     (router, engine)
+}
+
+/// Compute Optimizer, Amazon RDS and CloudWatch over ONE engine: the emulator a suite needs
+/// to drive an Amazon Aurora or RDS database recommendation, which is computed over the DB
+/// instances the Amazon RDS emulator holds and the `AWS/RDS` utilization published for them.
+pub(crate) fn emulator_with_analysed_databases() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>)
+{
+    let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
+    let mut router = MultiServiceRouter::new();
+    router.set_request_authentication(false);
+    router.register_service(EmulatedService::new(Arc::clone(&engine)));
+    router.register_service(
+        service_com_amazonaws_rds_amazonrdsv19::EmulatedService::new(Arc::clone(&engine)),
+    );
+    router.register_service(
+        service_com_amazonaws_cloudwatch_graniteserviceversion20100801::EmulatedService::new(
+            Arc::clone(&engine),
+        ),
+    );
+    router.register_service(service_com_amazonaws_s3_amazons3::EmulatedService::new(
+        Arc::clone(&engine),
+    ));
+    (router, engine)
+}
+
+/// One Amazon RDS call at the endpoint of `region`: an `awsQuery` `POST /` whose body carries
+/// the `Action`, the API `Version` and the request's parameters, as an SDK sends one.
+pub(crate) async fn call_rds_in(
+    router: &MultiServiceRouter,
+    region: &str,
+    action: &str,
+    params: &[(&str, String)],
+) -> (u16, String) {
+    let mut body = format!("Action={action}&Version=2014-10-31");
+    for (name, value) in params {
+        body.push('&');
+        body.push_str(name);
+        body.push('=');
+        body.push_str(&form_encode(value));
+    }
+    let request = http::Request::builder()
+        .method("POST")
+        .uri("https://rds.amazonaws.com/")
+        .header("content-type", "application/x-www-form-urlencoded")
+        // The SigV4 credential scope is what routes a request to its service, and the region
+        // it names is the regional endpoint the request addressed.
+        .header(
+            "authorization",
+            format!(
+                "AWS4-HMAC-SHA256 \
+                 Credential=AKIDEXAMPLE/20260101/{region}/rds/aws4_request, \
+                 SignedHeaders=host, Signature=not-verified"
+            ),
+        )
+        .body(Bytes::from(body))
+        .expect("build the request");
+    let response = router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let body = String::from_utf8(response.body().to_vec()).expect("a UTF-8 response body");
+    (status, body)
+}
+
+/// One Amazon RDS call at the endpoint every suite here signs for ([`REGION`]).
+pub(crate) async fn call_rds(
+    router: &MultiServiceRouter,
+    action: &str,
+    params: &[(&str, String)],
+) -> (u16, String) {
+    call_rds_in(router, REGION, action, params).await
+}
+
+/// One form value as a client puts it in an `application/x-www-form-urlencoded` body: every
+/// byte outside the unreserved set (`A-Z`, `a-z`, `0-9`, `-`, `_`, `.`, `~`) is
+/// percent-escaped.
+fn form_encode(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(char::from(byte));
+            }
+            other => encoded.push_str(&format!("%{other:02X}")),
+        }
+    }
+    encoded
 }
 
 /// The endpoint every Amazon S3 request below is addressed to (its `Host`), which is what
