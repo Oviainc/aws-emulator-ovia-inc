@@ -150,6 +150,10 @@ mod kafka_placement_subnets_resolve_in_ec2;
 // the sorted `b…` span (where every batch suite would land) are both regions concurrently
 #[path = "all/batch_job_state_change_is_scoped_to_its_own_job_queue.rs"]
 mod batch_job_state_change_is_scoped_to_its_own_job_queue;
+// Declared beside the suite above it shares its three services with: the same publication,
+// on a router that verifies request signatures.
+#[path = "all/batch_job_state_change_on_an_authenticating_router.rs"]
+mod batch_job_state_change_on_an_authenticating_router;
 // the sorted `t…` span are both regions concurrently landing suites add their line to.
 #[path = "all/tagged_hosted_zone_selects_a_sending_domain.rs"]
 mod tagged_hosted_zone_selects_a_sending_domain;
