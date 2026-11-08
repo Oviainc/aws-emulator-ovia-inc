@@ -841,8 +841,8 @@ async fn describe_resumes_from_the_marker() {
         "case \"the first page\": a full page must carry a Marker: {first}"
     );
 
-    // Resuming AT the token for a name reports that name and the ones after it: the
-    // marker is the opaque token for the key the next page starts at.
+    // Resuming from the token for a name reports the names BEYOND it: the marker is the
+    // opaque token for the last key its own page served.
     let resumed = expect_ok(
         "resume from the second name",
         describe(
@@ -854,7 +854,7 @@ async fn describe_resumes_from_the_marker() {
     let reported = reported_names(&resumed);
     assert_eq!(
         reported,
-        vec![names[1].to_string(), names[2].to_string()],
+        vec![names[2].to_string()],
         "case \"resume from the second name\": got {reported:?} in {resumed}"
     );
     assert!(

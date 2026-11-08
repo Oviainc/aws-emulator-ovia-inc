@@ -213,6 +213,8 @@ mod option_group_setting_catalog;
 mod option_groups;
 #[path = "all/orderable_db_instance_options.rs"]
 mod orderable_db_instance_options;
+#[path = "all/pagination_marker_positions.rs"]
+mod pagination_marker_positions;
 #[path = "all/parameter_group_and_snapshot_copies.rs"]
 mod parameter_group_and_snapshot_copies;
 #[path = "all/parameter_refusal_codes.rs"]

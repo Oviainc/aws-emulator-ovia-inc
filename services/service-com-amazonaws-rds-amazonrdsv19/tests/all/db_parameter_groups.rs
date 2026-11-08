@@ -749,15 +749,16 @@ async fn the_describe_refuses_what_it_cannot_serve_and_pages_what_it_can() {
     );
     assert_eq!(
         texts(&first, "DBParameterGroupName"),
-        names[..page_size].to_vec(),
-        "case \"the first page\": expected the first {page_size} groups in name order, got {first}"
+        names[1..=page_size].to_vec(),
+        "case \"the first page\": expected the {page_size} groups after the marker in name \
+         order, got {first}"
     );
     let marker = text(&first, "Marker");
     assert_eq!(
         marker,
         state::encode_marker(&names[page_size]),
-        "case \"the first page\": the marker must be the opaque token for the group the \
-         next page starts at, got {first}"
+        "case \"the first page\": the marker must be the opaque token for the last group the \
+         page served, got {first}"
     );
 
     let second = expect_ok(
@@ -774,7 +775,7 @@ async fn the_describe_refuses_what_it_cannot_serve_and_pages_what_it_can() {
     );
     assert_eq!(
         texts(&second, "DBParameterGroupName"),
-        names[page_size..].to_vec(),
+        names[page_size + 1..].to_vec(),
         "case \"the second page\": expected the groups after the marker, got {second}"
     );
     assert!(

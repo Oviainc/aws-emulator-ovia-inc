@@ -26,8 +26,8 @@
 //! * `RegisterDBProxyTargets` and `DeregisterDBProxyTargets` answer
 //!   `InvalidParameterCombination` (400) for a request that names no database with one fixed
 //!   sentence that names the two KINDS of database rather than the two members.
-//! * Every paginated report answers `InvalidParameterValue` (400) for a `Marker` no prior
-//!   page issued, ECHOING the token the request carried.
+//! * Every paginated report answers `InvalidParameterValue` (400) for a `Marker` this
+//!   service's codec could not have produced, ECHOING the token the request carried.
 //!
 //! Each table spans what the rule generalises over: which status blocks the instance call
 //! (still coming up, stopping, stopped, starting) across engine families and instance
@@ -36,15 +36,14 @@
 //! pending changes, how many are pending and how the reset was asked for (every parameter,
 //! the pending one by name, another one by name); which proxy call refused and how its
 //! request came to name no database; and the shape of the rejected marker (punctuation only,
-//! a word, one character, a well-formed token of this service's own codec naming no record,
-//! one carrying characters the XML envelope has to escape) across the reports that serve a
-//! `Marker`.
+//! a word, one character, encoded bytes that are no key at all, one carrying characters the
+//! XML envelope has to escape) across the reports that serve a `Marker`.
 //!
 //! Every call goes over the wire through the harness in `db_instances.rs`, so each assertion
 //! reads the XML the emulator itself answered with.
 
 use service_com_amazonaws_rds_amazonrdsv19::state::{
-    create_db_snapshot_instance_state_message, encode_marker, failover_needs_two_instances_message,
+    create_db_snapshot_instance_state_message, failover_needs_two_instances_message,
     invalid_marker_message, parameter_has_pending_changes_message,
     reboot_db_instance_state_message, start_db_instance_state_message,
     stop_db_instance_state_message, DB_INSTANCE_STATUS_STARTING, DB_INSTANCE_STATUS_STOPPED,
@@ -781,16 +780,13 @@ async fn an_unissued_marker_is_echoed_back_by_every_paginated_report() {
         .await;
 
     // `(case, the Marker the request carries)`. The rows differ along the SHAPE of the
-    // token, including one this service's own codec would have produced for a key no result
-    // set holds and one whose characters the XML envelope has to escape.
+    // token, including one whose characters the codec reads but whose bytes are no key, and
+    // one whose characters the XML envelope has to escape.
     let markers: Vec<(&str, String)> = vec![
         ("punctuation only", "!!!!".to_string()),
         ("a word", "not-a-marker".to_string()),
         ("one character", "m".to_string()),
-        (
-            "a well-formed token naming no record",
-            encode_marker("no-such-key"),
-        ),
+        ("encoded bytes that are no key", "/////w==".to_string()),
         (
             "characters the envelope has to escape",
             "a&b<c>\"d'".to_string(),

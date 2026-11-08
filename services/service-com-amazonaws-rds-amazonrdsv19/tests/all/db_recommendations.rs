@@ -959,8 +959,8 @@ const REFUSAL_CASES: &[RefusalCase] = &[
         message: None,
     },
     RefusalCase {
-        case: "a marker no prior page issued",
-        params: &[("Marker", "bm90LWEtbWFya2Vy")],
+        case: "a marker this service's codec could not have produced",
+        params: &[("Marker", "not~a~token")],
         status: 400,
         code: "InvalidParameterValue",
         message: None,

@@ -191,8 +191,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|(_, family)| matches_request(family, &input))
             .map(|(index, family)| (page_key(index), to_wire(family)))
             .collect();
-        // A `Marker` no prior page issued is refused rather than resynchronised: see
-        // `crate::state::paginate`.
+        // A `Marker` is placed in the report's own order and the page resumes BEYOND it; a
+        // token this codec could not have produced is refused: see `crate::state::paginate`.
         let page = crate::state::paginate(matching, input.marker.as_deref(), page_size)
             .map_err(DescribeDBMajorEngineVersionsError::invalid_parameter_value)?;
         Ok(DescribeDBMajorEngineVersionsOutput {

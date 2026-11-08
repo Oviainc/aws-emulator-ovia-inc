@@ -192,8 +192,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .collect();
 
-        // A `Marker` no prior page issued is refused rather than resynchronised: see
-        // `crate::state::paginate`.
+        // A `Marker` is placed in the report's own order and the page resumes BEYOND it; a
+        // token this codec could not have produced is refused: see `crate::state::paginate`.
         let page = crate::state::paginate(records, input.marker.as_deref(), page_size)
             .map_err(DescribeEngineDefaultClusterParametersError::invalid_parameter_value)?;
         Ok(DescribeEngineDefaultClusterParametersOutput {

@@ -3526,10 +3526,13 @@ pub fn check_option_list_len(member: &str, len: usize) -> Result<(), String> {
 
 /// One page of an ordered result set, plus the `Marker` to resume from.
 ///
-/// The marker names the record the next page starts AT, so resuming is a single lookup
-/// and a page boundary cannot drift when a record is added or removed between calls. A
-/// marker is returned only while records remain, which is what `@paginated` callers loop
-/// on.
+/// The marker names the LAST record the page SERVED, because that is the position a resume
+/// is defined against: "the response includes only records beyond the marker"
+/// (`DescribeDBParametersMessage$Marker` and every other paginated report of this front
+/// door). So the next page is whatever the report holds after that position, and a page
+/// boundary cannot drift — nor repeat a record — when a record is added or removed between
+/// calls. A marker is returned only while records remain, which is what `@paginated`
+/// callers loop on.
 pub struct Page<T> {
     pub items: Vec<T>,
     pub next_marker: Option<String>,
@@ -3541,9 +3544,9 @@ pub struct Page<T> {
 /// (`DBEngineVersionMessage$Marker` and every other paginated report of this front door):
 /// the token is OPAQUE, so a caller echoes it back verbatim and parses nothing out of it,
 /// and the service is free to carry in it whatever it needs to resume. This one carries
-/// the key of the record the next page starts at, encoded so that nothing of the result
-/// set's internal key form reaches the wire and so that a token is recognisably a token
-/// rather than a name a caller could have invented.
+/// the key of the last record the page served, encoded so that nothing of the result set's
+/// internal key form reaches the wire and so that a token is recognisably a token rather
+/// than a name a caller could have invented.
 ///
 /// The codec is `aws_smithy_types::base64` — already in this crate's dependency tree,
 /// because it is the one the wire protocols use for a blob — rather than a hand-rolled
@@ -3552,13 +3555,13 @@ pub fn encode_marker(key: &str) -> String {
     ::aws_smithy_types::base64::encode(key)
 }
 
-/// The result-set key a `Marker` carries, or `None` when the token is not one this
-/// service issued at all.
+/// The result-set key a `Marker` carries, or `None` when the token is not one this front
+/// door's codec could have produced at all.
 pub fn decode_marker(marker: &str) -> Option<String> {
     String::from_utf8(::aws_smithy_types::base64::decode(marker).ok()?).ok()
 }
 
-/// The refusal Amazon RDS answers a `Marker` no prior page issued with.
+/// The refusal Amazon RDS answers a `Marker` it cannot place in the report with.
 ///
 /// The one variable part is the token the REQUEST carried, echoed verbatim so a caller
 /// looping over pages can see which of the markers it holds was rejected; the rest is fixed
@@ -3570,16 +3573,20 @@ pub fn invalid_marker_message(marker: &str) -> String {
     )
 }
 
-/// Take the page of `records` that starts at `marker` and holds at most
-/// `page_size` items. `records` must be in the order the report serves them.
+/// Take the page of `records` that resumes after `marker` and holds at most `page_size`
+/// items. `records` must be in the order the report serves them.
 ///
-/// A `marker` is only ever a token this service issued for a key of the result set —
-/// that is what this function returns as `next_marker` — so a token that decodes to no
-/// key of `records`, or that does not decode at all, is one no prior page can have
-/// issued. It is REFUSED (the returned message is what the caller refuses the request
-/// with) rather than resynchronised to the nearest key: a paginator that silently
-/// restarts on a cursor the service never handed out reports a page the caller cannot
-/// place, and the real service answers an invalid-parameter error instead.
+/// A `Marker` names a POSITION in that order — the last record the page that issued it
+/// served — and the page it resumes is "only records beyond the marker"
+/// (`DescribeDBParametersMessage$Marker`). So the token is placed rather than required to
+/// still be a record: the report resumes at the first record after the key the token
+/// carries, which is the same page whether or not that record is still there. A report
+/// whose own order is NOT its key order can only place a key it still holds, so a token
+/// naming a key outside it is refused there.
+///
+/// A token this front door's codec could not have produced is REFUSED (the returned message
+/// is what the caller refuses the request with): it names no position at all, and
+/// resynchronising it to the first page would report a page the caller cannot place.
 pub fn paginate<T>(
     records: Vec<(String, T)>,
     marker: Option<&str>,
@@ -3587,14 +3594,17 @@ pub fn paginate<T>(
 ) -> Result<Page<T>, String> {
     let start = match marker {
         None => 0,
-        Some(marker) => decode_marker(marker)
-            .and_then(|key| records.iter().position(|(held, _)| *held == key))
-            // The wording Amazon RDS answers a marker it never issued with: it echoes the
-            // token the request carried and tells the caller the two ways to ask again.
+        // The wording Amazon RDS answers a marker it cannot place with: it echoes the token
+        // the request carried and tells the caller the two ways to ask again.
+        Some(marker) => resume_after(&records, marker)
             .ok_or_else(|| invalid_marker_message(marker))?,
     };
     let end = start.saturating_add(page_size).min(records.len());
-    let next_marker = records.get(end).map(|(key, _)| encode_marker(key));
+    let next_marker = (end < records.len())
+        .then(|| end.checked_sub(1))
+        .flatten()
+        .and_then(|last| records.get(last))
+        .map(|(key, _)| encode_marker(key));
     let items = records
         .into_iter()
         .skip(start)
@@ -3602,6 +3612,26 @@ pub fn paginate<T>(
         .map(|(_, record)| record)
         .collect();
     Ok(Page { items, next_marker })
+}
+
+/// Where in `records` a report resumes for the token `marker`: the index of the first record
+/// beyond the position that token names, or `None` when the token names no position in this
+/// report at all.
+///
+/// The key the token carries is placed two ways, in this order:
+///
+/// * the record that holds it, when the report still holds it — the common case, and the
+///   only one a report in any order can answer;
+/// * otherwise, in a report whose records are in ascending key order, the key's own place in
+///   that order, so a record that was removed between two calls does not cost the caller the
+///   rest of the report.
+fn resume_after<T>(records: &[(String, T)], marker: &str) -> Option<usize> {
+    let key = decode_marker(marker)?;
+    if let Some(index) = records.iter().position(|(held, _)| *held == key) {
+        return Some(index.saturating_add(1));
+    }
+    let ascending = records.is_sorted_by_key(|(key, _)| key);
+    ascending.then(|| records.partition_point(|(held, _)| *held <= key))
 }
 
 // ---------------------------------------------------------------------------

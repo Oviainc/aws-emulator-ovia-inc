@@ -676,10 +676,10 @@ async fn the_report_pages_at_max_records_and_resumes_from_its_marker() {
         "expected no marker where no record remains, got {second}"
     );
     assert_eq!(
-        second_page.first().map(|identifier| state::encode_marker(identifier)),
+        first_page.last().map(|identifier| state::encode_marker(identifier)),
         Some(marker.clone()),
-        "expected the marker to be the opaque token for the record the next page starts \
-         at, got {second}"
+        "expected the marker to be the opaque token for the last record the page served, \
+         got {second}"
     );
 
     let mut expected: Vec<String> = (0..total)

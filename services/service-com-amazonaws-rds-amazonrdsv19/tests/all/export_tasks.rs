@@ -612,9 +612,9 @@ async fn describe_export_tasks_pages_along_the_marker_it_issued() {
     let marker = marker.expect("a page that leaves records behind issues a Marker");
     assert_eq!(
         marker,
-        state::encode_marker(&identifiers[20]),
-        "case \"the first page of 20\": the Marker is the opaque token for the record the \
-         next page starts at, got {marker:?}"
+        state::encode_marker(&identifiers[19]),
+        "case \"the first page of 20\": the Marker is the opaque token for the last record \
+         the page served, got {marker:?}"
     );
 
     let (second, next) = describe_in(

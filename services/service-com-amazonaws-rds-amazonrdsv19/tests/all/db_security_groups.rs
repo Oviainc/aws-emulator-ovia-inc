@@ -627,9 +627,9 @@ async fn the_describe_refuses_what_it_cannot_serve_and_pages_what_it_can() {
     let marker = text(&first, "Marker");
     assert_eq!(
         marker,
-        state::encode_marker(&names[page_size]),
-        "case \"the first page\": the marker must be the opaque token for the group the \
-         next page starts at, got {first}"
+        state::encode_marker(&names[page_size - 1]),
+        "case \"the first page\": the marker must be the opaque token for the last group the \
+         page served, got {first}"
     );
 
     let second = expect_ok(

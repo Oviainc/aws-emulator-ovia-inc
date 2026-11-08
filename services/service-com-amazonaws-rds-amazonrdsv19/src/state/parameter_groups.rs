@@ -204,10 +204,15 @@ impl DbClusterParameterGroupRecord {
             data_type: spec.map(|spec| spec.data_type.to_string()),
             allowed_values: spec.map(|spec| spec.allowed_values.to_string()),
             is_modifiable: spec.map(|spec| spec.is_modifiable),
-            // Answered about THIS group's family; see
-            // [`cluster_engine_default_parameter_to_wire`].
-            minimum_engine_version: spec
-                .map(|spec| minimum_engine_version_in_family(&self.family, spec)),
+            // Answered about THIS group's family, and only where the catalog publishes the
+            // version the parameter was introduced in; see
+            // [`cluster_engine_default_parameter_to_wire`], which reports it by the same
+            // rule, so the two cannot disagree about a parameter a describe reports either
+            // way.
+            minimum_engine_version: spec.and_then(|spec| {
+                (!spec.minimum_engine_version.is_empty())
+                    .then(|| minimum_engine_version_in_family(&self.family, spec))
+            }),
             apply_method: setting.map(|setting| setting.apply_method.clone()),
             supported_engine_modes: Some(
                 crate::ops::describe_engine_default_cluster_parameters::family_engine_modes(
@@ -323,7 +328,15 @@ impl DbParameterGroupRecord {
             data_type: spec.map(|spec| spec.data_type.to_string()),
             allowed_values: spec.map(|spec| spec.allowed_values.to_string()),
             is_modifiable: spec.map(|spec| spec.is_modifiable),
-            minimum_engine_version: spec.map(|spec| spec.minimum_engine_version.to_string()),
+            // Reported only where the catalog publishes the version the parameter was
+            // introduced in, exactly as [`engine_default_parameter_to_wire`] reports it: "the
+            // earliest engine version to which the parameter can apply" is a fact about the
+            // engine's release history, so a catalog entry that names none reports no member
+            // rather than an empty one.
+            minimum_engine_version: spec.and_then(|spec| {
+                (!spec.minimum_engine_version.is_empty())
+                    .then(|| spec.minimum_engine_version.to_string())
+            }),
             apply_method: setting.map(|setting| setting.apply_method.clone()),
             supported_engine_modes: None,
         }
