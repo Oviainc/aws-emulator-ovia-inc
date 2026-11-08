@@ -383,6 +383,24 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // "The Amazon EMR release label, which determines the version of open-source
+        // application packages installed on the cluster." (`RunJobFlow$ReleaseLabel` doc.)
+        // A cluster runs ONE release of Amazon EMR, so the label a launch names is
+        // resolved against the release catalog this service publishes — the same catalog
+        // `DescribeReleaseLabel`, `ListReleaseLabels` and `ListSupportedInstanceTypes`
+        // answer from (`crate::state::catalog_release`) — and a label naming none of its
+        // releases is refused before any cluster state is written. The member is
+        // OPTIONAL: "for Amazon EMR releases 4.0 and later. ... Use AmiVersion for
+        // releases 3.x and 2.x", so a launch that names no release label names no release
+        // to resolve.
+        if let Some(release_label) = input.release_label.as_deref() {
+            if crate::state::catalog_release(release_label).is_none() {
+                return Err(refuse(crate::state::invalid_release_label_message(
+                    release_label,
+                )));
+            }
+        }
+
         // "A maximum of 256 steps are allowed in each job flow." (RunJobFlow doc.)
         let step_configs = input.steps.take().unwrap_or_default();
         if step_configs.len() > MAX_STEPS_PER_JOB_FLOW {
@@ -485,7 +503,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
 
-        let id = store.mint_cluster_id();
+        let (id, master_dns_name) = store.mint_cluster(&region);
         let arn = crate::state::cluster_arn(&region, &id);
         let mut instances = InstancesRecord::from_config(&input.instances);
 
@@ -597,6 +615,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // The groups the request named or implied, which `AddInstanceGroups`
             // appends to.
             groups,
+            // The DNS name of the master node this cluster launches, decided here and
+            // reported once the clock has brought that node up.
+            master_dns_name,
             // A new cluster carries no Spark Connect session: `StartSession` is what
             // starts one.
             sessions: Vec::new(),

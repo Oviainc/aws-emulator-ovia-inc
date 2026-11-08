@@ -21,7 +21,9 @@ use smithy_server_runtime::MultiServiceRouter;
 /// Longer than the service's clock-owed transition span (500 ms), so a cluster that was
 /// `TERMINATING`, or a step that was `PENDING` on a live cluster, has reached its next
 /// state by the time we look.
-const PAST_TRANSITION: Duration = Duration::from_millis(900);
+///
+/// `pub(crate)` for the reason [`PAST_CLUSTER_READY`] is.
+pub(crate) const PAST_TRANSITION: Duration = Duration::from_millis(900);
 
 /// Longer than the TWO phases a new cluster comes up over — one
 /// [`CLUSTER_PHASE_SPAN`] in `STARTING` and one in `BOOTSTRAPPING` — so a cluster has
@@ -71,6 +73,10 @@ pub(crate) const PRESENTED_AKID: &str = "AKIDEMRTESTHARNESS";
 /// The request target every harness call names, as an audit record reports it.
 pub(crate) const REQUEST_TARGET: &str = "POST /";
 
+/// The Region every request below is signed for unless a suite picks another
+/// ([`Emr::with_region`]).
+pub(crate) const DEFAULT_REGION: &str = "us-east-1";
+
 /// One emulator: a router carrying only this service, over one shared engine.
 ///
 /// `pub(crate)` so every suite in this test target drives the emulator through the
@@ -78,6 +84,7 @@ pub(crate) const REQUEST_TARGET: &str = "POST /";
 pub(crate) struct Emr {
     router: MultiServiceRouter,
     akid: &'static str,
+    region: &'static str,
 }
 
 impl Emr {
@@ -92,7 +99,21 @@ impl Emr {
         let mut router = MultiServiceRouter::new();
         router.set_request_authentication(false);
         router.register_service(EmulatedService::new(engine));
-        Self { router, akid }
+        Self {
+            router,
+            akid,
+            region: DEFAULT_REGION,
+        }
+    }
+
+    /// An emulator whose requests are signed for `region` — the credential scope is what
+    /// names the Region a request is addressed to, so a suite asserting something
+    /// Region-dependent picks it here rather than building its own requests.
+    pub(crate) fn with_region(region: &'static str) -> Self {
+        Self {
+            region,
+            ..Self::new()
+        }
     }
 
     pub(crate) async fn call(&self, operation: &str, body: Value) -> (u16, Value) {
@@ -111,7 +132,7 @@ impl Emr {
         let mut builder = http::Request::builder()
             .method("POST")
             .uri("/")
-            .header("host", "elasticmapreduce.us-east-1.amazonaws.com")
+            .header("host", format!("elasticmapreduce.{}.amazonaws.com", self.region))
             .header("content-type", "application/x-amz-json-1.1")
             .header("x-amz-target", format!("ElasticMapReduce.{operation}"));
         // `None` is an UNSIGNED request — the emulator attributes it to the `default`
@@ -120,8 +141,9 @@ impl Emr {
             builder = builder.header(
                 "authorization",
                 format!(
-                    "AWS4-HMAC-SHA256 Credential={akid}/20261022/us-east-1/\
-                     elasticmapreduce/aws4_request, SignedHeaders=host, Signature=00"
+                    "AWS4-HMAC-SHA256 Credential={akid}/20261022/{}/\
+                     elasticmapreduce/aws4_request, SignedHeaders=host, Signature=00",
+                    self.region
                 ),
             );
         }

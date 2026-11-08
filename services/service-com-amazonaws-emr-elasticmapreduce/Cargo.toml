@@ -27,6 +27,10 @@ tracing = { workspace = true }
 # generated client is needed — the emulator supplies the transport, so the SDK's
 # own HTTPS stack and runtime are left out.
 aws-sdk-iam = { version = "1", default-features = false }
+# The AWS SDK for EC2, driven over the same in-process callback: `CreateStudio` resolves
+# the VpcId, SubnetIds and security groups a Studio is wired to against the service that
+# owns them before allocating one. Only the generated client is needed.
+aws-sdk-ec2 = { version = "1", default-features = false }
 # The tree's one ARN parse, for reading a `JobFlowRole` given as an ARN.
 service-common = { path = "../common" }
 

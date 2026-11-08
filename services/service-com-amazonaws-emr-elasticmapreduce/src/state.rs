@@ -47,6 +47,16 @@ use crate::ops::types::{
 mod instance_catalog;
 pub use instance_catalog::*;
 
+/// A cluster's master node — the address it holds and the DNS name the cluster reports
+/// for it — split out of this root as its own concern and re-exported the same way.
+mod master_node;
+pub use master_node::*;
+
+/// The Amazon EC2 network and the IAM role an EMR Studio is wired to, which are resolved
+/// in the services that own them; split out and re-exported the same way.
+mod studio_network;
+pub use studio_network::*;
+
 /// The notebook-execution lifecycle, split out of this root as its own concern for the
 /// same reason, and re-exported the same way.
 mod notebook_executions;
@@ -1556,10 +1566,19 @@ impl Default for ComAmazonawsEmrElasticmapreduceState {
 }
 
 impl ComAmazonawsEmrElasticmapreduceState {
-    /// A fresh cluster id: [`CLUSTER_ID_PREFIX`] followed by uppercase alphanumerics.
-    pub fn mint_cluster_id(&mut self) -> String {
+    /// A fresh cluster id — [`CLUSTER_ID_PREFIX`] followed by uppercase alphanumerics —
+    /// and the DNS name the master node of that cluster carries in `region`.
+    ///
+    /// The two are minted TOGETHER because both come out of this account's cluster
+    /// sequence: the id is the sequence in base 36 ([`base36_id`]), and the master node's
+    /// address is the same sequence laid out over the master network ([`master_dns_name`]),
+    /// so one cluster's master node never holds another's address.
+    pub fn mint_cluster(&mut self, region: &str) -> (String, String) {
         self.next_cluster_seq += 1;
-        format!("{CLUSTER_ID_PREFIX}{}", base36_id(self.next_cluster_seq))
+        (
+            format!("{CLUSTER_ID_PREFIX}{}", base36_id(self.next_cluster_seq)),
+            master_dns_name(region, self.next_cluster_seq),
+        )
     }
 
     /// A fresh step id: `s-` followed by uppercase alphanumerics.
@@ -2792,6 +2811,10 @@ pub struct ClusterRecord {
     /// [`implied_instance_group_configs`]), and then every `AddInstanceGroups`, which is
     /// still a scaffold stub under its own issue. `ListInstanceGroups` projects these.
     pub groups: Vec<InstanceGroupRecord>,
+    /// The DNS name of this cluster's master node, decided when the cluster was launched
+    /// ([`master_dns_name`]) and reported once the clock has brought that node up
+    /// ([`ClusterRecord::master_public_dns_name`]).
+    pub master_dns_name: String,
     /// The Spark Connect sessions this cluster carries.
     ///
     /// `StartSession` is what appends one; it is still a scaffold stub (its own
@@ -3145,8 +3168,7 @@ impl ClusterRecord {
             tags: optional_list(&self.tags),
             service_role: self.service_role.clone(),
             normalized_instance_hours: Some(self.normalized_instance_hours()),
-            // No master node exists, so there is no DNS name to report.
-            master_public_dns_name: None,
+            master_public_dns_name: self.master_public_dns_name(),
             configurations: optional_list(&self.configurations),
             security_configuration: self.security_configuration.clone(),
             auto_scaling_role: self.auto_scaling_role.clone(),
@@ -3179,6 +3201,19 @@ impl ClusterRecord {
             cluster_arn: Some(self.arn.clone()),
             outpost_arn: None,
         }
+    }
+
+    /// "The DNS name of the master node." (`Cluster$MasterPublicDnsName` doc.)
+    ///
+    /// A cluster reports it once its master node is UP: the node is provisioned while the
+    /// cluster starts, so the name appears when the cluster leaves `STARTING` — the
+    /// instant its status records as `ReadyDateTime` — and stays on the record from then
+    /// on, a cluster that has since terminated included. A cluster that never became
+    /// ready never had a master node to name, so it reports none.
+    fn master_public_dns_name(&self) -> Option<String> {
+        self.status
+            .ready_date_time
+            .map(|_| self.master_dns_name.clone())
     }
 
     /// "An approximation of the cost of the cluster, represented in m1.small/hours.
@@ -3295,6 +3330,8 @@ impl InstanceFleetRecord {
     /// got to, and the provisioned capacities are what that status implies
     /// ([`InstanceFleetRecord::provisioned_capacity`]).
     pub fn to_instance_fleet(&self) -> InstanceFleet {
+        let target_on_demand_capacity = target_capacity(self.config.target_on_demand_capacity);
+        let target_spot_capacity = target_capacity(self.config.target_spot_capacity);
         InstanceFleet {
             id: Some(self.id.clone()),
             name: self.config.name.clone(),
@@ -3302,11 +3339,12 @@ impl InstanceFleetRecord {
             // "The node type that the instance fleet hosts" is required on the
             // configuration, so a persisted fleet always reports one.
             instance_fleet_type: Some(self.config.instance_fleet_type.clone()),
-            target_on_demand_capacity: self.config.target_on_demand_capacity,
-            target_spot_capacity: self.config.target_spot_capacity,
-            provisioned_on_demand_capacity: self
-                .provisioned_capacity(self.config.target_on_demand_capacity),
-            provisioned_spot_capacity: self.provisioned_capacity(self.config.target_spot_capacity),
+            target_on_demand_capacity: Some(target_on_demand_capacity),
+            target_spot_capacity: Some(target_spot_capacity),
+            provisioned_on_demand_capacity: Some(
+                self.provisioned_capacity(target_on_demand_capacity),
+            ),
+            provisioned_spot_capacity: Some(self.provisioned_capacity(target_spot_capacity)),
             instance_type_specifications: self
                 .config
                 .instance_type_configs
@@ -3331,16 +3369,30 @@ impl InstanceFleetRecord {
     ///
     /// A fleet still acquiring its instances has provisioned none of them, and one that
     /// has terminated holds none any more; a fleet that is up has provisioned the target
-    /// it asked for. A fleet that asked for no units of a market reports none for it
-    /// rather than a zero it never requested.
-    fn provisioned_capacity(&self, target: Option<i32>) -> Option<i32> {
-        let target = target?;
+    /// it asked for.
+    fn provisioned_capacity(&self, target: i32) -> i32 {
         if self.state == instance_fleet_state::RUNNING {
-            Some(target.max(0))
+            target
         } else {
-            Some(0)
+            0
         }
     }
+}
+
+/// "The target capacity of On-Demand units for the instance fleet, which determines how
+/// many On-Demand Instances to provision" (`InstanceFleet$TargetOnDemandCapacity` doc),
+/// and the same for the Spot units — as a fleet that was configured with `requested`
+/// reports it.
+///
+/// Both members are `WholeNumber` (`@range` min 0) and a fleet AWS describes carries both:
+/// "if not specified or set to 0, only Spot Instances are provisioned for the instance
+/// fleet using `TargetSpotCapacity`" reads the ABSENT value and the explicit zero as one
+/// and the same request, so a fleet that asked for no units of a market reports zero of it
+/// rather than leaving the member out. That is also what lets a client read the capacity it
+/// is NOT changing and pass it back to `ModifyInstanceFleet`, whose two capacities travel
+/// in one call.
+fn target_capacity(requested: Option<i32>) -> i32 {
+    requested.unwrap_or(0).max(0)
 }
 
 /// One `InstanceTypeConfig` a fleet was configured with, as the

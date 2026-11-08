@@ -171,7 +171,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{is_ec2_resource_id, is_s3_location, MAX_STUDIO_SUBNETS};
 
-        let _ = ctx;
+        let region = crate::state::request_region(ctx.parts());
         let refuse = |message: String| -> Self::Error {
             UpdateStudioErrorModeled::InvalidRequestException(InvalidRequestException {
                 error_code: None,
@@ -202,10 +202,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
             for subnet_id in subnet_ids {
                 if !is_ec2_resource_id("subnet", subnet_id) {
-                    return Err(refuse(format!(
-                        "SubnetIds entry '{subnet_id}' does not name a subnet in this account"
-                    )));
+                    return Err(refuse(crate::state::absent_subnet_message(subnet_id)));
                 }
+            }
+            // And an id in that FORM still has to name a subnet the account HOLDS, which
+            // is Amazon EC2's to answer — the same resolution `CreateStudio` makes before
+            // it allocates a Studio, here before anything of this one changes.
+            if let Some(message) =
+                crate::state::unresolved_subnets(ctx, &region, subnet_ids).await
+            {
+                return Err(refuse(message));
             }
         }
         if let Some(location) = input.default_s3_location.as_ref() {

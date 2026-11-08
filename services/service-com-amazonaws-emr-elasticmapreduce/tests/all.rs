@@ -31,6 +31,8 @@ mod emr_control_plane;
 mod enum_refusal_identity;
 #[path = "all/input_refusals.rs"]
 mod input_refusals;
+#[path = "all/instance_fleet_target_capacities.rs"]
+mod instance_fleet_target_capacities;
 #[path = "all/instance_fleets.rs"]
 mod instance_fleets;
 #[path = "all/instance_groups.rs"]
@@ -47,6 +49,8 @@ mod job_flow_role;
 mod malformed_input_refusals;
 #[path = "all/managed_scaling_policy.rs"]
 mod managed_scaling_policy;
+#[path = "all/master_public_dns_name.rs"]
+mod master_public_dns_name;
 #[path = "all/modify_instance_groups.rs"]
 mod modify_instance_groups;
 #[path = "all/multi_primary_termination_protection.rs"]
@@ -67,6 +71,8 @@ mod refusal_wording;
 mod release_label_application_names;
 #[path = "all/release_label_catalog.rs"]
 mod release_label_catalog;
+#[path = "all/release_label_launch.rs"]
+mod release_label_launch;
 #[path = "all/release_labels.rs"]
 mod release_labels;
 #[path = "all/resource_not_found_code.rs"]

@@ -44,8 +44,11 @@ const UNKNOWN_CLUSTER_IDS: &[&str] = &["j-ZZZZZZZZZZZZZ", "j-", "", "not-a-clust
 struct Expected {
     fleet_type: &'static str,
     name: Option<&'static str>,
-    target_on_demand: Option<i64>,
-    target_spot: Option<i64>,
+    /// The target capacities the fleet reports: what the request asked for, and 0 for a
+    /// market it asked for no units of — AWS reports both members for every fleet it
+    /// describes.
+    target_on_demand: i64,
+    target_spot: i64,
     /// `(instance type, weighted capacity, bid price as percentage)` per instance type
     /// the fleet configured, in configuration order.
     instance_types: &'static [(&'static str, Option<i64>, Option<f64>)],
@@ -116,12 +119,12 @@ fn assert_fleet(case: &str, expected: &Expected, got: &Value) {
     );
     assert_eq!(
         got["TargetOnDemandCapacity"].as_i64(),
-        expected.target_on_demand,
+        Some(expected.target_on_demand),
         "case {case:?}: wrong TargetOnDemandCapacity, got {got}"
     );
     assert_eq!(
         got["TargetSpotCapacity"].as_i64(),
-        expected.target_spot,
+        Some(expected.target_spot),
         "case {case:?}: wrong TargetSpotCapacity, got {got}"
     );
 
@@ -189,8 +192,8 @@ async fn list_instance_fleets_reports_every_fleet_a_cluster_was_launched_with() 
             expected: &[Expected {
                 fleet_type: "MASTER",
                 name: None,
-                target_on_demand: Some(1),
-                target_spot: None,
+                target_on_demand: 1,
+                target_spot: 0,
                 instance_types: &[("m5.xlarge", None, None)],
                 ebs_devices: &[],
             }],
@@ -234,16 +237,16 @@ async fn list_instance_fleets_reports_every_fleet_a_cluster_was_launched_with() 
                 Expected {
                     fleet_type: "MASTER",
                     name: Some("primary"),
-                    target_on_demand: Some(1),
-                    target_spot: None,
+                    target_on_demand: 1,
+                    target_spot: 0,
                     instance_types: &[("m5.2xlarge", None, None)],
                     ebs_devices: &[],
                 },
                 Expected {
                     fleet_type: "CORE",
                     name: Some("core"),
-                    target_on_demand: Some(2),
-                    target_spot: Some(3),
+                    target_on_demand: 2,
+                    target_spot: 3,
                     instance_types: &[
                         ("r5.xlarge", Some(2), None),
                         ("r5.2xlarge", Some(4), Some(60.0)),
@@ -253,8 +256,8 @@ async fn list_instance_fleets_reports_every_fleet_a_cluster_was_launched_with() 
                 Expected {
                     fleet_type: "TASK",
                     name: None,
-                    target_on_demand: None,
-                    target_spot: Some(5),
+                    target_on_demand: 0,
+                    target_spot: 5,
                     instance_types: &[("c5.xlarge", None, None)],
                     ebs_devices: &[],
                 },
@@ -284,8 +287,8 @@ async fn list_instance_fleets_reports_every_fleet_a_cluster_was_launched_with() 
             expected: &[Expected {
                 fleet_type: "MASTER",
                 name: None,
-                target_on_demand: Some(1),
-                target_spot: None,
+                target_on_demand: 1,
+                target_spot: 0,
                 instance_types: &[("m5.xlarge", None, None)],
                 // `/dev/sda` is the root volume, so the requested volumes start at
                 // `/dev/sdb`, in configuration order.
@@ -365,11 +368,11 @@ async fn a_provisioning_fleet_reaches_running_when_the_clock_makes_it_due() {
             ("TargetOnDemandCapacity", "ProvisionedOnDemandCapacity"),
             ("TargetSpotCapacity", "ProvisionedSpotCapacity"),
         ] {
-            // A fleet that asked for no units of a market reports none for it; one that
-            // did has provisioned none of them while it is still acquiring instances.
+            // A fleet still acquiring its instances has provisioned none of the units it
+            // asked for, whichever market they are of.
             assert_eq!(
                 got[provisioned].as_i64(),
-                got[target].as_i64().map(|_| 0),
+                Some(0),
                 "case \"provisioning\": a fleet that is not up has provisioned no \
                  {target}, got {got}"
             );

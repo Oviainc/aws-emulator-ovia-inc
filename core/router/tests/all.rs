@@ -523,6 +523,8 @@ mod elb_classic_network_resources_resolve_in_ec2;
 // collide.
 #[path = "all/emr_job_flow_role_instance_profile.rs"]
 mod emr_job_flow_role_instance_profile;
+#[path = "all/emr_studio_network_resolution.rs"]
+mod emr_studio_network_resolution;
 // Declared HERE too, in the sorted list rather than appended at the tail, for the reason
 // the note above gives: the appended region at the end of this file is where every
 // concurrent router suite lands, so a line added there conflicts with every other suite

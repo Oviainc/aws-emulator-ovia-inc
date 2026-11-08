@@ -236,28 +236,40 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             )));
         }
         if !is_ec2_resource_id("vpc", &input.vpc_id) {
-            return Err(refuse(format!(
-                "VpcId '{}' does not name a VPC in this account",
-                input.vpc_id
-            )));
+            return Err(refuse(crate::state::absent_vpc_message(&input.vpc_id)));
         }
         for subnet_id in &input.subnet_ids {
             if !is_ec2_resource_id("subnet", subnet_id) {
-                return Err(refuse(format!(
-                    "SubnetIds entry '{subnet_id}' does not name a subnet in this account"
-                )));
+                return Err(refuse(crate::state::absent_subnet_message(subnet_id)));
             }
         }
-        for (member, group_id) in [
-            ("WorkspaceSecurityGroupId", &input.workspace_security_group_id),
-            ("EngineSecurityGroupId", &input.engine_security_group_id),
-        ] {
+        let security_groups = [
+            (
+                "WorkspaceSecurityGroupId",
+                input.workspace_security_group_id.as_str(),
+            ),
+            (
+                "EngineSecurityGroupId",
+                input.engine_security_group_id.as_str(),
+            ),
+        ];
+        for (member, group_id) in security_groups {
             if !is_ec2_resource_id("sg", group_id) {
-                return Err(refuse(format!(
-                    "{member} '{group_id}' does not name a security group in this account"
+                return Err(refuse(crate::state::absent_security_group_message(
+                    member, group_id,
                 )));
             }
         }
+
+        // An id in the FORM Amazon EC2 gives that resource still has to name one the
+        // account HOLDS, and the role the Studio assumes has to be one IAM holds and
+        // Amazon EMR may assume. Both are resolved in the service that OWNS them
+        // (`crate::state::studio_network`) before a Studio is allocated, so a request
+        // naming anything that does not resolve is refused with nothing stored.
+        //
+        // Recorded behavior for the ORDER: a request whose role and whose network objects
+        // both fail to resolve is answered with the ROLE refusal, so the role is resolved
+        // first.
 
         // "The Amazon S3 location to back up Amazon EMR Studio Workspaces and notebook
         // files." (`CreateStudio$DefaultS3Location` doc.)
@@ -275,6 +287,26 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             return Err(refuse(
                 "ServiceRole is empty, so it names no IAM role".to_string(),
             ));
+        }
+        if let Some(message) =
+            crate::state::unassumable_service_role(ctx, &region, &input.service_role).await
+        {
+            return Err(refuse(message));
+        }
+
+        // Then the network objects the Studio's Workspaces run in and carry.
+        if let Some(message) = crate::state::unresolved_vpc(ctx, &region, &input.vpc_id).await {
+            return Err(refuse(message));
+        }
+        if let Some(message) =
+            crate::state::unresolved_subnets(ctx, &region, &input.subnet_ids).await
+        {
+            return Err(refuse(message));
+        }
+        if let Some(message) =
+            crate::state::unresolved_security_groups(ctx, &region, &security_groups).await
+        {
+            return Err(refuse(message));
         }
 
         // "Only specify a UserRole when you use IAM Identity Center authentication."
