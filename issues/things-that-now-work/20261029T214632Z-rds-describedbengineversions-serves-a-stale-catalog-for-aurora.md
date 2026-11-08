@@ -11,6 +11,23 @@ Issue-Commit: 9919ffd222ff0dfbfa1095fff748926e9311733c
 
 # RDS DescribeDBEngineVersions serves a stale catalog for Aurora MySQL, Db2 and SQL Server
 
+> _Resolution: the per-entry and per-release-line causes are fixed — an Aurora MySQL entry
+> is described by the two releases its version string carries (`Aurora (MySQL 5.7) 2.11.1`)
+> instead of the product name joined to the whole string, the Aurora MySQL 2.11 line
+> publishes its successive builds (2.11.2 … 2.11.5 beside 2.11.1 and 2.11.6) so a client
+> can create them and read them as that entry's minor upgrade targets, and Aurora
+> PostgreSQL publishes the 12 family (12.9), so an 11 entry's upgrade targets are 11.21 and
+> 12.9. The members each row carries — the Db2 exportable log types and
+> `S3_INTEGRATION` feature name, the RDS Custom for SQL Server `DefaultCharacterSet`, the
+> CA certificate identifiers, every `Supports*` flag and each upgrade target's
+> classification — and the `db2-ce` 12.1 line were already served and are now pinned by
+> `tests/all/engine_version_release_lines.rs`. DECLINED, and so still divergent on replay:
+> the IDENTITY, COUNT and ORDER of the recorded listings (the `DBEngineVersion[*]` key).
+> Those are a snapshot of AWS's live release catalogue on the day of the recording — it
+> moves with every RDS release and no rule produces it — so matching it entry-for-entry
+> would be fitting the recorded instance, exactly as resolved for the same key in
+> `20261022T162132Z-rds-describedbengineversions-engine-catalog-listings-do-not-match.md`._
+
 > _Note: this issue was identified against the code base at commit `9919ffd222ff0dfbfa1095fff748926e9311733c`. If you are an issue fixer working on this, the code base you are currently working in can have drifted, so you might need to trace the issue back to the current code base._
 
 ## Operation

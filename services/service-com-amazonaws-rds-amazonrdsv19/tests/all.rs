@@ -139,6 +139,8 @@ mod engine_statement_classes;
 mod engine_version_families;
 #[path = "all/engine_version_page_tokens.rs"]
 mod engine_version_page_tokens;
+#[path = "all/engine_version_release_lines.rs"]
+mod engine_version_release_lines;
 #[path = "all/event_subscription_source_not_found_wording.rs"]
 mod event_subscription_source_not_found_wording;
 #[path = "all/event_subscription_source_removal.rs"]

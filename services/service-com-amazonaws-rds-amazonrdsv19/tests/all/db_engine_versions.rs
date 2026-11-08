@@ -953,7 +953,7 @@ const AURORA_ONLY_FLAGS: [&str; 5] = [
 /// entries as `<member>` elements inside the member's own element
 /// (`smithy_query(query="shape",shape="CACertificateIdentifiersList")` — the list's
 /// member carries no `xmlName`).
-fn list_members(xml: &str, member: &str) -> Vec<String> {
+pub(crate) fn list_members(xml: &str, member: &str) -> Vec<String> {
     subtrees(xml, member)
         .first()
         .map(|subtree| texts(subtree, "member"))
@@ -961,7 +961,7 @@ fn list_members(xml: &str, member: &str) -> Vec<String> {
 }
 
 /// One boolean member of an entry, asserted to be a boolean at all.
-fn flag(case: &str, xml: &str, member: &str) -> bool {
+pub(crate) fn flag(case: &str, xml: &str, member: &str) -> bool {
     let value = optional_text(xml, member)
         .unwrap_or_else(|| panic!("case {case:?}: {member} must be reported, got {xml}"));
     match value.as_str() {
@@ -975,7 +975,7 @@ fn flag(case: &str, xml: &str, member: &str) -> bool {
 /// than as text: `10.11.9` is later than `10.5.28`, and `8.0.mysql_aurora.3.07.1` later
 /// than `8.0.mysql_aurora.3.05.2`.
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
-enum Component {
+pub(crate) enum Component {
     /// A numeric component, compared as a number.
     Number(u64),
     /// Anything else (`mysql_aurora`, `ru`, `v1`, `limitless`), compared as text and
@@ -984,7 +984,7 @@ enum Component {
 }
 
 /// The sort key of an engine version: its `.`, `-` and `_` separated components.
-fn version_key(version: &str) -> Vec<Component> {
+pub(crate) fn version_key(version: &str) -> Vec<Component> {
     version
         .split(['.', '-', '_'])
         .map(|part| match part.parse::<u64>() {
@@ -1188,7 +1188,7 @@ async fn the_envelope_reports_the_published_per_engine_and_per_version_reference
     // The engine's own description prose, which every version of that engine repeats, and
     // the version description built from it. (case, engine, engine version, the
     // DBEngineDescription, the DBEngineVersionDescription)
-    let descriptions: [(&str, &str, &str, &str, &str); 4] = [
+    let descriptions: [(&str, &str, &str, &str, &str); 5] = [
         (
             // Aurora PostgreSQL's version string IS the community PostgreSQL version it
             // is compatible with, which is how AWS describes it.
@@ -1199,11 +1199,22 @@ async fn the_envelope_reports_the_published_per_engine_and_per_version_reference
             "Aurora PostgreSQL (Compatible with PostgreSQL 16.6)",
         ),
         (
+            // An Aurora MySQL version string carries two releases — the MySQL release it
+            // is compatible with and the Aurora release itself — and the description
+            // states them in that order, as AWS publishes it for this engine. Both
+            // major-version families are rows, because the rule is the engine's.
+            "Aurora MySQL 2",
+            "aurora-mysql",
+            "5.7.mysql_aurora.2.11.1",
             "Aurora MySQL",
+            "Aurora (MySQL 5.7) 2.11.1",
+        ),
+        (
+            "Aurora MySQL 3",
             "aurora-mysql",
             "8.0.mysql_aurora.3.08.0",
             "Aurora MySQL",
-            "Aurora MySQL 8.0.mysql_aurora.3.08.0",
+            "Aurora (MySQL 8.0) 3.08.0",
         ),
         (
             "RDS for MySQL",

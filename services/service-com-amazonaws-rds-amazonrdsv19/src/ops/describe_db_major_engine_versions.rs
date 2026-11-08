@@ -325,25 +325,22 @@ fn offers_extended_support(engine: &str) -> bool {
 /// for an engine that is offered it — Amazon RDS Extended Support, from the day AFTER
 /// that until the published end of Extended Support.
 ///
-/// An open-source family the calendar carries no row for PANICS rather than reporting no
-/// lifecycle list: the calendar and the engine-version catalogue are both in-tree
-/// literals, so a family without a row is a gap between the two tables, and reporting it
-/// as "this engine publishes no lifecycle" would state the answer a COMMERCIAL engine
-/// owes. Caller data cannot reach this: an `Engine` that is not a catalogue engine
-/// selects no family at all.
+/// An open-source family the calendar carries no row for reports no lifecycle list, and
+/// the rest of the report is still answered: the calendar and the engine-version catalogue
+/// are both in-tree literals, so a gap between them is a defect in this crate rather than
+/// anything a caller did, and what catches it is this crate's own test over the report
+/// (`tests/all/db_major_engine_versions.rs`:
+/// `an_open_source_family_reports_its_support_lifecycles` reads every family this report
+/// answers and refuses an open-source one whose windows are missing) — not a panic on the
+/// request path, which would abort a request that asked for every family because of a row
+/// that has nothing to do with it.
 fn lifecycles(engine: &str, major_engine_version: &str) -> Option<Vec<SupportedEngineLifecycle>> {
     if !publishes_a_lifecycle(engine) {
         return None;
     }
     let calendar = LIFECYCLE_CALENDAR
         .iter()
-        .find(|row| row.engine == engine && row.major_engine_version == major_engine_version)
-        .unwrap_or_else(|| {
-            panic!(
-                "every open-source major engine version the catalogue publishes has a \
-                 support calendar row; {engine} {major_engine_version} has none"
-            )
-        });
+        .find(|row| row.engine == engine && row.major_engine_version == major_engine_version)?;
     let standard_end = crate::state::catalog_timestamp(calendar.standard_support_end);
     let mut found = vec![SupportedEngineLifecycle {
         lifecycle_support_name: STANDARD_SUPPORT.to_string(),
@@ -450,6 +447,13 @@ const LIFECYCLE_CALENDAR: &[MajorVersionLifecycle] = &[
         "2019-06-04T00:00:00Z",
         "2024-02-29T00:00:00Z",
         Some("2027-02-28T00:00:00Z"),
+    ),
+    lifecycle(
+        "aurora-postgresql",
+        "12",
+        "2020-09-17T00:00:00Z",
+        "2025-02-28T00:00:00Z",
+        Some("2028-02-28T00:00:00Z"),
     ),
     lifecycle(
         "aurora-postgresql",

@@ -1363,6 +1363,48 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         DefaultLevel::Neither,
         &AURORA_MYSQL_5_7,
     ),
+    // The 2.11 line's SUCCESSIVE builds, which is what a minor-version line is: Aurora
+    // releases a 2.11 build as `2.11.<n>` with `n` counting up from the line's first
+    // build, so publishing 2.11.1 and then jumping to 2.11.6 would leave out builds the
+    // engine is created with and would publish an upgrade path that skips them. The
+    // in-between builds are published here for the same reason the family's first and last
+    // are, and each carries its family's capability profile.
+    row(
+        "aurora-mysql",
+        "5.7.mysql_aurora.2.11.2",
+        "5.7",
+        "aurora-mysql5.7",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &AURORA_MYSQL_5_7,
+    ),
+    row(
+        "aurora-mysql",
+        "5.7.mysql_aurora.2.11.3",
+        "5.7",
+        "aurora-mysql5.7",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &AURORA_MYSQL_5_7,
+    ),
+    row(
+        "aurora-mysql",
+        "5.7.mysql_aurora.2.11.4",
+        "5.7",
+        "aurora-mysql5.7",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &AURORA_MYSQL_5_7,
+    ),
+    row(
+        "aurora-mysql",
+        "5.7.mysql_aurora.2.11.5",
+        "5.7",
+        "aurora-mysql5.7",
+        STATUS_AVAILABLE,
+        DefaultLevel::Neither,
+        &AURORA_MYSQL_5_7,
+    ),
     row(
         "aurora-mysql",
         "5.7.mysql_aurora.2.11.6",
@@ -1430,6 +1472,24 @@ pub(crate) const CATALOG: &[CatalogVersion] = &[
         "11.21",
         "11",
         "aurora-postgresql11",
+        STATUS_DEPRECATED,
+        DefaultLevel::Major,
+        &AURORA_POSTGRESQL_11,
+    ),
+    // Aurora PostgreSQL 12, the major-version family between the 11 family above and the
+    // 13 family below. It is the family a major-version upgrade of an 11 cluster moves to,
+    // so leaving it out would publish an upgrade path that skips a whole release and would
+    // refuse a create of a version this engine offers; `aurora-postgresql12` is one of the
+    // DB parameter group families this service publishes
+    // (`DescribeEngineDefaultParametersMessage$DBParameterGroupFamily`'s valid values).
+    // Past its end of standard support, like the 11 family, so it is reported `deprecated`
+    // and served only to a request that asks for every version. Its capabilities are the
+    // 11 family's: Babelfish and Aurora Serverless v2 arrived with the 13 family.
+    row(
+        "aurora-postgresql",
+        "12.9",
+        "12",
+        "aurora-postgresql12",
         STATUS_DEPRECATED,
         DefaultLevel::Major,
         &AURORA_POSTGRESQL_11,
@@ -3038,11 +3098,25 @@ fn reports_replication_log_capabilities(engine: &str) -> bool {
 
 /// `DBEngineVersionDescription` — "The description of the database engine version."
 ///
-/// An Aurora PostgreSQL version string IS the community PostgreSQL version that version
-/// is compatible with (`16.4`), and that compatibility is what the description states, as
-/// AWS publishes it for this engine. Every other engine's version string names its own
-/// release (`8.0.39`, `8.0.mysql_aurora.3.08.0`, `19.0.0.0.ru-2024-10.rur-2024-10.r1`),
-/// so there the description is the product and that version.
+/// An AURORA version's description names the community engine release that version is
+/// compatible with and the Aurora release itself, because an Aurora version is a service
+/// release of its own numbered against a community engine it is compatible with — the two
+/// are different numbers and a client reads both:
+///
+/// * an Aurora PostgreSQL version string IS the community PostgreSQL version (`16.4`), so
+///   the description states that compatibility, in the form AWS publishes for this engine;
+/// * an Aurora MySQL version string carries BOTH numbers, the MySQL release before
+///   `.mysql_aurora.` and the Aurora release after it (`5.7.mysql_aurora.2.11.1`), so the
+///   description states the MySQL release in parentheses and then the Aurora release —
+///   `Aurora (MySQL 5.7) 2.11.1` — rather than repeating the joined version string, which
+///   names no release the engine publishes on its own. Both halves come from the version
+///   string, so every row of either family is described by the same rule — and the engine
+///   gates it, so a version of another engine that happened to carry the same mark (a
+///   custom engine version is named by its caller) is described by the generic form below.
+///
+/// Every other engine's version string names its own release (`8.0.39`,
+/// `19.0.0.0.ru-2024-10.rur-2024-10.r1`), so there the description is the product and
+/// that version.
 fn version_description(facts: &EngineFacts, engine_version: &str) -> String {
     if facts.engine == "aurora-postgresql" {
         return format!(
@@ -3050,8 +3124,19 @@ fn version_description(facts: &EngineFacts, engine_version: &str) -> String {
             facts.product
         );
     }
+    if facts.engine == "aurora-mysql" {
+        if let Some((community_release, aurora_release)) =
+            engine_version.split_once(AURORA_MYSQL_MARK)
+        {
+            return format!("Aurora (MySQL {community_release}) {aurora_release}");
+        }
+    }
     format!("{} {engine_version}", facts.product)
 }
+
+/// What separates the two releases an Aurora MySQL version string carries: the MySQL
+/// release it is compatible with, and the Aurora release itself.
+const AURORA_MYSQL_MARK: &str = ".mysql_aurora.";
 
 /// The character-set and time-zone members of ONE reported engine version: its
 /// `DefaultCharacterSet`, and the three LISTS a request can ask for.
