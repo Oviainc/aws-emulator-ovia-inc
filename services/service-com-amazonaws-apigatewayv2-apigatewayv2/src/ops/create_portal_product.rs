@@ -150,6 +150,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM decides BEFORE this operation looks at its own input, so a caller no policy
+        // permits is told it is not authorized rather than told its request was malformed,
+        // and the call changes nothing. A create addresses the COLLECTION — the product it
+        // would mint does not exist yet — so that is the resource it is judged against.
+        let region = crate::state::request_region(ctx.parts());
+        if let Err(denied) = crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::portal_product_arn(
+                &region,
+                crate::service::authorization::ANY_MEMBER,
+            ),
+        ) {
+            return Err(CreatePortalProductErrorModeled::AccessDeniedException(denied).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Unreachable in the assembled emulator — see the note in `create_api`.
             return Err(crate::scaffolded::Scaffolded::not_implemented(
@@ -189,7 +206,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let region = crate::state::request_region(ctx.parts());
         let portal_product_id = store.mint_portal_product_id();
         let record = crate::state::PortalProduct {
             portal_product_arn: crate::state::portal_product_arn(&region, &portal_product_id),

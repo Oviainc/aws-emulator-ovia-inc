@@ -38,6 +38,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::state::integration_response_key::{key_matches_status, DEFAULT_SELECTION_KEY};
 use crate::state::{Api, DeployedConfiguration, Integration, IntegrationResponse, Route};
 
 /// The `RouteKey` of the route that serves the CONNECTION REQUEST: AWS documents `$connect`
@@ -53,10 +54,6 @@ pub const DISCONNECT_ROUTE_KEY: &str = "$disconnect";
 /// matching route is found".
 pub const DEFAULT_ROUTE_KEY: &str = "$default";
 
-/// The `SelectionKey` an integration response or a template map carries to be the fallback
-/// for a call no other key of the same map selects.
-pub const DEFAULT_SELECTION_KEY: &str = "$default";
-
 /// The media type a mapping template is keyed by when it is keyed by one at all — the key
 /// API Gateway's own console writes for a WebSocket api's templates, and the one a message
 /// carrying JSON selects.
@@ -65,15 +62,6 @@ pub const JSON_TEMPLATE_KEY: &str = "application/json";
 /// The `IntegrationType` whose reply is computed from the integration's own records; see the
 /// module docs.
 pub const MOCK_INTEGRATION_TYPE: &str = "MOCK";
-
-/// The compiled-program budget one caller-STORED `IntegrationResponseKey` pattern may take,
-/// so a key inside its stored length still cannot compile into an arbitrarily large
-/// automaton. Stated here rather than left to the engine's default, as the other data planes
-/// that evaluate a caller-stored pattern state theirs.
-const COMPILED_PATTERN_LIMIT: usize = 64 * 1024;
-
-/// See [`COMPILED_PATTERN_LIMIT`]: the budget for the lazy DFA a match runs through.
-const PATTERN_DFA_LIMIT: usize = 64 * 1024;
 
 /// What a route's integration replied with: the status the call produced and the payload the
 /// selected integration response rendered, if it rendered one.
@@ -396,30 +384,6 @@ fn selected_integration_response<'i>(
         .integration_responses
         .values()
         .find(|response| response.integration_response_key == DEFAULT_SELECTION_KEY)
-}
-
-/// Whether an `IntegrationResponseKey` selects `status`.
-///
-/// A key written between slashes is a regular expression — the form AWS documents for a
-/// WebSocket api's integration response keys (`/2\d\d/`) — and it selects the call when it
-/// matches the WHOLE status, so `/2\d\d/` selects `200` and not `1200`. A key written
-/// without slashes names the status literally, which is how a key spelled `200` selects
-/// one. The expression is compiled under the budgets above by the maintained engine, whose
-/// matching is linear in the subject, so a stored key cannot make a call expensive; a key
-/// those budgets refuse selects nothing.
-fn key_matches_status(key: &str, status: &str) -> bool {
-    let Some(pattern) = key
-        .strip_prefix('/')
-        .and_then(|rest| rest.strip_suffix('/'))
-        .filter(|pattern| !pattern.is_empty())
-    else {
-        return key == status;
-    };
-    ::regex::RegexBuilder::new(&format!("^(?:{pattern})$"))
-        .size_limit(COMPILED_PATTERN_LIMIT)
-        .dfa_size_limit(PATTERN_DFA_LIMIT)
-        .build()
-        .is_ok_and(|expression| expression.is_match(status))
 }
 
 #[cfg(test)]

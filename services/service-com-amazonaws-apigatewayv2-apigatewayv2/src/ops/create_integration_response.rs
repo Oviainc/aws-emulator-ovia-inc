@@ -242,6 +242,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             }
         }
 
+        // The integration response KEY is what the response is selected by, so it has to
+        // be one of the two forms a `SelectionKey` takes — and, on an integration whose
+        // responses are selected by the status of the call, one that can match a status at
+        // all. The rule is `crate::state::integration_response_key`'s, shared with the data
+        // plane that does the selecting. Asked after the path's own resources are resolved,
+        // so a request naming an integration that does not exist is answered about THAT.
+        if let Err(message) =
+            crate::state::integration_response_key::validate_integration_response_key(
+                &input.integration_response_key,
+                integration.integration_uri.as_deref(),
+            )
+        {
+            return Err(bad_request(&message));
+        }
+
         // The integration response key is what an integration response is SELECTED by
         // ("the result is compared against one or more selection keys to find a matching
         // key", `SelectionKey`), so one integration cannot carry two responses under one

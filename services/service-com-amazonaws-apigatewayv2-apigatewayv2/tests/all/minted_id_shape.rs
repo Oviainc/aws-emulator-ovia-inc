@@ -344,7 +344,7 @@ async fn mint_many(emulator: &MultiServiceRouter, member: &str) -> Vec<String> {
                 format!(
                     "/v2/apis/{api_id}/integrations/{host_integration_id}/integrationresponses"
                 ),
-                json!({ "integrationResponseKey": format!("/{index}\\d\\d/") }),
+                json!({ "integrationResponseKey": format!("/{}/", 200 + index) }),
             ),
             other => panic!("this suite mints no collection of {other:?}"),
         };

@@ -97,16 +97,16 @@ fn rows() -> Vec<Row> {
             ],
         },
         Row {
-            case: "a custom key converting the payload to binary, with a template \
-                   selection expression",
+            case: "a class pattern selection key converting the payload to binary, with a \
+                   template selection expression",
             request: json!({
-                "integrationResponseKey": "echo",
+                "integrationResponseKey": "/2\\d\\d/",
                 "contentHandlingStrategy": CONTENT_HANDLING_STRATEGY_VALUES[0],
                 "templateSelectionExpression": "$request.body.action"
             }),
             expected: || {
                 vec![
-                    ("integrationResponseKey", json!("echo")),
+                    ("integrationResponseKey", json!("/2\\d\\d/")),
                     (
                         "contentHandlingStrategy",
                         json!(CONTENT_HANDLING_STRATEGY_VALUES[0]),
@@ -120,14 +120,14 @@ fn rows() -> Vec<Row> {
             expect_empty: &["responseParameters", "responseTemplates"],
         },
         Row {
-            case: "an escaped literal selection key with one response template",
+            case: "a wildcard pattern selection key with one response template",
             request: json!({
-                "integrationResponseKey": "\\$default",
+                "integrationResponseKey": "/5../",
                 "responseTemplates": { "application/json": "{\"ok\":true}" }
             }),
             expected: || {
                 vec![
-                    ("integrationResponseKey", json!("\\$default")),
+                    ("integrationResponseKey", json!("/5../")),
                     (
                         "responseTemplates",
                         json!({ "application/json": "{\"ok\":true}" }),
@@ -143,7 +143,7 @@ fn rows() -> Vec<Row> {
         Row {
             case: "several response templates and response parameters",
             request: json!({
-                "integrationResponseKey": "many",
+                "integrationResponseKey": "/3\\d\\d/",
                 "templateSelectionExpression": "\\$default",
                 "responseTemplates": {
                     "application/json": "{\"body\":$input.json('$')}",
@@ -157,7 +157,7 @@ fn rows() -> Vec<Row> {
             }),
             expected: || {
                 vec![
-                    ("integrationResponseKey", json!("many")),
+                    ("integrationResponseKey", json!("/3\\d\\d/")),
                     ("templateSelectionExpression", json!("\\$default")),
                     (
                         "responseTemplates",
@@ -181,11 +181,11 @@ fn rows() -> Vec<Row> {
         Row {
             case: "explicitly empty collections, which store nothing",
             request: json!({
-                "integrationResponseKey": "empty-maps",
+                "integrationResponseKey": "/(404|410)/",
                 "responseTemplates": {},
                 "responseParameters": {}
             }),
-            expected: || vec![("integrationResponseKey", json!("empty-maps"))],
+            expected: || vec![("integrationResponseKey", json!("/(404|410)/"))],
             expect_empty: &[
                 "contentHandlingStrategy",
                 "responseParameters",
@@ -674,17 +674,23 @@ async fn a_template_selection_expression_naming_an_unknown_variable_is_refused()
 
     // The namespaces it DOES evaluate are accepted, and an escaped literal is not a
     // variable reference at all.
-    for (case, expression) in [
+    for (index, (case, expression)) in [
         ("a request variable", "$request.body.action"),
         ("a context variable", "$context.routeKey"),
         ("an escaped literal", "\\$default"),
-    ] {
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let (status, body) = call(
             &emulator,
             "POST",
             &uri,
             Some(json!({
-                "integrationResponseKey": format!("ok-{case}"),
+                // One status-code key per row: an `IntegrationResponseKey` is `$default`
+                // or a pattern that can match a status, and one integration holds at most
+                // one response per key.
+                "integrationResponseKey": format!("/{}/", 200 + index),
                 "templateSelectionExpression": expression
             })),
         )
@@ -721,7 +727,7 @@ async fn an_integration_holds_at_most_the_bounded_number_of_integration_response
             &emulator,
             "POST",
             &uri,
-            Some(json!({ "integrationResponseKey": format!("key-{index}") })),
+            Some(json!({ "integrationResponseKey": format!("/{}/", 100 + index) })),
         )
         .await;
         assert_eq!(
@@ -736,7 +742,7 @@ async fn an_integration_holds_at_most_the_bounded_number_of_integration_response
         &emulator,
         "POST",
         &uri,
-        Some(json!({ "integrationResponseKey": "one-too-many" })),
+        Some(json!({ "integrationResponseKey": "/400/" })),
     )
     .await;
     assert_eq!(

@@ -144,6 +144,25 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM decides BEFORE this operation looks at its own input, so a caller no policy
+        // permits is told it is not authorized rather than told whether the product it
+        // named exists, and the call changes nothing. A create addresses the COLLECTION —
+        // the page it would mint does not exist yet — so that is the resource it is judged
+        // against, under the product the URI names.
+        let region = crate::state::request_region(ctx.parts());
+        if let Err(denied) = crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::product_page_arn(
+                &region,
+                &input.portal_product_id,
+                crate::service::authorization::ANY_MEMBER,
+            ),
+        ) {
+            return Err(CreateProductPageErrorModeled::AccessDeniedException(denied).into());
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Unreachable in the assembled emulator — see the note in `create_api`.
             return Err(crate::scaffolded::Scaffolded::not_implemented(
@@ -156,7 +175,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // already refused a request that omits either or oversteps a bound: the content
         // reaching here is the page's content as it will be stored, with nothing left to
         // resolve.
-        let region = crate::state::request_region(ctx.parts());
         let mut store = state.lock();
 
         // A product page lives under the portal product the URI names, so a product

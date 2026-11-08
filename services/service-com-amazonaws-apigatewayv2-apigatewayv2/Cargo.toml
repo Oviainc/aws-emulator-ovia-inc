@@ -63,6 +63,13 @@ service-com-amazonaws-apigateway-backplanecontrolservice = { workspace = true }
 # `PostToConnection` a real delivery, which is the seam that crate's state documents for the
 # data plane of the api that owns the connection.
 service-com-amazonaws-apigatewaymanagementapi-apigatewaymanagementapi = { workspace = true }
+# The two stores the authorization gate reads (`src/service/authorization.rs`): the operations
+# whose model declares `AccessDeniedException` decide whether IAM lets the caller perform the
+# action, and the SESSION a credential speaks for lives in STS's store while the POLICIES in
+# force on that principal live in IAM's. Only their `state` accessors are used; the DECISION
+# itself is `service-common`'s one shared evaluation.
+service-com-amazonaws-iam-awsidentitymanagementv20100508 = { workspace = true }
+service-com-amazonaws-sts-awssecuritytokenservicev20110615 = { workspace = true }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }

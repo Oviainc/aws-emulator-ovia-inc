@@ -125,6 +125,10 @@ mod data_plane;
 mod invoke;
 mod jwt;
 mod portal;
+// `pub` for the operations that authorize: every operation whose model declares
+// `AccessDeniedException` asks `authorization::authorize` before it reads this service's
+// store.
+pub mod authorization;
 // `pub` for the data plane's own half: `websocket::transport::open_for_api` is called by the
 // operation that mints a WebSocket api, which is what opens that api's socket and gives its
 // `ApiEndpoint` the address to announce.

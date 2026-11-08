@@ -155,6 +155,27 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM decides BEFORE this operation looks at its own input, so a caller no policy
+        // permits is told it is not authorized rather than told its request was malformed,
+        // and the call changes nothing. A create addresses the COLLECTION — the page it
+        // would mint does not exist yet — so that is the resource it is judged against,
+        // under the product the URI names.
+        let region = crate::state::request_region(ctx.parts());
+        if let Err(denied) = crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::product_rest_endpoint_page_arn(
+                &region,
+                &input.portal_product_id,
+                crate::service::authorization::ANY_MEMBER,
+            ),
+        ) {
+            return Err(
+                CreateProductRestEndpointPageErrorModeled::AccessDeniedException(denied).into(),
+            );
+        }
+
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Unreachable in the assembled emulator — see the note in `create_api`.
             return Err(crate::scaffolded::Scaffolded::not_implemented(
@@ -170,7 +191,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The display content is resolved from the request's overrides and the identified
         // endpoint ONCE, here, so the page a later reader reports carries exactly the
         // content this call stored.
-        let region = crate::state::request_region(ctx.parts());
         let display_content = crate::state::resolve_endpoint_display_content(
             &region,
             parts,

@@ -24,6 +24,7 @@
 
 pub mod authorizer_cache;
 pub mod ec2_subnets;
+pub mod integration_response_key;
 mod network;
 pub mod paging;
 pub mod route_throttle;

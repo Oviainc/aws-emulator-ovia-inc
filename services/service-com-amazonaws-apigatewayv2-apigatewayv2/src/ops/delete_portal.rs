@@ -167,7 +167,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         // The engine is reachable from `&self` (constructor-injected); `ctx` carries
         // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = ctx;
+        // IAM decides BEFORE this operation looks at its own input, so a caller no policy
+        // permits is told it is not authorized rather than told anything about the resource
+        // it named, and the call changes nothing.
+        let region = crate::state::request_region(ctx.parts());
+        if let Err(denied) = crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::portal_arn(&region, &input.portal_id),
+        ) {
+            return Err(DeletePortalErrorModeled::AccessDeniedException(denied).into());
+        }
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Unreachable in the assembled emulator — see the note in `create_api`.
             return Err(crate::scaffolded::Scaffolded::not_implemented("DeletePortal"));

@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetIntegrationResponses
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetIntegrationResponses`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetIntegrationResponses::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! IMPLEMENTED: reports one bounded page of the integration responses the integration the
+//! URI names holds, each projected exactly as `GetIntegrationResponse` projects a single
+//! one. This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -148,18 +142,77 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetIntegrationResponses` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetIntegrationResponsesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetIntegrationResponses"))
+        let _ = ctx;
+        // The page size is bounded SERVER-SIDE, before any record is read: `MaxResults` is
+        // a `__string` query parameter, so `state::paging::parse_max_results` refuses
+        // anything that is not a positive integer and clamps what it accepts down to
+        // `state::MAX_PAGE_SIZE` — the same size a request that names none gets.
+        let max_results = crate::state::parse_max_results(input.max_results.as_deref())
+            .map_err(|message| -> Self::Error {
+                GetIntegrationResponsesErrorModeled::BadRequestException(BadRequestException {
+                    message: Some(message),
+                })
+                .into()
+            })?;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            // Unreachable in the assembled emulator — see the note in `create_api`.
+            return Err(crate::scaffolded::Scaffolded::not_implemented(
+                "GetIntegrationResponses",
+            ));
+        };
+        // A reporting operation: it reads the store and writes nothing.
+        let store = state.lock();
+        let Some(api) = store.apis.get(&input.api_id) else {
+            return Err(not_found(crate::state::invalid_api_identifier_message(
+                &input.api_id,
+            )));
+        };
+        // An integration response is resolvable only through the integration that owns it,
+        // so an `IntegrationId` this api does not hold names no collection to report — the
+        // same addressing `GetIntegrationResponse` reports on.
+        let Some(integration) = api.integrations.get(&input.integration_id) else {
+            return Err(not_found(crate::state::invalid_identifier_message(
+                crate::state::INTEGRATION_RESOURCE,
+            )));
+        };
+
+        let (page, next_token) = crate::state::page(
+            &integration.integration_responses,
+            &crate::state::page_scope(&[
+                "apis",
+                &input.api_id,
+                "integrations",
+                &input.integration_id,
+                "integrationresponses",
+            ]),
+            input.next_token.as_deref(),
+            max_results,
+        )
+        .map_err(|message| -> Self::Error {
+            GetIntegrationResponsesErrorModeled::BadRequestException(BadRequestException {
+                message: Some(message),
+            })
+            .into()
+        })?;
+
+        Ok(GetIntegrationResponsesOutput {
+            items: Some(
+                page.into_iter()
+                    .map(crate::state::IntegrationResponse::to_wire)
+                    .collect(),
+            ),
+            next_token,
+        })
     }
+}
+
+/// This operation's refusal of a request naming a resource no record holds: the modelled
+/// `NotFoundException`, whose message names the KIND of resource that resolved to nothing.
+fn not_found(message: String) -> GetIntegrationResponsesError {
+    GetIntegrationResponsesErrorModeled::NotFoundException(NotFoundException {
+        message: Some(message),
+        resource_type: ::std::option::Option::None,
+    })
+    .into()
 }

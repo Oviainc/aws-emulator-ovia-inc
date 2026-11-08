@@ -152,6 +152,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
+        // IAM decides BEFORE this operation looks at its own input, so a caller no policy
+        // permits is told it is not authorized rather than told its request was malformed,
+        // and the call changes nothing. A custom domain name IS its own identifier, so the
+        // resource this create is judged against is the one the request named.
+        let region = crate::state::request_region(ctx.parts());
+        if let Err(denied) = crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::domain_name_arn(&input.domain_name, &region),
+        ) {
+            return Err(CreateDomainNameErrorModeled::AccessDeniedException(denied).into());
+        }
+
         // The domain name IS the resource's identifier: every other operation on it
         // addresses it by this value (`/v2/domainnames/{DomainName}`), so the length
         // bound its target shape documents is checked before anything is keyed on it.
@@ -185,7 +199,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             Err(message) => return Err(bad_request(&message)),
         };
 
-        let region = crate::state::request_region(ctx.parts());
         let Some(state) = crate::state::service_state(&*self.engine) else {
             // Unreachable in the assembled emulator — see the note in `create_api`.
             return Err(crate::scaffolded::Scaffolded::not_implemented(

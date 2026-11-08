@@ -109,6 +109,8 @@ mod integration_deletion;
 mod integration_lifecycle;
 #[path = "all/integration_pagination.rs"]
 mod integration_pagination;
+#[path = "all/integration_response_key_grammar.rs"]
+mod integration_response_key_grammar;
 #[path = "all/integration_response_lifecycle.rs"]
 mod integration_response_lifecycle;
 #[path = "all/integration_update.rs"]
@@ -133,6 +135,8 @@ mod portal_data_plane;
 mod portal_deletion;
 #[path = "all/portal_hosted_zone.rs"]
 mod portal_hosted_zone;
+#[path = "all/portal_identity_authorization.rs"]
+mod portal_identity_authorization;
 #[path = "all/portal_lifecycle.rs"]
 mod portal_lifecycle;
 #[path = "all/portal_pagination.rs"]
@@ -233,6 +237,8 @@ mod state_roundtrip;
 mod vpc_link_deletion;
 #[path = "all/vpc_link_lifecycle.rs"]
 mod vpc_link_lifecycle;
+#[path = "all/vpc_link_listing.rs"]
+mod vpc_link_listing;
 #[path = "all/vpc_link_subnet_resolution.rs"]
 mod vpc_link_subnet_resolution;
 #[path = "all/vpc_link_update.rs"]

@@ -178,7 +178,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        let _ = ctx;
+        // IAM decides BEFORE this operation looks at its own input, so a caller no policy
+        // permits is told it is not authorized rather than told anything about the resource
+        // it named, and the call changes nothing.
+        let region = crate::state::request_region(ctx.parts());
+        if let Err(denied) = crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::portal_arn(&region, &input.portal_id),
+        ) {
+            return Err(UpdatePortalErrorModeled::AccessDeniedException(denied).into());
+        }
 
         // Every refusal of the request itself is decided BEFORE the store is touched, so
         // a refused patch leaves the portal exactly as it was. A request whose VALUES

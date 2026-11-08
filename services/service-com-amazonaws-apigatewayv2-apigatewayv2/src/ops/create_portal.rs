@@ -179,6 +179,20 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into()
         };
 
+        // IAM decides BEFORE this operation looks at its own input, so a caller no policy
+        // permits is told it is not authorized rather than told its request was malformed,
+        // and the call changes nothing. A create addresses the COLLECTION — the portal it
+        // would mint does not exist yet — so that is the resource it is judged against.
+        let region = crate::state::request_region(ctx.parts());
+        if let Err(denied) = crate::service::authorization::authorize(
+            &*self.engine,
+            ctx,
+            Self::NAME,
+            &crate::state::portal_arn(&region, crate::service::authorization::ANY_MEMBER),
+        ) {
+            return Err(CreatePortalErrorModeled::AccessDeniedException(denied).into());
+        }
+
         // `Authorization` and `EndpointConfiguration` are tagged unions modelled as
         // structures, so the ONE alternative each names is its meaning; naming none or
         // several is incomplete-or-incorrect input. See
@@ -259,7 +273,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         let portal_id = store.mint_portal_id();
-        let region = crate::state::request_region(ctx.parts());
         let created_at = ::std::time::SystemTime::now();
 
         // `PortalTheme$LogoLastUploaded` ("The timestamp when the logo was last
