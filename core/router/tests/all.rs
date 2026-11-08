@@ -53,6 +53,11 @@ mod directory_realm_follows_its_create;
 // Declared here, in this same head region, for the reason the entries above record.
 #[path = "all/directory_data_access_cycle.rs"]
 mod directory_data_access_cycle;
+// Declared here, in this same head region, for the reason the entries above record: the
+// appended tail and the sorted `c…` span (where every cloudformation suite lands) are both
+// regions concurrently landing suites add their line to.
+#[path = "all/cloudformation_lambda_ssm_sourced_update.rs"]
+mod cloudformation_lambda_ssm_sourced_update;
 // appended tail and the sorted `k…` span are both regions concurrently landing suites add
 #[path = "all/kinesisvideo_discovered_data_plane.rs"]
 mod kinesisvideo_discovered_data_plane;
