@@ -61,6 +61,11 @@ md-5 = "0.10"
 sha1 = "0.10"
 sha2 = { workspace = true }
 hex = { workspace = true }
+# Reads the ISO 8601 instants the Amazon States Language's `Timestamp*` comparators and
+# a `Wait` state's `Timestamp` are written as, offsets included: the maintained
+# date-time implementation, rather than the wire-timestamp parser whose RFC 3339 profile
+# carries no offset.
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 # JSONPath: the query language every Amazon States Language `*Path` member is
 # written in, evaluated by this maintained RFC 9535 implementation rather than a
 # hand-written subset.

@@ -33,6 +33,8 @@ mod alias_order_and_redrive_context;
 mod arn_validation;
 #[path = "all/callback_service_integration.rs"]
 mod callback_service_integration;
+#[path = "all/choice_and_wait_evaluation.rs"]
+mod choice_and_wait_evaluation;
 #[path = "all/client_error_wrappers.rs"]
 mod client_error_wrappers;
 #[path = "all/client_refusal_status.rs"]

@@ -1248,6 +1248,11 @@ impl Interpreter<'_> {
     /// `Seconds` is the caller's own figure and keeps its value; `Timestamp` is an
     /// instant, so the wait is however much of it is still ahead of the run. Each has
     /// a `*Path` form that reads the figure from the state's input instead.
+    ///
+    /// A member that could not be read is reported under THE MEMBER THE DEFINITION
+    /// WROTE — `SecondsPath` where the definition carries a `SecondsPath` — because the
+    /// member name is what points a reader at the field to correct, and a definition
+    /// carrying one of the pair does not carry the other.
     pub(super) fn wait_duration(
         &self,
         state: &Map<String, Value>,
@@ -1260,48 +1265,50 @@ impl Interpreter<'_> {
             self.literal(language, node, input, context)
                 .map_err(|failure| failure.cause.unwrap_or_default())
         };
-        let seconds = match (state.get("Seconds"), state.get("SecondsPath")) {
-            (Some(seconds), _) => evaluated(seconds)?,
-            (None, Some(Value::String(path))) => Some(
-                expression(path, input, context)
-                    .map_err(|failure| failure.cause.unwrap_or_default())?,
+        let (member, seconds) = match (state.get("Seconds"), state.get("SecondsPath")) {
+            (Some(seconds), _) => ("Seconds", evaluated(seconds)?),
+            (None, Some(Value::String(path))) => (
+                "SecondsPath",
+                Some(member_path_value("SecondsPath", path, input, context)?),
             ),
             (None, Some(other)) => {
                 return Err(format!("'SecondsPath' must be a JSONPath string, not {other}"));
             }
-            (None, None) => None,
+            (None, None) => ("Seconds", None),
         };
         if let Some(seconds) = seconds {
-            let seconds = seconds
-                .as_u64()
-                .ok_or_else(|| "'Seconds' must be a non-negative whole number".to_string())?;
+            let seconds = seconds.as_u64().ok_or_else(|| {
+                format!("'{member}' must be a non-negative whole number, not {seconds}")
+            })?;
             if seconds > MAX_WAIT_SECONDS {
                 return Err(format!(
-                    "'Seconds' is {seconds}, more than the {MAX_WAIT_SECONDS} seconds a 'Wait' \
+                    "'{member}' is {seconds}, more than the {MAX_WAIT_SECONDS} seconds a 'Wait' \
                      state may wait for"
                 ));
             }
             return Ok(Duration::from_secs(seconds));
         }
 
-        let timestamp = match (state.get("Timestamp"), state.get("TimestampPath")) {
-            (Some(timestamp), _) => evaluated(timestamp)?,
-            (None, Some(Value::String(path))) => Some(
-                expression(path, input, context)
-                    .map_err(|failure| failure.cause.unwrap_or_default())?,
+        let (member, timestamp) = match (state.get("Timestamp"), state.get("TimestampPath")) {
+            (Some(timestamp), _) => ("Timestamp", evaluated(timestamp)?),
+            (None, Some(Value::String(path))) => (
+                "TimestampPath",
+                Some(member_path_value("TimestampPath", path, input, context)?),
             ),
             (None, Some(other)) => {
                 return Err(format!(
                     "'TimestampPath' must be a JSONPath string, not {other}"
                 ));
             }
-            (None, None) => None,
+            (None, None) => ("Timestamp", None),
         };
         if let Some(timestamp) = timestamp {
-            let text = timestamp
-                .as_str()
-                .ok_or_else(|| "'Timestamp' must be an ISO 8601 string".to_string())?;
-            let due_millis = iso_millis(text)?;
+            let text = timestamp.as_str().ok_or_else(|| {
+                format!("'{member}' must be an ISO 8601 instant, not {timestamp}")
+            })?;
+            let due_millis = iso_millis(text).map_err(|_| {
+                format!("'{member}' must be an ISO 8601 instant, not {timestamp}")
+            })?;
             let reached = super::super::epoch_millis(self.start)
                 .saturating_add(i64::try_from(at.as_millis()).unwrap_or(i64::MAX));
             // A `Timestamp` already behind the run is no wait at all; one further
@@ -1310,7 +1317,7 @@ impl Interpreter<'_> {
             let remaining = u64::try_from(due_millis.saturating_sub(reached)).unwrap_or(0);
             if remaining > MAX_WAIT_SECONDS.saturating_mul(1_000) {
                 return Err(format!(
-                    "'Timestamp' is {text}, further ahead than the {MAX_WAIT_SECONDS} seconds a \
+                    "'{member}' is {text}, further ahead than the {MAX_WAIT_SECONDS} seconds a \
                      'Wait' state may wait for"
                 ));
             }
@@ -1377,7 +1384,7 @@ impl Interpreter<'_> {
                     )
                     .map_err(jsonata_failure)?
                 }
-                _ => condition_matches(rule, input, context).map_err(choice_condition_failure)?,
+                _ => condition_matches(rule, input, context)?,
             };
             if !matched {
                 continue;
@@ -2873,6 +2880,11 @@ impl Interpreter<'_> {
     }
 
     /// A numeric member of a state, from the literal member or from its `*Path` form.
+    ///
+    /// A value that is not a figure the member accepts is reported under the member the
+    /// DEFINITION wrote, as a `Wait` state's members are
+    /// ([`Interpreter::wait_duration`]): the two forms are alternatives, so naming the
+    /// one the definition does not carry points a reader at the wrong field.
     pub(super) fn number_member(
         &self,
         state: &Map<String, Value>,
@@ -2883,11 +2895,21 @@ impl Interpreter<'_> {
         default: f64,
     ) -> Result<f64, Failure> {
         let path_member = format!("{member}Path");
-        let value = match (state.get(member), state.get(&path_member)) {
-            (Some(value), _) => self
-                .literal(language, value, input, context)?
-                .unwrap_or(Value::Null),
-            (None, Some(Value::String(path))) => expression(path, input, context)?,
+        let (member, value) = match (state.get(member), state.get(&path_member)) {
+            (Some(value), _) => (
+                member.to_string(),
+                self.literal(language, value, input, context)?
+                    .unwrap_or(Value::Null),
+            ),
+            (None, Some(Value::String(path))) => (
+                path_member.clone(),
+                expression(path, input, context).map_err(|failure| Failure {
+                    error: failure.error,
+                    cause: failure
+                        .cause
+                        .map(|why| member_path_diagnosis(&path_member, path, why)),
+                })?,
+            ),
             (None, Some(other)) => {
                 return Err(runtime(format!(
                     "'{path_member}' must be a JSONPath string, not {other}"
@@ -2903,26 +2925,16 @@ impl Interpreter<'_> {
     }
 }
 
-/// A `Choice` rule's condition failure as the state reports it.
-///
-/// A rule reads the state's input through paths — the `Variable` it compares and the
-/// `*Path` form of a comparator's operand — and a path that resolves to nothing is a
-/// failure of the CONDITION rather than of the state's own data flow, which is why it
-/// is reported under the service's choice-condition diagnosis
-/// ([`CHOICE_CONDITION_PATH_INVALID`]) and not under the path diagnosis every other
-/// member of a state reports ([`no_results_for_path`]). Every other reason a condition
-/// could not be evaluated — a comparator the service does not define, an operand of the
-/// wrong type — already says what it was, so it is carried as raised.
-fn choice_condition_failure(failure: Failure) -> Failure {
-    let unresolved_path = failure
-        .cause
-        .as_deref()
-        .is_some_and(|cause| cause.starts_with(INVALID_PATH_OPENING));
-    if !unresolved_path {
-        return failure;
-    }
-    Failure {
-        error: failure.error,
-        cause: Some(CHOICE_CONDITION_PATH_INVALID.to_string()),
-    }
+/// The value the state member `member` selects through `path`, with a path that
+/// selected nothing reported under that member ([`member_path_diagnosis`]).
+fn member_path_value(
+    member: &str,
+    path: &str,
+    input: &Value,
+    context: &Value,
+) -> Result<Value, String> {
+    expression(path, input, context).map_err(|failure| {
+        member_path_diagnosis(member, path, failure.cause.unwrap_or_default())
+    })
 }
+

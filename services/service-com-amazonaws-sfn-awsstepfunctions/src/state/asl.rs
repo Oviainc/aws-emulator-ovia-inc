@@ -294,14 +294,75 @@ const NO_NEXT_STATE: &str =
 /// The diagnosis for a `Choice` rule whose condition reads a path the state's input
 /// does not resolve.
 ///
-/// RECORDED text: the service does not quote the path back for this one — it states
-/// that the condition path of the choice state references a value that is not there,
-/// which is a different outcome from the state deciding no transition
-/// ([`NO_NEXT_STATE`]), so a caller classifying a [`RUNTIME_ERROR`] by its cause can
-/// tell a condition it could not evaluate from a `Choice` that matched nothing. The
-/// state names itself around it ([`executing_state`], through [`names_its_state`]).
+/// RECORDED text: it states that the condition path of the choice state references a
+/// value that is not there, which is a different outcome from the state deciding no
+/// transition ([`NO_NEXT_STATE`]), so a caller classifying a [`RUNTIME_ERROR`] by its
+/// cause can tell a condition it could not evaluate from a `Choice` that matched
+/// nothing. The path that could not be resolved is named beside it
+/// ([`invalid_choice_condition_path`]), and the state names itself around the whole
+/// diagnosis ([`executing_state`], through [`names_its_state`]).
 const CHOICE_CONDITION_PATH_INVALID: &str =
     "The choice state's condition path references an invalid value.";
+
+/// The diagnosis for a `Choice` rule's condition path that resolved to nothing: the
+/// path the condition was written with, worded as every other unresolvable path is
+/// ([`no_results_for_path`]), and then what the service states about a condition whose
+/// path references a value that is not there ([`CHOICE_CONDITION_PATH_INVALID`]).
+///
+/// A `Choice` state reads several paths — one `Variable` per rule and the `*Path` form
+/// of each operand — so the sentence alone says only that SOME condition could not be
+/// evaluated. Naming the path is what tells the failing operand from every other path
+/// in the state, which is what a reader follows back to the rule that owns it.
+fn invalid_choice_condition_path(path: &str) -> String {
+    format!("{INVALID_PATH_OPENING}{path}' : {CHOICE_CONDITION_PATH_INVALID}")
+}
+
+/// Whether `cause` is the diagnosis `path` SELECTING NOTHING reports
+/// ([`no_results_for_path`]), as opposed to any other reason a path could not be
+/// evaluated — one this service refuses, a syntax it does not evaluate — each of which
+/// already says what it was.
+///
+/// The one place that knowledge of the diagnosis' wording lives, for the two callers
+/// that report an unresolved path under something more specific
+/// ([`choice_path_failure`], [`member_path_diagnosis`]).
+fn is_unresolved_path(cause: &str, path: &str) -> bool {
+    cause == no_results_for_path(path)
+}
+
+/// `failure`, as a `Choice` rule's condition reading `path` reports it.
+///
+/// A path that resolved to nothing is a failure of the CONDITION rather than of the
+/// state's own data flow, so it is reported under the service's choice-condition
+/// diagnosis, naming the path the condition was written with
+/// ([`invalid_choice_condition_path`]). Every other failure is carried as raised.
+fn choice_path_failure(failure: Failure, path: &str) -> Failure {
+    let unresolved = failure
+        .cause
+        .as_deref()
+        .is_some_and(|cause| is_unresolved_path(cause, path));
+    if !unresolved {
+        return failure;
+    }
+    Failure {
+        error: failure.error,
+        cause: Some(invalid_choice_condition_path(path)),
+    }
+}
+
+/// `why`, as the state member `member` reading `path` reports it.
+///
+/// A member and its `*Path` form are ALTERNATIVES — a definition carrying a
+/// `SecondsPath` carries no `Seconds` — so what a reader has to be told is which of the
+/// two the definition wrote and that its path selected nothing. The path's own
+/// diagnosis is kept as it was worded ([`no_results_for_path`]) and the member is named
+/// beside it in a clause of this service's own wording; every other failure is carried
+/// as raised.
+fn member_path_diagnosis(member: &str, path: &str, why: String) -> String {
+    if is_unresolved_path(&why, path) {
+        return format!("{why}. The '{member}' field selected no value.");
+    }
+    why
+}
 
 /// `fault` as the state it happened IN reports it: a diagnosis this module worded
 /// about that state's own expression is reported under [`executing_state`], naming the
@@ -336,9 +397,7 @@ fn diagnosed(name: &str, entered_at: i64, fault: Fault) -> Fault {
 /// transition out of it — so that state names itself around it ([`diagnosed`]) rather
 /// than carrying a name of its own.
 fn names_its_state(cause: &str) -> bool {
-    cause.starts_with(INVALID_PATH_OPENING)
-        || cause == NO_NEXT_STATE
-        || cause == CHOICE_CONDITION_PATH_INVALID
+    cause.starts_with(INVALID_PATH_OPENING) || cause == NO_NEXT_STATE
 }
 
 /// What a `Wait` state's members failing to evaluate reports.
@@ -3986,9 +4045,10 @@ fn nested_conditions<'a>(
 /// a comparator name the language does not define, an operand that is not a JSONPath
 /// string for a `*Path` comparator, a path this service refuses — fails the execution,
 /// because the rule says nothing that can be decided. A judgement about the DATA does
-/// not: a comparator cannot be applied to operands that are not of the type it
-/// compares, so such a rule simply does NOT match, and the `And`/`Or`/`Not` around it
-/// and the rules after it go on being evaluated.
+/// not: ASL's typed comparators are type-strict and never coerce (the service "doesn't
+/// attempt to match a numeric field to a string value"), so a rule whose operands are
+/// not of the type it compares simply does NOT match, and the `And`/`Or`/`Not` around
+/// it and the rules after it go on being evaluated — down to the state's `Default`.
 fn compare(
     operator: &str,
     variable: &str,
@@ -4024,13 +4084,16 @@ fn compare(
         return Ok(holds == expected);
     }
 
-    let value = select(variable, input, context)?;
+    let value =
+        select(variable, input, context).map_err(|failure| choice_path_failure(failure, variable))?;
     let (family, operand) = match operator.strip_suffix("Path") {
         Some(family) => {
             let path = operand.as_str().ok_or_else(|| {
                 runtime(format!("'{operator}' must be given a JSONPath string"))
             })?;
-            (family, select(path, input, context)?)
+            let operand = select(path, input, context)
+                .map_err(|failure| choice_path_failure(failure, path))?;
+            (family, operand)
         }
         None => (operator, operand.clone()),
     };
@@ -4044,30 +4107,28 @@ fn compare(
         // "StringMatches […] a string that may contain one or more wildcards": the
         // only comparator of this family that is not one of the four orderings.
         if comparison == "Matches" {
+            // Type-strict: only a string is a candidate for a string comparator, and a
+            // value of any other type is simply not matched.
             let (Some(text), Some(pattern)) = (value.as_str(), operand.as_str()) else {
                 return Ok(false);
             };
             return glob_matches(pattern, text);
         }
-        if !is_ordering(comparison) {
-            return Err(undefined());
-        }
+        let comparison = Comparison::named(comparison).ok_or_else(undefined)?;
         let (Some(left), Some(right)) = (value.as_str(), operand.as_str()) else {
             return Ok(false);
         };
-        return Ok(ordering(comparison, left.cmp(right)).unwrap_or(false));
+        return Ok(comparison.holds_for(left.cmp(right)));
     }
     if let Some(comparison) = family.strip_prefix("Numeric") {
-        if !is_ordering(comparison) {
-            return Err(undefined());
-        }
+        let comparison = Comparison::named(comparison).ok_or_else(undefined)?;
         let (Some(left), Some(right)) = (value.as_f64(), operand.as_f64()) else {
             return Ok(false);
         };
         let Some(order) = left.partial_cmp(&right) else {
             return Ok(false);
         };
-        return Ok(ordering(comparison, order).unwrap_or(false));
+        return Ok(comparison.holds_for(order));
     }
     if let Some(comparison) = family.strip_prefix("Boolean") {
         // `BooleanEquals` is the whole family: the language defines no ordering over
@@ -4081,9 +4142,7 @@ fn compare(
         return Ok(left == right);
     }
     if let Some(comparison) = family.strip_prefix("Timestamp") {
-        if !is_ordering(comparison) {
-            return Err(undefined());
-        }
+        let comparison = Comparison::named(comparison).ok_or_else(undefined)?;
         let (Some(left), Some(right)) = (value.as_str(), operand.as_str()) else {
             return Ok(false);
         };
@@ -4092,31 +4151,47 @@ fn compare(
         let (Ok(left), Ok(right)) = (iso_millis(left), iso_millis(right)) else {
             return Ok(false);
         };
-        return Ok(ordering(comparison, left.cmp(&right)).unwrap_or(false));
+        return Ok(comparison.holds_for(left.cmp(&right)));
     }
     Err(undefined())
 }
 
-/// Whether `comparison` names one of the ordering comparisons [`ordering`] defines,
-/// which every value-comparator family but `StringMatches` and `BooleanEquals` takes.
-///
-/// Asked of [`ordering`] itself rather than restating its name list, so the set of
-/// comparisons the language defines lives in ONE place: what cannot be applied to an
-/// ordering is not a comparison this service evaluates.
-fn is_ordering(comparison: &str) -> bool {
-    ordering(comparison, std::cmp::Ordering::Equal).is_some()
+/// One of the five comparisons ASL's `String*`, `Numeric*` and `Timestamp*` comparator
+/// families each define, read from the comparator's own suffix.
+#[derive(Clone, Copy, Debug)]
+enum Comparison {
+    Equals,
+    LessThan,
+    LessThanEquals,
+    GreaterThan,
+    GreaterThanEquals,
 }
 
-/// Whether `order` satisfies one of ASL's four ordering comparisons.
-fn ordering(comparison: &str, order: std::cmp::Ordering) -> Option<bool> {
-    use std::cmp::Ordering::{Equal, Greater, Less};
-    match comparison {
-        "Equals" => Some(order == Equal),
-        "LessThan" => Some(order == Less),
-        "LessThanEquals" => Some(order != Greater),
-        "GreaterThan" => Some(order == Greater),
-        "GreaterThanEquals" => Some(order != Less),
-        _ => None,
+impl Comparison {
+    /// The comparison `suffix` names, or `None` when the language defines none by that
+    /// name — which is a comparator this service cannot evaluate rather than a
+    /// comparison that holds for nothing.
+    fn named(suffix: &str) -> Option<Self> {
+        match suffix {
+            "Equals" => Some(Self::Equals),
+            "LessThan" => Some(Self::LessThan),
+            "LessThanEquals" => Some(Self::LessThanEquals),
+            "GreaterThan" => Some(Self::GreaterThan),
+            "GreaterThanEquals" => Some(Self::GreaterThanEquals),
+            _ => None,
+        }
+    }
+
+    /// Whether the candidate ordering `order` satisfies this comparison.
+    fn holds_for(self, order: std::cmp::Ordering) -> bool {
+        use std::cmp::Ordering::{Equal, Greater, Less};
+        match self {
+            Self::Equals => order == Equal,
+            Self::LessThan => order == Less,
+            Self::LessThanEquals => order != Greater,
+            Self::GreaterThan => order == Greater,
+            Self::GreaterThanEquals => order != Less,
+        }
     }
 }
 
@@ -4891,13 +4966,16 @@ fn iso(time: SystemTime) -> String {
 }
 
 /// An ISO 8601 instant in whole milliseconds since the Unix epoch.
+///
+/// The Amazon States Language's timestamps are ISO 8601 instants, and a timestamp
+/// comparator "compares" them as the instants they DENOTE — so the whole instant
+/// grammar is read here, a numeric UTC offset (`+01:00`) included, and the offset is
+/// applied rather than refused: `2024-03-01T13:00:00+01:00` and
+/// `2024-03-01T12:00:00Z` are one instant and compare equal. The maintained date-time
+/// implementation parses it, NOT the wire-timestamp parser this service's modelled
+/// members are deserialised by, whose RFC 3339 profile accepts no offset at all.
 fn iso_millis(text: &str) -> Result<i64, String> {
-    let parsed = ::aws_smithy_types::DateTime::from_str(
-        text,
-        ::aws_smithy_types::date_time::Format::DateTime,
-    )
-    .map_err(|error| format!("'{text}' is not an ISO 8601 instant: {error}"))?;
-    parsed
-        .to_millis()
-        .map_err(|error| format!("'{text}' is out of range: {error}"))
+    ::chrono::DateTime::parse_from_rfc3339(text)
+        .map(|parsed| parsed.timestamp_millis())
+        .map_err(|_| format!("'{text}' is not an ISO 8601 instant"))
 }

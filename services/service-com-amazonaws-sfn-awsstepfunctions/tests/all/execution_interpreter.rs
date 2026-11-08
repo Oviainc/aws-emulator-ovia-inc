@@ -430,7 +430,7 @@ async fn what_cannot_be_run_in_process_fails_rather_than_being_faked() {
 
 /// The definition a comparator row runs: the rule's branch answers `"rule"`, the
 /// `Default` answers `"default"`, so what the execution outputs says which was taken.
-fn choice_definition(rule: Value) -> String {
+pub(crate) fn choice_definition(rule: Value) -> String {
     json!({
         "StartAt": "C",
         "States": {
