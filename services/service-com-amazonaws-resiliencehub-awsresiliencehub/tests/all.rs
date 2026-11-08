@@ -27,6 +27,8 @@ mod app_version_resources;
 mod app_version_template;
 #[path = "all/application_lifecycle.rs"]
 mod application_lifecycle;
+#[path = "all/assessment_score_breakdown.rs"]
+mod assessment_score_breakdown;
 #[path = "all/list_app_versions.rs"]
 mod list_app_versions;
 #[path = "all/minted_identifier_shape.rs"]

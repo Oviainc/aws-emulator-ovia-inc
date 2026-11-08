@@ -45,8 +45,10 @@ const POLICY_BREACHED: &str = "PolicyBreached";
 const MISSING_POLICY: &str = "MissingPolicy";
 
 /// The score one disruption type's met objective earns, and so the score of an
-/// application that meets every objective its policy states.
-const FULL_SCORE: f64 = 100.0;
+/// application that meets every objective its policy states: a resiliency score is
+/// reported as the FRACTION of its maximum that was earned, so meeting everything
+/// scores 1.
+const FULL_SCORE: f64 = 1.0;
 
 /// An emulator holding only this service, over one shared engine — and that engine,
 /// so a case can move the CLOCK an assessment is waiting on instead of sleeping

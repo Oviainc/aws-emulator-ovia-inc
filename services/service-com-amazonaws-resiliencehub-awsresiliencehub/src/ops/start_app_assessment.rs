@@ -237,7 +237,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|policy_arn| store.policies.get(policy_arn))
             .cloned();
 
-        let compliance = disruption_compliance(&assessed, policy.as_ref());
+        // What stands between the application and the whole of the compliance
+        // score: the Application Components the assessed version leaves with
+        // nothing to recover them. The same set decides the verdict on every
+        // objective and how much is outstanding, so it is walked once.
+        let breaching_components = components_without_resources(&assessed);
+        let compliance = disruption_compliance(policy.as_ref(), &breaching_components);
         // An assessment PINS the version it graded: the release alias is a label the
         // next publish moves, so what the assessment records is the publish sequence
         // number that label resolved to at this call — a later read of the assessment
@@ -255,7 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             // `cost` is left out: this emulator holds no pricing for the resources
             // an application maps, so there is no amount to report.
             cost: None,
-            resiliency_score: Some(resiliency_score(&compliance)),
+            resiliency_score: Some(resiliency_score(&compliance, &breaching_components)),
             compliance_status: Some(overall_compliance_status(policy.as_ref(), &compliance)),
             compliance: Some(compliance),
             assessment_status: crate::state::ASSESSMENT_STATUS_SUCCESS.to_string(),
@@ -303,30 +308,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// query="shape" shape="Seconds"`: bounded below by 0 and not above).
 const UNRECOVERED_SECONDS: i32 = i32::MAX;
 
-/// What the assessment makes of `assessed` against `policy`, one entry per
+/// What the assessment makes of a version against `policy`, one entry per
 /// disruption type the POLICY states an objective for — an application is only
 /// compliant with the objectives it was given, so a disruption type the policy
 /// leaves out is not judged, and an application with no policy is not judged at
 /// all.
 ///
 /// Recovery is backed by what the assessed version actually maps: an Application
-/// Component with no resource mapped to it has nothing to recover, so while one
-/// exists no objective is met and the assessment reports the recovery times as
-/// unreached ([`UNRECOVERED_SECONDS`]) while reporting the objective itself as
-/// achievable — mapping a resource into the component is what reaches it.
+/// Component with no resource mapped to it has nothing to recover, so while one of
+/// `breaching_components` exists no objective is met and the assessment reports the
+/// recovery times as unreached ([`UNRECOVERED_SECONDS`]) while reporting the
+/// objective itself as achievable — mapping a resource into the component is what
+/// reaches it.
 fn disruption_compliance(
-    assessed: &crate::state::AppVersionContents,
     policy: Option<&ResiliencyPolicy>,
+    breaching_components: &[String],
 ) -> ::std::collections::HashMap<String, DisruptionCompliance> {
     let Some(objectives) = policy.and_then(|policy| policy.policy.as_ref()) else {
         return ::std::collections::HashMap::new();
     };
 
-    let unmapped = components_without_resources(assessed);
     objectives
         .iter()
         .map(|(disruption_type, objective)| {
-            let compliance = match unmapped.first() {
+            let compliance = match breaching_components.first() {
                 None => DisruptionCompliance {
                     current_rto_in_secs: objective.rto_in_secs,
                     achievable_rto_in_secs: objective.rto_in_secs,
@@ -418,27 +423,30 @@ fn overall_compliance_status(
     COMPLIANCE_STATUS_MET.to_string()
 }
 
-/// The score of a disruption type whose objective is reached, out of
-/// [`SCORE_PER_DISRUPTION`].
-const SCORE_PER_DISRUPTION: f64 = 100.0;
+/// The whole of a resiliency score. A score is reported as the FRACTION of its
+/// maximum that was earned, so what is earned for everything a score is made up of
+/// — one disruption type's objective, one scoring component's share — adds up to
+/// this, and an application that meets everything it is judged on scores exactly
+/// it.
+const WHOLE_SCORE: f64 = 1.0;
 
 /// The assessment's resiliency score: each disruption type the policy states an
-/// objective for scores the whole of [`SCORE_PER_DISRUPTION`] when that objective
-/// is reached and none of it when it is not, and the application's score is the
-/// mean of them — so the score says exactly how much of the policy the application
-/// meets, and an application with nothing to judge scores nothing.
+/// objective for earns the whole of [`WHOLE_SCORE`] when that objective is reached
+/// and none of it when it is not, and the application's score is the mean of them —
+/// so the score says exactly how much of the policy the application meets, and an
+/// application with nothing to judge scores nothing.
 ///
-/// `componentScore` is left out: it breaks the score down by scoring component
-/// (compliance, tests, alarms and standard operating procedures), and this service
-/// records no tests, alarms or procedures to score.
+/// `componentScore` breaks that same score down by scoring component — see
+/// [`component_score`].
 fn resiliency_score(
     compliance: &::std::collections::HashMap<String, DisruptionCompliance>,
+    breaching_components: &[String],
 ) -> ResiliencyScore {
     let disruption_score: ::std::collections::HashMap<String, f64> = compliance
         .iter()
         .map(|(disruption_type, entry)| {
             let score = if entry.compliance_status == COMPLIANCE_STATUS_MET {
-                SCORE_PER_DISRUPTION
+                WHOLE_SCORE
             } else {
                 0.0
             };
@@ -451,10 +459,63 @@ fn resiliency_score(
         disruption_score.values().sum::<f64>() / disruption_score.len() as f64
     };
     ResiliencyScore {
+        component_score: Some(component_score(score, compliance, breaching_components)),
         score,
         disruption_score,
-        component_score: None,
     }
+}
+
+/// The scoring component that grades an application against the objectives its
+/// resiliency policy states, as the model's `ResiliencyScoreType` enum names it;
+/// every other member of that enum ([`RESILIENCY_SCORE_TYPE_VALUES`]) is a
+/// component graded on implemented recommendations instead — resiliency tests,
+/// Amazon CloudWatch alarms and standard operating procedures.
+const SCORING_COMPONENT_COMPLIANCE: &str = "Compliance";
+
+/// How the assessment's score breaks down over the scoring components: one entry
+/// per member of the model's `ResiliencyScoreType` enum, so a member that enum
+/// gains is a component the breakdown reports. Every point of the score is earned
+/// by the one component this service grades — compliance with the policy's
+/// objectives — so that component's `possibleScore` is the whole share of the score
+/// and its `score` is the part of that share the application earned, while a
+/// component graded on implemented recommendations can earn no share and scores
+/// nothing: this service records no test, alarm or standard operating procedure
+/// recommendation, so there is none to implement and none to score. The shares
+/// therefore add up to the whole of a score, and what the components earn adds up
+/// to the score itself.
+///
+/// `outstandingCount` is what must still be done to reach that component's
+/// `possibleScore` — for compliance, the Application Components that breached the
+/// policy; `excludedCount` counts the recommendations excluded from the assessment,
+/// and this service excludes none. Should this service ever record recommendations
+/// to score, the shares have to be re-derived together, so that they still add up
+/// to the whole of a score and what they earn still adds up to the score.
+fn component_score(
+    score: f64,
+    compliance: &::std::collections::HashMap<String, DisruptionCompliance>,
+    breaching_components: &[String],
+) -> ::std::collections::HashMap<String, ScoringComponentResiliencyScore> {
+    RESILIENCY_SCORE_TYPE_VALUES
+        .iter()
+        .map(|component| {
+            let graded = if *component == SCORING_COMPONENT_COMPLIANCE {
+                ScoringComponentResiliencyScore {
+                    score,
+                    possible_score: WHOLE_SCORE,
+                    // Nothing breached a policy that states no objective to breach.
+                    outstanding_count: if compliance.is_empty() {
+                        0
+                    } else {
+                        breaching_components.len() as i64
+                    },
+                    excluded_count: 0,
+                }
+            } else {
+                ScoringComponentResiliencyScore::default()
+            };
+            ((*component).to_string(), graded)
+        })
+        .collect()
 }
 
 /// Whether `stored` is the assessment `request` asks for — the idempotency check: a
