@@ -42,10 +42,11 @@ pub fn kinesis_precision_unchanged(
 /// all (the engine is not the shared in-memory one): either way nothing resolves the ARN,
 /// so nothing can replicate to it.
 ///
-/// LOCKING: this takes the KINESIS store's lock, and the caller must NOT hold this
-/// service's own while it does — the one lock order this seam uses, as
-/// [`super::register_table_stream`] describes for the streams registry. The work under
-/// that lock is one walk over the region's streams, bounded by the registry's own quota.
+/// LOCKING: this takes the KINESIS store's lock. A caller may hold this service's own
+/// while it does — the order [`super::deliver_item_changes`] uses, and the only one in the
+/// emulator, since no Kinesis operation reaches into this store — and this caller does not
+/// need to. The work under that lock is one walk over the region's streams, bounded by the
+/// registry's own quota.
 pub fn kinesis_stream_exists<Eng: Send + Sync + 'static>(
     engine: &Eng,
     region: &str,

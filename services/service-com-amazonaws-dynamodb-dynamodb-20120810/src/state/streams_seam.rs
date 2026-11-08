@@ -14,9 +14,9 @@
 //! file to read rather than a section at the end of the store.
 //!
 //! The DATA plane's half is [`publish_item_changes`]: an item write records what it
-//! changed on this service's store and the handler hands the queue to the streams
-//! registry at the end of the request, so the records a consumer reads are appended
-//! THERE too.
+//! changed on this service's store and the handler hands the queue to the stores that
+//! hold the records at the end of the request, so the records a consumer reads are
+//! appended THERE too.
 
 use std::time::SystemTime;
 
@@ -205,16 +205,8 @@ pub fn register_table_stream<Eng: Send + Sync + 'static>(
 /// streaming destinations ([`crate::state::deliver_item_changes`]), whose records are the
 /// Kinesis service's own.
 ///
-/// Which modification a record describes is derived from the images the write queued:
-/// an item that was not there before is an `INSERT`, one that was and still is a
-/// `MODIFY`, and one that is gone a `REMOVE` (the model's `OperationType`). The
-/// stream drops the images its own `StreamViewType` does not capture, so what a
-/// consumer sees is never more than the stream was created to capture.
-///
-/// Publication cannot fail the write that made the change — the item is already
-/// stored and the response is already decided, and DynamoDB publishes to a stream
-/// asynchronously — so a change the registry will not take is LOGGED rather than
-/// turned into an error for the caller.
+/// The queue is drained ONCE here and handed to both, so the two cannot disagree about
+/// which changes a request made.
 ///
 /// LOCKING: like [`register_table_stream`], this takes the STREAMS store's lock while
 /// the caller holds this service's own, which is the one order the emulator uses, and then
@@ -239,6 +231,17 @@ pub fn publish_item_changes<Eng: Send + Sync + 'static>(
 /// Append every change to the DynamoDB stream it belongs to, for the changes made on a
 /// table whose own stream is enabled: a change queued by a table with no stream belongs to
 /// none and is only a Kinesis streaming destination's.
+///
+/// Which modification a record describes is derived from the images the write queued: an
+/// item that was not there before is an `INSERT`, one that was and still is a `MODIFY`,
+/// and one that is gone a `REMOVE` (the model's `OperationType`). The stream drops the
+/// images its own `StreamViewType` does not capture, so what a consumer sees is never
+/// more than the stream was created to capture.
+///
+/// Publication cannot fail the write that made the change — the item is already stored
+/// and the response is already decided, and DynamoDB publishes to a stream
+/// asynchronously — so a change the registry will not take is LOGGED rather than
+/// turned into an error for the caller.
 fn publish_to_streams<Eng: Send + Sync + 'static>(
     engine: &Eng,
     changes: &[crate::state::PendingStreamRecord],

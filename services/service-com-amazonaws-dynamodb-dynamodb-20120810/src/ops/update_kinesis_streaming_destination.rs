@@ -257,13 +257,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             stream_arn: Some(stream_arn),
             destination_status: Some(status),
             // The configuration this destination now replicates under, read back from
-            // the record rather than echoed: a command that named no precision reports
-            // the one already in force, and a destination carrying none reports no
-            // configuration at all.
-            update_kinesis_streaming_configuration: in_force.map(|precision| {
-                UpdateKinesisStreamingConfiguration {
-                    approximate_creation_date_time_precision: Some(precision),
-                }
+            // the record rather than echoed: the member REPORTS that configuration, so
+            // it is always there, carrying the precision in force — the one this command
+            // named, or the one already registered where it named none.
+            update_kinesis_streaming_configuration: Some(UpdateKinesisStreamingConfiguration {
+                approximate_creation_date_time_precision: in_force,
             }),
         })
     }

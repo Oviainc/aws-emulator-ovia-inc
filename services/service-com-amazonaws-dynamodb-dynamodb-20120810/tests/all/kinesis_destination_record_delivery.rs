@@ -121,59 +121,15 @@ async fn delete_item(router: &MultiServiceRouter, table: &str, id: &str) {
 /// JSON document its `Data` blob carries — what a change-data-capture consumer of a table's
 /// streaming destination reads.
 ///
-/// Read from the stream's trim horizon through the KINESIS service's own surface, because
-/// that is where the records live. The walk is bounded, so a delivery that never advances
-/// an iterator fails rather than hanging.
+/// The drain itself is the harness's ([`crate::emulator::drain_kinesis_stream`]); this
+/// suite is about the records rather than where in the shard map they landed, so the shard
+/// each came from is dropped here.
 async fn delivered(router: &MultiServiceRouter, case: &str, stream: &str) -> Vec<Value> {
-    let listed = ok_kinesis(router, "ListShards", json!({"StreamName": stream})).await;
-    let shards = listed["Shards"].as_array().cloned().unwrap_or_default();
-    assert!(
-        !shards.is_empty(),
-        "case {case:?}: the destination's stream must list at least one shard, got {listed}"
-    );
-    let mut records: Vec<Value> = Vec::new();
-    for shard in &shards {
-        let shard_id = shard["ShardId"].as_str().unwrap_or_default();
-        let minted = ok_kinesis(
-            router,
-            "GetShardIterator",
-            json!({
-                "StreamName": stream,
-                "ShardId": shard_id,
-                "ShardIteratorType": "TRIM_HORIZON",
-            }),
-        )
-        .await;
-        let mut iterator = minted["ShardIterator"]
-            .as_str()
-            .unwrap_or_default()
-            .to_string();
-        assert!(
-            !iterator.is_empty(),
-            "case {case:?}: GetShardIterator must mint a position in {shard_id:?}, got {minted}"
-        );
-        for _ in 0..16 {
-            let page = ok_kinesis(router, "GetRecords", json!({"ShardIterator": iterator})).await;
-            let batch = page["Records"].as_array().cloned().unwrap_or_default();
-            for record in &batch {
-                let encoded = record["Data"].as_str().unwrap_or_else(|| {
-                    panic!("case {case:?}: every record carries Data, got {record}")
-                });
-                let decoded = aws_smithy_types::base64::decode(encoded).unwrap_or_else(|error| {
-                    panic!("case {case:?}: a record's Data is base64, got {error}")
-                });
-                let document: Value = serde_json::from_slice(&decoded).unwrap_or_else(|error| {
-                    panic!("case {case:?}: a delivered record carries JSON, got {error}")
-                });
-                records.push(document);
-            }
-            match page["NextShardIterator"].as_str() {
-                Some(next) if !batch.is_empty() => iterator = next.to_string(),
-                _ => break,
-            }
-        }
-    }
-    records
+    crate::emulator::drain_kinesis_stream(router, case, stream)
+        .await
+        .into_iter()
+        .map(|(_, document)| document)
+        .collect()
 }
 
 /// Epoch milliseconds now — what a record's creation time is compared against.

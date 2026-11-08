@@ -653,8 +653,9 @@ async fn the_destination_lifecycle_is_driven_over_the_wire() {
         "case \"before any command\": a table replicates to nothing, got {empty}"
     );
 
-    // A registration that names no precision registers none: the member stays absent
-    // until a command names one.
+    // A registration that names no precision registers none: the member is still
+    // reported, because it REPORTS the configuration in force, and it is empty until a
+    // command names a precision.
     let enabled = ok(
         &router,
         "EnableKinesisStreamingDestination",
@@ -668,8 +669,9 @@ async fn the_destination_lifecycle_is_driven_over_the_wire() {
     );
     assert_eq!(
         enabled["EnableKinesisStreamingConfiguration"],
-        Value::Null,
-        "case \"registered\": a registration that named no precision reports none, got {enabled}"
+        json!({}),
+        "case \"registered\": a registration that named no precision reports an empty \
+         configuration, got {enabled}"
     );
 
     let registering = described(&router, "Wired", &arn).await;

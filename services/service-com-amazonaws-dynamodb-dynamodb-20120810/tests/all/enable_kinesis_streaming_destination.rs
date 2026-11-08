@@ -11,10 +11,12 @@
 //!    the transient status: the destination is `ENABLING` for the transient span and
 //!    `ACTIVE` after it, both as the command answers and as the reader reports;
 //! 2. the destination replicates under the configuration the request carried, and the
-//!    answer reports that configuration back from the record: a request that names no
-//!    precision — by carrying no configuration at all, or one with the member absent —
-//!    registers none, and the member stays absent in the answer and in the reader's
-//!    report until a command names one;
+//!    answer reports that configuration back from the record: the
+//!    `EnableKinesisStreamingConfiguration` member is always there, because it REPORTS the
+//!    configuration in force, and the precision INSIDE it only once a command has named
+//!    one — a request that names none, by carrying no configuration at all or one with the
+//!    member absent, is answered an EMPTY configuration, and the reader reports no
+//!    precision for it;
 //! 3. a table replicates to AT MOST ONE Kinesis data stream, and holds ONE record per
 //!    stream: an enable against a table whose replication is live is refused with HTTP 400
 //!    `ValidationException` carrying DynamoDB's enable-state sentence — whichever stream it
@@ -230,7 +232,7 @@ async fn an_enable_registers_the_destination_it_names() {
             json!("ENABLING"),
             "case {case:?}: expected the transient status, got {answered}"
         );
-        let expected_configuration = named.in_force().map_or(Value::Null, |precision| {
+        let expected_configuration = named.in_force().map_or(json!({}), |precision| {
             json!({"ApproximateCreationDateTimePrecision": precision})
         });
         assert_eq!(

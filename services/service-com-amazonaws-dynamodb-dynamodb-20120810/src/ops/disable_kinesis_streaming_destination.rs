@@ -207,6 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         destination.apply_disable(now);
         let stream_arn = destination.stream_arn.clone();
         let status = destination.status(now).to_string();
+        let in_force = destination.precision();
 
         // The audit record for a state-changing call: who asked, what was changed and
         // that it succeeded. Never a credential — only the access key id the caller
@@ -225,11 +226,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             table_name: Some(table_name),
             stream_arn: Some(stream_arn),
             destination_status: Some(status),
-            // The output member is documented as "the destination for the Kinesis
-            // streaming information that is being ENABLED". This command enables
-            // nothing — it stops replication and changes no configuration — so there is
-            // no such destination to report and the member stays absent.
-            enable_kinesis_streaming_configuration: None,
+            // The configuration the destination this command addressed replicates
+            // under, read back from the record: the member REPORTS that configuration,
+            // so it is always there, and the precision inside it only where the
+            // destination carries one — a stop changes neither.
+            enable_kinesis_streaming_configuration: Some(EnableKinesisStreamingConfiguration {
+                approximate_creation_date_time_precision: in_force,
+            }),
         })
     }
 }

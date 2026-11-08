@@ -567,10 +567,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let mut ledger = crate::state::WriteLedger::default();
         let mut undo: Vec<(String, crate::state::ItemKey, Option<crate::state::Item>)> = Vec::new();
         let mut refused: Option<Self::Error> = None;
-        // Where the streams of the tables this transaction writes stood before it
+        // Where the change feeds of the tables this transaction writes stood before it
         // started: a transaction that is rolled back below made no modification, so its
         // queued changes go back with the items.
-        let stream_mark = store.queued_stream_record_count();
+        let change_mark = store.queued_stream_record_count();
         for action in &planned {
             let after = match &action.write {
                 PlannedWrite::Put(item) | PlannedWrite::Update(item) => Some(item.clone()),
@@ -651,9 +651,9 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 }
             }
             // The restoring writes above queued changes of their own, so the queue is
-            // put back where it stood: the streams of these tables carry neither the
+            // put back where it stood: the feeds of these tables carry neither the
             // cancelled modifications nor their undo.
-            store.rewind_stream_records(stream_mark);
+            store.rewind_stream_records(change_mark);
             return Err(refused);
         }
 

@@ -47,19 +47,30 @@ pub fn emulator_and_engine() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>
 /// wire if it does not, and answer the ARN THAT SERVICE reports for it — the ARN a table's
 /// destination then names.
 ///
-/// A single shard: the destination only has to RESOLVE the stream, and the shard count is
-/// the caller's choice everywhere else. Idempotent, so a suite may call it from the helper
-/// that enables a destination however many times that helper runs: a stream the region
-/// already holds answers `ResourceInUseException`, which is this call's success too. The ARN
-/// is read back off that service's own description rather than built here, so a suite does
-/// not depend on how the Kinesis crate mints one.
+/// A single shard, which is all a destination that only has to RESOLVE the stream needs; a
+/// suite whose rule is about the shard MAP names its own count
+/// ([`ensure_kinesis_stream_with_shards`]). Idempotent, so a suite may call it from the
+/// helper that enables a destination however many times that helper runs: a stream the
+/// region already holds answers `ResourceInUseException`, which is this call's success too.
+/// The ARN is read back off that service's own description rather than built here, so a
+/// suite does not depend on how the Kinesis crate mints one.
 pub async fn ensure_kinesis_stream(router: &MultiServiceRouter, name: &str) -> String {
+    ensure_kinesis_stream_with_shards(router, name, 1).await
+}
+
+/// The same, over `shards` shards — for a suite that asserts WHERE in a stream's shard map
+/// a record landed, which a one-shard stream cannot show.
+pub async fn ensure_kinesis_stream_with_shards(
+    router: &MultiServiceRouter,
+    name: &str,
+    shards: u32,
+) -> String {
     let (status, body) = dispatch_as(
         router,
         REGION,
         "kinesis",
         "Kinesis_20131202.CreateStream",
-        json!({"StreamName": name, "ShardCount": 1}),
+        json!({"StreamName": name, "ShardCount": shards}),
     )
     .await;
     assert!(
@@ -330,6 +341,70 @@ pub async fn drain_stream(
             );
             let batch = page["Records"].as_array().cloned().unwrap_or_default();
             records.extend(batch.iter().cloned());
+            match page["NextShardIterator"].as_str() {
+                Some(next) if !batch.is_empty() => iterator = next.to_string(),
+                _ => break,
+            }
+        }
+    }
+    records
+}
+
+/// Every change record the KINESIS data stream `stream` holds, as the shard it landed in
+/// and the JSON document its `Data` blob carries — what a consumer of a table's Kinesis
+/// streaming destination reads, shared by every suite that asserts a delivery.
+///
+/// Read from each shard's trim horizon through that service's own surface, because that is
+/// where the records live. The walk is bounded, so a delivery that never advances an
+/// iterator fails rather than hanging, and it asserts the stream serves a shard and a
+/// position in it. `case` names the row the assertions belong to.
+pub async fn drain_kinesis_stream(
+    router: &MultiServiceRouter,
+    case: &str,
+    stream: &str,
+) -> Vec<(String, Value)> {
+    let listed = ok_kinesis(router, "ListShards", json!({"StreamName": stream})).await;
+    let shards = listed["Shards"].as_array().cloned().unwrap_or_default();
+    assert!(
+        !shards.is_empty(),
+        "case {case:?}: the destination's stream must list at least one shard, got {listed}"
+    );
+    let mut records: Vec<(String, Value)> = Vec::new();
+    for shard in &shards {
+        let shard_id = shard["ShardId"].as_str().unwrap_or_default().to_string();
+        let minted = ok_kinesis(
+            router,
+            "GetShardIterator",
+            json!({
+                "StreamName": stream,
+                "ShardId": shard_id,
+                "ShardIteratorType": "TRIM_HORIZON",
+            }),
+        )
+        .await;
+        let mut iterator = minted["ShardIterator"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(
+            !iterator.is_empty(),
+            "case {case:?}: GetShardIterator must mint a position in {shard_id:?}, got {minted}"
+        );
+        for _ in 0..16 {
+            let page = ok_kinesis(router, "GetRecords", json!({"ShardIterator": iterator})).await;
+            let batch = page["Records"].as_array().cloned().unwrap_or_default();
+            for record in &batch {
+                let encoded = record["Data"].as_str().unwrap_or_else(|| {
+                    panic!("case {case:?}: every record carries Data, got {record}")
+                });
+                let decoded = aws_smithy_types::base64::decode(encoded).unwrap_or_else(|error| {
+                    panic!("case {case:?}: a record's Data is base64, got {error}")
+                });
+                let document: Value = serde_json::from_slice(&decoded).unwrap_or_else(|error| {
+                    panic!("case {case:?}: a delivered record carries JSON, got {error}")
+                });
+                records.push((shard_id.clone(), document));
+            }
             match page["NextShardIterator"].as_str() {
                 Some(next) if !batch.is_empty() => iterator = next.to_string(),
                 _ => break,

@@ -12,10 +12,10 @@
 //!    replication: the destination is `DISABLING` for the transient span and `DISABLED`
 //!    after it, both as the command answers and as the reader reports;
 //! 2. stopping replication changes no configuration, so the precision the destination
-//!    replicated under survives the stop, and the answer carries no
-//!    `EnableKinesisStreamingConfiguration` — the member reports "the destination for
-//!    the Kinesis streaming information that is being enabled", and this command enables
-//!    nothing — whatever configuration the request itself carried;
+//!    replicated under survives the stop and the answer's
+//!    `EnableKinesisStreamingConfiguration` reports it — the member REPORTS the
+//!    configuration in force, so it is always there and carries a precision only where
+//!    the destination does — whatever configuration the request itself carried;
 //! 3. a table with no `ACTIVE` destination for that stream is refused with HTTP 400
 //!    `ValidationException` carrying DynamoDB's required-status sentence, whether it
 //!    never registered the stream, registered a different one, or has already stopped
@@ -158,8 +158,10 @@ async fn a_disable_stops_replication_to_the_stream_it_names() {
         );
         assert_eq!(
             answered["EnableKinesisStreamingConfiguration"],
-            Value::Null,
-            "case {case:?}: a stop enables nothing, so it reports no configuration, got \
+            precision.map_or(json!({}), |precision| {
+                json!({"ApproximateCreationDateTimePrecision": precision})
+            }),
+            "case {case:?}: a stop reports the configuration in force and changes none, got \
              {answered}"
         );
 

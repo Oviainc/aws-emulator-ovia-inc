@@ -2835,14 +2835,16 @@ pub struct ComAmazonawsDynamodbDynamodb20120810State {
     /// by `DescribeExport` and `ListExports`, so an account that has started no export
     /// holds none and the listing reports none.
     pub exports: BTreeMap<String, Export>,
-    /// The item-level changes landed writes owe their tables' streams, in the order
-    /// they were made.
+    /// The item-level changes landed writes owe their tables' change feeds, in the
+    /// order they were made.
     ///
-    /// NOT part of a table: the records are the STREAMS service's resources, and a
-    /// write can only hand them over once the request that made it is done deciding
-    /// (a transactional write that is cancelled part-way through rolls its queued
-    /// changes back with the items themselves). Bounded by
-    /// [`MAX_PENDING_STREAM_RECORDS`]; drained by [`publish_item_changes`].
+    /// NOT part of a table: the records are ANOTHER service's resources — the table's
+    /// stream in the DynamoDB Streams registry, and the Kinesis data stream of each
+    /// streaming destination that is taking changes — and a write can only hand them
+    /// over once the request that made it is done deciding (a transactional write that
+    /// is cancelled part-way through rolls its queued changes back with the items
+    /// themselves). Bounded by [`MAX_PENDING_STREAM_RECORDS`]; drained by
+    /// [`publish_item_changes`].
     pub pending_stream_records: Vec<PendingStreamRecord>,
 }
 
@@ -3590,7 +3592,7 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
         Ok(removed)
     }
 
-    /// How many changes are queued for the streams service — the mark a
+    /// How many changes are queued for the feeds a table publishes to — the mark a
     /// transactional write takes before it starts applying, so
     /// [`Self::rewind_stream_records`] can put the queue back where the items go back.
     pub fn queued_stream_record_count(&self) -> usize {
@@ -3599,18 +3601,19 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
 
     /// Drop every change queued since `mark`, for a transactional write that is
     /// rolling its items back: a cancelled transaction made no modification, so its
-    /// tables' streams must carry no record of one.
+    /// tables' feeds must carry no record of one.
     pub fn rewind_stream_records(&mut self, mark: usize) {
         self.pending_stream_records.truncate(mark);
     }
 
     /// Take every queued change, leaving the queue empty — what
-    /// [`publish_item_changes`] hands to the streams service.
+    /// [`publish_item_changes`] hands to the streams registry and to the Kinesis
+    /// streaming destinations alike.
     pub fn take_stream_records(&mut self) -> Vec<PendingStreamRecord> {
         ::std::mem::take(&mut self.pending_stream_records)
     }
 
-    /// Queue one change for the streams service, within [`MAX_PENDING_STREAM_RECORDS`].
+    /// Queue one change for those feeds, within [`MAX_PENDING_STREAM_RECORDS`].
     ///
     /// Past the cap the change is DROPPED rather than making room, so the entries
     /// already queued keep the positions a transactional write's mark names. Reaching
@@ -3624,7 +3627,7 @@ impl ComAmazonawsDynamodbDynamodb20120810State {
         if self.pending_stream_records.len() >= MAX_PENDING_STREAM_RECORDS {
             ::tracing::error!(
                 queued = MAX_PENDING_STREAM_RECORDS,
-                "an item change was dropped before it reached the DynamoDB Streams store"
+                "an item change was dropped before it reached the feeds it was owed to"
             );
             return;
         }
