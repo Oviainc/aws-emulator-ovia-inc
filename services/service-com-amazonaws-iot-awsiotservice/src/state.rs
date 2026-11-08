@@ -103,11 +103,11 @@ use sha2::{Digest, Sha256};
 use crate::ops::types::{
     Action, AuthorizerDescription, AwsJobExecutionsRolloutConfig, AwsJobPresignedUrlConfig,
     CodeSigning, CommandParameter, CommandParameterValue, CommandPayload, CommandPreprocessor,
-    GetCommandExecutionOutput, GetCommandOutput, Job, JobExecution, JobExecutionStatusDetails,
-    JobProcessDetails, Mqtt5Configuration, OTAUpdateFile, OTAUpdateInfo, PackageVersionArtifact,
-    PropagatingAttribute, S3Location, Sbom, ThingGroupIndexingConfiguration,
-    ThingIndexingConfiguration, ThingTypeMetadata, ThingTypeProperties, TimeoutConfig, TopicRule,
-    TopicRulePayload,
+    CommandSummary, GetCommandExecutionOutput, GetCommandOutput, Job, JobExecution,
+    JobExecutionStatusDetails, JobProcessDetails, Mqtt5Configuration, OTAUpdateFile, OTAUpdateInfo,
+    PackageVersionArtifact, PropagatingAttribute, S3Location, Sbom,
+    ThingGroupIndexingConfiguration, ThingIndexingConfiguration, ThingTypeMetadata,
+    ThingTypeProperties, TimeoutConfig, TopicRule, TopicRulePayload,
 };
 
 /// The shared index of which IoT COMMANDS exist, which the IoT Jobs data plane's
@@ -2316,7 +2316,35 @@ impl RegisteredCommand {
             pending_deletion: Some(self.pending_deletion),
         }
     }
+
+    /// The command as one entry of the modelled `CommandSummaryList` a listing hands
+    /// back.
+    ///
+    /// A listing projects the SAME stored record a single-command reader does, so what
+    /// `ListCommands` reports and what [`Self::view`] reports cannot drift: the
+    /// summary is the subset of members `CommandSummary` declares.
+    pub fn summary(&self) -> CommandSummary {
+        CommandSummary {
+            command_id: Some(self.command_id.clone()),
+            command_arn: Some(self.command_arn.clone()),
+            display_name: self.display_name.clone(),
+            deprecated: Some(self.deprecated),
+            created_at: Some(::aws_smithy_types::DateTime::from(self.created_at)),
+            last_updated_at: Some(::aws_smithy_types::DateTime::from(self.last_updated_at)),
+            pending_deletion: Some(self.pending_deletion),
+        }
+    }
 }
+
+/// The `CommandNamespace` a command created without one is in: the base namespace,
+/// which is the one `CreateCommand` admits a command carrying no `roleArn` in
+/// (`CreateCommand$roleArn`: "The IAM role that you must provide when using the
+/// AWS-IoT-FleetWise namespace [...] This field is not supported when you use the
+/// AWS-IoT namespace"). `CommandNamespace` declares no other value
+/// (`smithy_query(query="shape",shape="CommandNamespace")`: `AWS-IoT`,
+/// `AWS-IoT-FleetWise`), so it is the namespace a listing filtered by namespace puts
+/// such a command in.
+pub const BASE_COMMAND_NAMESPACE: &str = "AWS-IoT";
 
 /// The wire token every fleet-indexing mode uses for "this kind of indexing is
 /// disabled".

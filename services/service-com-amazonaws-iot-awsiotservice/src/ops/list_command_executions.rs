@@ -234,7 +234,8 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     .commands
                     .values()
                     .filter(|command| {
-                        command.namespace.as_deref().unwrap_or(BASE_NAMESPACE) == namespace
+                        command.namespace.as_deref().unwrap_or(crate::state::BASE_COMMAND_NAMESPACE)
+                            == namespace
                     })
                     .map(|command| command.command_arn.clone())
                     .collect()
@@ -352,15 +353,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 /// The largest page `CommandMaxResults` admits (`range 1..100`), and therefore the
 /// page a request that names no `maxResults` gets: the model states no other default.
 const MAX_COMMAND_MAX_RESULTS: i32 = 100;
-
-/// The `CommandNamespace` a command created without one is in: the base namespace,
-/// which is the one `CreateCommand` admits a command carrying no `roleArn` in
-/// (`CreateCommand$roleArn`: "The IAM role that you must provide when using the
-/// AWS-IoT-FleetWise namespace [...] This field is not supported when you use the
-/// AWS-IoT namespace"). `CommandNamespace` declares no other value
-/// (`smithy_query(query="shape",shape="CommandNamespace")`: `AWS-IoT`,
-/// `AWS-IoT-FleetWise`).
-const BASE_NAMESPACE: &str = "AWS-IoT";
 
 /// `ASCENDING`, the one `SortOrder` value that is not the operation's default.
 ///

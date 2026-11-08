@@ -1,15 +1,16 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListCommands
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListCommands`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListCommands::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! One page of the account's COMMANDS, computed from the command records this service
+//! persists (`crate::state::ComAmazonawsIotAwsiotserviceState::commands`), which
+//! `CreateCommand` writes and `UpdateCommand` moves. Every entry is the projection of
+//! one stored record ([`crate::state::RegisteredCommand::summary`]), so what this
+//! lists and what `GetCommand` reports are one value rather than two that could drift.
+//!
+//! The request narrows the listing — by the command's namespace and by a parameter
+//! name its commands must declare ([`Selection`]) — and `sortOrder` decides which way
+//! the creation order runs. A read only: nothing here writes.
 //!
 //! ## Shape of an operation
 //!
@@ -155,18 +156,262 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListCommands` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListCommandsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListCommands"))
+        // Every ARN this listing reports was minted when its command was created, so
+        // the listing needs no request metadata of its own.
+        let _ = ctx;
+
+        // What the request selects and in which order is resolved BEFORE any store is
+        // reached: a `nextToken` this listing never issued is refused whatever the
+        // store holds.
+        let selection = Selection::of(&input);
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_next_token(token, &selection.scope())?),
+            None => None,
+        };
+        // `maxResults` is `range 1..100`, refused outside that before this handler
+        // runs; a request that names none gets the page the member documents as the
+        // default. The clamp is defensive rather than load-bearing: it keeps the page
+        // inside the modelled range without depending on a validation performed
+        // outside this module.
+        let page_size = input.max_results.map_or(DEFAULT_COMMAND_MAX_RESULTS, |max| {
+            max.clamp(1, MAX_COMMAND_MAX_RESULTS)
+        }) as usize;
+
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(ListCommandsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: Some("the IoT emulator has no state store attached".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // One row per command this listing is about, carrying the key it is ordered
+        // by: when the command was created, with its id breaking a tie between two
+        // commands created in the same instant.
+        let store = state.lock();
+        let mut rows: Vec<(SortKey, CommandSummary)> = store
+            .commands
+            .values()
+            .filter(|command| selection.selects(command))
+            .map(|command| (sort_key(command), command.summary()))
+            .collect();
+        drop(store);
+
+        // ONE total order over the whole selection, which is what makes a page
+        // boundary meaningful: by the creation instant, oldest first. `sortOrder`
+        // reverses it; "By default, the API returns all commands in the descending
+        // order based on the time that they were created" (`sortOrder`), which is what
+        // `Selection` resolved.
+        rows.sort_by(|(left, _), (right, _)| left.cmp(right));
+        if !selection.ascending {
+            rows.reverse();
+        }
+
+        // One row beyond the page: its presence is what says the listing is truncated.
+        let mut page: Vec<(SortKey, CommandSummary)> = rows
+            .into_iter()
+            .filter(|(key, _)| {
+                resume_after
+                    .as_ref()
+                    .is_none_or(|cursor| selection.sorts_after(key, cursor))
+            })
+            .take(page_size.saturating_add(1))
+            .collect();
+        let truncated = page.len() > page_size;
+        page.truncate(page_size);
+
+        // `nextToken` is "The token to use to get the next set of results, or null if
+        // there are no additional results".
+        let next_token = if truncated {
+            page.last()
+                .map(|(key, _)| encode_next_token(&selection.scope(), key))
+        } else {
+            None
+        };
+
+        Ok(ListCommandsOutput {
+            // `CommandSummaryList` carries no length constraint, so a selection
+            // nothing matches answers with an EMPTY list rather than an absent member:
+            // "nothing matches" is an answer, not a missing one.
+            commands: Some(page.into_iter().map(|(_, summary)| summary).collect()),
+            next_token,
+        })
     }
+}
+
+/// The largest page `CommandMaxResults` admits (`range 1..100`), which `maxResults`
+/// documents as "You can override this default value to return up to a maximum of 100
+/// results for this operation".
+const MAX_COMMAND_MAX_RESULTS: i32 = 100;
+
+/// The page a request that names no `maxResults` gets: "By default, the API returns up
+/// to a maximum of 25 results" (`maxResults`).
+const DEFAULT_COMMAND_MAX_RESULTS: i32 = 25;
+
+/// `ASCENDING`, the one `SortOrder` value that is not this operation's default.
+///
+/// `sortOrder` documents "By default, the API returns all commands in the descending
+/// order based on the time that they were created"
+/// (`smithy_query(query="shape",shape="SortOrder")`: `ASCENDING`, `DESCENDING`).
+const SORT_ORDER_ASCENDING: &str = "ASCENDING";
+
+/// The key one command is ordered by: when it was created, as nanoseconds since the
+/// epoch, and its id breaking a tie between two commands created in the same instant
+/// (which is what keeps the order — and therefore every page boundary — total).
+type SortKey = (u128, String);
+
+/// The ordering key of a stored command.
+fn sort_key(command: &crate::state::RegisteredCommand) -> SortKey {
+    (
+        command
+            .created_at
+            .duration_since(::std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos(),
+        command.command_id.clone(),
+    )
+}
+
+/// WHICH commands a request selects and in WHICH order — everything the listing needs
+/// that comes from the request rather than from the store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Selection {
+    /// `namespace`: "By default, the API returns all commands that have been created
+    /// for both AWS-IoT and AWS-IoT-FleetWise namespaces. You can override this
+    /// default value if you want to return all commands that have been created only
+    /// for a specific namespace."
+    namespace: Option<String>,
+    /// `commandParameterName`: "A filter that can be used to display the list of
+    /// commands that have a specific command parameter name."
+    command_parameter_name: Option<String>,
+    /// Whether the oldest selected command comes first.
+    ascending: bool,
+}
+
+impl Selection {
+    /// The selection a request asks for. Infallible: every member it reads is modelled
+    /// — an enum, or a string with a pattern — so a value outside what the operation
+    /// admits is refused before this handler runs.
+    fn of(input: &ListCommandsInput) -> Self {
+        Self {
+            namespace: input.namespace.clone(),
+            command_parameter_name: input.command_parameter_name.clone(),
+            ascending: input.sort_order.as_deref() == Some(SORT_ORDER_ASCENDING),
+        }
+    }
+
+    /// Whether a stored command is one this listing is about.
+    ///
+    /// A command declares a parameter when its `mandatoryParameters` carry one of that
+    /// name — `CommandParameter$name` is "The name of a specific parameter used in a
+    /// command and command execution" — so that is the set a `commandParameterName`
+    /// names. A command created in no namespace is in the base one, for the reason
+    /// [`crate::state::BASE_COMMAND_NAMESPACE`] documents.
+    fn selects(&self, command: &crate::state::RegisteredCommand) -> bool {
+        self.namespace.as_deref().is_none_or(|wanted| {
+            command
+                .namespace
+                .as_deref()
+                .unwrap_or(crate::state::BASE_COMMAND_NAMESPACE)
+                == wanted
+        }) && self.command_parameter_name.as_deref().is_none_or(|wanted| {
+            command
+                .mandatory_parameters
+                .iter()
+                .flatten()
+                .any(|parameter| parameter.name == wanted)
+        })
+    }
+
+    /// Whether `key` comes after `cursor` in THIS selection's order, i.e. whether the
+    /// command it belongs to is still to be returned once a page ending at `cursor`
+    /// has been.
+    fn sorts_after(&self, key: &SortKey, cursor: &SortKey) -> bool {
+        if self.ascending {
+            key > cursor
+        } else {
+            key < cursor
+        }
+    }
+
+    /// The LISTING a continuation token belongs to: the filters and the order, which
+    /// together decide which commands it walks and therefore what "the next set of
+    /// results" means. A token issued for one listing is refused by another.
+    fn scope(&self) -> String {
+        format!(
+            "{}{SCOPE_SEPARATOR}{}{SCOPE_SEPARATOR}{}",
+            self.namespace.clone().unwrap_or_default(),
+            self.command_parameter_name.clone().unwrap_or_default(),
+            if self.ascending { "a" } else { "d" },
+        )
+    }
+}
+
+/// The character that separates the fields of a token's SCOPE. A control character, so
+/// it occurs in no `CommandNamespace` value, no `CommandParameterName`
+/// (`^[.$a-zA-Z0-9_-]+$`) and no `CommandId` (`^[a-zA-Z0-9_-]+$`), and cannot occur
+/// inside any field it joins.
+const SCOPE_SEPARATOR: char = '\u{1e}';
+
+/// The character that separates a token's scope from the position it resumes after.
+const TOKEN_SEPARATOR: char = '\u{1f}';
+
+/// The opaque `nextToken` that resumes `scope`'s listing after the command whose
+/// ordering key is `key`.
+///
+/// The key, not the id alone: it is the position in the listing's total order, so a
+/// page resumes where the last one ended even if that command has since been deleted.
+/// Hex-encoded so the token is opaque to the caller whatever the filters contain. The
+/// encoding carries no integrity protection and claims none: a caller that reverses it
+/// can name any resume point of the listing it is already reading, which selects a
+/// page of that same listing and nothing else.
+fn encode_next_token(scope: &str, key: &SortKey) -> String {
+    let (created_at, command_id) = key;
+    ::hex::encode(format!(
+        "{scope}{TOKEN_SEPARATOR}{created_at}{SCOPE_SEPARATOR}{command_id}"
+    ))
+}
+
+/// The position a `nextToken` resumes after, or the modelled `ValidationException`
+/// (HTTP 400, "The request is not valid") when the token is not one
+/// [`encode_next_token`] issued for THIS listing.
+///
+/// Every step is fallible on purpose: the token is caller-supplied, so nothing read out
+/// of it may panic the handler. A token issued for another selection is refused rather
+/// than silently resuming a different listing from the middle.
+fn decode_next_token(token: &str, scope: &str) -> Result<SortKey, ListCommandsError> {
+    let invalid = || -> ListCommandsError {
+        ListCommandsErrorModeled::ValidationException(ValidationException {
+            message: Some("nextToken is not a continuation token of this listing".to_string()),
+        })
+        .into()
+    };
+    let bytes = ::hex::decode(token).map_err(|_| invalid())?;
+    let decoded = String::from_utf8(bytes).map_err(|_| invalid())?;
+    let (token_scope, cursor) = decoded.split_once(TOKEN_SEPARATOR).ok_or_else(invalid)?;
+    if token_scope != scope {
+        return Err(invalid());
+    }
+    let (created_at, command_id) = cursor.split_once(SCOPE_SEPARATOR).ok_or_else(invalid)?;
+    // A resume point outside `CommandId` could name no command in the store, so a
+    // token carrying one was not issued by this listing.
+    if !is_modeled_command_id(command_id) {
+        return Err(invalid());
+    }
+    Ok((
+        created_at.parse().map_err(|_| invalid())?,
+        command_id.to_string(),
+    ))
+}
+
+/// Whether `command_id` satisfies the model's `CommandId`: 1..64 characters matching
+/// `^[a-zA-Z0-9_-]+$` (`smithy_query(query="shape",shape="CommandSummary")`,
+/// member `commandId`). Smithy `length` counts CHARACTERS, so this does too.
+fn is_modeled_command_id(command_id: &str) -> bool {
+    let length = command_id.chars().count();
+    (1..=64).contains(&length)
+        && command_id
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '_' | '-'))
 }
