@@ -2,6 +2,10 @@
 
 //! @op ListConnections
 //!
+//! Each listed element is the SAME projection of the stored row `GetConnection` renders
+//! ([`crate::state::StoredConnection::to_modeled`]), `OwnershipType` included — see
+//! [`crate::ops::get_connection`] for why that member is not in the shipped model.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

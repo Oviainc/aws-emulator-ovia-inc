@@ -283,6 +283,7 @@ async fn a_connection_round_trips_from_create_to_delete() {
             "ProviderType": "GitHub",
             "OwnerAccountId": engine::emulator_account_id(),
             "ConnectionStatus": "PENDING",
+            "OwnershipType": "Owned",
         }),
         "GetConnection: expected the created connection, got {got}"
     );

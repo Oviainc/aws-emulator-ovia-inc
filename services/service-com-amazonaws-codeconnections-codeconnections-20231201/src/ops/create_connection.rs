@@ -2,6 +2,16 @@
 
 //! @op CreateConnection
 //!
+//! ## What the create RESOLVES onto the connection
+//!
+//! The provider a connection talks to is a fact about the connection, not about which
+//! member of the request stated it: a create that names only a `HostArn` takes the
+//! provider type from that host (a host's `ProviderType` is modelled required), and a
+//! create that states one keeps it. The resolved value is persisted on the row, so every
+//! reader of the connection — and every resource that derives its own provider type from
+//! the connection — reports the same provider. The connection is minted in the calling
+//! account, so that account owns it: see [`crate::state::CONNECTION_OWNERSHIP_OWNED`].
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements
@@ -186,14 +196,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // modeled refusal, `ResourceUnavailableException` (400), stays reserved for a
         // host that exists but is not usable. A connection must never point at a
         // resource that is not there; an absent member associates nothing.
+        //
+        // Resolving the host is also where the connection's PROVIDER TYPE comes from
+        // when the request states none: `Connection.ProviderType` is "the name of the
+        // external provider where your third-party code repository is configured", and a
+        // host IS the infrastructure one installed provider runs on (`Host.ProviderType`
+        // is modeled required), so the provider a connection talks to is a fact about the
+        // connection rather than about which member of the request stated it. It is
+        // derived here and PERSISTED on the row, so every reader of that row
+        // (`GetConnection`, `ListConnections` and its `ProviderTypeFilter`, and the
+        // repository links and sync configurations that take their own provider type
+        // from the connection) reports the same provider. A request that states a
+        // provider type keeps it: the caller's value is never overwritten.
+        let mut provider_type = input.provider_type;
         if let Some(host_arn) = input.host_arn.as_deref() {
-            if !store.hosts.contains_key(host_arn) {
+            let Some(host) = store.hosts.get(host_arn) else {
                 return Err(CreateConnectionErrorModeled::ResourceNotFoundException(
                     ResourceNotFoundException {
                         message: Some(crate::state::host_not_found_message(host_arn)),
                     },
                 )
                 .into());
+            };
+            if provider_type.is_none() {
+                provider_type = Some(host.provider_type.clone());
             }
         }
 
@@ -247,13 +273,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let record = crate::state::StoredConnection {
             connection_name: input.connection_name,
             connection_arn: connection_arn.clone(),
-            provider_type: input.provider_type,
+            // Stated by the request, or resolved from the host above.
+            provider_type,
             owner_account_id,
             connection_status: crate::state::CONNECTION_STATUS_ON_CREATE.to_string(),
             // The host resolved above, so the association is persisted and every
             // reader (`GetConnection`, `ListConnections`, its `HostArnFilter`)
             // reports it from this one row.
             host_arn: input.host_arn,
+            // The connection is minted in the calling account, which is therefore the
+            // account that owns it (`owner_account_id` above) — see
+            // `state::CONNECTION_OWNERSHIP_OWNED`.
+            ownership_type: crate::state::CONNECTION_OWNERSHIP_OWNED.to_string(),
             tags,
         };
         let stored_tags = record.tags.clone();

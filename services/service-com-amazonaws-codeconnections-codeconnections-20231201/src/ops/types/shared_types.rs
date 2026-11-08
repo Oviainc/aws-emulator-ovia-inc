@@ -119,6 +119,10 @@ pub struct Connection {
     pub owner_account_id: Option<String>,
     pub connection_status: Option<String>,
     pub host_arn: Option<String>,
+    /// `OwnershipType`, a member ADDED to this service's model — see
+    /// [`crate::ops::get_connection`] for why the shipped model does not declare it
+    /// and the recorded responses carry it.
+    pub ownership_type: Option<String>,
 }
 
 #[smithy_macros::smithy(shape = "com.amazonaws.codeconnections#SyncBlocker")]

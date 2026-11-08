@@ -15,6 +15,8 @@
 mod absent_resource_answers;
 #[path = "all/connection_lifecycle.rs"]
 mod connection_lifecycle;
+#[path = "all/connection_reads.rs"]
+mod connection_reads;
 #[path = "all/git_sync.rs"]
 mod git_sync;
 #[path = "all/host_association.rs"]

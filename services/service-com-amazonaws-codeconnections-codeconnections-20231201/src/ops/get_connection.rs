@@ -2,6 +2,20 @@
 
 //! @op GetConnection
 //!
+//! ## `OwnershipType`, a member added to this service's model
+//!
+//! The shipped 2023-12-01 model declares `Connection` with `ConnectionName`,
+//! `ConnectionArn`, `ProviderType`, `OwnerAccountId`, `ConnectionStatus` and `HostArn`,
+//! while the recorded AWS responses answer every connection read with an
+//! `OwnershipType` beside them — the member that says whether the account reading the
+//! connection owns it or had it shared in. A schema-driven serializer cannot emit a
+//! member the model does not declare, so `OwnershipType` (target a string shape of the
+//! same name) was ADDED to
+//! `smithy-model/com-amazonaws-codeconnections-codeconnections-20231201.json`. The
+//! value is read off the stored row like every other member
+//! ([`crate::state::StoredConnection::to_modeled`]), so this operation and
+//! `ListConnections` report one ownership for one connection.
+//!
 //! ## Shape of an operation
 //!
 //! Each operation is a struct that owns the shared engine and implements

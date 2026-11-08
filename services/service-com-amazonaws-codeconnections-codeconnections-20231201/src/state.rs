@@ -26,6 +26,16 @@ pub const DEFAULT_REGION: &str = "us-east-1";
 /// connection this service mints stays `PENDING` until something updates it.
 pub const CONNECTION_STATUS_ON_CREATE: &str = "PENDING";
 
+/// The ownership a connection read reports for a connection held by the account that
+/// owns it.
+///
+/// A connection this service mints belongs to the account that called
+/// `CreateConnection` — that account is the connection's `OwnerAccountId` — so a read
+/// of it by that account reports the connection as owned rather than as one another
+/// account shared in. The value is kept ON the stored row, not recomputed per reader,
+/// so `GetConnection` and `ListConnections` report one ownership for one connection.
+pub const CONNECTION_OWNERSHIP_OWNED: &str = "Owned";
+
 /// The status a host minted through the API, CLI or an SDK carries.
 ///
 /// From `CreateHost`'s own documentation: "A host created through the CLI or the SDK
@@ -104,6 +114,9 @@ pub struct StoredConnection {
     pub connection_status: String,
     /// The host the connection is associated with, when it has one.
     pub host_arn: Option<String>,
+    /// How the account that holds the connection holds it: [`CONNECTION_OWNERSHIP_OWNED`]
+    /// for a connection that account owns.
+    pub ownership_type: String,
     /// The tags supplied at create time, in the order they were supplied.
     pub tags: Vec<Tag>,
 }
@@ -121,6 +134,7 @@ impl StoredConnection {
             owner_account_id: Some(self.owner_account_id.clone()),
             connection_status: Some(self.connection_status.clone()),
             host_arn: self.host_arn.clone(),
+            ownership_type: Some(self.ownership_type.clone()),
         }
     }
 }

@@ -696,22 +696,22 @@ async fn a_link_reports_its_connections_provider_and_refuses_an_unresolvable_con
     // admits each of these, so the refusal comes from the handler resolving the
     // reference, not from input validation.
     let account = engine::emulator_account_id();
-    // A connection created with a host and NO `ProviderType` names no provider, so it
-    // cannot back a link: `RepositoryLinkInfo.ProviderType` is required and is the
-    // connection's.
-    let providerless_host = create_host(&router, "providerless", "GitHubEnterpriseServer").await;
+    // A connection created with NEITHER a `ProviderType` nor a `HostArn` names no
+    // provider — nothing states one and there is no host to take one from — so it cannot
+    // back a link: `RepositoryLinkInfo.ProviderType` is required and is the connection's.
+    // (A connection created with a host and no `ProviderType` DOES name a provider: the
+    // host's. That derivation is covered in `connection_reads.rs`.)
     let (status, created) = call(
         &router,
         "CreateConnection",
         serde_json::json!({
             "ConnectionName": "providerless",
-            "HostArn": providerless_host,
         }),
     )
     .await;
     assert_eq!(
         status, 200,
-        "a connection with a host and no ProviderType must still be creatable, got {status} {created}"
+        "a connection with neither ProviderType nor HostArn must still be creatable, got {status} {created}"
     );
     let providerless = created["ConnectionArn"]
         .as_str()
