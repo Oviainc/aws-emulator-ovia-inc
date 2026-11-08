@@ -10,10 +10,9 @@
 //! statement allows for the resource it addressed is answered the AWS common
 //! `AccessDeniedException` whether or not that secret exists, and only a caller a statement
 //! DOES allow can be answered `ResourceNotFoundException`. The refusal's resource clause
-//! names the resource the request addressed as the service resolved it — the ARN the account
-//! holds the secret under, whichever form of `SecretId` the request carried, and otherwise
-//! the `SecretId` as the request spelled it, because an id this account holds no secret for
-//! addresses no resource of this account and so has no ARN of its own to name.
+//! names the `SecretId` as the request spelled it — whether or not the account holds a
+//! secret under it — because a refusal states the resource the CALLER asked about; the
+//! DECISION still resolves that id to the ARN a statement's `Resource` element matches.
 //!
 //! Without that order a narrowly scoped caller learns from `ResourceNotFoundException` that
 //! a name it was never allowed to ask about is free, which turns any secret-addressing
@@ -72,26 +71,16 @@ fn allow_on(action: &str, resource: &str) -> Value {
 /// ARN without its six trailing characters): `(case, the id, what a refusal names for it)`.
 ///
 /// `arn` is the full ARN the account would hold a secret of that `name` under.
-fn secret_id_forms(name: &str, arn: &str, reported_arn: Option<&str>) -> Vec<(String, String)> {
+fn secret_id_forms(name: &str, arn: &str) -> Vec<(String, String)> {
     let partial = arn
         .rsplit_once('-')
         .map(|(prefix, _)| prefix.to_string())
         .unwrap_or_else(|| arn.to_string());
-    // Where the account HOLDS the secret, every form resolves to the ARN it holds it under;
-    // where it does not, the refusal names the id as the request spelled it.
+    // Every form is reported back as the request spelled it, held secret or not.
     vec![
-        (
-            name.to_string(),
-            reported_arn.unwrap_or(name).to_string(),
-        ),
-        (
-            arn.to_string(),
-            reported_arn.unwrap_or(arn).to_string(),
-        ),
-        (
-            partial.clone(),
-            reported_arn.unwrap_or(&partial).to_string(),
-        ),
+        (name.to_string(), name.to_string()),
+        (arn.to_string(), arn.to_string()),
+        (partial.clone(), partial),
     ]
 }
 
@@ -161,8 +150,7 @@ fn assert_not_found(case: &str, status: u16, answer: &Value) {
 async fn a_missing_secret_is_refused_by_scope_before_it_is_reported_missing() {
     for operation in SECRET_OPERATIONS {
         let action = format!("secretsmanager:{operation}");
-        for (missing_id, reported) in
-            secret_id_forms("absent-secret", &arn_of("absent-secret"), None)
+        for (missing_id, reported) in secret_id_forms("absent-secret", &arn_of("absent-secret"))
         {
             let (router, engine) = router_with_identity();
             given_session(&engine);
@@ -214,11 +202,12 @@ async fn a_missing_secret_is_refused_by_scope_before_it_is_reported_missing() {
     }
 }
 
-/// THE RULE's other half: a secret the account DOES hold is named by the ARN it holds it
-/// under, whichever form of `SecretId` addressed it — so a scoped caller's refusal about an
-/// existing secret outside its scope carries that ARN, not the id it typed.
+/// THE RULE's other half: a secret the account DOES hold is named in the refusal by the
+/// `SecretId` the request supplied for it, whichever form that took — so a scoped caller's
+/// refusal about an existing secret outside its scope carries the id it typed, not the ARN
+/// the account holds that secret under.
 #[tokio::test]
-async fn an_existing_secret_outside_the_scope_is_named_by_the_arn_the_account_holds_it_under() {
+async fn an_existing_secret_outside_the_scope_is_named_by_the_id_the_request_supplied() {
     for operation in SECRET_OPERATIONS {
         let action = format!("secretsmanager:{operation}");
         let (router, engine) = router_with_identity();
@@ -227,9 +216,7 @@ async fn an_existing_secret_outside_the_scope_is_named_by_the_arn_the_account_ho
         let elsewhere = given_secret(&router, "uncovered-secret").await;
         given_role_policy(&engine, Some(&allow_on(&action, &in_scope)));
 
-        for (addressed, reported) in
-            secret_id_forms("uncovered-secret", &elsewhere, Some(&elsewhere))
-        {
+        for (addressed, reported) in secret_id_forms("uncovered-secret", &elsewhere) {
             let case = format!("{operation} on {addressed:?}, a held secret outside the scope");
             let (status, answer) = call_as(
                 &router,

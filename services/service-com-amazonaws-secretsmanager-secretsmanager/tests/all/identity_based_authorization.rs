@@ -14,11 +14,14 @@
 //! `Allow` covers reaches the operation's own answer. The refusal is IAM's own sentence,
 //! built from the principal, the action, the resource and which of IAM's rules refused.
 //!
-//! The resource is the secret the request names, by the ARN the account holds it under —
-//! whichever form of `SecretId` the request carried (the name, the full ARN, the partial
-//! ARN) — the NAME a create carries, since a secret the create never made has no ARN of
-//! this account to name, and nothing at all for an action that addresses no secret, whose
-//! refusal therefore states no resource clause.
+//! The DECISION's resource is the secret the request names, resolved to the ARN the account
+//! holds it under — whichever form of `SecretId` the request carried (the name, the full
+//! ARN, the partial ARN) — and the ARN a create is about to allocate, because that is what a
+//! statement's `Resource` element matches; an action that addresses no secret is judged
+//! against `*`. What the REFUSAL names is the identifier the request supplied for it (its
+//! `SecretId`, a create's `Name`), and nothing at all for an action that addresses no
+//! secret, whose refusal therefore states no resource clause —
+//! `tests/all/secret_denial_resource_clause.rs` spans that half of the rule.
 //!
 //! The user, the role, their policies and the session live in the IAM and STS stores of the
 //! SAME shared engine, so the documents under test are the ones `iam:PutUserPolicy` and
@@ -405,13 +408,12 @@ fn identity_documents(
 /// What the resource clause of an operation's refusal names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Addressed {
-    /// The secret the request names, by the ARN the account holds it under.
+    /// The secret the request names, by the `SecretId` the request supplied for it.
     Secret,
     /// Nothing: the action reports the account, generates a password, or selects the
     /// secrets it answers for, rather than addressing one.
     NoResource,
-    /// The secret a create would have created, by the NAME the request carried: a secret
-    /// the create never made has no ARN of this account to name.
+    /// The secret a create would have created, by the `Name` the request carried.
     CreatedSecret,
 }
 
@@ -494,7 +496,7 @@ struct Denial<'a> {
     action: String,
     /// What the resource clause names.
     addressed: Addressed,
-    /// The ARN that clause carries, empty for an action that addresses no resource.
+    /// The identifier that clause carries, empty for an action that addresses no resource.
     arn: &'a str,
     /// Which of IAM's two rules refused it.
     refusal: Refusal,
@@ -626,14 +628,15 @@ async fn every_operation_is_authorized_against_its_own_action_and_resource() {
             let (router, engine) = router_with_identity();
             given_session(&engine);
             let secret_name = format!("addressed-{index}");
-            let arn = given_secret(&router, &secret_name).await;
+            given_secret(&router, &secret_name).await;
             given_role_policy(&engine, document.as_ref());
 
             let created = format!("created-{index}");
-            // The resource a refusal names: the stored secret's ARN, the NAME a create
-            // carried, or nothing at all.
+            // The resource a refusal names: the identifier the request supplied — the
+            // `SecretId` it addressed the secret by, the `Name` a create carried, or
+            // nothing at all.
             let named = match addressed {
-                Addressed::Secret => arn.clone(),
+                Addressed::Secret => secret_name.clone(),
                 Addressed::CreatedSecret => created.clone(),
                 Addressed::NoResource => String::new(),
             };
@@ -835,8 +838,8 @@ async fn a_grant_scoped_to_one_secret_covers_it_under_every_id_form() {
             );
         }
 
-        // The SAME grant covers no other secret, and the refusal names the ARN of the one
-        // the request addressed rather than the one the grant covers.
+        // The SAME grant covers no other secret, and the refusal names the id the request
+        // addressed that other secret by rather than the one the grant covers.
         for (form, secret_id) in [
             ("its name", "ungranted-secret".to_string()),
             ("its ARN", other_arn.clone()),
@@ -857,7 +860,7 @@ async fn a_grant_scoped_to_one_secret_covers_it_under_every_id_form() {
                     principal: session_arn(),
                     action: "secretsmanager:GetSecretValue".to_string(),
                     addressed: Addressed::Secret,
-                    arn: &other_arn,
+                    arn: &secret_id,
                     refusal: Refusal::DefaultDeny,
                 },
             );

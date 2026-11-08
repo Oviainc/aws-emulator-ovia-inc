@@ -384,8 +384,8 @@ async fn a_conditioned_allow_admits_exactly_the_requests_its_condition_names() {
         // allowed mutation cannot change what a later row addresses.
         let (router, engine) = router_with_identity();
         given_session(&engine);
-        let arn = given_secret_with(&router, tagged.clone(), case).await;
-        let untagged = given_secret(&router, "conditioned-untagged").await;
+        given_secret_with(&router, tagged.clone(), case).await;
+        given_secret(&router, "conditioned-untagged").await;
         // A second version under another staging label, so a read scoped to one label is
         // refused by the DECISION rather than by there being no such version.
         let (status, staged) = call_as(
@@ -414,11 +414,10 @@ async fn a_conditioned_allow_admits_exactly_the_requests_its_condition_names() {
                  served, got {status} {answer}"
             );
         } else {
-            // What the refusal names: the ARN of the secret the request addressed, or —
-            // for a create, whose secret was never made — the NAME it carried.
+            // What the refusal names: the identifier the request supplied — its `SecretId`,
+            // or a create's `Name`.
             let addressed = match (body["SecretId"].as_str(), body["Name"].as_str()) {
-                (Some("conditioned-untagged"), _) => untagged.clone(),
-                (Some(_), _) => arn.clone(),
+                (Some(secret_id), _) => secret_id.to_string(),
                 (None, Some(name)) => name.to_string(),
                 (None, None) => panic!("case {case:?}: the row addresses nothing"),
             };
@@ -513,7 +512,7 @@ async fn a_conditioned_deny_refuses_only_the_request_values_it_names() {
     {
         let (router, engine) = router_with_identity();
         given_session(&engine);
-        let arn = given_secret(&router, "guarded-secret").await;
+        given_secret(&router, "guarded-secret").await;
         given_role_policy(&engine, Some(&guardrail));
 
         let mut body = json!({ "SecretId": "guarded-secret" });
@@ -532,7 +531,7 @@ async fn a_conditioned_deny_refuses_only_the_request_values_it_names() {
                 status,
                 &answer,
                 "secretsmanager:DeleteSecret",
-                &arn,
+                "guarded-secret",
                 "with an explicit deny in an identity-based policy",
             );
             // And the refused delete scheduled nothing.

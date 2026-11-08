@@ -27,6 +27,8 @@ mod secret_cross_account_resource_policy;
 mod secret_delete_metadata_and_filters;
 #[path = "all/secret_deletion_window.rs"]
 mod secret_deletion_window;
+#[path = "all/secret_denial_resource_clause.rs"]
+mod secret_denial_resource_clause;
 #[path = "all/secret_error_responses.rs"]
 mod secret_error_responses;
 #[path = "all/secret_kms_access_denied.rs"]

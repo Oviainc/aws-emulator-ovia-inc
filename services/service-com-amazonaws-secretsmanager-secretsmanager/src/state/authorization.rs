@@ -52,22 +52,27 @@
 //! what the request ADDRESSES:
 //!
 //! * an operation carrying a `SecretId` is judged against that secret's ARN
-//!   ([`secret_resource`]);
+//!   ([`secret_resource`]) — a statement's `Resource` element matches ARNs, so the decision
+//!   resolves the id, whichever form it took;
 //! * `CreateSecret` against the ARN of the secret it is about to create, which it allocates
-//!   before it stores anything — while its refusal names the NAME the request carried,
-//!   because a secret the create never made has no ARN of this account to name
-//!   ([`authorize_create`]);
+//!   before it stores anything ([`authorize_create`]);
 //! * an operation whose `SecretId` names a secret this account does NOT hold against the
-//!   ARN that id spells (`unheld_secret_arn`) — while its refusal names the id as the
-//!   request spelled it, for the same reason a create's does: an id this account holds no
-//!   secret for addresses no resource of this account, so there is no ARN of its own to
-//!   name. The decision is still taken, and a caller no statement allows is refused
-//!   WITHOUT the request reaching the store, so a refusal says nothing about whether the
-//!   secret exists;
+//!   ARN that id spells (`unheld_secret_arn`). The decision is still taken, and a caller no
+//!   statement allows is refused WITHOUT the request reaching the store, so a refusal says
+//!   nothing about whether the secret exists;
 //! * an operation that addresses no secret of its own — the account-wide list, the password
 //!   generator, the batched read that selects by filter — against the resource IAM writes
 //!   for such a request ([`ANY_RESOURCE`]), and the refusal of one states no resource
 //!   clause, because there is nothing to name.
+//!
+//! WHAT A REFUSAL NAMES is a separate question from what the decision is taken against: the
+//! resource clause of the refusal states the identifier the REQUEST supplied, verbatim — the
+//! `SecretId` as it was spelled (a name, a partial ARN or a full one) and a create's `Name`
+//! — never an ARN the service resolved for it. A refused caller is told which resource IT
+//! asked about, so the sentence is reproducible from the request alone and a client matching
+//! the clause against what it sent finds it there; it also keeps the refusal from publishing
+//! a resolved ARN, whose six trailing characters belong to a secret the refused caller was
+//! never allowed to learn anything about.
 //!
 //! The condition keys the request and the addressed secret populate TRAVEL with the request
 //! handed to the shared evaluation ([`crate::state::condition_keys`]), so a statement
@@ -181,9 +186,8 @@ pub fn authorize_with<Eng: Send + Sync + 'static>(
 /// the `name` the request carries.
 ///
 /// The decision is made against the ARN because that is what a statement's `Resource`
-/// element matches, while what the refusal NAMES is the secret the request named — the name
-/// it carries, because a secret the create never made has no ARN of its own, so there is no
-/// resource of this account to name.
+/// element matches, while what the refusal NAMES is the identifier the request supplied —
+/// the `Name` it carries — the same reading every other refusal of this service makes.
 ///
 /// A create addresses a secret that does not exist yet, so no resource-based policy takes
 /// part in the decision.
@@ -200,8 +204,8 @@ pub fn authorize_create<Eng: Send + Sync + 'static>(
 
 /// Whether the documents in force let this request perform `action` on `resource`.
 ///
-/// `reported` is what a refusal NAMES as the resource, which is the resource the request
-/// addressed as the request spelled it; `resource_policy` is the addressed secret's own
+/// `reported` is what a refusal NAMES as the resource, which is the identifier the request
+/// supplied, verbatim; `resource_policy` is the addressed secret's own
 /// stored policy, when it carries one, and `conditions` the condition keys the request and
 /// that secret populate. The rule is IAM's own order, over the union of the two kinds of
 /// document — see the module docs.
@@ -338,9 +342,9 @@ pub fn authorize_secret_with<Eng: Send + Sync + 'static>(
 }
 
 /// What the store holds about the secret a request addresses, read ONCE: the ARN the
-/// request is judged against, what a refusal NAMES as the resource, the tags that populate
-/// the resource-tag condition keys and the resource-based policy that may itself grant the
-/// call.
+/// request is judged against, what a refusal NAMES as the resource — the `SecretId` the
+/// request supplied — the tags that populate the resource-tag condition keys and the
+/// resource-based policy that may itself grant the call.
 #[derive(Debug, Clone, Default)]
 struct AddressedSecret {
     arn: String,
@@ -378,19 +382,16 @@ fn addressed_secret<Eng: Send + Sync + 'static>(
             .view(&crate::state::request_region(ctx.parts()), secret_id)
             .map(|view| AddressedSecret {
                 arn: view.secret.arn.clone(),
-                // A secret this account HOLDS is named by the ARN it holds it under,
-                // whichever form of `SecretId` the request addressed it by.
-                reported: view.secret.arn.clone(),
+                // The id the request supplied, whether or not this account holds a secret
+                // under it: a refusal states the resource the CALLER asked about, so the
+                // clause is reproducible from the request alone (see the module docs).
+                reported: secret_id.to_string(),
                 tags: view.content.tags.clone(),
                 policy: view.content.resource_policy.clone(),
             })
     });
     held.unwrap_or_else(|| AddressedSecret {
         arn: unheld_secret_arn(ctx, secret_id),
-        // A `SecretId` this account holds no secret for addresses no resource of this
-        // account, so there is no ARN of its own to report: the refusal names the id the
-        // request carried, as it spelled it — the same reading [`authorize_create`] makes
-        // of the name of a secret a create never made.
         reported: secret_id.to_string(),
         ..AddressedSecret::default()
     })
@@ -485,9 +486,8 @@ pub fn created_secret_arn<Eng: Send + Sync + 'static>(
 /// The refusal IAM states an authorization failure with: who was refused, which action,
 /// on which resource, and which of IAM's two rules refused it. Every value in it comes
 /// from the request and from the stored policies — the principal from the credential the
-/// request presented, the action from the operation it named, the resource from what the
-/// request addressed, as the request spelled it (see [`authorize_create`] for the one
-/// request that addresses a resource carrying no ARN yet).
+/// request presented, the action from the operation it named, the resource from the
+/// identifier the request supplied for it, verbatim (see the module docs).
 ///
 /// An action that addresses no resource of its own is judged against [`ANY_RESOURCE`], and
 /// the sentence states no resource clause for it: there is nothing to name.
