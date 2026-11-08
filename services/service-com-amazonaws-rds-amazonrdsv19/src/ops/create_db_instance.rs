@@ -504,7 +504,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             if store.resolve_db_subnet_group(&region, name).is_none() {
                 return Err(CreateDBInstanceErrorModeled::DBSubnetGroupNotFoundFault(
                     DBSubnetGroupNotFoundFault {
-                        message: Some(crate::state::db_subnet_group_not_found_message(name)),
+                        // The wording this front door gives the fault where the group is
+                        // the one an INSTANCE is placed in
+                        // ([`crate::state::db_subnet_group_not_found_for_db_instance_message`]),
+                        // which is neither the report's nor the one the calls whose subject
+                        // IS the group answer.
+                        message: Some(
+                            crate::state::db_subnet_group_not_found_for_db_instance_message(name),
+                        ),
                     },
                 )
                 .into());

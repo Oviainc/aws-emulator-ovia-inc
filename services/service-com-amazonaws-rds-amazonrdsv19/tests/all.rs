@@ -171,6 +171,8 @@ mod guard_order_and_refusal_classes;
 mod iam_role_association_refusals;
 #[path = "all/instance_configuration_guards.rs"]
 mod instance_configuration_guards;
+#[path = "all/instance_placement_and_backup_not_found_sentences.rs"]
+mod instance_placement_and_backup_not_found_sentences;
 #[path = "all/integration_deletion.rs"]
 mod integration_deletion;
 #[path = "all/lifecycle_poll_loops.rs"]

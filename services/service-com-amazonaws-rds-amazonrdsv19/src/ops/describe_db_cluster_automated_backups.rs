@@ -229,11 +229,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 }
 
 /// The modelled not-found fault for a value that resolves to no automated backup.
+///
+/// Amazon RDS words it as a statement about the BACKUP, naming its own resource type and
+/// the DB cluster the request named it by — `DBClusterAutomatedBackup for DBCluster
+/// <value> not found.` — rather than as a sentence about the cluster. `requested` is the
+/// value the request carried, whichever member narrowed the report (the cluster identifier
+/// or the cluster's resource id), so a caller matching the message against what it sent
+/// finds it there.
 fn not_found(requested: &str) -> DescribeDBClusterAutomatedBackupsError {
     DescribeDBClusterAutomatedBackupsErrorModeled::DBClusterAutomatedBackupNotFoundFault(
         DBClusterAutomatedBackupNotFoundFault {
             message: Some(format!(
-                "No automated backup for DB cluster {requested} was found."
+                "DBClusterAutomatedBackup for DBCluster {requested} not found."
             )),
         },
     )

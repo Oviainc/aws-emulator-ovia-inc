@@ -302,7 +302,12 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(CreateTenantDatabaseErrorModeled::DBInstanceNotFoundFault(
                 DBInstanceNotFoundFault {
-                    message: Some(format!("DBInstance {identifier} not found.")),
+                    // The wording this operation answers the fault with: the fixed phrase
+                    // first, then the identifier in the folded spelling the member
+                    // resolves in ("stored as a lowercase string"), and no terminal
+                    // period — the same sentence `DeleteTenantDatabase` answers for the
+                    // instance a tenant database hangs off.
+                    message: Some(format!("DBInstance not found: {identifier}")),
                 },
             )
             .into());

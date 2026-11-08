@@ -533,9 +533,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                     return Err(
                         RestoreDBInstanceFromDBSnapshotErrorModeled::DBSubnetGroupNotFoundFault(
                             DBSubnetGroupNotFoundFault {
-                                message: Some(crate::state::db_subnet_group_not_found_message(
-                                    name,
-                                )),
+                                // The restored resource IS a DB instance, so the group it
+                                // is placed in is resolved — and the fault worded — the way
+                                // `CreateDBInstance` does it.
+                                message: Some(
+                                    crate::state::db_subnet_group_not_found_for_db_instance_message(
+                                        name,
+                                    ),
+                                ),
                             },
                         )
                         .into(),

@@ -1763,12 +1763,29 @@ pub const DEFAULT_DB_SUBNET_GROUP: &str = "default";
 /// lives here, next to the wording the calls that ACT on a group answer
 /// ([`db_subnet_group_does_not_exist_message`]), rather than in each handler.
 ///
-/// `CreateDBInstance` still answers this wording for the group it places an instance in:
-/// its own recorded sentence is a THIRD template (`DBSubnetGroup '<name>' not found.`) and
-/// is the subject of its own open issue, so that handler keeps this one until that issue
-/// lands rather than taking the cluster create's.
+/// The calls that PLACE A DB INSTANCE in the group answer a third wording of the same
+/// fault ([`db_subnet_group_not_found_for_db_instance_message`]).
 pub fn db_subnet_group_not_found_message(name: &str) -> String {
     format!("DB Subnet group '{name}' not found.")
+}
+
+/// The message the `DBSubnetGroupNotFoundFault` carries where the group is the one the call
+/// PLACES A DB INSTANCE in: the create, the read replica built from another instance, and
+/// the restore that brings an instance back from a snapshot all resolve
+/// `DBSubnetGroupName` for the same purpose and answer the same sentence.
+///
+/// Amazon RDS words this one as a statement about the group, spelling the resource type the
+/// way the modelled shape spells it — `DBSubnetGroup`, with no internal space — and quoting
+/// the group in single quotes. It is a third wording of the one fault, beside the report's
+/// ([`db_subnet_group_not_found_message`]) and the one the calls whose SUBJECT is the group
+/// answer ([`db_subnet_group_does_not_exist_message`]), which is how this front door words a
+/// fault by the ROLE the resource plays in the call.
+///
+/// Like both of those it names the group in the folded spelling it would be stored under
+/// ("This value is stored as a lowercase string"), which is the spelling every operation
+/// resolves the member in.
+pub fn db_subnet_group_not_found_for_db_instance_message(name: &str) -> String {
+    format!("DBSubnetGroup '{name}' not found.")
 }
 
 /// The message the `DBSubnetGroupNotFoundFault` carries where the group is the group the
