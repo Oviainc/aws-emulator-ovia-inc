@@ -49,6 +49,9 @@ aws-sdk-lambda = { version = "1", default-features = false }
 # `<Protocol>{Success,Failure}FeedbackRoleArn` writes one delivery-status record per
 # delivery into `sns/<region>/<account-id>/<topic-name>` (`state::delivery_status`).
 aws-sdk-cloudwatchlogs = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest"] }
+# `aws-types`: the request id an endpoint's own service answered with, which a
+# delivery-status record reports as that provider's answer (`ops::publish`).
+aws-types = { version = "1", default-features = false }
 # The `cidr` matcher of a subscription's filter policy asks whether an address lies in a
 # network, which this parses rather than splitting the text by hand
 # (`state::message_filter`).

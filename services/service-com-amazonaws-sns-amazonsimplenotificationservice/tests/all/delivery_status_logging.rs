@@ -2,39 +2,45 @@
 
 //! DELIVERY-STATUS LOGGING: what a topic carrying a `<Protocol>` feedback role writes about
 //! each delivery it attempted, end to end over the wire through the real `MultiServiceRouter`,
-//! with Amazon SQS, IAM and CloudWatch Logs mounted on the same engine as SNS — so the record
-//! is read back where a client reads it, through `logs:DescribeLogStreams` and
+//! with Amazon SQS, AWS Lambda, IAM and CloudWatch Logs mounted on the same engine as SNS — so
+//! the record is read back where a client reads it, through `logs:DescribeLogStreams` and
 //! `logs:GetLogEvents`.
 //!
 //! The RULE asserted here: "`<Protocol>`SuccessFeedbackRoleArn – Indicates successful message
 //! delivery status for an Amazon SNS topic that is subscribed to an endpoint of that kind …
 //! `<Protocol>`FailureFeedbackRoleArn – Indicates failed message delivery status …
 //! `<Protocol>`SuccessFeedbackSampleRate – Indicates percentage of successful messages to
-//! sample" (`SetTopicAttributesInput$AttributeName`) — a topic that names a feedback role for
-//! the protocol a delivery went over has SNS ASSUME that role and write one record per
-//! delivery into the CloudWatch Logs log group `sns/<region>/<account-id>/<topic-name>`,
-//! naming the endpoint delivered to and the `SUCCESS`/`FAILURE` of the attempt; a success is
-//! written at the sampled percentage and a failure always. A topic that names no role for the
-//! delivery's protocol writes nothing, and neither does one whose role does not TRUST this
-//! service, because there is then nothing to assume.
+//! sample … The `<ENDPOINT>`SuccessFeedbackRoleArn and `<ENDPOINT>`FailureFeedbackRoleArn
+//! attributes are used to give Amazon SNS write access to use CloudWatch Logs on your behalf"
+//! (`SetTopicAttributesInput$AttributeName`) — a topic that names a feedback role for the
+//! protocol a delivery went over has SNS ASSUME that role and write one record per delivery,
+//! naming the endpoint delivered to, the `SUCCESS`/`FAILURE` of the attempt, the HTTP status
+//! the endpoint's own service answered with and that service's own answer. A success goes into
+//! `sns/<region>/<account-id>/<topic-name>` at the sampled percentage; a failure goes into that
+//! group's `/Failure` child, always. A topic that names no role for the delivery's protocol
+//! writes nothing, and neither does one whose role does not TRUST this service (there is then
+//! nothing to assume) or whose role is not ALLOWED the CloudWatch Logs write (there is then no
+//! write to make, and no group is created) — while the delivery itself happens either way.
 //!
 //! The rows differ along what the rule generalises over: which of the feedback attributes the
 //! topic carries, the sample rate (a full sample, none, and none named at all), the protocol
 //! the attributes were set for as against the one the delivery went over, whether the delivery
-//! succeeded or was withheld by the endpoint's own policy, and whether the named role's trust
-//! policy admits this service.
+//! succeeded or was withheld by the endpoint's own policy, whether the named role's trust
+//! policy admits this service, and which permissions that role carries.
 //!
-//! The deliveries here go over the `sqs` protocol, whose endpoint is a queue, because the
-//! feedback configuration is per protocol and the queue's own `Policy` is the cleanest way to
-//! make one delivery succeed and another fail; the `lambda` protocol's own deliveries are
-//! `lambda_subscription_delivery.rs`.
+//! Both delivery protocols SNS performs itself are exercised: the `sqs` one, whose endpoint is
+//! a queue reached by `SendMessage`, and the `lambda` one, whose endpoint is a function reached
+//! by an asynchronous `Invoke` — the two answer different success statuses and different
+//! refusal codes, which is exactly what the record reports.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
+use service_com_amazonaws_lambda_awsgirapiservice::state::ComAmazonawsLambdaAwsgirapiserviceState;
 use smithy_server_runtime::MultiServiceRouter;
 
+use crate::lambda_subscription_delivery::{ROLE as LAMBDA_EXECUTION_ROLE, ZIP_FILE};
 use crate::sqs_subscription_delivery::element;
 use crate::topics_subscriptions_publish::percent_encode;
 
@@ -56,11 +62,12 @@ const QUIET_BUDGET: Duration = Duration::from_millis(1_500);
 /// How often a wait re-reads the log group it is waiting on.
 const LOOK_INTERVAL: Duration = Duration::from_millis(25);
 
-/// SNS with the three services a logged delivery spans, on ONE engine: the queue the
-/// notification is delivered to, the IAM store the feedback role is resolved in, and the
-/// CloudWatch Logs store the record lands in.
+/// SNS with the four services a logged delivery spans, on ONE engine: the queue and the
+/// function the notification is delivered to, the IAM store the feedback role is resolved in,
+/// and the CloudWatch Logs store the record lands in.
 struct Emulator {
     router: MultiServiceRouter,
+    engine: Arc<engine::InMemoryEngine>,
 }
 
 fn emulator() -> Emulator {
@@ -76,14 +83,19 @@ fn emulator() -> Emulator {
         Arc::clone(&engine),
     ));
     router.register_service(
+        service_com_amazonaws_lambda_awsgirapiservice::EmulatedService::new(Arc::clone(&engine)),
+    );
+    router.register_service(
         service_com_amazonaws_iam_awsidentitymanagementv20100508::EmulatedService::new(
             Arc::clone(&engine),
         ),
     );
     router.register_service(
-        service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(engine),
+        service_com_amazonaws_cloudwatchlogs_logs_20140328::EmulatedService::new(Arc::clone(
+            &engine,
+        )),
     );
-    Emulator { router }
+    Emulator { router, engine }
 }
 
 /// A SigV4 `Authorization` whose credential scope names `signing_name`, which is what routes
@@ -166,6 +178,31 @@ async fn sqs(emulator: &Emulator, operation: &str, body: &Value) -> Value {
     parsed
 }
 
+/// One `restJson1` call against Lambda, with whatever status it answered.
+async fn lambda(emulator: &Emulator, method: &str, uri: &str, body: Value) -> (u16, Value) {
+    let payload = if body.is_null() {
+        bytes::Bytes::new()
+    } else {
+        bytes::Bytes::from(body.to_string())
+    };
+    let request = http::Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("host", format!("lambda.{REGION}.amazonaws.com"))
+        .header("content-type", "application/json")
+        .header("authorization", authorization("lambda"))
+        .body(payload)
+        .expect("the test request is well formed");
+    let response = emulator.router.dispatch(request).await;
+    let status = response.status().as_u16();
+    let parsed: Value = if response.body().is_empty() {
+        Value::Null
+    } else {
+        serde_json::from_slice(response.body()).unwrap_or(Value::Null)
+    };
+    (status, parsed)
+}
+
 /// One `awsJson1_1` call against CloudWatch Logs, with whatever status it answered: a row that
 /// expects NO record must be able to see the group simply not being there.
 async fn logs(emulator: &Emulator, operation: &str, body: &Value) -> (u16, Value) {
@@ -202,8 +239,57 @@ fn trusts(trusted: &str) -> String {
     .to_string()
 }
 
-/// Create the role `name` with a trust policy admitting `trusted`, and answer its ARN.
-async fn given_role(emulator: &Emulator, name: &str, trusted: &str) -> String {
+/// What the permissions in force on a feedback role allow — the half of the configuration that
+/// decides whether the record can be WRITTEN once the role has been assumed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Permissions {
+    /// The three CloudWatch Logs actions a record costs, which is what AWS documents a
+    /// delivery-status feedback role has to grant.
+    WritesLogs,
+    /// A CloudWatch Logs READ and nothing else: a role that can be assumed but cannot write.
+    ReadsLogs,
+    /// No policy at all.
+    None,
+}
+
+impl Permissions {
+    /// The inline policy document this grants, or `None` for a role that carries no policy.
+    ///
+    /// The action names are CloudWatch Logs' own
+    /// (`smithy_query(query="list_operations")` of the `logs` model: `CreateLogGroup`,
+    /// `CreateLogStream`, `PutLogEvents`, `DescribeLogGroups`).
+    fn document(self) -> Option<String> {
+        let actions: &[&str] = match self {
+            Self::WritesLogs => &[
+                "logs:CreateLogGroup",
+                "logs:CreateLogStream",
+                "logs:PutLogEvents",
+            ],
+            Self::ReadsLogs => &["logs:DescribeLogGroups"],
+            Self::None => return None,
+        };
+        Some(
+            json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": actions,
+                    "Resource": "*",
+                }],
+            })
+            .to_string(),
+        )
+    }
+}
+
+/// Create the role `name` with a trust policy admitting `trusted` and the permissions
+/// `permissions` describes, and answer its ARN.
+async fn given_role(
+    emulator: &Emulator,
+    name: &str,
+    trusted: &str,
+    permissions: Permissions,
+) -> String {
     let answered = iam(
         emulator,
         "CreateRole",
@@ -213,6 +299,18 @@ async fn given_role(emulator: &Emulator, name: &str, trusted: &str) -> String {
         ],
     )
     .await;
+    if let Some(document) = permissions.document() {
+        iam(
+            emulator,
+            "PutRolePolicy",
+            &[
+                ("RoleName", name),
+                ("PolicyName", "delivery-status"),
+                ("PolicyDocument", &document),
+            ],
+        )
+        .await;
+    }
     element(&answered, "Arn")
 }
 
@@ -265,14 +363,84 @@ async fn given_queue(emulator: &Emulator, name: &str, grants: bool) -> (String, 
     (url, arn)
 }
 
-/// The log group a topic's delivery-status records go into, read off the topic's own ARN:
-/// `sns/<region>/<account-id>/<topic-name>`.
+/// A function called `name`, brought to `Active` — the state an invocation needs — by moving
+/// the activation instant the store holds into the past, granting SNS the invoke when `grants`
+/// asks for it. Its ARN, which is what a subscription names it by.
+async fn given_function(emulator: &Emulator, name: &str, grants: bool) -> String {
+    let (status, created) = lambda(
+        emulator,
+        "POST",
+        "/2015-03-31/functions",
+        json!({
+            "FunctionName": name,
+            "Role": LAMBDA_EXECUTION_ROLE,
+            "Runtime": "python3.12",
+            "Handler": "index.handler",
+            "Code": { "ZipFile": ZIP_FILE },
+        }),
+    )
+    .await;
+    assert_eq!(
+        status, 201,
+        "CreateFunction {name}: expected HTTP 201, got {status} with {created}"
+    );
+    let arn = created["FunctionArn"]
+        .as_str()
+        .unwrap_or_else(|| panic!("CreateFunction {name}: no FunctionArn in {created}"))
+        .to_string();
+    {
+        let state = emulator
+            .engine
+            .state::<ComAmazonawsLambdaAwsgirapiserviceState>();
+        let mut store = state.lock();
+        let past = SystemTime::now() - Duration::from_secs(1);
+        for record in store.functions.values_mut() {
+            record.active_due = past;
+        }
+    }
+    if grants {
+        let (status, added) = lambda(
+            emulator,
+            "POST",
+            &format!("/2015-03-31/functions/{name}/policy"),
+            json!({
+                "StatementId": "AllowSNSInvoke",
+                "Action": "lambda:InvokeFunction",
+                "Principal": SNS_PRINCIPAL,
+            }),
+        )
+        .await;
+        assert_eq!(
+            status, 201,
+            "AddPermission {name}: expected HTTP 201, got {status} with {added}"
+        );
+    }
+    arn
+}
+
+/// The log group a topic's SUCCESSFUL delivery-status records go into, read off the topic's own
+/// ARN: `sns/<region>/<account-id>/<topic-name>`.
 fn feedback_log_group(topic_arn: &str) -> String {
     let fields: Vec<&str> = topic_arn.split(':').collect();
     let [_, _, _, region, account, name] = fields[..] else {
         panic!("a topic ARN has six colon-separated fields, got {topic_arn}");
     };
     format!("sns/{region}/{account}/{name}")
+}
+
+/// The group a FAILED delivery's record goes into: the `/Failure` child of the topic's own.
+fn failure_log_group(topic_arn: &str) -> String {
+    format!("{}/Failure", feedback_log_group(topic_arn))
+}
+
+/// The group a record of `status` goes into, which is the half of the rule that depends on the
+/// outcome.
+fn group_of(topic_arn: &str, status: &str) -> String {
+    if status == "SUCCESS" {
+        feedback_log_group(topic_arn)
+    } else {
+        failure_log_group(topic_arn)
+    }
 }
 
 /// Every delivery-status record `log_group` holds, parsed, across every stream in it — and an
@@ -331,6 +499,15 @@ async fn records_within(emulator: &Emulator, log_group: &str, budget: Duration) 
     }
 }
 
+/// The document a delivery-status record carries under `providerResponse`, parsed.
+fn provider_response(case: &str, record: &Value) -> Value {
+    let text = record["delivery"]["providerResponse"]
+        .as_str()
+        .unwrap_or_else(|| panic!("case {case:?}: the record must carry a providerResponse, got {record}"));
+    serde_json::from_str(text)
+        .unwrap_or_else(|error| panic!("case {case:?}: providerResponse is not JSON ({error}): {text}"))
+}
+
 /// Stands in for the feedback role's ARN in a row's attribute values, which is only known once
 /// the role has been created.
 const ROLE_PLACEHOLDER: &str = "<role>";
@@ -343,6 +520,8 @@ struct Row {
     attributes: &'static [(&'static str, &'static str)],
     /// The service principal the named role's trust policy admits.
     trusted: &'static str,
+    /// What the permissions in force on that role allow.
+    permissions: Permissions,
     /// Whether the subscribed queue grants this service the send, which is what decides whether
     /// the delivery succeeds.
     queue_grants: bool,
@@ -364,6 +543,7 @@ fn rows() -> Vec<Row> {
                 ("SQSSuccessFeedbackSampleRate", "100"),
             ],
             trusted: SNS_PRINCIPAL,
+            permissions: Permissions::WritesLogs,
             queue_grants: true,
             status: Some("SUCCESS"),
         },
@@ -371,6 +551,7 @@ fn rows() -> Vec<Row> {
             case: "a failure role, and a delivery the endpoint's own policy withheld",
             attributes: &[("SQSFailureFeedbackRoleArn", ROLE_PLACEHOLDER)],
             trusted: SNS_PRINCIPAL,
+            permissions: Permissions::WritesLogs,
             queue_grants: false,
             status: Some("FAILURE"),
         },
@@ -381,6 +562,7 @@ fn rows() -> Vec<Row> {
                 ("SQSSuccessFeedbackSampleRate", "0"),
             ],
             trusted: SNS_PRINCIPAL,
+            permissions: Permissions::WritesLogs,
             queue_grants: true,
             status: None,
         },
@@ -388,6 +570,7 @@ fn rows() -> Vec<Row> {
             case: "a success role with no sample rate named at all",
             attributes: &[("SQSSuccessFeedbackRoleArn", ROLE_PLACEHOLDER)],
             trusted: SNS_PRINCIPAL,
+            permissions: Permissions::WritesLogs,
             queue_grants: true,
             status: None,
         },
@@ -398,6 +581,7 @@ fn rows() -> Vec<Row> {
                 ("LambdaSuccessFeedbackSampleRate", "100"),
             ],
             trusted: SNS_PRINCIPAL,
+            permissions: Permissions::WritesLogs,
             queue_grants: true,
             status: None,
         },
@@ -408,17 +592,61 @@ fn rows() -> Vec<Row> {
                 ("SQSSuccessFeedbackSampleRate", "100"),
             ],
             trusted: "events.amazonaws.com",
+            permissions: Permissions::WritesLogs,
             queue_grants: true,
+            status: None,
+        },
+        Row {
+            case: "a trusted role carrying no permissions at all",
+            attributes: &[
+                ("SQSSuccessFeedbackRoleArn", ROLE_PLACEHOLDER),
+                ("SQSSuccessFeedbackSampleRate", "100"),
+            ],
+            trusted: SNS_PRINCIPAL,
+            permissions: Permissions::None,
+            queue_grants: true,
+            status: None,
+        },
+        Row {
+            case: "a trusted role that may read CloudWatch Logs but not write it",
+            attributes: &[
+                ("SQSSuccessFeedbackRoleArn", ROLE_PLACEHOLDER),
+                ("SQSSuccessFeedbackSampleRate", "100"),
+            ],
+            trusted: SNS_PRINCIPAL,
+            permissions: Permissions::ReadsLogs,
+            queue_grants: true,
+            status: None,
+        },
+        Row {
+            case: "a failure role that may not write CloudWatch Logs, and a withheld delivery",
+            attributes: &[("SQSFailureFeedbackRoleArn", ROLE_PLACEHOLDER)],
+            trusted: SNS_PRINCIPAL,
+            permissions: Permissions::ReadsLogs,
+            queue_grants: false,
             status: None,
         },
         Row {
             case: "no feedback attribute at all",
             attributes: &[],
             trusted: SNS_PRINCIPAL,
+            permissions: Permissions::WritesLogs,
             queue_grants: true,
             status: None,
         },
     ]
+}
+
+/// The refusal AWS states for a delivery no resource-based policy allows: the principal the
+/// delivery is made as, the action it performs and the resource it performs it on.
+///
+/// Amazon SQS compares action names lower-cased and words its refusal with them as compared,
+/// which is why the queue form carries `sqs:sendmessage`.
+fn not_authorized(action: &str, resource: &str) -> String {
+    format!(
+        "User: {SNS_PRINCIPAL} is not authorized to perform: {action} on resource: {resource} \
+         because no resource-based policy allows the {action} action"
+    )
 }
 
 #[tokio::test]
@@ -430,7 +658,13 @@ async fn a_topic_with_a_feedback_role_logs_one_record_per_delivery() {
             &sns(&emulator, "CreateTopic", &[("Name", "feedback")]).await,
             "TopicArn",
         );
-        let role = given_role(&emulator, &format!("sns-feedback-{index}"), row.trusted).await;
+        let role = given_role(
+            &emulator,
+            &format!("sns-feedback-{index}"),
+            row.trusted,
+            row.permissions,
+        )
+        .await;
         let (_, endpoint) =
             given_queue(&emulator, &format!("feedback-{index}"), row.queue_grants).await;
         sns(
@@ -464,21 +698,21 @@ async fn a_topic_with_a_feedback_role_logs_one_record_per_delivery() {
         )
         .await;
 
-        let log_group = feedback_log_group(&topic);
-        let budget = if row.status.is_some() {
-            RECORD_BUDGET
-        } else {
-            QUIET_BUDGET
-        };
-        let records = records_within(&emulator, &log_group, budget).await;
         let Some(expected) = row.status else {
-            assert!(
-                records.is_empty(),
-                "case {case:?}: this topic asks for no delivery-status record, so {log_group} \
-                 must stay empty, got {records:?}"
-            );
+            // Neither group may come into existence: the role that would have created it
+            // either cannot be assumed or may not write.
+            for log_group in [feedback_log_group(&topic), failure_log_group(&topic)] {
+                let records = records_within(&emulator, &log_group, QUIET_BUDGET).await;
+                assert!(
+                    records.is_empty(),
+                    "case {case:?}: this topic asks for no delivery-status record, so \
+                     {log_group} must stay empty, got {records:?}"
+                );
+            }
             continue;
         };
+        let log_group = group_of(&topic, expected);
+        let records = records_within(&emulator, &log_group, RECORD_BUDGET).await;
         assert_eq!(
             records.len(),
             1,
@@ -512,6 +746,157 @@ async fn a_topic_with_a_feedback_role_logs_one_record_per_delivery() {
                 .is_some_and(|id| !id.is_empty()),
             "case {case:?}: the record must carry a delivery id, got {record}"
         );
+        if expected == "SUCCESS" {
+            // Amazon SQS answers a `SendMessage` it took with 200, and reports the id it
+            // minted for the message.
+            assert_eq!(
+                record["delivery"]["statusCode"].as_u64(),
+                Some(200),
+                "case {case:?}: expected the queue's own success status, got {record}"
+            );
+            let response = provider_response(case, record);
+            assert!(
+                response["sqsMessageId"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty()),
+                "case {case:?}: the provider response must name the queue's message, got \
+                 {response}"
+            );
+        } else {
+            assert_eq!(
+                record["delivery"]["statusCode"].as_u64(),
+                Some(403),
+                "case {case:?}: a delivery no policy allows is a 403, got {record}"
+            );
+            let response = provider_response(case, record);
+            assert_eq!(
+                response["ErrorCode"].as_str(),
+                Some("AccessDenied"),
+                "case {case:?}: expected the AccessDenied code, got {response}"
+            );
+            assert_eq!(
+                response["ErrorMessage"].as_str(),
+                Some(not_authorized("sqs:sendmessage", &endpoint).as_str()),
+                "case {case:?}: expected the refusal AWS words, got {response}"
+            );
+        }
+    }
+}
+
+/// One row of the lambda table: the case, whether the function grants SNS the invoke, the
+/// status the record must report, the HTTP status the record must carry and the error code its
+/// provider response must name (`None` for a delivery that was taken).
+type FunctionCase<'a> = (&'a str, bool, &'a str, u64, Option<&'a str>);
+
+/// RULE: the record reports the status the ENDPOINT'S OWN SERVICE answered — so the same rule
+/// over the `lambda` protocol reports Lambda's asynchronous-invoke `202` for an invocation it
+/// accepted and a `403` naming Lambda's own refusal code for a function SNS may not invoke.
+#[tokio::test]
+async fn a_lambda_delivery_reports_the_status_lambda_answered() {
+    let rows: [FunctionCase<'_>; 2] = [
+        ("an invocation the function's policy grants", true, "SUCCESS", 202, None),
+        (
+            "a function SNS may not invoke",
+            false,
+            "FAILURE",
+            403,
+            Some("AccessDeniedException"),
+        ),
+    ];
+    for (index, (case, grants, expected, code, error_code)) in rows.into_iter().enumerate() {
+        let emulator = emulator();
+        let topic = element(
+            &sns(&emulator, "CreateTopic", &[("Name", "fn-feedback")]).await,
+            "TopicArn",
+        );
+        let role = given_role(
+            &emulator,
+            &format!("sns-fn-feedback-{index}"),
+            SNS_PRINCIPAL,
+            Permissions::WritesLogs,
+        )
+        .await;
+        let endpoint = given_function(&emulator, &format!("notify-{index}"), grants).await;
+        sns(
+            &emulator,
+            "Subscribe",
+            &[
+                ("TopicArn", &topic),
+                ("Protocol", "lambda"),
+                ("Endpoint", &endpoint),
+            ],
+        )
+        .await;
+        for (name, value) in [
+            ("LambdaSuccessFeedbackRoleArn", role.as_str()),
+            ("LambdaFailureFeedbackRoleArn", role.as_str()),
+            ("LambdaSuccessFeedbackSampleRate", "100"),
+        ] {
+            sns(
+                &emulator,
+                "SetTopicAttributes",
+                &[
+                    ("TopicArn", &topic),
+                    ("AttributeName", name),
+                    ("AttributeValue", value),
+                ],
+            )
+            .await;
+        }
+
+        sns(
+            &emulator,
+            "Publish",
+            &[("TopicArn", &topic), ("Message", "a notification")],
+        )
+        .await;
+
+        let log_group = group_of(&topic, expected);
+        let records = records_within(&emulator, &log_group, RECORD_BUDGET).await;
+        assert_eq!(
+            records.len(),
+            1,
+            "case {case:?}: expected one delivery-status record in {log_group}, got {records:?}"
+        );
+        let record = &records[0];
+        assert_eq!(
+            record["status"].as_str(),
+            Some(expected),
+            "case {case:?}: expected status {expected:?}, got {record}"
+        );
+        assert_eq!(
+            record["delivery"]["destination"].as_str(),
+            Some(endpoint.as_str()),
+            "case {case:?}: the record must name the function delivered to, got {record}"
+        );
+        assert_eq!(
+            record["delivery"]["statusCode"].as_u64(),
+            Some(code),
+            "case {case:?}: expected statusCode {code}, got {record}"
+        );
+        let Some(error_code) = error_code else {
+            // Lambda's own answer about the invocation it accepted: the request it answered.
+            let response = provider_response(case, record);
+            assert!(
+                response["lambdaRequestId"]
+                    .as_str()
+                    .is_some_and(|id| !id.is_empty()),
+                "case {case:?}: the provider response must name Lambda's invocation, got \
+                 {response}"
+            );
+            continue;
+        };
+        let response = provider_response(case, record);
+        assert_eq!(
+            response["ErrorCode"].as_str(),
+            Some(error_code),
+            "case {case:?}: expected the {error_code} code, got {response}"
+        );
+        assert_eq!(
+            response["ErrorMessage"].as_str(),
+            Some(not_authorized("lambda:InvokeFunction", &endpoint).as_str()),
+            "case {case:?}: expected the refusal AWS words, got {response}"
+        );
     }
 }
 
@@ -524,7 +909,13 @@ async fn one_record_is_written_per_delivery_of_the_topic() {
         &sns(&emulator, "CreateTopic", &[("Name", "fan-out")]).await,
         "TopicArn",
     );
-    let role = given_role(&emulator, "sns-fan-out-feedback", SNS_PRINCIPAL).await;
+    let role = given_role(
+        &emulator,
+        "sns-fan-out-feedback",
+        SNS_PRINCIPAL,
+        Permissions::WritesLogs,
+    )
+    .await;
     let (_, first) = given_queue(&emulator, "fan-out-one", true).await;
     let (_, second) = given_queue(&emulator, "fan-out-two", true).await;
     for endpoint in [&first, &second] {

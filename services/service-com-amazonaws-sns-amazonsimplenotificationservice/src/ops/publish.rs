@@ -557,11 +557,13 @@ impl QueueDelivery {
     /// Write the delivery-status record of this delivery, where the topic asked for one.
     ///
     /// The record reports a delivery that has already been attempted, so it is written after
-    /// the attempt and never instead of it.
+    /// the attempt and never instead of it, and it carries what the queue's own service
+    /// answered (`answered`).
     async fn record_status(
         &self,
         ctx: &smithy_server_runtime::OperationContext<'_>,
         delivered: bool,
+        answered: &state::delivery_status::Answered,
     ) {
         let Some(logged) = self.logged.as_ref() else {
             return;
@@ -573,6 +575,7 @@ impl QueueDelivery {
                 &self.topic_arn,
                 &self.target.queue_arn,
                 delivered,
+                answered,
             )
             .await;
     }
@@ -1026,11 +1029,13 @@ pub(crate) async fn deliver_to_endpoints(
     let mut waiting = RetryBudget::new();
     let mut queues = Queues::new(ctx);
     for delivery in &deliveries.queues {
-        let delivered = queues
+        let attempted = queues
             .hand_over(&delivery.target, delivery, &mut waiting)
             .await;
-        delivery.record_status(ctx, delivered).await;
-        if delivered {
+        delivery
+            .record_status(ctx, attempted.taken(), &attempted.answered)
+            .await;
+        if attempted.taken() {
             continue;
         }
         let Some(dead_letter) = delivery.dead_letter.as_ref() else {
@@ -1043,9 +1048,11 @@ pub(crate) async fn deliver_to_endpoints(
     }
     let mut functions = function_delivery::Functions::new(ctx);
     for delivery in &deliveries.functions {
-        let invoked = functions.invoke(delivery, &mut waiting).await;
-        delivery.record_status(ctx, invoked).await;
-        if invoked {
+        let attempted = functions.invoke(delivery, &mut waiting).await;
+        delivery
+            .record_status(ctx, attempted.taken(), &attempted.answered)
+            .await;
+        if attempted.taken() {
             continue;
         }
         let Some(parked) = delivery.dead_letter_copy() else {
@@ -1063,7 +1070,7 @@ async fn park_in_dead_letter(
     parked: &QueueDelivery,
     waiting: &mut RetryBudget,
 ) {
-    if queues.hand_over(dead_letter, parked, waiting).await {
+    if queues.hand_over(dead_letter, parked, waiting).await.taken() {
         ::tracing::info!(
             subscription = %parked.subscription_arn,
             queue = %dead_letter.queue_url,
@@ -1163,6 +1170,32 @@ pub(super) enum HandOver {
     Refused,
 }
 
+/// One attempt at a hand-over, as the delivery-status record of it reports it: which of the
+/// three outcomes it came to, and what the endpoint's own service answered.
+///
+/// The two travel together because the record reports both, and because every outcome has an
+/// answer to report: the status a refusal was answered with, the one a successful hand-over
+/// was, and none at all for a call that reached no answer.
+#[derive(Debug, Clone)]
+pub(super) struct Attempted {
+    /// Which of the three outcomes the attempt came to.
+    outcome: HandOver,
+    /// What the endpoint's service answered about it.
+    answered: state::delivery_status::Answered,
+}
+
+impl Attempted {
+    /// An attempt that came to `outcome` with `answered` as the endpoint service's answer.
+    fn new(outcome: HandOver, answered: state::delivery_status::Answered) -> Self {
+        Self { outcome, answered }
+    }
+
+    /// Whether the endpoint TOOK the message.
+    pub(super) fn taken(&self) -> bool {
+        self.outcome == HandOver::Taken
+    }
+}
+
 /// The SQS queues ONE publishing request hands its messages to.
 ///
 /// It remembers what each queue of the fan-out answered — the client its Region is reached
@@ -1184,8 +1217,9 @@ enum QueuePolicy {
     /// The queue answered: the policy document it carries, or `None` when it carries none.
     Stated(Option<String>),
     /// The queue did not answer at all — one that was deleted, or that never existed — so
-    /// nothing can be handed to it.
-    Unreachable,
+    /// nothing can be handed to it, and what its service answered instead is carried along
+    /// for the delivery-status record of the attempt.
+    Unreachable(state::delivery_status::Answered),
 }
 
 impl<'ctx, 'op> Queues<'ctx, 'op> {
@@ -1220,31 +1254,34 @@ impl<'ctx, 'op> Queues<'ctx, 'op> {
         read
     }
 
-    /// Hand `delivery`'s message to `queue`, and report whether the queue took it.
+    /// Hand `delivery`'s message to `queue`, and report whether the queue took it — together
+    /// with what the queue's own service answered, which is what the delivery-status record
+    /// of the attempt reports.
     ///
     /// A hand-over the queue could not take YET is retried along the phases the delivery
     /// policy publishes ([`retry_waits`]), within what `waiting` leaves the request; one it
     /// will not take is not retried at all, because another attempt earns the same answer.
-    /// `false` is every way the message did not reach the queue — the client errors a redrive
-    /// exists to make visible.
+    /// Anything but [`Attempted::taken`] is a way the message did not reach the queue — the
+    /// client errors a redrive exists to make visible — and the answer reported is the LAST
+    /// attempt's.
     pub(super) async fn hand_over(
         &mut self,
         queue: &QueueLocation,
         delivery: &QueueDelivery,
         waiting: &mut RetryBudget,
-    ) -> bool {
+    ) -> Attempted {
         let mut waits = retry_waits();
         loop {
-            match self.attempt_hand_over(queue, delivery).await {
-                HandOver::Taken => return true,
-                HandOver::Refused => return false,
+            let attempted = self.attempt_hand_over(queue, delivery).await;
+            match attempted.outcome {
+                HandOver::Taken | HandOver::Refused => return attempted,
                 HandOver::NotYet => {}
             }
             let Some(wait) = waits.next() else {
-                return false;
+                return attempted;
             };
             if !wait.is_zero() && !waiting.charge(wait) {
-                return false;
+                return attempted;
             }
             if !wait.is_zero() {
                 ::tokio::time::sleep(wait).await;
@@ -1259,18 +1296,18 @@ impl<'ctx, 'op> Queues<'ctx, 'op> {
         &mut self,
         queue: &QueueLocation,
         delivery: &QueueDelivery,
-    ) -> HandOver {
+    ) -> Attempted {
         let client = self.client(&queue.region);
         let policy = match self.policy(&client, &queue.queue_url).await {
             QueuePolicy::Stated(policy) => policy,
-            QueuePolicy::Unreachable => {
+            QueuePolicy::Unreachable(answered) => {
                 ::tracing::warn!(
                     subscription = %delivery.subscription_arn,
                     queue = %queue.queue_url,
                     "the subscribed queue does not answer, so the notification cannot be \
                      delivered to it"
                 );
-                return HandOver::Refused;
+                return Attempted::new(HandOver::Refused, answered);
             }
         };
         if !delivery_is_authorized(policy.as_deref(), &queue.queue_arn, &delivery.topic_arn) {
@@ -1280,7 +1317,7 @@ impl<'ctx, 'op> Queues<'ctx, 'op> {
                 "the subscribed queue's policy does not allow this service to send it a \
                  message, so the notification is withheld"
             );
-            return HandOver::Refused;
+            return Attempted::new(HandOver::Refused, send_was_denied(&queue.queue_arn));
         }
         let mut request = client
             .send_message()
@@ -1320,17 +1357,19 @@ impl<'ctx, 'op> Queues<'ctx, 'op> {
                 ),
             }
         }
-        if let Err(error) = request.send().await {
-            let answered = answered_status(&error);
-            ::tracing::warn!(
-                subscription = %delivery.subscription_arn,
-                queue = %queue.queue_url,
-                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "a subscribed queue could not be delivered to"
-            );
-            return refusal_of(answered);
+        match request.send().await {
+            Ok(answer) => Attempted::new(HandOver::Taken, send_was_taken(&answer)),
+            Err(error) => {
+                let answered = answered_refusal(&error);
+                ::tracing::warn!(
+                    subscription = %delivery.subscription_arn,
+                    queue = %queue.queue_url,
+                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                    "a subscribed queue could not be delivered to"
+                );
+                Attempted::new(refusal_of(answered.status_code), answered)
+            }
         }
-        HandOver::Taken
     }
 }
 
@@ -1449,9 +1488,106 @@ async fn queue_policy(client: &::aws_sdk_sqs::Client, queue_url: &str) -> QueueP
                 error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
                 "a subscribed queue's policy could not be read"
             );
-            QueuePolicy::Unreachable
+            QueuePolicy::Unreachable(answered_refusal(&error))
         }
     }
+}
+
+/// The HTTP status a refused delivery is reported under when the refusal was decided HERE,
+/// from the endpoint's own resource policy, rather than answered by the endpoint's service:
+/// an unauthorized request is a `403`.
+const FORBIDDEN_STATUS: u16 = 403;
+
+/// The error code AWS answers a request no resource-based policy allows with.
+const ACCESS_DENIED_CODE: &str = "AccessDenied";
+
+/// The action a delivery to a subscribed queue is REFUSED by name under, as the refusal
+/// sentence spells it.
+///
+/// Amazon SQS decides an access request over action names it has lower-cased, and the
+/// sentence it refuses with carries them as it compared them — which is why this is not
+/// [`SEND_MESSAGE_ACTION`], the modelled spelling the policy evaluation matches
+/// case-insensitively.
+const SEND_MESSAGE_REFUSED_ACTION: &str = "sqs:sendmessage";
+
+/// What the queue's service is reported to have answered for a delivery its own `Policy`
+/// withheld: the `403` an unauthorized request earns, and the error document AWS states such
+/// a refusal in.
+fn send_was_denied(queue_arn: &str) -> state::delivery_status::Answered {
+    state::delivery_status::Answered {
+        status_code: Some(FORBIDDEN_STATUS),
+        provider_response: Some(error_document(
+            ACCESS_DENIED_CODE,
+            Some(
+                &::service_common::iam_authorization::not_authorized_by_resource_policy(
+                    SNS_SERVICE_PRINCIPAL,
+                    SEND_MESSAGE_REFUSED_ACTION,
+                    queue_arn,
+                ),
+            ),
+        )),
+    }
+}
+
+/// The status Amazon SQS answers a `SendMessage` it took with: the operation's modelled
+/// success status, which is what the hand-over reached when the call returned an answer.
+const SEND_MESSAGE_SUCCESS_STATUS: u16 = 200;
+
+/// What the queue's service answered for a message it TOOK: the success status, and the
+/// identifiers that service reported for the delivery — the request it answered and the
+/// message the queue minted — as its own answer about it.
+fn send_was_taken(
+    answer: &::aws_sdk_sqs::operation::send_message::SendMessageOutput,
+) -> state::delivery_status::Answered {
+    let mut document = ::serde_json::Map::new();
+    if let Some(id) = ::aws_types::request_id::RequestId::request_id(answer) {
+        document.insert("sqsRequestId".to_string(), ::serde_json::Value::from(id));
+    }
+    if let Some(id) = answer.message_id() {
+        document.insert("sqsMessageId".to_string(), ::serde_json::Value::from(id));
+    }
+    state::delivery_status::Answered {
+        status_code: Some(SEND_MESSAGE_SUCCESS_STATUS),
+        provider_response: Some(::serde_json::Value::Object(document).to_string()),
+    }
+}
+
+/// What `error` says the endpoint's own service answered: the HTTP status of the answer and
+/// the error document it stated, as a delivery-status record reports them.
+///
+/// ONE reading for every endpoint kind, because the SDK reports a refusal the same way
+/// whichever service answered it.
+pub(super) fn answered_refusal<E>(
+    error: &::aws_smithy_runtime_api::client::result::SdkError<
+        E,
+        ::aws_smithy_runtime_api::client::orchestrator::HttpResponse,
+    >,
+) -> state::delivery_status::Answered
+where
+    E: ::aws_smithy_types::error::metadata::ProvideErrorMetadata,
+{
+    use ::aws_smithy_types::error::metadata::ProvideErrorMetadata;
+
+    state::delivery_status::Answered {
+        status_code: answered_status(error),
+        provider_response: error
+            .code()
+            .map(|code| error_document(code, error.message())),
+    }
+}
+
+/// The document a delivery-status record carries under `providerResponse` for a delivery the
+/// endpoint's own service refused: the code it refused with, and the sentence it stated.
+pub(super) fn error_document(code: &str, message: Option<&str>) -> String {
+    let mut document = ::serde_json::Map::new();
+    document.insert("ErrorCode".to_string(), ::serde_json::Value::from(code));
+    if let Some(message) = message {
+        document.insert(
+            "ErrorMessage".to_string(),
+            ::serde_json::Value::from(message),
+        );
+    }
+    ::serde_json::Value::Object(document).to_string()
 }
 
 /// The HTTP status an endpoint's service answered a failed hand-over with, or `None` when the

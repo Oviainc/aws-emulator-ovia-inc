@@ -29,7 +29,8 @@
 use crate::state::{self, PublishedMessage};
 
 use super::{
-    answered_status, refusal_of, retry_waits, HandOver, QueueDelivery, QueueLocation, RetryBudget,
+    answered_refusal, error_document, refusal_of, retry_waits, Attempted, HandOver, QueueDelivery,
+    QueueLocation, RetryBudget,
 };
 
 /// The subscription protocol whose endpoint is a Lambda function: "lambda – delivery of
@@ -130,11 +131,13 @@ impl FunctionDelivery {
     /// Write the delivery-status record of this invocation, where the topic asked for one.
     ///
     /// The record reports an invocation that has already been attempted, so it is written
-    /// after the attempt and never instead of it.
+    /// after the attempt and never instead of it, and it carries what the function's own
+    /// service answered (`answered`).
     pub(super) async fn record_status(
         &self,
         ctx: &smithy_server_runtime::OperationContext<'_>,
         invoked: bool,
+        answered: &state::delivery_status::Answered,
     ) {
         let Some(logged) = self.logged.as_ref() else {
             return;
@@ -146,6 +149,7 @@ impl FunctionDelivery {
                 &self.topic_arn,
                 &self.target.function_arn,
                 invoked,
+                answered,
             )
             .await;
     }
@@ -231,6 +235,10 @@ pub(super) struct Functions<'ctx, 'op> {
     policies: Vec<(String, FunctionPolicy)>,
 }
 
+/// The error code AWS Lambda refuses an invocation no policy allows with, which is what a
+/// delivery-status record of a withheld invocation carries as the provider's answer.
+const ACCESS_DENIED_CODE: &str = "AccessDeniedException";
+
 /// What a function answered when its resource-based policy was read.
 #[derive(Debug, Clone)]
 enum FunctionPolicy {
@@ -239,8 +247,9 @@ enum FunctionPolicy {
     /// delivery those are the same absence of a grant.
     Stated(Option<String>),
     /// The read failed in a way nothing can be concluded from, so no verdict is read off a
-    /// document this never saw.
-    Unreadable,
+    /// document this never saw — and what that service answered instead is carried along for
+    /// the delivery-status record of the attempt.
+    Unreadable(state::delivery_status::Answered),
 }
 
 impl<'ctx, 'op> Functions<'ctx, 'op> {
@@ -269,6 +278,7 @@ impl<'ctx, 'op> Functions<'ctx, 'op> {
         client: &::aws_sdk_lambda::Client,
         function_arn: &str,
     ) -> FunctionPolicy {
+
         if let Some((_, policy)) = self.policies.iter().find(|(held, _)| held == function_arn) {
             return policy.clone();
         }
@@ -287,27 +297,28 @@ impl<'ctx, 'op> Functions<'ctx, 'op> {
     /// this time, you can't invoke or modify the function" (`CreateFunction`) — while one it
     /// will not take is not retried at all, because another attempt earns the same answer.
     ///
-    /// `false` is every way the event did not reach the function: a function whose own policy
-    /// does not grant this service the invocation, a policy that could not be read, and an
-    /// invocation the function's service refused — the client errors a redrive exists to make
-    /// visible.
+    /// Anything but [`Attempted::taken`] is a way the event did not reach the function: a
+    /// function whose own policy does not grant this service the invocation, a policy that
+    /// could not be read, and an invocation the function's service refused — the client
+    /// errors a redrive exists to make visible. The answer reported is the LAST attempt's,
+    /// which is what the delivery-status record of the invocation carries.
     pub(super) async fn invoke(
         &mut self,
         delivery: &FunctionDelivery,
         waiting: &mut RetryBudget,
-    ) -> bool {
+    ) -> Attempted {
         let mut waits = retry_waits();
         loop {
-            match self.attempt_invoke(delivery).await {
-                HandOver::Taken => return true,
-                HandOver::Refused => return false,
+            let attempted = self.attempt_invoke(delivery).await;
+            match attempted.outcome {
+                HandOver::Taken | HandOver::Refused => return attempted,
                 HandOver::NotYet => {}
             }
             let Some(wait) = waits.next() else {
-                return false;
+                return attempted;
             };
             if !wait.is_zero() && !waiting.charge(wait) {
-                return false;
+                return attempted;
             }
             if !wait.is_zero() {
                 ::tokio::time::sleep(wait).await;
@@ -316,11 +327,13 @@ impl<'ctx, 'op> Functions<'ctx, 'op> {
     }
 
     /// ONE attempt at invoking the function `delivery` names with the event it carries.
-    async fn attempt_invoke(&mut self, delivery: &FunctionDelivery) -> HandOver {
+    async fn attempt_invoke(&mut self, delivery: &FunctionDelivery) -> Attempted {
         let client = self.client(&delivery.target.region);
         let policy = match self.policy(&client, &delivery.target.function_arn).await {
             FunctionPolicy::Stated(policy) => policy,
-            FunctionPolicy::Unreadable => return HandOver::Refused,
+            FunctionPolicy::Unreadable(answered) => {
+                return Attempted::new(HandOver::Refused, answered);
+            }
         };
         if !super::resource_policy_allows(
             policy.as_deref(),
@@ -334,9 +347,11 @@ impl<'ctx, 'op> Functions<'ctx, 'op> {
                 "the subscribed function's resource-based policy does not allow this service \
                  to invoke it, so the notification is withheld"
             );
-            return HandOver::Refused;
-        }
-        let answered = client
+            return Attempted::new(
+                HandOver::Refused,
+                invocation_was_denied(&delivery.target.function_arn),
+            );
+        }        let answered = client
             .invoke()
             .function_name(&delivery.target.function_arn)
             // The publishing call is answered before the handler runs, so the invocation is
@@ -348,17 +363,55 @@ impl<'ctx, 'op> Functions<'ctx, 'op> {
             ))
             .send()
             .await;
-        if let Err(error) = answered {
-            let status = answered_status(&error);
-            ::tracing::warn!(
-                subscription = %delivery.subscription_arn,
-                function = %delivery.target.function_arn,
-                error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
-                "a subscribed function could not be invoked"
-            );
-            return refusal_of(status);
+        match answered {
+            Ok(answer) => Attempted::new(HandOver::Taken, invocation_was_accepted(&answer)),
+            Err(error) => {
+                let answered = answered_refusal(&error);
+                ::tracing::warn!(
+                    subscription = %delivery.subscription_arn,
+                    function = %delivery.target.function_arn,
+                    error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),
+                    "a subscribed function could not be invoked"
+                );
+                Attempted::new(refusal_of(answered.status_code), answered)
+            }
         }
-        HandOver::Taken
+    }
+}
+
+/// What Lambda is reported to have answered for an invocation the FUNCTION's own policy
+/// withheld: the `403` an unauthorized request earns, and the error document AWS states such
+/// a refusal in.
+fn invocation_was_denied(function_arn: &str) -> state::delivery_status::Answered {
+    state::delivery_status::Answered {
+        status_code: Some(super::FORBIDDEN_STATUS),
+        provider_response: Some(error_document(
+            ACCESS_DENIED_CODE,
+            Some(
+                &::service_common::iam_authorization::not_authorized_by_resource_policy(
+                    super::SNS_SERVICE_PRINCIPAL,
+                    INVOKE_FUNCTION_ACTION,
+                    function_arn,
+                ),
+            ),
+        )),
+    }
+}
+
+/// What Lambda answered for an invocation it ACCEPTED: the status its own answer carries,
+/// which for the asynchronous invocation a publish makes is the `202` of "the Event
+/// invocation type" (`InvokeResponse$StatusCode`), and the invocation that service named, as
+/// its own answer about the delivery.
+fn invocation_was_accepted(
+    answer: &::aws_sdk_lambda::operation::invoke::InvokeOutput,
+) -> state::delivery_status::Answered {
+    let mut document = ::serde_json::Map::new();
+    if let Some(id) = ::aws_types::request_id::RequestId::request_id(answer) {
+        document.insert("lambdaRequestId".to_string(), ::serde_json::Value::from(id));
+    }
+    state::delivery_status::Answered {
+        status_code: u16::try_from(answer.status_code()).ok(),
+        provider_response: Some(::serde_json::Value::Object(document).to_string()),
     }
 }
 
@@ -390,7 +443,7 @@ async fn function_policy(
         "a subscribed function's resource-based policy could not be read, so the notification \
          cannot be delivered to it"
     );
-    FunctionPolicy::Unreadable
+    FunctionPolicy::Unreadable(answered_refusal(&error))
 }
 
 /// A Lambda client over the in-process callback into this same emulator.

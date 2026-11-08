@@ -18,22 +18,28 @@
 //! which is why the feedback attributes are a per-protocol pair rather than one switch.
 //!
 //! What makes this the role being EXERCISED rather than merely stored: the role is resolved
-//! in the account's own IAM records and its trust policy has to admit this service's
-//! principal ([`crate::state::SERVICE_PRINCIPAL`]) for `sts:AssumeRole`, through the tree's
-//! one reading of a trust document (`service_common::iam_trust_policy`). A role that does
-//! not trust Amazon SNS is one it cannot act as, so nothing is written — exactly as nothing
-//! is written on the real service, where the log group then stays empty.
+//! in the account's own IAM records, its trust policy has to admit this service's principal
+//! ([`crate::state::SERVICE_PRINCIPAL`]) for `sts:AssumeRole` — through the tree's one
+//! reading of a trust document (`service_common::iam_trust_policy`) — and the permissions in
+//! force ON that role have to allow the CloudWatch Logs calls the write makes
+//! ([`LOG_WRITE_ACTIONS`]), which is the question `service_common::iam_role` puts to IAM
+//! itself. A role Amazon SNS cannot act as, and one it can act as but that grants the write
+//! nothing, are both configurations under which the real service writes nothing and creates
+//! no log group at all, while the DELIVERY itself is unaffected: the record reports a
+//! delivery that has already been attempted.
 //!
 //! The write goes through the emulator's OWN CloudWatch Logs service over the in-process
 //! callback, so the record lands in the very store `logs:GetLogEvents` reads. It is BEST
 //! EFFORT and never fatal: the publish that attempted the delivery is answered either way,
 //! because the record reports a delivery that already happened.
 //!
-//! The REQUIREMENT this module reproduces is the log group's name template and a record per
-//! delivery naming the endpoint and the delivery's status; the member set around them is the
-//! form AWS publishes for a delivery-status record in the Amazon SNS Developer Guide (a
-//! `notification` block, a `delivery` block and a `status`), and the log STREAM's name is
-//! this emulator's, pinned by no recording.
+//! The REQUIREMENT this module reproduces is the log group's name template — the base group
+//! for a success and that group's `/Failure` child for a failure — and a record per delivery
+//! naming the endpoint, the delivery's status, the HTTP status the endpoint's own service
+//! answered with and that service's own answer; the member set around them is the form AWS
+//! publishes for a delivery-status record in the Amazon SNS Developer Guide (a `notification`
+//! block, a `delivery` block and a `status`), and the log STREAM's name is this emulator's,
+//! pinned by no recording.
 
 use ::std::time::SystemTime;
 
@@ -123,6 +129,12 @@ pub fn log_group_name(topic: &TopicRecord) -> String {
     format!("sns/{region}/{}/{}", topic.owner, topic.name)
 }
 
+/// What a FAILED delivery's log group carries beyond the topic's own
+/// ([`log_group_name`]): the records of successes and of failures are read apart, so a
+/// failure is written to that group's `/Failure` child rather than into the group a success
+/// goes to.
+const FAILURE_LOG_GROUP_SUFFIX: &str = "/Failure";
+
 /// What came of one delivery, as the record reports it under `status`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -140,6 +152,32 @@ impl Status {
             Self::Failure => "FAILURE",
         }
     }
+
+    /// The log group a record of this outcome goes into, given the topic's own group
+    /// `base`: that group for a success, and its [`FAILURE_LOG_GROUP_SUFFIX`] child for a
+    /// failure.
+    fn log_group(self, base: &str) -> String {
+        match self {
+            Self::Success => base.to_string(),
+            Self::Failure => format!("{base}{FAILURE_LOG_GROUP_SUFFIX}"),
+        }
+    }
+}
+
+/// What the endpoint's OWN service answered about one attempted delivery, which the record
+/// reports beside the outcome.
+///
+/// The two members are that answer and nothing else: a status no service answered and a
+/// sentence no service gave are not reported, so each is left out of the record when the
+/// attempt reached no answer carrying it.
+#[derive(Debug, Clone, Default)]
+pub struct Answered {
+    /// The HTTP status the endpoint's service answered with, as the record's `statusCode`.
+    pub status_code: Option<u16>,
+    /// That service's own answer about the delivery, as the record's `providerResponse`:
+    /// the identifiers it reported for a message it took, or the error document it refused
+    /// with.
+    pub provider_response: Option<String>,
 }
 
 /// One attempted delivery, as its delivery-status record reports it.
@@ -159,6 +197,8 @@ struct Attempt<'a> {
     published_at: SystemTime,
     /// What came of the attempt.
     status: Status,
+    /// What the endpoint's own service answered about it.
+    answered: &'a Answered,
 }
 
 /// The record `attempt` writes, as one JSON log event.
@@ -170,9 +210,9 @@ struct Attempt<'a> {
 /// and the message, so one published message's records are distinct per subscriber and
 /// stable across reads.
 ///
-/// There is NO `providerResponse`: AWS carries the endpoint service's own answer there, and
-/// this emulator does not keep that answer, so the member is left out rather than filled with
-/// a sentence no endpoint gave.
+/// `statusCode` and `providerResponse` are the endpoint service's OWN answer, carried here
+/// from the attempt ([`Answered`]); an attempt that reached no answer carrying one leaves
+/// that member out rather than reporting a status or a sentence no service gave.
 fn rendered(attempt: &Attempt<'_>, at: SystemTime) -> String {
     let mut notification = ::serde_json::Map::new();
     notification.insert(
@@ -203,6 +243,18 @@ fn rendered(attempt: &Attempt<'_>, at: SystemTime) -> String {
     // One attempt is what this emulator makes of a delivery, so that is what the record
     // reports rather than a retry count nothing performed.
     delivery.insert("attempts".to_string(), ::serde_json::Value::from(1));
+    if let Some(status_code) = attempt.answered.status_code {
+        delivery.insert(
+            "statusCode".to_string(),
+            ::serde_json::Value::from(status_code),
+        );
+    }
+    if let Some(response) = attempt.answered.provider_response.as_deref() {
+        delivery.insert(
+            "providerResponse".to_string(),
+            ::serde_json::Value::from(response),
+        );
+    }
 
     let mut record = ::serde_json::Map::new();
     record.insert(
@@ -318,12 +370,15 @@ impl Logged {
     }
 
     /// Write the record of one attempted delivery to `endpoint`, made on behalf of
-    /// `subscription_arn` for a message published to `topic_arn`.
+    /// `subscription_arn` for a message published to `topic_arn`, with `answered` the answer
+    /// the endpoint's own service gave.
     ///
     /// Nothing is written when the topic asks for no record of this outcome (no role for it,
     /// or a success outside the sampled percentage), when the role it names is not one of this
-    /// account's, or when that role's trust policy does not let this service assume it: each
-    /// of those is a configuration under which the real service writes nothing either.
+    /// account's, when that role's trust policy does not let this service assume it, or when
+    /// the permissions in force on that role do not allow the CloudWatch Logs write: each of
+    /// those is a configuration under which the real service writes nothing either, and
+    /// creates no log group.
     ///
     /// Best effort: a CloudWatch Logs write that fails is traced and changes nothing about
     /// what the publishing call answers. Call it with NO store guard held — it awaits.
@@ -334,6 +389,7 @@ impl Logged {
         topic_arn: &str,
         endpoint: &str,
         delivered: bool,
+        answered: &Answered,
     ) {
         let status = if delivered {
             Status::Success
@@ -346,7 +402,11 @@ impl Logged {
         let region = super::arn_region(topic_arn)
             .unwrap_or(super::DEFAULT_REGION)
             .to_string();
+        let log_group = status.log_group(&self.feedback.log_group);
         if !assumable(ctx, &region, role_arn).await {
+            return;
+        }
+        if !writes_logs(ctx, &region, role_arn, &log_group).await {
             return;
         }
         let attempt = Attempt {
@@ -356,16 +416,10 @@ impl Logged {
             endpoint,
             published_at: self.published_at,
             status,
+            answered,
         };
         let event = rendered(&attempt, SystemTime::now());
-        write_log_event(
-            ctx,
-            &region,
-            &self.feedback.log_group,
-            &log_stream_name(),
-            &event,
-        )
-        .await;
+        write_log_event(ctx, &region, &log_group, &log_stream_name(), &event).await;
     }
 }
 
@@ -418,6 +472,54 @@ async fn assumable(
              be assumed and no delivery-status record is written"
         );
         return false;
+    }
+    true
+}
+
+/// The CloudWatch Logs actions Amazon SNS performs AS the feedback role to leave one
+/// delivery-status record: the group and the stream are created on first write and then the
+/// record is put, which is what "give Amazon SNS write access to use CloudWatch Logs on your
+/// behalf" (`SetTopicAttributesInput$AttributeName`) asks the role to grant.
+const LOG_WRITE_ACTIONS: [&str; 3] = [
+    "logs:CreateLogGroup",
+    "logs:CreateLogStream",
+    "logs:PutLogEvents",
+];
+
+/// Whether the permissions in force on the role `role_arn` names allow the CloudWatch Logs
+/// write a record costs ([`LOG_WRITE_ACTIONS`]) on the group it goes into.
+///
+/// The record is written AS that role, so a role whose policies grant the write nothing
+/// cannot leave one — and because the group is created by the same role on first write,
+/// such a role leaves no group behind either, which is why this is asked BEFORE anything is
+/// created. The question is put to IAM itself through the tree's one reading of a principal's
+/// permissions (`service_common::iam_role::role_withholds_action`), so what decides it is the
+/// documents a client's `PutRolePolicy` or `AttachRolePolicy` left on the role; an emulator
+/// with no IAM to ask, and a role it holds nothing under, withhold nothing — a feedback role
+/// is routinely provisioned out of band.
+async fn writes_logs(
+    ctx: &::smithy_server_runtime::OperationContext<'_>,
+    region: &str,
+    role_arn: &str,
+    log_group: &str,
+) -> bool {
+    // The log group as an IAM resource: CloudWatch Logs names a group's own streams under
+    // it, so a policy written for the group covers `log-group:<name>:*`.
+    let resource =
+        ::emulator_server::emulator_arn("logs", region, &format!("log-group:{log_group}:*"));
+    for action in LOG_WRITE_ACTIONS {
+        if ::service_common::iam_role::role_withholds_action(ctx, region, role_arn, action, &resource)
+            .await
+        {
+            ::tracing::warn!(
+                role = %role_arn,
+                action = %action,
+                log_group = %log_group,
+                "a topic's delivery-status feedback role is not allowed the CloudWatch Logs \
+                 write a record costs, so no delivery-status record is written"
+            );
+            return false;
+        }
     }
     true
 }
@@ -695,14 +797,33 @@ mod tests {
         }
     }
 
-    /// RULE: the record names the delivery's endpoint and the status of the attempt.
+    /// RULE: the record names the delivery's endpoint, the status of the attempt and the
+    /// answer the endpoint's own service gave — and a record of a FAILURE goes into the
+    /// topic's `/Failure` group while a success goes into the group itself. The rows differ
+    /// along the outcome, which is what the rule generalises over.
     #[test]
     fn the_record_names_the_endpoint_and_the_status() {
         let published = SystemTime::now();
-        for (case, status, reported) in [
-            ("a delivery the endpoint took", Status::Success, "SUCCESS"),
-            ("one it did not", Status::Failure, "FAILURE"),
+        for (case, status, reported, code, group) in [
+            (
+                "a delivery the endpoint took",
+                Status::Success,
+                "SUCCESS",
+                200,
+                "sns/us-west-2/000000000000/alerts",
+            ),
+            (
+                "one it did not",
+                Status::Failure,
+                "FAILURE",
+                403,
+                "sns/us-west-2/000000000000/alerts/Failure",
+            ),
         ] {
+            let answered = Answered {
+                status_code: Some(code),
+                provider_response: Some("{\"ErrorCode\":\"AccessDenied\"}".to_string()),
+            };
             let attempt = Attempt {
                 message_id: "0123",
                 topic_arn: "arn:aws:sns:us-west-2:000000000000:alerts",
@@ -710,6 +831,7 @@ mod tests {
                 endpoint: "arn:aws:lambda:us-west-2:000000000000:function:notify",
                 published_at: published,
                 status,
+                answered: &answered,
             };
             let record: ::serde_json::Value =
                 ::serde_json::from_str(&rendered(&attempt, published))
@@ -728,6 +850,46 @@ mod tests {
                 record["notification"]["messageId"].as_str(),
                 Some(attempt.message_id),
                 "case {case:?}: the record must name the published message, got {record}"
+            );
+            assert_eq!(
+                record["delivery"]["statusCode"].as_u64(),
+                Some(u64::from(code)),
+                "case {case:?}: expected statusCode {code}, got {record}"
+            );
+            assert_eq!(
+                record["delivery"]["providerResponse"].as_str(),
+                answered.provider_response.as_deref(),
+                "case {case:?}: the record must carry the provider's answer, got {record}"
+            );
+            let named = status.log_group(&log_group_name(&topic(&[])));
+            assert_eq!(
+                named, group,
+                "case {case:?}: expected the record in {group:?}, got {named:?}"
+            );
+        }
+    }
+
+    /// RULE: a record whose attempt reached no answer from the endpoint's service carries
+    /// neither a status code nor a provider response, rather than a value no service gave.
+    #[test]
+    fn an_unanswered_attempt_reports_no_status_code() {
+        let published = SystemTime::now();
+        let answered = Answered::default();
+        let attempt = Attempt {
+            message_id: "0123",
+            topic_arn: "arn:aws:sns:us-west-2:000000000000:alerts",
+            subscription_arn: "arn:aws:sns:us-west-2:000000000000:alerts:abcd",
+            endpoint: "arn:aws:sqs:us-west-2:000000000000:orders",
+            published_at: published,
+            status: Status::Failure,
+            answered: &answered,
+        };
+        let record: ::serde_json::Value = ::serde_json::from_str(&rendered(&attempt, published))
+            .unwrap_or_else(|error| panic!("case \"no answer\": not JSON ({error})"));
+        for member in ["statusCode", "providerResponse"] {
+            assert!(
+                record["delivery"].get(member).is_none(),
+                "case \"no answer\": {member} must be left out, got {record}"
             );
         }
     }
