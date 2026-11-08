@@ -205,10 +205,12 @@ mod handler_aws_sdk;
 mod handler_db_auth_token;
 #[path = "all/handler_object_store_sdk.rs"]
 mod handler_object_store_sdk;
-#[path = "all/handler_email_sdk.rs"]
-mod handler_email_sdk;
 #[path = "all/handler_dynamodb_resource.rs"]
 mod handler_dynamodb_resource;
+#[path = "all/handler_email_sdk.rs"]
+mod handler_email_sdk;
+#[path = "all/handler_object_storage_sdk.rs"]
+mod handler_object_storage_sdk;
 #[path = "all/handler_rest_api_sdk.rs"]
 mod handler_rest_api_sdk;
 #[path = "all/handler_step_functions_sdk.rs"]

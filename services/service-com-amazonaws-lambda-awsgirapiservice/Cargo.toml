@@ -178,7 +178,7 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # (`@eventPayload`), which the framework's event serializer does not express: that one
 # frame is written with the event-stream encoder itself.
 aws-smithy-eventstream = "0.60"
-# A running handler's SDK call to a `restJson1` service binds its input to a URI, so a label
+# A running handler's SDK call to a REST-bound service binds its input to a URI, so a label
 # or a query parameter's value is percent-encoded on the way into one
 # (`state::execution::rest_json`).
 percent-encoding = "2.3"
