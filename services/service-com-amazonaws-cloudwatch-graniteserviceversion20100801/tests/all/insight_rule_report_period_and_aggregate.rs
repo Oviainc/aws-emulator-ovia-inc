@@ -268,9 +268,9 @@ async fn the_period_is_judged_before_the_rule_the_request_names_is_resolved() {
             "absent-rule",
             60,
             Some((
-                404,
-                "ResourceNotFoundException",
-                "Rule absent-rule does not exist.".to_string(),
+                400,
+                INVALID_VALUE,
+                "RULE_NAME: absent-rule".to_string(),
             )),
         ),
     ];

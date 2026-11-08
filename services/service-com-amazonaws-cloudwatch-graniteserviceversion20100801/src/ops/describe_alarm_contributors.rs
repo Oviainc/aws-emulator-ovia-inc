@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeAlarmContributors
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeAlarmContributors`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeAlarmContributors::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The read of what contributes to an alarm's state: the time series of the alarm a request
+//! names that are themselves in `ALARM`, derived from the alarm this store holds rather than
+//! recorded beside it.
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -86,9 +82,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // here — hence the `DescribeAlarmContributorsError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#DescribeAlarmContributors")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#DescribeAlarmContributors",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum DescribeAlarmContributorsErrorModeled {
+    // `InternalServiceFault` is widened in through `extra_errors`: this SERVICE models it and
+    // other operations declare it, so an unreachable store has a modelled server failure to
+    // answer with rather than the scaffold's 501.
+    InternalServiceFault(InternalServiceFault),
     InvalidNextToken(InvalidNextToken),
     ResourceNotFoundException(ResourceNotFoundException),
 }
@@ -144,18 +147,145 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeAlarmContributors` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeAlarmContributorsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeAlarmContributors"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            DescribeAlarmContributorsErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch alarm store is unavailable".into()),
+            })
+        })?;
+
+        // "The token returned by a previous call to indicate that there is more data available."
+        // (`DescribeAlarmContributorsInput$NextToken`) — an alarm's contributors are reported in
+        // one page (see below), so no call of this operation issues a token: every token a
+        // request can carry is one this service did not issue, which is the `InvalidNextToken` it
+        // models. Judged on EVERY path, so whether a token is refused never depends on which
+        // alarm the request named.
+        if input.next_token.is_some() {
+            return Err(DescribeAlarmContributorsErrorModeled::InvalidNextToken(
+                InvalidNextToken {
+                    message: Some(INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
+
+        // An alarm's state is EVALUATED, not stored by a caller, and each evaluation is due a
+        // span after the write that configured it — so what the clock has already made due is
+        // materialised before this read reports from it, exactly as the other alarm reads do,
+        // and this read's answer is the one every later caller sees.
+        crate::state::alarm_actions::settle_alarms(&*self.engine, ctx).await;
+
+        let store = state.lock();
+        let Some(stored) = store.alarms.get(&input.alarm_name) else {
+            if store.alarm_kind(&input.alarm_name).is_some() {
+                // An alarm of a kind that watches no metric time series of its own: a composite
+                // alarm's state comes from other alarms' states and a log alarm's from a
+                // scheduled query, so neither has a time series contributing to it. The answer is
+                // the empty list rather than a refusal: the alarm exists and has no contributor.
+                return Ok(DescribeAlarmContributorsOutput {
+                    alarm_contributors: Vec::new(),
+                    next_token: None,
+                });
+            }
+            // The recorded refusal of a name no alarm of this account and Region answers to: one
+            // sentence carrying the name the request asked for, which is what a client repairs
+            // the request from, and neither of the shape's other members.
+            return Err(
+                DescribeAlarmContributorsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        resource_type: None,
+                        resource_id: None,
+                        message: Some(no_alarm_for_name(&input.alarm_name)),
+                    },
+                )
+                .into(),
+            );
+        };
+
+        Ok(DescribeAlarmContributorsOutput {
+            alarm_contributors: contributors_of(&stored.alarm),
+            // Every contributor of the alarm is in this page, so there is no more data available
+            // and no token is owed (`DescribeAlarmContributorsOutput$NextToken`).
+            next_token: None,
+        })
     }
+}
+
+/// How CloudWatch states that no alarm of this account and Region answers to the name a request
+/// named: one sentence carrying that name.
+fn no_alarm_for_name(alarm_name: &str) -> String {
+    format!("No alarm for name {alarm_name} was found")
+}
+
+/// How this operation words a refusal of a `NextToken`, the same fixed sentence the other
+/// paginating reads of this service answer with (`crate::ops::list_metric_streams`).
+const INVALID_NEXT_TOKEN_MESSAGE: &str = "Invalid NextToken";
+
+/// The contributors of one metric alarm: "the current alarm contributors that are in `ALARM`
+/// state" (`DescribeAlarmContributors`).
+///
+/// A metric alarm of this store watches ONE time series — the metric its own members name, or the
+/// one query of its `Metrics` array the evaluation watches — so that series is the only thing
+/// that can contribute to its state, and it contributes exactly when the alarm's evaluated state
+/// is `ALARM`: an alarm in `OK` or `INSUFFICIENT_DATA` has no contributor in `ALARM` state, which
+/// is what this read reports from. Nothing is recorded per contributor: every member below is
+/// read off the alarm this store holds.
+fn contributors_of(alarm: &MetricAlarm) -> Vec<AlarmContributor> {
+    if alarm.state_value.as_deref() != Some(crate::state::ALARM_STATE_ALARM) {
+        return Vec::new();
+    }
+    vec![AlarmContributor {
+        contributor_id: contributor_id(alarm),
+        // "A map of attributes that describe the contributor, such as metric dimensions and other
+        // identifying characteristics." (`AlarmContributor$ContributorAttributes`) — the
+        // dimensions of the series, as the write that configured the alarm named them, and
+        // nothing this service made up: a series with no dimensions is described by no attribute.
+        contributor_attributes: alarm
+            .dimensions
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(|dimension| (dimension.name.clone(), dimension.value.clone()))
+            .collect(),
+        // Why that series is in `ALARM`, and when it got there: the alarm's own evaluated reason
+        // and transition instant, since the series IS what the alarm evaluates.
+        state_reason: alarm.state_reason.clone().unwrap_or_default(),
+        state_transitioned_timestamp: alarm.state_transitioned_timestamp,
+    }]
+}
+
+/// How many characters a contributor's identifier carries: the whole of `ContributorId`'s
+/// modelled 1..16 length.
+const CONTRIBUTOR_ID_LEN: usize = 16;
+
+/// The identifier of the contributor that is one alarm's watched series.
+///
+/// "Represents an individual contributor to a multi-timeseries alarm, containing information
+/// about a specific time series" (`AlarmContributor`) — so the identifier names a series OF an
+/// alarm: it is a digest of the alarm and the series identity (the metric, its namespace and its
+/// normalised dimension set), cut to the modelled length. Derived, so it is stable across reads
+/// and the same contributor keeps the same id for the life of the alarm, and distinct, so two
+/// series are two contributors.
+fn contributor_id(alarm: &MetricAlarm) -> String {
+    let mut identity = String::new();
+    for part in [
+        alarm.alarm_name.as_deref().unwrap_or_default(),
+        alarm.namespace.as_deref().unwrap_or_default(),
+        alarm.metric_name.as_deref().unwrap_or_default(),
+    ] {
+        identity.push_str(part);
+        identity.push('\n');
+    }
+    for (name, value) in crate::state::dimension_set(alarm.dimensions.as_deref()) {
+        identity.push_str(&name);
+        identity.push('=');
+        identity.push_str(&value);
+        identity.push('\n');
+    }
+    let digest = ::hex::encode(<::sha2::Sha256 as ::sha2::Digest>::digest(
+        identity.as_bytes(),
+    ));
+    digest
+        .get(..CONTRIBUTOR_ID_LEN)
+        .unwrap_or(digest.as_str())
+        .to_string()
 }

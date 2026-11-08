@@ -29,6 +29,8 @@ mod alarm_closed_period_grading;
 mod alarm_configuration;
 #[path = "all/alarm_configuration_refusal_messages.rs"]
 mod alarm_configuration_refusal_messages;
+#[path = "all/alarm_contributors.rs"]
+mod alarm_contributors;
 #[path = "all/alarm_delete_semantics.rs"]
 mod alarm_delete_semantics;
 #[path = "all/alarm_document_timestamps.rs"]
@@ -41,6 +43,8 @@ mod alarm_history;
 mod alarm_history_data;
 #[path = "all/alarm_m_of_n_directions.rs"]
 mod alarm_m_of_n_directions;
+#[path = "all/alarm_mute_rules.rs"]
+mod alarm_mute_rules;
 #[path = "all/alarm_period_windows.rs"]
 mod alarm_period_windows;
 #[path = "all/alarm_read_projection.rs"]

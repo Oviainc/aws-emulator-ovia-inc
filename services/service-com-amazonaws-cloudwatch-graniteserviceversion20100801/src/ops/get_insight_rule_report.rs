@@ -230,13 +230,17 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let request = report_request(&input)?;
 
         let store = state.lock();
-        let rule = store.insight_rules.get(&input.rule_name).ok_or_else(|| {
-            GetInsightRuleReportErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-                resource_type: None,
-                resource_id: None,
-                message: Some(crate::state::unknown_insight_rule(&input.rule_name)),
-            })
-        })?;
+        // A name no rule of this account and Region answers to is refused as a bad VALUE for the
+        // member that carried it, in the coded form this service states a single-member refusal
+        // in (`crate::state::invalid_insight_rule_name`) — the class this read's recorded refusal
+        // carries, which a client branches on to repair the request member rather than to create
+        // the rule.
+        let rule = store
+            .insight_rules
+            .get(&input.rule_name)
+            .ok_or_else(|| {
+                invalid_parameter_value(crate::state::invalid_insight_rule_name(&input.rule_name))
+            })?;
         // A pure read of what the rule collected while its log events were ingested, so two
         // reports of one window are the same report and neither changes what a later caller
         // sees.

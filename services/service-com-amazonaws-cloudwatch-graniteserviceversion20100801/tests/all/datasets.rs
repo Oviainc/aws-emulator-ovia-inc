@@ -21,6 +21,10 @@ use serde_json::{json, Value};
 /// emulator serves.
 const ACCOUNT: &str = "000000000000";
 
+/// An account OTHER than the one this emulator serves, for the rows whose identifier names a
+/// resource across an account boundary.
+const FOREIGN_ACCOUNT: &str = "123456789012";
+
 /// A string member of a body.
 fn text<'body>(value: &'body Value, member: &str) -> Option<&'body str> {
     value.get(member).and_then(Value::as_str)
@@ -166,14 +170,35 @@ async fn an_identifier_outside_the_callers_own_dataset_is_refused_as_unauthorize
     // see a resource is never told whether it is there, so the authorization layer in front of
     // the service answers `AccessDenied` — a code no shape of the model declares — rather than
     // the not-found the operation models for a dataset of its own scope.
+    //
+    // The last column is WHAT the refusal says, which follows from where the resource lives: a
+    // resource of the caller's own account is refused on the policy that granted nothing, naming
+    // the action and the resource, while one in ANOTHER ACCOUNT is refused on the accounts
+    // themselves and names no action at all.
     let rows = [
-        ("another Region", "arn:aws:cloudwatch:eu-west-1:000000000000:dataset/default"),
-        ("another account", "arn:aws:cloudwatch:us-east-1:123456789012:dataset/default"),
-        ("another partition", "arn:aws-cn:cloudwatch:us-east-1:000000000000:dataset/default"),
-        ("no Region", "arn:aws:cloudwatch::000000000000:dataset/default"),
+        (
+            "another Region",
+            "arn:aws:cloudwatch:eu-west-1:000000000000:dataset/default",
+            false,
+        ),
+        (
+            "another account",
+            "arn:aws:cloudwatch:us-east-1:123456789012:dataset/default",
+            true,
+        ),
+        (
+            "another partition",
+            "arn:aws-cn:cloudwatch:us-east-1:000000000000:dataset/default",
+            false,
+        ),
+        (
+            "no Region",
+            "arn:aws:cloudwatch::000000000000:dataset/default",
+            false,
+        ),
     ];
 
-    for (case, identifier) in rows {
+    for (case, identifier, cross_account) in rows {
         let (status, body) = call_in_region(
             &router,
             "us-east-1",
@@ -192,12 +217,24 @@ async fn an_identifier_outside_the_callers_own_dataset_is_refused_as_unauthorize
             "case {case:?}: expected AccessDenied, got {body}"
         );
         let message = error_message(&body);
-        assert!(
-            message.contains("is not authorized to perform: cloudwatch:GetDataset on resource: ")
-                && message.contains(identifier),
-            "case {case:?}: the refusal must name the action and the resource it refused, got \
-             {message:?}"
-        );
+        if cross_account {
+            assert_eq!(
+                message,
+                format!(
+                    "Caller account {ACCOUNT} is not authorized to access resource in account \
+                     {FOREIGN_ACCOUNT}"
+                ),
+                "case {case:?}: the refusal must name the caller's account and the account the \
+                 resource lives in, got {message:?}"
+            );
+        } else {
+            assert!(
+                message.contains("is not authorized to perform: cloudwatch:GetDataset on resource: ")
+                    && message.contains(identifier),
+                "case {case:?}: the refusal must name the action and the resource it refused, got \
+                 {message:?}"
+            );
+        }
     }
 }
 
@@ -615,14 +652,28 @@ async fn disassociating_a_dataset_with_no_associated_key_is_refused_and_removes_
                 "case {case:?}: expected HTTP 403 AccessDenied, got {status} with body {body}"
             );
             let message = error_message(&body);
-            assert!(
-                message.contains(
-                    "is not authorized to perform: cloudwatch:DisassociateDatasetKmsKey on \
-                     resource: "
-                ) && message.contains(&identifier),
-                "case {case:?}: the refusal must name the action and the resource it refused, \
-                 got {message:?}"
-            );
+            if identifier.contains(FOREIGN_ACCOUNT) {
+                // A resource in ANOTHER ACCOUNT is refused on the accounts themselves rather
+                // than on a policy of either of them, so that refusal names no action.
+                assert_eq!(
+                    message,
+                    format!(
+                        "Caller account {ACCOUNT} is not authorized to access resource in \
+                         account {FOREIGN_ACCOUNT}"
+                    ),
+                    "case {case:?}: the refusal must name the caller's account and the account \
+                     the resource lives in, got {message:?}"
+                );
+            } else {
+                assert!(
+                    message.contains(
+                        "is not authorized to perform: cloudwatch:DisassociateDatasetKmsKey on \
+                         resource: "
+                    ) && message.contains(&identifier),
+                    "case {case:?}: the refusal must name the action and the resource it refused, \
+                     got {message:?}"
+                );
+            }
         }
 
         // A refusal removes nothing: every association the store held before the refused call

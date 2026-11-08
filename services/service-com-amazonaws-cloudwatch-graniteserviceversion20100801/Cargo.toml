@@ -49,6 +49,18 @@ plotters = { version = "0.3", default-features = false, features = ["bitmap_back
 # carries by the maintained encoder.
 png = "0.17"
 
+# `state::alarm_mute_rules`: an alarm mute rule's schedule is a cron expression
+# (`Schedule$Expression`), so the maintained cron grammar reads the instants its windows open at
+# rather than a second parser being written here.
+cron = "0.15"
+# The calendar arithmetic those windows need: the local instant an `at` expression names, and the
+# moment it happens at in the schedule's own time zone. `now` is taken as well as `std`: the mute
+# rule suites state the instants their rows mean relative to the clock they run on.
+chrono = { version = "0.4", default-features = false, features = ["std", "now"] }
+# The time zone a schedule is evaluated in (`Schedule$Timezone`), resolved against the IANA
+# database rather than a hand-written offset table.
+chrono-tz = { version = "0.10", default-features = false, features = ["std"] }
+
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
 

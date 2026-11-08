@@ -266,11 +266,24 @@ const INSIGHT_RULE_NAME_FAILURE_CODE: &str = "RULE_NAME";
 /// How CloudWatch states that one of the names it was given is not a rule this store holds:
 /// fixed text around the name the request carried, ended as a sentence.
 ///
-/// One wording for every operation that answers for a name no rule answers to — the batch
-/// operations report it as a `Failures` entry's description and `GetInsightRuleReport` as its
-/// `ResourceNotFoundException` message, so the two cannot drift apart.
+/// The wording of the BATCH operations' per-entry report: they describe such a name in a
+/// `Failures` entry, and the entry's description is this sentence.
 pub fn unknown_insight_rule(rule_name: &str) -> String {
     format!("Rule {rule_name} does not exist.")
+}
+
+/// How CloudWatch refuses a request that READS a Contributor Insights rule by a name no rule of
+/// this account and Region answers to: the coded form its Contributor Insights refusals state a
+/// refusal about ONE request member in ([`EMPTY_RULE_NAMES`], [`missing_parameter_message`]) —
+/// the member's own code ([`INSIGHT_RULE_NAME_FAILURE_CODE`]), then the value the request
+/// carried, and nothing else.
+///
+/// Such a read is refused as a bad VALUE for the member that carried the name rather than as a
+/// resource that is missing, which is the class the reading operation's recorded refusal carries
+/// (`GetInsightRuleReport`, measured against `monitoring`): the client has to repair the request
+/// member, and the code it branches on says so.
+pub fn invalid_insight_rule_name(rule_name: &str) -> String {
+    format!("{INSIGHT_RULE_NAME_FAILURE_CODE}: {rule_name}")
 }
 
 /// The one `Failures` entry a batch Contributor Insights rule operation reports for a name

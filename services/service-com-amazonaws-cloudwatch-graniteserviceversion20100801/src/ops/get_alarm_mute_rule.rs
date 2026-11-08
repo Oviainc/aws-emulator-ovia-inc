@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetAlarmMuteRule
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetAlarmMuteRule`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetAlarmMuteRule::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The read half of the alarm mute rule store: it reports the rule `PutAlarmMuteRule`
+//! persisted, with the `Status` the clock makes of that rule's schedule.
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -100,9 +95,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // here — hence the `GetAlarmMuteRuleError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#GetAlarmMuteRule")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#GetAlarmMuteRule",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum GetAlarmMuteRuleErrorModeled {
+    // `InternalServiceFault` is widened in through `extra_errors`: this SERVICE models it and
+    // other operations declare it, so an unreachable store has a modelled server failure to
+    // answer with rather than the scaffold's 501.
+    InternalServiceFault(InternalServiceFault),
     ResourceNotFoundException(ResourceNotFoundException),
 }
 
@@ -157,18 +159,47 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetAlarmMuteRule` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetAlarmMuteRuleErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
+        // A pure read: the rule is reported exactly as `PutAlarmMuteRule` last left it, and
+        // nothing is written. Only the `Status` is not stored — "The returned status indicates
+        // the current state of the mute rule" (`GetAlarmMuteRule`), which is what the clock makes
+        // of the rule's own schedule, so it is computed from the stored configuration on each
+        // read (`crate::state::alarm_mute_rule_status`) and no read moves a rule's status.
         //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetAlarmMuteRule"))
+        // A mute rule is a regional resource, so the one this request names is the one of the
+        // Region it was signed for: the same name in another Region is another rule.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            GetAlarmMuteRuleErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch alarm mute rule store is unavailable".into()),
+            })
+        })?;
+
+        let now = crate::state::now_secs();
+        let store = state.lock();
+        let stored = store
+            .alarm_mute_rules
+            .get(&crate::state::alarm_mute_rule_key(
+                &region,
+                &input.alarm_mute_rule_name,
+            ))
+            .ok_or_else(|| {
+                // "The named resource does not exist." is what the SHAPE documents, and the
+                // refusal itself carries an EMPTY message: this error class is answered by its
+                // code alone, and the resource is named by the two members that carry it rather
+                // than by a sentence — the same body every other not-found of this class in this
+                // service answers with.
+                GetAlarmMuteRuleErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        resource_type: Some(ALARM_MUTE_RULE_RESOURCE_TYPE.to_string()),
+                        resource_id: Some(input.alarm_mute_rule_name.clone()),
+                        message: Some(String::new()),
+                    },
+                )
+            })?;
+        Ok(stored.reported(now))
     }
 }
+
+/// The `ResourceType` a not-found about an alarm mute rule reports, the kind of resource the
+/// request named (`ResourceNotFoundException$ResourceType`).
+const ALARM_MUTE_RULE_RESOURCE_TYPE: &str = "AlarmMuteRule";

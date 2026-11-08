@@ -1323,8 +1323,9 @@ async fn a_value_no_report_can_be_computed_for_is_refused() {
         }
     }
 
-    // A rule name this store holds no rule for is the not-found the operation models, in the
-    // service's own wording. Rows differ along how the name misses.
+    // A rule name this store holds no rule for is refused as a bad value for the member that
+    // carried it, in the coded form this service states a single-member refusal in. Rows differ
+    // along how the name misses.
     for (case, name) in [
         ("a name nothing was created under", "absent-rule".to_string()),
         ("a stored name in another case", "REFUSAL-RULE".to_string()),
@@ -1339,13 +1340,13 @@ async fn a_value_no_report_can_be_computed_for_is_refused() {
         .await;
         assert_eq!(
             (status, error_code(&body).as_str()),
-            (404, "ResourceNotFoundException"),
-            "case {case:?}: expected a 404 ResourceNotFoundException, got {status} {body}"
+            (400, "InvalidParameterValueException"),
+            "case {case:?}: expected a 400 InvalidParameterValueException, got {status} {body}"
         );
         assert_eq!(
             error_message(&body),
-            format!("Rule {name} does not exist."),
-            "case {case:?}: expected the service's own sentence, got {body}"
+            format!("RULE_NAME: {name}"),
+            "case {case:?}: expected the service's own coded refusal, got {body}"
         );
     }
 
@@ -1371,8 +1372,8 @@ async fn a_value_no_report_can_be_computed_for_is_refused() {
     .await;
     assert_eq!(
         (status, error_code(&body).as_str()),
-        (404, "ResourceNotFoundException"),
-        "case \"a rule created and then deleted\": expected a 404, got {status} {body}"
+        (400, "InvalidParameterValueException"),
+        "case \"a rule created and then deleted\": expected a 400, got {status} {body}"
     );
     // Re-created under the same name, it starts collecting over: "If you create a rule, delete
     // it, and then re-create it with the same name, historical data from the first time the

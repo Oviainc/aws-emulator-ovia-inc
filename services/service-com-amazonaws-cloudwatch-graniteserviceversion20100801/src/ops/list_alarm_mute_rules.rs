@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListAlarmMuteRules
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListAlarmMuteRules`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListAlarmMuteRules::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! The listing half of the alarm mute rule store: it reports the rules `PutAlarmMuteRule`
+//! persisted in the Region the request was signed for, filtered as the request asks and paged.
+//!
 //!
 //! ## Shape of an operation
 //!
@@ -92,9 +87,16 @@ smithy_macros::smithy_model!("smithy-model/com-amazonaws-cloudwatch-graniteservi
 // here — hence the `ListAlarmMuteRulesError` alias below. An operation that models no errors
 // generates an UNINHABITED enum here, which is correct and expected: there is nothing
 // to construct until the model says otherwise.
-#[smithy_macros::operation_error("com.amazonaws.cloudwatch#ListAlarmMuteRules")]
+#[smithy_macros::operation_error(
+    "com.amazonaws.cloudwatch#ListAlarmMuteRules",
+    extra_errors = ["InternalServiceFault"]
+)]
 #[derive(Debug)]
 pub enum ListAlarmMuteRulesErrorModeled {
+    // `InternalServiceFault` is widened in through `extra_errors`: this SERVICE models it and
+    // other operations declare it, so an unreachable store has a modelled server failure to
+    // answer with rather than the scaffold's 501.
+    InternalServiceFault(InternalServiceFault),
     InvalidNextToken(InvalidNextToken),
     ResourceNotFoundException(ResourceNotFoundException),
 }
@@ -150,18 +152,166 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListAlarmMuteRules` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListAlarmMuteRulesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListAlarmMuteRules"))
+        // A pure read: every rule is reported exactly as `PutAlarmMuteRule` last left it, with
+        // only its `Status` computed from the clock, and nothing is written. A mute rule is a
+        // regional resource — the listing reports "alarm mute rules in your Amazon Web Services
+        // account and region" (`ListAlarmMuteRules`) — so a rule of the same name in another
+        // Region belongs to that Region's listing.
+        let region = crate::state::request_region(ctx.parts());
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListAlarmMuteRulesErrorModeled::InternalServiceFault(InternalServiceFault {
+                message: Some("the CloudWatch alarm mute rule store is unavailable".into()),
+            })
+        })?;
+
+        // "The maximum number of mute rules to return in one call. The default is 50."
+        // (`ListAlarmMuteRulesInput$MaxRecords`), whose modelled range is 1..100 — so the boundary
+        // validator has already refused anything outside it. A value that somehow arrives outside
+        // that range is read at the nearest modelled bound rather than dropped, so a zero can
+        // never make the page empty and the paging non-terminating.
+        let page_size = match input.max_records {
+            None => DEFAULT_PAGE_SIZE,
+            Some(requested) => usize::try_from(requested)
+                .unwrap_or(MIN_PAGE_SIZE)
+                .clamp(MIN_PAGE_SIZE, MAX_PAGE_SIZE),
+        };
+
+        // "The token returned from a previous call to indicate where to continue retrieving
+        // results." (`ListAlarmMuteRulesInput$NextToken`) — a token this service did not issue
+        // names no page, which is the `InvalidNextToken` this operation models.
+        let start_at = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => Some(crate::state::decode_page_token(token).ok_or_else(|| {
+                ListAlarmMuteRulesErrorModeled::InvalidNextToken(InvalidNextToken {
+                    message: Some(INVALID_NEXT_TOKEN_MESSAGE.to_string()),
+                })
+            })?),
+        };
+
+        let now = crate::state::now_secs();
+        let store = state.lock();
+
+        // "Filter results to show only mute rules that target the specified alarm name."
+        // (`ListAlarmMuteRulesInput$AlarmName`) — the filter names an ALARM, so a name no alarm of
+        // any kind carries names no resource to filter by: the not-found this operation models
+        // ("The named resource does not exist."), answered by its code alone with the resource
+        // named by the two members that carry it, like every other not-found of this class in this
+        // service. A rule TARGETS an alarm by name, so the filter keeps the rules whose
+        // `MuteTargets` name it.
+        if let Some(alarm_name) = input.alarm_name.as_deref() {
+            if store.alarm_kind(alarm_name).is_none() {
+                return Err(ListAlarmMuteRulesErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        resource_type: Some(
+                            crate::state::TaggableKind::Alarm.resource_type().to_string(),
+                        ),
+                        resource_id: Some(alarm_name.to_string()),
+                        message: Some(String::new()),
+                    },
+                )
+                .into());
+            }
+        }
+
+        // Ordered by rule name so repeated calls report the same order, and so a token can simply
+        // name the rule the next page starts at: a page boundary keeps naming the same rule even
+        // when rules are created or deleted between two calls.
+        let mut selected: Vec<(&String, &crate::state::StoredAlarmMuteRule)> = store
+            .alarm_mute_rules
+            .iter()
+            .filter(|(key, _)| key.region == region)
+            .filter(|(_, stored)| targets_alarm(stored, input.alarm_name.as_deref()))
+            .filter(|(_, stored)| {
+                has_status(
+                    crate::state::alarm_mute_rule_status(&stored.configuration, now),
+                    input.statuses.as_deref(),
+                )
+            })
+            .map(|(key, stored)| (&key.name, stored))
+            .collect();
+        selected.sort_unstable_by_key(|(name, _)| *name);
+        let from = match start_at.as_deref() {
+            None => 0,
+            Some(cursor) => selected.partition_point(|(name, _)| name.as_str() < cursor),
+        };
+        let page = selected.get(from..).unwrap_or_default();
+        // "The token to use when requesting the next set of results. If this field is absent,
+        // there are no more results to retrieve." (`ListAlarmMuteRulesOutput$NextToken`) — present
+        // only when a rule is left over, so the last page terminates the walk.
+        let next_token = page
+            .get(page_size)
+            .map(|(name, _)| crate::state::encode_page_token(name));
+
+        let summaries: Vec<AlarmMuteRuleSummary> = page
+            .iter()
+            .take(page_size)
+            .map(|(_, stored)| summary_of(&stored.reported(now)))
+            .collect();
+
+        Ok(ListAlarmMuteRulesOutput {
+            alarm_mute_rule_summaries: Some(summaries),
+            next_token,
+        })
+    }
+}
+
+/// The page size an omitted `MaxRecords` asks for: "The default is 50."
+/// (`ListAlarmMuteRulesInput$MaxRecords`).
+const DEFAULT_PAGE_SIZE: usize = 50;
+
+/// The narrowest page that member can ask for (its modelled range is 1..100).
+const MIN_PAGE_SIZE: usize = 1;
+
+/// The widest page that member can ask for (its modelled range is 1..100).
+const MAX_PAGE_SIZE: usize = 100;
+
+/// How CloudWatch words a refusal of a `NextToken` it did not issue: one fixed sentence naming
+/// the member and carrying nothing of the request, the same wording the other paginating listing
+/// of this service answers with (`crate::ops::list_metric_streams`).
+const INVALID_NEXT_TOKEN_MESSAGE: &str = "Invalid NextToken";
+
+/// Whether `stored` targets the alarm the request filtered by, which a rule with no filter asked
+/// for is trivially true of.
+///
+/// "The list of alarm names that this mute rule targets." (`MuteTargets$AlarmNames`) — a rule
+/// targets an alarm when its own target list names it, so a rule carrying no targets is not a
+/// rule of any one alarm's listing.
+fn targets_alarm(stored: &crate::state::StoredAlarmMuteRule, alarm_name: Option<&str>) -> bool {
+    let Some(alarm_name) = alarm_name else {
+        return true;
+    };
+    stored
+        .configuration
+        .mute_targets
+        .as_ref()
+        .is_some_and(|targets| targets.alarm_names.iter().any(|name| name == alarm_name))
+}
+
+/// Whether `status` is one of the statuses the request filtered by.
+///
+/// "Filter results to show only mute rules with the specified statuses."
+/// (`ListAlarmMuteRulesInput$Statuses`) — a filter naming no status singles out no rule, which is
+/// what leaving the member out means, so an empty list filters nothing.
+fn has_status(status: &str, statuses: Option<&[String]>) -> bool {
+    match statuses {
+        None => true,
+        Some(statuses) => statuses.is_empty() || statuses.iter().any(|wanted| wanted == status),
+    }
+}
+
+/// The listing of one stored mute rule.
+///
+/// `AlarmMuteRuleSummary` is the SUBSET of a rule this listing carries — "Summary information
+/// about an alarm mute rule, including its name, status, and configuration details."
+/// (`AlarmMuteRuleSummary`) — so each member it models is copied from the rule as its reader
+/// reports it, and what it does not model (the schedule, the targets, the description and the
+/// start date) is left to `GetAlarmMuteRule`, the reader that does model it.
+fn summary_of(reported: &GetAlarmMuteRuleOutput) -> AlarmMuteRuleSummary {
+    AlarmMuteRuleSummary {
+        alarm_mute_rule_arn: reported.alarm_mute_rule_arn.clone(),
+        expire_date: reported.expire_date,
+        status: reported.status.clone(),
+        mute_type: reported.mute_type.clone(),
+        last_updated_timestamp: reported.last_updated_timestamp,
     }
 }
