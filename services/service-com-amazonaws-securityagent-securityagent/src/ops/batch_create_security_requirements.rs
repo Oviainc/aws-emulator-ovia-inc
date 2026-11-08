@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchCreateSecurityRequirements
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchCreateSecurityRequirements`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchCreateSecurityRequirements::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Batch creates security requirements in a customer managed security requirement pack.
+//! This is the ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -159,18 +152,170 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchCreateSecurityRequirements` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchCreateSecurityRequirementsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchCreateSecurityRequirements"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchCreateSecurityRequirementsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the security requirement store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // `packId` is `@required` but carries no `@length`, so an empty one reaches the
+        // handler. It names no pack and never could, so it is a bad request rather than
+        // a missing resource: refused with the modelled `ValidationException` (400).
+        if input.pack_id.is_empty() {
+            return Err(
+                BatchCreateSecurityRequirementsErrorModeled::ValidationException(
+                    ValidationException {
+                        message: "packId must not be empty".to_string(),
+                        field_list: Some(vec![ValidationExceptionField {
+                            path: "packId".to_string(),
+                            message: "must not be empty".to_string(),
+                        }]),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A requirement's NAME is its identity inside the pack, so a blank one names no
+        // requirement and could never be read, updated or deleted again. `name` is
+        // `@required` but carries no `@length`, so this is the one rule the boundary
+        // validator cannot have applied; it is a bad REQUEST, not a per-entry state
+        // conflict, so the whole call is refused and nothing is written.
+        for (index, entry) in input.security_requirements.iter().enumerate() {
+            if entry.name.trim().is_empty() {
+                return Err(
+                    BatchCreateSecurityRequirementsErrorModeled::ValidationException(
+                        ValidationException {
+                            message: format!(
+                                "securityRequirements[{index}].name must not be blank"
+                            ),
+                            field_list: Some(vec![ValidationExceptionField {
+                                path: format!("securityRequirements[{index}].name"),
+                                message: "must not be blank".to_string(),
+                            }]),
+                        },
+                    )
+                    .into(),
+                );
+            }
+        }
+
+        let mut state = state.lock();
+
+        // A requirement lives in a pack, so the pack has to exist before anything can be
+        // written into it: an unknown `packId` is the operation's modelled
+        // `ResourceNotFoundException` (404) for the whole call, not a per-entry error.
+        let pack = state
+            .security_requirement_packs
+            .get(&input.pack_id)
+            .ok_or_else(|| {
+                BatchCreateSecurityRequirementsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "No security requirement pack found for ID: {}",
+                            input.pack_id
+                        ),
+                    },
+                )
+            })?;
+
+        // "Batch creates security requirements in a CUSTOMER MANAGED pack": the contents
+        // of a pack AWS ships are the service's, so writing into one conflicts with the
+        // current state of that pack — the operation's modelled `ConflictException`
+        // (409). It holds for the whole call, since every entry names the same pack.
+        if pack.management_type == crate::state::MANAGEMENT_TYPE_AWS_MANAGED {
+            return Err(
+                BatchCreateSecurityRequirementsErrorModeled::ConflictException(
+                    ConflictException {
+                        message: crate::state::aws_managed_pack_conflict_message(&input.pack_id),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Every requirement is a stored record, so how many one pack can hold is
+        // bounded, as it is on the real service: past the quota the operation answers
+        // the service's own `ServiceQuotaExceededException` (402) and writes nothing,
+        // rather than growing the store without end. Only the names the pack does not
+        // already hold would add records, so a batch that re-sends names it already
+        // holds cannot be refused by the quota.
+        let fresh_names: ::std::collections::BTreeSet<&str> = input
+            .security_requirements
+            .iter()
+            .map(|entry| entry.name.as_str())
+            .filter(|name| state.security_requirement(&input.pack_id, name).is_none())
+            .collect();
+        let held = state.security_requirement_count(&input.pack_id);
+        if held + fresh_names.len() > crate::state::MAX_SECURITY_REQUIREMENTS_PER_PACK {
+            return Err(
+                BatchCreateSecurityRequirementsErrorModeled::ServiceQuotaExceededException(
+                    ServiceQuotaExceededException {
+                        message: format!(
+                            "The request would exceed the maximum number of security requirements ({}) for security requirement pack {}",
+                            crate::state::MAX_SECURITY_REQUIREMENTS_PER_PACK, input.pack_id
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Entries are processed IN REQUEST ORDER and the batch STOPS at the first one it
+        // cannot create: that entry is reported with the code of the condition that
+        // stopped it, every entry behind it is reported as one the service never
+        // processed, and the entries ahead of it keep the records they created — which is
+        // what a per-entry error list reports rather than one error for the request. A
+        // name repeated WITHIN one batch meets the same rule: the first occurrence
+        // creates the record, so a later one is a name the pack now holds.
+        let now = ::std::time::SystemTime::now();
+        let mut security_requirements = Vec::new();
+        let mut errors = Vec::new();
+        let mut stopped = false;
+        for entry in input.security_requirements {
+            if stopped {
+                errors.push(BatchSecurityRequirementError {
+                    security_requirement_name: entry.name,
+                    code: crate::state::BATCH_REQUIREMENT_ERROR_NOT_PROCESSED.to_string(),
+                    message: crate::state::SECURITY_REQUIREMENT_NOT_PROCESSED.to_string(),
+                });
+                continue;
+            }
+
+            if state
+                .security_requirement(&input.pack_id, &entry.name)
+                .is_some()
+            {
+                errors.push(BatchSecurityRequirementError {
+                    security_requirement_name: entry.name.clone(),
+                    code: crate::state::BATCH_REQUIREMENT_ERROR_CONFLICT.to_string(),
+                    message: crate::state::security_requirement_exists_message(&entry.name),
+                });
+                stopped = true;
+                continue;
+            }
+
+            let requirement = crate::state::SecurityRequirement::created(
+                &input.pack_id,
+                entry.name,
+                entry.description,
+                entry.domain,
+                entry.evaluation,
+                entry.remediation,
+                now,
+            );
+            // Projected off the STORED record, so this response carries what a later
+            // read of the same name carries.
+            security_requirements.push(requirement.create_result());
+            state.insert_security_requirement(requirement);
+        }
+
+        Ok(BatchCreateSecurityRequirementsOutput {
+            security_requirements,
+            errors,
+        })
     }
 }

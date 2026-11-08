@@ -37,6 +37,8 @@ mod security_requirement_pack;
 mod security_requirement_pack_lifecycle;
 #[path = "all/security_requirement_packs.rs"]
 mod security_requirement_packs;
+#[path = "all/security_requirements_batch.rs"]
+mod security_requirements_batch;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 // Not a suite of its own: the wire harness every suite shares, reached as

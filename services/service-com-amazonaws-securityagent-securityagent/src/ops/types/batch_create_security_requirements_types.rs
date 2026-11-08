@@ -28,14 +28,52 @@ pub struct CreateSecurityRequirementEntry {
     pub remediation: Option<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#BatchCreateSecurityRequirementsOutput")]
+/// `BatchCreateSecurityRequirementsOutput`, with its schema and serializer written out
+/// because its ELEMENT shape is: the derive's read path for the list member demands a
+/// `DeserializableStruct` on [`BatchCreateSecurityRequirementResult`], which an
+/// output-only shape has no caller for (see `super::wire_shape`). The wire form of this
+/// shape is otherwise exactly the model's.
 #[derive(Debug, Clone, Default)]
 pub struct BatchCreateSecurityRequirementsOutput {
     pub security_requirements: Vec<BatchCreateSecurityRequirementResult>,
     pub errors: Vec<BatchSecurityRequirementError>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#BatchCreateSecurityRequirementResult")]
+sa_schema_and_codec!(
+    BatchCreateSecurityRequirementsOutput,
+    BATCH_CREATE_SECURITY_REQUIREMENTS_OUTPUT_SCHEMA,
+    "com.amazonaws.securityagent#BatchCreateSecurityRequirementsOutput",
+    "com.amazonaws.securityagent",
+    "BatchCreateSecurityRequirementsOutput",
+    modelled: [
+        (
+            M_SECURITY_REQUIREMENTS,
+            security_requirements,
+            "securityRequirements",
+            0,
+            req,
+            list_of_struct(BatchCreateSecurityRequirementResult)
+        ),
+        (
+            M_ERRORS,
+            errors,
+            "errors",
+            1,
+            req,
+            list_of_struct(BatchSecurityRequirementError)
+        ),
+    ],
+    recorded: [],
+);
+
+/// `BatchCreateSecurityRequirementResult`, with its schema and serializer written out
+/// instead of derived: `createdAt` and `updatedAt` carry
+/// `@timestampFormat("date-time")` (`smithy_query(query="shape",
+/// shape="BatchCreateSecurityRequirementResult",
+/// model_path="services/service-com-amazonaws-securityagent-securityagent/smithy-model/com-amazonaws-securityagent-securityagent.json")`),
+/// which the derive drops, so each one would go onto the wire as an epoch-second number
+/// where the model requires an RFC 3339 string. Same reason, same machinery as the other
+/// `date-time`-bearing shapes of this service — see `super::wire_shape`.
 #[derive(Debug, Clone)]
 pub struct BatchCreateSecurityRequirementResult {
     pub pack_id: String,
@@ -47,4 +85,23 @@ pub struct BatchCreateSecurityRequirementResult {
     pub created_at: ::aws_smithy_types::DateTime,
     pub updated_at: ::aws_smithy_types::DateTime,
 }
+
+sa_schema_and_codec!(
+    BatchCreateSecurityRequirementResult,
+    BATCH_CREATE_SECURITY_REQUIREMENT_RESULT_SCHEMA,
+    "com.amazonaws.securityagent#BatchCreateSecurityRequirementResult",
+    "com.amazonaws.securityagent",
+    "BatchCreateSecurityRequirementResult",
+    modelled: [
+        (M_PACK_ID, pack_id, "packId", 0, req, string),
+        (M_NAME, name, "name", 1, req, string),
+        (M_DESCRIPTION, description, "description", 2, req, string),
+        (M_DOMAIN, domain, "domain", 3, req, string),
+        (M_EVALUATION, evaluation, "evaluation", 4, req, string),
+        (M_REMEDIATION, remediation, "remediation", 5, opt, string),
+        (M_CREATED_AT, created_at, "createdAt", 6, req, date_time),
+        (M_UPDATED_AT, updated_at, "updatedAt", 7, req, date_time),
+    ],
+    recorded: [],
+);
 

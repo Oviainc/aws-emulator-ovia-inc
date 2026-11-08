@@ -26,6 +26,12 @@
 //! `ListSecurityRequirementPacks` — and every pack operation implemented after them —
 //! read and write ONE copy of each pack record.
 //!
+//! The security requirements a pack holds live beside the packs, keyed by the pair of
+//! the owning `packId` and the requirement's own name, so
+//! `BatchCreateSecurityRequirements` writes one record and
+//! `BatchGetSecurityRequirements` — and every requirement operation implemented after
+//! them — reads back THAT record rather than a second copy of it.
+//!
 //! The helpers below (identity minting, the IdC application ARN, the account's network,
 //! the modelled projections and the pagination cursor codec) are shared by those
 //! handlers rather than duplicated per operation.
@@ -36,8 +42,9 @@ use std::time::{Duration, SystemTime};
 use sha2::{Digest, Sha256};
 
 use crate::ops::types::{
-    AWSResources, AgentSpace, ApplicationSummary, Artifact, CodeReviewSettings, DnsVerification,
-    HttpVerification, IdCConfiguration, PrivateConnectionSummary,
+    AWSResources, AgentSpace, ApplicationSummary, Artifact,
+    BatchCreateSecurityRequirementResult, BatchGetSecurityRequirementResult, CodeReviewSettings,
+    DnsVerification, HttpVerification, IdCConfiguration, PrivateConnectionSummary,
     SecurityRequirementPackSummary, TargetDomain, VerificationDetails,
 };
 
@@ -248,6 +255,74 @@ pub const MAX_ARTIFACT_CONTENT_BYTES: usize = 1 << 20;
 /// above any plausible client's pack count, so normal use never meets it, while the
 /// store a caller can grow stays bounded.
 pub const MAX_SECURITY_REQUIREMENT_PACKS: usize = 1_000;
+
+/// The most security requirements this emulator stores in ONE pack before
+/// `BatchCreateSecurityRequirements` answers the service's
+/// `ServiceQuotaExceededException`.
+///
+/// CHOSEN, not cited: the real service's per-pack requirement quota is not in the
+/// model. It is set far above any plausible pack's requirement count, so normal use
+/// never meets it, while the store one caller can grow stays bounded.
+pub const MAX_SECURITY_REQUIREMENTS_PER_PACK: usize = 1_000;
+
+/// The `code` one entry of a batch security requirement response carries when the pack
+/// already holds a security requirement of that name.
+///
+/// RECORDED, not modelled: `BatchSecurityRequirementError$code` is "The error code", an
+/// unconstrained string, and the recorded
+/// `securityagent.batch-create-security-requirements-duplicate-partial-failure` run
+/// reports this code — the SHAPE NAME of the request-level error the operation models
+/// for the same condition — for the entry whose name the pack already held. So a client
+/// matches one vocabulary whether a condition failed the whole call or one entry of it.
+pub const BATCH_REQUIREMENT_ERROR_CONFLICT: &str = "ConflictException";
+
+/// The `code` one entry carries when the pack holds no security requirement of that
+/// name: the shape name of the request-level error for the same condition, as
+/// [`BATCH_REQUIREMENT_ERROR_CONFLICT`] is.
+pub const BATCH_REQUIREMENT_ERROR_NOT_FOUND: &str = "ResourceNotFoundException";
+
+/// The `code` one entry carries when the service never processed it, because an entry
+/// ahead of it in the same request failed.
+///
+/// RECORDED, not modelled: the same recorded run reports this code for the entry BESIDE
+/// the one that conflicted. It is not the name of any modelled error, because nothing
+/// about that entry failed — the batch simply stopped before reaching it.
+pub const BATCH_REQUIREMENT_ERROR_NOT_PROCESSED: &str = "NotProcessed";
+
+/// The sentence one batch entry carries when the pack already holds a security
+/// requirement of that name.
+///
+/// Stated here once so every batch security requirement operation that meets the
+/// condition answers the same sentence. The only variable part is the requirement name,
+/// which the entry itself names.
+pub fn security_requirement_exists_message(name: &str) -> String {
+    format!("Security requirement already exists for name: {name}")
+}
+
+/// The sentence one batch entry carries when the pack holds no security requirement of
+/// that name — the per-entry counterpart of the pack's own not-found sentence ("No
+/// security requirement pack found for ID: …"), stated here once for the same reason as
+/// [`security_requirement_exists_message`].
+pub fn security_requirement_not_found_message(name: &str) -> String {
+    format!("No security requirement found for name: {name}")
+}
+
+/// The sentence one batch entry carries when the service never processed it. Wholly
+/// FIXED: it carries no value from the request, because nothing about this entry is what
+/// stopped the batch.
+pub const SECURITY_REQUIREMENT_NOT_PROCESSED: &str =
+    "Security requirement was not processed because an earlier entry in the request failed.";
+
+/// The sentence a refusal to write security requirements into a pack AWS manages
+/// states.
+///
+/// `BatchCreateSecurityRequirements` documents itself as creating requirements "in a
+/// customer managed pack", and `UpdateSecurityRequirementPack` documents that "for AWS
+/// managed packs, only status can be updated", so the contents of a shipped pack are
+/// the service's and not a caller's to write.
+pub fn aws_managed_pack_conflict_message(pack_id: &str) -> String {
+    format!("Security requirements cannot be modified for AWS managed pack: {pack_id}")
+}
 
 /// The `managementType` every pack this API creates carries.
 ///
@@ -631,6 +706,88 @@ impl SecurityRequirementPack {
             vendor_name: self.vendor_name.clone(),
             management_type: self.management_type.clone(),
             status: self.status.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
+        }
+    }
+}
+
+/// One stored security requirement: one rule inside a security requirement pack, as
+/// `BatchCreateSecurityRequirements` writes it and every other security requirement
+/// operation reads it.
+///
+/// A requirement belongs to exactly ONE pack — every operation that names a requirement
+/// names the pack beside it, and the batch operations address requirements by
+/// `securityRequirementNames` alone — so the owning `packId` is part of the record and
+/// the NAME is the requirement's identity WITHIN that pack, never across packs.
+#[derive(Debug, Clone)]
+pub struct SecurityRequirement {
+    pub pack_id: String,
+    pub name: String,
+    pub description: String,
+    pub domain: String,
+    pub evaluation: String,
+    /// Optional on the create entry ("remediation" carries no `@required`), so a
+    /// requirement created without one carries none on every later read.
+    pub remediation: Option<String>,
+    pub created_at: SystemTime,
+    /// Moves only when a later write changes the record; equal to `created_at` until
+    /// then.
+    pub updated_at: SystemTime,
+}
+
+impl SecurityRequirement {
+    /// The record one `CreateSecurityRequirementEntry` becomes: the entry's own fields,
+    /// the pack it was created in, and `now` as both stamps — nothing has updated a
+    /// requirement at the instant it is created.
+    pub fn created(
+        pack_id: &str,
+        name: String,
+        description: String,
+        domain: String,
+        evaluation: String,
+        remediation: Option<String>,
+        now: SystemTime,
+    ) -> Self {
+        Self {
+            pack_id: pack_id.to_string(),
+            name,
+            description,
+            domain,
+            evaluation,
+            remediation,
+            created_at: now,
+            updated_at: now,
+        }
+    }
+
+    /// This requirement projected onto the `BatchCreateSecurityRequirementResult`
+    /// shape: the STORED record's own fields, so the create answers what a later read
+    /// answers rather than echoing the request.
+    pub fn create_result(&self) -> BatchCreateSecurityRequirementResult {
+        BatchCreateSecurityRequirementResult {
+            pack_id: self.pack_id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            domain: self.domain.clone(),
+            evaluation: self.evaluation.clone(),
+            remediation: self.remediation.clone(),
+            created_at: ::aws_smithy_types::DateTime::from(self.created_at),
+            updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
+        }
+    }
+
+    /// The same record projected onto `BatchGetSecurityRequirementResult`, which
+    /// carries the same members: one projection per shape, both off the one stored
+    /// record.
+    pub fn get_result(&self) -> BatchGetSecurityRequirementResult {
+        BatchGetSecurityRequirementResult {
+            pack_id: self.pack_id.clone(),
+            name: self.name.clone(),
+            description: self.description.clone(),
+            domain: self.domain.clone(),
+            evaluation: self.evaluation.clone(),
+            remediation: self.remediation.clone(),
             created_at: ::aws_smithy_types::DateTime::from(self.created_at),
             updated_at: ::aws_smithy_types::DateTime::from(self.updated_at),
         }
@@ -1117,6 +1274,13 @@ pub struct ComAmazonawsSecurityagentSecurityagentState {
     /// `CreateSecurityRequirementPack` calls are two distinct records even when they
     /// carry byte-identical input.
     pub next_security_requirement_pack_seq: u64,
+    /// Every stored security requirement, keyed by the PAIR `(packId, name)` that
+    /// identifies it: a requirement lives in exactly one pack and its name is unique
+    /// only within that pack, so two packs can each hold a requirement of one name and
+    /// neither read sees the other's. A `BTreeMap` so the pairs of one pack are a
+    /// contiguous, name-ordered range — one stable order for a read that walks a pack's
+    /// requirements and for a cursor to resume in.
+    pub security_requirements: BTreeMap<(String, String), SecurityRequirement>,
     /// Every stored artifact, keyed by its `artifactId`. A `BTreeMap` for the same
     /// reason as [`Self::applications`]: the ids come from the counter below, so one
     /// stable order — the upload order — for a read that walks the artifacts of an
@@ -1156,6 +1320,7 @@ impl Default for ComAmazonawsSecurityagentSecurityagentState {
                 })
                 .collect(),
             next_security_requirement_pack_seq: 0,
+            security_requirements: BTreeMap::new(),
             artifacts: BTreeMap::new(),
             next_artifact_seq: 0,
         }
@@ -1308,6 +1473,46 @@ impl ComAmazonawsSecurityagentSecurityagentState {
         self.next_security_requirement_pack_seq =
             self.next_security_requirement_pack_seq.wrapping_add(1);
         format!("{:032x}", self.next_security_requirement_pack_seq)
+    }
+
+    /// The security requirement `name` names IN the pack `pack_id`, or `None` when that
+    /// pack holds no requirement of that name.
+    ///
+    /// A requirement is reachable only through the pack that holds it, so a name that
+    /// names a requirement of ANOTHER pack resolves to nothing here — a read of it is
+    /// answered exactly as a read of a name nothing created is.
+    pub fn security_requirement(&self, pack_id: &str, name: &str) -> Option<&SecurityRequirement> {
+        self.security_requirements
+            .get(&(pack_id.to_string(), name.to_string()))
+    }
+
+    /// Every security requirement the pack `pack_id` holds, in name order.
+    ///
+    /// The keys of one pack are a contiguous range of the store, so this walks that
+    /// range rather than the whole store.
+    pub fn security_requirements_in<'a>(
+        &'a self,
+        pack_id: &'a str,
+    ) -> impl Iterator<Item = &'a SecurityRequirement> {
+        self.security_requirements
+            .range((pack_id.to_string(), String::new())..)
+            .take_while(move |((pack, _), _)| pack == pack_id)
+            .map(|(_, requirement)| requirement)
+    }
+
+    /// How many security requirements the pack `pack_id` holds, i.e. how many count
+    /// against that pack's requirement quota ([`MAX_SECURITY_REQUIREMENTS_PER_PACK`]).
+    pub fn security_requirement_count(&self, pack_id: &str) -> usize {
+        self.security_requirements_in(pack_id).count()
+    }
+
+    /// Store `requirement` under the pair that identifies it, so every later read of
+    /// that pack and name resolves THIS record.
+    pub fn insert_security_requirement(&mut self, requirement: SecurityRequirement) {
+        self.security_requirements.insert(
+            (requirement.pack_id.clone(), requirement.name.clone()),
+            requirement,
+        );
     }
 
     /// Mint the `artifactId` of a newly uploaded artifact.

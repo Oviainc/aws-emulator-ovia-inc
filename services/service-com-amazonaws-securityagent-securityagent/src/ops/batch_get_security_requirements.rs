@@ -1,15 +1,8 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op BatchGetSecurityRequirements
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `BatchGetSecurityRequirements`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`BatchGetSecurityRequirements::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Batch retrieves security requirements from a security requirement pack. This is the
+//! ONLY file to touch for this operation.
 //!
 //! ## Shape of an operation
 //!
@@ -153,18 +146,71 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `BatchGetSecurityRequirements` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(BatchGetSecurityRequirementsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("BatchGetSecurityRequirements"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            BatchGetSecurityRequirementsErrorModeled::InternalServerException(
+                InternalServerException {
+                    message: "the security requirement store is unavailable".to_string(),
+                },
+            )
+        })?;
+
+        // `packId` is `@required` but carries no `@length`, so an empty one reaches the
+        // handler. It names no pack and never could, so it is a bad request rather than
+        // a missing resource: refused with the modelled `ValidationException` (400).
+        if input.pack_id.is_empty() {
+            return Err(BatchGetSecurityRequirementsErrorModeled::ValidationException(
+                ValidationException {
+                    message: "packId must not be empty".to_string(),
+                    field_list: Some(vec![ValidationExceptionField {
+                        path: "packId".to_string(),
+                        message: "must not be empty".to_string(),
+                    }]),
+                },
+            )
+            .into());
+        }
+
+        // A read (`@readonly`): it resolves the records and projects them, and writes
+        // nothing.
+        let state = state.lock();
+
+        // A requirement is reached through the pack that holds it, so an unknown
+        // `packId` is the operation's modelled `ResourceNotFoundException` (404) for the
+        // whole call rather than one error per name.
+        if !state.security_requirement_packs.contains_key(&input.pack_id) {
+            return Err(
+                BatchGetSecurityRequirementsErrorModeled::ResourceNotFoundException(
+                    ResourceNotFoundException {
+                        message: format!(
+                            "No security requirement pack found for ID: {}",
+                            input.pack_id
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // A PARTIAL outcome: every name the pack holds is projected off its stored
+        // record, and every name it does not hold is reported in `errors` instead — one
+        // missing name never fails the names beside it.
+        let mut security_requirements = Vec::new();
+        let mut errors = Vec::new();
+        for name in &input.security_requirement_names {
+            match state.security_requirement(&input.pack_id, name) {
+                Some(requirement) => security_requirements.push(requirement.get_result()),
+                None => errors.push(BatchSecurityRequirementError {
+                    security_requirement_name: name.clone(),
+                    code: crate::state::BATCH_REQUIREMENT_ERROR_NOT_FOUND.to_string(),
+                    message: crate::state::security_requirement_not_found_message(name),
+                }),
+            }
+        }
+
+        Ok(BatchGetSecurityRequirementsOutput {
+            security_requirements,
+            errors,
+        })
     }
 }

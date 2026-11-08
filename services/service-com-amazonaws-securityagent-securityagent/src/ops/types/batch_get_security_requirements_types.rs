@@ -18,14 +18,51 @@ pub struct BatchGetSecurityRequirementsInput {
     pub security_requirement_names: Vec<String>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#BatchGetSecurityRequirementsOutput")]
+/// `BatchGetSecurityRequirementsOutput`, with its schema and serializer written out for
+/// the reason [`BatchGetSecurityRequirementResult`] carries: the derive's read path for
+/// the list member demands a `DeserializableStruct` on an output-only element shape (see
+/// `super::wire_shape`). The wire form of this shape is otherwise exactly the model's.
 #[derive(Debug, Clone, Default)]
 pub struct BatchGetSecurityRequirementsOutput {
     pub security_requirements: Vec<BatchGetSecurityRequirementResult>,
     pub errors: Vec<BatchSecurityRequirementError>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.securityagent#BatchGetSecurityRequirementResult")]
+sa_schema_and_codec!(
+    BatchGetSecurityRequirementsOutput,
+    BATCH_GET_SECURITY_REQUIREMENTS_OUTPUT_SCHEMA,
+    "com.amazonaws.securityagent#BatchGetSecurityRequirementsOutput",
+    "com.amazonaws.securityagent",
+    "BatchGetSecurityRequirementsOutput",
+    modelled: [
+        (
+            M_SECURITY_REQUIREMENTS,
+            security_requirements,
+            "securityRequirements",
+            0,
+            req,
+            list_of_struct(BatchGetSecurityRequirementResult)
+        ),
+        (
+            M_ERRORS,
+            errors,
+            "errors",
+            1,
+            req,
+            list_of_struct(BatchSecurityRequirementError)
+        ),
+    ],
+    recorded: [],
+);
+
+/// `BatchGetSecurityRequirementResult`, with its schema and serializer written out
+/// instead of derived: `createdAt` and `updatedAt` carry
+/// `@timestampFormat("date-time")` (`smithy_query(query="shape",
+/// shape="BatchGetSecurityRequirementResult",
+/// model_path="services/service-com-amazonaws-securityagent-securityagent/smithy-model/com-amazonaws-securityagent-securityagent.json")`),
+/// which the derive drops, so each one would go onto the wire as an epoch-second number
+/// where the model requires an RFC 3339 string. The read answers the SAME members as the
+/// create — see `super::wire_shape`.
 #[derive(Debug, Clone)]
 pub struct BatchGetSecurityRequirementResult {
     pub pack_id: String,
@@ -37,4 +74,23 @@ pub struct BatchGetSecurityRequirementResult {
     pub created_at: ::aws_smithy_types::DateTime,
     pub updated_at: ::aws_smithy_types::DateTime,
 }
+
+sa_schema_and_codec!(
+    BatchGetSecurityRequirementResult,
+    BATCH_GET_SECURITY_REQUIREMENT_RESULT_SCHEMA,
+    "com.amazonaws.securityagent#BatchGetSecurityRequirementResult",
+    "com.amazonaws.securityagent",
+    "BatchGetSecurityRequirementResult",
+    modelled: [
+        (M_PACK_ID, pack_id, "packId", 0, req, string),
+        (M_NAME, name, "name", 1, req, string),
+        (M_DESCRIPTION, description, "description", 2, req, string),
+        (M_DOMAIN, domain, "domain", 3, req, string),
+        (M_EVALUATION, evaluation, "evaluation", 4, req, string),
+        (M_REMEDIATION, remediation, "remediation", 5, opt, string),
+        (M_CREATED_AT, created_at, "createdAt", 6, req, date_time),
+        (M_UPDATED_AT, updated_at, "updatedAt", 7, req, date_time),
+    ],
+    recorded: [],
+);
 
