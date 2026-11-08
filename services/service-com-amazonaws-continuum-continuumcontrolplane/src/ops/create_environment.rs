@@ -1,15 +1,9 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op CreateEnvironment
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `CreateEnvironment`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`CreateEnvironment::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: `CreateEnvironment` mints an `environmentId` and its ARN, persists the
+//! environment record in [`crate::state`], and answers HTTP 201 with the four members the
+//! model declares. Every later read of the environment projects that record.
 //!
 //! ## Shape of an operation
 //!
@@ -164,18 +158,64 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `CreateEnvironment` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(CreateEnvironmentErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("CreateEnvironment"))
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            CreateEnvironmentErrorModeled::InternalServerException(InternalServerException {
+                message: crate::state::STORE_UNAVAILABLE.to_string(),
+            })
+        })?;
+        let region = crate::state::request_region(ctx.parts());
+        let now = ::std::time::SystemTime::now();
+
+        let mut store = state.lock();
+
+        // The store this request would grow is bounded, so a caller looping on
+        // create meets the modelled quota rather than this process's memory
+        // limit.
+        if store.environments.len() >= crate::state::MAX_ENVIRONMENTS {
+            return Err(CreateEnvironmentErrorModeled::ServiceQuotaExceededException(
+                ServiceQuotaExceededException {
+                    message: format!(
+                        "The request would exceed the quota of {} environments for this account. \
+                         Review your quota and request an increase if needed.",
+                        crate::state::MAX_ENVIRONMENTS
+                    ),
+                    // The service code is this service's own namespace; the
+                    // quota code is an identifier AWS assigns per quota, which
+                    // nothing here can derive.
+                    service_code: Some(crate::state::ARN_SERVICE.to_string()),
+                    quota_code: None,
+                },
+            )
+            .into());
+        }
+
+        let environment_id = store.mint_environment_id(&input.name, now);
+        let record = crate::state::Environment::new(
+            &region,
+            environment_id.clone(),
+            input.name,
+            input.configuration,
+            now,
+        );
+        let output = record.create_output();
+        // Written into the VACANT slot the mint answered, so a create adds a
+        // record and can never replace one it would then report as created.
+        match store.environments.entry(environment_id) {
+            ::std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(record);
+            }
+            ::std::collections::btree_map::Entry::Occupied(taken) => {
+                return Err(CreateEnvironmentErrorModeled::ConflictException(ConflictException {
+                    message: format!(
+                        "The request could not be completed due to a conflict with the current \
+                         state of the resource: environment {} already exists.",
+                        taken.key()
+                    ),
+                })
+                .into());
+            }
+        }
+
+        Ok(output)
     }
 }

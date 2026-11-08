@@ -21,13 +21,16 @@ bytes = { workspace = true }
 http = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
+# Hex, for rendering the authenticated pagination token a listing hands back.
+hex = { workspace = true }
+# `date_time_json`: the workspace's ONE rendering of a `restJson1` timestamp whose model
+# declares the `date-time` form, which every timestamp member of this model does.
+# `page_tokens`: the ONE authenticated continuation-token codec, so a token this store did
+# not mint names no page. `stable_hex_id`: the ONE stable mixing function behind a minted id.
+service-common = { path = "../common" }
 
 [build-dependencies]
 emulator-core-build-support = { workspace = true }
-
-[dev-dependencies]
-sha2 = { workspace = true }
-hex = { workspace = true }
 
 [lints]
 workspace = true

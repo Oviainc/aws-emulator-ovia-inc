@@ -1,15 +1,10 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op ListEnvironments
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `ListEnvironments`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`ListEnvironments::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Implemented: `ListEnvironments` reports one entry per stored environment in
+//! `environmentId` order, truncating to `maxResults` and handing back a `nextToken` only
+//! while entries remain. A token that was not issued by a previous page is refused with
+//! the modelled 400 `ValidationException`.
 //!
 //! ## Shape of an operation
 //!
@@ -115,6 +110,9 @@ impl From<ListEnvironmentsErrorModeled> for ListEnvironmentsError {
     }
 }
 
+/// How this listing words a `nextToken` it did not issue.
+const INVALID_NEXT_TOKEN: &str = "The nextToken provided is invalid.";
+
 /// The `ListEnvironments` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -151,18 +149,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `ListEnvironments` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(ListEnvironmentsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("ListEnvironments"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            ListEnvironmentsErrorModeled::InternalServerException(InternalServerException {
+                message: crate::state::STORE_UNAVAILABLE.to_string(),
+            })
+        })?;
+
+        // A `nextToken` carries a cursor only this store's secret authenticates,
+        // so a token it did not mint names no place to resume from.
+        let store = state.lock();
+        let resume_after = match input.next_token.as_deref() {
+            Some(token) => Some(
+                crate::state::decode_page_token(&store.page_token_key, token).ok_or_else(|| {
+                    ListEnvironmentsErrorModeled::ValidationException(ValidationException {
+                        message: INVALID_NEXT_TOKEN.to_string(),
+                        field_list: Some(vec![ValidationExceptionField {
+                            path: "nextToken".to_string(),
+                            message: INVALID_NEXT_TOKEN.to_string(),
+                        }]),
+                    })
+                })?,
+            ),
+            None => None,
+        };
+
+        let (items, next_token) = store.page_environments(
+            resume_after.as_deref(),
+            crate::state::page_size(input.max_results),
+        );
+
+        Ok(ListEnvironmentsOutput { items, next_token })
     }
 }
