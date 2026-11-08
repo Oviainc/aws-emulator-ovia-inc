@@ -10,9 +10,11 @@
 //!   `DBInstance$AssociatedRoles` / `DBCluster$AssociatedRoles` report exactly the
 //!   associations that were made. A `FeatureName` outside the `SupportedFeatureNames` of
 //!   the resource's ENGINE VERSION, and a role whose stored trust policy does not let
-//!   `rds.amazonaws.com` assume it, are refused with `InvalidParameterValue`; the
-//!   role-and-feature pair is the identity of an association, so a second one is the
-//!   modelled already-exists fault and removing one that was never made is the modelled
+//!   `rds.amazonaws.com` assume it, are refused with `InvalidParameterValue`; an
+//!   association already in place is refused by the rule that holds for that resource — a
+//!   DB instance's engine takes one role ARN per feature name and a DB cluster takes one
+//!   association per role (`iam_role_association_refusals` beside this suite pins both
+//!   refusals' codes and sentences) — and removing one that was never made is the modelled
 //!   not-found fault.
 //! * `StartExportTask` EXPORTS the source's data: it writes one Apache Parquet object per
 //!   table of the source database plus the JSON file that says what was exported, into the
@@ -100,7 +102,7 @@ macro_rules! params {
 /// A router carrying this service plus the three its RDS/S3 integration resolves against —
 /// Amazon S3 (the destination bucket and the objects an export writes), IAM (the role) and
 /// KMS (the key) — all over ONE shared engine.
-fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
+pub(crate) fn emulator() -> (MultiServiceRouter, Arc<engine::InMemoryEngine>) {
     let engine: Arc<engine::InMemoryEngine> = Arc::new(engine::InMemoryEngine::new());
     let mut router = MultiServiceRouter::new();
     // Verifying signatures is the emulator's concern, not this service's; these tests sign
@@ -207,7 +209,7 @@ async fn create_bucket(router: &MultiServiceRouter, bucket: &str, region: &str) 
 /// Create a role trusting `principal`, with `policy` attached inline when one is given, and
 /// answer with its ARN — a role this emulator's own IAM holds, which is what the
 /// association and the export resolve.
-async fn role(
+pub(crate) async fn role(
     router: &MultiServiceRouter,
     name: &str,
     principal: &str,
@@ -237,23 +239,48 @@ async fn role(
 }
 
 /// Create a DB instance of `engine` and wait until it reports `available`.
-async fn available_instance(router: &MultiServiceRouter, identifier: &str, engine: &str) {
-    let request: Vec<(&str, String)> = params![
+pub(crate) async fn available_instance(router: &MultiServiceRouter, identifier: &str, engine: &str) {
+    available_instance_of(
+        router,
+        identifier,
+        engine,
+        "db.t3.micro",
+        20,
+        Some(DATABASE),
+    )
+    .await;
+}
+
+/// The same, with the class and the allocated storage the engine is OFFERED with, and the
+/// `DBName` it takes — the orderable options differ by engine family, and the Microsoft SQL
+/// Server engines take no `DBName` at all, so an engine outside the default row above names
+/// its own.
+pub(crate) async fn available_instance_of(
+    router: &MultiServiceRouter,
+    identifier: &str,
+    engine: &str,
+    class: &str,
+    storage: u32,
+    database: Option<&str>,
+) {
+    let mut request: Vec<(&str, String)> = params![
         "DBInstanceIdentifier" => identifier,
         "Engine" => engine,
-        "DBInstanceClass" => "db.t3.micro",
-        "AllocatedStorage" => 20,
+        "DBInstanceClass" => class,
+        "AllocatedStorage" => storage,
         "MasterUsername" => MASTER_USER,
         "MasterUserPassword" => MASTER_PASSWORD,
-        "DBName" => DATABASE,
     ]
     .to_vec();
+    if let Some(database) = database {
+        request.push(("DBName", database.to_string()));
+    }
     expect_ok(identifier, call(router, "CreateDBInstance", &request).await);
     wait_for_settle();
 }
 
 /// Create a DB cluster of `engine` and wait until it reports `available`.
-async fn available_cluster(router: &MultiServiceRouter, identifier: &str, engine: &str) {
+pub(crate) async fn available_cluster(router: &MultiServiceRouter, identifier: &str, engine: &str) {
     let request: Vec<(&str, String)> = params![
         "DBClusterIdentifier" => identifier,
         "Engine" => engine,
@@ -266,7 +293,7 @@ async fn available_cluster(router: &MultiServiceRouter, identifier: &str, engine
 }
 
 /// The `(RoleArn, FeatureName, Status)` triples an envelope's `AssociatedRoles` reports.
-fn associated_roles(envelope: &str) -> Vec<(String, String, String)> {
+pub(crate) fn associated_roles(envelope: &str) -> Vec<(String, String, String)> {
     subtrees(envelope, "AssociatedRoles")
         .into_iter()
         .flat_map(|roles| {
@@ -399,13 +426,26 @@ async fn an_instance_role_association_is_recorded_and_reported() {
             row.case
         );
 
-        // The pair is the identity of the association: a second one is refused rather than
-        // recorded twice.
-        expect_error(
+        // A feature of the instance's engine takes ONE role ARN, so a second association
+        // for the same feature is refused rather than recorded twice — with the Query API's
+        // parameter code and the engine's own sentence.
+        let body = expect_error(
             row.case,
             call(&router, "AddRoleToDBInstance", &request).await,
             400,
-            "DBInstanceRoleAlreadyExists",
+            "InvalidParameterValue",
+        );
+        let message = text(&body, "Message");
+        // Spelled out rather than taken from the code under test. Every published row above
+        // runs the `postgres` engine, which Amazon RDS names `PostgreSQL` in a sentence.
+        let expected = format!(
+            "The engine PostgreSQL supports only one ARN associated with feature name {}.",
+            row.feature
+        );
+        assert_eq!(
+            message, expected,
+            "case {:?}: expected the message {expected:?}, got {message:?}",
+            row.case
         );
 
         // Dropping it removes exactly that entry; dropping it again is the not-found fault.

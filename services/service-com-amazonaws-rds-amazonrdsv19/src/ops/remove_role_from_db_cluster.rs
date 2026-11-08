@@ -185,7 +185,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(cluster) = store.db_clusters.get(&key) else {
             return Err(RemoveRoleFromDBClusterErrorModeled::DBClusterNotFoundFault(
                 DBClusterNotFoundFault {
-                    message: Some(crate::state::db_cluster_cannot_be_accessed_message(
+                    message: Some(crate::state::db_cluster_not_found_colon_message(
                         &input.db_cluster_identifier,
                     )),
                 },
@@ -230,7 +230,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         let Some(cluster) = store.db_clusters.get_mut(&key) else {
             return Err(RemoveRoleFromDBClusterErrorModeled::DBClusterNotFoundFault(
                 DBClusterNotFoundFault {
-                    message: Some(crate::state::db_cluster_cannot_be_accessed_message(
+                    message: Some(crate::state::db_cluster_not_found_colon_message(
                         &input.db_cluster_identifier,
                     )),
                 },

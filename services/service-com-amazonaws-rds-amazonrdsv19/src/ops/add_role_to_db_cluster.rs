@@ -201,7 +201,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             else {
                 return Err(AddRoleToDBClusterErrorModeled::DBClusterNotFoundFault(
                     DBClusterNotFoundFault {
-                        message: Some(crate::state::db_cluster_cannot_be_accessed_message(
+                        message: Some(crate::state::db_cluster_not_found_colon_message(
                             &input.db_cluster_identifier,
                         )),
                     },
@@ -268,10 +268,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         .await
         {
             return Err(AddRoleToDBClusterError::invalid_parameter_value(
-                crate::state::role_not_trusted_message(
-                    &input.role_arn,
-                    crate::state::RDS_SERVICE_PRINCIPAL,
-                ),
+                crate::state::ROLE_NOT_TRUSTED_MESSAGE,
             ));
         }
 
@@ -284,7 +281,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         else {
             return Err(AddRoleToDBClusterErrorModeled::DBClusterNotFoundFault(
                 DBClusterNotFoundFault {
-                    message: Some(crate::state::db_cluster_cannot_be_accessed_message(
+                    message: Some(crate::state::db_cluster_not_found_colon_message(
                         &input.db_cluster_identifier,
                     )),
                 },
@@ -292,19 +289,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         };
         // "The specified IAM role Amazon Resource Name (ARN) is already associated with the
-        // specified DB cluster": the role-and-feature pair is the identity of an
-        // association, so associating it twice is the modelled already-exists fault rather
-        // than a second entry.
+        // specified DB cluster": a cluster's associations are keyed by the ROLE — the fault
+        // reports the role ARN and the cluster and names no feature — so a role already
+        // associated with this cluster, for this feature or another, is the modelled
+        // already-exists fault rather than a second entry.
         let held = crate::state::cluster_role_pairs(&cluster.associated_roles);
-        if crate::state::holds_association(&held, &input.role_arn, input.feature_name.as_deref()) {
+        if crate::state::holds_role(&held, &input.role_arn) {
             return Err(
                 AddRoleToDBClusterErrorModeled::DBClusterRoleAlreadyExistsFault(
                     DBClusterRoleAlreadyExistsFault {
-                        message: Some(crate::state::role_already_associated_message(
-                            "DB cluster",
-                            &identifier,
+                        message: Some(crate::state::cluster_role_already_associated_message(
                             &input.role_arn,
-                            input.feature_name.as_deref(),
+                            &input.db_cluster_identifier,
                         )),
                     },
                 )

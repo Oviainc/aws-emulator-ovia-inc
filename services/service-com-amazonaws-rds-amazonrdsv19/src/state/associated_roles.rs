@@ -7,11 +7,17 @@
 //! An association is what lets a database engine act under a caller-supplied role for ONE
 //! feature of that engine — loading from and unloading to Amazon S3, invoking a Lambda
 //! function, calling an Aurora machine-learning service — so the four operations all answer
-//! the same two questions before they write: does the ARN name a role this account's IAM
-//! holds that `rds.amazonaws.com` may assume, and is the `FeatureName` one the addressed
-//! resource's ENGINE VERSION publishes. Both questions have one answer per request
-//! whichever resource the request addressed, so they are stated once here rather than twice
-//! in the instance and cluster handlers.
+//! the same questions before they write: is the value an IAM role ARN at all
+//! ([`is_iam_role_arn`]), does it name a role this account's IAM holds that
+//! `rds.amazonaws.com` may assume, and is the `FeatureName` one the addressed resource's
+//! ENGINE VERSION publishes. Each question has one answer per request whichever resource
+//! the request addressed, so they are stated once here rather than twice in the instance
+//! and cluster handlers.
+//!
+//! What an association already in place is refused for is the one thing that differs by
+//! resource, because Amazon RDS words and codes the two refusals differently: a DB
+//! INSTANCE's engine takes one role ARN per feature name, and a DB CLUSTER takes one
+//! association per role.
 //!
 //! The feature names are not a list of this module's own: they are the
 //! `DBEngineVersion$SupportedFeatureNames` this service already publishes for that engine
@@ -98,26 +104,76 @@ pub fn unsupported_feature_name_message(
     )
 }
 
+/// The ARN form a member that names an IAM ROLE must carry:
+/// `arn:<aws partition>:iam::<account digits>:role/<name>`.
+///
+/// Source: this service's OWN model states the form, as the `IAMRoleArn` pattern
+/// `^arn:aws[a-z-]*:iam::[0-9]*:role/.*$` that `AddRoleToDBCluster$RoleArn` and
+/// `RemoveRoleFromDBCluster$RoleArn` target — so the partition is an `aws` one, an IAM ARN
+/// carries no Region, the account field is digits (the model lets it be empty) and the
+/// resource is a `role/…`. The sibling members of the same surface
+/// (`AddRoleToDBInstance$RoleArn`, `RemoveRoleFromDBInstance$RoleArn`) are modelled as a
+/// plain `String`, so for them the check is the handler's and this is where it lives: one
+/// reading of "the ARN of an IAM role" for every member of this service that takes one.
+///
+/// The vendor and the resource type come from `service_common::arn`'s shared requirement,
+/// so this crate and every other agree on what an IAM role ARN is; the three field rules
+/// beyond it are what this service's own pattern adds.
+#[must_use]
+pub fn is_iam_role_arn(value: &str) -> bool {
+    let role = ::service_common::arn::IAM_ROLE;
+    // One parse, filtered to the vendor the shared requirement names.
+    let Some(arn) = ::service_common::arn::parse_of(value, role.vendor) else {
+        return false;
+    };
+    let partition_of_aws = arn
+        .partition
+        .strip_prefix("aws")
+        .is_some_and(|rest| rest.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'-'));
+    // `role/` and not a bare `role`: the pattern's `.*` admits an empty role NAME, but not
+    // a resource field that names no role at all.
+    let names_a_role = role
+        .resource_type
+        .and_then(|kind| arn.resource.strip_prefix(kind))
+        .is_some_and(|rest| rest.starts_with('/'));
+    partition_of_aws
+        && arn.region.is_empty()
+        && arn.account.bytes().all(|byte| byte.is_ascii_digit())
+        && names_a_role
+}
+
+/// What a request whose `RoleArn` is not an IAM role ARN at all is refused with.
+///
+/// The sentence names the value that was rejected — the caller has to see which of its
+/// ARNs was unreadable — and nothing else: whether the role EXISTS is a different
+/// question, asked only of a value that is an ARN of a role to begin with.
+#[must_use]
+pub fn invalid_role_arn_message(role_arn: &str) -> String {
+    format!("Invalid Role ARN: {role_arn}")
+}
+
 /// What a request naming a role Amazon RDS cannot assume is refused with: the role's trust
 /// policy has to grant `sts:AssumeRole` to the service principal that will act under it.
 ///
-/// Named with the principal the trust policy must carry, because that is the part of the
-/// role the caller has to change.
-#[must_use]
-pub fn role_not_trusted_message(role_arn: &str, service_principal: &str) -> String {
-    format!(
-        "The IAM role {role_arn} cannot be assumed by Amazon RDS. Add {service_principal} to \
-         the trust relationship of the role and try again."
-    )
-}
+/// ONE fixed sentence, with no variable part: this refusal names neither the role ARN the
+/// request carried nor the principal the trust policy is missing — it reports only that the
+/// value does not carry what the role integration needs — so it is a constant rather than a
+/// `format!` over the request, and the cardinality of the text stays at one for a client
+/// matching on it.
+pub const ROLE_NOT_TRUSTED_MESSAGE: &str = "IAM role ARN value is invalid or does not \
+                                            include the required permissions for: \
+                                            AWS_ROLE_INTEGRATION";
 
 /// Whether `roles` already carries an association of `role_arn` for `feature_name`.
 ///
-/// The pair is the identity of an association — one role can serve two features of a
-/// resource, and two roles can serve two features — which is what the already-exists faults
-/// of both add operations report ("The specified RoleArn or FeatureName value is already
-/// associated with the DB instance"). A `FeatureName` the request left out compares as the
-/// association that names none.
+/// The pair is the identity of the association a DISASSOCIATION names: "the specified
+/// RoleArn value doesn't match the specified feature", so a role associated for another
+/// feature is not the association the request asked to remove. A `FeatureName` the request
+/// left out compares as the association that names none.
+///
+/// What an ASSOCIATION is refused for is narrower on each resource, and is not this pair:
+/// a DB instance's feature takes one role ([`holds_feature`]) and a DB cluster's role is
+/// associated once ([`holds_role`]).
 #[must_use]
 pub fn holds_association(
     roles: &[(String, Option<String>)],
@@ -129,24 +185,69 @@ pub fn holds_association(
     })
 }
 
-/// How Amazon RDS words the already-exists fault of an association: it names the role and
-/// the feature the resource already has that role associated for.
+/// Whether `roles` already carries an association of ANY role for `feature_name`.
+///
+/// A DB INSTANCE's engine admits one role ARN per feature name
+/// ([`one_arn_per_feature_message`]), so this — not the role-and-feature pair — is what an
+/// association on an instance is refused for: the feature is taken, whichever role took it.
 #[must_use]
-pub fn role_already_associated_message(
-    resource: &str,
-    identifier: &str,
-    role_arn: &str,
-    feature_name: Option<&str>,
-) -> String {
-    match feature_name {
-        Some(feature) => format!(
-            "The IAM role {role_arn} is already associated with the {resource} {identifier} for \
-             the feature {feature}."
-        ),
-        None => format!(
-            "The IAM role {role_arn} is already associated with the {resource} {identifier}."
-        ),
-    }
+pub fn holds_feature(roles: &[(String, Option<String>)], feature_name: &str) -> bool {
+    roles
+        .iter()
+        .any(|(_, held_feature)| held_feature.as_deref() == Some(feature_name))
+}
+
+/// Whether `roles` already carries an association of `role_arn`, for any feature or none.
+///
+/// A DB CLUSTER's associations are keyed by the ROLE: its already-exists fault reports
+/// that the role ARN "is already associated with DB Cluster: …" and names no feature at
+/// all ([`cluster_role_already_associated_message`]), so one role is associated with one
+/// cluster once.
+#[must_use]
+pub fn holds_role(roles: &[(String, Option<String>)], role_arn: &str) -> bool {
+    roles.iter().any(|(held_arn, _)| held_arn == role_arn)
+}
+
+/// The engine's own name, as Amazon RDS writes it in a sentence about the engine: the
+/// product name the published engine catalogue reports for that `Engine` value
+/// (`postgres` → `PostgreSQL`), which `DescribeDBEngineVersions` already answers with.
+///
+/// An engine the catalogue publishes nothing for is named by the `Engine` value itself —
+/// there is no other name for it this service knows.
+#[must_use]
+pub fn engine_display_name(engine: &str) -> &str {
+    crate::ops::describe_db_engine_versions::engine_facts(engine)
+        .map_or(engine, |facts| facts.product)
+}
+
+/// What an association on a DB INSTANCE whose `FeatureName` already has a role is refused
+/// with: a feature of a DB instance's engine acts under ONE role, so the second ARN for it
+/// is a value this parameter will not take rather than a resource conflict.
+///
+/// The sentence names the engine (by the product name it is published under) and the
+/// feature name the request carried, because those are the two halves of the rule the
+/// caller has to work with.
+#[must_use]
+pub fn one_arn_per_feature_message(engine: &str, feature_name: &str) -> String {
+    format!(
+        "The engine {} supports only one ARN associated with feature name {feature_name}.",
+        engine_display_name(engine)
+    )
+}
+
+/// How Amazon RDS words the already-exists fault of a DB CLUSTER's association: it names
+/// the role ARN the request carried and the cluster it is already associated with, and
+/// tells the caller which value to look at.
+///
+/// `identifier` is the value the REQUEST named rather than the key the store folded it to,
+/// so a caller matching the sentence against what it sent finds it there — the same reason
+/// the cluster not-found wordings name the request's spelling.
+#[must_use]
+pub fn cluster_role_already_associated_message(role_arn: &str, identifier: &str) -> String {
+    format!(
+        "Role ARN {role_arn} is already associated with DB Cluster: {identifier}. Verify your \
+         role ARN and try again."
+    )
 }
 
 /// How Amazon RDS words the role-not-found fault of a disassociation: the role the request

@@ -165,6 +165,8 @@ mod global_clusters;
 mod global_database_published_versions;
 #[path = "all/guard_order_and_refusal_classes.rs"]
 mod guard_order_and_refusal_classes;
+#[path = "all/iam_role_association_refusals.rs"]
+mod iam_role_association_refusals;
 #[path = "all/instance_configuration_guards.rs"]
 mod instance_configuration_guards;
 #[path = "all/integration_deletion.rs"]

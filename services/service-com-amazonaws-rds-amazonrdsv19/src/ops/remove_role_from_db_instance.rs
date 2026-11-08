@@ -162,6 +162,16 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         let region =
             crate::state::request_region(ctx).map_err(RemoveRoleFromDBInstanceError::validation)?;
+        // `RoleArn` is "the Amazon Resource Name (ARN) of the IAM role to disassociate from
+        // the DB instance": a value that is not an IAM role ARN names no role, so it is
+        // refused for its own form before the instance is resolved — the same reading of
+        // the member `AddRoleToDBInstance` applies, because the model leaves it a plain
+        // `String` on both.
+        if !crate::state::is_iam_role_arn(&input.role_arn) {
+            return Err(RemoveRoleFromDBInstanceError::invalid_parameter_value(
+                crate::state::invalid_role_arn_message(&input.role_arn),
+            ));
+        }
         // "The name of the DB instance to disassociate the IAM role from", folded the way
         // the stored key is.
         let identifier = crate::state::db_instance_identifier_of(&input.db_instance_identifier)
