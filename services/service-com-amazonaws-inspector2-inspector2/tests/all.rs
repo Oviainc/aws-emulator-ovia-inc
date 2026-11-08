@@ -19,6 +19,8 @@ mod code_security_scan_configurations;
 mod ec2_deep_inspection;
 #[path = "all/encryption_key.rs"]
 mod encryption_key;
+#[path = "all/encryption_key_scope.rs"]
+mod encryption_key_scope;
 #[path = "all/filter_arn_and_tags.rs"]
 mod filter_arn_and_tags;
 #[path = "all/filters_and_enablement.rs"]
@@ -27,11 +29,11 @@ mod filters_and_enablement;
 mod finding_aggregations;
 #[path = "all/pattern_refusal_wording.rs"]
 mod pattern_refusal_wording;
+#[path = "all/resource_tags.rs"]
+mod resource_tags;
+#[path = "all/search_vulnerabilities.rs"]
+mod search_vulnerabilities;
 #[path = "all/state_roundtrip.rs"]
 mod state_roundtrip;
 #[path = "all/usage_totals.rs"]
 mod usage_totals;
-#[path = "all/encryption_key_scope.rs"]
-mod encryption_key_scope;
-#[path = "all/resource_tags.rs"]
-mod resource_tags;

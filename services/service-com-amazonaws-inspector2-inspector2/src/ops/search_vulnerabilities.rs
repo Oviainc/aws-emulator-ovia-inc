@@ -1,15 +1,11 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op SearchVulnerabilities
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `SearchVulnerabilities`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`SearchVulnerabilities::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Answers the vulnerability record the requested CVE id addresses, out of the
+//! vulnerability database held in this service's store
+//! ([`crate::state::ComAmazonawsInspector2Inspector2State::vulnerabilities`]). A read: it
+//! reports records and writes nothing.
 //!
 //! ## Shape of an operation
 //!
@@ -117,6 +113,22 @@ impl From<SearchVulnerabilitiesErrorModeled> for SearchVulnerabilitiesError {
     }
 }
 
+/// How many records one page carries.
+///
+/// Source: `smithy_query(query="closure", operation="SearchVulnerabilities")` — the
+/// `Vulnerabilities` list the response reports is modelled `len 0..1`, so an answer holds
+/// at most ONE record and a request naming more matching ids is paged.
+const PAGE_SIZE: usize = 1;
+
+/// The vulnerability id a cursor names, or `None` when the value is not a cursor this
+/// operation minted. A token only decodes when it is hex AND the bytes are a vulnerability
+/// id, so an arbitrary even-length hex string is refused rather than read as a position.
+/// The hex coding itself is [`crate::state::decode_cursor`], shared with this service's
+/// other paginated operations.
+fn decode_token(token: &str) -> Option<String> {
+    crate::state::decode_cursor(token, crate::state::is_vulnerability_id)
+}
+
 /// The `SearchVulnerabilities` operation.
 ///
 /// Owns the shared engine (the constructor seam) and implements
@@ -153,18 +165,68 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `SearchVulnerabilities` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(SearchVulnerabilitiesErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("SearchVulnerabilities"))
+        let _ = ctx;
+        let state = crate::state::service_state(&*self.engine).ok_or_else(|| {
+            SearchVulnerabilitiesErrorModeled::InternalServerException(InternalServerException {
+                message: "Amazon Inspector vulnerability data is unavailable".to_string(),
+                retry_after_seconds: None,
+            })
+        })?;
+
+        // A token this operation did not mint cannot name a position, so the request is
+        // refused rather than silently answered from the start of the search.
+        let after = match input.next_token.as_deref() {
+            Some(token) => Some(decode_token(token).ok_or_else(|| {
+                SearchVulnerabilitiesErrorModeled::ValidationException(ValidationException {
+                    message:
+                        "nextToken is not a token returned by a previous SearchVulnerabilities call"
+                            .to_string(),
+                    reason: "CANNOT_PARSE".to_string(),
+                    fields: Some(vec![ValidationExceptionField {
+                        name: "nextToken".to_string(),
+                        message: "must be a nextToken returned by SearchVulnerabilities"
+                            .to_string(),
+                    }]),
+                })
+            })?),
+            None => None,
+        };
+
+        // The ids the request names, indexed ONCE into a set: a repeated id names one
+        // record, and the set's order is the stable order the page cursor is meaningful
+        // in. `VulnId`'s `@pattern` is already enforced at the boundary, so every id here
+        // is well formed.
+        let requested: ::std::collections::BTreeSet<&str> = input
+            .filter_criteria
+            .vulnerability_ids
+            .iter()
+            .map(String::as_str)
+            .collect();
+
+        let guard = state.lock();
+        // One more than the page is read so the cursor is only emitted when a further
+        // matching record really exists. An id the vulnerability database holds no record
+        // for matches nothing — which is what makes the answer for an unknown CVE an
+        // EMPTY list rather than a record with no data in it.
+        let mut page: Vec<&Vulnerability> = requested
+            .iter()
+            .filter(|id| after.as_deref().is_none_or(|cursor| **id > cursor))
+            .filter_map(|id| guard.vulnerabilities.get(*id))
+            .take(PAGE_SIZE + 1)
+            .collect();
+
+        let truncated = page.len() > PAGE_SIZE;
+        page.truncate(PAGE_SIZE);
+        let next_token = truncated
+            .then(|| {
+                page.last()
+                    .map(|record| crate::state::encode_cursor(&record.id))
+            })
+            .flatten();
+
+        Ok(SearchVulnerabilitiesOutput {
+            vulnerabilities: page.into_iter().cloned().collect(),
+            next_token,
+        })
     }
 }

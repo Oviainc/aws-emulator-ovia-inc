@@ -24,6 +24,9 @@
 //!   `DeleteCodeSecurityScanConfiguration`.
 //! * `org_package_paths` — the organization-wide deep inspection custom paths both deep
 //!   inspection reads report alongside an account's own.
+//! * `vulnerabilities` — the vulnerability database `SearchVulnerabilities` answers from,
+//!   seeded from the published records in [`vulnerability_catalog`] because no operation
+//!   of this API publishes a vulnerability.
 //!
 //! A resource's tags live on that resource's own record, never in a map beside it, so the
 //! tagging operations and the reads that echo a record's tags can never report two
@@ -31,10 +34,16 @@
 //! [`ComAmazonawsInspector2Inspector2State::resource_tag_slot_mut`] is the one place a
 //! `resourceArn` is resolved to the record whose tags a tagging call reads or writes.
 
+mod vulnerability_catalog;
+
+pub use vulnerability_catalog::*;
+
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, SystemTime};
 
-use crate::ops::types::{CodeSecurityScanConfiguration, FilterCriteria, Schedule, ScopeSettings};
+use crate::ops::types::{
+    CodeSecurityScanConfiguration, FilterCriteria, Schedule, ScopeSettings, Vulnerability,
+};
 
 /// The region a request is scoped to when it carries no SigV4 credential scope to read
 /// one from: the region every generated emulator defaults to (see `emulator_arn` in
@@ -400,7 +409,7 @@ impl AccountEnablement {
 }
 
 /// Per-service state for com-amazonaws-inspector2-inspector2. A handler reaches it through [`service_state`].
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct ComAmazonawsInspector2Inspector2State {
     /// Stored filters, keyed by ARN. Bounded by [`MAX_STORED_FILTERS`]: `CreateFilter`
     /// refuses once the map holds that many.
@@ -444,6 +453,30 @@ pub struct ComAmazonawsInspector2Inspector2State {
     /// `UpdateOrgEc2DeepInspectionConfiguration`, which both deep inspection reads report
     /// from here. Bounded by the modelled `PathList` length (at most 5).
     pub org_package_paths: Vec<String>,
+    /// The vulnerability database, keyed by the CVE id a record is addressed by.
+    ///
+    /// Amazon Inspector republishes vulnerability records rather than minting them, and
+    /// no operation of this API writes one, so this map is SEEDED with the published
+    /// records this emulator ships ([`seed_vulnerability_catalog`]) and only read from.
+    /// BOUNDED without a cap of its own: nothing adds an entry after the seed.
+    pub vulnerabilities: BTreeMap<String, Vulnerability>,
+}
+
+impl Default for ComAmazonawsInspector2Inspector2State {
+    fn default() -> Self {
+        Self {
+            filters: BTreeMap::new(),
+            accounts: BTreeMap::new(),
+            next_filter_id: 0,
+            cis_scan_configurations: BTreeMap::new(),
+            next_cis_scan_configuration_id: 0,
+            code_security_scan_configurations: BTreeMap::new(),
+            next_code_security_scan_configuration_id: 0,
+            encryption_keys: BTreeMap::new(),
+            org_package_paths: Vec::new(),
+            vulnerabilities: seed_vulnerability_catalog(),
+        }
+    }
 }
 
 /// What both EC2 deep inspection reads report for one account: its activation status at
