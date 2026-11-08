@@ -133,6 +133,18 @@ fn topic_calls() -> Vec<TopicCall> {
             "/topics?maxResults=10&topicNameFilter=ord".to_string(),
             None,
         ),
+        TopicCall::new(
+            "DescribeTopicPartitions",
+            "GET",
+            format!("/topics/{}/partitions", pct("orders")),
+            None,
+        ),
+        TopicCall::new(
+            "DescribeTopicPartitions with a page size",
+            "GET",
+            format!("/topics/{}/partitions?maxResults=10", pct("orders.v2")),
+            None,
+        ),
     ]
 }
 
@@ -273,6 +285,11 @@ async fn the_same_calls_serve_a_provisioned_cluster() {
         );
         for (case, method, suffix) in [
             ("DescribeTopic", "GET", format!("/topics/{}", pct("orders"))),
+            (
+                "DescribeTopicPartitions",
+                "GET",
+                format!("/topics/{}/partitions", pct("orders")),
+            ),
             ("ListTopics", "GET", "/topics".to_string()),
             ("DeleteTopic", "DELETE", format!("/topics/{}", pct("orders"))),
         ] {

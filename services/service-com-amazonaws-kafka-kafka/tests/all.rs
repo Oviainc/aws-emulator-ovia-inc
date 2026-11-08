@@ -125,6 +125,8 @@ mod topic_apis_serverless_gate;
 mod topic_lifecycle;
 #[path = "all/topic_lookup_miss_refusal.rs"]
 mod topic_lookup_miss_refusal;
+#[path = "all/topic_partition_reporting.rs"]
+mod topic_partition_reporting;
 #[path = "all/topic_replication.rs"]
 mod topic_replication;
 #[path = "all/version_catalog_consistency.rs"]

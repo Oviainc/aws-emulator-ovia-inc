@@ -1,15 +1,31 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op DescribeTopicPartitions
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `DescribeTopicPartitions`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
 //!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`DescribeTopicPartitions::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
+//! Pages the partitions of one topic of a stored cluster in partition-id order,
+//! each one computed from the topic's own record and the brokers the cluster
+//! holds: a topic of `PartitionCount` partitions reports exactly the ids
+//! `0 .. PartitionCount - 1`, so this reader and `DescribeTopic` can never
+//! disagree about how many partitions a topic has. Each partition's replica set
+//! is laid out over the cluster's broker ids by Apache Kafka's own default
+//! assignment ([`partition_info`]), the leader is the first replica, and every
+//! replica is in sync — nothing here can put a broker behind.
+//!
+//! The topic and the cluster are resolved exactly as in `DescribeTopic`, through
+//! [`crate::state::ComAmazonawsKafkaKafkaState::observable_topic_in`] — the one
+//! derivation every topic reader answers from — so a topic a running MSK
+//! Replicator carries onto this cluster reports its partitions here too. After
+//! the checks the request alone decides: a `ClusterArn` that is not an MSK
+//! cluster ARN and a `TopicName` Apache Kafka itself would refuse are
+//! `BadRequestException`, a well-formed ARN this endpoint's region holds no
+//! cluster for and a legal name the cluster holds no topic for are both
+//! `NotFoundException`, and a cluster whose `ClusterType` is serverless is
+//! refused on its KIND with [`crate::state::serverless_topic_apis_unsupported`]
+//! before the topic is looked up.
+//!
+//! REPORTING ONLY: the one write it makes is the one `observable_topic_in`
+//! materialises — a transition the clock already owed THIS topic, due at the same
+//! instant whether or not anybody called.
 //!
 //! ## Shape of an operation
 //!
@@ -82,6 +98,10 @@
 
 #[allow(unused_imports)]
 use super::types::*;
+// The largest page `MaxResults` may ask for, from that member's `range` in the
+// model (1..100), and the size used when the request names none. The crate's own
+// bound, shared with every other paginated reader rather than restated here.
+use crate::state::MAX_RESULTS_LIMIT;
 
 // `#[operation_error]` below expands to an invocation of the LOCAL declarative
 // `smithy!` macro, which this line is what emits into the module. Without it the
@@ -116,6 +136,99 @@ pub type DescribeTopicPartitionsError = crate::scaffolded::Scaffolded<DescribeTo
 impl From<DescribeTopicPartitionsErrorModeled> for DescribeTopicPartitionsError {
     fn from(modeled: DescribeTopicPartitionsErrorModeled) -> Self {
         crate::scaffolded::Scaffolded::Modeled(modeled)
+    }
+}
+
+/// Marker that prefixes a token's plaintext, so a token minted for some other
+/// list cannot be mistaken for one of these.
+const NEXT_TOKEN_PREFIX: &str = "kafka:topic-partitions:";
+
+/// Separates the cluster ARN and the topic name a token was minted for from the
+/// partition id the page stopped at. Neither an MSK ARN nor a legal Kafka topic
+/// name can contain it, so the plaintext splits back into exactly three fields.
+const NEXT_TOKEN_SEPARATOR: char = '#';
+
+/// Encode the topic and the partition id a page stopped at as a token, through
+/// the crate's one page-token codec ([`crate::state::encode_page_token`]).
+fn encode_next_token(cluster_arn: &str, topic_name: &str, last_partition: i32) -> String {
+    crate::state::encode_page_token(
+        NEXT_TOKEN_PREFIX,
+        &format!(
+            "{cluster_arn}{NEXT_TOKEN_SEPARATOR}{topic_name}\
+             {NEXT_TOKEN_SEPARATOR}{last_partition}"
+        ),
+    )
+}
+
+/// The partition id a token resumes after, or `None` when the token is not one
+/// this operation minted FOR THIS TOPIC: a token carries the list it was minted
+/// from, so one topic's page token cannot resume another topic's partitions.
+fn decode_next_token(token: &str, cluster_arn: &str, topic_name: &str) -> Option<i32> {
+    let plaintext = crate::state::decode_page_token(NEXT_TOKEN_PREFIX, token)?;
+    let (arn, rest) = plaintext.split_once(NEXT_TOKEN_SEPARATOR)?;
+    let (name, last_partition) = rest.split_once(NEXT_TOKEN_SEPARATOR)?;
+    if arn != cluster_arn || name != topic_name {
+        return None;
+    }
+    last_partition.parse().ok()
+}
+
+/// One partition of a topic, as the cluster's brokers hold it.
+///
+/// `broker_ids` are the ids of the brokers the cluster has, in the order it holds
+/// them, and `replication_factor` is the topic's own — bounded here by the number
+/// of brokers, because Apache Kafka cannot place more replicas of a partition
+/// than there are brokers to place them on.
+///
+/// The replica set is Apache Kafka's own default assignment
+/// (`AdminUtils.assignReplicasToBrokers`) with the start index and the replica
+/// shift at zero, so a partition's layout is a pure function of the partition id,
+/// the replication factor and the broker list: the first replica of partition `p`
+/// is broker `p % n`, and each further replica steps `1 + (p / n + j) % (n - 1)`
+/// brokers on from it, which is what spreads the followers of consecutive
+/// partitions over different brokers instead of stacking them on the same one.
+/// The first replica is the partition's leader, and every replica is in sync:
+/// nothing here can put a broker behind, so the in-sync set is computed from that
+/// fact rather than invented.
+fn partition_info(
+    partition: i32,
+    replication_factor: i32,
+    broker_ids: &[i32],
+) -> TopicPartitionInfo {
+    // BOUNDED, never trusted: the caller refused a cluster holding no brokers, so
+    // this is that cluster's broker count and every lookup below resolves. The
+    // replica set is bounded by it too, so the topic's own replication factor
+    // cannot size the allocation.
+    let brokers = broker_ids.len().max(1);
+    let index = usize::try_from(partition).unwrap_or(0);
+    let first = index % brokers;
+    let replicas_wanted = usize::try_from(replication_factor.max(1))
+        .unwrap_or(1)
+        .min(brokers);
+    // Kafka's own second-replica shift: it advances once per full pass over the
+    // brokers, which is what keeps the followers of one pass off the brokers the
+    // previous pass put them on.
+    let shift = index / brokers;
+    // A follower may sit on any broker but the leader's, so it steps over
+    // `brokers - 1` of them. `max(1)` keeps the modulus defined for a one-broker
+    // cluster, whose topics have one replica and so run no iteration below.
+    let spread = brokers.saturating_sub(1).max(1);
+    let mut replicas = Vec::with_capacity(replicas_wanted);
+    replicas.push(broker_ids.get(first).copied().unwrap_or_default());
+    for follower in 0..replicas_wanted.saturating_sub(1) {
+        let step = 1 + (shift + follower) % spread;
+        replicas.push(
+            broker_ids
+                .get((first + step) % brokers)
+                .copied()
+                .unwrap_or_default(),
+        );
+    }
+    TopicPartitionInfo {
+        partition: Some(partition),
+        leader: replicas.first().copied(),
+        isr: Some(replicas.clone()),
+        replicas: Some(replicas),
     }
 }
 
@@ -155,18 +268,175 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `DescribeTopicPartitions` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(DescribeTopicPartitionsErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("DescribeTopicPartitions"))
+        // Decided FIRST, on the ARN as submitted and from the request alone. A
+        // topic call reaches the cluster's Apache Kafka data plane, so the action
+        // it is authorized under is connecting to that cluster — and the caller
+        // holds no resource-based policy over a cluster of another account, so
+        // such a request is refused rather than answered out of what this
+        // registry happens to hold under that ARN. See
+        // [`crate::state::authorization`].
+        crate::state::authorization::authorize_action(
+            crate::state::authorization::CLUSTER_CONNECT_ACTION,
+            &input.cluster_arn,
+        )?;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(
+                DescribeTopicPartitionsErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some("the kafka service state is unavailable".to_string()),
+                    },
+                )
+                .into(),
+            );
+        };
+        let region = crate::state::request_region(ctx.parts());
+
+        // Request-only checks first, so the registry mutex below is held for the
+        // state-dependent work alone.
+        if !crate::state::is_cluster_arn(&input.cluster_arn) {
+            return Err(DescribeTopicPartitionsErrorModeled::BadRequestException(
+                crate::state::malformed_arn(crate::state::CLUSTER_ARN_MEMBER),
+            )
+            .into());
+        }
+        if let Some(reason) = crate::state::topic_name_error(&input.topic_name) {
+            return Err(DescribeTopicPartitionsErrorModeled::BadRequestException(
+                BadRequestException {
+                    invalid_parameter: Some("TopicName".to_string()),
+                    message: Some(reason),
+                },
+            )
+            .into());
+        }
+
+        // A token names the partition the previous page stopped at; the next page
+        // starts after it in partition-id order, so a topic whose partition count
+        // grows between pages shifts nothing already returned.
+        let resume_after = match input.next_token.as_deref() {
+            None => None,
+            Some(token) => {
+                match decode_next_token(token, &input.cluster_arn, &input.topic_name) {
+                    Some(partition) => Some(partition),
+                    None => {
+                        return Err(DescribeTopicPartitionsErrorModeled::BadRequestException(
+                            BadRequestException {
+                                invalid_parameter: Some("nextToken".to_string()),
+                                message: Some("The pagination token is not valid.".to_string()),
+                            },
+                        )
+                        .into())
+                    }
+                }
+            }
+        };
+
+        // Absent `MaxResults` pages at the largest size the model allows, and no
+        // request may ask for a longer page than that range permits.
+        let page_size = usize::try_from(input.max_results.unwrap_or(MAX_RESULTS_LIMIT))
+            .unwrap_or(MAX_RESULTS_LIMIT as usize)
+            .clamp(1, MAX_RESULTS_LIMIT as usize);
+
+        let mut state = state.lock();
+
+        // The partitions of a topic are held BY a cluster, so a `ClusterArn` this
+        // endpoint's region holds no cluster for names a resource that is not
+        // there.
+        let Some(cluster) = state.cluster_in(&region, &input.cluster_arn) else {
+            return Err(DescribeTopicPartitionsErrorModeled::NotFoundException(
+                NotFoundException {
+                    invalid_parameter: Some("ClusterArn".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // The Topic Management surface applies to a cluster whose brokers this
+        // service manages for the caller, so a serverless one is refused on its
+        // KIND -- before the topic is looked up at all, since no answer about a
+        // topic of such a cluster is this API's to give.
+        if cluster.is_serverless() {
+            return Err(crate::state::serverless_topic_apis_unsupported());
+        }
+
+        // The brokers the partitions below are placed over, in the order the
+        // cluster holds them. A provisioned cluster is laid out with one broker
+        // node per `NumberOfBrokerNodes`, so the list is never empty by the time a
+        // topic of it can be addressed; a record that somehow holds none has no
+        // brokers to report a partition's replicas on, which is a server-side
+        // condition rather than anything the caller can fix.
+        let broker_ids: Vec<i32> = cluster.brokers.iter().map(|broker| broker.id).collect();
+        if broker_ids.is_empty() {
+            return Err(
+                DescribeTopicPartitionsErrorModeled::InternalServerErrorException(
+                    InternalServerErrorException {
+                        invalid_parameter: None,
+                        message: Some(
+                            "the cluster holds no broker nodes to report partitions on"
+                                .to_string(),
+                        ),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // Reporting only: the write this makes materialises the transitions the
+        // clock already owed THIS topic, each of which was due at the same instant
+        // whether or not anybody called. The lookup answers from the one
+        // derivation every topic reader uses, so a topic a running replicator
+        // carries onto this cluster reports its partitions here exactly while
+        // `DescribeTopic` reports the topic itself.
+        let Some(topic) = state.observable_topic_in(
+            &input.cluster_arn,
+            &input.topic_name,
+            std::time::SystemTime::now(),
+        ) else {
+            return Err(DescribeTopicPartitionsErrorModeled::NotFoundException(
+                NotFoundException {
+                    invalid_parameter: Some("TopicName".to_string()),
+                    message: Some(crate::state::RESOURCE_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A topic of `PartitionCount` partitions has exactly the ids
+        // `0 .. PartitionCount - 1`, so the page is walked from its resume point
+        // and built one partition at a time: only the partitions this page
+        // reports are ever materialised, whatever count the topic carries.
+        let first = resume_after.map_or(0, |last| last.saturating_add(1)).max(0);
+        let mut partitions: Vec<TopicPartitionInfo> = Vec::with_capacity(page_size);
+        let mut last_partition: Option<i32> = None;
+        let mut more_remain = false;
+        for partition in first..topic.partition_count {
+            if partitions.len() == page_size {
+                more_remain = true;
+                break;
+            }
+            partitions.push(partition_info(
+                partition,
+                topic.replication_factor,
+                &broker_ids,
+            ));
+            last_partition = Some(partition);
+        }
+
+        // The token is minted from the PARTITION ID the resume comparison uses, so
+        // the two can never disagree and a full page that exhausted the topic's
+        // partitions closes the list rather than promising another page.
+        let next_token = if more_remain {
+            last_partition.map(|last| {
+                encode_next_token(&input.cluster_arn, &input.topic_name, last)
+            })
+        } else {
+            None
+        };
+
+        Ok(DescribeTopicPartitionsOutput {
+            partitions: Some(partitions),
+            next_token,
+        })
     }
 }

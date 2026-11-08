@@ -1045,3 +1045,8 @@ mod all_rs_declares_each_suite_once;
 mod cloudformation_wafv2_protection_stack;
 // Declared here, in the appended tail, for the reason the entries above record: the sorted
 // `e…` span is a region concurrently landing suites add their line to.
+// `cloudformation_asset_bucket_publishing_role` — are each ALREADY declared above, in the
+// sorted head. Two concurrent changes appended the same entry, which is a redefinition and
+// stops this target from compiling; the duplicate lines are removed here and the first
+// declaration of each stands. `bedrock_agentcore_data_plane_parent_resources`, which stood
+// just below, was appended the same way and is declared in that head too.
