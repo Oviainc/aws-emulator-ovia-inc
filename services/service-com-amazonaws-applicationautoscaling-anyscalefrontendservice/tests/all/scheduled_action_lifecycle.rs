@@ -844,12 +844,26 @@ async fn a_scheduled_action_needs_a_registered_target_and_a_matching_dimension()
         );
     }
 
-    // A namespace and a dimension that are each legal but do not belong together.
-    let mismatches: &[(&str, &str)] = &[
-        ("ecs", "dynamodb:table:ReadCapacityUnits"),
-        ("neptune", "rds:cluster:ReadReplicaCount"),
+    // A namespace and a dimension that are each legal but do not belong together: nothing
+    // could have registered that pair, so the triple names no scalable target to hang the
+    // action off — which is what this call reports, unless the `ResourceId` does not take the
+    // form the namespace documents for the dimension's resource type, which is a bad request
+    // and is refused as one first.
+    let mismatches: &[(&str, &str, &str, &str)] = &[
+        (
+            "a dimension of another namespace, whose resource type that namespace documents no form for",
+            "ecs",
+            "dynamodb:table:ReadCapacityUnits",
+            "ObjectNotFoundException",
+        ),
+        (
+            "a dimension of another namespace, whose resource type this one documents a form for",
+            "neptune",
+            "rds:cluster:ReadReplicaCount",
+            "ValidationException",
+        ),
     ];
-    for (namespace, dimension) in mismatches {
+    for (case, namespace, dimension, expected) in mismatches {
         let (status, body) = emulator
             .call(
                 "PutScheduledAction",
@@ -864,11 +878,11 @@ async fn a_scheduled_action_needs_a_registered_target_and_a_matching_dimension()
             .await;
         assert_eq!(
             status, 400,
-            "case {namespace:?}/{dimension:?}: expected HTTP 400, got {status} {body:?}"
+            "case {case:?}: expected HTTP 400, got {status} {body:?}"
         );
         assert!(
-            error_code(&body).contains("ValidationException"),
-            "case {namespace:?}/{dimension:?}: expected a ValidationException, got {body:?}"
+            error_code(&body).contains(expected),
+            "case {case:?}: expected a {expected}, got {body:?}"
         );
     }
 

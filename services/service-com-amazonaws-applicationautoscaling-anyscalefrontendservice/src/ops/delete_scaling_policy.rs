@@ -169,7 +169,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{check_dimension_namespace, check_enum, PolicyKey, TargetKey};
+        use crate::state::{check_enum, PolicyKey, TargetKey};
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeleteScalingPolicyErrorModeled::InternalServiceException(
@@ -194,8 +194,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             SCALABLE_DIMENSION_VALUES,
         )
         .map_err(validation)?;
-        check_dimension_namespace(&input.service_namespace, &input.scalable_dimension)
-            .map_err(validation)?;
+        // The pair is NOT cross-checked here: this operation addresses a sub-resource OF a
+        // scalable target, and the triple it names is resolved as that target's identity. A
+        // dimension of another namespace cannot have been registered with this one, so such
+        // a triple names nothing to delete (see `put_scaling_policy`).
 
         let key = PolicyKey {
             target: TargetKey {

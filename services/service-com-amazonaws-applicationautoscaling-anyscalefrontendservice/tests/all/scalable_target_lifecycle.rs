@@ -1140,9 +1140,12 @@ async fn every_modelled_dimension_names_the_namespace_it_belongs_to() {
 
     let emulator = Emulator::with_tables(TABLES).await;
 
-    // A namespace and a dimension that are each legal but do not belong together are
-    // refused by every operation that takes both as part of the target's identity, and
-    // by the Describes that filter on a dimension.
+    // A namespace and a dimension that are each legal but do not belong together: which
+    // refusal they get follows what the operation DOES with them. One that takes the pair as
+    // part of a REGISTRATION it writes, or as a filter it narrows a read with, refuses the
+    // pair itself; one that depends on an existing scalable target resolves the triple as
+    // that target's identity, and a pair that cannot belong together names no registered
+    // target — which is the answer it gets.
     let mismatches: &[(&str, &str)] = &[
         ("ecs", "dynamodb:table:ReadCapacityUnits"),
         ("dynamodb", "ecs:service:DesiredCount"),
@@ -1152,42 +1155,48 @@ async fn every_modelled_dimension_names_the_namespace_it_belongs_to() {
 
     for (namespace, dimension) in mismatches {
         let case = format!("{namespace} with {dimension}");
-        let requests: &[(&str, Value)] = &[
+        let requests: &[(&str, Value, &str)] = &[
             (
                 "RegisterScalableTarget",
                 json!({"ServiceNamespace": namespace, "ResourceId": "res/one", "ScalableDimension": dimension, "MinCapacity": 1, "MaxCapacity": 10}),
+                "ValidationException",
             ),
             (
                 "DeregisterScalableTarget",
                 json!({"ServiceNamespace": namespace, "ResourceId": "res/one", "ScalableDimension": dimension}),
+                "ObjectNotFoundException",
             ),
             (
                 "PutScalingPolicy",
                 json!({"PolicyName": "p", "ServiceNamespace": namespace, "ResourceId": "res/one", "ScalableDimension": dimension, "PolicyType": "TargetTrackingScaling", "TargetTrackingScalingPolicyConfiguration": {"TargetValue": 50.0, "PredefinedMetricSpecification": {"PredefinedMetricType": "DynamoDBReadCapacityUtilization"}}}),
+                "ObjectNotFoundException",
             ),
             (
                 "DeleteScalingPolicy",
                 json!({"PolicyName": "p", "ServiceNamespace": namespace, "ResourceId": "res/one", "ScalableDimension": dimension}),
+                "ObjectNotFoundException",
             ),
             (
                 "DescribeScalableTargets",
                 json!({"ServiceNamespace": namespace, "ScalableDimension": dimension}),
+                "ValidationException",
             ),
             (
                 "DescribeScalingPolicies",
                 json!({"ServiceNamespace": namespace, "ScalableDimension": dimension}),
+                "ValidationException",
             ),
         ];
 
-        for (operation, request) in requests {
+        for (operation, request, expected) in requests {
             let (status, body) = emulator.call(operation, request.clone()).await;
             assert_eq!(
                 status, 400,
                 "case {case:?} on {operation}: expected HTTP 400, got {status} {body:?}"
             );
             assert!(
-                error_code(&body).contains("ValidationException"),
-                "case {case:?} on {operation}: expected a ValidationException, got {body:?}"
+                error_code(&body).contains(expected),
+                "case {case:?} on {operation}: expected a {expected}, got {body:?}"
             );
         }
     }

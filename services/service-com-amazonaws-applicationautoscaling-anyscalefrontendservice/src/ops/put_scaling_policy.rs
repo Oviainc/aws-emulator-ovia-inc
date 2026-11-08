@@ -222,8 +222,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            check_dimension_namespace, check_enum, scaling_policy_arn, PolicyKey,
-            ScalingPolicyRecord, TargetKey,
+            check_enum, scaling_policy_arn, PolicyKey, ScalingPolicyRecord, TargetKey,
         };
 
         let Some(self_state) = crate::state::service_state(&*self.engine) else {
@@ -250,8 +249,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             SCALABLE_DIMENSION_VALUES,
         )
         .map_err(validation)?;
-        check_dimension_namespace(&input.service_namespace, &input.scalable_dimension)
-            .map_err(validation)?;
+        // The pair is NOT cross-checked here: this operation depends on the existence of a
+        // scalable target, and the triple it names is resolved as that target's identity.
+        // A dimension that belongs to another namespace cannot have been registered with
+        // this one (`RegisterScalableTarget` is what enforces that), so such a triple names
+        // no registered target — which is what the refusal below reports.
         if let Some(policy_type) = input.policy_type.as_deref() {
             check_enum("policyType", policy_type, POLICY_TYPE_VALUES).map_err(validation)?;
         }

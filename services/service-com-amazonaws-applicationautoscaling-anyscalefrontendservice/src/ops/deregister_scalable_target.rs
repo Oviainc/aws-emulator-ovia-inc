@@ -165,7 +165,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{check_dimension_namespace, check_enum, TargetKey};
+        use crate::state::{check_enum, TargetKey};
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(DeregisterScalableTargetErrorModeled::InternalServiceException(
@@ -190,8 +190,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             SCALABLE_DIMENSION_VALUES,
         )
         .map_err(validation)?;
-        check_dimension_namespace(&input.service_namespace, &input.scalable_dimension)
-            .map_err(validation)?;
+        // The pair is NOT cross-checked: this operation looks the registration itself up by
+        // the triple, and a dimension of another namespace cannot have been registered with
+        // this one, so such a triple names no registered target rather than a bad member
+        // (see `put_scaling_policy`).
 
         let key = TargetKey {
             // The target this endpoint can deregister is the one registered in the Region
@@ -227,11 +229,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
                 .filter(|(policy_key, _)| policy_key.target == key)
                 .map(|(policy_key, record)| (policy_key.clone(), record.policy_type.clone()))
                 .collect();
+            // The ARN this service minted for the target stops resolving with it: an
+            // operation addressed to that ARN now names no registered scalable target, which
+            // is the one answer every ARN-addressed operation has for such an ARN.
             state.arn_index.remove(&removed.arn);
-            // The ARN this service minted stays known as one of ITS ARNs, naming a target
-            // that is no longer registered: an operation addressed to it reports the resource
-            // as gone rather than as one this endpoint cannot resolve at all.
-            state.withdraw_arn(removed.arn.clone(), key.clone());
             state.policies.retain(|policy_key, _| policy_key.target != key);
             state
                 .scheduled_actions

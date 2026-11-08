@@ -19,7 +19,7 @@
 //! rather than in one operation's file so the six handlers of the target/policy lifecycle
 //! cannot drift from each other.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, SystemTime};
 
@@ -32,6 +32,10 @@ use crate::ops::types::{
 /// Executing a scaling policy whose CloudWatch alarm is in `ALARM`: the capacity it computes,
 /// the resource it moves and the activity it records.
 pub mod policy_execution;
+
+/// The refusals whose wire identity this service's own error list does not express, and the
+/// error channel that carries them.
+pub mod wire_refusals;
 
 /// The natural AWS identity of a scalable target, and the prefix of a scaling policy's
 /// and a scheduled action's identity.
@@ -267,24 +271,12 @@ pub struct ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
     pub policies: BTreeMap<PolicyKey, ScalingPolicyRecord>,
     /// `ScalableTargetARN` -> the target it names, so an ARN-addressed operation
     /// (`TagResource` and friends) can resolve a `ResourceARN` back to a target.
+    ///
+    /// `DeregisterScalableTarget` takes an ARN out of this index as it removes the target, so
+    /// an ARN whose target is no longer registered resolves to nothing here — which is the
+    /// one answer an ARN-addressed operation has for every ARN that names no registered
+    /// scalable target (`wire_refusals::WireRefusal::ScalableTargetNotFound`).
     pub arn_index: BTreeMap<String, TargetKey>,
-    /// The ARNs this service MINTED whose scalable target is no longer registered, each
-    /// still naming the target it was minted for.
-    ///
-    /// An ARN-addressed operation has two different answers for an ARN that resolves to no
-    /// registered target, and this is what tells them apart: an ARN this service minted names
-    /// a scalable target that existed, so the answer is that the RESOURCE is gone, while an
-    /// ARN it never minted names nothing it can resolve at all. `DeregisterScalableTarget`
-    /// moves an ARN here as it takes it out of [`Self::arn_index`], and a lookup consults the
-    /// index FIRST, so an ARN that is live again is never read as withdrawn.
-    ///
-    /// Bounded by [`MAX_WITHDRAWN_ARNS`] in the order the ARNs were withdrawn
-    /// ([`Self::withdraw_arn`]), so a long-lived emulator's register/deregister cycles cannot
-    /// grow it without end.
-    pub withdrawn_arns: BTreeMap<String, TargetKey>,
-    /// The order [`Self::withdrawn_arns`] took its entries in, so the oldest is the one the
-    /// ceiling drops.
-    pub withdrawal_order: VecDeque<String>,
     /// Scheduled actions, ordered by (target, action name). `DeregisterScalableTarget`
     /// cascades into this map, so a deregistered target leaves none behind.
     ///
@@ -458,27 +450,6 @@ impl ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState {
         self.alarm_sync.clone()
     }
 
-    /// Remember that `arn` was minted for `target` and that the target it names is no longer
-    /// registered. See [`Self::withdrawn_arns`].
-    pub fn withdraw_arn(&mut self, arn: String, target: TargetKey) {
-        if self.withdrawn_arns.insert(arn.clone(), target).is_none() {
-            self.withdrawal_order.push_back(arn);
-        }
-        while self.withdrawal_order.len() > MAX_WITHDRAWN_ARNS {
-            if let Some(oldest) = self.withdrawal_order.pop_front() {
-                self.withdrawn_arns.remove(&oldest);
-            }
-        }
-    }
-
-    /// Whether `arn` is an ARN this service minted in `region` whose scalable target is no
-    /// longer registered. See [`Self::withdrawn_arns`].
-    pub fn is_withdrawn_arn(&self, arn: &str, region: &str) -> bool {
-        self.withdrawn_arns
-            .get(arn)
-            .is_some_and(|target| target.region == region)
-    }
-
     /// Drop the activities that have aged out of the window this service reports over.
     ///
     /// This is owed by the CLOCK, not by the read that calls it: an activity older than
@@ -523,16 +494,6 @@ pub const MAX_SCALABLE_TARGETS: usize = 10_000;
 /// The same bound for scaling policies, whose records additionally carry the caller's
 /// whole policy configuration. See [`MAX_SCALABLE_TARGETS`].
 pub const MAX_SCALING_POLICIES: usize = 20_000;
-
-/// How many WITHDRAWN scalable-target ARNs this store remembers
-/// ([`ComAmazonawsApplicationautoscalingAnyscalefrontendserviceState::withdrawn_arns`]).
-///
-/// The EMULATOR's own bound, for the same reason as [`MAX_SCALABLE_TARGETS`]: a register /
-/// deregister cycle mints a new ARN each time, so without a ceiling N cycles would leave N
-/// resident entries for ever. Set to the same number of targets the store holds at once, and
-/// the oldest withdrawal is the one dropped — past it an ARN is answered as one this service
-/// never minted, which is what it can still say about it.
-pub const MAX_WITHDRAWN_ARNS: usize = MAX_SCALABLE_TARGETS;
 
 /// The same bound for scheduled actions, which hang off a target the same way a policy
 /// does and are keyed by a free-form name. See [`MAX_SCALABLE_TARGETS`].
@@ -1315,31 +1276,18 @@ pub fn take_page<T>(
 pub const CAPACITY_RANGE_INVERTED_MESSAGE: &str =
     "Maximum capacity cannot be less than minimum capacity";
 
-/// The message a request addressed to an ARN whose scalable target is gone carries.
+/// The message a request addressed to an ARN that resolves to no registered scalable target
+/// carries.
 ///
 /// The resource a tag operation addresses is the scalable target its `ResourceARN` names, and
 /// either that target is registered or it is not: the refusal states exactly that, and the
 /// ARN asked about is reported in the modelled `ResourceName` member rather than spliced into
-/// the sentence. It is answered through the modelled `ResourceNotFoundException`, whose
-/// `@httpError` is 404, because the ARN satisfies its member's own `@pattern`: what is absent
-/// is the resource, not anything about the request. The READ answers it for every ARN that
-/// resolves to no target; the two WRITES answer it for an ARN this service MINTED and
-/// [`ACCESS_DENIED`] for one it never minted.
+/// the sentence. All three tag operations answer it for every ARN that resolves to no
+/// registered target — one this service never minted and one whose target has since been
+/// deregistered alike, since neither identifies a scalable target now — and they answer it
+/// with the client-error status rather than with the 404 the shape's `@httpError` declares
+/// (`wire_refusals::WireRefusal::ScalableTargetNotFound`).
 pub const SCALABLE_TARGET_NOT_FOUND_MESSAGE: &str = "Scalable Target not found";
-
-/// The message the two MUTATING tag operations refuse a `ResourceARN` this service never
-/// minted with.
-///
-/// Recorded behaviour: `TagResource` on a well-formed ARN naming a resource that does not
-/// exist is `ValidationException` with `Access Denied`, while the ARN of a scalable target
-/// that WAS registered and has been deregistered is the modelled
-/// `ResourceNotFoundException` ([`SCALABLE_TARGET_NOT_FOUND_MESSAGE`]). The two differ in
-/// what the ARN names: one the service minted identifies a scalable target, and that it is
-/// gone is a report about the resource; one it never minted identifies nothing it can resolve
-/// at all, which a write is refused for without disclosing whether such a resource exists
-/// elsewhere. The ARN is not echoed, and the sentence is the same for every ARN that names
-/// nothing.
-pub const ACCESS_DENIED: &str = "Access Denied";
 
 // ---------------------------------------------------------------------------
 // Shared validation

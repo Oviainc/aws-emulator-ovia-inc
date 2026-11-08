@@ -18,9 +18,8 @@
 //! * an operation addressed at something no scalable target holds reports it as absent: the
 //!   `ObjectNotFoundException` template naming the triple for an identity nothing registered,
 //!   and the one naming the TARGET's own identifier for a scheduled action a registered target
-//!   does not hold; and, for an ARN, the answer follows what that ARN NAMES — one this service
-//!   minted whose target is gone is the modelled `ResourceNotFoundException` (a 404), one it
-//!   never minted is a write it cannot resolve.
+//!   does not hold; and, for an ARN, the `ResourceNotFoundException` body at the client-error
+//!   status for every ARN that resolves to no registered target.
 
 use serde_json::{json, Value};
 
@@ -380,10 +379,9 @@ async fn an_identity_nothing_registered_is_reported_as_not_registered() {
 
 #[tokio::test]
 async fn a_tag_operation_on_an_arn_naming_no_target_reports_the_resource_as_absent() {
-    /// The sentence a tag operation carries for an ARN whose scalable target is gone.
+    /// The sentence every tag operation carries for an ARN that resolves to no registered
+    /// scalable target.
     const TARGET_NOT_FOUND: &str = "Scalable Target not found";
-    /// The sentence a WRITE carries for an ARN this service never minted.
-    const ACCESS_DENIED: &str = "Access Denied";
 
     let emulator = Emulator::empty();
     let target = emulator
@@ -413,9 +411,9 @@ async fn a_tag_operation_on_an_arn_naming_no_target_reports_the_resource_as_abse
         );
     }
 
-    // Once it is deregistered that ARN still names a scalable target this service minted, so
-    // every one of the three reports the RESOURCE as absent: the modelled
-    // `ResourceNotFoundException`, a 404, with the ARN asked about in `ResourceName`.
+    // Once it is deregistered that ARN resolves to no registered scalable target, so every
+    // one of the three reports the RESOURCE as absent: `ResourceNotFoundException` at the
+    // client-error status, with the ARN asked about in `ResourceName`.
     let (status, body) = emulator
         .call("DeregisterScalableTarget", target.clone())
         .await;
@@ -427,8 +425,8 @@ async fn a_tag_operation_on_an_arn_naming_no_target_reports_the_resource_as_abse
         let case = "a deregistered target's ARN";
         let (status, body) = emulator.call(operation, request).await;
         assert_eq!(
-            status, 404,
-            "case {case:?} on {operation}: expected HTTP 404, got {status} {body:?}"
+            status, 400,
+            "case {case:?} on {operation}: expected HTTP 400, got {status} {body:?}"
         );
         assert_eq!(
             error_code(&body),
@@ -448,9 +446,9 @@ async fn a_tag_operation_on_an_arn_naming_no_target_reports_the_resource_as_abse
         );
     }
 
-    // An ARN this service never minted is the other answer: it names nothing this endpoint
-    // can resolve, so a WRITE through it is the recorded permission failure while the READ
-    // still reports on the resource. Over several ways an ARN can be one it never minted.
+    // An ARN this service never minted resolves to no registered scalable target either, so
+    // it is the SAME answer: neither names a target to report tags of or write tags to. Over
+    // several ways an ARN can be one it never minted.
     let never_minted: &[(&str, String)] = &[
         (
             "an id this service never minted",
@@ -481,26 +479,19 @@ async fn a_tag_operation_on_an_arn_naming_no_target_reports_the_resource_as_abse
     for (case, arn) in never_minted {
         for (operation, request) in tag_requests(arn) {
             let (status, body) = emulator.call(operation, request).await;
-            let read = operation == "ListTagsForResource";
-            let (expected_status, expected_code, expected_message) = if read {
-                (404, "ResourceNotFoundException", TARGET_NOT_FOUND)
-            } else {
-                (400, "ValidationException", ACCESS_DENIED)
-            };
             assert_eq!(
-                status, expected_status,
-                "case {case:?} on {operation}: expected HTTP {expected_status}, got {status} \
-                 {body:?}"
+                status, 400,
+                "case {case:?} on {operation}: expected HTTP 400, got {status} {body:?}"
             );
             assert_eq!(
                 error_code(&body),
-                expected_code,
-                "case {case:?} on {operation}: expected {expected_code}, got {body:?}"
+                "ResourceNotFoundException",
+                "case {case:?} on {operation}: expected a ResourceNotFoundException, got {body:?}"
             );
             let message = error_message(&body);
             assert_eq!(
-                message, expected_message,
-                "case {case:?} on {operation}: expected {expected_message:?}, got {message:?}"
+                message, TARGET_NOT_FOUND,
+                "case {case:?} on {operation}: expected {TARGET_NOT_FOUND:?}, got {message:?}"
             );
         }
     }

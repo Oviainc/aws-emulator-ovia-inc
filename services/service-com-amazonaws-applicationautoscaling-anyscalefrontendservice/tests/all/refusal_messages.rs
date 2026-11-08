@@ -730,12 +730,9 @@ async fn a_policy_configuration_that_cannot_be_evaluated_states_the_documented_r
     }
 }
 
-/// The sentence a tag operation addressed to an ARN whose scalable target is gone carries.
+/// The sentence a tag operation addressed to an ARN that resolves to no registered scalable
+/// target carries.
 const TARGET_NOT_FOUND: &str = "Scalable Target not found";
-
-/// The sentence a WRITE addressed to an ARN this service never minted carries: recorded
-/// behaviour for `TagResource` on a well-formed ARN naming a resource that does not exist.
-const ACCESS_DENIED: &str = "Access Denied";
 
 #[tokio::test]
 async fn a_tag_operation_on_an_unregistered_target_says_the_target_is_not_found() {
@@ -779,15 +776,15 @@ async fn a_tag_operation_on_an_unregistered_target_says_the_target_is_not_found(
     );
 
     // Every ARN that names no registered target now, whether it was minted and retired or
-    // never minted at all, is reported absent by the READ; the two WRITES tell the two apart.
+    // never minted at all, is reported absent by all three operations alike.
     let never_minted =
         format!("arn:aws:application-autoscaling:{REGION}:000000000000:scalable-target/0123456789abcdef");
-    for (case, resource_arn, minted) in [
-        ("a deregistered target's ARN", arn.clone(), true),
-        ("an ARN this emulator never minted", never_minted, false),
+    for (case, resource_arn) in [
+        ("a deregistered target's ARN", arn.clone()),
+        ("an ARN this emulator never minted", never_minted),
     ] {
-        // The read models `ResourceNotFoundException` ("the specified resource doesn't
-        // exist"), which is a 404.
+        // `ResourceNotFoundException` ("the specified resource doesn't exist"), answered at
+        // the client-error status rather than at the 404 the shape's `@httpError` declares.
         let (status, body) = emulator
             .call(
                 "ListTagsForResource",
@@ -795,8 +792,8 @@ async fn a_tag_operation_on_an_unregistered_target_says_the_target_is_not_found(
             )
             .await;
         assert_eq!(
-            status, 404,
-            "case {case:?} on ListTagsForResource: expected HTTP 404, got {status} {body:?}"
+            status, 400,
+            "case {case:?} on ListTagsForResource: expected HTTP 400, got {status} {body:?}"
         );
         assert_eq!(
             error_code(&body),
@@ -817,16 +814,10 @@ async fn a_tag_operation_on_an_unregistered_target_says_the_target_is_not_found(
         );
         assert_service_text(case, &message);
 
-        // The two writes follow what the ARN names: one this service MINTED named a scalable
-        // target, so its target being gone is reported about the resource (the modelled
-        // `ResourceNotFoundException`, a 404); one it never minted names nothing it can
-        // resolve, and the recorded answer for a write through it is the permission failure
-        // `refusal_texts` pins. Neither is the boundary validator's template.
-        let (expected_status, expected_code, expected_message) = if minted {
-            (404, "ResourceNotFoundException", TARGET_NOT_FOUND)
-        } else {
-            (400, "ValidationException", ACCESS_DENIED)
-        };
+        // The two writes answer the same condition the same way: an ARN that resolves to no
+        // registered target identifies no scalable target to write tags to, whether this
+        // service minted it for a target that has since been deregistered or never minted it
+        // at all. Neither is the boundary validator's template.
         for (operation, request) in [
             (
                 "TagResource",
@@ -839,19 +830,18 @@ async fn a_tag_operation_on_an_unregistered_target_says_the_target_is_not_found(
         ] {
             let (status, body) = emulator.call(operation, request).await;
             assert_eq!(
-                status, expected_status,
-                "case {case:?} on {operation}: expected HTTP {expected_status}, got {status} \
-                 {body:?}"
+                status, 400,
+                "case {case:?} on {operation}: expected HTTP 400, got {status} {body:?}"
             );
             assert_eq!(
                 error_code(&body),
-                expected_code,
-                "case {case:?} on {operation}: expected {expected_code}, got {body:?}"
+                "ResourceNotFoundException",
+                "case {case:?} on {operation}: expected a ResourceNotFoundException, got {body:?}"
             );
             let message = error_message(&body);
             assert_eq!(
-                message, expected_message,
-                "case {case:?} on {operation}: expected {expected_message:?}, got {message:?}"
+                message, TARGET_NOT_FOUND,
+                "case {case:?} on {operation}: expected {TARGET_NOT_FOUND:?}, got {message:?}"
             );
             assert_service_text(case, &message);
         }

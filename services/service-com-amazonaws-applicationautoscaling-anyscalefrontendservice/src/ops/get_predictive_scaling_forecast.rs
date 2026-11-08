@@ -110,17 +110,21 @@ pub enum GetPredictiveScalingForecastErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::get_predictive_scaling_forecast::GetPredictiveScalingForecastError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type GetPredictiveScalingForecastError = crate::scaffolded::Scaffolded<GetPredictiveScalingForecastErrorModeled>;
+/// (`crate::ops::get_predictive_scaling_forecast::GetPredictiveScalingForecastError`): the
+/// operation's own channel widened by the refusals this service words itself, which is how
+/// an operation it does not offer for the namespace addressed is refused outright
+/// (`crate::state::wire_refusals`).
+pub type GetPredictiveScalingForecastError =
+    crate::state::wire_refusals::Refusable<GetPredictiveScalingForecastErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// wrapper variant.
 impl From<GetPredictiveScalingForecastErrorModeled> for GetPredictiveScalingForecastError {
     fn from(modeled: GetPredictiveScalingForecastErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        crate::state::wire_refusals::Refusable::Channel(crate::scaffolded::Scaffolded::Modeled(
+            modeled,
+        ))
     }
 }
 
@@ -160,7 +164,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        use crate::state::{check_dimension_namespace, check_enum, PolicyKey, TargetKey};
+        use crate::state::{check_enum, PolicyKey, TargetKey};
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
             return Err(
@@ -187,8 +191,18 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             SCALABLE_DIMENSION_VALUES,
         )
         .map_err(validation)?;
-        check_dimension_namespace(&input.service_namespace, &input.scalable_dimension)
-            .map_err(validation)?;
+
+        // Predictive scaling is offered for ONE service namespace: the model's own
+        // `PolicyType` documentation states "PredictiveScaling—Only supported for Amazon
+        // ECS". Retrieving the forecast data OF a predictive scaling policy is therefore an
+        // action this service does not offer in any other namespace, and it is refused as
+        // one — ahead of every lookup, because no state could make it available: a target
+        // registered there carries no predictive policy to forecast in the first place.
+        if input.service_namespace != PREDICTIVE_SCALING_NAMESPACE {
+            return Err(
+                crate::state::wire_refusals::WireRefusal::not_supported(Self::NAME).into(),
+            );
+        }
 
         let now = ::std::time::SystemTime::now()
             .duration_since(::std::time::UNIX_EPOCH)
@@ -329,6 +343,11 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The `PolicyType` this operation forecasts for; every other type has no forecast.
 const PREDICTIVE_SCALING: &str = "PredictiveScaling";
+
+/// The one service namespace predictive scaling is offered in: the model documents it on the
+/// `PolicyType` member — "PredictiveScaling—Only supported for Amazon ECS"
+/// (`smithy_query(query="doc",shape="com.amazonaws.applicationautoscaling#PutScalingPolicyRequest",member="PolicyType")`).
+const PREDICTIVE_SCALING_NAMESPACE: &str = "ecs";
 
 /// The default `MaxCapacityBreachBehavior`: "Defaults to `HonorMaxCapacity` if not
 /// specified." The other value is the only one that lets the maximum give way.
@@ -483,7 +502,7 @@ fn load_series(
         ));
     };
     crate::state::predictive_metric_series(target, metric_type, resource_label).ok_or_else(|| {
-        crate::scaffolded::Scaffolded::not_implemented(&format!(
+        not_implemented(&format!(
             "GetPredictiveScalingForecast for the predictive scaling metric type {metric_type}"
         ))
     })
@@ -531,7 +550,7 @@ fn customized_series(
         })
     });
     let series = series.ok_or_else(|| {
-        crate::scaffolded::Scaffolded::not_implemented(
+        not_implemented(
             "GetPredictiveScalingForecast for a customized metric specification that is a metric \
              math expression",
         )
@@ -542,7 +561,7 @@ fn customized_series(
     // a stored aggregate does not carry. AWS accepts such a `Stat`, so it is answered with
     // the scaffold's 501 rather than with a forecast aggregated some other way.
     if !cloudwatch::ops::types::STATISTIC_VALUES.contains(&series.statistic.as_str()) {
-        return Err(crate::scaffolded::Scaffolded::not_implemented(&format!(
+        return Err(not_implemented(&format!(
             "GetPredictiveScalingForecast for a load metric aggregated with the statistic {}",
             series.statistic
         )));
@@ -668,4 +687,12 @@ fn validation(message: impl Into<String>) -> GetPredictiveScalingForecastError {
         message: Some(message.into()),
     })
     .into()
+}
+
+/// The scaffold's 501 for a forecast this emulator cannot compute: a metric series nobody can
+/// name, rather than a forecast of numbers it never measured.
+fn not_implemented(what: &str) -> GetPredictiveScalingForecastError {
+    GetPredictiveScalingForecastError::Channel(crate::scaffolded::Scaffolded::not_implemented(
+        what,
+    ))
 }

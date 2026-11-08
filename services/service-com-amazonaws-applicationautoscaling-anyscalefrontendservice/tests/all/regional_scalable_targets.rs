@@ -269,8 +269,8 @@ async fn a_scalable_target_is_only_in_the_region_it_was_registered_in() {
             )
             .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected ListTagsForResource in {} to answer 404, got {status} \
+            status, 400,
+            "case {case:?}: expected ListTagsForResource in {} to answer 400, got {status} \
              {body:?}",
             row.other
         );

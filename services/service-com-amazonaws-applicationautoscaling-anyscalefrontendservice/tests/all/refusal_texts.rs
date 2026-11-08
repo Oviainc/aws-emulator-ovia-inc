@@ -37,10 +37,8 @@ const DIMENSION_WITHOUT_RESOURCE_ID: &str =
     "Scalable dimension cannot be provided without a resource ID.";
 /// A `NextToken` this service did not issue.
 const INVALID_NEXT_TOKEN: &str = "The NextToken value is not valid";
-/// A request addressed to an ARN whose scalable target is gone.
+/// A request addressed to an ARN that resolves to no registered scalable target.
 const TARGET_NOT_FOUND: &str = "Scalable Target not found";
-/// A WRITE addressed to an ARN this service never minted.
-const ACCESS_DENIED: &str = "Access Denied";
 /// A write to the reserved tag namespace.
 const SYSTEM_TAG_KEY_REFUSED: &str = "Caller is an end user and not allowed to mutate system tags";
 /// A tag set over the per-resource maximum.
@@ -822,14 +820,12 @@ fn generated_tags(count: usize) -> Value {
     Value::Object(tags)
 }
 
-/// RULE: the three tagging refusals each carry their own sentence — a WRITE addressed to an
-/// ARN this service never minted is a permission failure, a tag set over the per-resource
-/// maximum states that maximum, and a key in the reserved namespace is refused as a system
-/// tag — so a client can tell the three apart by text as well as by code. (The other answer a
-/// write has, for an ARN this service minted whose target is gone, is pinned by
-/// `refusal_messages` and `recorded_refusal_wording`.)
+/// RULE: the three tagging refusals each carry their own sentence — an ARN that resolves to
+/// no registered scalable target reports the resource as absent, a tag set over the
+/// per-resource maximum states that maximum, and a key in the reserved namespace is refused
+/// as a system tag — so a client can tell the three apart by text as well as by code.
 ///
-/// Rows differ along the operation (both mutating tag operations), along how the ARN fails
+/// Rows differ along the operation (all three tag operations), along how the ARN fails
 /// to resolve, along the batch size either side of the maximum, and along how the reserved
 /// prefix appears.
 #[tokio::test]
@@ -868,35 +864,30 @@ async fn the_tagging_refusals_are_three_distinct_sentences() {
         ),
     ];
     for (case, unknown) in unresolvable {
-        refused(
-            &emulator,
-            &format!("TagResource on {case}"),
-            "TagResource",
-            json!({"ResourceARN": unknown, "Tags": {"team": "search"}}),
-            "ValidationException",
-            ACCESS_DENIED,
-        )
-        .await;
-        refused(
-            &emulator,
-            &format!("UntagResource on {case}"),
-            "UntagResource",
-            json!({"ResourceARN": unknown, "TagKeys": ["team"]}),
-            "ValidationException",
-            ACCESS_DENIED,
-        )
-        .await;
-        // The READ reports on the resource for every ARN that resolves to none.
-        refused_with_status(
-            &emulator,
-            &format!("ListTagsForResource on {case}"),
-            "ListTagsForResource",
-            json!({"ResourceARN": unknown}),
-            404,
-            "ResourceNotFoundException",
-            TARGET_NOT_FOUND,
-        )
-        .await;
+        // All three operations report the resource as absent for an ARN that resolves to
+        // none, at the client-error status rather than at the modelled 404.
+        for (operation, request) in [
+            (
+                "TagResource",
+                json!({"ResourceARN": unknown, "Tags": {"team": "search"}}),
+            ),
+            (
+                "UntagResource",
+                json!({"ResourceARN": unknown, "TagKeys": ["team"]}),
+            ),
+            ("ListTagsForResource", json!({"ResourceARN": unknown})),
+        ] {
+            refused_with_status(
+                &emulator,
+                &format!("{operation} on {case}"),
+                operation,
+                request,
+                400,
+                "ResourceNotFoundException",
+                TARGET_NOT_FOUND,
+            )
+            .await;
+        }
     }
 
     // One batch past the per-resource maximum: the sentence states the maximum, and the

@@ -79,3 +79,5 @@ mod tags;
 mod target_tracking_alarms;
 #[path = "all/target_tracking_execution.rs"]
 mod target_tracking_execution;
+#[path = "all/unregistered_target_refusals.rs"]
+mod unregistered_target_refusals;

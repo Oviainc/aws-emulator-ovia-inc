@@ -91,17 +91,21 @@ pub enum ListTagsForResourceErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::list_tags_for_resource::ListTagsForResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type ListTagsForResourceError = crate::scaffolded::Scaffolded<ListTagsForResourceErrorModeled>;
+/// (`crate::ops::list_tags_for_resource::ListTagsForResourceError`): the operation's own
+/// channel widened by the refusals this service words itself, which is how an ARN resolving
+/// to no registered scalable target is answered at the client-error status rather than at the
+/// 404 the modelled shape declares (`crate::state::wire_refusals`).
+pub type ListTagsForResourceError =
+    crate::state::wire_refusals::Refusable<ListTagsForResourceErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// wrapper variant.
 impl From<ListTagsForResourceErrorModeled> for ListTagsForResourceError {
     fn from(modeled: ListTagsForResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        crate::state::wire_refusals::Refusable::Channel(crate::scaffolded::Scaffolded::Modeled(
+            modeled,
+        ))
     }
 }
 
@@ -165,18 +169,13 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .and_then(|key| state.targets.get(key));
 
         // "Returns all the tags on the specified Application Auto Scaling scalable
-        // target" — so an ARN no registered target carries is a 404 rather than an empty
-        // tag set: the two are different answers and a client tells them apart. Either
-        // the target is registered or it is not, which is what the message states; the
-        // ARN asked about is reported in `ResourceName`.
+        // target" — so an ARN no registered target carries is refused rather than answered
+        // with an empty tag set: the two are different answers and a client tells them
+        // apart. The refusal is the one all three tag operations answer an unresolvable ARN
+        // with, so this read and the two writes cannot word the condition differently.
         let Some(record) = record else {
-            return Err(ListTagsForResourceErrorModeled::ResourceNotFoundException(
-                ResourceNotFoundException {
-                    message: Some(crate::state::SCALABLE_TARGET_NOT_FOUND_MESSAGE.to_string()),
-                    // The member's own documentation: "The name of the Application Auto
-                    // Scaling resource. This value is an Amazon Resource Name (ARN)."
-                    resource_name: Some(input.resource_arn.clone()),
-                },
+            return Err(crate::state::wire_refusals::WireRefusal::scalable_target_not_found(
+                &input.resource_arn,
             )
             .into());
         };

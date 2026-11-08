@@ -168,7 +168,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
-            check_dimension_namespace, check_enum, ScheduledActionKey, TargetKey,
+            check_enum, ScheduledActionKey, TargetKey,
         };
 
         let Some(state) = crate::state::service_state(&*self.engine) else {
@@ -183,9 +183,10 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         };
 
         // The two identifying enums arrive as plain strings, so the permitted set is
-        // checked here against the model-derived value lists, and the pair against the
-        // namespace the dimension names — the same check every other operation addressing
-        // a scalable target makes.
+        // checked here against the model-derived value lists. The PAIR is not cross-checked:
+        // this call depends on the existence of a scalable target and resolves the triple as
+        // that target's identity, so a dimension of another namespace names no registered
+        // target rather than a bad member (see `put_scaling_policy`).
         check_enum(
             "serviceNamespace",
             &input.service_namespace,
@@ -198,8 +199,6 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             SCALABLE_DIMENSION_VALUES,
         )
         .map_err(validation)?;
-        check_dimension_namespace(&input.service_namespace, &input.scalable_dimension)
-            .map_err(validation)?;
 
         // A scheduled action's name is scoped to its target, so the SAME name on another
         // resource or dimension is another action and this call leaves it alone.

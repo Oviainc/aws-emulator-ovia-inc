@@ -100,17 +100,20 @@ pub enum TagResourceErrorModeled {
 }
 
 /// This operation's error channel, as the generated `impl Operation` names it
-/// (`crate::ops::tag_resource::TagResourceError`). Wrapping the modeled enum is what
-/// lets a scaffolded operation answer 501 for one whose model declares no errors at all.
-pub type TagResourceError = crate::scaffolded::Scaffolded<TagResourceErrorModeled>;
+/// (`crate::ops::tag_resource::TagResourceError`): the operation's own channel widened by the
+/// refusals this service words itself, which is how an ARN resolving to no registered
+/// scalable target is answered at the client-error status rather than at the 404 the modelled
+/// shape declares (`crate::state::wire_refusals`).
+pub type TagResourceError = crate::state::wire_refusals::Refusable<TagResourceErrorModeled>;
 
 /// Lets `?` and `.into()` lift a modeled failure into the error channel, so an
 /// implemented handler writes `Err(SomeModeledError.into())` rather than naming the
-/// wrapper variant. See `crate::scaffolded` for how to drop the wrapper entirely once
-/// this operation is implemented.
+/// wrapper variant.
 impl From<TagResourceErrorModeled> for TagResourceError {
     fn from(modeled: TagResourceErrorModeled) -> Self {
-        crate::scaffolded::Scaffolded::Modeled(modeled)
+        crate::state::wire_refusals::Refusable::Channel(crate::scaffolded::Scaffolded::Modeled(
+            modeled,
+        ))
     }
 }
 
@@ -152,7 +155,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
     ) -> Result<Self::Output, Self::Error> {
         use crate::state::{
             check_tag_count, check_tag_key, check_tag_keys_unreserved, check_tag_value,
-            ACCESS_DENIED, MAX_TAGS_PER_RESOURCE,
+            MAX_TAGS_PER_RESOURCE,
         };
 
         // Input validation first, so a request no resource could accept is refused the
@@ -182,24 +185,21 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // An engine that holds no state holds no scalable target either, so an ARN
-        // addressed to it resolves to nothing — and it minted none, which is the refusal
-        // below, rather than a server error this operation does not model.
+        // addressed to it resolves to nothing — which is the refusal below, rather than a
+        // server error this operation does not model.
         let Some(state) = crate::state::service_state(&*self.engine) else {
-            return Err(validation(ACCESS_DENIED));
+            return Err(target_not_found(&input.resource_arn));
         };
         let mut state = state.lock();
 
         // `ResourceARN` "identifies the Application Auto Scaling scalable target that
         // you want to apply tags to", and the only ARNs that identify one are those
-        // `RegisterScalableTarget` minted. Which refusal an ARN that resolves to no
-        // registered target gets follows WHAT IT NAMES, and the recorded behaviour of the
-        // two is different: an ARN this service minted named a scalable target, so the
-        // answer is the modelled `ResourceNotFoundException` ("the specified resource
-        // doesn't exist", HTTP 404) — the resource is gone; an ARN it never minted
-        // identifies nothing it can resolve, and a WRITE through it is refused as
-        // `Access Denied` without disclosing whether such a resource exists elsewhere. A
-        // scalable target is regional, so an ARN of another Region is neither: this
-        // endpoint minted none of it.
+        // `RegisterScalableTarget` minted. An ARN that resolves to no REGISTERED target
+        // identifies no scalable target to tag, whether this service never minted it or
+        // minted it for a target that has since been deregistered, so both are the one
+        // refusal the three tag operations share. A scalable target is regional, so an ARN
+        // of another Region resolves to none of it either: this endpoint holds the targets
+        // of its own Region.
         let region = crate::state::request_region(ctx.parts());
         let resolved = state
             .arn_index
@@ -207,11 +207,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .filter(|key| key.region == region)
             .cloned();
         let Some(record) = resolved.and_then(|key| state.targets.get_mut(&key)) else {
-            return Err(if state.is_withdrawn_arn(&input.resource_arn, &region) {
-                target_not_found(&input.resource_arn)
-            } else {
-                validation(ACCESS_DENIED)
-            });
+            return Err(target_not_found(&input.resource_arn));
         };
 
         // The merge is computed before anything is stored: "To add a tag, specify a new
@@ -251,13 +247,10 @@ fn validation(message: impl Into<String>) -> TagResourceError {
     .into()
 }
 
-/// The modelled `ResourceNotFoundException` (HTTP 404) for an ARN this service minted whose
-/// scalable target is no longer registered, reporting that ARN in `ResourceName` — "the name
-/// of the Application Auto Scaling resource. This value is an Amazon Resource Name (ARN)".
+/// The refusal of an ARN that resolves to no registered scalable target, reporting that ARN
+/// in `ResourceName` — "the name of the Application Auto Scaling resource. This value is an
+/// Amazon Resource Name (ARN)". Shared with the other two tag operations
+/// (`crate::state::wire_refusals`), so all three answer the condition alike.
 fn target_not_found(resource_arn: &str) -> TagResourceError {
-    TagResourceErrorModeled::ResourceNotFoundException(ResourceNotFoundException {
-        message: Some(crate::state::SCALABLE_TARGET_NOT_FOUND_MESSAGE.to_string()),
-        resource_name: Some(resource_arn.to_string()),
-    })
-    .into()
+    crate::state::wire_refusals::WireRefusal::scalable_target_not_found(resource_arn).into()
 }

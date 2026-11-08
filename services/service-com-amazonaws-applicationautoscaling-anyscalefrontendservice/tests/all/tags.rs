@@ -5,7 +5,7 @@
 //!
 //! The rule under test: for the ARN of a registered scalable target the operation answers
 //! exactly the tag set persisted on that target — no more, no fewer, and unchanged by the
-//! read — and for an ARN no registered target carries it answers 404
+//! read — and for an ARN no registered target carries it answers
 //! `ResourceNotFoundException`.
 //!
 //! The suite is a table, not a single call: its rows differ along what the rule
@@ -216,7 +216,7 @@ async fn list_tags_answers_exactly_the_tags_the_target_was_registered_with() {
 async fn list_tags_refuses_an_arn_no_registered_target_carries() {
     let emulator = Emulator::with_tables(TABLES).await;
 
-    // One registered target, so the store is not empty and a 404 means "not this ARN"
+    // One registered target, so the store is not empty and the refusal means "not this ARN"
     // rather than "nothing at all".
     let resident = register(
         &emulator,
@@ -276,8 +276,8 @@ async fn list_tags_refuses_an_arn_no_registered_target_carries() {
             .call("ListTagsForResource", json!({"ResourceARN": arn}))
             .await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected HTTP 404, got {status} {body:?}"
+            status, 400,
+            "case {case:?}: expected HTTP 400, got {status} {body:?}"
         );
         assert!(
             error_code(&body).contains("ResourceNotFoundException"),

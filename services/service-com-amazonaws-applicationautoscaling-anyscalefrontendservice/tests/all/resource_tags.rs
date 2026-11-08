@@ -650,9 +650,9 @@ async fn a_resource_arn_naming_no_registered_target_is_refused() {
         "case {case:?}: expected DeregisterScalableTarget to answer 200, got {status} {body:?}"
     );
 
-    // The ARN of the target that WAS registered names a scalable target this service minted,
-    // so every one of the three reports the resource as gone: the modelled
-    // `ResourceNotFoundException` and its HTTP 404.
+    // The ARN of the target that WAS registered now resolves to no registered scalable
+    // target, so every one of the three reports the resource as absent:
+    // `ResourceNotFoundException` at the client-error status.
     for (operation, request) in [
         (
             "TagResource",
@@ -666,8 +666,8 @@ async fn a_resource_arn_naming_no_registered_target_is_refused() {
     ] {
         let (status, body) = emulator.call(operation, request).await;
         assert_eq!(
-            status, 404,
-            "case {case:?}: expected {operation} to refuse with HTTP 404, got {status} {body:?}"
+            status, 400,
+            "case {case:?}: expected {operation} to refuse with HTTP 400, got {status} {body:?}"
         );
         assert_eq!(
             error_code(&body),
@@ -711,15 +711,16 @@ async fn a_resource_arn_naming_no_registered_target_is_refused() {
     ];
 
     for (case, arn) in unresolvable {
-        // None of these ARNs is one this service minted, so the two WRITES are refused as
-        // writes it cannot resolve — the 400 `ValidationException` the recorded run shows —
-        // while the READ reports on the resource.
+        // None of these ARNs resolves to a registered scalable target, so all three answer
+        // the same way the ARN of a deregistered target is answered: there is no scalable
+        // target to report tags of or to write tags to.
         for (operation, request) in [
             ("TagResource", json!({"ResourceARN": arn, "Tags": {"a": "1"}})),
             (
                 "UntagResource",
                 json!({"ResourceARN": arn, "TagKeys": ["a"]}),
             ),
+            ("ListTagsForResource", json!({"ResourceARN": arn})),
         ] {
             let (status, body) = emulator.call(operation, request).await;
             assert_eq!(
@@ -728,26 +729,11 @@ async fn a_resource_arn_naming_no_registered_target_is_refused() {
             );
             assert_eq!(
                 error_code(&body),
-                "ValidationException",
-                "case {case:?}: expected {operation} to answer ValidationException, got {body:?}"
+                "ResourceNotFoundException",
+                "case {case:?}: expected {operation} to answer ResourceNotFoundException, got \
+                 {body:?}"
             );
         }
-
-        // The report models only `ResourceNotFoundException` ("the specified resource
-        // doesn't exist"), its HTTP 404.
-        let (status, body) = emulator
-            .call("ListTagsForResource", json!({"ResourceARN": arn}))
-            .await;
-        assert_eq!(
-            status, 404,
-            "case {case:?}: expected ListTagsForResource to refuse with HTTP 404, got {status} \
-             {body:?}"
-        );
-        assert_eq!(
-            error_code(&body),
-            "ResourceNotFoundException",
-            "case {case:?}: expected ResourceNotFoundException, got {body:?}"
-        );
     }
 }
 

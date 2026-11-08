@@ -351,8 +351,9 @@ async fn deleting_an_action_the_store_does_not_hold_is_refused() {
 }
 
 /// The identifying enums a delete carries, checked against the model's own value sets
-/// (`ServiceNamespace` and `ScalableDimension`), and against each other: a dimension names
-/// the namespace it belongs to in its first segment.
+/// (`ServiceNamespace` and `ScalableDimension`). A value outside its enum is a bad member; a
+/// dimension that belongs to ANOTHER namespace is a triple nothing registered a target for,
+/// which this call reports as the missing target rather than as a bad member.
 #[tokio::test]
 async fn an_unmodelled_namespace_or_dimension_is_refused_and_deletes_nothing() {
     let emulator = Emulator::empty();
@@ -361,19 +362,36 @@ async fn an_unmodelled_namespace_or_dimension_is_refused_and_deletes_nothing() {
         .await;
     put(&emulator, &target, "nightly", "rate(5 minutes)", "enums").await;
 
-    for (case, member, value) in [
-        ("a namespace outside the enum", "ServiceNamespace", "dynamo"),
-        ("an empty namespace", "ServiceNamespace", ""),
+    for (case, member, value, expected) in [
+        (
+            "a namespace outside the enum",
+            "ServiceNamespace",
+            "dynamo",
+            "ValidationException",
+        ),
+        (
+            "an empty namespace",
+            "ServiceNamespace",
+            "",
+            "ValidationException",
+        ),
         (
             "a dimension outside the enum",
             "ScalableDimension",
             "dynamodb:table:Capacity",
+            "ValidationException",
         ),
-        ("an empty dimension", "ScalableDimension", ""),
+        (
+            "an empty dimension",
+            "ScalableDimension",
+            "",
+            "ValidationException",
+        ),
         (
             "a dimension belonging to another namespace",
             "ScalableDimension",
             "ecs:service:DesiredCount",
+            "ObjectNotFoundException",
         ),
     ] {
         let mut body = request(&target, "nightly");
@@ -385,8 +403,8 @@ async fn an_unmodelled_namespace_or_dimension_is_refused_and_deletes_nothing() {
         );
         assert_eq!(
             error_code(&response),
-            "ValidationException",
-            "case {case:?}: expected a ValidationException, got {response:?}"
+            expected,
+            "case {case:?}: expected a {expected}, got {response:?}"
         );
     }
 
