@@ -119,6 +119,8 @@ mod group_lifecycle;
 mod group_membership;
 #[path = "all/group_role_claims.rs"]
 mod group_role_claims;
+#[path = "all/iam_authorization.rs"]
+mod iam_authorization;
 #[path = "all/identity_provider_lifecycle.rs"]
 mod identity_provider_lifecycle;
 #[path = "all/identity_provider_type_defaults.rs"]

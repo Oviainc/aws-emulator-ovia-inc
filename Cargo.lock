@@ -10164,6 +10164,7 @@ dependencies = [
  "serde_json",
  "service-com-amazonaws-cloudwatchlogs-logs-20140328",
  "service-com-amazonaws-firehose-firehose-20150804",
+ "service-com-amazonaws-iam-awsidentitymanagementv20100508",
  "service-com-amazonaws-s3-amazons3",
  "service-com-amazonaws-wafv2-awswaf-20190729",
  "service-common",

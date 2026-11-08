@@ -26,7 +26,9 @@
 //!   refused before the handler runs states the COLLECTION the caller submitted, which
 //!   the framework's walk can only summarise as `<n> items` — and through
 //!   [`BehindWebAcl`], so a request to a pool with a WAFv2 web ACL associated is decided
-//!   by that web ACL before the operation serves it.
+//!   by that web ACL before the operation serves it — and through
+//!   [`iam_authorization::IamAuthorized`], so an operation the model requires a signature
+//!   for is served only to a caller IAM allows to perform it.
 //! - `override_refusal` — how this service words a request the framework refused
 //!   before any handler ran. The default returns `None`, keeping the framework's
 //!   wording. See the inline note on that method for how to reword.
@@ -77,6 +79,11 @@ mod error_wire;
 /// The WAFv2 web ACL in front of a user pool, which decides the pool's API operations
 /// before the operation serves them ([`BehindWebAcl`]).
 mod web_acl;
+
+/// Whether IAM lets a request perform the action it names, which is decided in front of
+/// every operation the model requires a SigV4 signature for
+/// ([`iam_authorization::IamAuthorized`]).
+pub mod iam_authorization;
 
 /// The error code Amazon Cognito answers a bad parameter with, and the code this service
 /// gives a refusal the framework made before any handler ran. Restated beside the message
@@ -172,7 +179,8 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
 }
 
 /// Wire one `crate::ops::<module>::<Operation>` per line into `table`, each wrapped in
-/// [`WithSubmittedValues`] and keyed by its operation shape name — the routing key
+/// [`WithSubmittedValues`], in [`iam_authorization::IamAuthorized`] and in
+/// [`BehindWebAcl`], and keyed by its operation shape name — the routing key
 /// `ServerHttpProtocol::routing_key` resolves and the generated table is keyed by.
 macro_rules! wrap_operations {
     ($table:expr, $engine:expr, $($module:ident :: $operation:ident),+ $(,)?) => {
@@ -182,8 +190,12 @@ macro_rules! wrap_operations {
                 ::std::boxed::Box::new(BehindWebAcl::new(
                     stringify!($operation),
                     ::std::sync::Arc::clone(&$engine),
-                    ::std::boxed::Box::new(WithSubmittedValues::new(
-                        crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                    ::std::boxed::Box::new(iam_authorization::IamAuthorized::new(
+                        stringify!($operation),
+                        ::std::sync::Arc::clone(&$engine),
+                        ::std::boxed::Box::new(WithSubmittedValues::new(
+                            crate::ops::$module::$operation::new(::std::sync::Arc::clone(&$engine)),
+                        )) as ::std::boxed::Box<dyn ErasedOperation>,
                     )) as ::std::boxed::Box<dyn ErasedOperation>,
                 )) as ::std::boxed::Box<dyn ErasedOperation>,
             );
@@ -789,7 +801,9 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // NOT a re-route: the key is the one the generated table's own protocol resolves,
         // and the operation it names is the one served — wrapped in
         // [`WithSubmittedValues`] so a constraint refusal states the value the caller
-        // submitted rather than the framework's summary of it, and in [`BehindWebAcl`] so
+        // submitted rather than the framework's summary of it, in
+        // [`iam_authorization::IamAuthorized`] so a caller IAM does not allow is refused
+        // before the operation reads or writes anything, and in [`BehindWebAcl`] so
         // the web ACL in front of the pool decides the request first. A key the model does not
         // name resolves to `None` here exactly as it does in the generated table (the two
         // non-modelled GET routes below are among them), so the router's routing-error
