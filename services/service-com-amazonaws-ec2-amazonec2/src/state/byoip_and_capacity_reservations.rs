@@ -394,7 +394,7 @@ impl AddressFamily {
     pub fn pool_resource_type(self) -> &'static str {
         match self {
             Self::Ipv4 => PUBLIC_IPV4_POOL_RESOURCE_TYPE,
-            Self::Ipv6 => "ipv6pool-ec2",
+            Self::Ipv6 => IPV6_POOL_RESOURCE_TYPE,
         }
     }
 

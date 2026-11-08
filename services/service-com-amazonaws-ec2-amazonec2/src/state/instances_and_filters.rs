@@ -909,10 +909,11 @@ impl ComAmazonawsEc2Amazonec2State {
                     // The address pool the provision created for the range goes with it: a
                     // pool holds the addresses OF a range, so once the account does not hold
                     // the range there is no pool of those addresses either, and its bytes
-                    // return to the budget as well. An `ipv6pool-ec2` id names no stored
-                    // pool, so this finds nothing for an IPv6 range.
+                    // return to the budget as well. The id names a pool of ONE of the two
+                    // families, so at most one of these removals finds anything.
                     if let Some(pool_id) = record.byoip_cidr.pool_id.as_deref() {
                         self.remove_public_ipv4_pool(pool_id);
+                        self.remove_ipv6_pool(pool_id);
                     }
                 }
                 continue;

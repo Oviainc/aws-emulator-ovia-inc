@@ -604,6 +604,27 @@
 //! one range back out of a pool, and [`public_ipv4_pool_payload_bytes`] is the one definition
 //! of what a pool is charged against the byte budget.
 //!
+//! ## IPv6 address pools
+//!
+//! The other family of the same sentence: "provisioning an IPv4 or IPv6 address range …
+//! creates a corresponding address pool" (`ProvisionByoipCidr`), so a provisioned IPv6 range
+//! gives the account one IPv6 pool, held in [`ComAmazonawsEc2Amazonec2State::ipv6_pools`] as
+//! an [`Ipv6PoolRecord`] under the `ipv6pool-ec2-…` id the provision minted — the same id the
+//! range reports as its `ByoipCidr$PoolId`, so the range and the pool cannot name each other
+//! differently, and the pool goes away with the range when the clock's release drops it.
+//! Keyed by that id in a [`BTreeMap`], the arrangement every other pool store here uses: that
+//! id order is the one stable order `DescribeIpv6Pools` reports and pages over, so a
+//! pagination token can name the id the next page starts at.
+//!
+//! A record holds the pool's own facts (its description and the pool tags
+//! `ProvisionByoipCidrRequest$PoolTagSpecifications` asked for) beside the ADDRESS RANGES
+//! provisioned to it, each a canonical IPv6 CIDR block ([`canonical_ipv6_cidr`]) — the one
+//! source of truth for what the pool holds, which
+//! [`ComAmazonawsEc2Amazonec2State::ipv6_pool_view`] reports as the modelled
+//! `Ipv6Pool$PoolCidrBlocks` in address order. [`ipv6_pool_payload_bytes`] is the one
+//! definition of what such a pool is charged against the byte budget, given back when the
+//! clock's release drops it.
+//!
 //! ## Elastic IP addresses
 //!
 //! [`ComAmazonawsEc2Amazonec2State::addresses`] holds the account's Elastic IP addresses
@@ -1916,6 +1937,13 @@ pub use traffic_mirror_filters::*;
 /// primitive here.
 pub mod public_ipv4_pools;
 pub use public_ipv4_pools::*;
+
+/// The IPv6 address pools the account holds — what one is stored as, the insert that mints
+/// its id, the removal, the projection `DescribeIpv6Pools` reports it through and the refusal
+/// for a pool id the account holds none for. Re-exported, so a handler reaches them as
+/// `crate::state::<item>` like every other primitive here.
+pub mod ipv6_pools;
+pub use ipv6_pools::*;
 
 /// The Traffic Mirror session store's own primitives — the id prefix, the bounds, the byte
 /// charge and the error channel the Traffic Mirror session operations share. Re-exported,

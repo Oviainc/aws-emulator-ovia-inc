@@ -15,6 +15,18 @@
 // exactly that. The lines above are the file header, which no landing edits.
 #[path = "all/prefix_lists.rs"]
 mod prefix_lists;
+// The IPv6 address pools the account holds: the pool a BYOIP IPv6 provision creates under
+// the id the range reports, the blocks it holds in address order, the narrowing its
+// documented filters and `PoolIds` do, the pages `DescribeIpv6Pools` cuts the store into,
+// and what that read refuses. Declared beside `prefix_lists` for the reason the note above
+// gives: the sorted neighbourhood and the tail of this file are where every new ec2 suite
+// inserts its lines.
+#[path = "all/ipv6_pools.rs"]
+mod ipv6_pools;
+// What `DescribeAccountAttributes` reports about the ACCOUNT: every attribute the operation
+// documents with the value the account holds for it, `default-vpc` asserted against the VPC
+// the same Region's `DescribeVpcs` reports, the narrowing `AttributeNames` does, and the
+// refusals for a name that is no account attribute and for a dry run. Declared beside
 // What `DescribeBundleTasks` reports out of the bundle-task store: every member of a stored
 // task, the ids and the published filters that narrow the report, the bounds on a request's
 // match, the dry-run answer, and that describing writes nothing. Declared beside

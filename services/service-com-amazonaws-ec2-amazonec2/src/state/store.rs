@@ -2093,6 +2093,15 @@ pub struct ComAmazonawsEc2Amazonec2State {
     /// to AWS, so a fresh account has none until a provision creates one through
     /// [`Self::insert_public_ipv4_pool`].
     pub public_ipv4_pools: BTreeMap<String, PublicIpv4PoolRecord>,
+    /// Every IPv6 address pool the account holds, by `Ipv6PoolEc2Id` — see the module docs.
+    /// Ordered by that id in a [`BTreeMap`], the arrangement every other pool store here
+    /// uses: that id order is the one stable order `DescribeIpv6Pools` reports and pages
+    /// over, so a pagination token can name the id the next page starts at.
+    ///
+    /// Starts EMPTY: an IPv6 pool exists only for an IPv6 address range the account brought
+    /// to AWS, so a fresh account has none until a provision creates one through
+    /// [`Self::insert_ipv6_pool`].
+    pub ipv6_pools: BTreeMap<String, Ipv6PoolRecord>,
     /// Every Capacity Block the account holds, by `CapacityBlockId` — see the module docs.
     /// Ordered by id, which is the order `DescribeCapacityBlocks` reports and pages over.
     pub capacity_blocks: BTreeMap<String, CapacityBlockRecord>,
@@ -3273,6 +3282,7 @@ impl Default for ComAmazonawsEc2Amazonec2State {
             // A fresh account has brought no address range of its own.
             byoip_cidrs: BTreeMap::new(),
             public_ipv4_pools: BTreeMap::new(),
+            ipv6_pools: BTreeMap::new(),
             coip_pools: BTreeMap::new(),
             capacity_blocks: BTreeMap::new(),
             fleets: BTreeMap::new(),

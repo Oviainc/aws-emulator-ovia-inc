@@ -1641,8 +1641,8 @@ impl ComAmazonawsEc2Amazonec2State {
     /// can choose a pool id. For an IPv4 range that pool is a resource this store HOLDS — a
     /// [`PublicIpv4PoolRecord`] carrying the range and the request's pool tags, which
     /// `DescribePublicIpv4Pools` reports and `DeprovisionPublicIpv4PoolCidr` takes the range
-    /// back out of; for an IPv6 range the corresponding pool is an `ipv6pool-ec2`, which no
-    /// store here holds yet, so only its id is minted.
+    /// back out of; for an IPv6 range it is an [`Ipv6PoolRecord`] under an `ipv6pool-ec2-…`
+    /// id, carrying the same facts, which `DescribeIpv6Pools` reports.
     ///
     /// The record goes in through [`Self::insert_byoip_cidr`], the one write path, which
     /// charges the bytes it holds and REFUSES a record that does not fit the store's ceilings
@@ -1658,7 +1658,13 @@ impl ComAmazonawsEc2Amazonec2State {
                 tags: spec.pool_tags.clone(),
                 cidrs: vec![spec.block.cidr.clone()],
             })?,
-            AddressFamily::Ipv6 => self.next_id(spec.block.family.pool_resource_type()),
+            AddressFamily::Ipv6 => self.insert_ipv6_pool(Ipv6PoolSpec {
+                // The one description describes both, exactly as it does for the pool of
+                // the other family above.
+                description: spec.description.clone(),
+                tags: spec.pool_tags.clone(),
+                cidrs: vec![spec.block.cidr.clone()],
+            })?,
         };
         let becomes = match (spec.block.family, spec.publicly_advertisable) {
             (AddressFamily::Ipv6, false) => BYOIP_CIDR_STATE_PROVISIONED_NOT_PUBLICLY_ADVERTISABLE,
@@ -1701,8 +1707,10 @@ impl ComAmazonawsEc2Amazonec2State {
         if !self.insert_byoip_cidr(record) {
             // A range the store would not hold is not reported, so the pool created a moment
             // ago for it goes back too: a pool whose range was never provisioned is no pool
-            // of this account, and its bytes return to the budget.
+            // of this account, and its bytes return to the budget. The id names a pool of
+            // ONE of the two families, so at most one of these removals finds anything.
             self.remove_public_ipv4_pool(&pool_id);
+            self.remove_ipv6_pool(&pool_id);
             return None;
         }
         Some(reported)
