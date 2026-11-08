@@ -107,5 +107,9 @@ mod package_version_publish_conflict;
 mod package_delete_cascade;
 #[path = "all/package_version_not_found_coordinate.rs"]
 mod package_version_not_found_coordinate;
+#[path = "all/package_version_summary_published_time.rs"]
+mod package_version_summary_published_time;
+#[path = "all/asset_response_media_type.rs"]
+mod asset_response_media_type;
 #[path = "all/control_plane_refusal_sentences.rs"]
 mod control_plane_refusal_sentences;

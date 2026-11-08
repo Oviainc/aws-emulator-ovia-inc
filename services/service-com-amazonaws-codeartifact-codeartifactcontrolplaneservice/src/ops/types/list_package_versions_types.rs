@@ -45,5 +45,6 @@ pub struct PackageVersionSummary {
     pub revision: Option<String>,
     pub status: String,
     pub origin: Option<PackageVersionOrigin>,
+    pub published_time: Option<::aws_smithy_types::DateTime>,
 }
 

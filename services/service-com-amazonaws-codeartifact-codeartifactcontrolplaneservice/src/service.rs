@@ -59,6 +59,8 @@
 //!   answers.
 //! - [`token_authorization`] — whether IAM lets the caller mint a repository bearer
 //!   credential, which `GetAuthorizationToken` takes before anything is minted.
+//! - [`wire`] — the media type every successful answer of this service declares, which the
+//!   generic `restJson1` serializer types off the body's own target shape instead.
 
 pub mod authorization;
 
@@ -67,6 +69,8 @@ pub mod npm_manifest;
 pub mod npm_registry;
 
 pub mod token_authorization;
+
+pub mod wire;
 
 use smithy_server_runtime::{
     http, ErasedOperation, Refusal, Refused, Service, Violation, ViolationKind,
@@ -178,6 +182,10 @@ pub struct EmulatedService<Eng: Send + Sync + 'static> {
     /// ([`npm_registry::NpmRegistryEndpoint`]), built from that same engine and resolved by
     /// [`override_operation`](Service::override_operation).
     npm_registry_endpoint: npm_registry::NpmRegistryEndpoint<Eng>,
+    /// This service's wire protocol: the model's own `restJson1`, answering with the media
+    /// type of [`wire`]. Built once here because
+    /// [`override_protocol`](Service::override_protocol) hands back a borrow of it.
+    protocol: wire::JsonMediaTypeRestJson,
 }
 
 impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
@@ -188,6 +196,7 @@ impl<Eng: Send + Sync + 'static> EmulatedService<Eng> {
         Self {
             entry: crate::ServiceDefinition::new(Arc::clone(&engine)),
             npm_registry_endpoint: npm_registry::NpmRegistryEndpoint::new(Arc::clone(&engine)),
+            protocol: wire::JsonMediaTypeRestJson::new(),
             engine,
         }
     }
@@ -302,5 +311,18 @@ impl<Eng: Send + Sync + 'static> Service for EmulatedService<Eng> {
         // consume it on `None`.
         let _ = error;
         None
+    }
+
+    fn override_protocol(&self) -> Option<&dyn smithy_server_runtime::ServerHttpProtocol> {
+        // The model's own restJson1 codec, with the ONE difference the generic renderer
+        // cannot express: a successful answer declares this service's own media type for
+        // the whole response, so a package version's asset bytes are served the way every
+        // other answer of this service is (see [`wire`]). Borrowed from the field built in
+        // `new`, never constructed per request.
+        //
+        // This seam drives the MODELLED sequence only. A framework-level refusal still
+        // renders in the generated entry's envelope, which is correct: that answer is a
+        // JSON document already.
+        Some(&self.protocol)
     }
 }
