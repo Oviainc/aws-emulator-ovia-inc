@@ -89,6 +89,8 @@ mod merged_api_association_topology;
 mod merged_api_disassociation;
 #[path = "all/resource_tags.rs"]
 mod resource_tags;
+#[path = "all/schema_creation.rs"]
+mod schema_creation;
 #[path = "all/source_api_association.rs"]
 mod source_api_association;
 #[path = "all/source_api_association_listing.rs"]

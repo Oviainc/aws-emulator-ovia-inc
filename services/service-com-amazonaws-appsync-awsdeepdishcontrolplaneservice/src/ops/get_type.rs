@@ -166,7 +166,15 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             .into());
         }
 
-        let guard = state.lock();
+        let now = std::time::SystemTime::now();
+        let mut guard = state.lock();
+
+        // The only write this read makes: a schema creation the CLOCK already made due
+        // installed the types its document declares, and it was owed at this instant
+        // whether or not anybody called, so it is materialised before a type is looked
+        // up rather than being left for the next caller to observe differently.
+        guard.settle_schema_creations(now);
+
         let Some(api) = guard.graphql_apis.get(&input.api_id) else {
             return Err(GetTypeErrorModeled::NotFoundException(NotFoundException {
                 message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),

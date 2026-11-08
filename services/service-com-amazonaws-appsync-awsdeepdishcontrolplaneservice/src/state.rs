@@ -21,6 +21,10 @@ pub mod event_data_plane;
 mod schema_types;
 pub use schema_types::*;
 
+/// The schema a GraphQL API holds, and the asynchronous creation that installs one.
+mod schema_creation;
+pub use schema_creation::*;
+
 use crate::ops::types::{
     AdditionalAuthenticationProvider, Api, ApiAssociation, ApiCache, ApiKey, AppSyncRuntime,
     AuthMode, ChannelNamespace, DataSource, DomainNameConfig, DynamodbDataSourceConfig,
@@ -105,6 +109,13 @@ pub struct GraphqlApiRecord {
     /// Bounded: `CreateType` refuses a create once the API holds the AppSync per-API
     /// quota of types, so this map cannot grow without limit.
     pub types: BTreeMap<String, TypeRecord>,
+    /// This API's schema creation, or `None` while no `StartSchemaCreation` has ever
+    /// run for it: the document the last call carried, the `SchemaStatus` it left
+    /// behind and the outcome the clock still owes ([`SchemaCreationRecord`]). A
+    /// creation that succeeds installs the types its document declares into
+    /// [`Self::types`], so the API's schema and its types are read under one lock and
+    /// cannot disagree.
+    pub schema: Option<SchemaCreationRecord>,
 }
 
 impl GraphqlApiRecord {

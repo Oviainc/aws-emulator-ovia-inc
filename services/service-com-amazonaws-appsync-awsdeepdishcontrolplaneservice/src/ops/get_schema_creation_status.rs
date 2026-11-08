@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op GetSchemaCreationStatus
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `GetSchemaCreationStatus`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`GetSchemaCreationStatus::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -147,18 +138,56 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `GetSchemaCreationStatus` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(GetSchemaCreationStatusErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("GetSchemaCreationStatus"))
+        // A read reports what is stored; nothing of the request's metadata changes what
+        // this answer is.
+        let _ = ctx;
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(GetSchemaCreationStatusErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(GetSchemaCreationStatusErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        let now = std::time::SystemTime::now();
+        let mut guard = state.lock();
+
+        // The only write a read makes: the schema creation the CLOCK already made due
+        // was owed at this instant whether or not anybody called, so it is materialised
+        // before the status is reported rather than being left for the next caller to
+        // observe differently.
+        guard.settle_schema_creations(now);
+
+        // A schema is a property OF a GraphQL API, so an API this account does not hold
+        // has no schema status to report.
+        let Some(api) = guard.graphql_apis.get(&input.api_id) else {
+            return Err(GetSchemaCreationStatusErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // Answered from the STORED record, so this body is the one the creation that
+        // scheduled it left behind.
+        let (status, details) = api.schema_creation_status();
+        Ok(GetSchemaCreationStatusOutput {
+            status: Some(status),
+            details,
+        })
     }
 }

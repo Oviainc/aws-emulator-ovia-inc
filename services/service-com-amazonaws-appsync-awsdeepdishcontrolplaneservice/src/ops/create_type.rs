@@ -179,7 +179,14 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         // The type is reported in the region the caller addressed, so its ARN is built
         // from that region rather than from a fixed one.
         let region = crate::state::request_region(ctx);
+        let now = std::time::SystemTime::now();
         let mut guard = state.lock();
+
+        // Materialise every schema creation the clock already owes first, so this
+        // create is checked against the types the API holds at THIS instant: a schema
+        // the clock installed is the API's type system, so a name it declared is taken.
+        guard.settle_schema_creations(now);
+
         let seq = guard.next_seq();
 
         // A type lives under a GraphQL API, so it cannot be created under an API this
@@ -190,6 +197,19 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
             .into());
         };
+
+        // A schema creation the clock still owes is a modification of this API's type
+        // system that is already in progress, and it "must complete before you can make
+        // your change": the create is refused rather than adding a type the schema
+        // being created is about to replace.
+        if api.schema_creation_in_progress() {
+            return Err(CreateTypeErrorModeled::ConcurrentModificationException(
+                ConcurrentModificationException {
+                    message: Some(crate::state::CONCURRENT_MODIFICATION_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        }
 
         // The declared name identifies the type within its API — it is what every type
         // operation addresses one by — so a create cannot take a name the API already
@@ -240,5 +260,7 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
 /// The AppSync service quota for types on ONE GraphQL API, which also bounds the
 /// per-API collection this operation writes to: a create past it is refused, so
-/// repeating the call cannot grow the store without limit.
-const TYPES_PER_API: usize = 2_500;
+/// repeating the call cannot grow the store without limit. Shared with the schema
+/// creation that installs a whole document's types, so the two paths cannot disagree
+/// about how many types one API holds.
+const TYPES_PER_API: usize = crate::state::TYPES_PER_API;

@@ -1,15 +1,6 @@
 // SPDX-License-Identifier: CC0-1.0
 
 //! @op StartSchemaCreation
-//! SCAFFOLDED, NOT IMPLEMENTED: this operation answers HTTP 501 `NotImplemented` and
-//! asserts NOTHING about `StartSchemaCreation`'s real behaviour. Implement it here — this is
-//! the ONLY file to touch for this operation.
-//!
-//! A 501 from this operation means "nobody has written it yet", never "the emulator is
-//! broken". Replace the `Err(..)` in [`StartSchemaCreation::handle`] with real behaviour and
-//! delete the SCAFFOLDED marker line above; that line is the machine-readable record of
-//! which operations are still stubs (`grep -rl '^//! SCAFFOLDED, NOT IMPLEMENTED:' */src/ops/`),
-//! so leaving it on an implemented operation under-reports progress.
 //!
 //! ## Shape of an operation
 //!
@@ -151,18 +142,119 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         input: Self::Input,
         ctx: &smithy_server_runtime::OperationContext<'_>,
     ) -> Result<Self::Output, Self::Error> {
-        // The engine is reachable from `&self` (constructor-injected); `ctx` carries
-        // request metadata. Both are bound here so an implementer has them in scope.
-        let _ = (&input, ctx, &self.engine);
-        // Implement `StartSchemaCreation` here, then delete the SCAFFOLDED marker at the top of
-        // this file. Return modeled failures as
-        // `Err(StartSchemaCreationErrorModeled::Variant(..).into())` — the `From` impl above lifts it.
-        //
-        // To refuse a bad request this operation models no error for, return
-        // `Err(crate::scaffolded::Scaffolded::validation("..."))` — a 400
-        // `ValidationException`. Do NOT answer 501 for it: 501 means "not written yet",
-        // not "bad request". Modeled constraints are already refused BEFORE this
-        // handler runs, so reaching here means the input satisfies every one of them.
-        Err(crate::scaffolded::Scaffolded::not_implemented("StartSchemaCreation"))
+        let Some(state) = crate::state::service_state(&*self.engine) else {
+            return Err(StartSchemaCreationErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some("the appsync store is unavailable on this engine".to_string()),
+                },
+            )
+            .into());
+        };
+
+        // An `apiId` that is not an API id at all is a malformed request, not a
+        // missing resource (see `crate::state::is_api_id`).
+        if !crate::state::is_api_id(&input.api_id) {
+            return Err(StartSchemaCreationErrorModeled::BadRequestException(
+                BadRequestException {
+                    message: Some(crate::state::invalid_api_id_message(&input.api_id)),
+                    ..Default::default()
+                },
+            )
+            .into());
+        }
+
+        // The schema arrives as "The schema definition, in GraphQL schema language
+        // format", i.e. as text: a payload that is not UTF-8 text is no GraphQL document
+        // either, so it is carried into the creation as a document that cannot be read
+        // rather than refused here — every ground a document is rejected on is reported
+        // the same way, through the status of the creation this call schedules.
+        let definition = String::from_utf8_lossy(&input.definition).into_owned();
+
+        // A type is reported in the region the caller addressed, so its ARN is built
+        // from that region rather than from a fixed one.
+        let region = crate::state::request_region(ctx);
+        let now = std::time::SystemTime::now();
+        let mut guard = state.lock();
+
+        // Materialise everything the clock already owes first, so this call is answered
+        // against the schema state of THIS instant rather than the one the last caller
+        // left behind.
+        guard.settle_schema_creations(now);
+
+        // A schema is a property OF a GraphQL API, so an API this account does not hold
+        // has none to add one to.
+        let Some(api) = guard.graphql_apis.get(&input.api_id) else {
+            return Err(StartSchemaCreationErrorModeled::NotFoundException(
+                NotFoundException {
+                    message: Some(crate::state::API_NOT_FOUND_MESSAGE.to_string()),
+                },
+            )
+            .into());
+        };
+
+        // A creation the clock still owes is a modification of this API's schema that is
+        // already in progress, and it "must complete before you can make your change":
+        // the second call is refused rather than replacing the document the first one is
+        // still creating.
+        if api.schema_creation_in_progress() {
+            return Err(
+                StartSchemaCreationErrorModeled::ConcurrentModificationException(
+                    ConcurrentModificationException {
+                        message: Some(crate::state::CONCURRENT_MODIFICATION_MESSAGE.to_string()),
+                    },
+                )
+                .into(),
+            );
+        }
+
+        // What the creation settles to is computed HERE, from the document this call
+        // carried: a document that defines a type system the API can hold yields the
+        // types it declares, each with the SDL text the document writes it in, and one
+        // that does not yields the reason it does not. Nothing of a later request takes
+        // part in the outcome.
+        let outcome = match crate::state::parse_schema_document(&definition) {
+            Ok(declared) => {
+                let mut types = std::collections::BTreeMap::new();
+                for crate::state::DeclaredType { definition, parsed } in declared {
+                    // Creation order comes from the store's own counter, so the types a
+                    // document installs are ordered exactly as separately created ones
+                    // are.
+                    let seq = guard.next_seq();
+                    types.insert(
+                        parsed.name.clone(),
+                        crate::state::TypeRecord {
+                            seq,
+                            arn: ::engine::emulator_arn(
+                                crate::state::ARN_SERVICE,
+                                &region,
+                                &crate::state::type_resource(&input.api_id, &parsed.name),
+                            ),
+                            definition,
+                            parsed,
+                        },
+                    );
+                }
+                crate::state::SchemaCreationOutcome::Created(types)
+            }
+            Err(refusal) => crate::state::SchemaCreationOutcome::Failed(refusal.detail()),
+        };
+
+        // The operation is asynchronous, so the call SCHEDULES the creation and answers
+        // the non-terminal state the API is left in; the clock performs it, and
+        // `GetSchemaCreationStatus` is what reports that it has.
+        let Some(api) = guard.graphql_apis.get_mut(&input.api_id) else {
+            // Unreachable: the lookup above resolved this very key under the same lock.
+            return Err(StartSchemaCreationErrorModeled::InternalFailureException(
+                InternalFailureException {
+                    message: Some(format!("the appsync store lost API {}", input.api_id)),
+                },
+            )
+            .into());
+        };
+        let status = api.start_schema_creation(definition, outcome, now);
+
+        Ok(StartSchemaCreationOutput {
+            status: Some(status),
+        })
     }
 }

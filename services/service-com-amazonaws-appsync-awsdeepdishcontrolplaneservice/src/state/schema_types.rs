@@ -353,80 +353,182 @@ pub fn parse_type_definition(definition: &str) -> Result<TypeDefinition, TypeDef
 
     let mut declared: Option<TypeDefinition> = None;
     for node in tree.document().definitions() {
-        let parsed = match node {
-            cst::Definition::ObjectTypeDefinition(object) => TypeDefinition {
+        // Everything else a GraphQL document can declare — an operation, a fragment, a
+        // directive, a schema, a type EXTENSION — declares no type, so it leaves nothing
+        // for this call to create.
+        let Some(parsed) = declared_type(&node) else {
+            return Err(TypeDefinitionError::NoTypeDeclared);
+        };
+        if declared.replace(parsed?).is_some() {
+            return Err(TypeDefinitionError::MoreThanOneTypeDeclared);
+        }
+    }
+
+    declared.ok_or(TypeDefinitionError::NoTypeDeclared)
+}
+
+/// The type `node` declares, or `None` for a definition that declares no type at all.
+///
+/// The one reading of what each SDL type keyword declares, so a type parsed out of a
+/// single definition and one parsed out of a whole schema document cannot differ.
+fn declared_type(
+    node: &cst::Definition,
+) -> Option<Result<TypeDefinition, TypeDefinitionError>> {
+    let parsed = match node {
+        cst::Definition::ObjectTypeDefinition(object) => (|| {
+            Ok(TypeDefinition {
                 kind: OBJECT_KIND,
                 name: name_text(object.name())?,
                 description: description_text(object.description()),
                 interfaces: implemented_interfaces(object.implements_interfaces()),
                 fields: field_definitions(object.fields_definition()),
                 ..TypeDefinition::default()
-            },
-            cst::Definition::InterfaceTypeDefinition(interface) => TypeDefinition {
+            })
+        })(),
+        cst::Definition::InterfaceTypeDefinition(interface) => (|| {
+            Ok(TypeDefinition {
                 kind: INTERFACE_KIND,
                 name: name_text(interface.name())?,
                 description: description_text(interface.description()),
                 interfaces: implemented_interfaces(interface.implements_interfaces()),
                 fields: field_definitions(interface.fields_definition()),
                 ..TypeDefinition::default()
-            },
-            cst::Definition::InputObjectTypeDefinition(input) => TypeDefinition {
+            })
+        })(),
+        cst::Definition::InputObjectTypeDefinition(input) => (|| {
+            Ok(TypeDefinition {
                 kind: INPUT_OBJECT_KIND,
                 name: name_text(input.name())?,
                 description: description_text(input.description()),
-                input_fields: input
-                    .input_fields_definition()
-                    .map(|fields| {
-                        fields
-                            .input_value_definitions()
-                            .map(input_value_definition)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                input_fields: input_field_definitions(input.input_fields_definition()),
                 ..TypeDefinition::default()
-            },
-            cst::Definition::EnumTypeDefinition(enumeration) => TypeDefinition {
+            })
+        })(),
+        cst::Definition::EnumTypeDefinition(enumeration) => (|| {
+            Ok(TypeDefinition {
                 kind: ENUM_KIND,
                 name: name_text(enumeration.name())?,
                 description: description_text(enumeration.description()),
-                enum_values: enumeration
-                    .enum_values_definition()
-                    .map(|values| {
-                        values
-                            .enum_value_definitions()
-                            .map(enum_value_definition)
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                enum_values: enum_value_definitions(enumeration.enum_values_definition()),
                 ..TypeDefinition::default()
-            },
-            cst::Definition::UnionTypeDefinition(union) => TypeDefinition {
+            })
+        })(),
+        cst::Definition::UnionTypeDefinition(union) => (|| {
+            Ok(TypeDefinition {
                 kind: UNION_KIND,
                 name: name_text(union.name())?,
                 description: description_text(union.description()),
-                members: union
-                    .union_member_types()
-                    .map(|members| named_type_names(members.named_types()))
-                    .unwrap_or_default(),
+                members: union_members(union.union_member_types()),
                 ..TypeDefinition::default()
-            },
-            cst::Definition::ScalarTypeDefinition(scalar) => TypeDefinition {
+            })
+        })(),
+        cst::Definition::ScalarTypeDefinition(scalar) => (|| {
+            Ok(TypeDefinition {
                 kind: SCALAR_KIND,
                 name: name_text(scalar.name())?,
                 description: description_text(scalar.description()),
                 ..TypeDefinition::default()
-            },
-            // Everything else a GraphQL document can declare — an operation, a
-            // fragment, a directive, a schema, a type EXTENSION — declares no type, so
-            // it leaves nothing for this call to create.
-            _ => return Err(TypeDefinitionError::NoTypeDeclared),
-        };
-        if declared.replace(parsed).is_some() {
-            return Err(TypeDefinitionError::MoreThanOneTypeDeclared);
-        }
-    }
+            })
+        })(),
+        _ => return None,
+    };
+    Some(parsed)
+}
 
-    declared.ok_or(TypeDefinitionError::NoTypeDeclared)
+/// The type `node` EXTENDS, as the members the extension contributes to it, or `None`
+/// for a definition that extends no type.
+///
+/// An extension carries no description of its own — GraphQL's SDL grammar gives a
+/// description only to a definition — so what it contributes is members alone.
+fn extended_type(node: &cst::Definition) -> Option<Result<TypeDefinition, TypeDefinitionError>> {
+    let parsed = match node {
+        cst::Definition::ObjectTypeExtension(object) => (|| {
+            Ok(TypeDefinition {
+                kind: OBJECT_KIND,
+                name: name_text(object.name())?,
+                interfaces: implemented_interfaces(object.implements_interfaces()),
+                fields: field_definitions(object.fields_definition()),
+                ..TypeDefinition::default()
+            })
+        })(),
+        cst::Definition::InterfaceTypeExtension(interface) => (|| {
+            Ok(TypeDefinition {
+                kind: INTERFACE_KIND,
+                name: name_text(interface.name())?,
+                interfaces: implemented_interfaces(interface.implements_interfaces()),
+                fields: field_definitions(interface.fields_definition()),
+                ..TypeDefinition::default()
+            })
+        })(),
+        cst::Definition::InputObjectTypeExtension(input) => (|| {
+            Ok(TypeDefinition {
+                kind: INPUT_OBJECT_KIND,
+                name: name_text(input.name())?,
+                input_fields: input_field_definitions(input.input_fields_definition()),
+                ..TypeDefinition::default()
+            })
+        })(),
+        cst::Definition::EnumTypeExtension(enumeration) => (|| {
+            Ok(TypeDefinition {
+                kind: ENUM_KIND,
+                name: name_text(enumeration.name())?,
+                enum_values: enum_value_definitions(enumeration.enum_values_definition()),
+                ..TypeDefinition::default()
+            })
+        })(),
+        cst::Definition::UnionTypeExtension(union) => (|| {
+            Ok(TypeDefinition {
+                kind: UNION_KIND,
+                name: name_text(union.name())?,
+                members: union_members(union.union_member_types()),
+                ..TypeDefinition::default()
+            })
+        })(),
+        cst::Definition::ScalarTypeExtension(scalar) => (|| {
+            Ok(TypeDefinition {
+                kind: SCALAR_KIND,
+                name: name_text(scalar.name())?,
+                ..TypeDefinition::default()
+            })
+        })(),
+        _ => return None,
+    };
+    Some(parsed)
+}
+
+/// The input fields a `{ … }` input field set declares.
+fn input_field_definitions(
+    fields: Option<cst::InputFieldsDefinition>,
+) -> Vec<InputValueDefinition> {
+    fields
+        .map(|fields| {
+            fields
+                .input_value_definitions()
+                .map(input_value_definition)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The values an `{ … }` enum value set declares.
+fn enum_value_definitions(
+    values: Option<cst::EnumValuesDefinition>,
+) -> Vec<EnumValueDefinition> {
+    values
+        .map(|values| {
+            values
+                .enum_value_definitions()
+                .map(enum_value_definition)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The member types a `= A | B` union member list names.
+fn union_members(members: Option<cst::UnionMemberTypes>) -> Vec<String> {
+    members
+        .map(|members| named_type_names(members.named_types()))
+        .unwrap_or_default()
 }
 
 /// The text of a declared name, or [`TypeDefinitionError::NoTypeDeclared`] for a
@@ -658,6 +760,13 @@ fn kind_of(name: &str, api_types: &BTreeMap<String, TypeRecord>) -> Option<&'sta
     api_types.get(name).map(|record| record.parsed.kind)
 }
 
+/// The AppSync service quota for types on ONE GraphQL API.
+///
+/// It bounds the per-API collection however a type got into it — created one at a time
+/// by `CreateType` or installed by a whole schema document — so neither path can grow
+/// the store without limit.
+pub const TYPES_PER_API: usize = 2_500;
+
 /// The resource portion of a type's ARN: a type is a child of its API, so it is named
 /// under the API's own `apis/{apiId}` path, as `GetType`'s URI
 /// (`/v1/apis/{apiId}/types/{typeName}`) addresses it.
@@ -684,4 +793,249 @@ pub fn type_not_found_message(type_name: &str) -> String {
 /// (`crate::state::data_source_exists_message`).
 pub fn type_exists_message(type_name: &str) -> String {
     format!("Type with name {type_name} already exists.")
+}
+
+/// One type a whole schema document declares: the SDL text the document writes it in
+/// and the definition that text parses to.
+///
+/// The same pair a single `CreateType` stores ([`TypeRecord`]), so a type that arrived
+/// inside a schema document and one created on its own are stored and reported
+/// identically.
+#[derive(Debug, Clone)]
+pub struct DeclaredType {
+    /// The document's own text for this type, the definition and every extension of it
+    /// the document writes, in document order.
+    pub definition: String,
+    /// What [`Self::definition`] parses to.
+    pub parsed: TypeDefinition,
+}
+
+/// Why a caller-supplied schema document is not a GraphQL schema this service can
+/// create.
+///
+/// Each ground is a rule of GraphQL's own type system, checked against the parsed
+/// document rather than against the request's text.
+#[derive(Debug, Clone)]
+pub enum SchemaDocumentError {
+    /// The document is not well-formed GraphQL, carrying the parser's own account of
+    /// the first thing wrong with it.
+    Unparseable(String),
+    /// The document declares no type at all, so it defines no schema.
+    NoTypeDeclared,
+    /// The document declares a type that carries no name.
+    TypeWithoutName,
+    /// The document declares one type name twice: a GraphQL type system defines each
+    /// name once, so the second declaration has no type of its own to be.
+    TypeDeclaredTwice(String),
+    /// The document extends a type it never declares, which leaves the extension's
+    /// members on no type.
+    ExtendedTypeNotDeclared(String),
+    /// A type of the document references a type name nothing declares and that is no
+    /// scalar every schema holds, so the reference resolves to no type.
+    UndefinedTypeReferenced {
+        /// The type whose definition carries the reference.
+        type_name: String,
+        /// The name it references.
+        referenced: String,
+    },
+    /// The document declares more types than an API can hold ([`TYPES_PER_API`]), so
+    /// the type system it defines does not fit on one API.
+    MoreTypesThanTheQuota(usize),
+}
+
+impl SchemaDocumentError {
+    /// The detail a failed schema creation reports: what about the document has to be
+    /// fixed, in one sentence.
+    ///
+    /// This is the `details` of the schema status, "Detailed information about the
+    /// status of the schema creation operation"; the parser's and the type system's own
+    /// account of the first thing wrong is carried through, so the caller can fix the
+    /// document from the status alone.
+    pub fn detail(&self) -> String {
+        match self {
+            Self::Unparseable(detail) => {
+                format!("Unable to parse the schema document: {detail}")
+            }
+            Self::NoTypeDeclared => {
+                "The schema document declares no GraphQL type.".to_string()
+            }
+            Self::TypeWithoutName => {
+                "The schema document declares a type without a name.".to_string()
+            }
+            Self::TypeDeclaredTwice(name) => {
+                format!("The schema document declares the type {name} more than once.")
+            }
+            Self::ExtendedTypeNotDeclared(name) => format!(
+                "The schema document extends the type {name}, which it does not declare."
+            ),
+            Self::UndefinedTypeReferenced {
+                type_name,
+                referenced,
+            } => format!(
+                "The type {type_name} references the type {referenced}, which the schema \
+                 document does not declare."
+            ),
+            Self::MoreTypesThanTheQuota(declared) => format!(
+                "The schema document declares {declared} types, more than the \
+                 {TYPES_PER_API} an API can hold."
+            ),
+        }
+    }
+}
+
+/// Parse one caller-supplied schema document, written in GraphQL schema language, into
+/// the types it declares — in document order.
+///
+/// A schema document declares a whole type system rather than the one type
+/// [`parse_type_definition`] reads, so every type definition it writes is kept, a type
+/// extension contributes its members to the type of that name, and the definitions a
+/// type system carries that are no type at all (a `schema` definition naming the root
+/// operation types, a directive definition) declare no type and are left to the
+/// document.
+///
+/// The type system the document defines has to hold together, so the parse refuses a
+/// document that declares nothing, declares one name twice, extends a type it does not
+/// declare, or references a type neither it nor GraphQL defines
+/// ([`BUILT_IN_SCALARS`]) — each the rule GraphQL's own type system states, and each
+/// reported as the detail of a FAILED creation rather than stored as a schema nothing
+/// resolves.
+///
+/// The parse is bounded by [`DEFINITION_RECURSION_LIMIT`] and
+/// [`DEFINITION_TOKEN_LIMIT`], the same bounds a single definition is read under, so
+/// neither the depth nor the amount of work one caller-supplied document costs comes
+/// from the request.
+pub fn parse_schema_document(definition: &str) -> Result<Vec<DeclaredType>, SchemaDocumentError> {
+    let tree = Parser::new(definition)
+        .recursion_limit(DEFINITION_RECURSION_LIMIT)
+        .token_limit(DEFINITION_TOKEN_LIMIT)
+        .parse();
+    if let Some(error) = tree.errors().next() {
+        return Err(SchemaDocumentError::Unparseable(error.message().to_string()));
+    }
+
+    // Declaration order is the document's, which is the order introspection reports a
+    // schema's types in, so it is kept beside the by-name index the checks below need.
+    let mut order: Vec<String> = Vec::new();
+    let mut declared: BTreeMap<String, DeclaredType> = BTreeMap::new();
+    let mut extensions: Vec<(TypeDefinition, String)> = Vec::new();
+
+    for node in tree.document().definitions() {
+        let text = node.syntax().text().to_string().trim().to_string();
+        if let Some(parsed) = declared_type(&node) {
+            let parsed = parsed.map_err(|_| SchemaDocumentError::TypeWithoutName)?;
+            let name = parsed.name.clone();
+            if declared.contains_key(&name) {
+                return Err(SchemaDocumentError::TypeDeclaredTwice(name));
+            }
+            order.push(name.clone());
+            declared.insert(
+                name,
+                DeclaredType {
+                    definition: text,
+                    parsed,
+                },
+            );
+            continue;
+        }
+        if let Some(parsed) = extended_type(&node) {
+            let parsed = parsed.map_err(|_| SchemaDocumentError::TypeWithoutName)?;
+            extensions.push((parsed, text));
+        }
+    }
+
+    // An extension contributes to the type of its name, so it is applied after the
+    // whole document has been read: GraphQL does not require a type to be declared
+    // before the extension that extends it.
+    for (extension, text) in extensions {
+        let Some(target) = declared.get_mut(&extension.name) else {
+            return Err(SchemaDocumentError::ExtendedTypeNotDeclared(extension.name));
+        };
+        target.parsed.extend_with(extension);
+        target.definition.push_str("\n\n");
+        target.definition.push_str(&text);
+    }
+
+    if order.is_empty() {
+        return Err(SchemaDocumentError::NoTypeDeclared);
+    }
+
+    // The type system a document installs is bounded by the same per-API quota a type
+    // created on its own counts against, so one document cannot grow the store past it.
+    if order.len() > TYPES_PER_API {
+        return Err(SchemaDocumentError::MoreTypesThanTheQuota(order.len()));
+    }
+
+    // Every type reference of the finished type system has to resolve, so a document
+    // that names a type it does not define is refused rather than stored as a schema
+    // whose fields resolve to nothing.
+    for name in &order {
+        let Some(entry) = declared.get(name) else {
+            continue;
+        };
+        for referenced in entry.parsed.referenced_types() {
+            if BUILT_IN_SCALARS.contains(&referenced.as_str()) || declared.contains_key(&referenced)
+            {
+                continue;
+            }
+            return Err(SchemaDocumentError::UndefinedTypeReferenced {
+                type_name: name.clone(),
+                referenced,
+            });
+        }
+    }
+
+    Ok(order
+        .iter()
+        .filter_map(|name| declared.remove(name))
+        .collect())
+}
+
+impl TypeDefinition {
+    /// Contribute everything the extension `extension` declares to this type.
+    ///
+    /// A type extension "can be used to represent a type which has been extended from
+    /// some original type": the members it writes are ADDED to the ones the definition
+    /// already declares, in the order the document writes them, and nothing of the
+    /// definition is replaced — an extension carries no description and no kind of its
+    /// own to replace them with.
+    fn extend_with(&mut self, extension: Self) {
+        self.interfaces.extend(extension.interfaces);
+        self.fields.extend(extension.fields);
+        self.input_fields.extend(extension.input_fields);
+        self.enum_values.extend(extension.enum_values);
+        self.members.extend(extension.members);
+    }
+
+    /// Every type name this definition references: the interfaces it implements, the
+    /// types a union holds, and the type of each field, field argument and input field.
+    ///
+    /// A list or non-null reference is a wrapper around a named one (`[Post!]!`), so
+    /// what is reported is the NAME at its root — the only part that has to resolve to a
+    /// declared type.
+    fn referenced_types(&self) -> Vec<String> {
+        let mut referenced: Vec<String> = Vec::new();
+        referenced.extend(self.interfaces.iter().cloned());
+        referenced.extend(self.members.iter().cloned());
+        for field in &self.fields {
+            referenced.extend(field.value_type.as_ref().map(TypeRef::root_name));
+            for argument in &field.arguments {
+                referenced.extend(argument.value_type.as_ref().map(TypeRef::root_name));
+            }
+        }
+        for input_field in &self.input_fields {
+            referenced.extend(input_field.value_type.as_ref().map(TypeRef::root_name));
+        }
+        referenced
+    }
+}
+
+impl TypeRef {
+    /// The name at the root of this reference, unwrapping every list and non-null
+    /// around it.
+    fn root_name(&self) -> String {
+        match self {
+            Self::Named(name) => name.clone(),
+            Self::List(inner) | Self::NonNull(inner) => inner.root_name(),
+        }
+    }
 }
