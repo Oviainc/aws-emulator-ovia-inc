@@ -606,7 +606,18 @@ pub struct ManagedScaling {
     pub instance_warmup_period: Option<i32>,
 }
 
-#[smithy_macros::smithy(shape = "com.amazonaws.ecs#InstanceLaunchTemplate")]
+// `skip_validation = ["monitoring"]`: this member's own documentation publishes the two
+// monitoring categories in lower case ("CloudWatch provides two categories of monitoring:
+// basic monitoring and detailed monitoring. By default, your managed instance is
+// configured for basic monitoring"), and Amazon ECS serves a request that spells the
+// option that way, so the modelled value set cannot be enforced as case-sensitive
+// equality at the boundary. The set is still enforced, by the handler that stores the
+// template (`crate::state::managed_instances_monitoring_option`), which also stores the
+// option in the spelling the set lists.
+#[smithy_macros::smithy(
+    shape = "com.amazonaws.ecs#InstanceLaunchTemplate",
+    skip_validation = ["monitoring"]
+)]
 #[derive(Debug, Clone, Default)]
 pub struct InstanceLaunchTemplate {
     pub ec2_instance_profile_arn: String,

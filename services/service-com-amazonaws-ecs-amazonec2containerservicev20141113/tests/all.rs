@@ -107,6 +107,10 @@ mod load_balancer_pairing_refusal_wording;
 mod load_balancer_target_group_placement;
 #[path = "all/load_balancer_target_groups.rs"]
 mod load_balancer_target_groups;
+// The spellings a Managed Instances launch template's `monitoring` option is accepted in,
+// beside the option the stored template reports (`probe_monitoring`).
+#[path = "all/managed_instances_monitoring_spelling.rs"]
+mod managed_instances_monitoring_spelling;
 #[path = "all/name_pattern_refusals.rs"]
 mod name_pattern_refusals;
 #[path = "all/page_size_range_refusals.rs"]

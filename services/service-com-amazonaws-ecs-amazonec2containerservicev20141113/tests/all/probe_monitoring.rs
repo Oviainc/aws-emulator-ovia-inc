@@ -9,8 +9,9 @@
 //! through the create's own answer and through `DescribeCapacityProviders` — and a create
 //! that names none reports none, since the member has no value Amazon ECS substitutes
 //! into the stored template. One row per modelled option, plus the create that names
-//! none; a value outside the modelled set is refused before any handler runs, which is
-//! [`crate::enum_value_refusals`]'s subject.
+//! none; which SPELLINGS of an option reach the stored template, and what a value outside
+//! the modelled set is refused with, is
+//! [`crate::managed_instances_monitoring_spelling`]'s subject.
 //!
 //! Every case goes through the shared wire harness in [`crate::ecs_wire`], the same front
 //! door a client uses, so nothing reaches into the state struct.

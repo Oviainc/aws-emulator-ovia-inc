@@ -691,6 +691,34 @@ pub fn enum_value_message(member_path: &str, accepted: &[String]) -> String {
     )
 }
 
+/// The member of a Managed Instances launch template that names which of the two
+/// CloudWatch monitoring categories its instances run under.
+pub const MONITORING_MEMBER: &str = "monitoring";
+
+/// The option a Managed Instances launch template's `monitoring` names, in the spelling
+/// the modelled value set lists — or the sentence a value that names none of them is
+/// refused with ([`enum_value_message`]).
+///
+/// The value is matched WITHOUT regard to ASCII case: the member's own documentation
+/// publishes the two categories in lower case ("basic monitoring and detailed
+/// monitoring"), and Amazon ECS serves a request that spells the option that way. The
+/// stored template reports this member back through a shape that targets the modelled
+/// enum, so the option is stored in the spelling that set lists and a read reports a value
+/// inside it whichever spelling created it. A value that matches no option in any case is
+/// outside the set, and is refused as any other out-of-set enumerated value of this
+/// service is.
+pub fn managed_instances_monitoring_option(value: &str) -> Result<String, String> {
+    let accepted = crate::ops::types::MANAGED_INSTANCES_MONITORING_OPTIONS_VALUES;
+    accepted
+        .iter()
+        .find(|option| option.eq_ignore_ascii_case(value))
+        .map(|option| (*option).to_string())
+        .ok_or_else(|| {
+            let accepted: Vec<String> = accepted.iter().map(|option| option.to_string()).collect();
+            enum_value_message(MONITORING_MEMBER, &accepted)
+        })
+}
+
 /// `InvalidParameterException$message` for a `containerInstance` whose id is not one
 /// Amazon ECS mints: the ids it names are the hexadecimal and UUID forms
 /// [`CONTAINER_INSTANCE_ID_PATTERN`] describes, and the refusal states that pattern

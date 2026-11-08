@@ -189,6 +189,36 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
             })
         })?;
 
+        // `InstanceLaunchTemplate$monitoring` is judged HERE rather than at the framework
+        // boundary (`skip_validation` on `InstanceLaunchTemplate` in `src/ops/types/`),
+        // because the option is accepted in the lower-case spelling its own documentation
+        // publishes as well as in the spelling the modelled set lists, which case-sensitive
+        // equality cannot express. The modelled set is still what it is checked against
+        // ([`crate::state::managed_instances_monitoring_option`]), and the option is stored
+        // in that set's own spelling. This stands FIRST, where the boundary walk would have
+        // refused it, so a value outside the set is what the request is refused for
+        // whatever else it names.
+        let monitoring = match input
+            .managed_instances_provider
+            .as_ref()
+            .and_then(|provider| provider.instance_launch_template.monitoring.as_deref())
+        {
+            Some(requested) => match crate::state::managed_instances_monitoring_option(requested) {
+                Ok(option) => Some(option),
+                Err(message) => {
+                    return Err(
+                        CreateCapacityProviderErrorModeled::InvalidParameterException(
+                            InvalidParameterException {
+                                message: Some(message),
+                            },
+                        )
+                        .into(),
+                    )
+                }
+            },
+            None => None,
+        };
+
         // The name is the provider's identifier, so a value outside the one rule the
         // member documents — its length, its character set, or a prefix Amazon ECS keeps
         // for its own providers — names no provider this account may create.
@@ -314,17 +344,23 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
 
         // `CreateManagedInstancesProviderConfiguration` is what the request carries and
         // `ManagedInstancesProvider` what a response reports: the same configuration,
-        // member for member, so the stored provider reports back what it was created with.
+        // member for member, so the stored provider reports back what it was created with
+        // — with `monitoring` in the spelling the modelled set lists, so the reported
+        // template carries a value inside that set whichever spelling created it.
         let managed_instances_provider =
             input
                 .managed_instances_provider
                 .as_ref()
-                .map(|requested| ManagedInstancesProvider {
-                    infrastructure_role_arn: Some(requested.infrastructure_role_arn.clone()),
-                    instance_launch_template: Some(requested.instance_launch_template.clone()),
-                    propagate_tags: requested.propagate_tags.clone(),
-                    infrastructure_optimization: requested.infrastructure_optimization.clone(),
-                    auto_repair_configuration: requested.auto_repair_configuration.clone(),
+                .map(|requested| {
+                    let mut instance_launch_template = requested.instance_launch_template.clone();
+                    instance_launch_template.monitoring = monitoring.clone();
+                    ManagedInstancesProvider {
+                        infrastructure_role_arn: Some(requested.infrastructure_role_arn.clone()),
+                        instance_launch_template: Some(instance_launch_template),
+                        propagate_tags: requested.propagate_tags.clone(),
+                        infrastructure_optimization: requested.infrastructure_optimization.clone(),
+                        auto_repair_configuration: requested.auto_repair_configuration.clone(),
+                    }
                 });
         // What this request would bind the provider onto, as the stored record renders its
         // own binding — the comparison the idempotency rule below is decided on.
