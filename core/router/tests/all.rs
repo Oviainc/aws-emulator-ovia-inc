@@ -1086,3 +1086,7 @@ mod sesv2_probe3;
 // concurrent changes declared the same entry, which is a redefinition and stops this target
 // `bedrock_agentcore_data_plane_parent_resources` — are each ALREADY declared above in the
 // sorted head. Concurrent changes appended the same entry twice, which is a redefinition and
+// Declared here, in this same head region, for the reason the note above records: the sorted
+// `s…` span every SNS suite lands in is a region concurrently landing suites append to.
+#[path = "all/sns_lambda_invoke_permission_revocation.rs"]
+mod sns_lambda_invoke_permission_revocation;
