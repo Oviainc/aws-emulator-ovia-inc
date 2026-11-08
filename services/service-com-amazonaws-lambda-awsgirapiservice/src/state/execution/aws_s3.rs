@@ -745,6 +745,10 @@ impl Observed {
             error_type: None,
             request_id: carried.request_id,
             streams,
+            // Amazon S3's own protocol carries an object's bytes as the body itself rather
+            // than as a member of a JSON document, so the bytes of this answer are the ones
+            // `streams` names and no value of its document is base64.
+            blobs: Vec::new(),
         })
     }
 }
@@ -779,6 +783,7 @@ fn refused<E: ProvideErrorMetadata>(
         error_type: Some(code.to_string()),
         request_id: carried.request_id,
         streams: Vec::new(),
+        blobs: Vec::new(),
     })
 }
 
@@ -813,6 +818,7 @@ fn refused_without_a_document<E: ProvideErrorMetadata>(
         error_type: Some(code),
         request_id: carried.request_id,
         streams: Vec::new(),
+        blobs: Vec::new(),
     })
 }
 

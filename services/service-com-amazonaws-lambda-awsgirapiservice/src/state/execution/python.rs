@@ -34,32 +34,38 @@
 //!   the in-process X-Ray daemon, whose datagrams travel over the SAME bounded AWS SDK seam
 //!   below, and every other destination raises the error a host with no route to it answers;
 //! * the only host functions the guest can call are the four on [`HOST_MODULE`]: the
-//!   invocation log, a sleep clamped to what is left of the run, the step hook below, and
-//!   ONE AWS SDK call into this same emulator ([`super::aws_api`], which decides which
-//!   services are reachable, signs the request itself and bounds it by what the run has
-//!   left). No host path, host environment variable, host credential or other function's
-//!   state is reachable from guest code.
+//!   invocation log, a sleep clamped to what is left of the run, ONE AWS SDK call into this
+//!   same emulator ([`super::aws_api`], which decides which services are reachable, signs the
+//!   request itself and bounds it by what the run has left), and the authentication token an
+//!   SDK mints in its client. No host path, host environment variable, host credential or
+//!   other function's state is reachable from guest code, and NO bound of the run is reachable
+//!   from it either.
 //!
 //! # Bounds
 //!
 //! Every bound lives in host code the guest cannot switch off:
 //!
-//! * STEPS and the DEADLINE are checked by [`Bounds::step`], called from the interpreter's
-//!   trace hook, which the host installs and then REMOVES `sys.settrace` /
-//!   `sys.setprofile` / `sys.gettrace` for, so no guest call can clear or replace it. The
-//!   stop is LATCHED: once the budget is spent the run's answer is that stop, whatever the
-//!   guest goes on to return or catch.
+//! * STEPS and the DEADLINE are checked by [`Bounds::step`], which the interpreter's trace
+//!   hook calls DIRECTLY: the hook is a host function ([`install_trace_hook`]) rather than
+//!   Python, so no module attribute, global or default argument stands between a traced event
+//!   and the bound, and the host then REMOVES `sys.settrace` / `sys.setprofile` /
+//!   `sys.gettrace`, so no guest call can clear or replace it either. The stop is LATCHED:
+//!   once the budget is spent the run's answer is that stop, whatever the guest goes on to
+//!   return or catch.
 //! * MEMORY is sampled from outside the guest — this thread's faulted pages and the
-//!   process's resident size — because the interpreter exposes no allocation seam; a
-//!   sample past the run's ceiling ends the run.
+//!   process's resident size — because the interpreter exposes no allocation seam; a sample
+//!   past the run's own ceiling ends the run, and so does one showing the run has grown the
+//!   whole process past the process ceiling.
 //! * RECURSION is clamped on the interpreter before any guest code runs, and
 //!   `sys.setrecursionlimit` is removed so the guest cannot raise it.
 //! * The LOG and the RESPONSE are each capped, so a small request cannot make an
 //!   unbounded answer.
-//! * A long NATIVE call emits no trace event, so the deadline cannot land inside one.
-//!   That is what the caller's own host watch and abandoned-run accounting
-//!   ([`super::run_invocation`]) exist for: the CALLER is always answered inside its
-//!   ceiling, and a run still going after its budget was spent is given up on.
+//! * A long NATIVE call emits no trace event, so the deadline cannot land inside one. That is
+//!   what the host's own watch ([`watch_run`]) is for: ONE thread of this process reads the
+//!   same clock for every live run and LATCHES the stop, which the next event the interpreter
+//!   delivers then raises. Beside it, the caller's own host wait and abandoned-run accounting
+//!   ([`super::run_invocation`]) make sure the CALLER is always answered inside its ceiling,
+//!   and a run still going after its budget was spent is given up on.
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -78,8 +84,7 @@ use super::aws_api::{AwsAccess, Refusal, MAX_CALLS_PER_RUN};
 use super::outcome::{captured, Capture};
 use super::package::PackageModule;
 
-/// The name of the module the three host functions live on, as the runtime source imports
-/// it.
+/// The name of the module the host functions live on, as the runtime source imports it.
 const HOST_MODULE: &str = "_lambda_host";
 
 /// Every native module this interpreter registers, out of the engine's own two pools.
@@ -176,8 +181,14 @@ const STEPS_BETWEEN_PROCESS_SAMPLES: u64 = 2_048;
 const PAGE_BYTES: u64 = 4_096;
 
 /// The resident size this WHOLE process may reach while a handler is running, whatever any
-/// one run has added. An absolute ceiling, so no number of concurrent runs can take the
-/// emulator past it.
+/// one run has added.
+///
+/// A ceiling on the PROCESS, not on one run: the run's own ceiling is its `MemorySize`, which
+/// is what a run is answerable for. What this adds is that no number of concurrent runs can
+/// take the emulator past it — so a run is stopped for it when the run has GROWN the process
+/// past it ([`Bounds::past_process_ceiling`]), and not for a process that was already there
+/// when the run began: memory a run did not allocate is not a bound that run breached, and
+/// stopping it would answer the wrong caller while freeing nothing.
 const PROCESS_RESIDENT_CEILING_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
 /// One invocation to run: the package, the handler, and everything the runtime reports to
@@ -250,8 +261,17 @@ fn evaluate(request: &Run<'_>, capture: &Arc<Mutex<Capture>>, bounds: &Arc<Bound
             "the interpreter's native modules could not be narrowed to the allow-list".to_string(),
         );
     }
+    // The hook the bounds are spent through, held HERE: it stays installed and answering
+    // until the interpreter has been finalized, because finalization runs the guest's own
+    // `atexit` callbacks and those frames are traced like every other guest frame.
+    let held: TraceCell = ::std::rc::Rc::new(::std::cell::RefCell::new(None));
+    // The host's own watch over this run, sampling the clock from OUTSIDE the guest for as
+    // long as the run lasts ([`watch_run`]).
+    watch_run(bounds);
     let completion = interpreter.enter(|vm| {
-        match prepare(vm, request, capture, bounds).and_then(|()| drive(vm, &input, bounds)) {
+        match prepare(vm, request, capture, bounds)
+            .and_then(|()| drive(vm, &input, bounds, &held))
+        {
             Ok(result) => result,
             Err(exception) => Completion::Internal(formatted_exception(vm, &exception)),
         }
@@ -262,10 +282,69 @@ fn evaluate(request: &Run<'_>, capture: &Arc<Mutex<Capture>>, bounds: &Arc<Bound
     // would hold its interpreter's memory for the life of this process however short the run
     // was. Finalizing it is also what the language itself does at the end of a program, so a
     // handler's `atexit` callback runs the way it runs on the real runtime, and it runs
-    // against the SAME bounds the handler did (the step hook is still installed and its stop
-    // is latched), so nothing of the run outlasts the run's budget.
+    // against the SAME bounds the handler did — the hook is still installed and still
+    // answering itself as each frame's local tracer, the host watch below is still sampling
+    // the clock, and a stop already latched stays latched — so nothing of the run outlasts
+    // the run's budget.
     interpreter.finalize(None);
+    // Only now: the hook and this cell hold each other, so emptying it is what lets the one
+    // the run installed go.
+    held.borrow_mut().take();
     completion
+}
+
+/// How often the host's own watch samples a run's deadline.
+///
+/// A long NATIVE call emits no traced event, so a deadline checked only from the trace hook is
+/// one the guest decides the timing of. The watch reads the same clock from a thread of its
+/// own, so a run that stops producing events is still noticed and still stopped.
+const WATCH_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Have the host's own watch sample this run's deadline while the run lasts.
+///
+/// The watch is ONE thread for the whole process, not one per run: it holds a WEAK reference
+/// to each run's bounds, so a run it is watching is one that is still going and a run that
+/// ended simply falls out of the list. The thread is started with the list, on the first run
+/// of this process.
+fn watch_run(bounds: &Arc<Bounds>) {
+    let mut watched = watched_runs()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    watched.retain(|run| run.strong_count() > 0);
+    watched.push(Arc::downgrade(bounds));
+    drop(watched);
+    start_watch_thread();
+}
+
+/// The bounds of every run the watch is sampling.
+fn watched_runs() -> &'static Mutex<Vec<::std::sync::Weak<Bounds>>> {
+    static WATCHED: ::std::sync::OnceLock<Mutex<Vec<::std::sync::Weak<Bounds>>>> =
+        ::std::sync::OnceLock::new();
+    WATCHED.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Start the one watch thread of this process, if it is not already running.
+fn start_watch_thread() {
+    static STARTED: ::std::sync::OnceLock<()> = ::std::sync::OnceLock::new();
+    STARTED.get_or_init(|| {
+        let _ = ::std::thread::Builder::new()
+            .name("lambda-run-watch".to_string())
+            .spawn(|| loop {
+                ::std::thread::sleep(WATCH_INTERVAL);
+                // The live runs are copied out under the lock and sampled outside it, so a
+                // sample never holds the list against the next run that starts.
+                let live: Vec<Arc<Bounds>> = {
+                    let mut watched = watched_runs()
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner);
+                    watched.retain(|run| run.strong_count() > 0);
+                    watched.iter().filter_map(::std::sync::Weak::upgrade).collect()
+                };
+                for bounds in live {
+                    bounds.watch();
+                }
+            });
+    });
 }
 
 /// The interpreter itself: the frozen standard library and the ALLOW-LISTED native
@@ -405,11 +484,15 @@ fn install_environment(vm: &VirtualMachine, variables: &BTreeMap<String, String>
     Ok(())
 }
 
-/// Replace every call that would open a HOST file with a refusal, on each of the three
-/// objects a Python program reaches one through.
+/// Take away every way of opening a HOST file: the TYPE that opens one, and each of the three
+/// names a Python program reaches it through.
 ///
-/// The guest sees the names it expects — `open`, `io.open`, `_io.FileIO` — and the call
-/// raises, so no host path resolves for it. The rest of `_io` (the in-memory streams the
+/// The refusal is put on the type's own construction, not only on the names: a type that has
+/// been created stays in the interpreter's type graph and is reachable by traversal from
+/// `object`, so replacing `_io.FileIO` alone would leave the type that opens the file one
+/// `__subclasses__` walk away. With `__new__` and `__init__` refusing, an instance obtained
+/// however it was reached opens nothing. The guest sees the names it expects — `open`,
+/// `io.open`, `_io.FileIO` — and the call raises. The rest of `_io` (the in-memory streams the
 /// standard library is built on) is left exactly as it is.
 fn refuse_host_file_access(vm: &VirtualMachine) -> PyResult<()> {
     // `io` is loaded FIRST, so the standard library's own stream classes are bound and
@@ -420,6 +503,13 @@ fn refuse_host_file_access(vm: &VirtualMachine) -> PyResult<()> {
             "a Lambda function in this emulator cannot open a file of the host".to_owned(),
         ))
     });
+    // The TYPE, before the name it is read off is replaced: its construction is what opens a
+    // host file, so that is where the refusal goes.
+    if let Ok(raw_file) = vm.import("_io", 0).and_then(|module| module.get_attr("FileIO", vm)) {
+        for slot in ["__new__", "__init__"] {
+            let _ = raw_file.set_attr(slot, refusing.clone(), vm);
+        }
+    }
     let targets: [(&str, &[&str]); 2] = [
         ("_io", &["open", "open_code", "FileIO"]),
         ("io", &["open", "open_code", "FileIO"]),
@@ -476,7 +566,12 @@ const MAX_GUEST_SLEEP_SECONDS: f64 = 3_600.0;
 /// spending against it, because none of it is the caller's work. The bounds are installed
 /// between that and the one call that does the caller's work, so the step budget, the
 /// deadline and the memory sample all measure the HANDLER.
-fn drive(vm: &VirtualMachine, input: &str, bounds: &Arc<Bounds>) -> PyResult<Completion> {
+fn drive(
+    vm: &VirtualMachine,
+    input: &str,
+    bounds: &Arc<Bounds>,
+    held: &TraceCell,
+) -> PyResult<Completion> {
     let scope = vm.new_scope_with_builtins();
     let code = vm
         .compile(
@@ -489,7 +584,7 @@ fn drive(vm: &VirtualMachine, input: &str, bounds: &Arc<Bounds>) -> PyResult<Com
         })?;
     vm.run_code_obj(code, scope.clone())?;
     let entry = scope.globals.get_item("__lambda_entry", vm)?;
-    install_trace_hook(vm)?;
+    install_trace_hook(vm, bounds, held)?;
     bounds.start();
     let answered = entry.call((vm.ctx.new_str(input),), vm)?;
     let text: String = answered.try_into_value(vm)?;
@@ -602,18 +697,37 @@ fn runtime_stdlib() -> ::serde_json::Map<String, ::serde_json::Value> {
 
 /// Install the trace hook the step and deadline bounds are checked from, then take away
 /// every way the guest could clear or replace it.
-fn install_trace_hook(vm: &VirtualMachine) -> PyResult<()> {
-    let scope = vm.new_scope_with_builtins();
-    let code = vm
-        .compile(
-            TRACE_HOOK_SOURCE,
-            ::rustpython_vm::compiler::Mode::Exec,
-            "<lambda-bounds>".to_owned(),
-        )
-        .map_err(|error| {
-            vm.new_runtime_error(format!("the bounds hook source does not compile: {error}"))
-        })?;
-    vm.run_code_obj(code, scope)?;
+///
+/// The hook is a HOST function, not Python: what the interpreter calls on every traced event
+/// is [`Bounds::step`] itself, reached through no name the guest can rebind — there is no
+/// module attribute, no global and no default argument between the event and the bound. A
+/// trace function has to answer the local tracer to use, and the local tracer is this same
+/// function, so the one it answers is read from `held` — the cell [`evaluate`] owns, which
+/// stays filled until the interpreter has been FINALIZED, because a guest `atexit` callback
+/// runs during finalization and its line events have to be traced too.
+fn install_trace_hook(
+    vm: &VirtualMachine,
+    bounds: &Arc<Bounds>,
+    held: &TraceCell,
+) -> PyResult<()> {
+    let answered = ::std::rc::Rc::clone(held);
+    let step_bounds = Arc::clone(bounds);
+    let hook = vm.new_function(
+        "__lambda_trace",
+        move |_args: FuncArgs, vm: &VirtualMachine| {
+            if let Some(stop) = step_bounds.step() {
+                return Err(vm.new_runtime_error(stop.reason().to_owned()));
+            }
+            // The local tracer for the frame this event belongs to is this same hook, so
+            // every event of every frame spends the budget.
+            let held = answered.borrow();
+            Ok(held.clone().unwrap_or_else(|| vm.ctx.none()))
+        },
+    );
+    let hook: PyObjectRef = hook.into();
+    *held.borrow_mut() = Some(hook.clone());
+    let setter = vm.sys_module.as_object().get_attr("settrace", vm)?;
+    setter.call((hook,), vm)?;
     // With these gone, no guest call can reach the interpreter's trace slot at all: the
     // hook that spends the budget is the only one there will be for this run.
     for name in ["settrace", "setprofile", "gettrace", "getprofile"] {
@@ -622,19 +736,14 @@ fn install_trace_hook(vm: &VirtualMachine) -> PyResult<()> {
     Ok(())
 }
 
-/// The hook itself. A trace function has to be a Python callable that returns the local
-/// tracer to use, so this is three lines of Python over the host's own step hook; the
-/// budget it spends, and the exception it raises, are [`Bounds::step`]'s.
-const TRACE_HOOK_SOURCE: &str = r#"
-import sys
-_host = __import__("_lambda_host")
-
-def __lambda_trace(frame, event, arg):
-    _host.step()
-    return __lambda_trace
-
-sys.settrace(__lambda_trace)
-"#;
+/// Where the installed trace hook is held, for the life of one run.
+///
+/// The hook answers ITSELF as each frame's local tracer, so this cell holds the hook and the
+/// hook holds this cell. [`evaluate`] owns it and empties it once the interpreter has been
+/// finalized — not before, because a guest `atexit` callback runs during finalization and has
+/// to be traced like every other guest frame — which is what keeps one run's hook from
+/// outliving the run that installed it.
+type TraceCell = ::std::rc::Rc<::std::cell::RefCell<Option<PyObjectRef>>>;
 
 /// Clamp how deep the guest may recurse, and take away the call that would raise it.
 fn clamp_recursion(vm: &VirtualMachine, limit: usize) -> PyResult<()> {
@@ -673,16 +782,9 @@ fn host_module(
             Ok(vm.ctx.none())
         },
     );
-    let step_bounds = Arc::clone(bounds);
-    set_function(
-        vm,
-        &module,
-        "step",
-        move |_args: FuncArgs, vm: &VirtualMachine| match step_bounds.step() {
-            None => Ok(vm.ctx.none()),
-            Some(stop) => Err(vm.new_runtime_error(stop.reason().to_owned())),
-        },
-    );
+    // The hook that spends the step, deadline and memory budget is NOT here: the
+    // interpreter calls it directly ([`install_trace_hook`]), so there is no name on this
+    // module for a guest to rebind and no way for guest code to reach the bounds at all.
     // The ONE call a handler reaches another service of this emulator by. The service
     // table, the signature and the destination are all [`super::aws_api`]'s, so what the
     // guest decides is only which operation of which reachable service it asks for and
@@ -870,6 +972,7 @@ fn call_answer(answered: &Result<super::aws_api::Answer, Refusal>) -> String {
             "errorType": answer.error_type,
             "requestId": answer.request_id,
             "streams": answer.streams,
+            "blobs": answer.blobs,
         })
         .to_string(),
         Err(refused) => refusal_answer_for(refused),
@@ -1052,11 +1155,17 @@ pub struct Bounds {
     response_bytes: usize,
     /// This thread's faulted bytes when the handler's work started.
     faulted_at_start: AtomicU64,
+    /// What this PROCESS held resident when the handler's work started, which is what the
+    /// process ceiling measures this run's own growth against.
+    resident_at_start: AtomicU64,
     /// Which bound was breached, once one was. Latched: the answer to a run that spent its
     /// budget is that stop, whatever the guest does afterwards.
     stopped: Mutex<Option<Stop>>,
     /// Whether a bound was breached at all, read without taking the lock.
     breached: AtomicBool,
+    /// Whether the handler's own work has begun ([`Self::start`]), which is when the bounds
+    /// start measuring and so when the host's watch starts judging.
+    spending: AtomicBool,
 }
 
 impl Bounds {
@@ -1071,8 +1180,10 @@ impl Bounds {
             memory_bytes: budget.memory_bytes,
             response_bytes: budget.response_bytes,
             faulted_at_start: AtomicU64::new(faulted_bytes()),
+            resident_at_start: AtomicU64::new(0),
             stopped: Mutex::new(None),
             breached: AtomicBool::new(false),
+            spending: AtomicBool::new(false),
         }
     }
 
@@ -1084,6 +1195,34 @@ impl Bounds {
             Instant::now() + self.wall_clock;
         self.faulted_at_start
             .store(faulted_bytes(), Ordering::Relaxed);
+        self.resident_at_start
+            .store(resident_bytes(), Ordering::Relaxed);
+        self.spending.store(true, Ordering::Relaxed);
+    }
+
+    /// Sample the run's DEADLINE from OUTSIDE it, and latch the stop when it is spent.
+    ///
+    /// Called by the host's own watch thread ([`watch_run`]) rather than by the interpreter,
+    /// so the clock a run is stopped on is the host's and not the guest's traced events: a
+    /// long NATIVE call emits none, and this is what notices a run that has stopped producing
+    /// them. The stop is latched here and raised at the next event the interpreter does
+    /// deliver, which is the only place an interpreter can be interrupted; the caller's own
+    /// wait and abandoned-run accounting ([`super::run_invocation`]) answer the caller
+    /// whatever the run goes on doing.
+    ///
+    /// The memory samples stay with the hook ([`Self::step`]): the run's own ceiling is this
+    /// THREAD's faulted pages, which only the run's own thread can read, and the whole
+    /// process's resident size is a bound about the process rather than about this run.
+    ///
+    /// Nothing is judged before the handler's own work begins: the interpreter this emulator
+    /// builds to run the handler in spends none of the run's budget ([`Self::start`]).
+    fn watch(&self) {
+        if !self.spending.load(Ordering::Relaxed) || self.stopped().is_some() {
+            return;
+        }
+        if Instant::now() >= self.deadline() {
+            self.breach(Stop::Deadline);
+        }
     }
 
     /// When the run must be over.
@@ -1112,9 +1251,7 @@ impl Bounds {
         if self.past_run_ceiling() {
             return Some(self.breach(Stop::Memory));
         }
-        if spent.is_multiple_of(STEPS_BETWEEN_PROCESS_SAMPLES)
-            && resident_bytes() > PROCESS_RESIDENT_CEILING_BYTES
-        {
+        if spent.is_multiple_of(STEPS_BETWEEN_PROCESS_SAMPLES) && self.past_process_ceiling() {
             return Some(self.breach(Stop::Memory));
         }
         None
@@ -1126,6 +1263,23 @@ impl Bounds {
     fn past_run_ceiling(&self) -> bool {
         faulted_bytes().saturating_sub(self.faulted_at_start.load(Ordering::Relaxed))
             > self.memory_bytes
+    }
+
+    /// Whether THIS RUN has grown the whole process past [`PROCESS_RESIDENT_CEILING_BYTES`].
+    ///
+    /// Both halves are needed, and each says something the other does not: the process is past
+    /// the ceiling, AND this run is what took it there — it holds more than it held when the
+    /// handler's work began, by more than the run's own ceiling allows it to add. A process
+    /// already past the ceiling when the run began is not this run's doing: stopping the run
+    /// for it would answer a caller that allocated none of it and would free none of it
+    /// either, while the run's own growth is bounded by the ceiling above whatever the rest of
+    /// the process holds.
+    fn past_process_ceiling(&self) -> bool {
+        let held = resident_bytes();
+        if held <= PROCESS_RESIDENT_CEILING_BYTES {
+            return false;
+        }
+        held.saturating_sub(self.resident_at_start.load(Ordering::Relaxed)) > self.memory_bytes
     }
 
     /// Latch `stop` as the run's answer and report it.
@@ -1592,6 +1746,122 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// Containment of the TYPE behind a host file, attempted the way a Python-level denylist
+    /// is sidestepped: not by the name `_io.FileIO`, which is replaced, but by walking the
+    /// interpreter's type graph from `object` to the type itself. Constructing it opens
+    /// nothing, because the refusal is on the type's own construction.
+    #[test]
+    fn the_type_behind_a_host_file_refuses_however_it_is_reached() {
+        let source = "def handler(event, context):\n    \
+                          def found(cls):\n        \
+                              for sub in cls.__subclasses__():\n            \
+                                  if sub.__name__ == 'FileIO':\n                \
+                                      return sub\n            \
+                                  deeper = found(sub)\n            \
+                                  if deeper is not None:\n                \
+                                      return deeper\n        \
+                              return None\n    \
+                          reached = found(object)\n    \
+                          if reached is None:\n        \
+                              return {'reached': False}\n    \
+                          try:\n        \
+                              held = reached('/etc/hostname').read()\n    \
+                          except BaseException as error:\n        \
+                              return {'reached': True, 'refused': type(error).__name__}\n    \
+                          return {'reached': True, 'opened': True, 'held': len(held)}\n";
+        let finished = ran(source, "lambda_function.handler", None);
+        match &finished.completion {
+            // Reaching the type at all is allowed; opening a host file with it is not.
+            Completion::Raised { .. } | Completion::Stopped(_) => {}
+            Completion::Returned(payload) => assert!(
+                !payload.contains("\"opened\"")
+                    && (payload.contains("\"refused\"") || payload.contains("\"reached\": false")
+                        || payload.contains("\"reached\":false")),
+                "expected no host file to be opened through the type graph, got {payload}"
+            ),
+            other => panic!("expected the type behind a host file to refuse, got {other:?}"),
+        }
+    }
+
+    /// The step, deadline and memory bounds are the HOST's: a handler that rebinds every name
+    /// the host module carries — including one it may expect the hook to be behind — and then
+    /// spins is still stopped, because the hook the interpreter calls is not reached through
+    /// any name the guest can write.
+    #[test]
+    fn a_guest_that_rebinds_the_host_module_is_still_bounded() {
+        let source = "def handler(event, context):\n    \
+                          host = __import__('_lambda_host')\n    \
+                          for name in dir(host) + ['step']:\n        \
+                              try:\n            \
+                                  setattr(host, name, lambda *a, **k: None)\n        \
+                              except Exception:\n            \
+                                  pass\n    \
+                          while True:\n        \
+                              pass\n";
+        let mut tight = budget();
+        // A small STEP budget, so the stop the guest cannot reach arrives at once: with the
+        // hook switched off nothing would arrive at all.
+        tight.steps = 20_000;
+        tight.wall_clock = Duration::from_secs(2);
+        let started = Instant::now();
+        let finished = ran_with(
+            source,
+            "lambda_function.handler",
+            None,
+            &BTreeMap::new(),
+            tight,
+        );
+        assert!(
+            matches!(finished.completion, Completion::Stopped(_)),
+            "expected the run to be stopped by a bound the guest cannot reach, got {:?}",
+            finished.completion
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "expected the stop inside the run's own ceiling, took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A guest `atexit` callback runs during the interpreter's finalization, which is after
+    /// the handler returned — and it is bounded like every other guest frame: the hook is
+    /// still installed and still answers itself as the local tracer, so a callback that spins
+    /// is stopped on the run's own deadline rather than wedging the thread.
+    #[test]
+    fn a_guest_atexit_callback_is_bounded_like_the_handler() {
+        let source = "import atexit\n\
+                      def spin():\n    \
+                          while True:\n        \
+                              pass\n\
+                      def handler(event, context):\n    \
+                          atexit.register(spin)\n    \
+                          return {'registered': True}\n";
+        let mut tight = budget();
+        // The callback is stopped on a budget, so this row is about WHETHER it is bounded and
+        // not about how much it is given: a small step budget keeps the spin short.
+        tight.steps = 20_000;
+        tight.wall_clock = Duration::from_secs(2);
+        let started = Instant::now();
+        let finished = ran_with(
+            source,
+            "lambda_function.handler",
+            None,
+            &BTreeMap::new(),
+            tight,
+        );
+        assert!(
+            !matches!(finished.completion, Completion::Internal(_)),
+            "expected the run to end on the handler's answer or on its own bound, got {:?}",
+            finished.completion
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "expected the spinning atexit callback to be stopped inside the run's ceiling, \
+             took {:?}",
+            started.elapsed()
+        );
     }
 
     /// The ENVIRONMENT a run sees is the invocation's own and nothing of this process's:

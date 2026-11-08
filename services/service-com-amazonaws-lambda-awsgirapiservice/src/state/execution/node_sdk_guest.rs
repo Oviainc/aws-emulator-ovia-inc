@@ -364,6 +364,31 @@ function streamedBody(base64Text) {
     };
 }
 
+// Every OTHER value an answer carries BYTES in is handed over as the byte array a v3 client
+// gives a caller for a blob member, decoded from the base64 a JSON protocol travels it as.
+// `path` is the keys and indices that reach the one value from the document's root, as the
+// runtime read them out of the called operation's own model; a path this document does not
+// hold, or a value that is not that text, is left exactly as it arrived.
+function materialiseBytes(document, path) {
+    if (!Array.isArray(path) || path.length === 0) {
+        return;
+    }
+    var held = document;
+    for (var at = 0; at < path.length - 1; at += 1) {
+        if (held === null || typeof held !== 'object') {
+            return;
+        }
+        held = held[path[at]];
+    }
+    if (held === null || typeof held !== 'object') {
+        return;
+    }
+    var last = path[path.length - 1];
+    if (typeof held[last] === 'string') {
+        held[last] = new Uint8Array(globalThis.Buffer.from(held[last], 'base64'));
+    }
+}
+
 function notMade(answered) {
     var error = new Error(answered.detail === undefined || answered.detail === null
         ? 'The request was not made: ' + answered.outcome
@@ -430,6 +455,12 @@ Client.prototype.send = function (command) {
             if (typeof document[member] === 'string') {
                 document[member] = streamedBody(document[member]);
             }
+        });
+        var blobs = answered.blobs === undefined || answered.blobs === null
+            ? []
+            : answered.blobs;
+        blobs.forEach(function (path) {
+            materialiseBytes(document, path);
         });
         document.$metadata = {
             httpStatusCode: answered.status,

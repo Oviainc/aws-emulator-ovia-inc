@@ -445,6 +445,32 @@ def _copy_source(value):
     return rendered
 
 
+def _materialise_bytes(document, path):
+    """Replace the value `path` reaches with the bytes its base64 text carries.
+
+    `path` is the object keys and list indices that reach one value from the root of the
+    answer's document, as the runtime read them out of the called operation's own model: a
+    JSON protocol carries a blob as base64 text, and what the SDK gives a caller is the
+    bytes. A path the document does not hold, or a value that is not that text, is left
+    exactly as it arrived.
+    """
+    held = document
+    for step in path[:-1]:
+        try:
+            held = held[step]
+        except (KeyError, IndexError, TypeError):
+            return
+    if not path:
+        return
+    last = path[-1]
+    try:
+        carried = held[last]
+    except (KeyError, IndexError, TypeError):
+        return
+    if isinstance(carried, str):
+        held[last] = base64.b64decode(carried)
+
+
 def _error_code(error_type, document):
     """The error code a refusal names, from the header or the document's own member."""
     for named in (
@@ -650,6 +676,12 @@ class Client:
                 carried = document.get(member)
                 if isinstance(carried, str):
                     document[member] = StreamingBody(base64.b64decode(carried))
+            # Every other value the answer says carries bytes is handed over as those
+            # bytes, which is what the SDK gives a caller for a blob member: a JSON
+            # protocol travels one as base64 text, so the text is decoded wherever the
+            # answer places it — at whatever depth, inside a list or a map as well.
+            for path in answered.get("blobs") or ():
+                _materialise_bytes(document, path)
             document["ResponseMetadata"] = metadata
             return document
         code = _error_code(answered.get("errorType"), document)

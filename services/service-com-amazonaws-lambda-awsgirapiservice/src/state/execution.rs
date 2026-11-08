@@ -84,6 +84,9 @@ mod aws_s3;
 /// Binding one of those calls to HTTP for a service whose protocol is `restJson1`.
 pub mod rest_json;
 
+/// WHICH values of an answered call carry BYTES, which the called service's own model says.
+pub mod blob_members;
+
 /// The AUTHENTICATION TOKEN the SDK mints in the CLIENT for a handler connecting to a
 /// database with IAM database authentication, which is not an API call at all.
 pub mod db_auth_token;

@@ -203,6 +203,8 @@ mod functions_by_code_signing_config;
 mod handler_aws_sdk;
 #[path = "all/handler_object_store_sdk.rs"]
 mod handler_object_store_sdk;
+#[path = "all/handler_dynamodb_binary_attributes.rs"]
+mod handler_dynamodb_binary_attributes;
 #[path = "all/handler_dynamodb_resource.rs"]
 mod handler_dynamodb_resource;
 #[path = "all/handler_email_sdk.rs"]
@@ -218,6 +220,8 @@ mod handler_rest_api_sdk;
 mod handler_step_functions_sdk;
 #[path = "all/handler_s3_object_access.rs"]
 mod handler_s3_object_access;
+#[path = "all/handler_secret_sdk.rs"]
+mod handler_secret_sdk;
 #[path = "all/invocation_concurrency.rs"]
 mod invocation_concurrency;
 #[path = "all/invocation_count_series.rs"]

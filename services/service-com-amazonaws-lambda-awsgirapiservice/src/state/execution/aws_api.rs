@@ -89,6 +89,11 @@ pub struct Api {
     pub endpoint_prefix: &'static str,
     /// The protocol its model declares, which is what a request to it is bound by.
     pub protocol: Protocol,
+    /// The service's own model, read for the ANSWER: WHICH of its values carry bytes rather
+    /// than text ([`super::blob_members`]), which only that model says. `None` for a service
+    /// whose answers this seam reads some other way — Amazon S3, whose own client parses them
+    /// ([`super::aws_s3`]).
+    pub answer_model: Option<&'static super::blob_members::ServiceModel>,
 }
 
 /// How a request to one service is bound to HTTP, which its model's protocol trait decides.
@@ -156,6 +161,7 @@ pub const APIS: &[Api] = &[
             target_prefix: "AmazonSQS",
             json_version: "1.0",
         },
+        answer_model: Some(&SQS),
     },
     // `services/service-com-amazonaws-eventbridge-awsevents/smithy-model/
     // com-amazonaws-eventbridge-awsevents.json`: awsJson1_1, sigv4Name `events`,
@@ -168,6 +174,7 @@ pub const APIS: &[Api] = &[
             target_prefix: "AWSEvents",
             json_version: "1.1",
         },
+        answer_model: Some(&EVENTBRIDGE),
     },
     // The same service under the token its own SDK id gives it, which is the other name an
     // SDK client is built with (`boto3.client("eventbridge")`).
@@ -179,6 +186,7 @@ pub const APIS: &[Api] = &[
             target_prefix: "AWSEvents",
             json_version: "1.1",
         },
+        answer_model: Some(&EVENTBRIDGE),
     },
     // `services/service-com-amazonaws-dynamodb-dynamodb-20120810/smithy-model/
     // com-amazonaws-dynamodb-dynamodb-20120810.json`: awsJson1_0, sigv4Name `dynamodb`,
@@ -191,6 +199,7 @@ pub const APIS: &[Api] = &[
             target_prefix: "DynamoDB_20120810",
             json_version: "1.0",
         },
+        answer_model: Some(&DYNAMODB),
     },
     // `services/service-com-amazonaws-cloudwatchlogs-logs-20140328/smithy-model/
     // com-amazonaws-cloudwatchlogs-logs-20140328.json`: awsJson1_1, sigv4Name `logs`,
@@ -205,6 +214,7 @@ pub const APIS: &[Api] = &[
             target_prefix: "Logs_20140328",
             json_version: "1.1",
         },
+        answer_model: Some(&CLOUDWATCH_LOGS),
     },
     // The same service under the token its own SDK id gives it, as EventBridge is above.
     Api {
@@ -215,6 +225,7 @@ pub const APIS: &[Api] = &[
             target_prefix: "Logs_20140328",
             json_version: "1.1",
         },
+        answer_model: Some(&CLOUDWATCH_LOGS),
     },
     // `services/service-com-amazonaws-apigateway-backplanecontrolservice/smithy-model/
     // com-amazonaws-apigateway-backplanecontrolservice.json`: restJson1, sigv4Name
@@ -225,6 +236,7 @@ pub const APIS: &[Api] = &[
         signing_name: "apigateway",
         endpoint_prefix: "apigateway",
         protocol: Protocol::RestJson(&APIGATEWAY),
+        answer_model: Some(&APIGATEWAY_ANSWERS),
     },
     // `services/service-com-amazonaws-secretsmanager-secretsmanager/smithy-model/
     // com-amazonaws-secretsmanager-secretsmanager.json`: awsJson1_1, sigv4Name
@@ -243,6 +255,7 @@ pub const APIS: &[Api] = &[
             target_prefix: "secretsmanager",
             json_version: "1.1",
         },
+        answer_model: Some(&SECRETSMANAGER),
     },
     // `services/service-com-amazonaws-opensearch-amazonopensearchservice/smithy-model/
     // com-amazonaws-opensearch-amazonopensearchservice.json`: restJson1, sigv4Name `es`,
@@ -257,6 +270,7 @@ pub const APIS: &[Api] = &[
         signing_name: "es",
         endpoint_prefix: "es",
         protocol: Protocol::RestJson(&OPENSEARCH),
+        answer_model: Some(&OPENSEARCH_ANSWERS),
     },
     // The same service under the token its ENDPOINT PREFIX gives it, which is the other
     // name an SDK client for it is built with (`boto3.client("es")`).
@@ -265,6 +279,7 @@ pub const APIS: &[Api] = &[
         signing_name: "es",
         endpoint_prefix: "es",
         protocol: Protocol::RestJson(&OPENSEARCH),
+        answer_model: Some(&OPENSEARCH_ANSWERS),
     },
     // `services/service-com-amazonaws-sfn-awsstepfunctions/smithy-model/
     // com-amazonaws-sfn-awsstepfunctions.json`: awsJson1_0, sigv4Name `states`,
@@ -287,6 +302,7 @@ pub const APIS: &[Api] = &[
             target_prefix: "AWSStepFunctions",
             json_version: "1.0",
         },
+        answer_model: Some(&SFN),
     },
     // The same service under the token its own SDK id gives it, as EventBridge and
     // CloudWatch Logs are above.
@@ -298,6 +314,7 @@ pub const APIS: &[Api] = &[
             target_prefix: "AWSStepFunctions",
             json_version: "1.0",
         },
+        answer_model: Some(&SFN),
     },
     // `services/service-com-amazonaws-sesv2-simpleemailservice-v2/smithy-model/
     // com-amazonaws-sesv2-simpleemailservice-v2.json`: restJson1, sigv4Name `ses`,
@@ -310,6 +327,7 @@ pub const APIS: &[Api] = &[
         signing_name: "ses",
         endpoint_prefix: "email",
         protocol: Protocol::RestJson(&SESV2),
+        answer_model: Some(&SESV2_ANSWERS),
     },
     // `services/service-com-amazonaws-s3-amazons3/smithy-model/
     // com-amazonaws-s3-amazons3.json`: restXml, sigv4Name `s3`, endpointPrefix `s3`, sdkId
@@ -321,6 +339,7 @@ pub const APIS: &[Api] = &[
         signing_name: "s3",
         endpoint_prefix: "s3",
         protocol: Protocol::S3Rest,
+        answer_model: None,
     },
     // `services/service-com-amazonaws-xray-awsxray/smithy-model/
     // com-amazonaws-xray-awsxray.json`: restJson1, sigv4Name `xray`, endpointPrefix `xray`,
@@ -336,6 +355,7 @@ pub const APIS: &[Api] = &[
         signing_name: "xray",
         endpoint_prefix: "xray",
         protocol: Protocol::RestJson(&XRAY),
+        answer_model: Some(&XRAY_ANSWERS),
     },
 ];
 
@@ -383,6 +403,10 @@ pub(super) const SFN_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-sfn-awsstepfunctions/smithy-model/\
      com-amazonaws-sfn-awsstepfunctions.json"
 );
+pub(super) const OPENSEARCH_MODEL: &str = include_str!(
+    "../../../../service-com-amazonaws-opensearch-amazonopensearchservice/smithy-model/\
+     com-amazonaws-opensearch-amazonopensearchservice.json"
+);
 pub(super) const XRAY_MODEL: &str = include_str!(
     "../../../../service-com-amazonaws-xray-awsxray/smithy-model/\
      com-amazonaws-xray-awsxray.json"
@@ -395,6 +419,55 @@ static XRAY: super::rest_json::RestApi = super::rest_json::RestApi {
     model: XRAY_MODEL,
     namespace: "com.amazonaws.xray",
     parsed: ::std::sync::OnceLock::new(),
+};
+
+/// WHICH values of one service's answers carry BYTES, read out of that service's own model on
+/// the first call to it ([`super::blob_members`]).
+///
+/// One per service a call may be made to whose answers this seam reads itself: an AWS JSON one,
+/// whose answer document IS the body, and a `restJson1` one, whose answer this seam reads
+/// through [`super::rest_json`]. Each stands on the same embedded file above, so nothing read
+/// here can drift from the surface the service serves, and what each KEEPS is the compact plan
+/// rather than the model document.
+static SQS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: SQS_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
+static EVENTBRIDGE: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: EVENTBRIDGE_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
+static DYNAMODB: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: DYNAMODB_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
+static CLOUDWATCH_LOGS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: CLOUDWATCH_LOGS_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
+static SECRETSMANAGER: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: SECRETSMANAGER_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
+static SFN: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: SFN_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
+static APIGATEWAY_ANSWERS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: APIGATEWAY_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
+static OPENSEARCH_ANSWERS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: OPENSEARCH_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
+static XRAY_ANSWERS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: XRAY_MODEL,
+    plan: ::std::sync::OnceLock::new(),
+};
+static SESV2_ANSWERS: super::blob_members::ServiceModel = super::blob_members::ServiceModel {
+    source: SESV2_MODEL,
+    plan: ::std::sync::OnceLock::new(),
 };
 
 /// Amazon API Gateway's own model, which a call to it is bound by.
@@ -415,10 +488,7 @@ static APIGATEWAY: super::rest_json::RestApi = super::rest_json::RestApi {
 /// as [`APIGATEWAY`] is, and for the same reason: the wire facts of each operation are that
 /// model's, so this seam states none of them.
 static OPENSEARCH: super::rest_json::RestApi = super::rest_json::RestApi {
-    model: include_str!(
-        "../../../../service-com-amazonaws-opensearch-amazonopensearchservice/smithy-model/\
-         com-amazonaws-opensearch-amazonopensearchservice.json"
-    ),
+    model: OPENSEARCH_MODEL,
     namespace: "com.amazonaws.opensearch",
     parsed: ::std::sync::OnceLock::new(),
 };
@@ -765,6 +835,13 @@ pub struct Answer {
     /// managed runtime. Empty for every answer whose members are all text, which is every
     /// AWS JSON one.
     pub streams: Vec<String>,
+    /// WHERE in [`Self::body`] the answer carries BYTES rather than text: one path per value
+    /// the called operation's own model types as a non-streaming blob
+    /// ([`super::blob_members`]), each a JSON array of the object keys and array indices that
+    /// reach it from the document's root. A JSON protocol carries such a value as the base64
+    /// of its bytes, and the SDK the guest calls hands over the BYTES, so a handler reads
+    /// bytes where it reads bytes on a managed runtime. Empty for an answer carrying none.
+    pub blobs: Vec<::serde_json::Value>,
 }
 
 /// Build, sign and dispatch one request, and read the answer back.
@@ -883,12 +960,36 @@ async fn sent(
         ),
         _ => answered,
     };
+    // WHICH of the answer's values carry bytes is the called service's own model's to say, so
+    // the SDK the guest calls hands each of them over as bytes rather than as the base64 a
+    // JSON protocol travels a blob as. A REFUSAL carries no output member at all.
+    //
+    // Read on a BLOCKING THREAD of the runtime rather than here: reading a service's model for
+    // the first time in this process parses a document of several megabytes, and the thread
+    // this is called on is the RUN's own, whose faulted pages are what the invocation's memory
+    // ceiling is measured from ([`super::python::Bounds`]). The work a call makes for the
+    // emulator is not the handler's memory, so it is not spent against it.
+    let blobs = match (api.answer_model, (200..300).contains(&status)) {
+        (Some(model), true) => {
+            let operation = operation.to_string();
+            let body = body.clone();
+            ::tokio::task::spawn_blocking(move || {
+                let document = ::serde_json::from_str::<::serde_json::Value>(&body)
+                    .unwrap_or(::serde_json::Value::Null);
+                model.answer_paths(&operation, &document)
+            })
+            .await
+            .unwrap_or_default()
+        }
+        _ => Vec::new(),
+    };
     Ok(Answer {
         status,
         body,
         error_type,
         request_id,
         streams: Vec::new(),
+        blobs,
     })
 }
 

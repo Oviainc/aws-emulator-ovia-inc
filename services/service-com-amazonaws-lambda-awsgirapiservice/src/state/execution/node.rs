@@ -594,6 +594,7 @@ fn call_answer(answered: &Result<Answer, Refusal>) -> String {
         "errorType": answer.error_type,
         "requestId": answer.request_id,
         "streams": answer.streams,
+        "blobs": answer.blobs,
     })
     .to_string()
 }

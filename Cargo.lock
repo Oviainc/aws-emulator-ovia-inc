@@ -13758,6 +13758,7 @@ dependencies = [
  "service-com-amazonaws-kinesis-kinesis-20131202",
  "service-com-amazonaws-kms-trentservice",
  "service-com-amazonaws-s3-amazons3",
+ "service-com-amazonaws-secretsmanager-secretsmanager",
  "service-com-amazonaws-sesv2-simpleemailservice-v2",
  "service-com-amazonaws-sfn-awsstepfunctions",
  "service-com-amazonaws-sqs-amazonsqs",
