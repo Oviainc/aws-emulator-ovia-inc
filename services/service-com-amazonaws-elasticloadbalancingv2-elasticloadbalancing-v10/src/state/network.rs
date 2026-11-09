@@ -550,6 +550,10 @@ const GROUP_ID_MALFORMED: &str = "InvalidGroupId.Malformed";
 /// that resolved without reporting one of the ids ran into.
 const GROUP_NOT_FOUND: &str = "InvalidGroup.NotFound";
 
+/// What a refusal CALLS a security group id, for the sentence it states when EC2 worded
+/// none — EC2's own noun for the resource an id of this kind names.
+const GROUP_NOUN: &str = "security group";
+
 /// What EC2 says about the security groups `group_ids` names.
 ///
 /// EC2 refuses a read naming an id the account holds no group for, so one bad id says
@@ -594,7 +598,15 @@ pub async fn resolve_security_groups(
                 .map(|group| group.group_id.as_str())
                 .collect();
             if group_ids.iter().any(|id| !index.contains(id.as_str())) {
-                return SecurityGroupLookup::Absent(NetworkRefusal::new(GROUP_NOT_FOUND));
+                let unresolved: Vec<&str> = group_ids
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|id| !index.contains(id))
+                    .collect();
+                return SecurityGroupLookup::Absent(NetworkRefusal::worded(
+                    GROUP_NOT_FOUND,
+                    Some(unresolved_ids_message(GROUP_NOUN, &unresolved)),
+                ));
             }
             return SecurityGroupLookup::Resolved(reported);
         }
@@ -608,10 +620,22 @@ pub async fn resolve_security_groups(
     if GROUP_REFUSAL_CODES.contains(&code.as_str()) {
         // EC2 worded this refusal around the group id it would not resolve, so the
         // sentence is carried along with the code: it is what names that id to the caller.
+        // EC2 refused the read for the ids it was given as a whole, so when it worded no
+        // sentence of its own the refusal states them. The status EC2 ANSWERED travels with
+        // them, as it does for every other resource this module resolves: a caller that
+        // states the fault states what EC2 answered rather than a status of its own.
         let message = refused
             .and_then(ProvideErrorMetadata::message)
-            .map(str::to_string);
-        return SecurityGroupLookup::Absent(NetworkRefusal::worded(code, message));
+            .map(str::to_string)
+            .unwrap_or_else(|| {
+                let named: Vec<&str> = group_ids.iter().map(String::as_str).collect();
+                unresolved_ids_message(GROUP_NOUN, &named)
+            });
+        return SecurityGroupLookup::Absent(NetworkRefusal::answered(
+            code,
+            Some(message),
+            error.raw_response().map(|response| response.status().as_u16()),
+        ));
     }
     ::tracing::debug!(
         error = %::aws_smithy_types::error::display::DisplayErrorContext(&error),

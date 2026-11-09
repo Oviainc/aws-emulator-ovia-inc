@@ -195,22 +195,30 @@ impl<Eng: ::std::marker::Send + ::std::marker::Sync + 'static> smithy_server_run
         }
 
         // Which Availability Zone — and which VPC — a subnet is in is EC2's to say, and so is
-        // whether it exists at all, so the subnets are resolved against EC2 before the store
-        // is locked; nothing is held across that call. A subnet the account does not hold is
-        // an attachment EC2 itself refuses, so the modelled `SubnetNotFound` reports the
-        // refusal EC2 answered for the id this request named.
+        // whether it exists at all, so the subnets are resolved by the EC2 service mounted in
+        // THIS process, reached through the framework's in-process callback
+        // (`OperationContext::callback`): the lookup opens no socket and leaves the host it
+        // runs on, no part of the request chooses a destination, and the only request-derived
+        // value it carries is the credential-scope region, which
+        // `crate::state::region_from_request` accepts solely in the published region shape.
+        // It runs before the store is locked; nothing is held across it. A subnet the account
+        // does not hold is an attachment EC2 itself refuses, so the modelled `SubnetNotFound`
+        // relays the EC2 fault that attachment ran into.
         let placement =
             match crate::state::resolve_subnet_placement(ctx, &region, &input.subnets).await {
                 Ok(placement) => placement,
                 Err(refusal) => {
                     // `SubnetNotFound` is raised for every subnet of every request this
-                    // operation cannot resolve, so the message is what tells them apart: it
-                    // is the refusal EC2 answered, which names the id at fault — not the
-                    // error shape's documentation summary, which describes the class.
+                    // operation cannot resolve, so the message is what tells them apart: the
+                    // EC2 fault relayed whole, which names the ids at fault and the call that
+                    // refused them — not a sentence of this service's own, and not the error
+                    // shape's documentation summary, which describes the class.
                     return Err(
                         AttachLoadBalancerToSubnetsErrorModeled::SubnetNotFoundException(
                             SubnetNotFoundException {
-                                message: Some(refusal.reported_message()),
+                                message: Some(
+                                    crate::state::relayed_network_refusal_message(&refusal),
+                                ),
                             },
                         )
                         .into(),

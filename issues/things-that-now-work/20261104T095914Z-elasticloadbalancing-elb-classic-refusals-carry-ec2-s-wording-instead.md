@@ -7,7 +7,6 @@ Issue-Corpus-Kind: wire
 Issue-Trace-Ids: elbclassic-subnet-attach-detach-and-security-group-reassignment
 Issue-Shape-Id: com.amazonaws.elasticloadbalancing#ElasticLoadBalancing_v7
 Issue-Key: elasticloadbalancing|AttachLoadBalancerToSubnets|4xx->4xx|$.ErrorResponse.Error.Message
-Issue-Key: elasticloadbalancing|ApplySecurityGroupsToLoadBalancer|4xx->4xx|$.ErrorResponse.Error.Message
 Issue-Commit: a57dea262f41459244daf18c6d5b4cdf00e6a648
 
 # ELB Classic refusals carry EC2's wording instead of the modeled ELB message
@@ -47,3 +46,26 @@ Emulator source: services/service-com-amazonaws-elasticloadbalancing-elasticload
 3. Step task#14: call AttachLoadBalancerToSubnets on that load balancer naming a subnet id the account holds no subnet for. The emulator answers 400 SubnetNotFound but with Error.Message "The subnet ID '<subnet-id>' does not exist" instead of ELB's own sentence for the SubnetNotFound class.
 4. Step task#15: call ApplySecurityGroupsToLoadBalancer on that load balancer naming a security group id the account does not hold. The emulator answers 400 InvalidSecurityGroup but with Error.Message "The security group '<sg-id>' does not exist" instead of ELB's own sentence for the InvalidSecurityGroup class.
 5. Compare each ErrorResponse/Error/Message against the recorded AWS message for the same request.
+
+## Resolution
+
+Both handlers' error-construction sites were the root cause and both are fixed: the message is
+now the EC2 fault RELAYED WHOLE — the sentence EC2 worded about the ids the request named,
+followed by `(Service: AmazonEC2; Status Code: <status EC2 answered>; Error Code: <code EC2
+answered>; Request ID: <that call's id>; Proxy: null)` — stated once in
+`services/service-com-amazonaws-elasticloadbalancing-elasticloadbalancing-v7/src/state.rs`
+(`relayed_network_refusal_message`) and used by `AttachLoadBalancerToSubnets` and
+`ApplySecurityGroupsToLoadBalancer` alike. The issue's claim that AWS words a sentence of ELB's
+OWN for these classes is not what the recording shows: the subnet step accepts exactly the
+relayed EC2 fault, and the documentation summary of the error shape is not the message.
+
+Cause 1 (AttachLoadBalancerToSubnets, task#14) replays as fixed.
+
+Cause 2 (ApplySecurityGroupsToLoadBalancer, task#15) is served by the same rule — status 400,
+code `InvalidSecurityGroup`, the ids from the request, the EC2 call that refused them, and no
+state changed — but the recorded message for that step is withheld by the corpus
+(`<shaped-not-asserted>`) and the shape it asserts still rejects the sentence EC2's
+security-group lookup words. The residual is the INNER EC2 sentence, which this service relays
+rather than re-words, and it is filed with the full list of wordings tried as
+`issues/things-that-do-not-work/20261108T000000Z-elasticloadbalancing-elb-classic-applysecuritygroups-relayed-ec2-sentence.md`.
+

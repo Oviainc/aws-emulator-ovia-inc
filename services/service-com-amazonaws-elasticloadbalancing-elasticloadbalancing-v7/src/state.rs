@@ -1121,6 +1121,41 @@ pub struct SourceSecurityGroup {
     pub group_name: Option<String>,
 }
 
+/// How Amazon EC2 names itself in the context clause of a fault reported through another
+/// service's API.
+const EC2_SERVICE_NAME: &str = "AmazonEC2";
+
+/// The status a relayed context clause states when the answer that carried the refusal
+/// reached this service without one: a read of the account's network is refused for the ids
+/// the caller sent, which is a client fault.
+const RELAYED_REFUSAL_STATUS: u16 = 400;
+
+/// The MESSAGE this service states when a request names a subnet or a security group the
+/// account holds no such resource for: the EC2 fault it ran into, RELAYED WHOLE.
+///
+/// Both refusals have one root — a read of an EC2-owned resource EC2 would not resolve — so
+/// both state it the same way, which is why the wording lives here rather than in each
+/// handler. What a caller reads is the fault as the SDK of the service that raised it
+/// renders it: the sentence EC2 worded about the ids this request named, and the context of
+/// the call that produced it — which service answered, the status and the error code it
+/// answered with, and the id of that call. Neither half alone is the message: the sentence
+/// without the context is EC2's refusal passed off as this service's own, and the context
+/// without the sentence names nothing the caller sent.
+///
+/// Every part comes from the answer EC2 gave for THIS request, except the call's own request
+/// id, which is minted per call like every other request id — never derived from the request
+/// and never stored.
+pub fn relayed_network_refusal_message(refusal: &NetworkRefusal) -> String {
+    format!(
+        "{} (Service: {EC2_SERVICE_NAME}; Status Code: {}; Error Code: {}; Request ID: {}; \
+         Proxy: null)",
+        refusal.reported_message(),
+        refusal.status.unwrap_or(RELAYED_REFUSAL_STATUS),
+        refusal.code,
+        ::service_common::query_error_envelope::new_request_id()
+    )
+}
+
 /// What EC2 says about the subnets a request named: the Availability Zone of each subnet
 /// it reported one for, and the VPC they all belong to.
 #[derive(Debug, Clone, Default)]

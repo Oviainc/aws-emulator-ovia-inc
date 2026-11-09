@@ -29,6 +29,8 @@ mod load_balancer_policies;
 mod load_balancer_tags;
 #[path = "all/modeled_refusal_envelopes.rs"]
 mod modeled_refusal_envelopes;
+#[path = "all/relayed_network_fault_messages.rs"]
+mod relayed_network_fault_messages;
 #[path = "all/shared_endpoint_api_version_dispatch.rs"]
 mod shared_endpoint_api_version_dispatch;
 #[path = "all/shared_endpoint_api_versions.rs"]

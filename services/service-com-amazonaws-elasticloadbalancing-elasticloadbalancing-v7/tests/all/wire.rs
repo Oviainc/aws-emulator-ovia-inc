@@ -302,6 +302,23 @@ pub(crate) fn kid_text(node: &Element, tag: &str) -> Option<String> {
     kid(node, tag).and_then(Element::text).map(str::to_string)
 }
 
+/// Whether `id` has the 8-4-4-4-12 hexadecimal form every AWS request id carries.
+///
+/// Here, once, because a suite that reads an id a response MINTS asserts its form rather
+/// than a value: the id names one call and nothing else.
+pub(crate) fn is_request_id(id: &str) -> bool {
+    let mut groups = id.split('-');
+    for width in [8usize, 4, 4, 4, 12] {
+        let Some(group) = groups.next() else {
+            return false;
+        };
+        if group.len() != width || !group.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    groups.next().is_none()
+}
+
 /// The `<member>` elements of the list child named `tag`.
 pub(crate) fn members<'a>(node: &'a Element, tag: &str) -> Vec<&'a Element> {
     kid(node, tag)

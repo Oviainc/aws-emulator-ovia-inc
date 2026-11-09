@@ -7,8 +7,10 @@
 //! balancer request names is resolved against EC2: a value EC2 holds no such resource for
 //! is refused with the error this operation models for it — `SubnetNotFound` for a subnet
 //! and `InvalidSecurityGroup` for a security group, both HTTP 400 `text/xml` awsQuery
-//! `ErrorResponse` envelopes, whose MESSAGE is the refusal EC2 answered for the id the
-//! request named rather than the documentation summary of the error shape — and the request
+//! `ErrorResponse` envelopes, whose MESSAGE is the EC2 fault RELAYED WHOLE — the sentence
+//! EC2 worded about the ids the request named, followed by the context of the call that
+//! raised it (the service, the status and error code it answered with, and that call's own
+//! request id) — rather than the documentation summary of the error shape — and the request
 //! changes nothing, while what EC2 reports for
 //! the resources it DOES hold is what the load balancer reports back: the zone of each
 //! attached subnet, the VPC they belong to, and the name and owner of its source security
@@ -562,10 +564,10 @@ struct MessageCase {
     ec2_params: Vec<(String, String)>,
     unknown_id: String,
     shape_summary: &'static str,
-    /// Whether this operation states the EC2 error CODE rather than the sentence EC2 worded
-    /// its refusal with: `CreateLoadBalancer`'s own recorded network refusal carries that
-    /// code, so a recording pins its wording, while the two operations whose recordings do
-    /// not assert the message state the sentence that names the id.
+    /// Whether this operation states the EC2 error CODE alone rather than the fault EC2
+    /// raised: `CreateLoadBalancer`'s own recorded network refusal carries that code, so a
+    /// recording pins its wording, while the two operations whose recordings do not assert
+    /// the message relay the fault whole.
     states_ec2_code: bool,
 }
 
@@ -589,19 +591,20 @@ fn indexed(prefix: &str, values: &[&str]) -> Vec<(String, String)> {
 
 /// One error code answers every subnet a request names that EC2 cannot resolve — and one
 /// answers every security group — so the MESSAGE is what tells the caller WHICH of the
-/// values it sent was rejected: it is the refusal EC2 answered for that very id, which
-/// names it, rather than the documentation summary of the error shape, which describes the
-/// class and carries nothing from the request.
+/// values it sent was rejected and WHAT refused it: it is the EC2 fault relayed whole — the
+/// sentence EC2 worded for that very id, and the context of the call that raised it — rather
+/// than the documentation summary of the error shape, which describes the class and carries
+/// nothing from the request.
 ///
 /// Each row asserts the Classic message against what EC2 ITSELF answers for the same read,
-/// through the same router — the sentence EC2 worded, or the error code it answered where
-/// the operation's own recorded refusal carries that code — so what is pinned is that the
-/// EC2 refusal is reported rather than a sentence this suite memorised. The rows differ
+/// through the same router — the sentence EC2 worded and the code it answered, or just that
+/// code where the operation's own recorded refusal carries it — so what is pinned is that the
+/// EC2 fault is relayed rather than a sentence this suite memorised. The rows differ
 /// along the FORM of the value EC2 holds no resource for (its 17-hex and 8-hex id forms, and
 /// a value that is no id at all), along the operation that names it, and along how many
 /// resources the request names beside it.
 #[tokio::test]
-async fn a_network_refusal_reports_the_ec2_refusal_for_the_id_the_request_named() {
+async fn a_network_refusal_relays_the_ec2_fault_for_the_id_the_request_named() {
     let router = emulator();
     let network = ec2_network(&router).await;
     let created = elb(
@@ -756,23 +759,143 @@ async fn a_network_refusal_reports_the_ec2_refusal_for_the_id_the_request_named(
             refused.status,
             refused.body
         );
-        // Either way the message is the refusal EC2 answered for that id: the sentence it
-        // worded, or — where the operation's own recording pins it — the code it answered.
-        let expected = if case.states_ec2_code {
-            code(&from_ec2)
-        } else {
-            ec2_message.clone()
-        };
+        // Either way the message states what EC2 answered: the fault relayed whole — its
+        // sentence and the context of the call that raised it — or, where the operation's own
+        // recording pins it, the code it answered.
         let stated = message(&refused);
-        assert_eq!(
-            stated, expected,
-            "case {:?}: expected the refusal EC2 answered, {expected:?}, got {stated:?}",
-            case.case
-        );
+        if case.states_ec2_code {
+            assert_eq!(
+                stated,
+                code(&from_ec2),
+                "case {:?}: expected the code EC2 answered, got {stated:?}",
+                case.case
+            );
+        } else {
+            let head = format!(
+                "{ec2_message} (Service: {EC2_IN_A_RELAYED_FAULT}; Status Code: 400; \
+                 Error Code: {}; Request ID: ",
+                code(&from_ec2)
+            );
+            let relayed_request_id = stated
+                .strip_prefix(&head)
+                .and_then(|tail| tail.strip_suffix(RELAYED_FAULT_TAIL))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "case {:?}: expected the EC2 fault relayed as \
+                         {head:?}<request id>{RELAYED_FAULT_TAIL:?}, got {stated:?}",
+                        case.case
+                    )
+                });
+            assert!(
+                is_request_id(relayed_request_id),
+                "case {:?}: expected the relayed clause to carry a request id, got \
+                 {relayed_request_id:?}",
+                case.case
+            );
+            // The relayed id names the EC2 call, not this response: the envelope reports its
+            // own, so a caller reading the two sees two calls rather than one id twice.
+            assert_ne!(
+                Some(relayed_request_id.to_string()),
+                opt_element(&refused.body, "RequestId"),
+                "case {:?}: the relayed clause must name the EC2 call, not this response",
+                case.case
+            );
+        }
         assert_ne!(
             stated, case.shape_summary,
             "case {:?}: the message must state the request, not the error shape's summary",
             case.case
+        );
+    }
+}
+
+/// How EC2 names itself in the context clause of a fault relayed through another service's
+/// API, as the SDK of the service that raised it renders it.
+const EC2_IN_A_RELAYED_FAULT: &str = "AmazonEC2";
+
+/// The close of that clause, after the raising call's own request id.
+const RELAYED_FAULT_TAIL: &str = "; Proxy: null)";
+
+/// Whether `id` has the 8-4-4-4-12 hexadecimal form every AWS request id carries.
+fn is_request_id(id: &str) -> bool {
+    let mut groups = id.split('-');
+    for width in [8usize, 4, 4, 4, 12] {
+        let Some(group) = groups.next() else {
+            return false;
+        };
+        if group.len() != width || !group.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    groups.next().is_none()
+}
+
+/// The relayed clause names ONE EC2 call, so two refusals of the same request carry two
+/// request ids: the id is minted per call rather than derived from the request, which is
+/// what lets a caller find each attempt in EC2's own records.
+#[tokio::test]
+async fn each_relayed_fault_names_its_own_ec2_call() {
+    let router = emulator();
+    let network = ec2_network(&router).await;
+    let created = elb(
+        &router,
+        "CreateLoadBalancer",
+        &[
+            param("LoadBalancerName", LOAD_BALANCER),
+            param("Listeners.member.1.Protocol", "HTTP"),
+            param("Listeners.member.1.LoadBalancerPort", "80"),
+            param("Listeners.member.1.InstancePort", "80"),
+            param("Subnets.member.1", &network.subnets[0]),
+            param("SecurityGroups.member.1", &network.security_groups[0]),
+        ],
+    )
+    .await;
+    assert_eq!(
+        created.status, 200,
+        "the fixture must be created, got {} with {}",
+        created.status, created.body
+    );
+
+    for (case, action, params) in [
+        (
+            "an attach naming a subnet EC2 does not hold",
+            "AttachLoadBalancerToSubnets",
+            vec![
+                param("LoadBalancerName", LOAD_BALANCER),
+                param("Subnets.member.1", "subnet-0f1e2d3c4b5a69780"),
+            ],
+        ),
+        (
+            "an apply naming a group EC2 does not hold",
+            "ApplySecurityGroupsToLoadBalancer",
+            vec![
+                param("LoadBalancerName", LOAD_BALANCER),
+                param("SecurityGroups.member.1", "sg-0f1e2d3c4b5a69780"),
+            ],
+        ),
+    ] {
+        let first = message(&elb(&router, action, &params).await);
+        let second = message(&elb(&router, action, &params).await);
+        assert_ne!(
+            first, second,
+            "case {case:?}: two refusals of the same request must name two EC2 calls, got \
+             {first:?} twice"
+        );
+        // Everything but that id is the same fault, stated the same way.
+        let clause = |stated: &str| {
+            stated
+                .split_once("; Request ID: ")
+                .map(|(head, _)| head.to_string())
+                .unwrap_or_default()
+        };
+        assert_eq!(
+            clause(&first),
+            clause(&second),
+            "case {case:?}: the fault itself must not change between two refusals"
+        );
+        assert!(
+            !clause(&first).is_empty(),
+            "case {case:?}: expected a relayed fault clause, got {first:?}"
         );
     }
 }
